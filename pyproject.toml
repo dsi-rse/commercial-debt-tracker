@@ -17,6 +17,9 @@ dependencies = [
   
 ]
 
+[project.scripts]
+cdt = "cdt.cli:main"
+
 [dependency-groups]
 dev = [
   "ruff==0.7.2",

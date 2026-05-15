@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 from io import BytesIO
 from pathlib import Path
 from typing import Self
 
-from cdt.ingest import acquire_documents, normalize_accession_number
+import pytest
+
+import cdt.ingest
+from cdt.ingest import (
+    acquire_documents,
+    acquire_documents_for_date_range,
+    iter_filings,
+    normalize_accession_number,
+)
 
 
 class FakePaginator:
@@ -31,6 +40,7 @@ class FakeS3Client:
         """Initialize the fake with bucket/key object bytes."""
         self.objects = objects
         self.downloads: list[tuple[str, str]] = []
+        self.manifest_reads: list[tuple[str, str]] = []
 
     def get_paginator(self: Self, name: str) -> FakePaginator:
         """Return a fake list-objects paginator."""
@@ -40,7 +50,9 @@ class FakeS3Client:
 
     def get_object(self: Self, Bucket: str, Key: str) -> dict[str, BytesIO]:  # noqa: N803
         """Return fake object bytes."""
-        if not Key.endswith("manifest.json"):
+        if Key.endswith("manifest.json"):
+            self.manifest_reads.append((Bucket, Key))
+        else:
             self.downloads.append((Bucket, Key))
         return {"Body": BytesIO(self.objects[(Bucket, Key)])}
 
@@ -56,37 +68,48 @@ def test_acquire_documents_filters_and_skips_existing(tmp_path: Path) -> None:
         {
             (
                 "sec-bucket",
-                "2024-01-02/8-K/320193/000114036126006577/manifest.json",
+                "sec/2024-01-02/8-K/320193/000114036126006577/manifest.json",
             ): json.dumps(
                 {
                     "cik": "320193",
                     "accession_number": "0001140361-26-006577",
+                    "form_type": "8-K",
                     "filing_date": "2024-01-02",
                     "failure_reason": "",
                     "documents": [
                         {
-                            "s3_key": "s3://sec-bucket/2024-01-02/8-K/320193/000114036126006577/full.txt",
+                            "type": "EX-99",
+                            "s3_key": "s3://sec-bucket/sec/2024-01-02/8-K/320193/000114036126006577/exhibit.htm",
+                            "url": "https://sec.example/exhibit.htm",
+                        },
+                        {
+                            "description": "Complete submission text file",
+                            "filename": "full.txt",
+                            "type": "",
+                            "s3_key": "s3://sec-bucket/sec/2024-01-02/8-K/320193/000114036126006577/full.txt",
                             "url": "https://sec.example/full.txt",
-                        }
+                        },
                     ],
                 }
             ).encode(),
             (
                 "sec-bucket",
-                "2024-01-02/8-K/320193/000114036126006577/full.txt",
+                "sec/2024-01-02/8-K/320193/000114036126006577/full.txt",
             ): b"complete submission",
             (
                 "sec-bucket",
-                "2024-01-03/8-K/789019/000000000024000001/manifest.json",
+                "sec/2024-01-03/8-K/789019/000000000024000001/manifest.json",
             ): json.dumps(
                 {
                     "cik": "789019",
                     "accession_number": "0000000000-24-000001",
+                    "form_type": "8-K",
                     "filing_date": "2024-01-03",
                     "failure_reason": "",
                     "documents": [
                         {
-                            "s3_key": "s3://sec-bucket/2024-01-03/8-K/789019/000000000024000001/full.txt",
+                            "type": "COMPLETE SUBMISSION TEXT FILE",
+                            "s3_key": "s3://sec-bucket/sec/2024-01-03/8-K/789019/000000000024000001/full.txt",
                             "url": "https://sec.example/other.txt",
                         }
                     ],
@@ -94,11 +117,12 @@ def test_acquire_documents_filters_and_skips_existing(tmp_path: Path) -> None:
             ).encode(),
             (
                 "sec-bucket",
-                "2024-01-04/8-K/320193/000000000024000002/manifest.json",
+                "sec/2024-01-04/8-K/320193/000000000024000002/manifest.json",
             ): json.dumps(
                 {
                     "cik": "320193",
                     "accession_number": "0000000000-24-000002",
+                    "form_type": "8-K",
                     "filing_date": "2024-01-04",
                     "failure_reason": "api_error",
                     "documents": [],
@@ -106,11 +130,12 @@ def test_acquire_documents_filters_and_skips_existing(tmp_path: Path) -> None:
             ).encode(),
             (
                 "sec-bucket",
-                "2023-01-02/8-K/320193/000000000023000001/manifest.json",
+                "sec/2023-01-02/8-K/320193/000000000023000001/manifest.json",
             ): json.dumps(
                 {
                     "cik": "320193",
                     "accession_number": "0000000000-23-000001",
+                    "form_type": "8-K",
                     "filing_date": "2023-01-02",
                     "failure_reason": "",
                     "documents": [],
@@ -138,5 +163,250 @@ def test_acquire_documents_filters_and_skips_existing(tmp_path: Path) -> None:
     assert first["text"].to_list() == ["complete submission"]
     assert len(second) == 1
     assert client.downloads == [
-        ("sec-bucket", "2024-01-02/8-K/320193/000114036126006577/full.txt")
+        ("sec-bucket", "sec/2024-01-02/8-K/320193/000114036126006577/full.txt")
     ]
+    assert (
+        "sec-bucket",
+        "sec/2024-01-03/8-K/789019/000000000024000001/manifest.json",
+    ) not in client.manifest_reads
+
+
+def test_acquire_documents_writes_downloads_in_batches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Downloaded rows are flushed according to the batch size."""
+    client = FakeS3Client(
+        {
+            (
+                "sec-bucket",
+                "sec/2024-01-02/8-K/320193/000000000024000001/manifest.json",
+            ): _manifest_bytes(
+                "320193",
+                "0000000000-24-000001",
+                "8-K",
+                "2024-01-02",
+                "COMPLETE SUBMISSION TEXT FILE",
+                s3_key="s3://sec-bucket/sec/2024-01-02/8-K/320193/000000000024000001/full.txt",
+            ),
+            (
+                "sec-bucket",
+                "sec/2024-01-02/8-K/320193/000000000024000001/full.txt",
+            ): b"first",
+            (
+                "sec-bucket",
+                "sec/2024-01-03/8-K/320193/000000000024000002/manifest.json",
+            ): _manifest_bytes(
+                "320193",
+                "0000000000-24-000002",
+                "8-K",
+                "2024-01-03",
+                "COMPLETE SUBMISSION TEXT FILE",
+                s3_key="s3://sec-bucket/sec/2024-01-03/8-K/320193/000000000024000002/full.txt",
+            ),
+            (
+                "sec-bucket",
+                "sec/2024-01-03/8-K/320193/000000000024000002/full.txt",
+            ): b"second",
+            (
+                "sec-bucket",
+                "sec/2024-01-04/8-K/320193/000000000024000003/manifest.json",
+            ): _manifest_bytes(
+                "320193",
+                "0000000000-24-000003",
+                "8-K",
+                "2024-01-04",
+                "COMPLETE SUBMISSION TEXT FILE",
+                s3_key="s3://sec-bucket/sec/2024-01-04/8-K/320193/000000000024000003/full.txt",
+            ),
+            (
+                "sec-bucket",
+                "sec/2024-01-04/8-K/320193/000000000024000003/full.txt",
+            ): b"third",
+        }
+    )
+    batch_sizes: list[int] = []
+    original_append = cdt.ingest._append_document_batch
+
+    def record_batch(
+        path: Path,
+        rows: list[dict[str, str]],
+        *,
+        force: bool,
+    ) -> object:
+        batch_sizes.append(len(rows))
+        return original_append(path, rows, force=force)
+
+    monkeypatch.setattr(cdt.ingest, "_append_document_batch", record_batch)
+
+    table = acquire_documents_for_date_range(
+        "sec-bucket",
+        date(2024, 1, 2),
+        date(2024, 1, 4),
+        {"320193"},
+        data_dir=tmp_path,
+        s3_client=client,
+        batch_size=2,
+    )
+
+    assert batch_sizes == [2, 1]
+    assert table["text"].to_list() == ["first", "second", "third"]
+
+
+def test_iter_filings_yields_manifest_objects_for_form_type_list() -> None:
+    """Manifest iteration unions exact form type prefixes over the date range."""
+    client = FakeS3Client(
+        {
+            (
+                "sec-bucket",
+                "sec/2024-01-02/8-K/320193/000114036126006577/manifest.json",
+            ): _manifest_bytes(
+                "320193",
+                "0001140361-26-006577",
+                "8-K",
+                "2024-01-02",
+                "COMPLETE SUBMISSION TEXT FILE",
+            ),
+            (
+                "sec-bucket",
+                "sec/2024-01-03/13F-HR/1000045/000100004524000001/manifest.json",
+            ): _manifest_bytes(
+                "1000045",
+                "0001000045-24-000001",
+                "13F-HR",
+                "2024-01-03",
+                "INFORMATION TABLE",
+            ),
+            (
+                "sec-bucket",
+                "sec/2024-01-04/8-K/320193/000114036124000001/manifest.json",
+            ): _manifest_bytes(
+                "320193",
+                "0001140361-24-000001",
+                "8-K",
+                "2024-01-04",
+                "COMPLETE SUBMISSION TEXT FILE",
+            ),
+        }
+    )
+
+    filings = list(
+        iter_filings(
+            client,
+            "sec-bucket",
+            ["8-K", "13F-HR"],
+            date(2024, 1, 2),
+            date(2024, 1, 3),
+        )
+    )
+
+    assert [filing.form_type for filing in filings] == ["8-K", "13F-HR"]
+    assert filings[0].filing_date == date(2024, 1, 2)
+    assert filings[0].documents[0].type == "COMPLETE SUBMISSION TEXT FILE"
+
+
+def test_iter_filings_skips_failures_unless_requested() -> None:
+    """Failure manifests are available only when explicitly requested."""
+    client = FakeS3Client(
+        {
+            (
+                "sec-bucket",
+                "sec/2024-01-02/8-K/320193/000114036126006577/manifest.json",
+            ): _manifest_bytes(
+                "320193",
+                "0001140361-26-006577",
+                "8-K",
+                "2024-01-02",
+                "COMPLETE SUBMISSION TEXT FILE",
+                failure_reason="api_error",
+            )
+        }
+    )
+
+    skipped = list(
+        iter_filings(
+            client,
+            "sec-bucket",
+            "8-K",
+            date(2024, 1, 2),
+            date(2024, 1, 2),
+        )
+    )
+    included = list(
+        iter_filings(
+            client,
+            "sec-bucket",
+            "8-K",
+            date(2024, 1, 2),
+            date(2024, 1, 2),
+            include_failures=True,
+        )
+    )
+
+    assert skipped == []
+    assert included[0].failure_reason == "api_error"
+
+
+def test_iter_filings_normalizes_amended_form_prefix() -> None:
+    """SEC form slashes are normalized to scraper S3 prefixes."""
+    client = FakeS3Client(
+        {
+            (
+                "sec-bucket",
+                "sec/2024-01-02/10-K_A/320193/000114036126006577/manifest.json",
+            ): _manifest_bytes(
+                "320193",
+                "0001140361-26-006577",
+                "10-K/A",
+                "2024-01-02",
+                "EX-21.1",
+            )
+        }
+    )
+
+    filings = list(
+        iter_filings(
+            client,
+            "sec-bucket",
+            "10-K/A",
+            date(2024, 1, 2),
+            date(2024, 1, 2),
+        )
+    )
+
+    assert filings[0].form_type == "10-K/A"
+
+
+def _manifest_bytes(
+    cik: str,
+    accession_number: str,
+    form_type: str,
+    filing_date: str,
+    document_type: str,
+    *,
+    failure_reason: str = "",
+    s3_key: str = "s3://sec-bucket/sec/2024-01-02/8-K/320193/000114036126006577/document.htm",
+) -> bytes:
+    return json.dumps(
+        {
+            "cik": cik,
+            "accession_number": accession_number,
+            "form_type": form_type,
+            "filing_date": filing_date,
+            "last_scraped_at": "2026-04-30T12:00:00+00:00",
+            "index_url": "https://sec.example/index.htm",
+            "company_name": "Example Inc.",
+            "report_date": filing_date,
+            "failure_reason": failure_reason,
+            "documents": [
+                {
+                    "seq": "1",
+                    "description": document_type,
+                    "filename": "document.htm",
+                    "type": document_type,
+                    "s3_key": s3_key,
+                    "url": "https://sec.example/document.htm",
+                }
+            ],
+        }
+    ).encode()
