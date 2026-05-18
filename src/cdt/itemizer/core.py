@@ -7,7 +7,6 @@ import sqlite3
 from pathlib import Path
 from urllib.parse import urlparse
 
-import boto3
 import pandas as pd
 
 from cdt import settings
@@ -19,7 +18,7 @@ from cdt.database import (
     read_item_accessions,
     upsert_items,
 )
-from cdt.ingest import DOCUMENT_COLUMNS
+from cdt.ingest import DOCUMENT_COLUMNS, default_s3_client
 from cdt.itemizer.extract import DocumentText, ItemSection, extract_items_from_document
 from cdt.storage import write_parquet_batch
 
@@ -80,6 +79,11 @@ def itemize_documents(
             return pd.DataFrame(columns=ITEM_COLUMNS)
 
         resource_uri_map = _resource_uri_map(conn)
+        resolved_s3_client = _ensure_s3_client(
+            s3_client,
+            documents_to_process.to_dict("records"),
+            resource_uri_map,
+        )
         rows: list[dict[str, object]] = []
         for document in documents_to_process.to_dict("records"):
             rows.extend(
@@ -88,7 +92,7 @@ def itemize_documents(
                     document,
                     resource_uri_map=resource_uri_map,
                     data_dir=data_dir,
-                    s3_client=s3_client,
+                    s3_client=resolved_s3_client,
                 )
             )
 
@@ -126,6 +130,7 @@ def itemize_pending_documents(
     processed_accessions: set[str] = set()
     processed_frames: list[pd.DataFrame] = []
     total_documents = 0
+    shared_s3_client = s3_client
     try:
         while True:
             index_rows = read_documents(
@@ -139,11 +144,16 @@ def itemize_pending_documents(
             if not index_rows:
                 break
             documents = pd.DataFrame(index_rows)
+            shared_s3_client = _ensure_s3_client(
+                shared_s3_client,
+                documents.to_dict("records"),
+                None,
+            )
             items = itemize_documents(
                 documents,
                 data_dir=data_dir,
                 force=force,
-                s3_client=s3_client,
+                s3_client=shared_s3_client,
             )
             if items.empty:
                 break
@@ -258,9 +268,11 @@ def _load_resource_text(
     s3_client: object | None,
 ) -> str:
     if resource_uri.startswith("s3://"):
-        client = s3_client or boto3.Session(profile_name="idi-analysis").client("s3")
+        if s3_client is None:
+            msg = "expected an initialized S3 client for s3:// resources"
+            raise ValueError(msg)
         bucket, key = _parse_s3_uri(resource_uri)
-        body = client.get_object(Bucket=bucket, Key=key)["Body"].read()
+        body = s3_client.get_object(Bucket=bucket, Key=key)["Body"].read()
         return body.decode("utf-8", errors="replace")
 
     path = Path(resource_uri)
@@ -275,3 +287,21 @@ def _parse_s3_uri(uri: str) -> tuple[str, str]:
         msg = f"Expected an s3:// URI, got {uri!r}"
         raise ValueError(msg)
     return parsed.netloc, parsed.path.lstrip("/")
+
+
+def _ensure_s3_client(
+    s3_client: object | None,
+    documents: list[dict[str, object]],
+    resource_uri_map: dict[str, str] | None,
+) -> object | None:
+    if s3_client is not None:
+        return s3_client
+    for document in documents:
+        resource_uri = document.get("resource_uri")
+        if not isinstance(resource_uri, str) or not resource_uri.strip():
+            resource_uri = (resource_uri_map or {}).get(
+                str(document["accession_number"])
+            )
+        if isinstance(resource_uri, str) and resource_uri.startswith("s3://"):
+            return default_s3_client()
+    return None

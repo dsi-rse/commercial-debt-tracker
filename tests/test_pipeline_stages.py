@@ -1,11 +1,13 @@
 """Tests for pipeline stage persistence and stub behavior."""
 
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 
+import cdt.itemizer.core
 from cdt.classifier import classify_items
 from cdt.classifier import core as classifier_core
 from cdt.database import cdt_db_path, connect_cdt_db, upsert_documents
@@ -145,6 +147,71 @@ SIGNATURES
     assert second.empty
     assert statuses == ["itemized"]
     assert len(list((tmp_path / "items").glob("item-batch-*.parquet"))) == 1
+
+
+def test_itemize_documents_reuses_one_s3_client_per_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S3-backed itemization should reuse one default client per invocation."""
+
+    class FakeS3Client:
+        def __init__(self: "FakeS3Client") -> None:
+            self.requests: list[tuple[str, str]] = []
+
+        def get_object(
+            self: "FakeS3Client", Bucket: str, Key: str
+        ) -> dict[str, BytesIO]:  # noqa: N803
+            self.requests.append((Bucket, Key))
+            return {
+                "Body": BytesIO(
+                    b"""
+ITEM INFORMATION: Other Events
+Item 8.01 Other Events.
+Shared client text.
+SIGNATURES
+"""
+                )
+            }
+
+    created_clients: list[FakeS3Client] = []
+
+    def fake_default_s3_client() -> FakeS3Client:
+        client = FakeS3Client()
+        created_clients.append(client)
+        return client
+
+    monkeypatch.setattr(cdt.itemizer.core, "default_s3_client", fake_default_s3_client)
+
+    documents = pd.DataFrame(
+        [
+            {
+                "accession_number": "000114036126006577",
+                "cik": "320193",
+                "url": "https://sec.example/full-1.txt",
+                "text": "",
+                "date": "2024-01-02",
+                "resource_uri": "s3://sec-bucket/doc-1.txt",
+            },
+            {
+                "accession_number": "000114036126006578",
+                "cik": "320193",
+                "url": "https://sec.example/full-2.txt",
+                "text": "",
+                "date": "2024-01-03",
+                "resource_uri": "s3://sec-bucket/doc-2.txt",
+            },
+        ]
+    )
+
+    items = itemize_documents(documents, data_dir=tmp_path)
+
+    assert len(items) == 2
+    assert len(created_clients) == 1
+    assert created_clients[0].requests == [
+        ("sec-bucket", "doc-1.txt"),
+        ("sec-bucket", "doc-2.txt"),
+    ]
 
 
 def test_classifier_adds_binary_predictions(
