@@ -65,12 +65,6 @@ def default_model_dir(data_dir: Path | None = None) -> Path:
     )
 
 
-def default_train_csv_path(data_dir: Path | None = None) -> Path:
-    """Return the default training CSV path."""
-    base_dir = (data_dir or settings.DATA_DIR).resolve().parent
-    return base_dir / "data" / "annotation" / "svm-annotated-8K-20260318.csv"
-
-
 def train_classifier_model(
     *,
     train_csv: Path,

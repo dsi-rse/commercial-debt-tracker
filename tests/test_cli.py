@@ -236,7 +236,6 @@ def test_classifier_train_cli_calls_training(
         )
         return {"training_row_count": 2}
 
-    monkeypatch.setattr(cli, "default_train_csv_path", lambda: train_csv)
     monkeypatch.setattr(cli, "default_model_dir", lambda: model_dir)
     monkeypatch.setattr(cli, "train_classifier_model", fake_train_classifier_model)
 
@@ -244,6 +243,8 @@ def test_classifier_train_cli_calls_training(
         [
             "classifier",
             "train",
+            "--train-csv",
+            str(train_csv),
             "--target-recall",
             "0.99",
             "--cv-splits",
@@ -264,6 +265,16 @@ def test_classifier_train_cli_calls_training(
             "random_seed": 7,
         }
     ]
+
+
+def test_classifier_train_cli_requires_train_csv() -> None:
+    """Training should fail argument parsing without an explicit CSV path."""
+    parser = cli.build_parser()
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["classifier", "train"])
+
+    assert exc_info.value.code == ARGPARSE_USAGE_ERROR
 
 
 def test_parse_date_rejects_non_iso_date() -> None:

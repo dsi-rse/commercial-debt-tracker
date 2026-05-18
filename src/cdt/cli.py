@@ -14,7 +14,6 @@ from cdt.classifier import (
     DEFAULT_TARGET_RECALL,
     classify_pending_items,
     default_model_dir,
-    default_train_csv_path,
     train_classifier_model,
 )
 from cdt.database import cdt_db_path
@@ -176,8 +175,10 @@ def build_parser() -> argparse.ArgumentParser:
     classifier_train_parser.add_argument(
         "--train-csv",
         type=Path,
-        default=None,
-        help="Optional training CSV path. Defaults to the shared annotation CSV.",
+        required=True,
+        help=(
+            "Training CSV path. The file must contain `text` and `label` " "columns."
+        ),
     )
     classifier_train_parser.add_argument(
         "--model-dir",
@@ -317,20 +318,19 @@ def run_classifier_train(args: argparse.Namespace) -> int:
     """Run the classifier training subcommand."""
     configure_logging(quiet=args.quiet, log_file=args.log_file)
     logger = logging.getLogger(__name__)
-    resolved_train_csv = args.train_csv or default_train_csv_path()
     resolved_model_dir = args.model_dir or default_model_dir()
     try:
         logger.info(
             "Starting classifier training: train_csv=%s model_dir=%s "
             "target_recall=%s cv_splits=%s random_seed=%s",
-            resolved_train_csv,
+            args.train_csv,
             resolved_model_dir,
             args.target_recall,
             args.cv_splits,
             args.random_seed,
         )
         metadata = train_classifier_model(
-            train_csv=resolved_train_csv,
+            train_csv=args.train_csv,
             model_dir=resolved_model_dir,
             target_recall=args.target_recall,
             cv_splits=args.cv_splits,

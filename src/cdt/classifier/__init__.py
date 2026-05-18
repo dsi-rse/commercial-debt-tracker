@@ -7,7 +7,6 @@ from cdt.classifier.core import (
     classify_items,
     classify_pending_items,
     default_model_dir,
-    default_train_csv_path,
     train_classifier_model,
 )
 
@@ -18,6 +17,5 @@ __all__ = [
     "classify_items",
     "classify_pending_items",
     "default_model_dir",
-    "default_train_csv_path",
     "train_classifier_model",
 ]
