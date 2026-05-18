@@ -70,3 +70,6 @@ convention = "google"
 
 [tool.pytest.ini_options]
 python_files = "test_*.py"
+
+[tool.ruff.lint.extend-per-file-ignores]
+"tests/*" = ["PLR2004"]

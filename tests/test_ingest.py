@@ -8,15 +8,17 @@ from io import BytesIO
 from pathlib import Path
 from typing import Self
 
-import pytest
-
-import cdt.ingest
+from cdt.database import cdt_db_path
 from cdt.ingest import (
     acquire_documents,
     acquire_documents_for_date_range,
+    document_batches_path,
+    documents_db_path,
     iter_filings,
     normalize_accession_number,
 )
+
+EXPECTED_BATCH_FILES = 2
 
 
 class FakePaginator:
@@ -62,8 +64,10 @@ def test_normalize_accession_number_strips_dashes() -> None:
     assert normalize_accession_number("0001140361-26-006577") == "000114036126006577"
 
 
-def test_acquire_documents_filters_and_skips_existing(tmp_path: Path) -> None:
-    """Acquisition filters manifests and downloads only missing documents."""
+def test_acquire_documents_indexes_resources_without_downloading(
+    tmp_path: Path,
+) -> None:
+    """Acquisition records resource URIs without fetching document bodies."""
     client = FakeS3Client(
         {
             (
@@ -160,22 +164,25 @@ def test_acquire_documents_filters_and_skips_existing(tmp_path: Path) -> None:
     )
 
     assert first["accession_number"].to_list() == ["000114036126006577"]
-    assert first["text"].to_list() == ["complete submission"]
-    assert len(second) == 1
-    assert client.downloads == [
-        ("sec-bucket", "sec/2024-01-02/8-K/320193/000114036126006577/full.txt")
+    assert first["text"].to_list() == [""]
+    assert first["resource_uri"].to_list() == [
+        "s3://sec-bucket/sec/2024-01-02/8-K/320193/000114036126006577/full.txt"
     ]
+    assert first["status"].to_list() == ["indexed"]
+    assert len(second) == 1
+    assert client.downloads == []
     assert (
         "sec-bucket",
         "sec/2024-01-03/8-K/789019/000000000024000001/manifest.json",
     ) not in client.manifest_reads
+    assert cdt_db_path(tmp_path).exists()
+    assert len(list(document_batches_path(tmp_path).glob("*.parquet"))) == 0
 
 
-def test_acquire_documents_writes_downloads_in_batches(
+def test_acquire_documents_writes_downloads_in_batches_when_requested(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Downloaded rows are flushed according to the batch size."""
+    """Downloaded document bodies are flushed according to the batch size."""
     client = FakeS3Client(
         {
             (
@@ -225,20 +232,6 @@ def test_acquire_documents_writes_downloads_in_batches(
             ): b"third",
         }
     )
-    batch_sizes: list[int] = []
-    original_append = cdt.ingest._append_document_batch
-
-    def record_batch(
-        path: Path,
-        rows: list[dict[str, str]],
-        *,
-        force: bool,
-    ) -> object:
-        batch_sizes.append(len(rows))
-        return original_append(path, rows, force=force)
-
-    monkeypatch.setattr(cdt.ingest, "_append_document_batch", record_batch)
-
     table = acquire_documents_for_date_range(
         "sec-bucket",
         date(2024, 1, 2),
@@ -247,10 +240,26 @@ def test_acquire_documents_writes_downloads_in_batches(
         data_dir=tmp_path,
         s3_client=client,
         batch_size=2,
+        download=True,
     )
 
-    assert batch_sizes == [2, 1]
-    assert table["text"].to_list() == ["first", "second", "third"]
+    assert table["accession_number"].to_list() == [
+        "000000000024000001",
+        "000000000024000002",
+        "000000000024000003",
+    ]
+    assert table["text"].to_list() == ["", "", ""]
+    assert table["status"].to_list() == ["downloaded", "downloaded", "downloaded"]
+    assert client.downloads == [
+        ("sec-bucket", "sec/2024-01-02/8-K/320193/000000000024000001/full.txt"),
+        ("sec-bucket", "sec/2024-01-03/8-K/320193/000000000024000002/full.txt"),
+        ("sec-bucket", "sec/2024-01-04/8-K/320193/000000000024000003/full.txt"),
+    ]
+    assert documents_db_path(tmp_path).exists()
+    assert (
+        len(list(document_batches_path(tmp_path).glob("*.parquet")))
+        == EXPECTED_BATCH_FILES
+    )
 
 
 def test_iter_filings_yields_manifest_objects_for_form_type_list() -> None:

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 from typing import Protocol, Self, cast
 from urllib.parse import urlparse
@@ -15,10 +16,18 @@ import boto3
 import pandas as pd
 
 from cdt import settings
-from cdt.storage import append_new_rows, read_table
+from cdt.database import (
+    cdt_db_path,
+    connect_cdt_db,
+    read_document_accessions,
+    read_documents,
+    upsert_documents,
+)
+from cdt.storage import write_parquet_batch
 
 LOGGER = logging.getLogger(__name__)
 DOCUMENT_COLUMNS = ["accession_number", "cik", "url", "text", "date"]
+DOCUMENT_INDEX_COLUMNS = [*DOCUMENT_COLUMNS, "resource_uri", "batch_path", "status"]
 DEFAULT_BUCKET = "idi-dev-processor-s3"
 DEFAULT_AWS_PROFILE = "idi-analysis"
 DEFAULT_S3_PREFIX = "sec"
@@ -29,6 +38,7 @@ DEFAULT_BATCH_SIZE = 100
 PROGRESS_DAY_INTERVAL = 30
 MIN_MANIFEST_KEY_PARTS = 5
 MANIFEST_KEY_CIK_INDEX = 3
+DOCUMENT_BATCH_PREFIX = "document-batch"
 
 
 class ReadableBody(Protocol):
@@ -62,7 +72,7 @@ class DocumentCandidate:
     accession_number: str
     cik: str
     url: str
-    s3_uri: str
+    resource_uri: str
     date: str
 
 
@@ -95,8 +105,18 @@ class ScrapedFiling:
 
 
 def documents_path(data_dir: Path | None = None) -> Path:
-    """Return the canonical documents table path."""
-    return (data_dir or settings.DATA_DIR) / "documents" / "documents.parquet"
+    """Return the directory for document batch artifacts."""
+    return (data_dir or settings.DATA_DIR) / "documents"
+
+
+def documents_db_path(data_dir: Path | None = None) -> Path:
+    """Return the shared CDT SQLite database path."""
+    return cdt_db_path(data_dir)
+
+
+def document_batches_path(data_dir: Path | None = None) -> Path:
+    """Return the directory for append-only document parquet batches."""
+    return documents_path(data_dir)
 
 
 def normalize_accession_number(accession_number: str) -> str:
@@ -113,6 +133,7 @@ def acquire_documents(
     s3_client: S3Client | None = None,
     force: bool = False,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    download: bool = False,
 ) -> pd.DataFrame:
     """Acquire matching 8-K documents and update the canonical documents table."""
     return acquire_documents_for_date_range(
@@ -124,6 +145,7 @@ def acquire_documents(
         s3_client=s3_client,
         force=force,
         batch_size=batch_size,
+        download=download,
     )
 
 
@@ -137,6 +159,7 @@ def acquire_documents_for_date_range(
     s3_client: S3Client | None = None,
     force: bool = False,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    download: bool = False,
 ) -> pd.DataFrame:
     """Acquire matching 8-K documents for a date range and update the table."""
     if batch_size <= 0:
@@ -144,8 +167,8 @@ def acquire_documents_for_date_range(
         raise ValueError(msg)
 
     client = s3_client or default_s3_client()
-    path = documents_path(data_dir)
-    existing = read_table(path, DOCUMENT_COLUMNS)
+    db_path = documents_db_path(data_dir)
+    conn = connect_document_db(db_path)
     normalized_ciks = _normalize_ciks(ciks)
 
     LOGGER.info(
@@ -155,15 +178,37 @@ def acquire_documents_for_date_range(
         bucket,
     )
 
-    existing_accessions = (
-        set(existing["accession_number"]) if not existing.empty and not force else set()
-    )
+    existing_accessions = set() if force else read_document_accessions(conn)
     seen_accessions: set[str] = set()
-    pending_rows: list[dict[str, str]] = []
+    pending_index_rows: list[dict[str, object]] = []
+    pending_download_rows: list[dict[str, str]] = []
     candidates_seen = 0
     skipped_existing = 0
     downloaded = 0
     batches_written = 0
+
+    def flush_pending_rows() -> None:
+        nonlocal pending_index_rows, pending_download_rows, batches_written
+        if not pending_index_rows:
+            return
+        batch_path: str | None = None
+        if download:
+            batch_path = str(
+                write_parquet_batch(
+                    document_batches_path(data_dir),
+                    DOCUMENT_BATCH_PREFIX,
+                    pd.DataFrame(pending_download_rows, columns=DOCUMENT_COLUMNS),
+                )
+            )
+        upsert_documents(
+            conn,
+            pending_index_rows,
+            batch_path=batch_path,
+            status="downloaded" if download else "indexed",
+        )
+        batches_written += 1
+        pending_index_rows = []
+        pending_download_rows = []
 
     for candidate in iter_document_candidates_for_date_range(
         client,
@@ -181,35 +226,24 @@ def acquire_documents_for_date_range(
             skipped_existing += 1
             continue
 
-        pending_rows.append(_download_candidate(client, candidate))
-        downloaded += 1
-        if len(pending_rows) >= batch_size:
-            batches_written += 1
-            _append_document_batch(path, pending_rows, force=force)
-            LOGGER.info(
-                "Wrote batch %s: downloaded=%s candidates=%s skipped_existing=%s",
-                batches_written,
-                downloaded,
-                candidates_seen,
-                skipped_existing,
-            )
-            pending_rows = []
-
-    if pending_rows:
-        batches_written += 1
-        _append_document_batch(path, pending_rows, force=force)
-        LOGGER.info(
-            "Wrote final batch %s: downloaded=%s candidates=%s skipped_existing=%s",
-            batches_written,
-            downloaded,
-            candidates_seen,
-            skipped_existing,
+        pending_index_rows.append(
+            {
+                "accession_number": candidate.accession_number,
+                "cik": candidate.cik,
+                "url": candidate.url,
+                "resource_uri": candidate.resource_uri,
+                "date": candidate.date,
+            }
         )
+        if download:
+            pending_download_rows.append(_download_candidate(client, candidate))
+            downloaded += 1
+        if len(pending_index_rows) >= batch_size:
+            flush_pending_rows()
 
-    if not path.exists():
-        _append_document_batch(path, [], force=force)
+    flush_pending_rows()
 
-    updated = read_table(path, DOCUMENT_COLUMNS)
+    updated = read_documents_from_index(conn)
     LOGGER.info(
         "Document acquisition complete: candidates=%s downloaded=%s "
         "skipped_existing=%s rows=%s path=%s",
@@ -217,8 +251,9 @@ def acquire_documents_for_date_range(
         downloaded,
         skipped_existing,
         len(updated),
-        path,
+        db_path,
     )
+    conn.close()
     return updated
 
 
@@ -293,7 +328,11 @@ def iter_filings(
         end_date,
         ciks=_normalize_ciks(ciks),
     ):
-        manifest = _read_json_object(s3_client, bucket, manifest_key)
+        try:
+            manifest = _read_json_object(s3_client, bucket, manifest_key)
+        except Exception:
+            LOGGER.exception("Failed to read manifest: key=%s", manifest_key)
+            raise
         filing = _filing_from_manifest(manifest)
         if filing.failure_reason and not include_failures:
             LOGGER.info("Skipping failed manifest %s", manifest_key)
@@ -317,7 +356,7 @@ def _candidate_from_filing(filing: ScrapedFiling) -> DocumentCandidate | None:
         accession_number=normalize_accession_number(filing.accession_number),
         cik=filing.cik,
         url=document.url,
-        s3_uri=document.s3_key,
+        resource_uri=document.s3_key,
         date=filing.filing_date.isoformat(),
     )
 
@@ -332,7 +371,7 @@ def _is_cdt_document(document: ScrapedDocument) -> bool:
 def _download_candidate(
     s3_client: S3Client, candidate: DocumentCandidate
 ) -> dict[str, str]:
-    bucket, key = parse_s3_uri(candidate.s3_uri)
+    bucket, key = parse_s3_uri(candidate.resource_uri)
     body = s3_client.get_object(Bucket=bucket, Key=key)["Body"].read()
     text = body.decode("utf-8", errors="replace")
     return {
@@ -344,26 +383,59 @@ def _download_candidate(
     }
 
 
-def _append_document_batch(
-    path: Path,
+def connect_document_db(path: Path) -> sqlite3.Connection:
+    """Connect to the shared CDT SQLite database and initialize its schema."""
+    return connect_cdt_db(path)
+
+
+def write_document_batch(
+    conn: sqlite3.Connection,
+    batches_path: Path,
     rows: list[dict[str, str]],
     *,
     force: bool,
 ) -> pd.DataFrame:
+    """Write one append-only parquet batch and update the SQLite index."""
+    del force
+    if not rows:
+        return read_documents_from_index(conn)
+
     table = pd.DataFrame(rows, columns=DOCUMENT_COLUMNS)
-    replace_keys = (
-        {row["accession_number"] for row in rows}
-        if force and rows
-        else None
-    )
-    return append_new_rows(
-        path,
+    batch_path = write_parquet_batch(
+        batches_path,
+        DOCUMENT_BATCH_PREFIX,
         table,
-        ["accession_number"],
-        DOCUMENT_COLUMNS,
-        replace_keys=replace_keys,
-        replace_key_column="accession_number" if replace_keys is not None else None,
     )
+    index_rows = [
+        {
+            "accession_number": str(row["accession_number"]),
+            "cik": str(row["cik"]),
+            "url": str(row["url"]),
+            "resource_uri": str(row.get("resource_uri", row["url"])),
+            "date": str(row["date"]),
+        }
+        for row in rows
+    ]
+    upsert_documents(
+        conn,
+        index_rows,
+        batch_path=str(batch_path),
+        status="downloaded",
+    )
+    return read_documents_from_index(conn)
+
+
+def read_documents_from_index(conn: sqlite3.Connection) -> pd.DataFrame:
+    """Read indexed documents from the shared database."""
+    records = read_documents(
+        conn,
+        statuses=("indexed", "downloaded", "itemized"),
+    )
+    if not records:
+        return pd.DataFrame(columns=DOCUMENT_INDEX_COLUMNS)
+    table = pd.DataFrame(records)
+    table["text"] = ""
+    return table.reindex(columns=DOCUMENT_INDEX_COLUMNS)
 
 
 def _read_json_object(s3_client: S3Client, bucket: str, key: str) -> dict[str, object]:
@@ -466,4 +538,4 @@ def _days_in_range(start: date, end: date) -> Iterator[date]:
     current = start
     while current <= end:
         yield current
-        current += timedelta(days=1)
+        current = current.fromordinal(current.toordinal() + 1)

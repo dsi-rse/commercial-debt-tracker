@@ -1,0 +1,89 @@
+"""Tests for pure 8-K item text extraction."""
+
+from __future__ import annotations
+
+from cdt.itemizer.extract import (
+    DocumentText,
+    extract_items_from_document,
+    primary_8k_body,
+)
+
+
+def test_extract_items_from_complete_submission() -> None:
+    """Extraction maps ITEM INFORMATION and slices the matching body section."""
+    document = DocumentText(
+        accession_number="0001",
+        cik="320193",
+        url="https://sec.example/full.txt",
+        date="2024-01-02",
+        text="""
+ITEM INFORMATION: Other Events
+<DOCUMENT>
+<TYPE>8-K
+<TEXT>
+<html><body>
+<p>Item 8.01 Other Events.</p>
+<p>The company entered a material update.</p>
+<p>Item 9.01 Financial Statements and Exhibits.</p>
+<p>Exhibit text.</p>
+</body></html>
+</TEXT>
+</DOCUMENT>
+""",
+    )
+
+    sections = extract_items_from_document(document)
+
+    assert len(sections) == 1
+    assert sections[0].item_number == "8.01"
+    assert sections[0].extraction_status == "ok"
+    assert "material update" in sections[0].section_text
+    assert "Exhibit text" not in sections[0].section_text
+
+
+def test_extract_items_marks_unmapped_item_information() -> None:
+    """Unknown ITEM INFORMATION captions produce an unmapped status row."""
+    document = DocumentText(
+        accession_number="0001",
+        cik="320193",
+        url="https://sec.example/full.txt",
+        date="2024-01-02",
+        text="ITEM INFORMATION: Not A Real Item\nItem 8.01 Other Events",
+    )
+
+    sections = extract_items_from_document(document)
+
+    assert sections[0].item_number == ""
+    assert sections[0].extraction_status == "unmapped_item_information"
+
+
+def test_extract_items_marks_missing_heading() -> None:
+    """Mapped ITEM INFORMATION without a body heading is reported."""
+    document = DocumentText(
+        accession_number="0001",
+        cik="320193",
+        url="https://sec.example/full.txt",
+        date="2024-01-02",
+        text="ITEM INFORMATION: Other Events\nNo matching heading here.",
+    )
+
+    sections = extract_items_from_document(document)
+
+    assert sections[0].item_number == "8.01"
+    assert sections[0].extraction_status == "missing_heading"
+
+
+def test_primary_8k_body_prefers_8k_document_block() -> None:
+    """Only the primary 8-K document block is selected from submissions."""
+    text = """
+<DOCUMENT>
+<TYPE>EX-99
+<TEXT>wrong</TEXT>
+</DOCUMENT>
+<DOCUMENT>
+<TYPE>8-K
+<TEXT>right</TEXT>
+</DOCUMENT>
+"""
+
+    assert primary_8k_body(text).strip() == "right"

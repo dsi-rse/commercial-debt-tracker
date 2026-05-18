@@ -1,5 +1,6 @@
 """Helpers for reading and updating pipeline artifacts."""
 
+import re
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -29,6 +30,26 @@ def write_table(path: Path, table: pd.DataFrame) -> None:
             temp_path.unlink()
 
 
+def next_batch_path(directory: Path, prefix: str) -> Path:
+    """Return the next sequential Parquet batch path in a directory."""
+    directory.mkdir(parents=True, exist_ok=True)
+    pattern = re.compile(rf"^{re.escape(prefix)}-(\d+)\.parquet$")
+    highest = 0
+    for path in directory.glob(f"{prefix}-*.parquet"):
+        match = pattern.match(path.name)
+        if match is None:
+            continue
+        highest = max(highest, int(match.group(1)))
+    return directory / f"{prefix}-{highest + 1:06d}.parquet"
+
+
+def write_parquet_batch(directory: Path, prefix: str, table: pd.DataFrame) -> Path:
+    """Write a sequentially numbered Parquet batch and return its path."""
+    path = next_batch_path(directory, prefix)
+    write_table(path, table)
+    return path
+
+
 def append_new_rows(
     path: Path,
     rows: pd.DataFrame,
@@ -40,6 +61,8 @@ def append_new_rows(
 ) -> pd.DataFrame:
     """Append rows to a keyed Parquet table and return the full updated table."""
     existing = read_table(path, columns)
+    existing = existing.reindex(columns=columns)
+    rows = rows.reindex(columns=columns)
     if existing.empty and rows.empty:
         write_table(path, existing)
         return existing
@@ -52,12 +75,11 @@ def append_new_rows(
         existing = existing.loc[~existing[replace_key_column].isin(set(replace_keys))]
 
     if rows.empty:
-        updated = existing.reindex(columns=columns)
+        updated = existing
+    elif existing.empty:
+        updated = rows
     else:
-        combined = pd.concat(
-            [existing.reindex(columns=columns), rows.reindex(columns=columns)],
-            ignore_index=True,
-        )
+        combined = pd.concat([existing, rows], ignore_index=True)
         updated = combined.drop_duplicates(subset=list(key_columns), keep="last")
 
     write_table(path, updated)

@@ -8,7 +8,13 @@ from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 
-from cdt.ingest import DEFAULT_BUCKET, acquire_documents_for_date_range, documents_path
+from cdt.ingest import (
+    DEFAULT_BUCKET,
+    acquire_documents_for_date_range,
+    document_batches_path,
+    documents_db_path,
+)
+from cdt.itemizer import itemize_pending_documents, items_path
 
 ALL_TIME_START_DATE = date(1994, 1, 1)
 DEFAULT_BATCH_SIZE = 100
@@ -28,7 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     ingest_parser = subparsers.add_parser(
         "ingest",
-        help="Download complete 8-K submission text files for CIKs.",
+        help="Index 8-K submission resources for CIKs.",
     )
     ingest_parser.add_argument(
         "cik_file",
@@ -62,63 +68,142 @@ def build_parser() -> argparse.ArgumentParser:
         type=positive_int,
         default=DEFAULT_BATCH_SIZE,
         help=(
-            "Number of downloaded documents to write per batch. "
+            "Number of matching documents to process per batch. "
             f"Defaults to {DEFAULT_BATCH_SIZE}."
         ),
+    )
+    ingest_parser.add_argument(
+        "--download",
+        action="store_true",
+        help="Download matched documents into Parquet batch files.",
     )
     ingest_parser.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress progress logging.",
     )
+    ingest_parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="Optional path to write logs for long-running ingests.",
+    )
     ingest_parser.set_defaults(func=run_ingest)
+
+    itemize_parser = subparsers.add_parser(
+        "itemize",
+        help="Extract 8-K item sections from tracked document resources.",
+    )
+    itemize_parser.add_argument(
+        "--batch-size",
+        type=positive_int,
+        default=DEFAULT_BATCH_SIZE,
+        help=(
+            "Number of source documents to itemize per batch. "
+            f"Defaults to {DEFAULT_BATCH_SIZE}."
+        ),
+    )
+    itemize_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-itemize documents already marked itemized.",
+    )
+    itemize_parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress progress logging.",
+    )
+    itemize_parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="Optional path to write logs for long-running itemization.",
+    )
+    itemize_parser.set_defaults(func=run_itemize)
     return parser
 
 
 def run_ingest(args: argparse.Namespace) -> int:
     """Run the ingest subcommand."""
-    configure_logging(quiet=args.quiet)
+    configure_logging(quiet=args.quiet, log_file=args.log_file)
     ciks = read_cik_file(args.cik_file)
     logger = logging.getLogger(__name__)
-    logger.info(
-        "Starting ingest: ciks=%s bucket=%s start_date=%s end_date=%s "
-        "batch_size=%s output=%s",
-        len(ciks),
-        args.bucket,
-        args.start_date,
-        args.end_date,
-        args.batch_size,
-        documents_path(),
-    )
-    documents = acquire_documents_for_date_range(
-        args.bucket,
-        args.start_date,
-        args.end_date,
-        ciks,
-        force=args.force,
-        batch_size=args.batch_size,
-    )
+    try:
+        logger.info(
+            "Starting ingest: ciks=%s bucket=%s start_date=%s end_date=%s "
+            "batch_size=%s download=%s database=%s",
+            len(ciks),
+            args.bucket,
+            args.start_date,
+            args.end_date,
+            args.batch_size,
+            args.download,
+            documents_db_path(),
+        )
+        documents = acquire_documents_for_date_range(
+            args.bucket,
+            args.start_date,
+            args.end_date,
+            ciks,
+            force=args.force,
+            batch_size=args.batch_size,
+            download=args.download,
+        )
+    except Exception:
+        logger.exception("Ingest failed")
+        return 1
     print(
-        f"Ingested {len(documents)} document rows for {len(ciks)} CIKs "
+        f"Indexed {len(documents)} document rows for {len(ciks)} CIKs "
         f"from {args.start_date} through {args.end_date}."
     )
-    print(f"Wrote {documents_path()}.")
+    print(f"Wrote {documents_db_path()}.")
+    if args.download:
+        print(f"Wrote document batches to {document_batches_path()}.")
     return 0
 
 
-def configure_logging(*, quiet: bool) -> None:
+def run_itemize(args: argparse.Namespace) -> int:
+    """Run the itemize subcommand."""
+    configure_logging(quiet=args.quiet, log_file=args.log_file)
+    logger = logging.getLogger(__name__)
+    try:
+        logger.info(
+            "Starting itemization: batch_size=%s force=%s database=%s output=%s",
+            args.batch_size,
+            args.force,
+            documents_db_path(),
+            items_path(),
+        )
+        items = itemize_pending_documents(
+            batch_size=args.batch_size,
+            force=args.force,
+        )
+    except Exception:
+        logger.exception("Itemization failed")
+        return 1
+    print(f"Itemized {len(items)} item rows.")
+    print(f"Wrote item batches to {items_path()}.")
+    return 0
+
+
+def configure_logging(*, quiet: bool, log_file: Path | None = None) -> None:
     """Configure CLI logging."""
     level = logging.WARNING if quiet else logging.INFO
-    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(message)s")
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if log_file is not None:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        handlers=handlers,
+        force=True,
+    )
 
 
 def read_cik_file(path: Path) -> set[str]:
     """Read a one-CIK-per-line file."""
-    return {
-        line.strip()
-        for line in path.read_text().splitlines()
-        if line.strip()
-    }
+    return {line.strip() for line in path.read_text().splitlines() if line.strip()}
 
 
 def parse_date(value: str) -> date:
