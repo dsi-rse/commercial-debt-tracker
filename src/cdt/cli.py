@@ -23,7 +23,11 @@ from cdt.ingest import (
     document_batches_path,
     documents_db_path,
 )
-from cdt.itemizer import itemize_pending_documents, items_path
+from cdt.itemizer import (
+    POTENTIALLY_RELEVANT_ITEM_NUMBERS,
+    itemize_pending_documents,
+    items_path,
+)
 
 ALL_TIME_START_DATE = date(1994, 1, 1)
 DEFAULT_BATCH_SIZE = 100
@@ -116,6 +120,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="Re-itemize documents already marked itemized.",
+    )
+    itemize_parser.add_argument(
+        "--item-numbers",
+        type=parse_item_numbers,
+        default=POTENTIALLY_RELEVANT_ITEM_NUMBERS,
+        help=(
+            "Comma-separated 8-K item numbers to save. "
+            "Defaults to potentially relevant items only."
+        ),
     )
     itemize_parser.add_argument(
         "--quiet",
@@ -270,15 +283,17 @@ def run_itemize(args: argparse.Namespace) -> int:
     logger = logging.getLogger(__name__)
     try:
         logger.info(
-            "Starting itemization: batch_size=%s force=%s database=%s output=%s",
+            "Starting itemization: batch_size=%s force=%s item_numbers=%s database=%s output=%s",
             args.batch_size,
             args.force,
+            ",".join(args.item_numbers),
             documents_db_path(),
             items_path(),
         )
         items = itemize_pending_documents(
             batch_size=args.batch_size,
             force=args.force,
+            item_numbers=args.item_numbers,
         )
     except Exception:
         logger.exception("Itemization failed")
@@ -382,6 +397,15 @@ def positive_int(value: str) -> int:
         raise argparse.ArgumentTypeError(msg) from exc
     if parsed <= 0:
         msg = f"expected a positive integer, got {value!r}"
+        raise argparse.ArgumentTypeError(msg)
+    return parsed
+
+
+def parse_item_numbers(value: str) -> tuple[str, ...]:
+    """Parse a comma-separated item-number list for argparse."""
+    parsed = tuple(part.strip() for part in value.split(",") if part.strip())
+    if not parsed:
+        msg = "expected a comma-separated list of item numbers"
         raise argparse.ArgumentTypeError(msg)
     return parsed
 

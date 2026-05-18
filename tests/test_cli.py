@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 from cdt import cli
+from cdt.itemizer import POTENTIALLY_RELEVANT_ITEM_NUMBERS
 
 ARGPARSE_USAGE_ERROR = 2
 
@@ -165,8 +166,15 @@ def test_itemize_cli_calls_pending_itemizer(monkeypatch: pytest.MonkeyPatch) -> 
         *,
         batch_size: int,
         force: bool = False,
+        item_numbers: tuple[str, ...] | None = None,
     ) -> pd.DataFrame:
-        calls.append({"batch_size": batch_size, "force": force})
+        calls.append(
+            {
+                "batch_size": batch_size,
+                "force": force,
+                "item_numbers": item_numbers,
+            }
+        )
         return pd.DataFrame([{"item_id": "item-1"}])
 
     monkeypatch.setattr(
@@ -176,7 +184,52 @@ def test_itemize_cli_calls_pending_itemizer(monkeypatch: pytest.MonkeyPatch) -> 
     status = cli.main(["itemize", "--batch-size", "25", "--force", "--quiet"])
 
     assert status == 0
-    assert calls == [{"batch_size": 25, "force": True}]
+    assert calls == [
+        {
+            "batch_size": 25,
+            "force": True,
+            "item_numbers": POTENTIALLY_RELEVANT_ITEM_NUMBERS,
+        }
+    ]
+
+
+def test_itemize_cli_passes_custom_item_numbers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The itemize command forwards a custom item-number list."""
+    calls: list[dict[str, object]] = []
+
+    def fake_itemize_pending_documents(
+        *,
+        batch_size: int,
+        force: bool = False,
+        item_numbers: tuple[str, ...] | None = None,
+    ) -> pd.DataFrame:
+        calls.append(
+            {
+                "batch_size": batch_size,
+                "force": force,
+                "item_numbers": item_numbers,
+            }
+        )
+        return pd.DataFrame([{"item_id": "item-1"}])
+
+    monkeypatch.setattr(
+        cli, "itemize_pending_documents", fake_itemize_pending_documents
+    )
+
+    status = cli.main(
+        ["itemize", "--item-numbers", "1.01,8.01", "--batch-size", "10", "--quiet"]
+    )
+
+    assert status == 0
+    assert calls == [
+        {
+            "batch_size": 10,
+            "force": False,
+            "item_numbers": ("1.01", "8.01"),
+        }
+    ]
 
 
 def test_classifier_cli_calls_pending_classifier(
@@ -287,3 +340,15 @@ def test_parse_date_rejects_non_iso_date() -> None:
         assert exc.code == ARGPARSE_USAGE_ERROR
     else:
         raise AssertionError("expected argparse to reject a non-ISO date")
+
+
+def test_parse_item_numbers_rejects_empty_list() -> None:
+    """CLI item-number overrides must contain at least one value."""
+    parser = cli.build_parser()
+
+    try:
+        parser.parse_args(["itemize", "--item-numbers", " , "])
+    except SystemExit as exc:
+        assert exc.code == ARGPARSE_USAGE_ERROR
+    else:
+        raise AssertionError("expected argparse to reject an empty item-number list")

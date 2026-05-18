@@ -13,7 +13,12 @@ from cdt.classifier import core as classifier_core
 from cdt.database import cdt_db_path, connect_cdt_db, upsert_documents
 from cdt.extractor import extract_tables
 from cdt.ingest import DOCUMENT_COLUMNS
-from cdt.itemizer import item_id_for, itemize_documents, itemize_pending_documents
+from cdt.itemizer import (
+    POTENTIALLY_RELEVANT_ITEM_NUMBERS,
+    item_id_for,
+    itemize_documents,
+    itemize_pending_documents,
+)
 
 
 def test_itemizer_creates_stable_item_ids_and_is_idempotent(tmp_path: Path) -> None:
@@ -67,7 +72,7 @@ def test_itemizer_handles_mixed_integer_and_empty_section_fields(
                 "url": "https://sec.example/full.txt",
                 "text": """
 ITEM INFORMATION: Other Events
-ITEM INFORMATION: Not A Real Item
+ITEM INFORMATION: Creation of a Direct Financial Obligation or an Obligation Under an Off-Balance Sheet Arrangement of a Registrant
 <DOCUMENT>
 <TYPE>8-K
 <TEXT>
@@ -86,14 +91,59 @@ ITEM INFORMATION: Not A Real Item
         columns=DOCUMENT_COLUMNS,
     )
 
-    items = itemize_documents(documents, data_dir=tmp_path)
+    items = itemize_documents(
+        documents,
+        data_dir=tmp_path,
+        item_numbers=("8.01", "2.03"),
+    )
 
     assert len(items) == 2
-    assert items["item"].to_list() == ["8.01", ""]
+    assert items["item"].to_list() == ["8.01", "2.03"]
     assert items["start_line"].dtype.name == "Int64"
     assert items["end_line"].dtype.name == "Int64"
     assert items["section_char_count"].dtype.name == "Int64"
+    assert pd.isna(items.iloc[1]["start_line"])
     assert len(list((tmp_path / "items").glob("item-batch-*.parquet"))) == 1
+
+
+def test_itemizer_defaults_to_potentially_relevant_items_only(tmp_path: Path) -> None:
+    """Default itemization drops sections outside the relevant item list."""
+    documents = pd.DataFrame(
+        [
+            {
+                "accession_number": "000114036126006577",
+                "cik": "320193",
+                "url": "https://sec.example/full.txt",
+                "text": """
+ITEM INFORMATION: Other Events
+ITEM INFORMATION: Financial Statements and Exhibits
+<DOCUMENT>
+<TYPE>8-K
+<TEXT>
+Item 8.01 Other Events.
+Relevant text.
+Item 9.01 Financial Statements and Exhibits.
+Excluded text.
+</TEXT>
+</DOCUMENT>
+""",
+                "date": "2024-01-02",
+            }
+        ],
+        columns=DOCUMENT_COLUMNS,
+    )
+
+    items = itemize_documents(documents, data_dir=tmp_path)
+
+    assert POTENTIALLY_RELEVANT_ITEM_NUMBERS == (
+        "1.01",
+        "1.02",
+        "2.03",
+        "2.04",
+        "7.01",
+        "8.01",
+    )
+    assert items["item"].to_list() == ["8.01"]
 
 
 def test_itemize_pending_documents_processes_downloaded_database_rows(
@@ -147,6 +197,94 @@ SIGNATURES
     assert second.empty
     assert statuses == ["itemized"]
     assert len(list((tmp_path / "items").glob("item-batch-*.parquet"))) == 1
+
+
+def test_itemizer_logs_saved_and_irrelevant_item_counts(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Itemizer logs a per-item summary and irrelevant discard count."""
+    documents = pd.DataFrame(
+        [
+            {
+                "accession_number": "000114036126006577",
+                "cik": "320193",
+                "url": "https://sec.example/full.txt",
+                "text": """
+ITEM INFORMATION: Other Events
+ITEM INFORMATION: Financial Statements and Exhibits
+<DOCUMENT>
+<TYPE>8-K
+<TEXT>
+Item 8.01 Other Events.
+Relevant text.
+Item 9.01 Financial Statements and Exhibits.
+Excluded text.
+</TEXT>
+</DOCUMENT>
+""",
+                "date": "2024-01-02",
+            }
+        ],
+        columns=DOCUMENT_COLUMNS,
+    )
+
+    with caplog.at_level("INFO", logger="cdt.itemizer.core"):
+        itemize_documents(documents, data_dir=tmp_path)
+
+    assert "total_saved=1" in caplog.text
+    assert "8.01=1" in caplog.text
+    assert "irrelevant_not_saved=1" in caplog.text
+
+
+def test_itemize_pending_documents_marks_irrelevant_only_documents_itemized(
+    tmp_path: Path,
+) -> None:
+    """Documents with only irrelevant items should still be marked itemized."""
+    resource_file = tmp_path / "irrelevant-source.txt"
+    resource_file.write_text(
+        """
+ITEM INFORMATION: Financial Statements and Exhibits
+Item 9.01 Financial Statements and Exhibits.
+Excluded text.
+SIGNATURES
+""",
+        encoding="utf-8",
+    )
+    conn = connect_cdt_db(cdt_db_path(tmp_path))
+    try:
+        upsert_documents(
+            conn,
+            [
+                {
+                    "accession_number": "000114036126006579",
+                    "cik": "320193",
+                    "url": "https://sec.example/full-irrelevant.txt",
+                    "resource_uri": str(resource_file),
+                    "date": "2024-01-04",
+                }
+            ],
+            batch_path=None,
+            status="indexed",
+        )
+    finally:
+        conn.close()
+
+    items = itemize_pending_documents(data_dir=tmp_path, batch_size=1)
+    conn = connect_cdt_db(cdt_db_path(tmp_path))
+    try:
+        statuses = [
+            row[0]
+            for row in conn.execute(
+                "SELECT status FROM documents WHERE accession_number = ?",
+                ("000114036126006579",),
+            )
+        ]
+    finally:
+        conn.close()
+
+    assert items.empty
+    assert statuses == ["itemized"]
 
 
 def test_itemize_documents_reuses_one_s3_client_per_run(

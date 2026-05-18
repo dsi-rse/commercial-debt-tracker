@@ -163,6 +163,8 @@ def classify_pending_items(
     processed_item_ids: set[str] = set()
     processed_frames: list[pd.DataFrame] = []
     total_rows = 0
+    relevant_count = 0
+    irrelevant_count = 0
     try:
         while True:
             index_rows = read_items(
@@ -188,10 +190,17 @@ def classify_pending_items(
             processed_frames.append(classified)
             processed_item_ids.update(str(item_id) for item_id in classified["item_id"])
             total_rows += len(classified)
+            relevant_count += int(classified["relevance"].sum())
+            irrelevant_count += int((~classified["relevance"]).sum())
     finally:
         conn.close()
 
-    LOGGER.info("Classifier complete: %s item rows updated", total_rows)
+    LOGGER.info(
+        "Classifier complete: total_classified=%s relevant=%s irrelevant=%s",
+        total_rows,
+        relevant_count,
+        irrelevant_count,
+    )
     if not processed_frames:
         return pd.DataFrame(columns=CLASSIFIED_ITEM_COLUMNS)
     return pd.concat(processed_frames, ignore_index=True).reindex(

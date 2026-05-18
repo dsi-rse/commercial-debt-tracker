@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from collections import Counter
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -23,6 +24,14 @@ from cdt.itemizer.extract import DocumentText, ItemSection, extract_items_from_d
 from cdt.storage import write_parquet_batch
 
 LOGGER = logging.getLogger(__name__)
+POTENTIALLY_RELEVANT_ITEM_NUMBERS = (
+    "1.01",
+    "1.02",
+    "2.03",
+    "2.04",
+    "7.01",
+    "8.01",
+)
 ITEM_METADATA_COLUMNS = [
     "item_information",
     "extraction_status",
@@ -57,11 +66,13 @@ def itemize_documents(
     data_dir: Path | None = None,
     force: bool = False,
     s3_client: object | None = None,
+    item_numbers: tuple[str, ...] | None = None,
 ) -> pd.DataFrame:
     """Extract and persist item sections from complete 8-K documents."""
     if documents.empty:
         return pd.DataFrame(columns=ITEM_COLUMNS)
 
+    selected_item_numbers = normalize_item_numbers(item_numbers)
     conn = connect_cdt_db(cdt_db_path(data_dir))
     try:
         existing_accessions = (
@@ -85,19 +96,39 @@ def itemize_documents(
             resource_uri_map,
         )
         rows: list[dict[str, object]] = []
+        saved_item_counts: Counter[str] = Counter()
+        irrelevant_count = 0
         for document in documents_to_process.to_dict("records"):
-            rows.extend(
-                item_row(section)
-                for section in itemize_document_record(
-                    document,
-                    resource_uri_map=resource_uri_map,
-                    data_dir=data_dir,
-                    s3_client=resolved_s3_client,
-                )
+            sections = itemize_document_record(
+                document,
+                resource_uri_map=resource_uri_map,
+                data_dir=data_dir,
+                s3_client=resolved_s3_client,
+                item_numbers=None,
             )
+            relevant_sections = [
+                section
+                for section in sections
+                if section.item_number in selected_item_numbers
+            ]
+            irrelevant_count += len(sections) - len(relevant_sections)
+            saved_item_counts.update(
+                section.item_number
+                for section in relevant_sections
+                if section.item_number
+            )
+            rows.extend(item_row(section) for section in relevant_sections)
 
         table = normalize_item_table(pd.DataFrame(rows, columns=ITEM_COLUMNS))
+        mark_documents_itemized(conn, documents_to_process["accession_number"])
         if table.empty:
+            _log_itemizer_summary(
+                total_saved=0,
+                saved_item_counts=saved_item_counts,
+                selected_item_numbers=selected_item_numbers,
+                irrelevant_count=irrelevant_count,
+                batch_path=None,
+            )
             return table
 
         batch_path = write_parquet_batch(items_path(data_dir), ITEM_BATCH_PREFIX, table)
@@ -107,8 +138,13 @@ def itemize_documents(
             batch_path=str(batch_path),
             status="itemized",
         )
-        mark_documents_itemized(conn, documents_to_process["accession_number"])
-        LOGGER.info("Itemizer complete: %s rows at %s", len(table), batch_path)
+        _log_itemizer_summary(
+            total_saved=len(table),
+            saved_item_counts=saved_item_counts,
+            selected_item_numbers=selected_item_numbers,
+            irrelevant_count=irrelevant_count,
+            batch_path=batch_path,
+        )
         return table
     finally:
         conn.close()
@@ -120,12 +156,14 @@ def itemize_pending_documents(
     batch_size: int = 100,
     force: bool = False,
     s3_client: object | None = None,
+    item_numbers: tuple[str, ...] | None = None,
 ) -> pd.DataFrame:
     """Itemize source documents tracked in the shared CDT SQLite database."""
     if batch_size <= 0:
         msg = f"batch_size must be positive, got {batch_size}"
         raise ValueError(msg)
 
+    selected_item_numbers = normalize_item_numbers(item_numbers)
     conn = connect_cdt_db(cdt_db_path(data_dir))
     processed_accessions: set[str] = set()
     processed_frames: list[pd.DataFrame] = []
@@ -154,14 +192,14 @@ def itemize_pending_documents(
                 data_dir=data_dir,
                 force=force,
                 s3_client=shared_s3_client,
+                item_numbers=selected_item_numbers,
             )
-            if items.empty:
-                break
-            processed_frames.append(items)
             accessions = set(documents["accession_number"])
-            mark_documents_itemized(conn, accessions)
             processed_accessions.update(accessions)
             total_documents += len(documents)
+            if items.empty:
+                continue
+            processed_frames.append(items)
     finally:
         conn.close()
 
@@ -190,6 +228,7 @@ def itemize_document_record(
     resource_uri_map: dict[str, str] | None = None,
     data_dir: Path | None = None,
     s3_client: object | None = None,
+    item_numbers: tuple[str, ...] | None = None,
 ) -> list[ItemSection]:
     """Extract item sections from one document record."""
     text = _document_text_for_record(
@@ -198,7 +237,7 @@ def itemize_document_record(
         data_dir=data_dir,
         s3_client=s3_client,
     )
-    return extract_items_from_document(
+    sections = extract_items_from_document(
         DocumentText(
             accession_number=str(document["accession_number"]),
             cik=str(document["cik"]),
@@ -207,6 +246,13 @@ def itemize_document_record(
             date=str(document["date"]),
         )
     )
+    if item_numbers is None:
+        return sections
+
+    selected_item_numbers = normalize_item_numbers(item_numbers)
+    return [
+        section for section in sections if section.item_number in selected_item_numbers
+    ]
 
 
 def item_row(section: ItemSection) -> dict[str, object]:
@@ -305,3 +351,36 @@ def _ensure_s3_client(
         if isinstance(resource_uri, str) and resource_uri.startswith("s3://"):
             return default_s3_client()
     return None
+
+
+def normalize_item_numbers(item_numbers: tuple[str, ...] | None) -> tuple[str, ...]:
+    """Normalize configured item numbers or return the default relevant set."""
+    values = item_numbers or POTENTIALLY_RELEVANT_ITEM_NUMBERS
+    normalized = []
+    for value in values:
+        stripped = value.strip()
+        if stripped:
+            normalized.append(stripped)
+    return tuple(dict.fromkeys(normalized))
+
+
+def _log_itemizer_summary(
+    *,
+    total_saved: int,
+    saved_item_counts: Counter[str],
+    selected_item_numbers: tuple[str, ...],
+    irrelevant_count: int,
+    batch_path: Path | None,
+) -> None:
+    """Log the saved relevant-item counts and discarded irrelevant count."""
+    item_summary = ", ".join(
+        f"{item_number}={saved_item_counts.get(item_number, 0)}"
+        for item_number in selected_item_numbers
+    )
+    LOGGER.info(
+        "Itemizer complete: total_saved=%s items=[%s] irrelevant_not_saved=%s%s",
+        total_saved,
+        item_summary,
+        irrelevant_count,
+        f" batch_path={batch_path}" if batch_path is not None else "",
+    )

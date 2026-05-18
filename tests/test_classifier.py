@@ -219,3 +219,75 @@ def test_classify_pending_items_updates_sqlite_idempotently(
     assert rows[0]["relevance"] == 1
     assert rows[0]["classification_score"] > 0.5
     assert rows[0]["classified_at"]
+
+
+def test_classify_pending_items_logs_relevant_and_irrelevant_counts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Classifier logs end-of-run relevant and irrelevant totals."""
+    batch_path = tmp_path / "items" / "item-batch-000001.parquet"
+    batch_path.parent.mkdir(parents=True, exist_ok=True)
+    item_rows = pd.DataFrame(
+        [
+            {
+                "item_id": "000114036126006577-8-01",
+                "item": "8.01",
+                "accession_number": "000114036126006577",
+                "cik": "320193",
+                "url": "https://sec.example/item-1",
+                "text": "Loan agreement announced.",
+                "date": "2024-01-02",
+                "item_information": "Other Events",
+                "extraction_status": "ok",
+                "duplicate_resolution": "",
+                "section_heading": "Item 8.01 Other Events.",
+                "start_line": 1,
+                "end_line": 3,
+                "section_char_count": 25,
+            },
+            {
+                "item_id": "000114036126006578-8-01",
+                "item": "8.01",
+                "accession_number": "000114036126006578",
+                "cik": "320193",
+                "url": "https://sec.example/item-2",
+                "text": "General corporate update.",
+                "date": "2024-01-03",
+                "item_information": "Other Events",
+                "extraction_status": "ok",
+                "duplicate_resolution": "",
+                "section_heading": "Item 8.01 Other Events.",
+                "start_line": 1,
+                "end_line": 3,
+                "section_char_count": 25,
+            },
+        ],
+        columns=ITEM_COLUMNS,
+    )
+    item_rows.to_parquet(batch_path, index=False)
+
+    conn = connect_cdt_db(cdt_db_path(tmp_path))
+    try:
+        upsert_items(
+            conn,
+            item_rows[["item_id", "accession_number", "item"]].to_dict("records"),
+            batch_path=str(batch_path),
+            status="itemized",
+        )
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(
+        classifier_core,
+        "load_training_artifacts",
+        lambda path: (FakeModel(), 0.5, {"threshold": 0.5}),
+    )
+
+    with caplog.at_level(logging.INFO, logger="cdt.classifier.core"):
+        classifier_core.classify_pending_items(data_dir=tmp_path, batch_size=10)
+
+    assert "total_classified=2" in caplog.text
+    assert "relevant=1" in caplog.text
+    assert "irrelevant=1" in caplog.text
