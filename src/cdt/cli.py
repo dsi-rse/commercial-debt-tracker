@@ -8,6 +8,16 @@ from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 
+from cdt.classifier import (
+    DEFAULT_CV_SPLITS,
+    DEFAULT_RANDOM_SEED,
+    DEFAULT_TARGET_RECALL,
+    classify_pending_items,
+    default_model_dir,
+    default_train_csv_path,
+    train_classifier_model,
+)
+from cdt.database import cdt_db_path
 from cdt.ingest import (
     DEFAULT_BUCKET,
     acquire_documents_for_date_range,
@@ -120,6 +130,97 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional path to write logs for long-running itemization.",
     )
     itemize_parser.set_defaults(func=run_itemize)
+
+    classifier_parser = subparsers.add_parser(
+        "classifier",
+        help="Train or run the binary item relevance classifier.",
+    )
+    classifier_parser.set_defaults(func=run_classifier)
+    classifier_parser.add_argument(
+        "--batch-size",
+        type=positive_int,
+        default=DEFAULT_BATCH_SIZE,
+        help=(
+            "Number of item index rows to classify per batch. "
+            f"Defaults to {DEFAULT_BATCH_SIZE}."
+        ),
+    )
+    classifier_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-classify rows already marked classified.",
+    )
+    classifier_parser.add_argument(
+        "--model-dir",
+        type=Path,
+        default=None,
+        help="Optional path to a trained classifier artifact directory.",
+    )
+    classifier_parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress progress logging.",
+    )
+    classifier_parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="Optional path to write logs for long-running classification.",
+    )
+
+    classifier_subparsers = classifier_parser.add_subparsers(dest="classifier_command")
+    classifier_train_parser = classifier_subparsers.add_parser(
+        "train",
+        help="Train and persist the binary item relevance classifier.",
+    )
+    classifier_train_parser.add_argument(
+        "--train-csv",
+        type=Path,
+        default=None,
+        help="Optional training CSV path. Defaults to the shared annotation CSV.",
+    )
+    classifier_train_parser.add_argument(
+        "--model-dir",
+        type=Path,
+        default=None,
+        help="Optional output directory for model artifacts.",
+    )
+    classifier_train_parser.add_argument(
+        "--target-recall",
+        type=float,
+        default=DEFAULT_TARGET_RECALL,
+        help=(
+            "Minimum recall target used during threshold selection. "
+            f"Defaults to {DEFAULT_TARGET_RECALL:.2f}."
+        ),
+    )
+    classifier_train_parser.add_argument(
+        "--cv-splits",
+        type=positive_int,
+        default=DEFAULT_CV_SPLITS,
+        help=(
+            "Requested number of stratified cross-validation folds. "
+            f"Defaults to {DEFAULT_CV_SPLITS}."
+        ),
+    )
+    classifier_train_parser.add_argument(
+        "--random-seed",
+        type=int,
+        default=DEFAULT_RANDOM_SEED,
+        help=f"Random seed for model training. Defaults to {DEFAULT_RANDOM_SEED}.",
+    )
+    classifier_train_parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress progress logging.",
+    )
+    classifier_train_parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="Optional path to write training logs.",
+    )
+    classifier_train_parser.set_defaults(func=run_classifier_train)
     return parser
 
 
@@ -183,6 +284,63 @@ def run_itemize(args: argparse.Namespace) -> int:
         return 1
     print(f"Itemized {len(items)} item rows.")
     print(f"Wrote item batches to {items_path()}.")
+    return 0
+
+
+def run_classifier(args: argparse.Namespace) -> int:
+    """Run the classifier inference subcommand."""
+    configure_logging(quiet=args.quiet, log_file=args.log_file)
+    logger = logging.getLogger(__name__)
+    resolved_model_dir = args.model_dir or default_model_dir()
+    try:
+        logger.info(
+            "Starting classification: batch_size=%s force=%s database=%s model_dir=%s",
+            args.batch_size,
+            args.force,
+            cdt_db_path(),
+            resolved_model_dir,
+        )
+        items = classify_pending_items(
+            batch_size=args.batch_size,
+            force=args.force,
+            model_dir=args.model_dir,
+        )
+    except Exception:
+        logger.exception("Classification failed")
+        return 1
+    print(f"Classified {len(items)} item rows.")
+    print(f"Updated {cdt_db_path()}.")
+    return 0
+
+
+def run_classifier_train(args: argparse.Namespace) -> int:
+    """Run the classifier training subcommand."""
+    configure_logging(quiet=args.quiet, log_file=args.log_file)
+    logger = logging.getLogger(__name__)
+    resolved_train_csv = args.train_csv or default_train_csv_path()
+    resolved_model_dir = args.model_dir or default_model_dir()
+    try:
+        logger.info(
+            "Starting classifier training: train_csv=%s model_dir=%s "
+            "target_recall=%s cv_splits=%s random_seed=%s",
+            resolved_train_csv,
+            resolved_model_dir,
+            args.target_recall,
+            args.cv_splits,
+            args.random_seed,
+        )
+        metadata = train_classifier_model(
+            train_csv=resolved_train_csv,
+            model_dir=resolved_model_dir,
+            target_recall=args.target_recall,
+            cv_splits=args.cv_splits,
+            random_seed=args.random_seed,
+        )
+    except Exception:
+        logger.exception("Classifier training failed")
+        return 1
+    print(f"Trained classifier on {metadata['training_row_count']} labeled rows.")
+    print(f"Wrote model artifacts to {resolved_model_dir}.")
     return 0
 
 

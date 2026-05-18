@@ -11,7 +11,13 @@ from cdt import settings
 
 CDT_DB_FILENAME = "cdt.sqlite"
 DOCUMENT_STATUSES = ("indexed", "downloaded", "itemized")
-ITEM_STATUSES = ("itemized",)
+ITEM_STATUSES = ("itemized", "classified")
+ITEM_EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("label", "TEXT"),
+    ("relevance", "INTEGER"),
+    ("classification_score", "REAL"),
+    ("classified_at", "TEXT"),
+)
 SQLITE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
     accession_number TEXT PRIMARY KEY,
@@ -51,6 +57,7 @@ def connect_cdt_db(path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(SQLITE_SCHEMA)
+    ensure_item_columns(conn)
     conn.commit()
     return conn
 
@@ -128,6 +135,10 @@ def upsert_items(
             batch_path,
             status,
             updated_at,
+            None,
+            None,
+            None,
+            None,
         )
         for row in rows
     ]
@@ -141,15 +152,23 @@ def upsert_items(
             item,
             batch_path,
             status,
-            updated_at
+            updated_at,
+            label,
+            relevance,
+            classification_score,
+            classified_at
         )
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(item_id) DO UPDATE SET
             accession_number = excluded.accession_number,
             item = excluded.item,
             batch_path = excluded.batch_path,
             status = excluded.status,
-            updated_at = excluded.updated_at
+            updated_at = excluded.updated_at,
+            label = NULL,
+            relevance = NULL,
+            classification_score = NULL,
+            classified_at = NULL
         """,
         payload,
     )
@@ -232,6 +251,63 @@ def read_item_accessions(
     return {str(row[0]) for row in rows}
 
 
+def read_items(
+    conn: sqlite3.Connection,
+    *,
+    statuses: Sequence[str] | None = None,
+    exclude_item_ids: Iterable[str] | None = None,
+    limit: int | None = None,
+) -> list[dict[str, object]]:
+    """Read item index rows from the shared database."""
+    query = [
+        "SELECT",
+        "    item_id,",
+        "    accession_number,",
+        "    item,",
+        "    batch_path,",
+        "    status,",
+        "    updated_at,",
+        "    label,",
+        "    relevance,",
+        "    classification_score,",
+        "    classified_at",
+        "FROM items",
+    ]
+    params: list[object] = []
+    where: list[str] = []
+    if statuses:
+        placeholders = ", ".join("?" for _ in statuses)
+        where.append(f"status IN ({placeholders})")
+        params.extend(statuses)
+    if exclude_item_ids:
+        excluded = list(exclude_item_ids)
+        placeholders = ", ".join("?" for _ in excluded)
+        where.append(f"item_id NOT IN ({placeholders})")
+        params.extend(excluded)
+    if where:
+        query.append("WHERE " + " AND ".join(where))
+    query.append("ORDER BY accession_number, item_id")
+    if limit is not None:
+        query.append("LIMIT ?")
+        params.append(limit)
+    rows = conn.execute("\n".join(query), params)
+    return [
+        {
+            "item_id": row[0],
+            "accession_number": row[1],
+            "item": row[2],
+            "batch_path": row[3],
+            "status": row[4],
+            "updated_at": row[5],
+            "label": row[6],
+            "relevance": row[7],
+            "classification_score": row[8],
+            "classified_at": row[9],
+        }
+        for row in rows
+    ]
+
+
 def read_document_resource_uri(
     conn: sqlite3.Connection, accession_number: str
 ) -> str | None:
@@ -263,3 +339,48 @@ def mark_documents_itemized(
         [(updated_at, accession) for accession in accessions],
     )
     conn.commit()
+
+
+def mark_items_classified(
+    conn: sqlite3.Connection,
+    rows: Iterable[dict[str, object]],
+) -> None:
+    """Persist classification outputs for item rows."""
+    classified_at = timestamp()
+    payload = [
+        (
+            "classified",
+            str(row["label"]),
+            int(bool(row["relevance"])),
+            float(row["classification_score"]),
+            classified_at,
+            classified_at,
+            str(row["item_id"]),
+        )
+        for row in rows
+    ]
+    if not payload:
+        return
+    conn.executemany(
+        """
+        UPDATE items
+        SET status = ?,
+            label = ?,
+            relevance = ?,
+            classification_score = ?,
+            classified_at = ?,
+            updated_at = ?
+        WHERE item_id = ?
+        """,
+        payload,
+    )
+    conn.commit()
+
+
+def ensure_item_columns(conn: sqlite3.Connection) -> None:
+    """Add optional classifier columns to the items table when missing."""
+    existing_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(items)")}
+    for column_name, column_type in ITEM_EXTRA_COLUMNS:
+        if column_name in existing_columns:
+            continue
+        conn.execute(f"ALTER TABLE items ADD COLUMN {column_name} {column_type}")

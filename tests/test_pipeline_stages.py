@@ -2,9 +2,12 @@
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
+import pytest
 
 from cdt.classifier import classify_items
+from cdt.classifier import core as classifier_core
 from cdt.database import cdt_db_path, connect_cdt_db, upsert_documents
 from cdt.extractor import extract_tables
 from cdt.ingest import DOCUMENT_COLUMNS
@@ -144,8 +147,11 @@ SIGNATURES
     assert len(list((tmp_path / "items").glob("item-batch-*.parquet"))) == 1
 
 
-def test_classifier_adds_relevance_and_is_idempotent(tmp_path: Path) -> None:
-    """The stub classifier marks items as not relevant and avoids duplicates."""
+def test_classifier_adds_binary_predictions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The classifier adds binary label, score, and relevance fields."""
     items = pd.DataFrame(
         [
             {
@@ -160,11 +166,21 @@ def test_classifier_adds_relevance_and_is_idempotent(tmp_path: Path) -> None:
         ]
     )
 
-    first = classify_items(items, data_dir=tmp_path)
-    second = classify_items(items, data_dir=tmp_path)
+    class FakeModel:
+        def decision_function(self: "FakeModel", texts: list[str]) -> np.ndarray:
+            return np.asarray([1.0 if "submission" in text else -1.0 for text in texts])
 
-    assert first["relevance"].to_list() == [False]
-    assert len(second) == 1
+    monkeypatch.setattr(
+        classifier_core,
+        "load_training_artifacts",
+        lambda path: (FakeModel(), 0.5, {"threshold": 0.5}),
+    )
+
+    first = classify_items(items, data_dir=tmp_path)
+
+    assert first["label"].to_list() == ["relevant"]
+    assert first["relevance"].to_list() == [True]
+    assert first["classification_score"].to_list()[0] > 0.5
 
 
 def test_extractor_returns_empty_tables_and_writes_metadata(tmp_path: Path) -> None:

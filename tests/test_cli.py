@@ -179,6 +179,93 @@ def test_itemize_cli_calls_pending_itemizer(monkeypatch: pytest.MonkeyPatch) -> 
     assert calls == [{"batch_size": 25, "force": True}]
 
 
+def test_classifier_cli_calls_pending_classifier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The classifier command passes batch, force, and model_dir options through."""
+    calls: list[dict[str, object]] = []
+
+    def fake_classify_pending_items(
+        *,
+        batch_size: int,
+        force: bool = False,
+        model_dir: Path | None = None,
+    ) -> pd.DataFrame:
+        calls.append(
+            {
+                "batch_size": batch_size,
+                "force": force,
+                "model_dir": model_dir,
+            }
+        )
+        return pd.DataFrame([{"item_id": "item-1"}])
+
+    monkeypatch.setattr(cli, "classify_pending_items", fake_classify_pending_items)
+
+    status = cli.main(["classifier", "--batch-size", "25", "--force", "--quiet"])
+
+    assert status == 0
+    assert calls == [{"batch_size": 25, "force": True, "model_dir": None}]
+
+
+def test_classifier_train_cli_calls_training(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The classifier training command forwards resolved defaults and options."""
+    calls: list[dict[str, object]] = []
+    train_csv = tmp_path / "annotations.csv"
+    model_dir = tmp_path / "model"
+
+    def fake_train_classifier_model(
+        *,
+        train_csv: Path,
+        model_dir: Path,
+        target_recall: float,
+        cv_splits: int,
+        random_seed: int,
+    ) -> dict[str, object]:
+        calls.append(
+            {
+                "train_csv": train_csv,
+                "model_dir": model_dir,
+                "target_recall": target_recall,
+                "cv_splits": cv_splits,
+                "random_seed": random_seed,
+            }
+        )
+        return {"training_row_count": 2}
+
+    monkeypatch.setattr(cli, "default_train_csv_path", lambda: train_csv)
+    monkeypatch.setattr(cli, "default_model_dir", lambda: model_dir)
+    monkeypatch.setattr(cli, "train_classifier_model", fake_train_classifier_model)
+
+    status = cli.main(
+        [
+            "classifier",
+            "train",
+            "--target-recall",
+            "0.99",
+            "--cv-splits",
+            "3",
+            "--random-seed",
+            "7",
+            "--quiet",
+        ]
+    )
+
+    assert status == 0
+    assert calls == [
+        {
+            "train_csv": train_csv,
+            "model_dir": model_dir,
+            "target_recall": 0.99,
+            "cv_splits": 3,
+            "random_seed": 7,
+        }
+    ]
+
+
 def test_parse_date_rejects_non_iso_date() -> None:
     """CLI dates must be provided as YYYY-MM-DD."""
     parser = cli.build_parser()
