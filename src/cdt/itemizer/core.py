@@ -19,7 +19,7 @@ from cdt.database import (
     read_item_accessions,
     upsert_items,
 )
-from cdt.ingest import DOCUMENT_COLUMNS, default_s3_client
+from cdt.ingest import DOCUMENT_COLUMNS, decode_document_bytes, default_s3_client
 from cdt.itemizer.extract import DocumentText, ItemSection, extract_items_from_document
 from cdt.storage import write_parquet_batch
 
@@ -319,12 +319,12 @@ def _load_resource_text(
             raise ValueError(msg)
         bucket, key = _parse_s3_uri(resource_uri)
         body = s3_client.get_object(Bucket=bucket, Key=key)["Body"].read()
-        return body.decode("utf-8", errors="replace")
+        return decode_document_bytes(body)
 
     path = Path(resource_uri)
     if not path.is_absolute() and data_dir is not None:
         path = (data_dir / path).resolve()
-    return path.read_text(encoding="utf-8")
+    return decode_document_bytes(path.read_bytes())
 
 
 def _parse_s3_uri(uri: str) -> tuple[str, str]:
