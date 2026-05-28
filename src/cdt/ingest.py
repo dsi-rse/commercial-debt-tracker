@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 import sqlite3
@@ -373,7 +374,7 @@ def _download_candidate(
 ) -> dict[str, str]:
     bucket, key = parse_s3_uri(candidate.resource_uri)
     body = s3_client.get_object(Bucket=bucket, Key=key)["Body"].read()
-    text = body.decode("utf-8", errors="replace")
+    text = decode_document_bytes(body)
     return {
         "accession_number": candidate.accession_number,
         "cik": candidate.cik,
@@ -381,6 +382,13 @@ def _download_candidate(
         "text": text,
         "date": candidate.date,
     }
+
+
+def decode_document_bytes(body: bytes) -> str:
+    """Decode plain-text or gzip-compressed SEC document bytes."""
+    if body.startswith(b"\x1f\x8b"):
+        body = gzip.decompress(body)
+    return body.decode("utf-8", errors="replace")
 
 
 def connect_document_db(path: Path) -> sqlite3.Connection:
