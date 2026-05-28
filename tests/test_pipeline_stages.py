@@ -1,5 +1,6 @@
 """Tests for pipeline stage persistence and stub behavior."""
 
+import gzip
 from io import BytesIO
 from pathlib import Path
 
@@ -352,6 +353,51 @@ SIGNATURES
     ]
 
 
+def test_itemize_documents_reads_gzip_s3_resources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S3-backed itemization should decompress gzip-compressed filings."""
+
+    class FakeS3Client:
+        def get_object(
+            self: "FakeS3Client", Bucket: str, Key: str
+        ) -> dict[str, BytesIO]:  # noqa: N803
+            del Bucket, Key
+            return {
+                "Body": BytesIO(
+                    gzip.compress(
+                        b"""
+ITEM INFORMATION: Other Events
+Item 8.01 Other Events.
+Compressed filing text.
+SIGNATURES
+"""
+                    )
+                )
+            }
+
+    monkeypatch.setattr(cdt.itemizer.core, "default_s3_client", lambda: FakeS3Client())
+
+    documents = pd.DataFrame(
+        [
+            {
+                "accession_number": "000114036126006577",
+                "cik": "320193",
+                "url": "https://sec.example/full.txt",
+                "text": "",
+                "date": "2024-01-02",
+                "resource_uri": "s3://sec-bucket/doc.txt",
+            }
+        ]
+    )
+
+    items = itemize_documents(documents, data_dir=tmp_path)
+
+    assert items["item"].to_list() == ["8.01"]
+    assert "Compressed filing text" in items["text"].to_list()[0]
+
+
 def test_classifier_adds_binary_predictions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -388,13 +434,13 @@ def test_classifier_adds_binary_predictions(
     assert first["classification_score"].to_list()[0] > 0.5
 
 
-def test_extractor_returns_empty_tables_and_writes_metadata(tmp_path: Path) -> None:
-    """The stub extractor records successful completion."""
+def test_extractor_returns_empty_tables_for_irrelevant_rows(tmp_path: Path) -> None:
+    """Extractor should no-op when no relevant classified rows are present."""
     classified_items = pd.DataFrame(
         [{"item_id": "000114036126006577-0-00", "relevance": False}]
     )
 
     tables = extract_tables(classified_items, data_dir=tmp_path)
 
-    assert tables == {}
-    assert (tmp_path / "extracted_tables" / "_SUCCESS.json").exists()
+    assert list(tables) == ["instrument_mentions"]
+    assert tables["instrument_mentions"].empty

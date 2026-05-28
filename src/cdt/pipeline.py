@@ -9,6 +9,7 @@ from cdt.classifier import classify_items
 from cdt.extractor import extract_tables
 from cdt.ingest import acquire_documents
 from cdt.itemizer import itemize_documents
+from cdt.matcher import match_tables
 
 
 @dataclass(frozen=True)
@@ -23,7 +24,7 @@ class PipelineConfig:
 
 
 def run_pipeline(config: PipelineConfig) -> dict[str, pd.DataFrame]:
-    """Run acquisition, itemization, classification, and extraction."""
+    """Run acquisition, itemization, classification, extraction, and matching."""
     documents = acquire_documents(
         config.bucket,
         config.year,
@@ -35,6 +36,20 @@ def run_pipeline(config: PipelineConfig) -> dict[str, pd.DataFrame]:
     classified_items = classify_items(
         items, data_dir=config.data_dir, force=config.force
     )
-    return extract_tables(
+    extracted = extract_tables(
         classified_items, data_dir=config.data_dir, force=config.force
     )
+    mentions = extracted["instrument_mentions"]
+    if mentions.empty:
+        return {
+            **extracted,
+            **match_tables(pd.DataFrame()),
+        }
+    mention_context = classified_items[
+        ["item_id", "accession_number", "cik", "date"]
+    ].drop_duplicates()
+    matcher_input = mentions.merge(mention_context, on="item_id", how="left")
+    return {
+        **extracted,
+        **match_tables(matcher_input),
+    }

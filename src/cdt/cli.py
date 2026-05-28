@@ -17,6 +17,19 @@ from cdt.classifier import (
     train_classifier_model,
 )
 from cdt.database import cdt_db_path
+from cdt.extractor import (
+    DEFAULT_MAX_ATTEMPTS as DEFAULT_EXTRACTOR_MAX_ATTEMPTS,
+)
+from cdt.extractor import (
+    DEFAULT_MODEL as DEFAULT_EXTRACTOR_MODEL,
+)
+from cdt.extractor import (
+    DEFAULT_REASONING_EFFORT as DEFAULT_EXTRACTOR_REASONING_EFFORT,
+)
+from cdt.extractor import (
+    extract_pending_items,
+    extracted_tables_path,
+)
 from cdt.ingest import (
     DEFAULT_BUCKET,
     acquire_documents_for_date_range,
@@ -28,6 +41,7 @@ from cdt.itemizer import (
     itemize_pending_documents,
     items_path,
 )
+from cdt.matcher import match_pending_mentions
 
 ALL_TIME_START_DATE = date(1994, 1, 1)
 DEFAULT_BATCH_SIZE = 100
@@ -235,6 +249,90 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional path to write training logs.",
     )
     classifier_train_parser.set_defaults(func=run_classifier_train)
+
+    extractor_parser = subparsers.add_parser(
+        "extractor",
+        help="Extract instrument mentions from relevant classified item rows.",
+    )
+    extractor_parser.set_defaults(func=run_extractor)
+    extractor_parser.add_argument(
+        "--batch-size",
+        type=positive_int,
+        default=DEFAULT_BATCH_SIZE,
+        help=(
+            "Number of item rows to extract per batch. "
+            f"Defaults to {DEFAULT_BATCH_SIZE}."
+        ),
+    )
+    extractor_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-extract rows already marked extracted or extraction_failed.",
+    )
+    extractor_parser.add_argument(
+        "--model",
+        default=DEFAULT_EXTRACTOR_MODEL,
+        help=f"OpenRouter model ID to use. Defaults to {DEFAULT_EXTRACTOR_MODEL}.",
+    )
+    extractor_parser.add_argument(
+        "--reasoning-effort",
+        default=DEFAULT_EXTRACTOR_REASONING_EFFORT,
+        help=(
+            "OpenRouter reasoning effort to request. "
+            f"Defaults to {DEFAULT_EXTRACTOR_REASONING_EFFORT}."
+        ),
+    )
+    extractor_parser.add_argument(
+        "--max-attempts",
+        type=positive_int,
+        default=DEFAULT_EXTRACTOR_MAX_ATTEMPTS,
+        help=(
+            "Maximum prompt attempts per stage before marking the item failed. "
+            f"Defaults to {DEFAULT_EXTRACTOR_MAX_ATTEMPTS}."
+        ),
+    )
+    extractor_parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress progress logging.",
+    )
+    extractor_parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="Optional path to write extraction logs.",
+    )
+
+    matcher_parser = subparsers.add_parser(
+        "matcher",
+        help="Group extracted instrument mentions into debt instruments.",
+    )
+    matcher_parser.set_defaults(func=run_matcher)
+    matcher_parser.add_argument(
+        "--batch-size",
+        type=positive_int,
+        default=DEFAULT_BATCH_SIZE,
+        help=(
+            "Number of pending mention rows to match per batch. "
+            f"Defaults to {DEFAULT_BATCH_SIZE}."
+        ),
+    )
+    matcher_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Recompute matcher outputs for all extracted instrument mentions.",
+    )
+    matcher_parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress progress logging.",
+    )
+    matcher_parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="Optional path to write matcher logs.",
+    )
     return parser
 
 
@@ -356,6 +454,60 @@ def run_classifier_train(args: argparse.Namespace) -> int:
         return 1
     print(f"Trained classifier on {metadata['training_row_count']} labeled rows.")
     print(f"Wrote model artifacts to {resolved_model_dir}.")
+    return 0
+
+
+def run_extractor(args: argparse.Namespace) -> int:
+    """Run the LLM extractor subcommand."""
+    configure_logging(quiet=args.quiet, log_file=args.log_file)
+    logger = logging.getLogger(__name__)
+    try:
+        logger.info(
+            "Starting extraction: batch_size=%s force=%s database=%s model=%s reasoning_effort=%s max_attempts=%s output=%s",
+            args.batch_size,
+            args.force,
+            cdt_db_path(),
+            args.model,
+            args.reasoning_effort,
+            args.max_attempts,
+            extracted_tables_path(),
+        )
+        mentions = extract_pending_items(
+            batch_size=args.batch_size,
+            force=args.force,
+            model=args.model,
+            reasoning_effort=args.reasoning_effort,
+            max_attempts=args.max_attempts,
+        )
+    except Exception:
+        logger.exception("Extraction failed")
+        return 1
+    print(f"Extracted {len(mentions)} instrument mention rows.")
+    print(f"Updated {cdt_db_path()}.")
+    print(f"Wrote full.jsonl audit output under {extracted_tables_path()}.")
+    return 0
+
+
+def run_matcher(args: argparse.Namespace) -> int:
+    """Run the matcher subcommand."""
+    configure_logging(quiet=args.quiet, log_file=args.log_file)
+    logger = logging.getLogger(__name__)
+    try:
+        logger.info(
+            "Starting matcher: batch_size=%s force=%s database=%s",
+            args.batch_size,
+            args.force,
+            cdt_db_path(),
+        )
+        tables = match_pending_mentions(
+            batch_size=args.batch_size,
+            force=args.force,
+        )
+    except Exception:
+        logger.exception("Matcher failed")
+        return 1
+    print(f"Matched {len(tables['instrument_mentions'])} instrument mention rows.")
+    print(f"Updated {cdt_db_path()}.")
     return 0
 
 

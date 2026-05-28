@@ -330,6 +330,91 @@ def test_classifier_train_cli_requires_train_csv() -> None:
     assert exc_info.value.code == ARGPARSE_USAGE_ERROR
 
 
+def test_extractor_cli_calls_pending_extractor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The extractor command forwards batch and model options."""
+    calls: list[dict[str, object]] = []
+
+    def fake_extract_pending_items(
+        *,
+        batch_size: int,
+        force: bool = False,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+        max_attempts: int,
+    ) -> pd.DataFrame:
+        calls.append(
+            {
+                "batch_size": batch_size,
+                "force": force,
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+                "max_attempts": max_attempts,
+            }
+        )
+        return pd.DataFrame([{"instrument_mention_id": "m-1"}])
+
+    monkeypatch.setattr(cli, "extract_pending_items", fake_extract_pending_items)
+
+    status = cli.main(
+        [
+            "extractor",
+            "--batch-size",
+            "25",
+            "--force",
+            "--model",
+            "anthropic/claude-sonnet-4",
+            "--reasoning-effort",
+            "high",
+            "--max-attempts",
+            "5",
+            "--quiet",
+        ]
+    )
+
+    assert status == 0
+    assert calls == [
+        {
+            "batch_size": 25,
+            "force": True,
+            "model": "anthropic/claude-sonnet-4",
+            "reasoning_effort": "high",
+            "max_attempts": 5,
+        }
+    ]
+
+
+def test_matcher_cli_calls_pending_matcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The matcher command forwards batch and force options."""
+    calls: list[dict[str, object]] = []
+
+    def fake_match_pending_mentions(
+        *,
+        batch_size: int,
+        force: bool = False,
+    ) -> dict[str, pd.DataFrame]:
+        calls.append(
+            {
+                "batch_size": batch_size,
+                "force": force,
+            }
+        )
+        return {
+            "instrument_mentions": pd.DataFrame([{"instrument_mention_id": "m-1"}]),
+            "debt_instruments": pd.DataFrame([{"debt_instrument_id": "di-1"}]),
+        }
+
+    monkeypatch.setattr(cli, "match_pending_mentions", fake_match_pending_mentions)
+
+    status = cli.main(["matcher", "--batch-size", "25", "--force", "--quiet"])
+
+    assert status == 0
+    assert calls == [{"batch_size": 25, "force": True}]
+
+
 def test_parse_date_rejects_non_iso_date() -> None:
     """CLI dates must be provided as YYYY-MM-DD."""
     parser = cli.build_parser()

@@ -113,3 +113,102 @@ That command reads pending item rows from `$DATA_DIR/cdt.sqlite`, scores the cor
 - `classified_at`
 
 Reruns are idempotent and skip rows already marked classified unless `--force` is used.
+
+### LLM Extraction
+
+`cdt extractor` processes item rows that have already been classified as relevant. It reads pending rows from `cdt.sqlite`, loads the corresponding item text from the recorded item batch Parquet file, runs an OpenRouter-backed three-stage workflow (`ner`, `instrument_ie`, `instrument_relation`), persists extracted `instrument_mentions` into SQLite, and writes a per-run `full.jsonl` audit log.
+
+Set the following environment variables in `.env` before running the extractor:
+
+```text
+OPENROUTER_API_KEY=...
+EXTRACTOR_MODEL=openai/gpt-5.4
+EXTRACTOR_REASONING=none
+```
+
+`OPENROUTER_API_TOKEN` is also accepted as a fallback key name, but `OPENROUTER_API_KEY` is preferred. The model value is passed directly to OpenRouter, so provider-prefixed model IDs such as `openai/...` or `anthropic/...` can be swapped without code changes. The default reasoning effort is `none`.
+
+Run extraction with:
+
+```bash
+uv run cdt extractor --batch-size 100 --log-file extractor.log
+```
+
+Useful flags:
+
+- `--force`: re-extract rows already marked `extracted` or `extraction_failed`
+- `--model`: override the OpenRouter model ID for this run
+- `--reasoning-effort`: override the requested OpenRouter reasoning effort
+- `--max-attempts`: number of validation retries per stage before the item is marked failed
+
+Only rows with:
+
+- `status = classified`
+- `relevance = 1`
+
+are eligible by default.
+
+On success, each processed item row is updated in SQLite with:
+
+- `status = extracted`
+- `extracted_at`
+- `extractor_model`
+- `extractor_reasoning`
+- `extractor_run_path`
+
+On failure, each processed item row is updated with:
+
+- `status = extraction_failed`
+- `extractor_error`
+- the same extractor metadata fields for auditability
+
+Extractor outputs are persisted to the SQLite `instrument_mentions` table. These rows are mention-level outputs only. They are not canonical instruments, and they should not be interpreted as consolidated entities across items or filings. A later stage will resolve and consolidate mentions into actual instruments.
+
+Each `instrument_mentions` row stores:
+
+- stable mention identity: `instrument_mention_id`, `item_id`, `raw_id`
+- scalar mention properties: `name`, `start_date`, `end_date`, `amount`
+- mention lineage links: `amendment_of`, `split_of`
+- JSON payloads for richer mention data and audit details:
+  - `lenders_json`
+  - `other_interested_parties_json`
+  - `mention_corefs_json`
+  - `start_date_corefs_json`
+  - `end_date_corefs_json`
+  - `amount_corefs_json`
+  - `instrument_mention_json`
+
+The extractor writes run artifacts under:
+
+```text
+$DATA_DIR/extractor_runs/run-*/full.jsonl
+```
+
+`full.jsonl` contains per-item attempt history, raw stage responses, final status, and the extracted `instrument_mentions` payload used to populate SQLite.
+
+### Matcher
+
+`cdt matcher` groups extracted `instrument_mentions` into logical `debt_instruments`. Matching is conservative and same-issuer only: the stage normalizes `amount` and `start_date`, compares mentions within the same `cik`, uses lender string similarity as the final merge check, and treats direct `amendment_of` and `split_of` relations as one-hop alternate match surfaces.
+
+Run matching with:
+
+```bash
+uv run cdt matcher --batch-size 100
+```
+
+Useful flags:
+
+- `--force`: recompute matcher outputs for all extracted mentions
+
+By default, matcher reruns are idempotent and skip work when no `instrument_mentions` remain with a null matcher status.
+
+Matcher writes to:
+
+- SQLite `debt_instruments`, one row per consolidated logical instrument
+- additional `instrument_mentions` columns:
+  - `debt_instrument_id`
+  - `matcher_status = singleton | matched | ambiguous`
+  - `matched_at`
+  - `potential_matches_json`
+
+`potential_matches_json` stores loose candidates that matched on normalized amount and start date but did not meet the lender-similarity threshold for an automatic merge.

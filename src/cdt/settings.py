@@ -23,3 +23,8 @@ load_dotenv()
 
 # Set the data directory
 DATA_DIR = resolve_path(Path(os.environ["DATA_DIR"]))
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get(
+    "OPENROUTER_API_TOKEN"
+)
+EXTRACTOR_MODEL = os.environ.get("EXTRACTOR_MODEL", "openai/gpt-5.4")
+EXTRACTOR_REASONING = os.environ.get("EXTRACTOR_REASONING", "none")
