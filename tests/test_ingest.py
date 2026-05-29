@@ -13,12 +13,15 @@ import pandas as pd
 
 from cdt.database import cdt_db_path
 from cdt.ingest import (
+    IngestConfig,
     acquire_documents,
     acquire_documents_for_date_range,
+    default_failure_file,
     document_batches_path,
     documents_db_path,
     iter_filings,
     normalize_accession_number,
+    run_ingest_pipeline,
 )
 
 EXPECTED_BATCH_FILES = 2
@@ -304,6 +307,98 @@ def test_acquire_documents_decompresses_gzip_downloads(tmp_path: Path) -> None:
     assert statuses == ["downloaded"]
     assert downloaded["text"].to_list() == [
         "Item 8.01 Other Events.\nDownloaded text.\n"
+    ]
+
+
+def test_ingest_records_missing_document_failures(tmp_path: Path) -> None:
+    """Missing complete-submission documents are persisted in the failure registry."""
+    client = FakeS3Client(
+        {
+            (
+                "sec-bucket",
+                "sec/2024-01-02/8-K/320193/000114036126006577/manifest.json",
+            ): json.dumps(
+                {
+                    "cik": "320193",
+                    "accession_number": "0001140361-26-006577",
+                    "form_type": "8-K",
+                    "filing_date": "2024-01-02",
+                    "failure_reason": "",
+                    "documents": [
+                        {
+                            "type": "EX-99",
+                            "description": "Exhibit 99",
+                            "filename": "ex99.htm",
+                            "s3_key": "s3://sec-bucket/sec/2024-01-02/8-K/320193/000114036126006577/ex99.htm",
+                            "url": "https://sec.example/ex99.htm",
+                        }
+                    ],
+                }
+            ).encode()
+        }
+    )
+
+    config = IngestConfig(
+        mode="historical",
+        bucket="sec-bucket",
+        cik_file=tmp_path / "ciks.txt",
+        start_date=date(2024, 1, 2),
+        end_date=date(2024, 1, 2),
+        data_dir=tmp_path,
+        failure_file=tmp_path / "failures" / "ingest_failures.json",
+    )
+    first, result = run_ingest_pipeline(config, ciks={"320193"}, s3_client=client)
+    second, _ = run_ingest_pipeline(config, ciks={"320193"}, s3_client=client)
+
+    assert first.empty
+    assert second.empty
+    assert result.failures == 0
+    assert client.manifest_reads == [
+        ("sec-bucket", "sec/2024-01-02/8-K/320193/000114036126006577/manifest.json")
+    ]
+    failure_json = json.loads(result.failure_file.read_text(encoding="utf-8"))
+    assert failure_json["entries"] == [
+        ["sec-bucket", "sec/2024-01-02/8-K/320193/000114036126006577/manifest.json"]
+    ]
+
+
+def test_ingest_records_download_failures(tmp_path: Path) -> None:
+    """Download failures are written to the failure registry."""
+    client = FakeS3Client(
+        {
+            (
+                "sec-bucket",
+                "sec/2024-01-02/8-K/320193/000114036126006577/manifest.json",
+            ): _manifest_bytes(
+                "320193",
+                "0001140361-26-006577",
+                "8-K",
+                "2024-01-02",
+                "COMPLETE SUBMISSION TEXT FILE",
+                s3_key="s3://sec-bucket/sec/2024-01-02/8-K/320193/000114036126006577/missing.txt",
+            )
+        }
+    )
+
+    _, result = run_ingest_pipeline(
+        IngestConfig(
+            mode="historical",
+            bucket="sec-bucket",
+            cik_file=tmp_path / "ciks.txt",
+            start_date=date(2024, 1, 2),
+            end_date=date(2024, 1, 2),
+            data_dir=tmp_path,
+            failure_file=default_failure_file(tmp_path),
+            download=True,
+        ),
+        ciks={"320193"},
+        s3_client=client,
+    )
+
+    assert result.failures == 1
+    failure_json = json.loads(result.failure_file.read_text(encoding="utf-8"))
+    assert failure_json["entries"] == [
+        ["sec-bucket", "sec/2024-01-02/8-K/320193/000114036126006577/missing.txt"]
     ]
 
 

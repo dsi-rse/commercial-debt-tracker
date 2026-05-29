@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import gzip
 import json
-import logging
 import sqlite3
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import date
+from enum import StrEnum
 from pathlib import Path
 from typing import Protocol, Self, cast
 from urllib.parse import urlparse
@@ -24,9 +24,10 @@ from cdt.database import (
     read_documents,
     upsert_documents,
 )
+from cdt.shared import FailureClassifier, FailureRegistry, get_logger
 from cdt.storage import write_parquet_batch
 
-LOGGER = logging.getLogger(__name__)
+LOGGER = get_logger(__name__)
 DOCUMENT_COLUMNS = ["accession_number", "cik", "url", "text", "date"]
 DOCUMENT_INDEX_COLUMNS = [*DOCUMENT_COLUMNS, "resource_uri", "batch_path", "status"]
 DEFAULT_BUCKET = "idi-dev-processor-s3"
@@ -40,6 +41,31 @@ PROGRESS_DAY_INTERVAL = 30
 MIN_MANIFEST_KEY_PARTS = 5
 MANIFEST_KEY_CIK_INDEX = 3
 DOCUMENT_BATCH_PREFIX = "document-batch"
+
+
+class IngestFailureType(StrEnum):
+    """Permanent ingest failure types."""
+
+    MANIFEST_READ_FAILED = "manifest_read_failed"
+    INVALID_MANIFEST = "invalid_manifest"
+    DOCUMENT_NOT_FOUND = "document_not_found"
+    DOCUMENT_DOWNLOAD_FAILED = "document_download_failed"
+
+
+class IngestFailureClassifier(FailureClassifier):
+    """Treat ingest source failures as permanent by default."""
+
+    @property
+    def do_not_retry(self: Self) -> frozenset[IngestFailureType]:
+        """Return non-retryable failure types."""
+        return frozenset(IngestFailureType)
+
+    def classify_from_response(
+        self: Self, response: dict, **kwargs: object
+    ) -> IngestFailureType:
+        """Satisfy the shared classifier interface."""
+        del response, kwargs
+        return IngestFailureType.MANIFEST_READ_FAILED
 
 
 class ReadableBody(Protocol):
@@ -105,6 +131,42 @@ class ScrapedFiling:
     documents: tuple[ScrapedDocument, ...]
 
 
+@dataclass(frozen=True)
+class IngestConfig:
+    """Configuration for one ingest run."""
+
+    mode: str
+    bucket: str
+    cik_file: Path
+    start_date: date
+    end_date: date
+    data_dir: Path | None = None
+    force: bool = False
+    batch_size: int = DEFAULT_BATCH_SIZE
+    download: bool = False
+    failure_file: Path | None = None
+    aws_profile: str = DEFAULT_AWS_PROFILE
+    s3_prefix: str = DEFAULT_S3_PREFIX
+
+
+@dataclass(frozen=True)
+class IngestRunResult:
+    """Summary of a completed ingest run."""
+
+    mode: str
+    start_date: date
+    end_date: date
+    ciks_count: int
+    candidates_seen: int
+    skipped_existing: int
+    downloaded: int
+    failures: int
+    total_rows: int
+    database_path: Path
+    documents_path: Path
+    failure_file: Path
+
+
 def documents_path(data_dir: Path | None = None) -> Path:
     """Return the directory for document batch artifacts."""
     return (data_dir or settings.DATA_DIR) / "documents"
@@ -118,6 +180,11 @@ def documents_db_path(data_dir: Path | None = None) -> Path:
 def document_batches_path(data_dir: Path | None = None) -> Path:
     """Return the directory for append-only document parquet batches."""
     return documents_path(data_dir)
+
+
+def default_failure_file(data_dir: Path | None = None) -> Path:
+    """Return the default ingest failure registry path."""
+    return (data_dir or settings.DATA_DIR) / "failures" / "ingest_failures.json"
 
 
 def normalize_accession_number(accession_number: str) -> str:
@@ -137,17 +204,22 @@ def acquire_documents(
     download: bool = False,
 ) -> pd.DataFrame:
     """Acquire matching 8-K documents and update the canonical documents table."""
-    return acquire_documents_for_date_range(
-        bucket,
-        date(year, 1, 1),
-        date(year, 12, 31),
-        ciks,
-        data_dir=data_dir,
+    documents, _ = run_ingest_pipeline(
+        IngestConfig(
+            mode="historical",
+            bucket=bucket,
+            cik_file=Path(),
+            start_date=date(year, 1, 1),
+            end_date=date(year, 12, 31),
+            data_dir=data_dir,
+            force=force,
+            batch_size=batch_size,
+            download=download,
+        ),
+        ciks=ciks,
         s3_client=s3_client,
-        force=force,
-        batch_size=batch_size,
-        download=download,
     )
+    return documents
 
 
 def acquire_documents_for_date_range(
@@ -163,40 +235,74 @@ def acquire_documents_for_date_range(
     download: bool = False,
 ) -> pd.DataFrame:
     """Acquire matching 8-K documents for a date range and update the table."""
-    if batch_size <= 0:
-        msg = f"batch_size must be positive, got {batch_size}"
+    documents, _ = run_ingest_pipeline(
+        IngestConfig(
+            mode="historical",
+            bucket=bucket,
+            cik_file=Path(),
+            start_date=start_date,
+            end_date=end_date,
+            data_dir=data_dir,
+            force=force,
+            batch_size=batch_size,
+            download=download,
+        ),
+        ciks=ciks,
+        s3_client=s3_client,
+    )
+    return documents
+
+
+def run_ingest_pipeline(
+    config: IngestConfig,
+    *,
+    ciks: set[str] | None = None,
+    s3_client: S3Client | None = None,
+) -> tuple[pd.DataFrame, IngestRunResult]:
+    """Run ingest using an orchestrator-style config object."""
+    if config.batch_size <= 0:
+        msg = f"batch_size must be positive, got {config.batch_size}"
         raise ValueError(msg)
 
-    client = s3_client or default_s3_client()
-    db_path = documents_db_path(data_dir)
+    client = s3_client or default_s3_client(config.aws_profile)
+    db_path = documents_db_path(config.data_dir)
     conn = connect_document_db(db_path)
     normalized_ciks = _normalize_ciks(ciks)
-
-    LOGGER.info(
-        "Starting SEC document acquisition for start_date=%s end_date=%s bucket=%s",
-        start_date,
-        end_date,
-        bucket,
+    failure_file = config.failure_file or default_failure_file(config.data_dir)
+    failure_file.parent.mkdir(parents=True, exist_ok=True)
+    failure_registry = FailureRegistry(
+        str(failure_file),
+        IngestFailureClassifier(),
     )
 
-    existing_accessions = set() if force else read_document_accessions(conn)
+    LOGGER.info(
+        "Starting ingest: mode=%s bucket=%s start_date=%s end_date=%s batch_size=%s download=%s",
+        config.mode,
+        config.bucket,
+        config.start_date,
+        config.end_date,
+        config.batch_size,
+        config.download,
+    )
+
+    existing_accessions = set() if config.force else read_document_accessions(conn)
     seen_accessions: set[str] = set()
     pending_index_rows: list[dict[str, object]] = []
     pending_download_rows: list[dict[str, str]] = []
     candidates_seen = 0
     skipped_existing = 0
     downloaded = 0
-    batches_written = 0
+    failures = 0
 
     def flush_pending_rows() -> None:
-        nonlocal pending_index_rows, pending_download_rows, batches_written
+        nonlocal pending_index_rows, pending_download_rows
         if not pending_index_rows:
             return
         batch_path: str | None = None
-        if download:
+        if config.download:
             batch_path = str(
                 write_parquet_batch(
-                    document_batches_path(data_dir),
+                    document_batches_path(config.data_dir),
                     DOCUMENT_BATCH_PREFIX,
                     pd.DataFrame(pending_download_rows, columns=DOCUMENT_COLUMNS),
                 )
@@ -205,18 +311,19 @@ def acquire_documents_for_date_range(
             conn,
             pending_index_rows,
             batch_path=batch_path,
-            status="downloaded" if download else "indexed",
+            status="downloaded" if config.download else "indexed",
         )
-        batches_written += 1
         pending_index_rows = []
         pending_download_rows = []
 
     for candidate in iter_document_candidates_for_date_range(
         client,
-        bucket,
-        start_date,
-        end_date,
+        config.bucket,
+        config.start_date,
+        config.end_date,
         normalized_ciks,
+        failure_registry=failure_registry,
+        s3_prefix=config.s3_prefix,
     ):
         candidates_seen += 1
         if candidate.accession_number in seen_accessions:
@@ -227,6 +334,23 @@ def acquire_documents_for_date_range(
             skipped_existing += 1
             continue
 
+        if config.download:
+            try:
+                pending_download_rows.append(_download_candidate(client, candidate))
+            except Exception:
+                LOGGER.exception(
+                    "Failed to download candidate: accession=%s resource=%s",
+                    candidate.accession_number,
+                    candidate.resource_uri,
+                )
+                failure_registry.add(
+                    _failure_key_for_candidate(candidate),
+                    IngestFailureType.DOCUMENT_DOWNLOAD_FAILED,
+                )
+                failures += 1
+                continue
+            downloaded += 1
+
         pending_index_rows.append(
             {
                 "accession_number": candidate.accession_number,
@@ -236,26 +360,37 @@ def acquire_documents_for_date_range(
                 "date": candidate.date,
             }
         )
-        if download:
-            pending_download_rows.append(_download_candidate(client, candidate))
-            downloaded += 1
-        if len(pending_index_rows) >= batch_size:
+        if len(pending_index_rows) >= config.batch_size:
             flush_pending_rows()
 
     flush_pending_rows()
+    failure_registry.flush()
 
     updated = read_documents_from_index(conn)
     LOGGER.info(
-        "Document acquisition complete: candidates=%s downloaded=%s "
-        "skipped_existing=%s rows=%s path=%s",
+        "Document acquisition complete: candidates=%s downloaded=%s skipped_existing=%s failures=%s rows=%s path=%s",
         candidates_seen,
         downloaded,
         skipped_existing,
+        failures,
         len(updated),
         db_path,
     )
     conn.close()
-    return updated
+    return updated, IngestRunResult(
+        mode=config.mode,
+        start_date=config.start_date,
+        end_date=config.end_date,
+        ciks_count=len(normalized_ciks or set()),
+        candidates_seen=candidates_seen,
+        skipped_existing=skipped_existing,
+        downloaded=downloaded,
+        failures=failures,
+        total_rows=len(updated),
+        database_path=db_path,
+        documents_path=document_batches_path(config.data_dir),
+        failure_file=failure_file,
+    )
 
 
 def iter_document_candidates(
@@ -280,18 +415,33 @@ def iter_document_candidates_for_date_range(
     start_date: date,
     end_date: date,
     ciks: set[str] | None = None,
+    *,
+    failure_registry: FailureRegistry | None = None,
+    s3_prefix: str = DEFAULT_S3_PREFIX,
 ) -> list[DocumentCandidate]:
     """Return manifest-backed document candidates for a date range."""
     candidates: list[DocumentCandidate] = []
-    for filing in iter_filings(
+    for manifest_key in _iter_manifest_keys(
         s3_client,
         bucket,
         CDT_FORM_TYPE,
         start_date,
         end_date,
-        ciks=ciks,
+        ciks=_normalize_ciks(ciks),
+        s3_prefix=s3_prefix,
     ):
-        candidate = _candidate_from_filing(filing)
+        key = _failure_key(bucket, manifest_key)
+        if failure_registry is not None and key in failure_registry:
+            LOGGER.info(
+                "Skipping known ingest failure: bucket=%s key=%s", bucket, manifest_key
+            )
+            continue
+        candidate = _candidate_from_manifest_key(
+            s3_client,
+            bucket,
+            manifest_key,
+            failure_registry=failure_registry,
+        )
         if candidate is not None:
             candidates.append(candidate)
     return candidates
@@ -341,9 +491,9 @@ def iter_filings(
         yield filing
 
 
-def default_s3_client() -> S3Client:
+def default_s3_client(profile_name: str = DEFAULT_AWS_PROFILE) -> S3Client:
     """Return the default S3 client for the analysis account profile."""
-    return cast(S3Client, boto3.Session(profile_name=DEFAULT_AWS_PROFILE).client("s3"))
+    return cast(S3Client, boto3.Session(profile_name=profile_name).client("s3"))
 
 
 def _candidate_from_filing(filing: ScrapedFiling) -> DocumentCandidate | None:
@@ -360,6 +510,51 @@ def _candidate_from_filing(filing: ScrapedFiling) -> DocumentCandidate | None:
         resource_uri=document.s3_key,
         date=filing.filing_date.isoformat(),
     )
+
+
+def _candidate_from_manifest_key(
+    s3_client: S3Client,
+    bucket: str,
+    manifest_key: str,
+    *,
+    failure_registry: FailureRegistry | None = None,
+) -> DocumentCandidate | None:
+    try:
+        manifest = _read_json_object(s3_client, bucket, manifest_key)
+    except Exception:
+        LOGGER.exception("Failed to read manifest: key=%s", manifest_key)
+        _record_failure(
+            failure_registry,
+            _failure_key(bucket, manifest_key),
+            IngestFailureType.MANIFEST_READ_FAILED,
+        )
+        return None
+
+    try:
+        filing = _filing_from_manifest(manifest)
+    except Exception:
+        LOGGER.exception("Invalid manifest: key=%s", manifest_key)
+        _record_failure(
+            failure_registry,
+            _failure_key(bucket, manifest_key),
+            IngestFailureType.INVALID_MANIFEST,
+        )
+        return None
+
+    if filing.failure_reason:
+        LOGGER.info("Skipping failed upstream manifest %s", manifest_key)
+        return None
+
+    candidate = _candidate_from_filing(filing)
+    if candidate is None:
+        LOGGER.warning("Manifest missing target CDT document: key=%s", manifest_key)
+        _record_failure(
+            failure_registry,
+            _failure_key(bucket, manifest_key),
+            IngestFailureType.DOCUMENT_NOT_FOUND,
+        )
+        return None
+    return candidate
 
 
 def _is_cdt_document(document: ScrapedDocument) -> bool:
@@ -382,6 +577,17 @@ def _download_candidate(
         "text": text,
         "date": candidate.date,
     }
+
+
+def _record_failure(
+    failure_registry: FailureRegistry | None,
+    key: tuple[str, str],
+    failure_type: IngestFailureType,
+) -> None:
+    """Persist the failure when a registry is configured."""
+    if failure_registry is None:
+        return
+    failure_registry.add(key, failure_type)
 
 
 def decode_document_bytes(body: bytes) -> str:
@@ -489,13 +695,14 @@ def _iter_manifest_keys(
     end_date: date,
     *,
     ciks: set[str] | None = None,
+    s3_prefix: str = DEFAULT_S3_PREFIX,
 ) -> Iterator[str]:
     paginator = s3_client.get_paginator("list_objects_v2")
     for day_index, day in enumerate(_days_in_range(start_date, end_date), start=1):
         if day_index == 1 or day_index % PROGRESS_DAY_INTERVAL == 0:
             LOGGER.info("Scanning S3 manifest prefixes through %s", day)
         for form_type in _normalize_form_types(form_types):
-            prefix = f"{DEFAULT_S3_PREFIX}/{day.isoformat()}/{form_type}/"
+            prefix = f"{s3_prefix}/{day.isoformat()}/{form_type}/"
             for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
                 contents = cast(list[dict[str, str]], page.get("Contents", []))
                 yield from (
@@ -524,6 +731,15 @@ def _key_matches_ciks(key: str, ciks: set[str] | None) -> bool:
     if len(parts) < MIN_MANIFEST_KEY_PARTS:
         return False
     return parts[MANIFEST_KEY_CIK_INDEX] in ciks
+
+
+def _failure_key(bucket: str, key: str) -> tuple[str, str]:
+    return (bucket, key)
+
+
+def _failure_key_for_candidate(candidate: DocumentCandidate) -> tuple[str, str]:
+    parsed = urlparse(candidate.resource_uri)
+    return (parsed.netloc, parsed.path.lstrip("/"))
 
 
 def parse_s3_uri(uri: str) -> tuple[str, str]:

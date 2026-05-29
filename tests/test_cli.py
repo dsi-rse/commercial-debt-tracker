@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 from cdt import cli
+from cdt.ingest import IngestRunResult
 from cdt.itemizer import POTENTIALLY_RELEVANT_ITEM_NUMBERS
 
 ARGPARSE_USAGE_ERROR = 2
@@ -18,44 +19,52 @@ def test_ingest_cli_reads_cik_file_and_calls_acquire(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The ingest command passes CIKs and dates to document acquisition."""
+    """The ingest command builds an ingest config and passes CIKs through."""
     cik_file = tmp_path / "ciks.txt"
     cik_file.write_text("0000320193\n\n789019\n", encoding="utf-8")
     calls: list[dict[str, object]] = []
 
-    def fake_acquire(
-        bucket: str,
-        start_date: date,
-        end_date: date,
-        ciks: set[str] | None = None,
+    def fake_run_ingest_pipeline(
+        config: cli.IngestConfig,
         *,
-        force: bool = False,
-        batch_size: int = cli.DEFAULT_BATCH_SIZE,
-        download: bool = False,
-    ) -> pd.DataFrame:
+        ciks: set[str] | None = None,
+        s3_client: object | None = None,
+    ) -> tuple[pd.DataFrame, IngestRunResult]:
+        del s3_client
         calls.append(
             {
-                "bucket": bucket,
-                "start_date": start_date,
-                "end_date": end_date,
+                "mode": config.mode,
+                "bucket": config.bucket,
+                "start_date": config.start_date,
+                "end_date": config.end_date,
                 "ciks": ciks,
-                "force": force,
-                "batch_size": batch_size,
-                "download": download,
+                "force": config.force,
+                "batch_size": config.batch_size,
+                "download": config.download,
+                "aws_profile": config.aws_profile,
+                "s3_prefix": config.s3_prefix,
             }
         )
-        return pd.DataFrame([{"accession_number": "1"}])
+        return pd.DataFrame([{"accession_number": "1"}]), IngestRunResult(
+            mode=config.mode,
+            start_date=config.start_date,
+            end_date=config.end_date,
+            ciks_count=len(ciks or set()),
+            candidates_seen=1,
+            skipped_existing=0,
+            downloaded=1,
+            failures=0,
+            total_rows=1,
+            database_path=tmp_path / "cdt.sqlite",
+            documents_path=tmp_path / "documents",
+            failure_file=tmp_path / "failures" / "ingest_failures.json",
+        )
 
-    monkeypatch.setattr(cli, "acquire_documents_for_date_range", fake_acquire)
+    monkeypatch.setattr(cli, "run_ingest_pipeline", fake_run_ingest_pipeline)
 
     status = cli.main(
         [
             "ingest",
-            str(cik_file),
-            "--start-date",
-            "2024-01-01",
-            "--end-date",
-            "2024-01-31",
             "--bucket",
             "test-bucket",
             "--force",
@@ -63,12 +72,19 @@ def test_ingest_cli_reads_cik_file_and_calls_acquire(
             "25",
             "--download",
             "--quiet",
+            "daily",
+            str(cik_file),
+            "--start-date",
+            "2024-01-01",
+            "--end-date",
+            "2024-01-31",
         ]
     )
 
     assert status == 0
     assert calls == [
         {
+            "mode": "daily",
             "bucket": "test-bucket",
             "start_date": date(2024, 1, 1),
             "end_date": date(2024, 1, 31),
@@ -76,47 +92,124 @@ def test_ingest_cli_reads_cik_file_and_calls_acquire(
             "force": True,
             "batch_size": 25,
             "download": True,
+            "aws_profile": cli.DEFAULT_AWS_PROFILE,
+            "s3_prefix": "sec",
         }
     ]
 
 
-def test_ingest_cli_defaults_to_all_time_date_range(
+def test_ingest_cli_historical_defaults_to_all_time_date_range(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Omitted ingest dates default to the all-time EDGAR range."""
+    """Historical ingest keeps the all-time EDTGAR defaults."""
     cik_file = tmp_path / "ciks.txt"
     cik_file.write_text("320193\n", encoding="utf-8")
     calls: list[dict[str, object]] = []
 
-    def fake_acquire(
-        bucket: str,
-        start_date: date,
-        end_date: date,
-        ciks: set[str] | None = None,
+    def fake_run_ingest_pipeline(
+        config: cli.IngestConfig,
         *,
-        force: bool = False,
-        batch_size: int = cli.DEFAULT_BATCH_SIZE,
-        download: bool = False,
-    ) -> pd.DataFrame:
-        del bucket, ciks, force, batch_size
+        ciks: set[str] | None = None,
+        s3_client: object | None = None,
+    ) -> tuple[pd.DataFrame, IngestRunResult]:
+        del ciks, s3_client
         calls.append(
-            {"start_date": start_date, "end_date": end_date, "download": download}
+            {
+                "mode": config.mode,
+                "start_date": config.start_date,
+                "end_date": config.end_date,
+                "download": config.download,
+            }
         )
-        return pd.DataFrame()
+        return pd.DataFrame(), IngestRunResult(
+            mode=config.mode,
+            start_date=config.start_date,
+            end_date=config.end_date,
+            ciks_count=1,
+            candidates_seen=0,
+            skipped_existing=0,
+            downloaded=0,
+            failures=0,
+            total_rows=0,
+            database_path=tmp_path / "cdt.sqlite",
+            documents_path=tmp_path / "documents",
+            failure_file=tmp_path / "failures" / "ingest_failures.json",
+        )
 
-    monkeypatch.setattr(cli, "acquire_documents_for_date_range", fake_acquire)
+    monkeypatch.setattr(cli, "run_ingest_pipeline", fake_run_ingest_pipeline)
 
-    status = cli.main(["ingest", str(cik_file), "--quiet"])
+    status = cli.main(["ingest", "--quiet", "historical", str(cik_file)])
 
     assert status == 0
     assert calls == [
         {
+            "mode": "historical",
             "start_date": cli.ALL_TIME_START_DATE,
             "end_date": date.today(),
             "download": False,
         }
     ]
+
+
+def test_ingest_cli_daily_defaults_to_yesterday(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Daily ingest defaults both dates to yesterday."""
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("320193\n", encoding="utf-8")
+    calls: list[tuple[date, date]] = []
+
+    def fake_run_ingest_pipeline(
+        config: cli.IngestConfig,
+        *,
+        ciks: set[str] | None = None,
+        s3_client: object | None = None,
+    ) -> tuple[pd.DataFrame, IngestRunResult]:
+        del ciks, s3_client
+        calls.append((config.start_date, config.end_date))
+        return pd.DataFrame(), IngestRunResult(
+            mode=config.mode,
+            start_date=config.start_date,
+            end_date=config.end_date,
+            ciks_count=1,
+            candidates_seen=0,
+            skipped_existing=0,
+            downloaded=0,
+            failures=0,
+            total_rows=0,
+            database_path=tmp_path / "cdt.sqlite",
+            documents_path=tmp_path / "documents",
+            failure_file=tmp_path / "failures" / "ingest_failures.json",
+        )
+
+    monkeypatch.setattr(cli, "run_ingest_pipeline", fake_run_ingest_pipeline)
+
+    status = cli.main(["ingest", "--quiet", "daily", str(cik_file)])
+
+    yesterday = date.today().fromordinal(date.today().toordinal() - 1)
+    assert status == 0
+    assert calls == [(yesterday, yesterday)]
+
+
+def test_ingest_cli_daily_rejects_partial_date_range(tmp_path: Path) -> None:
+    """Daily ingest requires both dates when either is supplied."""
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("320193\n", encoding="utf-8")
+
+    status = cli.main(
+        [
+            "ingest",
+            "--quiet",
+            "daily",
+            str(cik_file),
+            "--start-date",
+            "2024-01-01",
+        ]
+    )
+
+    assert status == ARGPARSE_USAGE_ERROR
 
 
 def test_ingest_cli_logs_failures_to_file(
@@ -128,28 +221,25 @@ def test_ingest_cli_logs_failures_to_file(
     log_file = tmp_path / "ingest.log"
     cik_file.write_text("320193\n", encoding="utf-8")
 
-    def fake_acquire(
-        bucket: str,
-        start_date: date,
-        end_date: date,
-        ciks: set[str] | None = None,
+    def fake_run_ingest_pipeline(
+        config: cli.IngestConfig,
         *,
-        force: bool = False,
-        batch_size: int = cli.DEFAULT_BATCH_SIZE,
-        download: bool = False,
-    ) -> pd.DataFrame:
-        del bucket, start_date, end_date, ciks, force, batch_size, download
+        ciks: set[str] | None = None,
+        s3_client: object | None = None,
+    ) -> tuple[pd.DataFrame, IngestRunResult]:
+        del config, ciks, s3_client
         raise RuntimeError("simulated failure")
 
-    monkeypatch.setattr(cli, "acquire_documents_for_date_range", fake_acquire)
+    monkeypatch.setattr(cli, "run_ingest_pipeline", fake_run_ingest_pipeline)
 
     status = cli.main(
         [
             "ingest",
-            str(cik_file),
             "--quiet",
             "--log-file",
             str(log_file),
+            "historical",
+            str(cik_file),
         ]
     )
 

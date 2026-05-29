@@ -31,10 +31,12 @@ from cdt.extractor import (
     extracted_tables_path,
 )
 from cdt.ingest import (
+    DEFAULT_AWS_PROFILE,
     DEFAULT_BUCKET,
-    acquire_documents_for_date_range,
-    document_batches_path,
+    IngestConfig,
     documents_db_path,
+    documents_path,
+    run_ingest_pipeline,
 )
 from cdt.itemizer import (
     POTENTIALLY_RELEVANT_ITEM_NUMBERS,
@@ -64,23 +66,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Index 8-K submission resources for CIKs.",
     )
     ingest_parser.add_argument(
-        "cik_file",
-        type=Path,
-        help="Path to a file containing one CIK per line.",
-    )
-    ingest_parser.add_argument(
-        "--start-date",
-        type=parse_date,
-        default=ALL_TIME_START_DATE,
-        help="First filing date to include. Defaults to 1994-01-01.",
-    )
-    ingest_parser.add_argument(
-        "--end-date",
-        type=parse_date,
-        default=date.today(),
-        help="Last filing date to include. Defaults to today.",
-    )
-    ingest_parser.add_argument(
         "--bucket",
         default=DEFAULT_BUCKET,
         help=f"S3 bucket to read from. Defaults to {DEFAULT_BUCKET}.",
@@ -105,6 +90,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Download matched documents into Parquet batch files.",
     )
     ingest_parser.add_argument(
+        "--failure-file",
+        type=Path,
+        default=None,
+        help="Optional path to write the permanent ingest failure registry.",
+    )
+    ingest_parser.add_argument(
+        "--aws-profile",
+        default=DEFAULT_AWS_PROFILE,
+        help=f"AWS profile name for S3 access. Defaults to {DEFAULT_AWS_PROFILE}.",
+    )
+    ingest_parser.add_argument(
+        "--s3-prefix",
+        default="sec",
+        help="Top-level scraper prefix inside the bucket. Defaults to sec.",
+    )
+    ingest_parser.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress progress logging.",
@@ -115,7 +116,54 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional path to write logs for long-running ingests.",
     )
-    ingest_parser.set_defaults(func=run_ingest)
+
+    ingest_subparsers = ingest_parser.add_subparsers(dest="ingest_mode", required=True)
+
+    ingest_daily_parser = ingest_subparsers.add_parser(
+        "daily",
+        help="Index 8-K filings from a daily date window.",
+    )
+    ingest_daily_parser.add_argument(
+        "cik_file",
+        type=Path,
+        help="Path to a file containing one CIK per line.",
+    )
+    ingest_daily_parser.add_argument(
+        "--start-date",
+        type=parse_date,
+        default=None,
+        help="First filing date to include. Defaults to yesterday when omitted.",
+    )
+    ingest_daily_parser.add_argument(
+        "--end-date",
+        type=parse_date,
+        default=None,
+        help="Last filing date to include. Defaults to yesterday when omitted.",
+    )
+    ingest_daily_parser.set_defaults(func=run_ingest)
+
+    ingest_historical_parser = ingest_subparsers.add_parser(
+        "historical",
+        help="Index 8-K filings from the historical scraper archive.",
+    )
+    ingest_historical_parser.add_argument(
+        "cik_file",
+        type=Path,
+        help="Path to a file containing one CIK per line.",
+    )
+    ingest_historical_parser.add_argument(
+        "--start-date",
+        type=parse_date,
+        default=ALL_TIME_START_DATE,
+        help="First filing date to include. Defaults to 1994-01-01.",
+    )
+    ingest_historical_parser.add_argument(
+        "--end-date",
+        type=parse_date,
+        default=date.today(),
+        help="Last filing date to include. Defaults to today.",
+    )
+    ingest_historical_parser.set_defaults(func=run_ingest)
 
     itemize_parser = subparsers.add_parser(
         "itemize",
@@ -342,36 +390,55 @@ def run_ingest(args: argparse.Namespace) -> int:
     ciks = read_cik_file(args.cik_file)
     logger = logging.getLogger(__name__)
     try:
-        logger.info(
-            "Starting ingest: ciks=%s bucket=%s start_date=%s end_date=%s "
-            "batch_size=%s download=%s database=%s",
-            len(ciks),
-            args.bucket,
-            args.start_date,
-            args.end_date,
-            args.batch_size,
-            args.download,
-            documents_db_path(),
-        )
-        documents = acquire_documents_for_date_range(
-            args.bucket,
-            args.start_date,
-            args.end_date,
-            ciks,
+        start_date, end_date = resolve_ingest_dates(args)
+        config = IngestConfig(
+            mode=args.ingest_mode,
+            bucket=args.bucket,
+            cik_file=args.cik_file,
+            start_date=start_date,
+            end_date=end_date,
             force=args.force,
             batch_size=args.batch_size,
             download=args.download,
+            failure_file=args.failure_file,
+            aws_profile=args.aws_profile,
+            s3_prefix=args.s3_prefix,
         )
+        logger.info(
+            "Starting ingest: mode=%s ciks=%s bucket=%s start_date=%s end_date=%s "
+            "batch_size=%s download=%s database=%s",
+            config.mode,
+            len(ciks),
+            config.bucket,
+            config.start_date,
+            config.end_date,
+            config.batch_size,
+            config.download,
+            documents_db_path(),
+        )
+        _, result = run_ingest_pipeline(config, ciks=ciks)
+    except ValueError as exc:
+        logger.error("Invalid ingest arguments: %s", exc)
+        return 2
     except Exception:
         logger.exception("Ingest failed")
         return 1
     print(
-        f"Indexed {len(documents)} document rows for {len(ciks)} CIKs "
-        f"from {args.start_date} through {args.end_date}."
+        f"Indexed {result.total_rows} document rows for {len(ciks)} CIKs "
+        f"from {result.start_date} through {result.end_date}."
     )
-    print(f"Wrote {documents_db_path()}.")
-    if args.download:
-        print(f"Wrote document batches to {document_batches_path()}.")
+    print(
+        f"Matched {result.candidates_seen} candidate filings, skipped "
+        f"{result.skipped_existing} existing accessions, and recorded {result.failures} failures."
+    )
+    print(f"Wrote {result.database_path}.")
+    if config.download:
+        print(f"Wrote document batches to {result.documents_path}.")
+    else:
+        print(
+            f"Document batches will be written under {documents_path()} when download mode is used."
+        )
+    print(f"Failure registry: {result.failure_file}.")
     return 0
 
 
@@ -531,6 +598,22 @@ def configure_logging(*, quiet: bool, log_file: Path | None = None) -> None:
 def read_cik_file(path: Path) -> set[str]:
     """Read a one-CIK-per-line file."""
     return {line.strip() for line in path.read_text().splitlines() if line.strip()}
+
+
+def resolve_ingest_dates(args: argparse.Namespace) -> tuple[date, date]:
+    """Resolve ingest dates for the selected ingest mode."""
+    if args.ingest_mode == "historical":
+        return args.start_date, args.end_date
+    if args.start_date is None and args.end_date is None:
+        yesterday = date.today().fromordinal(date.today().toordinal() - 1)
+        return yesterday, yesterday
+    if args.start_date is None:
+        msg = "--start-date is required when --end-date is provided"
+        raise ValueError(msg)
+    if args.end_date is None:
+        msg = "--end-date is required when --start-date is provided"
+        raise ValueError(msg)
+    return args.start_date, args.end_date
 
 
 def parse_date(value: str) -> date:

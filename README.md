@@ -1,58 +1,196 @@
 # Commercial Debt Tracker
 
-## Project Background
+Commercial Debt Tracker (CDT) is a multi-stage processor for finding debt-related disclosures in SEC 8-K filings, extracting structured debt-instrument mentions, and matching those mentions into filing-level instrument histories.
 
-[Please add project background]
+The ingest stage consumes `manifest.json` artifacts produced by [`idi-sec-scraper`](https://github.com/dsi-clinic/idi-sec-scraper). CDT does not scrape SEC EDGAR directly; it indexes and optionally downloads only the 8-K complete-submission documents it needs from the shared scraper bucket.
 
-## Project Goals
+## Pipeline Overview
 
-[Please add project background]
+The current pipeline stages are:
 
-## Usage
+1. **Ingest**: read CIKs, scan scraper manifests, index matching 8-K complete-submission text files, and optionally download document batches
+2. **Itemize**: extract potentially relevant 8-K item sections
+3. **Classifier**: score item rows as `relevant` or `irrelevant`
+4. **Extractor**: run the LLM extraction workflow on relevant rows
+5. **Matcher**: group extracted mention rows into logical debt instruments
 
-Set `DATA_DIR` in `.env`; CDT writes generated artifacts under that directory.
+Processing is resumable. SQLite stores stage progress, and ingest also maintains a permanent failure registry for upstream source artifacts that should not be retried.
+
+## Output Layout
+
+All generated artifacts live under `DATA_DIR`.
+
+```text
+{DATA_DIR}/
+  cdt.sqlite
+  documents/
+    document-batch-*.parquet
+  items/
+    item-batch-*.parquet
+  extractor_runs/
+    run-*/full.jsonl
+  failures/
+    ingest_failures.json
+  models/
+    classifier/tfidf-linear-svc/
+```
+
+`cdt.sqlite` is the canonical pipeline state store. It tracks document rows, item rows, extraction status, matcher outputs, and related audit metadata.
+
+## Quick Start
+
+### Requirements
+
+- Python 3.13+
+- `uv`
+- AWS credentials with read access to the shared SEC scraper bucket
+
+### Installation
+
+```bash
+uv sync
+```
+
+For development dependencies:
+
+```bash
+uv sync --all-groups
+```
+
+### Environment
+
+Set `DATA_DIR` in `.env` or the shell before running CDT:
 
 ```bash
 DATA_DIR=/path/to/commercial-debt-tracker/processor
 ```
 
-### SEC 8-K Ingest
+Ingest uses the `idi-analysis` AWS profile by default. Override it with `--aws-profile` when needed.
 
-`cdt ingest` reads one CIK per line, scans the shared SEC scraper bucket for
-matching 8-K complete submission text files, and records the resource
-locations in the shared SQLite database.
+### Local Runtime
+
+The repo includes a simple Docker-based local environment:
 
 ```bash
-uv run cdt ingest 100K-ciks.txt \
-  --start-date 2024-01-01 \
-  --end-date 2024-12-31 \
-  --batch-size 100 \
-  --download \
-  --log-file ingest.log
+docker compose build
+docker compose run --rm commercial-debt-tracker /bin/bash
 ```
 
-If dates are omitted, the command scans from `1994-01-01` through today. The
-default bucket is `idi-dev-processor-s3`, with scraper data under the `sec/`
-prefix. The command expects AWS credentials for the `idi-analysis` profile.
-Without `--download`, ingest only indexes resources; with `--download`, it also
-writes Parquet document batches.
+The compose setup mounts the repo at `/project` and mounts `${DATA_DIR}` at `/data`.
 
-Ingest writes:
+## Ingest
+
+### What Ingest Reads
+
+Ingest expects the bucket layout written by `idi-sec-scraper`:
 
 ```text
-$DATA_DIR/cdt.sqlite
-$DATA_DIR/documents/document-batch-*.parquet
+s3://{bucket}/
+  sec/
+    {YYYY-MM-DD}/
+      8-K/
+        {cik}/
+          {accession_without_dashes}/
+            manifest.json
+            ...
 ```
 
-The SQLite database tracks document accessions, resource URIs, and pipeline
-status. Reruns skip documents that are already indexed or itemized.
+Each `manifest.json` is treated as the source of truth for a filing. CDT selects the `COMPLETE SUBMISSION TEXT FILE` document entry from that manifest.
 
-### 8-K Itemization
+### Modes
 
-`cdt itemize` processes resources that have not yet been itemized. It reads
-pending document rows from `cdt.sqlite`, loads each source from its recorded
-S3 URI or local file path, extracts Form 8-K item sections, writes item batch
-Parquet files, and marks source documents as itemized in SQLite.
+`cdt ingest` follows the same mode structure used in the standalone processors:
+
+- `daily`: inclusive date window; if neither date is supplied, both default to yesterday
+- `historical`: full backfill window by default (`1994-01-01` through today), with optional bounds for partial backfills
+
+### Run
+
+Daily ingest for an explicit window:
+
+```bash
+uv run cdt ingest \
+  --bucket idi-dev-processor-s3 \
+  --download \
+  daily 100K-ciks.txt \
+  --start-date 2024-01-01 \
+  --end-date 2024-01-31
+```
+
+Daily ingest using the default yesterday window:
+
+```bash
+uv run cdt ingest daily 100K-ciks.txt
+```
+
+Historical ingest across the full CDT range:
+
+```bash
+uv run cdt ingest historical 100K-ciks.txt
+```
+
+Historical ingest for a bounded backfill:
+
+```bash
+uv run cdt ingest \
+  --batch-size 250 \
+  --download \
+  --log-file ingest.log \
+  historical 100K-ciks.txt \
+  --start-date 2024-01-01 \
+  --end-date 2024-12-31
+```
+
+Without `--download`, ingest only indexes matching resources in SQLite. With `--download`, it also writes append-only Parquet document batches under `documents/`.
+
+### CLI Reference
+
+Common ingest options must appear before the mode:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--bucket` | `idi-dev-processor-s3` | Shared scraper bucket |
+| `--force` | `false` | Replace existing rows for requested accessions |
+| `--batch-size` | `100` | Matching documents processed per batch |
+| `--download` | `false` | Download matched document bodies into Parquet batches |
+| `--failure-file` | `{DATA_DIR}/failures/ingest_failures.json` | Permanent ingest failure registry path |
+| `--aws-profile` | `idi-analysis` | AWS profile used to create the S3 client |
+| `--s3-prefix` | `sec` | Top-level scraper prefix inside the bucket |
+| `--log-file` | disabled | Optional file logging for long-running runs |
+| `--quiet` | `false` | Suppress info-level progress logs |
+
+Mode-specific arguments:
+
+| Mode | Arguments | Behavior |
+|---|---|---|
+| `daily` | `cik_file`, optional `--start-date`, `--end-date` | Defaults both dates to yesterday when omitted; if either date is supplied, both are required |
+| `historical` | `cik_file`, optional `--start-date`, `--end-date` | Defaults to `1994-01-01` through today |
+
+### Failure Registry
+
+Ingest writes permanent source failures to:
+
+```text
+{DATA_DIR}/failures/ingest_failures.json
+```
+
+These failures are distinct from SQLite pipeline state:
+
+- **SQLite** tracks document indexing and downstream stage status
+- **Failure registry** tracks source artifacts that should not be retried
+
+Currently ingest records permanent failures for:
+
+- unreadable manifests
+- invalid manifest payloads
+- manifests that do not contain a complete-submission document
+- document download failures in `--download` mode
+
+On rerun, ingest skips entries already recorded in the failure registry.
+
+## Itemize
+
+`cdt itemize` processes document rows that have not yet been itemized. It reads pending document rows from `cdt.sqlite`, loads the recorded S3 URI or local file path, extracts Form 8-K item sections, writes item batch Parquet files, and marks source documents as itemized.
 
 ```bash
 uv run cdt itemize --batch-size 100 --log-file itemize.log
@@ -61,19 +199,14 @@ uv run cdt itemize --batch-size 100 --log-file itemize.log
 Itemization writes:
 
 ```text
-$DATA_DIR/items/item-batch-*.parquet
+{DATA_DIR}/items/item-batch-*.parquet
 ```
 
 Use `--force` to re-itemize documents already marked itemized.
 
+## Classifier
 
-### 8-K Classification
-
-Using dsi-core/11th-hour/commercial-debt-tracker/data/annotations/classification/svm-annotated-8K-20260318.csv to train with 5 CV splits and a random seed of 42, a classifier was created with recall of .9903 and precision of .8483. 
-
-This is saved to dsi-core/11th-hour/commercial-debt-tracker/processor/models/classifier/tfidf-linear-svc.
-
-In this repo, the classifier is binary: `relevant` or `irrelevant`.
+The classifier is binary: `relevant` or `irrelevant`.
 
 Train it with:
 
@@ -81,22 +214,20 @@ Train it with:
 uv run cdt classifier train --train-csv path/to/training.csv
 ```
 
-The training CSV must contain these columns:
+The training CSV must contain:
 
 ```text
 text
 label
 ```
 
-`text` is the item text to score. `label` is the binary training target and must be one of `relevant`, `irrelevant`, `true`, `false`, `t`, `f`, `1`, or `0`.
+`text` is the item text to score. `label` must be one of `relevant`, `irrelevant`, `true`, `false`, `t`, `f`, `1`, or `0`.
 
 The default model output directory is:
 
 ```text
-$DATA_DIR/models/classifier/tfidf-linear-svc
+{DATA_DIR}/models/classifier/tfidf-linear-svc
 ```
-
-Training targets `99%` recall and logs the resulting precision, recall, and PR-AUC after fitting. You can override the default recall target, CV split count, random seed, and model directory with CLI flags.
 
 Run classification with:
 
@@ -104,21 +235,13 @@ Run classification with:
 uv run cdt classifier
 ```
 
-That command reads pending item rows from `$DATA_DIR/cdt.sqlite`, scores the corresponding item batch Parquet rows, and updates each item row in SQLite with:
+That command reads pending item rows from `cdt.sqlite`, scores the corresponding item batch Parquet rows, and updates each item row in SQLite with classification metadata. Reruns skip rows already marked classified unless `--force` is used.
 
-- `status = classified`
-- `label = relevant` or `irrelevant`
-- `relevance = 1` for relevant rows, `0` for irrelevant rows
-- `classification_score`
-- `classified_at`
+## Extractor
 
-Reruns are idempotent and skip rows already marked classified unless `--force` is used.
+`cdt extractor` processes item rows already classified as relevant. It reads pending rows from `cdt.sqlite`, loads the corresponding item text from the recorded item batch Parquet file, runs the OpenRouter-backed three-stage workflow (`ner`, `instrument_ie`, `instrument_relation`), persists extracted `debt_instrument_mentions` into SQLite, and writes a per-run `full.jsonl` audit log.
 
-### LLM Extraction
-
-`cdt extractor` processes item rows that have already been classified as relevant. It reads pending rows from `cdt.sqlite`, loads the corresponding item text from the recorded item batch Parquet file, runs an OpenRouter-backed three-stage workflow (`ner`, `instrument_ie`, `instrument_relation`), persists extracted `debt_instrument_mentions` into SQLite, and writes a per-run `full.jsonl` audit log.
-
-Set the following environment variables in `.env` before running the extractor:
+Set the following environment variables before running the extractor:
 
 ```text
 OPENROUTER_API_KEY=...
@@ -126,7 +249,7 @@ EXTRACTOR_MODEL=openai/gpt-5.4
 EXTRACTOR_REASONING=none
 ```
 
-`OPENROUTER_API_TOKEN` is also accepted as a fallback key name, but `OPENROUTER_API_KEY` is preferred. The model value is passed directly to OpenRouter, so provider-prefixed model IDs such as `openai/...` or `anthropic/...` can be swapped without code changes. The default reasoning effort is `none`.
+`OPENROUTER_API_TOKEN` is also accepted as a fallback key name. The model value is passed directly to OpenRouter, so provider-prefixed model IDs such as `openai/...` or `anthropic/...` can be swapped without code changes.
 
 Run extraction with:
 
@@ -139,58 +262,19 @@ Useful flags:
 - `--force`: re-extract rows already marked `extracted` or `extraction_failed`
 - `--model`: override the OpenRouter model ID for this run
 - `--reasoning-effort`: override the requested OpenRouter reasoning effort
-- `--max-attempts`: number of validation retries per stage before the item is marked failed
-
-Only rows with:
-
-- `status = classified`
-- `relevance = 1`
-
-are eligible by default.
-
-On success, each processed item row is updated in SQLite with:
-
-- `status = extracted`
-- `extracted_at`
-- `extractor_model`
-- `extractor_reasoning`
-- `extractor_run_path`
-
-On failure, each processed item row is updated with:
-
-- `status = extraction_failed`
-- `extractor_error`
-- the same extractor metadata fields for auditability
-
-Extractor outputs are persisted to the SQLite `debt_instrument_mentions` table. These rows are mention-level outputs only. They are not canonical instruments, and they should not be interpreted as consolidated entities across items or filings. A later stage will resolve and consolidate mentions into actual instruments.
-
-Each `debt_instrument_mentions` row stores:
-
-- stable mention identity: `debt_instrument_mention_id`, `item_id`, `raw_id`
-- scalar mention properties: `name`, `start_date`, `end_date`, `amount`
-- mention lineage links: `amendment_of`, `split_of`
-- JSON payloads for richer mention data and audit details:
-  - `lenders_json`
-  - `other_interested_parties_json`
-  - `mention_corefs_json`
-  - `start_date_corefs_json`
-  - `end_date_corefs_json`
-  - `amount_corefs_json`
-  - `instrument_mention_json`
+- `--max-attempts`: validation retries per stage before the item is marked failed
 
 The extractor writes run artifacts under:
 
 ```text
-$DATA_DIR/extractor_runs/run-*/full.jsonl
+{DATA_DIR}/extractor_runs/run-*/full.jsonl
 ```
 
 `full.jsonl` contains per-item attempt history, raw stage responses, final status, and the extracted `debt_instrument_mentions` payload used to populate SQLite.
 
-### Matcher
+## Matcher
 
 `cdt matcher` groups extracted `debt_instrument_mentions` into logical `debt_instrument` rows. Matching is conservative and same-issuer only: the stage compares mentions only within the same `cik`, derives direct mention matches first, and then builds amendment and split parent links between matched debt instruments.
-
-Run matching with:
 
 ```bash
 uv run cdt matcher --batch-size 100
@@ -202,32 +286,22 @@ Useful flags:
 
 By default, matcher reruns are idempotent and skip work when no `debt_instrument_mentions` remain with a null matcher status.
 
-Matcher decision rules:
-
-- Primary auto-match path:
-  - exact normalized `amount`
-  - exact normalized `start_date`
-  - usable lender evidence on both sides
-  - lender string similarity above the strong match threshold
-- Fallback auto-match path, used only when lender evidence is missing or generic on at least one side:
-  - exact normalized `amount`
-  - exact normalized `start_date`
-  - exact normalized debt-name fingerprint
-  - compatible `end_date` values
-    - equal when both are present
-    - otherwise one side may be null
-- Loose candidates are recorded, not merged, when amount and start date match but the primary lender-similarity path does not clear the strong threshold.
-
-Lender evidence is treated as unusable when it is empty or only contains generic role labels such as `lender`, `lenders`, `purchaser`, `purchasers`, `holder`, `holders`, `investor`, `investors`, `buyer`, `buyers`, `noteholder`, `noteholders`, `trustee`, or `trustees`. These generic labels do not count as real counterparty identity for direct matching.
-
 Matcher writes to:
 
-- SQLite `debt_instrument`, one row per matched debt-instrument state
-- SQLite view `active_debt_instruments`, which returns terminal current rows only and adds a computed `mentions_json`
-- additional `debt_instrument_mentions` columns:
-  - `debt_instrument_id`
-  - `matcher_status = singleton | matched | ambiguous`
-  - `matched_at`
-  - `potential_matches_json`
+- SQLite `debt_instrument`
+- SQLite view `active_debt_instruments`
+- additional `debt_instrument_mentions` columns including matcher status and candidate metadata
 
-`potential_matches_json` stores loose candidates that matched on normalized amount and start date but did not meet the automatic-merge rules.
+## Development
+
+Run tests with:
+
+```bash
+uv run pytest
+```
+
+Run linting with:
+
+```bash
+uv run ruff check .
+```
