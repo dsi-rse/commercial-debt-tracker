@@ -496,7 +496,23 @@ def default_s3_client(profile_name: str = DEFAULT_AWS_PROFILE) -> S3Client:
     return cast(S3Client, boto3.Session(profile_name=profile_name).client("s3"))
 
 
-def _candidate_from_filing(filing: ScrapedFiling) -> DocumentCandidate | None:
+def s3_uri(bucket: str, key: str) -> str:
+    """Build a canonical S3 URI from bucket and key."""
+    return f"s3://{bucket}/{key.lstrip('/')}"
+
+
+def normalize_s3_uri(bucket: str, key_or_uri: str) -> str:
+    """Return a canonical S3 URI for a manifest-provided key or URI."""
+    if key_or_uri.startswith("s3://"):
+        return key_or_uri
+    return s3_uri(bucket, key_or_uri)
+
+
+def _candidate_from_filing(
+    filing: ScrapedFiling,
+    *,
+    bucket: str,
+) -> DocumentCandidate | None:
     document = next(
         (document for document in filing.documents if _is_cdt_document(document)),
         None,
@@ -507,7 +523,7 @@ def _candidate_from_filing(filing: ScrapedFiling) -> DocumentCandidate | None:
         accession_number=normalize_accession_number(filing.accession_number),
         cik=filing.cik,
         url=document.url,
-        resource_uri=document.s3_key,
+        resource_uri=normalize_s3_uri(bucket, document.s3_key),
         date=filing.filing_date.isoformat(),
     )
 
@@ -545,7 +561,7 @@ def _candidate_from_manifest_key(
         LOGGER.info("Skipping failed upstream manifest %s", manifest_key)
         return None
 
-    candidate = _candidate_from_filing(filing)
+    candidate = _candidate_from_filing(filing, bucket=bucket)
     if candidate is None:
         LOGGER.warning("Manifest missing target CDT document: key=%s", manifest_key)
         _record_failure(
@@ -738,8 +754,7 @@ def _failure_key(bucket: str, key: str) -> tuple[str, str]:
 
 
 def _failure_key_for_candidate(candidate: DocumentCandidate) -> tuple[str, str]:
-    parsed = urlparse(candidate.resource_uri)
-    return (parsed.netloc, parsed.path.lstrip("/"))
+    return parse_s3_uri(candidate.resource_uri)
 
 
 def parse_s3_uri(uri: str) -> tuple[str, str]:

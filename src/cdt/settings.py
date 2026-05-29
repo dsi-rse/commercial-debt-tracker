@@ -5,6 +5,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
+
 
 def resolve_path(path: Path) -> Path:
     """Resolve a path to an absolute path.
@@ -13,8 +16,7 @@ def resolve_path(path: Path) -> Path:
     """
     path = path.expanduser()
     if not path.is_absolute():
-        project_root = Path(__file__).parent.parent.parent
-        path = project_root / path
+        path = PROJECT_ROOT / path
     return path.resolve()
 
 
@@ -22,7 +24,7 @@ def resolve_path(path: Path) -> Path:
 load_dotenv()
 
 # Set the data directory
-DATA_DIR = resolve_path(Path(os.environ["DATA_DIR"]))
+DATA_DIR = resolve_path(Path(os.environ.get("DATA_DIR", str(DEFAULT_DATA_DIR))))
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get(
     "OPENROUTER_API_TOKEN"
 )

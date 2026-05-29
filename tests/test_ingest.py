@@ -268,6 +268,46 @@ def test_acquire_documents_writes_downloads_in_batches_when_requested(
     )
 
 
+def test_acquire_documents_normalizes_bare_s3_keys(tmp_path: Path) -> None:
+    """Manifest document keys without an s3:// prefix are canonicalized."""
+    client = FakeS3Client(
+        {
+            (
+                "sec-bucket",
+                "sec/2024-01-02/8-K/320193/000000000024000001/manifest.json",
+            ): _manifest_bytes(
+                "320193",
+                "0000000000-24-000001",
+                "8-K",
+                "2024-01-02",
+                "COMPLETE SUBMISSION TEXT FILE",
+                s3_key="sec/2024-01-02/8-K/320193/000000000024000001/full.txt",
+            ),
+            (
+                "sec-bucket",
+                "sec/2024-01-02/8-K/320193/000000000024000001/full.txt",
+            ): b"first",
+        }
+    )
+
+    table = acquire_documents_for_date_range(
+        "sec-bucket",
+        date(2024, 1, 2),
+        date(2024, 1, 2),
+        {"320193"},
+        data_dir=tmp_path,
+        s3_client=client,
+        download=True,
+    )
+
+    assert table["resource_uri"].to_list() == [
+        "s3://sec-bucket/sec/2024-01-02/8-K/320193/000000000024000001/full.txt"
+    ]
+    assert client.downloads == [
+        ("sec-bucket", "sec/2024-01-02/8-K/320193/000000000024000001/full.txt")
+    ]
+
+
 def test_acquire_documents_decompresses_gzip_downloads(tmp_path: Path) -> None:
     """Downloaded SEC document bodies should be decompressed before storage."""
     client = FakeS3Client(
