@@ -10,7 +10,7 @@ import json
 import logging
 import re
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from importlib import resources
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -43,7 +43,58 @@ INSTRUMENT_SINGLE_VALUE_PROPERTIES = {
     "amount": {"amount"},
     "name": {"debt_instrument"},
 }
+STANDARDIZED_SINGLE_VALUE_PROPERTIES = {"start_date", "end_date", "amount"}
 INSTRUMENT_RELATION_TYPES = {"amendment_of", "split_of"}
+NUMERIC_STRING_PATTERN = re.compile(r"^\d+(?:\.\d+)?$")
+ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+MONTH_MAP = {
+    "january": "01",
+    "february": "02",
+    "march": "03",
+    "april": "04",
+    "may": "05",
+    "june": "06",
+    "july": "07",
+    "august": "08",
+    "september": "09",
+    "october": "10",
+    "november": "11",
+    "december": "12",
+}
+AMOUNT_MULTIPLIERS = {
+    "thousand": 1_000,
+    "thousands": 1_000,
+    "million": 1_000_000,
+    "millions": 1_000_000,
+    "billion": 1_000_000_000,
+    "billions": 1_000_000_000,
+}
+COMMON_CURRENCY_CODES = {
+    "AED",
+    "AUD",
+    "BRL",
+    "CAD",
+    "CHF",
+    "CNY",
+    "DKK",
+    "EUR",
+    "GBP",
+    "HKD",
+    "INR",
+    "JPY",
+    "KRW",
+    "MXN",
+    "NOK",
+    "NZD",
+    "SAR",
+    "SEK",
+    "SGD",
+    "TRY",
+    "USD",
+    "ZAR",
+}
+CURRENCY_CODE_LENGTH = 3
+_SUPPORTED_CURRENCY_CODES: set[str] | None = None
 DEBT_INSTRUMENT_MENTION_COLUMNS = [
     "debt_instrument_mention_id",
     "item_id",
@@ -339,15 +390,23 @@ class InstrumentIEStage:
             ) in INSTRUMENT_SINGLE_VALUE_PROPERTIES.items():
                 if property_name not in obj:
                     continue
-                tag_ids = obj[property_name]
+                tag_ids = single_value_evidence_tag_ids(obj[property_name])
+                if property_name in STANDARDIZED_SINGLE_VALUE_PROPERTIES:
+                    failures.extend(
+                        validate_standardized_single_value_shape(
+                            index=index,
+                            property_name=property_name,
+                            value=obj[property_name],
+                        )
+                    )
                 if not isinstance(tag_ids, list):
                     failures.append(
-                        f"Entry {index}: '{property_name}' must be a list of tag IDs."
+                        f"Entry {index}: '{property_name}' evidence must be a list of tag IDs."
                     )
                     continue
                 if not all(isinstance(tag_id, str) for tag_id in tag_ids):
                     failures.append(
-                        f"Entry {index}: '{property_name}' must contain string tag IDs only."
+                        f"Entry {index}: '{property_name}' evidence must contain string tag IDs only."
                     )
                     continue
                 for tag_id in tag_ids:
@@ -447,13 +506,25 @@ class InstrumentIEStage:
         mentions: list[dict[str, object]] = []
         for index, obj in mention_entries:
             raw_id = raw_id_for(index)
+            amount_payload = standardized_amount_payload(
+                obj.get("amount"),
+                tag_details,
+            )
+            start_date_payload = standardized_date_payload(
+                obj.get("start_date"),
+                tag_details,
+            )
+            end_date_payload = standardized_date_payload(
+                obj.get("end_date"),
+                tag_details,
+            )
             mention_row: dict[str, object] = {
                 "item_id": row_state.item_id,
                 "raw_id": raw_id,
                 "name": canonical_value(obj.get("name", []), tag_details),
-                "start_date": canonical_value(obj.get("start_date", []), tag_details),
-                "end_date": canonical_value(obj.get("end_date", []), tag_details),
-                "amount": canonical_value(obj.get("amount", []), tag_details),
+                "start_date": start_date_payload["normalized_date"],
+                "end_date": end_date_payload["normalized_date"],
+                "amount": amount_payload["normalized_amount"],
                 "amendment_of": None,
                 "split_of": None,
                 "lenders_json": json.dumps(
@@ -472,17 +543,10 @@ class InstrumentIEStage:
                     sort_keys=True,
                 ),
                 "start_date_corefs_json": json.dumps(
-                    cluster_payload(obj.get("start_date", []), tag_details),
-                    sort_keys=True,
+                    start_date_payload, sort_keys=True
                 ),
-                "end_date_corefs_json": json.dumps(
-                    cluster_payload(obj.get("end_date", []), tag_details),
-                    sort_keys=True,
-                ),
-                "amount_corefs_json": json.dumps(
-                    cluster_payload(obj.get("amount", []), tag_details),
-                    sort_keys=True,
-                ),
+                "end_date_corefs_json": json.dumps(end_date_payload, sort_keys=True),
+                "amount_corefs_json": json.dumps(amount_payload, sort_keys=True),
             }
             mention_row["debt_instrument_mention_id"] = debt_instrument_mention_id_for(
                 row_state.item_id,
@@ -492,9 +556,9 @@ class InstrumentIEStage:
                 "debt_instrument_mention_id": mention_row["debt_instrument_mention_id"],
                 "raw_id": raw_id,
                 "name": cluster_payload(obj.get("name", []), tag_details),
-                "start_date": cluster_payload(obj.get("start_date", []), tag_details),
-                "end_date": cluster_payload(obj.get("end_date", []), tag_details),
-                "amount": cluster_payload(obj.get("amount", []), tag_details),
+                "start_date": start_date_payload,
+                "end_date": end_date_payload,
+                "amount": amount_payload,
                 "lenders": cluster_payload_list(obj.get("lenders", []), tag_details),
                 "other_interested_parties": cluster_payload_list(
                     obj.get("other_interested_parties", []),
@@ -934,6 +998,58 @@ def collapse_whitespace(value: str) -> str:
     return re.sub(r"\s+", "", value)
 
 
+def single_value_evidence_tag_ids(value: object) -> object:
+    """Return evidence tag IDs from one single-value extractor payload."""
+    if isinstance(value, dict):
+        return value.get("evidence", [])
+    return value
+
+
+def validate_standardized_single_value_shape(
+    *,
+    index: int,
+    property_name: str,
+    value: object,
+) -> list[str]:
+    """Validate one standardized single-value object shape."""
+    if not isinstance(value, dict):
+        return [f"Entry {index}: '{property_name}' must be an object."]
+    evidence = value.get("evidence")
+    if not isinstance(evidence, list):
+        return [f"Entry {index}: '{property_name}.evidence' must be a list of tag IDs."]
+
+    failures: list[str] = []
+    if property_name == "amount":
+        normalized_amount = value.get("normalized_amount")
+        currency = value.get("currency")
+        if normalized_amount is not None and (
+            not isinstance(normalized_amount, str)
+            or not NUMERIC_STRING_PATTERN.fullmatch(normalized_amount)
+        ):
+            failures.append(
+                f"Entry {index}: 'amount.normalized_amount' must be a numeric string or null."
+            )
+        if currency is not None and (
+            not isinstance(currency, str)
+            or len(currency) != CURRENCY_CODE_LENGTH
+            or currency != currency.upper()
+        ):
+            failures.append(
+                f"Entry {index}: 'amount.currency' must be an uppercase 3-letter code or null."
+            )
+    else:
+        normalized_date = value.get("normalized_date")
+        if normalized_date is not None and (
+            not isinstance(normalized_date, str)
+            or not ISO_DATE_PATTERN.fullmatch(normalized_date)
+            or not is_valid_iso_date(normalized_date)
+        ):
+            failures.append(
+                f"Entry {index}: '{property_name}.normalized_date' must be YYYY-MM-DD or null."
+            )
+    return failures
+
+
 def iter_instrument_entries(
     data: list[dict[str, Any]],
     tag_details: dict[str, dict[str, object]],
@@ -1021,6 +1137,145 @@ def canonical_value(
     if not values:
         return None
     return max(values, key=len)
+
+
+def is_valid_iso_date(value: str) -> bool:
+    """Return whether one ISO date string is valid."""
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+def supported_currency_codes() -> set[str]:
+    """Return supported ISO 4217 codes."""
+    global _SUPPORTED_CURRENCY_CODES
+    if _SUPPORTED_CURRENCY_CODES is not None:
+        return _SUPPORTED_CURRENCY_CODES
+
+    codes: set[str] = set(COMMON_CURRENCY_CODES)
+    try:
+        import pycountry
+
+        codes.update(
+            currency.alpha_3
+            for currency in pycountry.currencies
+            if getattr(currency, "alpha_3", None)
+        )
+    except Exception:  # noqa: BLE001
+        LOGGER.debug("pycountry unavailable; falling back to bundled currency set.")
+    _SUPPORTED_CURRENCY_CODES = codes
+    return _SUPPORTED_CURRENCY_CODES
+
+
+def normalize_numeric_string(value: float) -> str:
+    """Return one deterministic numeric string."""
+    if value.is_integer():
+        return str(int(value))
+    return f"{value:.12f}".rstrip("0").rstrip(".")
+
+
+def normalized_amount_from_text(text: str | None) -> str | None:
+    """Parse one amount mention into a normalized numeric string."""
+    if not text:
+        return None
+    lowered = text.lower().replace(",", "")
+    match = re.search(r"\d+(?:\.\d+)?", lowered)
+    if not match:
+        return None
+    amount = float(match.group(0))
+    for word, multiplier in AMOUNT_MULTIPLIERS.items():
+        if re.search(rf"\b{word}\b", lowered):
+            amount *= multiplier
+            break
+    return normalize_numeric_string(amount)
+
+
+def currency_candidates_from_text(text: str | None) -> set[str]:
+    """Infer plausible ISO currency codes from one amount mention."""
+    if not text:
+        return set()
+    lowered = text.lower()
+    candidates: set[str] = set()
+    if "$" in text or "u.s. dollar" in lowered or "us dollar" in lowered:
+        candidates.add("USD")
+    if "€" in text or " euro" in lowered:
+        candidates.add("EUR")
+    if "£" in text or " pound sterling" in lowered or " british pound" in lowered:
+        candidates.add("GBP")
+    if "¥" in text or " yen" in lowered:
+        candidates.add("JPY")
+    for match in re.findall(r"\b[A-Z]{3}\b", text):
+        if match in supported_currency_codes():
+            candidates.add(match)
+    return candidates
+
+
+def normalized_date_from_text(text: str | None) -> str | None:
+    """Parse one date mention into ISO format."""
+    if not text:
+        return None
+    stripped = text.strip()
+    if ISO_DATE_PATTERN.fullmatch(stripped) and is_valid_iso_date(stripped):
+        return stripped
+    match = re.search(
+        r"(?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2}),\s+(?P<year>\d{4})",
+        stripped,
+    )
+    if not match:
+        return None
+    month = MONTH_MAP.get(match.group("month").lower())
+    if month is None:
+        return None
+    normalized = f"{match.group('year')}-{month}-{int(match.group('day')):02d}"
+    return normalized if is_valid_iso_date(normalized) else None
+
+
+def standardized_amount_payload(
+    value: object,
+    tag_details: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    """Return evidence payload plus validated normalized amount fields."""
+    evidence_tag_ids = single_value_evidence_tag_ids(value)
+    payload = cluster_payload(evidence_tag_ids, tag_details)
+    evidence_text = canonical_value(evidence_tag_ids, tag_details)
+    parsed_amount = normalized_amount_from_text(evidence_text)
+    parsed_currency_candidates = currency_candidates_from_text(evidence_text)
+    model_amount = value.get("normalized_amount") if isinstance(value, dict) else None
+    model_currency = value.get("currency") if isinstance(value, dict) else None
+
+    payload["normalized_amount"] = (
+        model_amount
+        if isinstance(model_amount, str) and parsed_amount == model_amount
+        else None
+    )
+    payload["currency"] = (
+        model_currency
+        if isinstance(model_currency, str)
+        and model_currency in supported_currency_codes()
+        and model_currency in parsed_currency_candidates
+        else None
+    )
+    return payload
+
+
+def standardized_date_payload(
+    value: object,
+    tag_details: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    """Return evidence payload plus validated normalized date field."""
+    evidence_tag_ids = single_value_evidence_tag_ids(value)
+    payload = cluster_payload(evidence_tag_ids, tag_details)
+    evidence_text = canonical_value(evidence_tag_ids, tag_details)
+    parsed_date = normalized_date_from_text(evidence_text)
+    model_date = value.get("normalized_date") if isinstance(value, dict) else None
+    payload["normalized_date"] = (
+        model_date
+        if isinstance(model_date, str) and model_date == parsed_date
+        else None
+    )
+    return payload
 
 
 def cluster_payload(

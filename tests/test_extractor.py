@@ -190,6 +190,139 @@ def test_extract_tables_returns_instrument_mentions(tmp_path: Path) -> None:
     assert (tmp_path / "extractor_runs").exists()
 
 
+def test_extract_tables_persists_validated_normalized_amount_and_dates(
+    tmp_path: Path,
+) -> None:
+    """Extractor should store normalized values in columns and evidence JSON."""
+    item_rows = pd.DataFrame(
+        [
+            {
+                "item_id": "normalized-1",
+                "item": "8.01",
+                "accession_number": "normalized-acc",
+                "cik": "320193",
+                "url": "https://sec.example/normalized",
+                "text": (
+                    "On January 2, 2024, the Company entered into the Term Loan "
+                    "for $100 million."
+                ),
+                "date": "2024-01-02",
+                "relevance": True,
+            }
+        ]
+    )
+    client = FakeChatClient(
+        {
+            "ner": (
+                "<body>On <date>January 2, 2024</date>, the Company entered into "
+                "the <debt_instrument>Term Loan</debt_instrument> for "
+                "<amount>$100 million</amount>.</body>"
+            ),
+            "instrument_ie": json.dumps(
+                [
+                    {
+                        "name": ["tag-2"],
+                        "start_date": {
+                            "evidence": ["tag-1"],
+                            "normalized_date": "2024-01-02",
+                        },
+                        "amount": {
+                            "evidence": ["tag-3"],
+                            "normalized_amount": "100000000",
+                            "currency": "USD",
+                        },
+                    }
+                ]
+            ),
+            "instrument_relation": "[]",
+        }
+    )
+
+    mentions = extract_tables(item_rows, data_dir=tmp_path, client=client)[
+        "debt_instrument_mentions"
+    ]
+
+    assert len(mentions) == 1
+    mention = mentions.iloc[0]
+    assert mention["start_date"] == "2024-01-02"
+    assert mention["amount"] == "100000000"
+    start_payload = json.loads(str(mention["start_date_corefs_json"]))
+    amount_payload = json.loads(str(mention["amount_corefs_json"]))
+    mention_payload = json.loads(str(mention["instrument_mention_json"]))
+    assert start_payload["mentions"][0]["text"] == "January 2, 2024"
+    assert start_payload["normalized_date"] == "2024-01-02"
+    assert amount_payload["mentions"][0]["text"] == "$100 million"
+    assert amount_payload["normalized_amount"] == "100000000"
+    assert amount_payload["currency"] == "USD"
+    assert mention_payload["amount"]["normalized_amount"] == "100000000"
+    assert mention_payload["start_date"]["normalized_date"] == "2024-01-02"
+
+
+def test_extract_tables_nulls_invalid_normalized_values_but_keeps_evidence(
+    tmp_path: Path,
+) -> None:
+    """Invalid standardization should not fail extraction, only null the fields."""
+    item_rows = pd.DataFrame(
+        [
+            {
+                "item_id": "normalized-2",
+                "item": "8.01",
+                "accession_number": "normalized-acc-2",
+                "cik": "320193",
+                "url": "https://sec.example/normalized-2",
+                "text": (
+                    "On January 2, 2024, the Company entered into the Term Loan "
+                    "for $100 million."
+                ),
+                "date": "2024-01-02",
+                "relevance": True,
+            }
+        ]
+    )
+    client = FakeChatClient(
+        {
+            "ner": (
+                "<body>On <date>January 2, 2024</date>, the Company entered into "
+                "the <debt_instrument>Term Loan</debt_instrument> for "
+                "<amount>$100 million</amount>.</body>"
+            ),
+            "instrument_ie": json.dumps(
+                [
+                    {
+                        "name": ["tag-2"],
+                        "start_date": {
+                            "evidence": ["tag-1"],
+                            "normalized_date": "2024-02-02",
+                        },
+                        "amount": {
+                            "evidence": ["tag-3"],
+                            "normalized_amount": "100",
+                            "currency": "ZZZ",
+                        },
+                    }
+                ]
+            ),
+            "instrument_relation": "[]",
+        }
+    )
+
+    mentions = extract_tables(item_rows, data_dir=tmp_path, client=client)[
+        "debt_instrument_mentions"
+    ]
+
+    assert len(mentions) == 1
+    mention = mentions.iloc[0]
+    assert mention["start_date"] is None
+    assert mention["amount"] is None
+    start_payload = json.loads(str(mention["start_date_corefs_json"]))
+    amount_payload = json.loads(str(mention["amount_corefs_json"]))
+    assert start_payload["mentions"][0]["text"] == "January 2, 2024"
+    assert start_payload["normalized_date"] is None
+    assert amount_payload["mentions"][0]["text"] == "$100 million"
+    assert amount_payload["normalized_amount"] is None
+    assert amount_payload["currency"] is None
+
+
 def test_extract_tables_skips_relation_for_single_mention(tmp_path: Path) -> None:
     """Relation stage should be skipped when only one mention cluster is found."""
     client = single_mention_client()
@@ -252,6 +385,80 @@ def test_extract_tables_retries_after_malformed_name_cluster(tmp_path: Path) -> 
     ]
 
     assert len(mentions) == 2
+    assert client.stage_attempts["instrument_ie"] == 2
+
+
+def test_extract_tables_retries_after_invalid_standardized_shape(
+    tmp_path: Path,
+) -> None:
+    """Malformed standardized values should fail validation and retry."""
+    item_rows = pd.DataFrame(
+        [
+            {
+                "item_id": "normalized-3",
+                "item": "8.01",
+                "accession_number": "normalized-acc-3",
+                "cik": "320193",
+                "url": "https://sec.example/normalized-3",
+                "text": (
+                    "On January 2, 2024, the Original Loan was issued for "
+                    "$100 million."
+                ),
+                "date": "2024-01-02",
+                "relevance": True,
+            }
+        ]
+    )
+    client = FakeChatClient(
+        {
+            "ner": (
+                "<body>On <date>January 2, 2024</date>, the "
+                "<debt_instrument>Original Loan</debt_instrument> was issued for "
+                "<amount>$100 million</amount>.</body>"
+            ),
+            "instrument_ie": [
+                json.dumps(
+                    [
+                        {
+                            "name": ["tag-2"],
+                            "start_date": {
+                                "evidence": ["tag-1"],
+                                "normalized_date": "2024/01/02",
+                            },
+                            "amount": {
+                                "evidence": ["tag-3"],
+                                "normalized_amount": "100,000,000",
+                                "currency": "usd",
+                            },
+                        }
+                    ]
+                ),
+                json.dumps(
+                    [
+                        {
+                            "name": ["tag-2"],
+                            "start_date": {
+                                "evidence": ["tag-1"],
+                                "normalized_date": "2024-01-02",
+                            },
+                            "amount": {
+                                "evidence": ["tag-3"],
+                                "normalized_amount": "100000000",
+                                "currency": "USD",
+                            },
+                        }
+                    ]
+                ),
+            ],
+            "instrument_relation": "[]",
+        }
+    )
+
+    mentions = extract_tables(item_rows, data_dir=tmp_path, client=client)[
+        "debt_instrument_mentions"
+    ]
+
+    assert len(mentions) == 1
     assert client.stage_attempts["instrument_ie"] == 2
 
 
@@ -333,8 +540,10 @@ def test_extract_pending_items_updates_sqlite_idempotently(tmp_path: Path) -> No
     assert Path(item_row[3]).joinpath("full.jsonl").exists()
     assert len(mention_rows) == 2
     assert all(row[0].startswith("dim::") for row in mention_rows)
-    assert mention_rows[0][1] is None
-    assert mention_rows[1][1] == mention_rows[0][0]
+    mention_ids = {row[0] for row in mention_rows}
+    amendment_targets = [row[1] for row in mention_rows]
+    assert amendment_targets.count(None) == 1
+    assert len([target for target in amendment_targets if target in mention_ids]) == 1
 
 
 def test_extract_pending_items_force_replaces_existing_mentions(tmp_path: Path) -> None:
