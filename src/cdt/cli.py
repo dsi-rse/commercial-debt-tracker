@@ -506,7 +506,9 @@ def run_matcher(args: argparse.Namespace) -> int:
     except Exception:
         logger.exception("Matcher failed")
         return 1
-    print(f"Matched {len(tables['instrument_mentions'])} instrument mention rows.")
+    print(
+        f"Matched {len(tables['debt_instrument_mentions'])} debt instrument mention rows."
+    )
     print(f"Updated {cdt_db_path()}.")
     return 0
 

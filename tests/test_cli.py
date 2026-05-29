@@ -353,7 +353,7 @@ def test_extractor_cli_calls_pending_extractor(
                 "max_attempts": max_attempts,
             }
         )
-        return pd.DataFrame([{"instrument_mention_id": "m-1"}])
+        return pd.DataFrame([{"debt_instrument_mention_id": "m-1"}])
 
     monkeypatch.setattr(cli, "extract_pending_items", fake_extract_pending_items)
 
@@ -403,8 +403,10 @@ def test_matcher_cli_calls_pending_matcher(
             }
         )
         return {
-            "instrument_mentions": pd.DataFrame([{"instrument_mention_id": "m-1"}]),
-            "debt_instruments": pd.DataFrame([{"debt_instrument_id": "di-1"}]),
+            "debt_instrument_mentions": pd.DataFrame(
+                [{"debt_instrument_mention_id": "m-1"}]
+            ),
+            "debt_instrument": pd.DataFrame([{"debt_instrument_id": "di-1"}]),
         }
 
     monkeypatch.setattr(cli, "match_pending_mentions", fake_match_pending_mentions)

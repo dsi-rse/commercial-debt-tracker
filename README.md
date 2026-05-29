@@ -116,7 +116,7 @@ Reruns are idempotent and skip rows already marked classified unless `--force` i
 
 ### LLM Extraction
 
-`cdt extractor` processes item rows that have already been classified as relevant. It reads pending rows from `cdt.sqlite`, loads the corresponding item text from the recorded item batch Parquet file, runs an OpenRouter-backed three-stage workflow (`ner`, `instrument_ie`, `instrument_relation`), persists extracted `instrument_mentions` into SQLite, and writes a per-run `full.jsonl` audit log.
+`cdt extractor` processes item rows that have already been classified as relevant. It reads pending rows from `cdt.sqlite`, loads the corresponding item text from the recorded item batch Parquet file, runs an OpenRouter-backed three-stage workflow (`ner`, `instrument_ie`, `instrument_relation`), persists extracted `debt_instrument_mentions` into SQLite, and writes a per-run `full.jsonl` audit log.
 
 Set the following environment variables in `.env` before running the extractor:
 
@@ -162,11 +162,11 @@ On failure, each processed item row is updated with:
 - `extractor_error`
 - the same extractor metadata fields for auditability
 
-Extractor outputs are persisted to the SQLite `instrument_mentions` table. These rows are mention-level outputs only. They are not canonical instruments, and they should not be interpreted as consolidated entities across items or filings. A later stage will resolve and consolidate mentions into actual instruments.
+Extractor outputs are persisted to the SQLite `debt_instrument_mentions` table. These rows are mention-level outputs only. They are not canonical instruments, and they should not be interpreted as consolidated entities across items or filings. A later stage will resolve and consolidate mentions into actual instruments.
 
-Each `instrument_mentions` row stores:
+Each `debt_instrument_mentions` row stores:
 
-- stable mention identity: `instrument_mention_id`, `item_id`, `raw_id`
+- stable mention identity: `debt_instrument_mention_id`, `item_id`, `raw_id`
 - scalar mention properties: `name`, `start_date`, `end_date`, `amount`
 - mention lineage links: `amendment_of`, `split_of`
 - JSON payloads for richer mention data and audit details:
@@ -184,11 +184,11 @@ The extractor writes run artifacts under:
 $DATA_DIR/extractor_runs/run-*/full.jsonl
 ```
 
-`full.jsonl` contains per-item attempt history, raw stage responses, final status, and the extracted `instrument_mentions` payload used to populate SQLite.
+`full.jsonl` contains per-item attempt history, raw stage responses, final status, and the extracted `debt_instrument_mentions` payload used to populate SQLite.
 
 ### Matcher
 
-`cdt matcher` groups extracted `instrument_mentions` into logical `debt_instruments`. Matching is conservative and same-issuer only: the stage normalizes `amount` and `start_date`, compares mentions within the same `cik`, uses lender string similarity as the final merge check, and treats direct `amendment_of` and `split_of` relations as one-hop alternate match surfaces.
+`cdt matcher` groups extracted `debt_instrument_mentions` into logical `debt_instrument` rows. Matching is conservative and same-issuer only: the stage compares mentions only within the same `cik`, derives direct mention matches first, and then builds amendment and split parent links between matched debt instruments.
 
 Run matching with:
 
@@ -200,15 +200,34 @@ Useful flags:
 
 - `--force`: recompute matcher outputs for all extracted mentions
 
-By default, matcher reruns are idempotent and skip work when no `instrument_mentions` remain with a null matcher status.
+By default, matcher reruns are idempotent and skip work when no `debt_instrument_mentions` remain with a null matcher status.
+
+Matcher decision rules:
+
+- Primary auto-match path:
+  - exact normalized `amount`
+  - exact normalized `start_date`
+  - usable lender evidence on both sides
+  - lender string similarity above the strong match threshold
+- Fallback auto-match path, used only when lender evidence is missing or generic on at least one side:
+  - exact normalized `amount`
+  - exact normalized `start_date`
+  - exact normalized debt-name fingerprint
+  - compatible `end_date` values
+    - equal when both are present
+    - otherwise one side may be null
+- Loose candidates are recorded, not merged, when amount and start date match but the primary lender-similarity path does not clear the strong threshold.
+
+Lender evidence is treated as unusable when it is empty or only contains generic role labels such as `lender`, `lenders`, `purchaser`, `purchasers`, `holder`, `holders`, `investor`, `investors`, `buyer`, `buyers`, `noteholder`, `noteholders`, `trustee`, or `trustees`. These generic labels do not count as real counterparty identity for direct matching.
 
 Matcher writes to:
 
-- SQLite `debt_instruments`, one row per consolidated logical instrument
-- additional `instrument_mentions` columns:
+- SQLite `debt_instrument`, one row per matched debt-instrument state
+- SQLite view `active_debt_instruments`, which returns terminal current rows only and adds a computed `mentions_json`
+- additional `debt_instrument_mentions` columns:
   - `debt_instrument_id`
   - `matcher_status = singleton | matched | ambiguous`
   - `matched_at`
   - `potential_matches_json`
 
-`potential_matches_json` stores loose candidates that matched on normalized amount and start date but did not meet the lender-similarity threshold for an automatic merge.
+`potential_matches_json` stores loose candidates that matched on normalized amount and start date but did not meet the automatic-merge rules.

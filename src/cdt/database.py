@@ -23,7 +23,7 @@ ITEM_EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
     ("extractor_run_path", "TEXT"),
     ("extractor_error", "TEXT"),
 )
-INSTRUMENT_MENTION_EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
+DEBT_INSTRUMENT_MENTION_EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
     ("debt_instrument_id", "TEXT"),
     ("matcher_status", "TEXT"),
     ("matched_at", "TEXT"),
@@ -48,8 +48,8 @@ CREATE TABLE IF NOT EXISTS items (
     status TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS instrument_mentions (
-    instrument_mention_id TEXT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS debt_instrument_mentions (
+    debt_instrument_mention_id TEXT PRIMARY KEY,
     item_id TEXT NOT NULL,
     raw_id TEXT NOT NULL,
     name TEXT,
@@ -72,10 +72,20 @@ CREATE TABLE IF NOT EXISTS instrument_mentions (
     updated_at TEXT NOT NULL,
     FOREIGN KEY(item_id) REFERENCES items(item_id)
 );
-CREATE TABLE IF NOT EXISTS debt_instruments (
+CREATE TABLE IF NOT EXISTS debt_instrument (
     debt_instrument_id TEXT PRIMARY KEY,
     cik TEXT NOT NULL,
-    created_from_mention_id TEXT NOT NULL,
+    seed_debt_instrument_mention_id TEXT NOT NULL,
+    amendment_of_debt_instrument_id TEXT,
+    split_of_debt_instrument_id TEXT,
+    name TEXT,
+    start_date TEXT,
+    end_date TEXT,
+    amount TEXT,
+    direct_mentions_json TEXT NOT NULL,
+    lenders_json TEXT NOT NULL,
+    other_interested_parties_json TEXT NOT NULL,
+    possibly_related_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -84,8 +94,66 @@ CREATE INDEX IF NOT EXISTS idx_documents_date ON documents(date);
 CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status);
 CREATE INDEX IF NOT EXISTS idx_items_accession_number ON items(accession_number);
 CREATE INDEX IF NOT EXISTS idx_items_status ON items(status);
-CREATE INDEX IF NOT EXISTS idx_instrument_mentions_item_id ON instrument_mentions(item_id);
-CREATE INDEX IF NOT EXISTS idx_debt_instruments_cik ON debt_instruments(cik);
+CREATE INDEX IF NOT EXISTS idx_debt_instrument_mentions_item_id ON debt_instrument_mentions(item_id);
+CREATE INDEX IF NOT EXISTS idx_debt_instrument_mentions_matcher_status ON debt_instrument_mentions(matcher_status);
+CREATE INDEX IF NOT EXISTS idx_debt_instrument_mentions_debt_instrument_id ON debt_instrument_mentions(debt_instrument_id);
+CREATE INDEX IF NOT EXISTS idx_debt_instrument_cik ON debt_instrument(cik);
+CREATE INDEX IF NOT EXISTS idx_debt_instrument_amendment_of ON debt_instrument(amendment_of_debt_instrument_id);
+CREATE INDEX IF NOT EXISTS idx_debt_instrument_split_of ON debt_instrument(split_of_debt_instrument_id);
+"""
+ACTIVE_DEBT_INSTRUMENT_VIEW_SQL = """
+CREATE VIEW active_debt_instruments AS
+WITH RECURSIVE
+active_rows AS (
+    SELECT debt_instrument.*
+    FROM debt_instrument
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM debt_instrument AS child
+        WHERE child.amendment_of_debt_instrument_id = debt_instrument.debt_instrument_id
+           OR child.split_of_debt_instrument_id = debt_instrument.debt_instrument_id
+    )
+),
+lineage(active_debt_instrument_id, current_debt_instrument_id) AS (
+    SELECT debt_instrument_id, debt_instrument_id
+    FROM active_rows
+    UNION ALL
+    SELECT
+        lineage.active_debt_instrument_id,
+        parent.debt_instrument_id
+    FROM lineage
+    JOIN debt_instrument AS current
+      ON current.debt_instrument_id = lineage.current_debt_instrument_id
+    JOIN debt_instrument AS parent
+      ON parent.debt_instrument_id = COALESCE(
+            current.amendment_of_debt_instrument_id,
+            current.split_of_debt_instrument_id
+         )
+),
+lineage_mentions AS (
+    SELECT
+        lineage.active_debt_instrument_id,
+        json_each.value AS debt_instrument_mention_id
+    FROM lineage
+    JOIN debt_instrument AS member
+      ON member.debt_instrument_id = lineage.current_debt_instrument_id
+    JOIN json_each(member.direct_mentions_json)
+)
+SELECT
+    active_rows.*,
+    COALESCE(
+        (
+            SELECT json_group_array(mention_id)
+            FROM (
+                SELECT DISTINCT lineage_mentions.debt_instrument_mention_id AS mention_id
+                FROM lineage_mentions
+                WHERE lineage_mentions.active_debt_instrument_id = active_rows.debt_instrument_id
+                ORDER BY mention_id
+            )
+        ),
+        '[]'
+    ) AS mentions_json
+FROM active_rows;
 """
 
 
@@ -102,10 +170,16 @@ def connect_cdt_db(path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(SQLITE_SCHEMA)
     ensure_item_columns(conn)
-    ensure_instrument_mention_columns(conn)
-    ensure_matcher_indexes(conn)
+    ensure_debt_instrument_mention_columns(conn)
+    ensure_active_debt_instruments_view(conn)
     conn.commit()
     return conn
+
+
+def ensure_active_debt_instruments_view(conn: sqlite3.Connection) -> None:
+    """Recreate the active debt instrument view."""
+    conn.execute("DROP VIEW IF EXISTS active_debt_instruments")
+    conn.executescript(ACTIVE_DEBT_INSTRUMENT_VIEW_SQL)
 
 
 def timestamp() -> str:
@@ -396,8 +470,8 @@ def mark_documents_itemized(
     conn: sqlite3.Connection, accessions: Iterable[str]
 ) -> None:
     """Mark source documents as itemized."""
-    accessions = list(accessions)
-    if not accessions:
+    accession_list = list(accessions)
+    if not accession_list:
         return
     updated_at = timestamp()
     conn.executemany(
@@ -407,7 +481,7 @@ def mark_documents_itemized(
             updated_at = ?
         WHERE accession_number = ?
         """,
-        [(updated_at, accession) for accession in accessions],
+        [(updated_at, accession) for accession in accession_list],
     )
     conn.commit()
 
@@ -462,8 +536,8 @@ def mark_items_extracted(
     extractor_run_path: str,
 ) -> None:
     """Persist successful extraction metadata for item rows."""
-    item_ids = list(item_ids)
-    if not item_ids:
+    item_id_list = list(item_ids)
+    if not item_id_list:
         return
     extracted_at = timestamp()
     conn.executemany(
@@ -487,7 +561,7 @@ def mark_items_extracted(
                 extracted_at,
                 item_id,
             )
-            for item_id in item_ids
+            for item_id in item_id_list
         ],
     )
     conn.commit()
@@ -534,17 +608,17 @@ def mark_items_extraction_failed(
     conn.commit()
 
 
-def replace_instrument_mentions(
+def replace_debt_instrument_mentions(
     conn: sqlite3.Connection,
     item_id: str,
     rows: Iterable[dict[str, object]],
 ) -> None:
-    """Replace all extracted instrument mentions for one item."""
+    """Replace all extracted debt instrument mentions for one item."""
     updated_at = timestamp()
-    conn.execute("DELETE FROM instrument_mentions WHERE item_id = ?", (item_id,))
+    conn.execute("DELETE FROM debt_instrument_mentions WHERE item_id = ?", (item_id,))
     payload = [
         (
-            str(row["instrument_mention_id"]),
+            str(row["debt_instrument_mention_id"]),
             item_id,
             str(row["raw_id"]),
             row.get("name"),
@@ -571,8 +645,8 @@ def replace_instrument_mentions(
     if payload:
         conn.executemany(
             """
-            INSERT INTO instrument_mentions (
-                instrument_mention_id,
+            INSERT INTO debt_instrument_mentions (
+                debt_instrument_mention_id,
                 item_id,
                 raw_id,
                 name,
@@ -610,29 +684,18 @@ def ensure_item_columns(conn: sqlite3.Connection) -> None:
         conn.execute(f"ALTER TABLE items ADD COLUMN {column_name} {column_type}")
 
 
-def ensure_instrument_mention_columns(conn: sqlite3.Connection) -> None:
-    """Add optional matcher columns to the instrument_mentions table when missing."""
+def ensure_debt_instrument_mention_columns(conn: sqlite3.Connection) -> None:
+    """Add optional matcher columns to the mention table when missing."""
     existing_columns = {
-        str(row[1]) for row in conn.execute("PRAGMA table_info(instrument_mentions)")
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(debt_instrument_mentions)")
     }
-    for column_name, column_type in INSTRUMENT_MENTION_EXTRA_COLUMNS:
+    for column_name, column_type in DEBT_INSTRUMENT_MENTION_EXTRA_COLUMNS:
         if column_name in existing_columns:
             continue
         conn.execute(
-            f"ALTER TABLE instrument_mentions ADD COLUMN {column_name} {column_type}"
+            f"ALTER TABLE debt_instrument_mentions ADD COLUMN {column_name} {column_type}"
         )
-
-
-def ensure_matcher_indexes(conn: sqlite3.Connection) -> None:
-    """Create matcher indexes after migration-added columns are present."""
-    conn.executescript(
-        """
-        CREATE INDEX IF NOT EXISTS idx_instrument_mentions_matcher_status
-        ON instrument_mentions(matcher_status);
-        CREATE INDEX IF NOT EXISTS idx_instrument_mentions_debt_instrument_id
-        ON instrument_mentions(debt_instrument_id);
-        """
-    )
 
 
 def read_matcher_mentions(
@@ -641,10 +704,10 @@ def read_matcher_mentions(
     pending_only: bool = True,
     limit: int | None = None,
 ) -> list[dict[str, object]]:
-    """Read instrument mentions with issuer and filing context for matcher processing."""
+    """Read debt instrument mentions with issuer and filing context."""
     query = [
         "SELECT",
-        "    mention.instrument_mention_id,",
+        "    mention.debt_instrument_mention_id,",
         "    mention.item_id,",
         "    mention.raw_id,",
         "    mention.name,",
@@ -667,7 +730,7 @@ def read_matcher_mentions(
         "    item.accession_number,",
         "    document.cik,",
         "    document.date",
-        "FROM instrument_mentions AS mention",
+        "FROM debt_instrument_mentions AS mention",
         "JOIN items AS item ON item.item_id = mention.item_id",
         "JOIN documents AS document ON document.accession_number = item.accession_number",
     ]
@@ -683,7 +746,7 @@ def read_matcher_mentions(
     rows = conn.execute("\n".join(query), params)
     return [
         {
-            "instrument_mention_id": row[0],
+            "debt_instrument_mention_id": row[0],
             "item_id": row[1],
             "raw_id": row[2],
             "name": row[3],
@@ -721,7 +784,7 @@ def clear_matcher_assignments(
     if mention_list is None:
         conn.execute(
             """
-            UPDATE instrument_mentions
+            UPDATE debt_instrument_mentions
             SET debt_instrument_id = NULL,
                 matcher_status = NULL,
                 matched_at = NULL,
@@ -733,31 +796,41 @@ def clear_matcher_assignments(
     elif mention_list:
         conn.executemany(
             """
-            UPDATE instrument_mentions
+            UPDATE debt_instrument_mentions
             SET debt_instrument_id = NULL,
                 matcher_status = NULL,
                 matched_at = NULL,
                 potential_matches_json = NULL,
                 updated_at = ?
-            WHERE instrument_mention_id = ?
+            WHERE debt_instrument_mention_id = ?
             """,
             [(updated_at, mention_id) for mention_id in mention_list],
         )
     conn.commit()
 
 
-def replace_debt_instruments(
+def replace_debt_instrument_rows(
     conn: sqlite3.Connection,
-    rows: Iterable[dict[str, str]],
+    rows: Iterable[dict[str, object]],
 ) -> None:
-    """Replace all debt instruments with a deterministic payload."""
+    """Replace all debt instrument rows."""
     updated_at = timestamp()
-    conn.execute("DELETE FROM debt_instruments")
+    conn.execute("DELETE FROM debt_instrument")
     payload = [
         (
-            row["debt_instrument_id"],
-            row["cik"],
-            row["created_from_mention_id"],
+            str(row["debt_instrument_id"]),
+            str(row["cik"]),
+            str(row["seed_debt_instrument_mention_id"]),
+            row.get("amendment_of_debt_instrument_id"),
+            row.get("split_of_debt_instrument_id"),
+            row.get("name"),
+            row.get("start_date"),
+            row.get("end_date"),
+            row.get("amount"),
+            str(row["direct_mentions_json"]),
+            str(row["lenders_json"]),
+            str(row["other_interested_parties_json"]),
+            str(row["possibly_related_json"]),
             updated_at,
             updated_at,
         )
@@ -766,17 +839,28 @@ def replace_debt_instruments(
     if payload:
         conn.executemany(
             """
-            INSERT INTO debt_instruments (
+            INSERT INTO debt_instrument (
                 debt_instrument_id,
                 cik,
-                created_from_mention_id,
+                seed_debt_instrument_mention_id,
+                amendment_of_debt_instrument_id,
+                split_of_debt_instrument_id,
+                name,
+                start_date,
+                end_date,
+                amount,
+                direct_mentions_json,
+                lenders_json,
+                other_interested_parties_json,
+                possibly_related_json,
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             payload,
         )
+    ensure_active_debt_instruments_view(conn)
     conn.commit()
 
 
@@ -784,7 +868,7 @@ def update_matcher_results(
     conn: sqlite3.Connection,
     rows: Iterable[dict[str, object]],
 ) -> None:
-    """Persist matcher outputs for instrument mentions."""
+    """Persist matcher outputs for debt instrument mentions."""
     matched_at = timestamp()
     payload = [
         (
@@ -793,7 +877,7 @@ def update_matcher_results(
             matched_at,
             row["potential_matches_json"],
             matched_at,
-            row["instrument_mention_id"],
+            row["debt_instrument_mention_id"],
         )
         for row in rows
     ]
@@ -801,13 +885,13 @@ def update_matcher_results(
         return
     conn.executemany(
         """
-        UPDATE instrument_mentions
+        UPDATE debt_instrument_mentions
         SET debt_instrument_id = ?,
             matcher_status = ?,
             matched_at = ?,
             potential_matches_json = ?,
             updated_at = ?
-        WHERE instrument_mention_id = ?
+        WHERE debt_instrument_mention_id = ?
         """,
         payload,
     )

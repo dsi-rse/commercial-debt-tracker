@@ -143,7 +143,17 @@ def test_connect_cdt_db_migrates_item_columns(tmp_path: Path) -> None:
     finally:
         conn.close()
 
-    assert {"label", "relevance", "classification_score", "classified_at"} <= columns
+    assert {
+        "label",
+        "relevance",
+        "classification_score",
+        "classified_at",
+        "extracted_at",
+        "extractor_model",
+        "extractor_reasoning",
+        "extractor_run_path",
+        "extractor_error",
+    } <= columns
 
 
 def test_classify_pending_items_updates_sqlite_idempotently(

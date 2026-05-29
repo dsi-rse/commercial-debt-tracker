@@ -12,7 +12,7 @@ import pandas as pd
 
 from cdt.database import cdt_db_path, connect_cdt_db, upsert_items
 from cdt.extractor import (
-    INSTRUMENT_MENTION_COLUMNS,
+    DEBT_INSTRUMENT_MENTION_COLUMNS,
     extract_pending_items,
     extract_tables,
 )
@@ -180,13 +180,13 @@ def test_extract_tables_returns_instrument_mentions(tmp_path: Path) -> None:
         client=successful_client(),
     )
 
-    mentions = tables["instrument_mentions"]
-    assert mentions.columns.tolist() == INSTRUMENT_MENTION_COLUMNS
-    assert mentions["instrument_mention_id"].to_list() == [
-        "000114036126006577-8-01--i-1",
-        "000114036126006577-8-01--i-2",
-    ]
-    assert mentions["amendment_of"].to_list() == [None, "000114036126006577-8-01--i-1"]
+    mentions = tables["debt_instrument_mentions"]
+    assert mentions.columns.tolist() == DEBT_INSTRUMENT_MENTION_COLUMNS
+    ids = mentions["debt_instrument_mention_id"].to_list()
+    assert len(ids) == 2
+    assert all(identifier.startswith("dim::") for identifier in ids)
+    assert ids[0] != ids[1]
+    assert mentions["amendment_of"].to_list() == [None, ids[0]]
     assert (tmp_path / "extractor_runs").exists()
 
 
@@ -198,7 +198,7 @@ def test_extract_tables_skips_relation_for_single_mention(tmp_path: Path) -> Non
 
     tables = extract_tables(item_rows, data_dir=tmp_path, client=client)
 
-    mentions = tables["instrument_mentions"]
+    mentions = tables["debt_instrument_mentions"]
     assert len(mentions) == 1
     assert "instrument_relation" not in client.calls
 
@@ -222,7 +222,7 @@ def test_extract_tables_retries_after_validation_failure(tmp_path: Path) -> None
     )
 
     mentions = extract_tables(build_item_rows(), data_dir=tmp_path, client=client)[
-        "instrument_mentions"
+        "debt_instrument_mentions"
     ]
 
     assert len(mentions) == 2
@@ -248,7 +248,7 @@ def test_extract_tables_retries_after_malformed_name_cluster(tmp_path: Path) -> 
     )
 
     mentions = extract_tables(build_item_rows(), data_dir=tmp_path, client=client)[
-        "instrument_mentions"
+        "debt_instrument_mentions"
     ]
 
     assert len(mentions) == 2
@@ -283,7 +283,7 @@ def test_extract_pending_items_marks_failures(tmp_path: Path) -> None:
             ("000114036126006577-8-01",),
         ).fetchone()
         mention_count = conn.execute(
-            "SELECT COUNT(*) FROM instrument_mentions WHERE item_id = ?",
+            "SELECT COUNT(*) FROM debt_instrument_mentions WHERE item_id = ?",
             ("000114036126006577-8-01",),
         ).fetchone()
     finally:
@@ -315,10 +315,10 @@ def test_extract_pending_items_updates_sqlite_idempotently(tmp_path: Path) -> No
         ).fetchone()
         mention_rows = conn.execute(
             """
-            SELECT instrument_mention_id, amendment_of
-            FROM instrument_mentions
+            SELECT debt_instrument_mention_id, amendment_of
+            FROM debt_instrument_mentions
             WHERE item_id = ?
-            ORDER BY instrument_mention_id
+            ORDER BY debt_instrument_mention_id
             """,
             ("000114036126006577-8-01",),
         ).fetchall()
@@ -331,10 +331,10 @@ def test_extract_pending_items_updates_sqlite_idempotently(tmp_path: Path) -> No
     assert item_row[1] == "openai/gpt-5.4"
     assert item_row[2] == "none"
     assert Path(item_row[3]).joinpath("full.jsonl").exists()
-    assert mention_rows == [
-        ("000114036126006577-8-01--i-1", None),
-        ("000114036126006577-8-01--i-2", "000114036126006577-8-01--i-1"),
-    ]
+    assert len(mention_rows) == 2
+    assert all(row[0].startswith("dim::") for row in mention_rows)
+    assert mention_rows[0][1] is None
+    assert mention_rows[1][1] == mention_rows[0][0]
 
 
 def test_extract_pending_items_force_replaces_existing_mentions(tmp_path: Path) -> None:
@@ -344,8 +344,8 @@ def test_extract_pending_items_force_replaces_existing_mentions(tmp_path: Path) 
     try:
         conn.execute(
             """
-            INSERT INTO instrument_mentions (
-                instrument_mention_id,
+            INSERT INTO debt_instrument_mentions (
+                debt_instrument_mention_id,
                 item_id,
                 raw_id,
                 name,
@@ -412,23 +412,21 @@ def test_extract_pending_items_force_replaces_existing_mentions(tmp_path: Path) 
     try:
         rows = conn.execute(
             """
-            SELECT instrument_mention_id
-            FROM instrument_mentions
+            SELECT debt_instrument_mention_id
+            FROM debt_instrument_mentions
             WHERE item_id = ?
-            ORDER BY instrument_mention_id
+            ORDER BY debt_instrument_mention_id
             """,
             ("000114036126006577-8-01",),
         ).fetchall()
     finally:
         conn.close()
 
-    assert rows == [
-        ("000114036126006577-8-01--i-1",),
-        ("000114036126006577-8-01--i-2",),
-    ]
+    assert len(rows) == 2
+    assert all(row[0].startswith("dim::") for row in rows)
 
 
-def test_connect_cdt_db_creates_instrument_mentions_table(tmp_path: Path) -> None:
+def test_connect_cdt_db_creates_debt_instrument_mentions_table(tmp_path: Path) -> None:
     """Connecting should create the extractor output table."""
     db_path = cdt_db_path(tmp_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -461,4 +459,4 @@ def test_connect_cdt_db_creates_instrument_mentions_table(tmp_path: Path) -> Non
     finally:
         conn.close()
 
-    assert "instrument_mentions" in tables
+    assert "debt_instrument_mentions" in tables

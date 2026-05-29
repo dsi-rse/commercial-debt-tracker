@@ -442,5 +442,5 @@ def test_extractor_returns_empty_tables_for_irrelevant_rows(tmp_path: Path) -> N
 
     tables = extract_tables(classified_items, data_dir=tmp_path)
 
-    assert list(tables) == ["instrument_mentions"]
-    assert tables["instrument_mentions"].empty
+    assert list(tables) == ["debt_instrument_mentions"]
+    assert tables["debt_instrument_mentions"].empty

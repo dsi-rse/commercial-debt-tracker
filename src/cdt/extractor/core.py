@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -26,7 +27,7 @@ from cdt.database import (
     mark_items_extracted,
     mark_items_extraction_failed,
     read_items,
-    replace_instrument_mentions,
+    replace_debt_instrument_mentions,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -43,8 +44,8 @@ INSTRUMENT_SINGLE_VALUE_PROPERTIES = {
     "name": {"debt_instrument"},
 }
 INSTRUMENT_RELATION_TYPES = {"amendment_of", "split_of"}
-INSTRUMENT_MENTION_COLUMNS = [
-    "instrument_mention_id",
+DEBT_INSTRUMENT_MENTION_COLUMNS = [
+    "debt_instrument_mention_id",
     "item_id",
     "raw_id",
     "name",
@@ -100,7 +101,7 @@ class ExtractionRowState:
     stage_name: str
     all_attempts: list[AttemptRecord] = field(default_factory=list)
     stage_responses: dict[str, str] = field(default_factory=dict)
-    instrument_mentions: list[dict[str, object]] = field(default_factory=list)
+    debt_instrument_mentions: list[dict[str, object]] = field(default_factory=list)
     ner_tagged_xml: str | None = None
     state: str | None = None
     current_attempt: AttemptRecord = field(init=False)
@@ -162,7 +163,7 @@ class ExtractionRowState:
             "accession_number": self.item_row.get("accession_number"),
             "item": self.item_row.get("item"),
             "stage_responses": self.stage_responses,
-            "instrument_mentions": self.instrument_mentions,
+            "debt_instrument_mentions": self.debt_instrument_mentions,
             "state": self.state,
             "attempts": attempts,
         }
@@ -443,15 +444,10 @@ class InstrumentIEStage:
         mention_entries = iter_instrument_entries(
             cast(list[dict[str, Any]], data), tag_details
         )
-        raw_to_global = {
-            raw_id_for(index): instrument_mention_id_for(row_state.item_id, index)
-            for index, _ in mention_entries
-        }
         mentions: list[dict[str, object]] = []
         for index, obj in mention_entries:
             raw_id = raw_id_for(index)
             mention_row: dict[str, object] = {
-                "instrument_mention_id": raw_to_global[raw_id],
                 "item_id": row_state.item_id,
                 "raw_id": raw_id,
                 "name": canonical_value(obj.get("name", []), tag_details),
@@ -488,8 +484,12 @@ class InstrumentIEStage:
                     sort_keys=True,
                 ),
             }
+            mention_row["debt_instrument_mention_id"] = debt_instrument_mention_id_for(
+                row_state.item_id,
+                mention_row,
+            )
             mention_payload = {
-                "instrument_mention_id": mention_row["instrument_mention_id"],
+                "debt_instrument_mention_id": mention_row["debt_instrument_mention_id"],
                 "raw_id": raw_id,
                 "name": cluster_payload(obj.get("name", []), tag_details),
                 "start_date": cluster_payload(obj.get("start_date", []), tag_details),
@@ -506,7 +506,7 @@ class InstrumentIEStage:
                 sort_keys=True,
             )
             mentions.append(mention_row)
-        row_state.instrument_mentions = mentions
+        row_state.debt_instrument_mentions = mentions
 
     def early_stop(self, row_state: ExtractionRowState) -> bool:
         return False
@@ -542,7 +542,7 @@ class InstrumentRelationStage:
         if not isinstance(data, list):
             return ["Output must be a JSON array of objects."]
         instrument_ids = {
-            str(mention["raw_id"]) for mention in row_state.instrument_mentions
+            str(mention["raw_id"]) for mention in row_state.debt_instrument_mentions
         }
         failures: list[str] = []
         for relation in data:
@@ -577,11 +577,12 @@ class InstrumentRelationStage:
             return
         data = json.loads(response)
         by_raw_id = {
-            str(mention["raw_id"]): mention for mention in row_state.instrument_mentions
+            str(mention["raw_id"]): mention
+            for mention in row_state.debt_instrument_mentions
         }
         raw_to_global = {
-            str(mention["raw_id"]): str(mention["instrument_mention_id"])
-            for mention in row_state.instrument_mentions
+            str(mention["raw_id"]): str(mention["debt_instrument_mention_id"])
+            for mention in row_state.debt_instrument_mentions
         }
         for relation in data:
             mention = by_raw_id.get(relation["from"])
@@ -667,18 +668,18 @@ def extract_pending_items(
                     )
                 )
                 append_audit_record(full_jsonl_path, row_state.to_audit_dict())
-                replace_instrument_mentions(
+                replace_debt_instrument_mentions(
                     conn,
                     row_state.item_id,
-                    row_state.instrument_mentions,
+                    row_state.debt_instrument_mentions,
                 )
                 if row_state.state == "SUCCESS":
                     successful_item_ids.append(row_state.item_id)
-                    if row_state.instrument_mentions:
+                    if row_state.debt_instrument_mentions:
                         processed_frames.append(
                             pd.DataFrame(
-                                row_state.instrument_mentions,
-                                columns=INSTRUMENT_MENTION_COLUMNS,
+                                row_state.debt_instrument_mentions,
+                                columns=DEBT_INSTRUMENT_MENTION_COLUMNS,
                             )
                         )
                 else:
@@ -715,9 +716,9 @@ def extract_pending_items(
         run_dir,
     )
     if not processed_frames:
-        return pd.DataFrame(columns=INSTRUMENT_MENTION_COLUMNS)
+        return pd.DataFrame(columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
     return pd.concat(processed_frames, ignore_index=True).reindex(
-        columns=INSTRUMENT_MENTION_COLUMNS
+        columns=DEBT_INSTRUMENT_MENTION_COLUMNS
     )
 
 
@@ -734,14 +735,22 @@ def extract_tables(
     """Run in-memory extraction and return instrument mention tables."""
     del force
     if classified_items.empty:
-        return {"instrument_mentions": pd.DataFrame(columns=INSTRUMENT_MENTION_COLUMNS)}
+        return {
+            "debt_instrument_mentions": pd.DataFrame(
+                columns=DEBT_INSTRUMENT_MENTION_COLUMNS
+            )
+        }
     relevant_items = (
         classified_items.loc[classified_items["relevance"].fillna(False)]
         if "relevance" in classified_items
         else classified_items
     )
     if relevant_items.empty:
-        return {"instrument_mentions": pd.DataFrame(columns=INSTRUMENT_MENTION_COLUMNS)}
+        return {
+            "debt_instrument_mentions": pd.DataFrame(
+                columns=DEBT_INSTRUMENT_MENTION_COLUMNS
+            )
+        }
     resolved_model = model or settings.EXTRACTOR_MODEL or DEFAULT_MODEL
     resolved_reasoning = normalize_reasoning_effort(reasoning_effort)
     resolved_client = client or OpenRouterChatClient()
@@ -760,7 +769,7 @@ def extract_tables(
         )
         append_audit_record(full_jsonl_path, row_state.to_audit_dict())
         if row_state.state == "SUCCESS":
-            rows.extend(row_state.instrument_mentions)
+            rows.extend(row_state.debt_instrument_mentions)
         else:
             LOGGER.warning(
                 "In-memory extractor failed for item %s: %s",
@@ -768,7 +777,9 @@ def extract_tables(
                 summarize_failure(row_state),
             )
     return {
-        "instrument_mentions": pd.DataFrame(rows, columns=INSTRUMENT_MENTION_COLUMNS)
+        "debt_instrument_mentions": pd.DataFrame(
+            rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS
+        )
     }
 
 
@@ -828,7 +839,7 @@ async def run_extraction_workflow(
                     return row_state
                 if (
                     stages[stage_index + 1].name == "instrument_relation"
-                    and len(row_state.instrument_mentions) <= 1
+                    and len(row_state.debt_instrument_mentions) <= 1
                 ):
                     row_state.finish("SUCCESS")
                     return row_state
@@ -952,9 +963,47 @@ def raw_id_for(index: int) -> str:
     return f"i-{index}"
 
 
-def instrument_mention_id_for(item_id: str, index: int) -> str:
-    """Return a stable persisted instrument-mention ID."""
-    return f"{item_id}--i-{index}"
+def debt_instrument_mention_id_for(
+    item_id: str,
+    mention_row: dict[str, object],
+) -> str:
+    """Return a stable persisted debt-instrument-mention ID."""
+    payload = {
+        "amount": mention_row.get("amount"),
+        "amount_corefs_json": normalize_json_text(
+            mention_row.get("amount_corefs_json")
+        ),
+        "end_date": mention_row.get("end_date"),
+        "end_date_corefs_json": normalize_json_text(
+            mention_row.get("end_date_corefs_json")
+        ),
+        "item_id": item_id,
+        "lenders_json": normalize_json_text(mention_row.get("lenders_json")),
+        "mention_corefs_json": normalize_json_text(
+            mention_row.get("mention_corefs_json")
+        ),
+        "name": mention_row.get("name"),
+        "other_interested_parties_json": normalize_json_text(
+            mention_row.get("other_interested_parties_json")
+        ),
+        "start_date": mention_row.get("start_date"),
+        "start_date_corefs_json": normalize_json_text(
+            mention_row.get("start_date_corefs_json")
+        ),
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:24]
+    return f"dim::{digest}"
+
+
+def normalize_json_text(value: object) -> str:
+    """Normalize one JSON-encoded payload for deterministic hashing."""
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, json.JSONDecodeError):
+        return str(value)
+    return json.dumps(parsed, sort_keys=True, separators=(",", ":"))
 
 
 def canonical_value(
@@ -1014,7 +1063,7 @@ def relation_prompt_xml(row_state: ExtractionRowState) -> str:
         raise ValueError("ner_tagged_xml is required for instrument_relation.")
     root, _, _ = parse_tag_details(row_state.ner_tagged_xml)
     tag_to_raw_id: dict[str, str] = {}
-    for mention in row_state.instrument_mentions:
+    for mention in row_state.debt_instrument_mentions:
         payload = json.loads(str(mention["mention_corefs_json"]))
         for tag_id in payload.get("tag_ids", []):
             tag_to_raw_id[str(tag_id)] = str(mention["raw_id"])

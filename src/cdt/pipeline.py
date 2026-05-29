@@ -39,12 +39,9 @@ def run_pipeline(config: PipelineConfig) -> dict[str, pd.DataFrame]:
     extracted = extract_tables(
         classified_items, data_dir=config.data_dir, force=config.force
     )
-    mentions = extracted["instrument_mentions"]
+    mentions = extracted["debt_instrument_mentions"]
     if mentions.empty:
-        return {
-            **extracted,
-            **match_tables(pd.DataFrame()),
-        }
+        return {**extracted, **match_tables(pd.DataFrame())}
     mention_context = classified_items[
         ["item_id", "accession_number", "cik", "date"]
     ].drop_duplicates()

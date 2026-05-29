@@ -72,28 +72,40 @@ def insert_mention(
     raw_id: str,
     name: str,
     start_date: str,
+    end_date: str | None = None,
     amount: str,
     lenders: list[str],
+    other_interested_parties: list[str] | None = None,
     amendment_of: str | None = None,
     split_of: str | None = None,
 ) -> None:
-    """Insert one instrument mention row."""
+    """Insert one debt instrument mention row."""
     conn = connect_cdt_db(cdt_db_path(tmp_path))
     try:
         lender_payload = json.dumps(
             [
                 {
-                    "tag_ids": [f"tag-{index}"],
-                    "mentions": [{"tag_id": f"tag-{index}", "text": lender}],
+                    "tag_ids": [f"tag-l-{index}"],
+                    "mentions": [{"tag_id": f"tag-l-{index}", "text": lender}],
                 }
                 for index, lender in enumerate(lenders, start=1)
             ],
             sort_keys=True,
         )
+        party_payload = json.dumps(
+            [
+                {
+                    "tag_ids": [f"tag-p-{index}"],
+                    "mentions": [{"tag_id": f"tag-p-{index}", "text": party}],
+                }
+                for index, party in enumerate(other_interested_parties or [], start=1)
+            ],
+            sort_keys=True,
+        )
         conn.execute(
             """
-            INSERT INTO instrument_mentions (
-                instrument_mention_id,
+            INSERT INTO debt_instrument_mentions (
+                debt_instrument_mention_id,
                 item_id,
                 raw_id,
                 name,
@@ -119,12 +131,12 @@ def insert_mention(
                 raw_id,
                 name,
                 start_date,
-                None,
+                end_date,
                 amount,
                 amendment_of,
                 split_of,
                 lender_payload,
-                "[]",
+                party_payload,
                 "{}",
                 "{}",
                 "{}",
@@ -139,7 +151,7 @@ def insert_mention(
 
 
 def test_connect_cdt_db_creates_matcher_schema(tmp_path: Path) -> None:
-    """Connecting should create matcher tables and columns."""
+    """Connecting should create matcher tables and active view."""
     db_path = cdt_db_path(tmp_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
@@ -154,25 +166,6 @@ def test_connect_cdt_db_creates_matcher_schema(tmp_path: Path) -> None:
                 status TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
-            CREATE TABLE instrument_mentions (
-                instrument_mention_id TEXT PRIMARY KEY,
-                item_id TEXT NOT NULL,
-                raw_id TEXT NOT NULL,
-                name TEXT,
-                start_date TEXT,
-                end_date TEXT,
-                amount TEXT,
-                amendment_of TEXT,
-                split_of TEXT,
-                lenders_json TEXT NOT NULL,
-                other_interested_parties_json TEXT NOT NULL,
-                mention_corefs_json TEXT NOT NULL,
-                start_date_corefs_json TEXT NOT NULL,
-                end_date_corefs_json TEXT NOT NULL,
-                amount_corefs_json TEXT NOT NULL,
-                instrument_mention_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
             """
         )
         conn.commit()
@@ -184,22 +177,25 @@ def test_connect_cdt_db_creates_matcher_schema(tmp_path: Path) -> None:
         tables = {
             row[0]
             for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
             )
         }
         mention_columns = {
-            row[1] for row in conn.execute("PRAGMA table_info(instrument_mentions)")
+            row[1]
+            for row in conn.execute("PRAGMA table_info(debt_instrument_mentions)")
+        }
+        instrument_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(debt_instrument)")
         }
     finally:
         conn.close()
 
-    assert "debt_instruments" in tables
-    assert {
-        "debt_instrument_id",
-        "matcher_status",
-        "matched_at",
-        "potential_matches_json",
-    } <= mention_columns
+    assert "debt_instrument_mentions" in tables
+    assert "debt_instrument" in tables
+    assert "active_debt_instruments" in tables
+    assert "debt_instrument_mention_id" in mention_columns
+    assert "direct_mentions_json" in instrument_columns
+    assert "mentions_json" not in instrument_columns
 
 
 def test_matcher_groups_exact_same_cik_mentions_and_skips_reruns(
@@ -222,7 +218,7 @@ def test_matcher_groups_exact_same_cik_mentions_and_skips_reruns(
     )
     insert_mention(
         tmp_path,
-        mention_id="0001-8-01--i-1",
+        mention_id="m-0001",
         item_id="0001-8-01",
         raw_id="i-1",
         name="Original Loan",
@@ -232,7 +228,7 @@ def test_matcher_groups_exact_same_cik_mentions_and_skips_reruns(
     )
     insert_mention(
         tmp_path,
-        mention_id="0002-8-01--i-1",
+        mention_id="m-0002",
         item_id="0002-8-01",
         raw_id="i-1",
         name="Term Loan",
@@ -246,69 +242,29 @@ def test_matcher_groups_exact_same_cik_mentions_and_skips_reruns(
 
     conn = connect_cdt_db(cdt_db_path(tmp_path))
     try:
-        rows = conn.execute(
+        mention_rows = conn.execute(
             """
-            SELECT instrument_mention_id, debt_instrument_id, matcher_status
-            FROM instrument_mentions
-            ORDER BY instrument_mention_id
+            SELECT debt_instrument_mention_id, debt_instrument_id, matcher_status
+            FROM debt_instrument_mentions
+            ORDER BY debt_instrument_mention_id
             """
         ).fetchall()
-        instruments = conn.execute(
-            "SELECT debt_instrument_id FROM debt_instruments ORDER BY debt_instrument_id"
+        instrument_rows = conn.execute(
+            """
+            SELECT debt_instrument_id, seed_debt_instrument_mention_id, direct_mentions_json
+            FROM debt_instrument
+            """
         ).fetchall()
     finally:
         conn.close()
 
-    assert len(first["instrument_mentions"]) == 2
-    assert second["instrument_mentions"].empty
-    assert rows == [
-        ("0001-8-01--i-1", "di::0001-8-01--i-1", "singleton"),
-        ("0002-8-01--i-1", "di::0001-8-01--i-1", "matched"),
+    assert len(first["debt_instrument_mentions"]) == 2
+    assert second["debt_instrument_mentions"].empty
+    assert mention_rows == [
+        ("m-0001", "m-0001", "singleton"),
+        ("m-0002", "m-0001", "matched"),
     ]
-    assert instruments == [("di::0001-8-01--i-1",)]
-
-
-def test_matcher_does_not_cross_match_different_ciks(tmp_path: Path) -> None:
-    """Equivalent terms across issuers should remain separate instruments."""
-    seed_document_and_item(
-        tmp_path,
-        accession_number="0001",
-        cik="320193",
-        item_id="0001-8-01",
-        date="2024-01-02",
-    )
-    seed_document_and_item(
-        tmp_path,
-        accession_number="0002",
-        cik="789019",
-        item_id="0002-8-01",
-        date="2024-01-03",
-    )
-    for item_id in ("0001-8-01", "0002-8-01"):
-        insert_mention(
-            tmp_path,
-            mention_id=f"{item_id}--i-1",
-            item_id=item_id,
-            raw_id="i-1",
-            name="Revolver",
-            start_date="2024-01-01",
-            amount="$50 million",
-            lenders=["Bank of America"],
-        )
-
-    match_pending_mentions(data_dir=tmp_path)
-
-    conn = connect_cdt_db(cdt_db_path(tmp_path))
-    try:
-        count = conn.execute("SELECT COUNT(*) FROM debt_instruments").fetchone()[0]
-        statuses = conn.execute(
-            "SELECT matcher_status FROM instrument_mentions ORDER BY instrument_mention_id"
-        ).fetchall()
-    finally:
-        conn.close()
-
-    assert count == 2
-    assert statuses == [("singleton",), ("singleton",)]
+    assert instrument_rows == [("m-0001", "m-0001", '["m-0001", "m-0002"]')]
 
 
 def test_matcher_records_loose_candidates_without_forcing_merge(tmp_path: Path) -> None:
@@ -329,7 +285,7 @@ def test_matcher_records_loose_candidates_without_forcing_merge(tmp_path: Path) 
     )
     insert_mention(
         tmp_path,
-        mention_id="0001-8-01--i-1",
+        mention_id="m-0001",
         item_id="0001-8-01",
         raw_id="i-1",
         name="Credit Facility",
@@ -339,7 +295,7 @@ def test_matcher_records_loose_candidates_without_forcing_merge(tmp_path: Path) 
     )
     insert_mention(
         tmp_path,
-        mention_id="0002-8-01--i-1",
+        mention_id="m-0002",
         item_id="0002-8-01",
         raw_id="i-1",
         name="Credit Facility",
@@ -355,8 +311,8 @@ def test_matcher_records_loose_candidates_without_forcing_merge(tmp_path: Path) 
         row = conn.execute(
             """
             SELECT matcher_status, potential_matches_json
-            FROM instrument_mentions
-            WHERE instrument_mention_id = '0002-8-01--i-1'
+            FROM debt_instrument_mentions
+            WHERE debt_instrument_mention_id = 'm-0002'
             """
         ).fetchone()
     finally:
@@ -366,7 +322,7 @@ def test_matcher_records_loose_candidates_without_forcing_merge(tmp_path: Path) 
     assert json.loads(row[1]) == [
         {
             "amount_match": True,
-            "debt_instrument_id": "di::0001-8-01--i-1",
+            "debt_instrument_id": "m-0001",
             "lender_similarity": 0.7619,
             "match_via": "self->self",
             "start_date_match": True,
@@ -374,8 +330,76 @@ def test_matcher_records_loose_candidates_without_forcing_merge(tmp_path: Path) 
     ]
 
 
-def test_matcher_uses_amendment_bridge_for_exact_terms(tmp_path: Path) -> None:
-    """Amendment lineage should provide an alternate match surface."""
+def test_matcher_falls_back_to_exact_name_when_lender_evidence_is_missing_or_generic(
+    tmp_path: Path,
+) -> None:
+    """Missing or generic lender evidence should still merge exact same note mentions."""
+    seed_document_and_item(
+        tmp_path,
+        accession_number="0001",
+        cik="1461755",
+        item_id="0001-8-01",
+        date="2020-08-21",
+    )
+    seed_document_and_item(
+        tmp_path,
+        accession_number="0002",
+        cik="1461755",
+        item_id="0002-8-01",
+        date="2020-12-04",
+    )
+    insert_mention(
+        tmp_path,
+        mention_id="dim::9e36b5bc2daf2c6f893d9d21",
+        item_id="0001-8-01",
+        raw_id="i-1",
+        name="5.50% Fixed to Floating Rate Subordinated Notes due 2030",
+        start_date="August 20, 2020",
+        end_date="September 1, 2025",
+        amount="$75.0 million",
+        lenders=["Purchasers"],
+    )
+    insert_mention(
+        tmp_path,
+        mention_id="dim::615353591b21b1b773f7806b",
+        item_id="0002-8-01",
+        raw_id="i-1",
+        name="5.5% fixed to floating rate subordinated notes due 2030",
+        start_date="2020-08-20",
+        amount="$75 million",
+        lenders=[],
+    )
+
+    match_pending_mentions(data_dir=tmp_path)
+
+    conn = connect_cdt_db(cdt_db_path(tmp_path))
+    try:
+        rows = conn.execute(
+            """
+            SELECT debt_instrument_mention_id, debt_instrument_id, matcher_status
+            FROM debt_instrument_mentions
+            ORDER BY debt_instrument_mention_id
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert rows == [
+        (
+            "dim::615353591b21b1b773f7806b",
+            "dim::9e36b5bc2daf2c6f893d9d21",
+            "matched",
+        ),
+        (
+            "dim::9e36b5bc2daf2c6f893d9d21",
+            "dim::9e36b5bc2daf2c6f893d9d21",
+            "singleton",
+        ),
+    ]
+
+
+def test_matcher_does_not_fallback_merge_distinct_series_names(tmp_path: Path) -> None:
+    """Exact amount and start date should not override distinct normalized names."""
     seed_document_and_item(
         tmp_path,
         accession_number="0001",
@@ -390,43 +414,250 @@ def test_matcher_uses_amendment_bridge_for_exact_terms(tmp_path: Path) -> None:
         item_id="0002-8-01",
         date="2024-01-03",
     )
+    insert_mention(
+        tmp_path,
+        mention_id="m-a2",
+        item_id="0001-8-01",
+        raw_id="i-1",
+        name="Class A-2 Asset Backed Notes",
+        start_date="2024-01-01",
+        amount="$100 million",
+        lenders=[],
+    )
+    insert_mention(
+        tmp_path,
+        mention_id="m-a3",
+        item_id="0002-8-01",
+        raw_id="i-1",
+        name="Class A-3 Asset Backed Notes",
+        start_date="2024-01-01",
+        amount="$100 million",
+        lenders=["Purchasers"],
+    )
+
+    match_pending_mentions(data_dir=tmp_path)
+
+    conn = connect_cdt_db(cdt_db_path(tmp_path))
+    try:
+        rows = conn.execute(
+            """
+            SELECT debt_instrument_mention_id, debt_instrument_id, matcher_status
+            FROM debt_instrument_mentions
+            ORDER BY debt_instrument_mention_id
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert rows == [
+        ("m-a2", "m-a2", "singleton"),
+        ("m-a3", "m-a3", "singleton"),
+    ]
+
+
+def test_matcher_does_not_fallback_merge_conflicting_end_dates(tmp_path: Path) -> None:
+    """Fallback should reject rows when both end dates are present and disagree."""
+    seed_document_and_item(
+        tmp_path,
+        accession_number="0001",
+        cik="320193",
+        item_id="0001-8-01",
+        date="2024-01-02",
+    )
+    seed_document_and_item(
+        tmp_path,
+        accession_number="0002",
+        cik="320193",
+        item_id="0002-8-01",
+        date="2024-01-03",
+    )
+    insert_mention(
+        tmp_path,
+        mention_id="m-2031",
+        item_id="0001-8-01",
+        raw_id="i-1",
+        name="6.125% Senior Unsecured Notes due 2031",
+        start_date="2024-01-01",
+        end_date="2031-09-01",
+        amount="$100 million",
+        lenders=[],
+    )
+    insert_mention(
+        tmp_path,
+        mention_id="m-2031-bad",
+        item_id="0002-8-01",
+        raw_id="i-1",
+        name="6.125% Senior Unsecured Notes due 2031",
+        start_date="2024-01-01",
+        end_date="2034-09-01",
+        amount="$100 million",
+        lenders=["Holders"],
+    )
+
+    match_pending_mentions(data_dir=tmp_path)
+
+    conn = connect_cdt_db(cdt_db_path(tmp_path))
+    try:
+        rows = conn.execute(
+            """
+            SELECT debt_instrument_mention_id, debt_instrument_id, matcher_status
+            FROM debt_instrument_mentions
+            ORDER BY debt_instrument_mention_id
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert rows == [
+        ("m-2031", "m-2031", "singleton"),
+        ("m-2031-bad", "m-2031-bad", "singleton"),
+    ]
+
+
+def test_matcher_creates_active_view_rollup_for_split(tmp_path: Path) -> None:
+    """Active view should include ancestor mentions on both split branches."""
+    seed_document_and_item(
+        tmp_path,
+        accession_number="0001",
+        cik="320193",
+        item_id="0001-8-01",
+        date="2024-01-01",
+    )
+    seed_document_and_item(
+        tmp_path,
+        accession_number="0002",
+        cik="320193",
+        item_id="0002-8-01",
+        date="2024-01-02",
+    )
     seed_document_and_item(
         tmp_path,
         accession_number="0003",
         cik="320193",
         item_id="0003-8-01",
-        date="2024-01-04",
+        date="2024-01-03",
     )
     insert_mention(
         tmp_path,
-        mention_id="0001-8-01--i-1",
+        mention_id="m-root",
         item_id="0001-8-01",
         raw_id="i-1",
-        name="Original Loan",
+        name="Original Facility",
         start_date="2024-01-01",
         amount="$100 million",
         lenders=["Acme Bank"],
     )
     insert_mention(
         tmp_path,
-        mention_id="0002-8-01--i-1",
+        mention_id="m-left",
         item_id="0002-8-01",
         raw_id="i-1",
-        name="Amended Loan",
+        name="Left Facility",
         start_date="2024-02-01",
-        amount="$125 million",
+        amount="$55 million",
         lenders=["Acme Bank"],
-        amendment_of="0001-8-01--i-1",
+        split_of="m-root",
     )
     insert_mention(
         tmp_path,
-        mention_id="0003-8-01--i-1",
+        mention_id="m-right",
         item_id="0003-8-01",
         raw_id="i-1",
-        name="Facility Reference",
+        name="Right Facility",
+        start_date="2024-03-01",
+        amount="$45 million",
+        lenders=["Acme Bank"],
+        split_of="m-root",
+    )
+
+    match_pending_mentions(data_dir=tmp_path)
+
+    conn = connect_cdt_db(cdt_db_path(tmp_path))
+    try:
+        instrument_rows = conn.execute(
+            """
+            SELECT debt_instrument_id, split_of_debt_instrument_id
+            FROM debt_instrument
+            ORDER BY debt_instrument_id
+            """
+        ).fetchall()
+        active_rows = conn.execute(
+            """
+            SELECT debt_instrument_id, mentions_json
+            FROM active_debt_instruments
+            ORDER BY debt_instrument_id
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert instrument_rows == [
+        ("m-left", "m-root"),
+        ("m-right", "m-root"),
+        ("m-root", None),
+    ]
+    assert active_rows == [
+        ("m-left", '["m-left","m-root"]'),
+        ("m-right", '["m-right","m-root"]'),
+    ]
+
+
+def test_matcher_resolves_current_properties_and_related_mentions(
+    tmp_path: Path,
+) -> None:
+    """Debt instrument rows should use newest non-null fields and advisory related mentions."""
+    seed_document_and_item(
+        tmp_path,
+        accession_number="0001",
+        cik="320193",
+        item_id="0001-8-01",
+        date="2024-01-01",
+    )
+    seed_document_and_item(
+        tmp_path,
+        accession_number="0002",
+        cik="320193",
+        item_id="0002-8-01",
+        date="2024-01-02",
+    )
+    seed_document_and_item(
+        tmp_path,
+        accession_number="0003",
+        cik="320193",
+        item_id="0003-8-01",
+        date="2024-01-03",
+    )
+    insert_mention(
+        tmp_path,
+        mention_id="m-root",
+        item_id="0001-8-01",
+        raw_id="i-1",
+        name="Original Facility",
         start_date="2024-01-01",
         amount="$100 million",
         lenders=["Acme Bank"],
+        other_interested_parties=["Party One"],
+    )
+    insert_mention(
+        tmp_path,
+        mention_id="m-amended",
+        item_id="0002-8-01",
+        raw_id="i-1",
+        name="Amended Facility",
+        start_date="2024-01-01",
+        amount="$125 million",
+        lenders=["Acme Bank, N.A."],
+        amendment_of="m-root",
+    )
+    insert_mention(
+        tmp_path,
+        mention_id="m-related",
+        item_id="0003-8-01",
+        raw_id="i-1",
+        name="Possible Sidecar",
+        start_date="2026-01-01",
+        amount="$33 million",
+        lenders=["Acme Bank National Association"],
     )
 
     match_pending_mentions(data_dir=tmp_path)
@@ -435,12 +666,29 @@ def test_matcher_uses_amendment_bridge_for_exact_terms(tmp_path: Path) -> None:
     try:
         row = conn.execute(
             """
-            SELECT debt_instrument_id, matcher_status
-            FROM instrument_mentions
-            WHERE instrument_mention_id = '0003-8-01--i-1'
+            SELECT
+                debt_instrument_id,
+                amendment_of_debt_instrument_id,
+                name,
+                amount,
+                other_interested_parties_json,
+                possibly_related_json
+            FROM debt_instrument
+            WHERE debt_instrument_id = 'm-amended'
             """
         ).fetchone()
+        active_ids = conn.execute(
+            "SELECT debt_instrument_id FROM active_debt_instruments ORDER BY debt_instrument_id"
+        ).fetchall()
     finally:
         conn.close()
 
-    assert row == ("di::0001-8-01--i-1", "matched")
+    assert row == (
+        "m-amended",
+        "m-root",
+        "Amended Facility",
+        "$125 million",
+        '[{"mentions": [{"tag_id": "tag-p-1", "text": "Party One"}], "tag_ids": ["tag-p-1"]}]',
+        '["m-related"]',
+    )
+    assert active_ids == [("m-amended",), ("m-related",)]
