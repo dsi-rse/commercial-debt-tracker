@@ -246,16 +246,13 @@ def test_extract_tables_persists_validated_normalized_amount_and_dates(
     mention = mentions.iloc[0]
     assert mention["start_date"] == "2024-01-02"
     assert mention["amount"] == "100000000"
-    start_payload = json.loads(str(mention["start_date_corefs_json"]))
-    amount_payload = json.loads(str(mention["amount_corefs_json"]))
-    mention_payload = json.loads(str(mention["instrument_mention_json"]))
+    start_payload = json.loads(str(mention["start_date_json"]))
+    amount_payload = json.loads(str(mention["amount_json"]))
     assert start_payload["mentions"][0]["text"] == "January 2, 2024"
     assert start_payload["normalized_date"] == "2024-01-02"
     assert amount_payload["mentions"][0]["text"] == "$100 million"
     assert amount_payload["normalized_amount"] == "100000000"
     assert amount_payload["currency"] == "USD"
-    assert mention_payload["amount"]["normalized_amount"] == "100000000"
-    assert mention_payload["start_date"]["normalized_date"] == "2024-01-02"
 
 
 def test_extract_tables_nulls_invalid_normalized_values_but_keeps_evidence(
@@ -314,8 +311,8 @@ def test_extract_tables_nulls_invalid_normalized_values_but_keeps_evidence(
     mention = mentions.iloc[0]
     assert mention["start_date"] is None
     assert mention["amount"] is None
-    start_payload = json.loads(str(mention["start_date_corefs_json"]))
-    amount_payload = json.loads(str(mention["amount_corefs_json"]))
+    start_payload = json.loads(str(mention["start_date_json"]))
+    amount_payload = json.loads(str(mention["amount_json"]))
     assert start_payload["mentions"][0]["text"] == "January 2, 2024"
     assert start_payload["normalized_date"] is None
     assert amount_payload["mentions"][0]["text"] == "$100 million"
@@ -565,14 +562,13 @@ def test_extract_pending_items_force_replaces_existing_mentions(tmp_path: Path) 
                 split_of,
                 lenders_json,
                 other_interested_parties_json,
-                mention_corefs_json,
-                start_date_corefs_json,
-                end_date_corefs_json,
-                amount_corefs_json,
-                instrument_mention_json,
+                name_json,
+                start_date_json,
+                end_date_json,
+                amount_json,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 "stale-mention",
@@ -586,7 +582,6 @@ def test_extract_pending_items_force_replaces_existing_mentions(tmp_path: Path) 
                 None,
                 "[]",
                 "[]",
-                "{}",
                 "{}",
                 "{}",
                 "{}",

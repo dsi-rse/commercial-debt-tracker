@@ -116,14 +116,13 @@ def insert_mention(
                 split_of,
                 lenders_json,
                 other_interested_parties_json,
-                mention_corefs_json,
-                start_date_corefs_json,
-                end_date_corefs_json,
-                amount_corefs_json,
-                instrument_mention_json,
+                name_json,
+                start_date_json,
+                end_date_json,
+                amount_json,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 mention_id,
@@ -137,7 +136,6 @@ def insert_mention(
                 split_of,
                 lender_payload,
                 party_payload,
-                "{}",
                 "{}",
                 "{}",
                 "{}",
@@ -196,6 +194,117 @@ def test_connect_cdt_db_creates_matcher_schema(tmp_path: Path) -> None:
     assert "debt_instrument_mention_id" in mention_columns
     assert "direct_mentions_json" in instrument_columns
     assert "mentions_json" not in instrument_columns
+
+
+def test_connect_cdt_db_migrates_legacy_mention_columns(tmp_path: Path) -> None:
+    """Connecting should migrate legacy mention column names in place."""
+    db_path = cdt_db_path(tmp_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE items (
+                item_id TEXT PRIMARY KEY,
+                accession_number TEXT NOT NULL,
+                item TEXT NOT NULL,
+                batch_path TEXT NOT NULL,
+                status TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE debt_instrument_mentions (
+                debt_instrument_mention_id TEXT PRIMARY KEY,
+                item_id TEXT NOT NULL,
+                raw_id TEXT NOT NULL,
+                name TEXT,
+                start_date TEXT,
+                end_date TEXT,
+                amount TEXT,
+                amendment_of TEXT,
+                split_of TEXT,
+                lenders_json TEXT NOT NULL,
+                other_interested_parties_json TEXT NOT NULL,
+                mention_corefs_json TEXT NOT NULL,
+                start_date_corefs_json TEXT NOT NULL,
+                end_date_corefs_json TEXT NOT NULL,
+                amount_corefs_json TEXT NOT NULL,
+                instrument_mention_json TEXT NOT NULL,
+                debt_instrument_id TEXT,
+                matcher_status TEXT,
+                matched_at TEXT,
+                potential_matches_json TEXT,
+                updated_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO debt_instrument_mentions (
+                debt_instrument_mention_id,
+                item_id,
+                raw_id,
+                name,
+                lenders_json,
+                other_interested_parties_json,
+                mention_corefs_json,
+                start_date_corefs_json,
+                end_date_corefs_json,
+                amount_corefs_json,
+                instrument_mention_json,
+                potential_matches_json,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-1",
+                "item-1",
+                "i-1",
+                "Legacy Loan",
+                "[]",
+                "[]",
+                '{"tag_ids":["tag-1"],"mentions":[]}',
+                '{"tag_ids":["tag-2"],"mentions":[]}',
+                '{"tag_ids":["tag-3"],"mentions":[]}',
+                '{"tag_ids":["tag-4"],"mentions":[]}',
+                '{"legacy":true}',
+                '[{"candidate":"old"}]',
+                "2024-01-01T00:00:00+00:00",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    conn = connect_cdt_db(db_path)
+    try:
+        mention_columns = [
+            row[1]
+            for row in conn.execute("PRAGMA table_info(debt_instrument_mentions)")
+        ]
+        row = conn.execute(
+            """
+            SELECT name_json, start_date_json, end_date_json, amount_json
+            FROM debt_instrument_mentions
+            WHERE debt_instrument_mention_id = 'legacy-1'
+            """
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert "name_json" in mention_columns
+    assert "start_date_json" in mention_columns
+    assert "end_date_json" in mention_columns
+    assert "amount_json" in mention_columns
+    assert "mention_corefs_json" not in mention_columns
+    assert "instrument_mention_json" not in mention_columns
+    assert "potential_matches_json" not in mention_columns
+    assert row == (
+        '{"tag_ids":["tag-1"],"mentions":[]}',
+        '{"tag_ids":["tag-2"],"mentions":[]}',
+        '{"tag_ids":["tag-3"],"mentions":[]}',
+        '{"tag_ids":["tag-4"],"mentions":[]}',
+    )
 
 
 def test_matcher_groups_exact_same_cik_mentions_and_skips_reruns(
@@ -268,7 +377,7 @@ def test_matcher_groups_exact_same_cik_mentions_and_skips_reruns(
 
 
 def test_matcher_records_loose_candidates_without_forcing_merge(tmp_path: Path) -> None:
-    """Weak lender similarity should keep a singleton and store potential matches."""
+    """Weak lender similarity should keep a singleton marked ambiguous."""
     seed_document_and_item(
         tmp_path,
         accession_number="0001",
@@ -310,7 +419,7 @@ def test_matcher_records_loose_candidates_without_forcing_merge(tmp_path: Path) 
     try:
         row = conn.execute(
             """
-            SELECT matcher_status, potential_matches_json
+            SELECT matcher_status, debt_instrument_id
             FROM debt_instrument_mentions
             WHERE debt_instrument_mention_id = 'm-0002'
             """
@@ -319,15 +428,7 @@ def test_matcher_records_loose_candidates_without_forcing_merge(tmp_path: Path) 
         conn.close()
 
     assert row[0] == "ambiguous"
-    assert json.loads(row[1]) == [
-        {
-            "amount_match": True,
-            "debt_instrument_id": "m-0001",
-            "lender_similarity": 0.7619,
-            "match_via": "self->self",
-            "start_date_match": True,
-        }
-    ]
+    assert row[1] == "m-0002"
 
 
 def test_matcher_falls_back_to_exact_name_when_lender_evidence_is_missing_or_generic(

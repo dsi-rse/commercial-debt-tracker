@@ -27,7 +27,6 @@ DEBT_INSTRUMENT_MENTION_EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
     ("debt_instrument_id", "TEXT"),
     ("matcher_status", "TEXT"),
     ("matched_at", "TEXT"),
-    ("potential_matches_json", "TEXT"),
 )
 SQLITE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
@@ -60,15 +59,13 @@ CREATE TABLE IF NOT EXISTS debt_instrument_mentions (
     split_of TEXT,
     lenders_json TEXT NOT NULL,
     other_interested_parties_json TEXT NOT NULL,
-    mention_corefs_json TEXT NOT NULL,
-    start_date_corefs_json TEXT NOT NULL,
-    end_date_corefs_json TEXT NOT NULL,
-    amount_corefs_json TEXT NOT NULL,
-    instrument_mention_json TEXT NOT NULL,
+    name_json TEXT NOT NULL,
+    start_date_json TEXT NOT NULL,
+    end_date_json TEXT NOT NULL,
+    amount_json TEXT NOT NULL,
     debt_instrument_id TEXT,
     matcher_status TEXT,
     matched_at TEXT,
-    potential_matches_json TEXT,
     updated_at TEXT NOT NULL,
     FOREIGN KEY(item_id) REFERENCES items(item_id)
 );
@@ -170,7 +167,7 @@ def connect_cdt_db(path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(SQLITE_SCHEMA)
     ensure_item_columns(conn)
-    ensure_debt_instrument_mention_columns(conn)
+    ensure_debt_instrument_mentions_schema(conn)
     ensure_active_debt_instruments_view(conn)
     conn.commit()
     return conn
@@ -629,12 +626,10 @@ def replace_debt_instrument_mentions(
             row.get("split_of"),
             str(row["lenders_json"]),
             str(row["other_interested_parties_json"]),
-            str(row["mention_corefs_json"]),
-            str(row["start_date_corefs_json"]),
-            str(row["end_date_corefs_json"]),
-            str(row["amount_corefs_json"]),
-            str(row["instrument_mention_json"]),
-            None,
+            str(row["name_json"]),
+            str(row["start_date_json"]),
+            str(row["end_date_json"]),
+            str(row["amount_json"]),
             None,
             None,
             None,
@@ -657,18 +652,16 @@ def replace_debt_instrument_mentions(
                 split_of,
                 lenders_json,
                 other_interested_parties_json,
-                mention_corefs_json,
-                start_date_corefs_json,
-                end_date_corefs_json,
-                amount_corefs_json,
-                instrument_mention_json,
+                name_json,
+                start_date_json,
+                end_date_json,
+                amount_json,
                 debt_instrument_id,
                 matcher_status,
                 matched_at,
-                potential_matches_json,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             payload,
         )
@@ -684,18 +677,166 @@ def ensure_item_columns(conn: sqlite3.Connection) -> None:
         conn.execute(f"ALTER TABLE items ADD COLUMN {column_name} {column_type}")
 
 
-def ensure_debt_instrument_mention_columns(conn: sqlite3.Connection) -> None:
-    """Add optional matcher columns to the mention table when missing."""
+def ensure_debt_instrument_mentions_schema(conn: sqlite3.Connection) -> None:
+    """Ensure debt instrument mentions use the current schema."""
     existing_columns = {
         str(row[1])
         for row in conn.execute("PRAGMA table_info(debt_instrument_mentions)")
     }
+    if not existing_columns:
+        return
+    expected_columns = {
+        "debt_instrument_mention_id",
+        "item_id",
+        "raw_id",
+        "name",
+        "start_date",
+        "end_date",
+        "amount",
+        "amendment_of",
+        "split_of",
+        "lenders_json",
+        "other_interested_parties_json",
+        "name_json",
+        "start_date_json",
+        "end_date_json",
+        "amount_json",
+        "debt_instrument_id",
+        "matcher_status",
+        "matched_at",
+        "updated_at",
+    }
+    legacy_columns = {
+        "mention_corefs_json",
+        "start_date_corefs_json",
+        "end_date_corefs_json",
+        "amount_corefs_json",
+        "instrument_mention_json",
+        "potential_matches_json",
+    }
+    if existing_columns == expected_columns:
+        return
+    if legacy_columns.intersection(existing_columns) or not expected_columns.issubset(
+        existing_columns
+    ):
+        migrate_debt_instrument_mentions_table(conn)
+        return
     for column_name, column_type in DEBT_INSTRUMENT_MENTION_EXTRA_COLUMNS:
         if column_name in existing_columns:
             continue
         conn.execute(
             f"ALTER TABLE debt_instrument_mentions ADD COLUMN {column_name} {column_type}"
         )
+
+
+def migrate_debt_instrument_mentions_table(conn: sqlite3.Connection) -> None:
+    """Rebuild debt instrument mentions to the current schema."""
+    conn.execute("DROP VIEW IF EXISTS active_debt_instruments")
+    conn.execute(
+        "ALTER TABLE debt_instrument_mentions RENAME TO debt_instrument_mentions_legacy"
+    )
+    conn.execute(
+        """
+        CREATE TABLE debt_instrument_mentions (
+            debt_instrument_mention_id TEXT PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            raw_id TEXT NOT NULL,
+            name TEXT,
+            start_date TEXT,
+            end_date TEXT,
+            amount TEXT,
+            amendment_of TEXT,
+            split_of TEXT,
+            lenders_json TEXT NOT NULL,
+            other_interested_parties_json TEXT NOT NULL,
+            name_json TEXT NOT NULL,
+            start_date_json TEXT NOT NULL,
+            end_date_json TEXT NOT NULL,
+            amount_json TEXT NOT NULL,
+            debt_instrument_id TEXT,
+            matcher_status TEXT,
+            matched_at TEXT,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(item_id) REFERENCES items(item_id)
+        )
+        """
+    )
+    legacy_columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(debt_instrument_mentions_legacy)")
+    }
+
+    def select_expr(
+        *,
+        current_name: str | None = None,
+        legacy_name: str | None = None,
+        default: str | None = None,
+    ) -> str:
+        if current_name and current_name in legacy_columns:
+            return current_name
+        if legacy_name and legacy_name in legacy_columns:
+            return legacy_name
+        if default is not None:
+            return default
+        msg = "Cannot migrate debt_instrument_mentions: missing required source column"
+        raise RuntimeError(msg)
+
+    conn.execute(
+        f"""
+        INSERT INTO debt_instrument_mentions (
+            debt_instrument_mention_id,
+            item_id,
+            raw_id,
+            name,
+            start_date,
+            end_date,
+            amount,
+            amendment_of,
+            split_of,
+            lenders_json,
+            other_interested_parties_json,
+            name_json,
+            start_date_json,
+            end_date_json,
+            amount_json,
+            debt_instrument_id,
+            matcher_status,
+            matched_at,
+            updated_at
+        )
+        SELECT
+            {select_expr(current_name='debt_instrument_mention_id')},
+            {select_expr(current_name='item_id')},
+            {select_expr(current_name='raw_id')},
+            {select_expr(current_name='name', default='NULL')},
+            {select_expr(current_name='start_date', default='NULL')},
+            {select_expr(current_name='end_date', default='NULL')},
+            {select_expr(current_name='amount', default='NULL')},
+            {select_expr(current_name='amendment_of', default='NULL')},
+            {select_expr(current_name='split_of', default='NULL')},
+            {select_expr(current_name='lenders_json', default="'[]'")},
+            {select_expr(current_name='other_interested_parties_json', default="'[]'")},
+            {select_expr(current_name='name_json', legacy_name='mention_corefs_json', default="'{}'")},
+            {select_expr(current_name='start_date_json', legacy_name='start_date_corefs_json', default="'{}'")},
+            {select_expr(current_name='end_date_json', legacy_name='end_date_corefs_json', default="'{}'")},
+            {select_expr(current_name='amount_json', legacy_name='amount_corefs_json', default="'{}'")},
+            {select_expr(current_name='debt_instrument_id', default='NULL')},
+            {select_expr(current_name='matcher_status', default='NULL')},
+            {select_expr(current_name='matched_at', default='NULL')},
+            {select_expr(current_name='updated_at')}
+        FROM debt_instrument_mentions_legacy
+        """
+    )
+    conn.execute("DROP TABLE debt_instrument_mentions_legacy")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_debt_instrument_mentions_item_id ON debt_instrument_mentions(item_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_debt_instrument_mentions_matcher_status ON debt_instrument_mentions(matcher_status)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_debt_instrument_mentions_debt_instrument_id ON debt_instrument_mentions(debt_instrument_id)"
+    )
 
 
 def read_matcher_mentions(
@@ -718,15 +859,13 @@ def read_matcher_mentions(
         "    mention.split_of,",
         "    mention.lenders_json,",
         "    mention.other_interested_parties_json,",
-        "    mention.mention_corefs_json,",
-        "    mention.start_date_corefs_json,",
-        "    mention.end_date_corefs_json,",
-        "    mention.amount_corefs_json,",
-        "    mention.instrument_mention_json,",
+        "    mention.name_json,",
+        "    mention.start_date_json,",
+        "    mention.end_date_json,",
+        "    mention.amount_json,",
         "    mention.debt_instrument_id,",
         "    mention.matcher_status,",
         "    mention.matched_at,",
-        "    mention.potential_matches_json,",
         "    item.accession_number,",
         "    document.cik,",
         "    document.date",
@@ -757,18 +896,16 @@ def read_matcher_mentions(
             "split_of": row[8],
             "lenders_json": row[9],
             "other_interested_parties_json": row[10],
-            "mention_corefs_json": row[11],
-            "start_date_corefs_json": row[12],
-            "end_date_corefs_json": row[13],
-            "amount_corefs_json": row[14],
-            "instrument_mention_json": row[15],
-            "debt_instrument_id": row[16],
-            "matcher_status": row[17],
-            "matched_at": row[18],
-            "potential_matches_json": row[19],
-            "accession_number": row[20],
-            "cik": row[21],
-            "date": row[22],
+            "name_json": row[11],
+            "start_date_json": row[12],
+            "end_date_json": row[13],
+            "amount_json": row[14],
+            "debt_instrument_id": row[15],
+            "matcher_status": row[16],
+            "matched_at": row[17],
+            "accession_number": row[18],
+            "cik": row[19],
+            "date": row[20],
         }
         for row in rows
     ]
@@ -788,7 +925,6 @@ def clear_matcher_assignments(
             SET debt_instrument_id = NULL,
                 matcher_status = NULL,
                 matched_at = NULL,
-                potential_matches_json = NULL,
                 updated_at = ?
             """,
             (updated_at,),
@@ -800,7 +936,6 @@ def clear_matcher_assignments(
             SET debt_instrument_id = NULL,
                 matcher_status = NULL,
                 matched_at = NULL,
-                potential_matches_json = NULL,
                 updated_at = ?
             WHERE debt_instrument_mention_id = ?
             """,
@@ -875,7 +1010,6 @@ def update_matcher_results(
             row.get("debt_instrument_id"),
             row["matcher_status"],
             matched_at,
-            row["potential_matches_json"],
             matched_at,
             row["debt_instrument_mention_id"],
         )
@@ -889,7 +1023,6 @@ def update_matcher_results(
         SET debt_instrument_id = ?,
             matcher_status = ?,
             matched_at = ?,
-            potential_matches_json = ?,
             updated_at = ?
         WHERE debt_instrument_mention_id = ?
         """,

@@ -46,7 +46,6 @@ DEBT_INSTRUMENT_MENTION_COLUMNS = [
     "debt_instrument_mention_id",
     "debt_instrument_id",
     "matcher_status",
-    "potential_matches_json",
 ]
 DEBT_INSTRUMENT_COLUMNS = [
     "debt_instrument_id",
@@ -257,7 +256,6 @@ def match_tables(
                     "debt_instrument_mention_id": mention.debt_instrument_mention_id,
                     "debt_instrument_id": chosen_instrument_id,
                     "matcher_status": "matched",
-                    "potential_matches_json": json.dumps([], sort_keys=True),
                 }
             )
             continue
@@ -278,7 +276,6 @@ def match_tables(
                 "debt_instrument_mention_id": mention.debt_instrument_mention_id,
                 "debt_instrument_id": new_instrument_id,
                 "matcher_status": "ambiguous" if potential_matches else "singleton",
-                "potential_matches_json": json.dumps(potential_matches, sort_keys=True),
             }
         )
 

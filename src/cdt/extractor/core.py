@@ -107,11 +107,10 @@ DEBT_INSTRUMENT_MENTION_COLUMNS = [
     "split_of",
     "lenders_json",
     "other_interested_parties_json",
-    "mention_corefs_json",
-    "start_date_corefs_json",
-    "end_date_corefs_json",
-    "amount_corefs_json",
-    "instrument_mention_json",
+    "name_json",
+    "start_date_json",
+    "end_date_json",
+    "amount_json",
 ]
 
 
@@ -538,36 +537,17 @@ class InstrumentIEStage:
                     ),
                     sort_keys=True,
                 ),
-                "mention_corefs_json": json.dumps(
+                "name_json": json.dumps(
                     cluster_payload(obj.get("name", []), tag_details),
                     sort_keys=True,
                 ),
-                "start_date_corefs_json": json.dumps(
-                    start_date_payload, sort_keys=True
-                ),
-                "end_date_corefs_json": json.dumps(end_date_payload, sort_keys=True),
-                "amount_corefs_json": json.dumps(amount_payload, sort_keys=True),
+                "start_date_json": json.dumps(start_date_payload, sort_keys=True),
+                "end_date_json": json.dumps(end_date_payload, sort_keys=True),
+                "amount_json": json.dumps(amount_payload, sort_keys=True),
             }
             mention_row["debt_instrument_mention_id"] = debt_instrument_mention_id_for(
                 row_state.item_id,
                 mention_row,
-            )
-            mention_payload = {
-                "debt_instrument_mention_id": mention_row["debt_instrument_mention_id"],
-                "raw_id": raw_id,
-                "name": cluster_payload(obj.get("name", []), tag_details),
-                "start_date": start_date_payload,
-                "end_date": end_date_payload,
-                "amount": amount_payload,
-                "lenders": cluster_payload_list(obj.get("lenders", []), tag_details),
-                "other_interested_parties": cluster_payload_list(
-                    obj.get("other_interested_parties", []),
-                    tag_details,
-                ),
-            }
-            mention_row["instrument_mention_json"] = json.dumps(
-                mention_payload,
-                sort_keys=True,
             )
             mentions.append(mention_row)
         row_state.debt_instrument_mentions = mentions
@@ -653,11 +633,6 @@ class InstrumentRelationStage:
             if mention is None:
                 continue
             mention[str(relation["type"])] = raw_to_global.get(relation["to"])
-            mention_payload = json.loads(str(mention["instrument_mention_json"]))
-            mention_payload[str(relation["type"])] = raw_to_global.get(relation["to"])
-            mention["instrument_mention_json"] = json.dumps(
-                mention_payload, sort_keys=True
-            )
 
     def early_stop(self, row_state: ExtractionRowState) -> bool:
         return False
@@ -1086,26 +1061,18 @@ def debt_instrument_mention_id_for(
     """Return a stable persisted debt-instrument-mention ID."""
     payload = {
         "amount": mention_row.get("amount"),
-        "amount_corefs_json": normalize_json_text(
-            mention_row.get("amount_corefs_json")
-        ),
+        "amount_json": normalize_json_text(mention_row.get("amount_json")),
         "end_date": mention_row.get("end_date"),
-        "end_date_corefs_json": normalize_json_text(
-            mention_row.get("end_date_corefs_json")
-        ),
+        "end_date_json": normalize_json_text(mention_row.get("end_date_json")),
         "item_id": item_id,
         "lenders_json": normalize_json_text(mention_row.get("lenders_json")),
-        "mention_corefs_json": normalize_json_text(
-            mention_row.get("mention_corefs_json")
-        ),
+        "name_json": normalize_json_text(mention_row.get("name_json")),
         "name": mention_row.get("name"),
         "other_interested_parties_json": normalize_json_text(
             mention_row.get("other_interested_parties_json")
         ),
         "start_date": mention_row.get("start_date"),
-        "start_date_corefs_json": normalize_json_text(
-            mention_row.get("start_date_corefs_json")
-        ),
+        "start_date_json": normalize_json_text(mention_row.get("start_date_json")),
     }
     digest = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -1319,7 +1286,7 @@ def relation_prompt_xml(row_state: ExtractionRowState) -> str:
     root, _, _ = parse_tag_details(row_state.ner_tagged_xml)
     tag_to_raw_id: dict[str, str] = {}
     for mention in row_state.debt_instrument_mentions:
-        payload = json.loads(str(mention["mention_corefs_json"]))
+        payload = json.loads(str(mention["name_json"]))
         for tag_id in payload.get("tag_ids", []):
             tag_to_raw_id[str(tag_id)] = str(mention["raw_id"])
     body = render_relation_body(root, tag_to_raw_id)
