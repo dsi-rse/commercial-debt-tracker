@@ -78,6 +78,41 @@ docker compose run --rm commercial-debt-tracker /bin/bash
 
 The compose setup mounts the repo at `/project` and mounts `${DATA_DIR}` at `/data`.
 
+## End-to-End Pipeline
+
+`cdt pipeline` runs ingest, itemize, classifier, extractor, and matcher in sequence using the same `daily` and `historical` mode structure as the other FTM2J processor repos.
+
+Daily pipeline run for an explicit filing window:
+
+```bash
+uv run cdt pipeline \
+  --bucket idi-dev-processor-s3 \
+  --download \
+  --model-dir /path/to/tfidf-linear-svc \
+  daily 100K-ciks.txt \
+  --start-date 2024-01-01 \
+  --end-date 2024-01-31
+```
+
+Historical end-to-end run:
+
+```bash
+uv run cdt pipeline \
+  --model-dir /path/to/tfidf-linear-svc \
+  historical 100K-ciks.txt
+```
+
+Common pipeline options include:
+
+- ingest controls: `--bucket`, `--download`, `--failure-file`, `--aws-profile`, `--s3-prefix`
+- stage batch sizes: `--ingest-batch-size`, `--itemize-batch-size`, `--classify-batch-size`, `--extract-batch-size`, `--match-batch-size`
+- itemization scope: `--item-numbers`
+- classifier configuration: `--model-dir`
+- extractor configuration: `--model`, `--reasoning-effort`, `--max-attempts`
+- matcher configuration: `--strong-match-threshold`, `--loose-match-threshold`
+
+`daily` defaults both dates to yesterday when omitted. `historical` defaults to `1994-01-01` through today.
+
 ## Ingest
 
 ### What Ingest Reads

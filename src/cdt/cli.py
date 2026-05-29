@@ -44,6 +44,14 @@ from cdt.itemizer import (
     items_path,
 )
 from cdt.matcher import match_pending_mentions
+from cdt.pipeline import (
+    ALL_TIME_START_DATE as PIPELINE_ALL_TIME_START_DATE,
+)
+from cdt.pipeline import (
+    PipelineConfig,
+    resolve_mode_dates,
+    run_pipeline,
+)
 
 ALL_TIME_START_DATE = date(1994, 1, 1)
 DEFAULT_BATCH_SIZE = 100
@@ -381,6 +389,178 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional path to write matcher logs.",
     )
+
+    pipeline_parser = subparsers.add_parser(
+        "pipeline",
+        help="Run the full CDT pipeline end-to-end.",
+    )
+    pipeline_parser.add_argument(
+        "--bucket",
+        default=DEFAULT_BUCKET,
+        help=f"S3 bucket to read from. Defaults to {DEFAULT_BUCKET}.",
+    )
+    pipeline_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-run all stages against already-processed rows where supported.",
+    )
+    pipeline_parser.add_argument(
+        "--download",
+        action="store_true",
+        help="Download matched documents into Parquet batches during ingest.",
+    )
+    pipeline_parser.add_argument(
+        "--failure-file",
+        type=Path,
+        default=None,
+        help="Optional path to write the permanent ingest failure registry.",
+    )
+    pipeline_parser.add_argument(
+        "--aws-profile",
+        default=DEFAULT_AWS_PROFILE,
+        help=f"AWS profile name for S3 access. Defaults to {DEFAULT_AWS_PROFILE}.",
+    )
+    pipeline_parser.add_argument(
+        "--s3-prefix",
+        default="sec",
+        help="Top-level scraper prefix inside the bucket. Defaults to sec.",
+    )
+    pipeline_parser.add_argument(
+        "--ingest-batch-size",
+        type=positive_int,
+        default=DEFAULT_BATCH_SIZE,
+        help=f"Documents processed per ingest batch. Defaults to {DEFAULT_BATCH_SIZE}.",
+    )
+    pipeline_parser.add_argument(
+        "--itemize-batch-size",
+        type=positive_int,
+        default=DEFAULT_BATCH_SIZE,
+        help=f"Documents processed per itemize batch. Defaults to {DEFAULT_BATCH_SIZE}.",
+    )
+    pipeline_parser.add_argument(
+        "--classify-batch-size",
+        type=positive_int,
+        default=DEFAULT_BATCH_SIZE,
+        help=f"Items processed per classifier batch. Defaults to {DEFAULT_BATCH_SIZE}.",
+    )
+    pipeline_parser.add_argument(
+        "--extract-batch-size",
+        type=positive_int,
+        default=DEFAULT_BATCH_SIZE,
+        help=f"Items processed per extractor batch. Defaults to {DEFAULT_BATCH_SIZE}.",
+    )
+    pipeline_parser.add_argument(
+        "--match-batch-size",
+        type=positive_int,
+        default=DEFAULT_BATCH_SIZE,
+        help=f"Mentions processed per matcher batch. Defaults to {DEFAULT_BATCH_SIZE}.",
+    )
+    pipeline_parser.add_argument(
+        "--item-numbers",
+        type=parse_item_numbers,
+        default=POTENTIALLY_RELEVANT_ITEM_NUMBERS,
+        help="Comma-separated 8-K item numbers to save during itemization.",
+    )
+    pipeline_parser.add_argument(
+        "--model-dir",
+        type=Path,
+        default=None,
+        help="Optional path to a trained classifier artifact directory.",
+    )
+    pipeline_parser.add_argument(
+        "--model",
+        default=DEFAULT_EXTRACTOR_MODEL,
+        help=f"OpenRouter model ID to use. Defaults to {DEFAULT_EXTRACTOR_MODEL}.",
+    )
+    pipeline_parser.add_argument(
+        "--reasoning-effort",
+        default=DEFAULT_EXTRACTOR_REASONING_EFFORT,
+        help=(
+            "OpenRouter reasoning effort to request. "
+            f"Defaults to {DEFAULT_EXTRACTOR_REASONING_EFFORT}."
+        ),
+    )
+    pipeline_parser.add_argument(
+        "--max-attempts",
+        type=positive_int,
+        default=DEFAULT_EXTRACTOR_MAX_ATTEMPTS,
+        help=(
+            "Maximum prompt attempts per stage before marking the item failed. "
+            f"Defaults to {DEFAULT_EXTRACTOR_MAX_ATTEMPTS}."
+        ),
+    )
+    pipeline_parser.add_argument(
+        "--strong-match-threshold",
+        type=float,
+        default=0.90,
+        help="Matcher threshold for automatic direct matches. Defaults to 0.90.",
+    )
+    pipeline_parser.add_argument(
+        "--loose-match-threshold",
+        type=float,
+        default=0.75,
+        help="Matcher threshold for recording loose candidates. Defaults to 0.75.",
+    )
+    pipeline_parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress progress logging.",
+    )
+    pipeline_parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="Optional path to write pipeline logs.",
+    )
+
+    pipeline_subparsers = pipeline_parser.add_subparsers(
+        dest="pipeline_mode", required=True
+    )
+    pipeline_daily_parser = pipeline_subparsers.add_parser(
+        "daily",
+        help="Run the full pipeline for a daily filing window.",
+    )
+    pipeline_daily_parser.add_argument(
+        "cik_file",
+        type=Path,
+        help="Path to a file containing one CIK per line.",
+    )
+    pipeline_daily_parser.add_argument(
+        "--start-date",
+        type=parse_date,
+        default=None,
+        help="First filing date to include. Defaults to yesterday when omitted.",
+    )
+    pipeline_daily_parser.add_argument(
+        "--end-date",
+        type=parse_date,
+        default=None,
+        help="Last filing date to include. Defaults to yesterday when omitted.",
+    )
+    pipeline_daily_parser.set_defaults(func=run_pipeline_command)
+
+    pipeline_historical_parser = pipeline_subparsers.add_parser(
+        "historical",
+        help="Run the full pipeline for the historical filing range.",
+    )
+    pipeline_historical_parser.add_argument(
+        "cik_file",
+        type=Path,
+        help="Path to a file containing one CIK per line.",
+    )
+    pipeline_historical_parser.add_argument(
+        "--start-date",
+        type=parse_date,
+        default=PIPELINE_ALL_TIME_START_DATE,
+        help="First filing date to include. Defaults to 1994-01-01.",
+    )
+    pipeline_historical_parser.add_argument(
+        "--end-date",
+        type=parse_date,
+        default=date.today(),
+        help="Last filing date to include. Defaults to today.",
+    )
+    pipeline_historical_parser.set_defaults(func=run_pipeline_command)
     return parser
 
 
@@ -465,6 +645,66 @@ def run_itemize(args: argparse.Namespace) -> int:
         return 1
     print(f"Itemized {len(items)} item rows.")
     print(f"Wrote item batches to {items_path()}.")
+    return 0
+
+
+def run_pipeline_command(args: argparse.Namespace) -> int:
+    """Run the full CDT pipeline."""
+    configure_logging(quiet=args.quiet, log_file=args.log_file)
+    logger = logging.getLogger(__name__)
+    try:
+        start_date, end_date = resolve_mode_dates(
+            args.pipeline_mode,
+            args.start_date,
+            args.end_date,
+        )
+        result = run_pipeline(
+            PipelineConfig(
+                mode=args.pipeline_mode,
+                cik_file=args.cik_file,
+                bucket=args.bucket,
+                start_date=start_date,
+                end_date=end_date,
+                force=args.force,
+                download=args.download,
+                failure_file=args.failure_file,
+                aws_profile=args.aws_profile,
+                s3_prefix=args.s3_prefix,
+                ingest_batch_size=args.ingest_batch_size,
+                itemize_batch_size=args.itemize_batch_size,
+                classify_batch_size=args.classify_batch_size,
+                extract_batch_size=args.extract_batch_size,
+                match_batch_size=args.match_batch_size,
+                item_numbers=args.item_numbers,
+                classifier_model_dir=args.model_dir,
+                extractor_model=args.model,
+                extractor_reasoning_effort=args.reasoning_effort,
+                extractor_max_attempts=args.max_attempts,
+                strong_match_threshold=args.strong_match_threshold,
+                loose_match_threshold=args.loose_match_threshold,
+            )
+        )
+    except ValueError as exc:
+        logger.error("Invalid pipeline arguments: %s", exc)
+        return 2
+    except Exception:
+        logger.exception("Pipeline failed")
+        return 1
+
+    print(
+        f"Ran pipeline for {result.ingest.ciks_count} CIKs from {result.start_date} through {result.end_date}."
+    )
+    print(
+        f"Ingest indexed {result.ingest.total_rows} rows, itemized {result.itemized_rows}, "
+        f"classified {result.classified_rows}, extracted {result.extracted_rows}, "
+        f"and matched {result.matched_rows} mentions."
+    )
+    print(
+        f"Debt instruments written: {result.debt_instrument_rows}. "
+        f"Classifier model dir: {result.classifier_model_dir}."
+    )
+    print(f"Extractor runs: {result.extractor_run_path}.")
+    print(f"Failure registry: {result.ingest.failure_file}.")
     return 0
 
 
@@ -602,18 +842,7 @@ def read_cik_file(path: Path) -> set[str]:
 
 def resolve_ingest_dates(args: argparse.Namespace) -> tuple[date, date]:
     """Resolve ingest dates for the selected ingest mode."""
-    if args.ingest_mode == "historical":
-        return args.start_date, args.end_date
-    if args.start_date is None and args.end_date is None:
-        yesterday = date.today().fromordinal(date.today().toordinal() - 1)
-        return yesterday, yesterday
-    if args.start_date is None:
-        msg = "--start-date is required when --end-date is provided"
-        raise ValueError(msg)
-    if args.end_date is None:
-        msg = "--end-date is required when --start-date is provided"
-        raise ValueError(msg)
-    return args.start_date, args.end_date
+    return resolve_mode_dates(args.ingest_mode, args.start_date, args.end_date)
 
 
 def parse_date(value: str) -> date:

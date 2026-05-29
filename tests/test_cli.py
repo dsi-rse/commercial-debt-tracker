@@ -11,6 +11,7 @@ import pytest
 from cdt import cli
 from cdt.ingest import IngestRunResult
 from cdt.itemizer import POTENTIALLY_RELEVANT_ITEM_NUMBERS
+from cdt.pipeline import PipelineRunResult
 
 ARGPARSE_USAGE_ERROR = 2
 
@@ -246,6 +247,109 @@ def test_ingest_cli_logs_failures_to_file(
     assert status == 1
     assert "Ingest failed" in log_file.read_text(encoding="utf-8")
     assert "simulated failure" in log_file.read_text(encoding="utf-8")
+
+
+def test_pipeline_cli_builds_pipeline_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pipeline command builds a full PipelineConfig and runs it."""
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("320193\n", encoding="utf-8")
+    calls: list[dict[str, object]] = []
+
+    def fake_run_pipeline(config: cli.PipelineConfig) -> PipelineRunResult:
+        calls.append(
+            {
+                "mode": config.mode,
+                "bucket": config.bucket,
+                "start_date": config.start_date,
+                "end_date": config.end_date,
+                "download": config.download,
+                "item_numbers": config.item_numbers,
+                "model_dir": config.classifier_model_dir,
+            }
+        )
+        ingest_result = IngestRunResult(
+            mode=config.mode,
+            start_date=config.start_date or date(2024, 1, 1),
+            end_date=config.end_date or date(2024, 1, 31),
+            ciks_count=1,
+            candidates_seen=3,
+            skipped_existing=0,
+            downloaded=3,
+            failures=0,
+            total_rows=3,
+            database_path=tmp_path / "cdt.sqlite",
+            documents_path=tmp_path / "documents",
+            failure_file=tmp_path / "failures" / "ingest_failures.json",
+        )
+        return PipelineRunResult(
+            mode=config.mode,
+            start_date=ingest_result.start_date,
+            end_date=ingest_result.end_date,
+            ingest=ingest_result,
+            itemized_rows=5,
+            classified_rows=5,
+            extracted_rows=2,
+            matched_rows=2,
+            debt_instrument_rows=1,
+            classifier_model_dir=config.classifier_model_dir or tmp_path / "model",
+            extractor_run_path=tmp_path / "extractor_runs",
+        )
+
+    monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
+
+    status = cli.main(
+        [
+            "pipeline",
+            "--bucket",
+            "test-bucket",
+            "--download",
+            "--item-numbers",
+            "1.01,8.01",
+            "--model-dir",
+            str(tmp_path / "model"),
+            "daily",
+            str(cik_file),
+            "--start-date",
+            "2024-01-01",
+            "--end-date",
+            "2024-01-31",
+        ]
+    )
+
+    assert status == 0
+    assert calls == [
+        {
+            "mode": "daily",
+            "bucket": "test-bucket",
+            "start_date": date(2024, 1, 1),
+            "end_date": date(2024, 1, 31),
+            "download": True,
+            "item_numbers": ("1.01", "8.01"),
+            "model_dir": tmp_path / "model",
+        }
+    ]
+
+
+def test_pipeline_cli_daily_rejects_partial_date_range(tmp_path: Path) -> None:
+    """Daily pipeline runs require both dates when either is supplied."""
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("320193\n", encoding="utf-8")
+
+    status = cli.main(
+        [
+            "pipeline",
+            "--quiet",
+            "daily",
+            str(cik_file),
+            "--start-date",
+            "2024-01-01",
+        ]
+    )
+
+    assert status == ARGPARSE_USAGE_ERROR
 
 
 def test_itemize_cli_calls_pending_itemizer(monkeypatch: pytest.MonkeyPatch) -> None:

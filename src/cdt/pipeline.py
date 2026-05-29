@@ -1,52 +1,219 @@
-"""Pipeline orchestration for SEC 8-K document processing."""
+"""Database-backed orchestration for the full CDT pipeline."""
 
-from dataclasses import dataclass
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from datetime import date, datetime
 from pathlib import Path
+from typing import Self
 
-import pandas as pd
+from cdt.classifier import classify_pending_items, default_model_dir
+from cdt.extractor import (
+    DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_MODEL,
+    DEFAULT_REASONING_EFFORT,
+    extract_pending_items,
+    extracted_tables_path,
+)
+from cdt.ingest import (
+    DEFAULT_AWS_PROFILE,
+    DEFAULT_BUCKET,
+    DEFAULT_S3_PREFIX,
+    IngestConfig,
+    IngestRunResult,
+    run_ingest_pipeline,
+)
+from cdt.ingest import (
+    DEFAULT_BATCH_SIZE as DEFAULT_INGEST_BATCH_SIZE,
+)
+from cdt.itemizer import POTENTIALLY_RELEVANT_ITEM_NUMBERS, itemize_pending_documents
+from cdt.matcher import (
+    DEFAULT_LOOSE_MATCH_THRESHOLD,
+    DEFAULT_STRONG_MATCH_THRESHOLD,
+    match_pending_mentions,
+)
+from cdt.shared import get_logger
 
-from cdt.classifier import classify_items
-from cdt.extractor import extract_tables
-from cdt.ingest import acquire_documents
-from cdt.itemizer import itemize_documents
-from cdt.matcher import match_tables
+ALL_TIME_START_DATE = date(1994, 1, 1)
+DEFAULT_STAGE_BATCH_SIZE = 100
+PIPELINE_MODES = ("daily", "historical")
+LOGGER = get_logger(__name__)
 
 
 @dataclass(frozen=True)
 class PipelineConfig:
-    """Configuration for a single 8-K pipeline invocation."""
+    """Configuration for a single CDT pipeline invocation."""
 
-    bucket: str
-    year: int
-    ciks: set[str] | None = None
+    mode: str
+    cik_file: Path
+    bucket: str = DEFAULT_BUCKET
+    start_date: date | None = None
+    end_date: date | None = None
     data_dir: Path | None = None
     force: bool = False
+    download: bool = False
+    failure_file: Path | None = None
+    aws_profile: str = DEFAULT_AWS_PROFILE
+    s3_prefix: str = DEFAULT_S3_PREFIX
+    ingest_batch_size: int = DEFAULT_INGEST_BATCH_SIZE
+    itemize_batch_size: int = DEFAULT_STAGE_BATCH_SIZE
+    classify_batch_size: int = DEFAULT_STAGE_BATCH_SIZE
+    extract_batch_size: int = DEFAULT_STAGE_BATCH_SIZE
+    match_batch_size: int = DEFAULT_STAGE_BATCH_SIZE
+    item_numbers: tuple[str, ...] = POTENTIALLY_RELEVANT_ITEM_NUMBERS
+    classifier_model_dir: Path | None = None
+    extractor_model: str = DEFAULT_MODEL
+    extractor_reasoning_effort: str = DEFAULT_REASONING_EFFORT
+    extractor_max_attempts: int = DEFAULT_MAX_ATTEMPTS
+    strong_match_threshold: float = DEFAULT_STRONG_MATCH_THRESHOLD
+    loose_match_threshold: float = DEFAULT_LOOSE_MATCH_THRESHOLD
 
 
-def run_pipeline(config: PipelineConfig) -> dict[str, pd.DataFrame]:
-    """Run acquisition, itemization, classification, extraction, and matching."""
-    documents = acquire_documents(
-        config.bucket,
-        config.year,
-        config.ciks,
-        data_dir=config.data_dir,
-        force=config.force,
-    )
-    items = itemize_documents(documents, data_dir=config.data_dir, force=config.force)
-    classified_items = classify_items(
-        items, data_dir=config.data_dir, force=config.force
-    )
-    extracted = extract_tables(
-        classified_items, data_dir=config.data_dir, force=config.force
-    )
-    mentions = extracted["debt_instrument_mentions"]
-    if mentions.empty:
-        return {**extracted, **match_tables(pd.DataFrame())}
-    mention_context = classified_items[
-        ["item_id", "accession_number", "cik", "date"]
-    ].drop_duplicates()
-    matcher_input = mentions.merge(mention_context, on="item_id", how="left")
-    return {
-        **extracted,
-        **match_tables(matcher_input),
-    }
+@dataclass(frozen=True)
+class PipelineRunResult:
+    """Summary of one end-to-end pipeline run."""
+
+    mode: str
+    start_date: date
+    end_date: date
+    ingest: IngestRunResult
+    itemized_rows: int
+    classified_rows: int
+    extracted_rows: int
+    matched_rows: int
+    debt_instrument_rows: int
+    classifier_model_dir: Path
+    extractor_run_path: Path
+
+
+class PipelineOrchestrator:
+    """Run the full CDT pipeline with structured logging."""
+
+    def __init__(self: Self, config: PipelineConfig) -> None:
+        """Initialize the orchestrator."""
+        self.config = config
+        self.logger = get_logger(type(self).__name__)
+
+    def _log_banner(self: Self, message: str) -> None:
+        self.logger.info("=" * 60)
+        self.logger.info(message)
+        self.logger.info("=" * 60)
+
+    def _log_config(self: Self, resolved_start: date, resolved_end: date) -> None:
+        config_values = asdict(self.config)
+        config_values["start_date"] = resolved_start
+        config_values["end_date"] = resolved_end
+        for key, value in config_values.items():
+            self.logger.info("%s: %s", key, value)
+
+    def run(self: Self) -> PipelineRunResult:
+        """Execute the full CDT pipeline."""
+        resolved_start, resolved_end = resolve_mode_dates(
+            self.config.mode,
+            self.config.start_date,
+            self.config.end_date,
+        )
+        ciks = read_cik_file(self.config.cik_file)
+        self._log_banner(
+            f"Starting pipeline | mode={self.config.mode} | cik_file={self.config.cik_file.name}"
+        )
+        self._log_config(resolved_start, resolved_end)
+        start_time = datetime.now()
+
+        ingest_table, ingest_result = run_ingest_pipeline(
+            IngestConfig(
+                mode=self.config.mode,
+                bucket=self.config.bucket,
+                cik_file=self.config.cik_file,
+                start_date=resolved_start,
+                end_date=resolved_end,
+                data_dir=self.config.data_dir,
+                force=self.config.force,
+                batch_size=self.config.ingest_batch_size,
+                download=self.config.download,
+                failure_file=self.config.failure_file,
+                aws_profile=self.config.aws_profile,
+                s3_prefix=self.config.s3_prefix,
+            ),
+            ciks=ciks,
+        )
+        del ingest_table
+
+        items = itemize_pending_documents(
+            data_dir=self.config.data_dir,
+            batch_size=self.config.itemize_batch_size,
+            force=self.config.force,
+            item_numbers=self.config.item_numbers,
+        )
+        classified = classify_pending_items(
+            data_dir=self.config.data_dir,
+            model_dir=self.config.classifier_model_dir,
+            batch_size=self.config.classify_batch_size,
+            force=self.config.force,
+        )
+        extracted = extract_pending_items(
+            data_dir=self.config.data_dir,
+            batch_size=self.config.extract_batch_size,
+            force=self.config.force,
+            model=self.config.extractor_model,
+            reasoning_effort=self.config.extractor_reasoning_effort,
+            max_attempts=self.config.extractor_max_attempts,
+        )
+        matched = match_pending_mentions(
+            data_dir=self.config.data_dir,
+            batch_size=self.config.match_batch_size,
+            force=self.config.force,
+            strong_match_threshold=self.config.strong_match_threshold,
+            loose_match_threshold=self.config.loose_match_threshold,
+        )
+
+        result = PipelineRunResult(
+            mode=self.config.mode,
+            start_date=resolved_start,
+            end_date=resolved_end,
+            ingest=ingest_result,
+            itemized_rows=len(items),
+            classified_rows=len(classified),
+            extracted_rows=len(extracted),
+            matched_rows=len(matched["debt_instrument_mentions"]),
+            debt_instrument_rows=len(matched["debt_instrument"]),
+            classifier_model_dir=self.config.classifier_model_dir
+            or default_model_dir(self.config.data_dir),
+            extractor_run_path=extracted_tables_path(self.config.data_dir),
+        )
+        elapsed = datetime.now() - start_time
+        self._log_banner(f"Pipeline completed successfully in {elapsed}")
+        return result
+
+
+def run_pipeline(config: PipelineConfig) -> PipelineRunResult:
+    """Run the full CDT pipeline for the provided config."""
+    return PipelineOrchestrator(config).run()
+
+
+def read_cik_file(path: Path) -> set[str]:
+    """Read a one-CIK-per-line file."""
+    return {line.strip() for line in path.read_text().splitlines() if line.strip()}
+
+
+def resolve_mode_dates(
+    mode: str,
+    start_date: date | None,
+    end_date: date | None,
+) -> tuple[date, date]:
+    """Resolve mode-specific dates for ingest-like commands."""
+    if mode not in PIPELINE_MODES:
+        msg = f"unsupported mode {mode!r}"
+        raise ValueError(msg)
+    if mode == "historical":
+        return start_date or ALL_TIME_START_DATE, end_date or date.today()
+    if start_date is None and end_date is None:
+        yesterday = date.today().fromordinal(date.today().toordinal() - 1)
+        return yesterday, yesterday
+    if start_date is None:
+        msg = "--start-date is required when --end-date is provided"
+        raise ValueError(msg)
+    if end_date is None:
+        msg = "--end-date is required when --start-date is provided"
+        raise ValueError(msg)
+    return start_date, end_date
