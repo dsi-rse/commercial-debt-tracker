@@ -4,6 +4,7 @@ WORKDIR /app
 
 ENV UV_LINK_MODE=copy
 ENV PYTHONUNBUFFERED=1
+ENV PATH="/app/.venv/bin:$PATH"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git \
@@ -11,8 +12,9 @@ RUN apt-get update \
 
 COPY pyproject.toml uv.lock ./
 COPY src ./src
+COPY data ./data
 
 RUN uv sync --locked --no-dev
 
-ENTRYPOINT ["uv", "run", "cdt-orchestrator"]
+ENTRYPOINT ["cdt-orchestrator"]
 CMD ["--help"]

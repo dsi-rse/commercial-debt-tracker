@@ -1,0 +1,12 @@
+{
+  "cv_splits": 5,
+  "model_name": "tfidf_linear_svc",
+  "pr_auc": 0.9881726268174761,
+  "precision": 0.8483333333333334,
+  "random_seed": 42,
+  "recall": 0.9902723735408561,
+  "target_recall": 0.99,
+  "threshold": 0.4140091427733884,
+  "train_csv": "/mnt/Box/dsi-core/11th-hour/commercial-debt-tracker/data/annotations/classification/svm-annotated-8K-20260318.csv",
+  "training_row_count": 3932
+}
