@@ -1,4 +1,4 @@
-name: commercial-debt-tracker
+name: idi-commercial-debt-tracker
 runtime:
   name: python
 description: ECS scheduled deployment for the Commercial Debt Tracker processor
