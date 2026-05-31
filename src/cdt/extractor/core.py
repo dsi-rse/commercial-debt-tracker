@@ -257,7 +257,10 @@ class OpenRouterChatClient:
     def __init__(self, *, api_key: str | None = None) -> None:
         self.api_key = api_key or settings.OPENROUTER_API_KEY
         if not self.api_key:
-            raise RuntimeError("OPENROUTER_API_KEY is required for cdt extractor.")
+            raise RuntimeError(
+                "OPENROUTER_API_KEY is required for cdt extractor. "
+                "OPENROUTER_API_TOKEN is also accepted as a compatibility alias."
+            )
 
     async def complete(
         self,
@@ -706,7 +709,6 @@ def extract_pending_items(
         raise ValueError(f"max_attempts must be positive, got {max_attempts}")
     resolved_model = model or settings.EXTRACTOR_MODEL or DEFAULT_MODEL
     resolved_reasoning = normalize_reasoning_effort(reasoning_effort)
-    resolved_client = client or OpenRouterChatClient()
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     full_jsonl_path = extractor_run_path(
@@ -747,7 +749,7 @@ def extract_pending_items(
                     model=resolved_model,
                     reasoning_effort=resolved_reasoning,
                     max_attempts=max_attempts,
-                    client=resolved_client,
+                    client=client,
                 )
             )
             audit_records.append(json.dumps(row_state.to_audit_dict(), sort_keys=True))
@@ -844,7 +846,6 @@ def extract_tables(
         }
     resolved_model = model or settings.EXTRACTOR_MODEL or DEFAULT_MODEL
     resolved_reasoning = normalize_reasoning_effort(reasoning_effort)
-    resolved_client = client or OpenRouterChatClient()
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     full_jsonl_path = extractor_run_path(
@@ -859,7 +860,7 @@ def extract_tables(
                 model=resolved_model,
                 reasoning_effort=resolved_reasoning,
                 max_attempts=max_attempts,
-                client=resolved_client,
+                client=client,
             )
         )
         audit_records.append(json.dumps(row_state.to_audit_dict(), sort_keys=True))
@@ -888,9 +889,10 @@ async def run_extraction_workflow(
     model: str,
     reasoning_effort: str,
     max_attempts: int,
-    client: SupportsChatCompletion,
+    client: SupportsChatCompletion | None = None,
 ) -> ExtractionRowState:
     """Run the three-stage extraction workflow for one item row."""
+    resolved_client = client or OpenRouterChatClient()
     stages: list[StageSpec] = [
         NERStage(),
         InstrumentIEStage(),
@@ -912,7 +914,7 @@ async def run_extraction_workflow(
 
         while True:
             try:
-                response = await client.complete(
+                response = await resolved_client.complete(
                     messages=row_state.current_attempt.messages,
                     model=model,
                     reasoning_effort=reasoning_effort,
