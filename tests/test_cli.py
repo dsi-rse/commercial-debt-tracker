@@ -309,6 +309,7 @@ def test_pipeline_cli_builds_pipeline_config(
             classifier_model_dir=config.classifier_model_dir or tmp_path / "model",
             artifact_root=str(tmp_path),
             extractor_run_path=tmp_path / "extractor_runs",
+            r2_published=False,
         )
 
     monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)

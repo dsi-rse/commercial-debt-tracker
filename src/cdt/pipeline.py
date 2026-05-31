@@ -32,6 +32,7 @@ from cdt.matcher import (
     DEFAULT_STRONG_MATCH_THRESHOLD,
     match_pending_mentions,
 )
+from cdt.r2_publisher import publish_config_from_env, publish_dashboard_snapshot
 from cdt.shared import get_logger
 from cdt.storage import ArtifactPath, read_text_artifact
 
@@ -87,6 +88,7 @@ class PipelineRunResult:
     classifier_model_dir: Path
     artifact_root: str
     extractor_run_path: str
+    r2_published: bool
 
 
 class PipelineOrchestrator:
@@ -182,6 +184,13 @@ class PipelineOrchestrator:
             strong_match_threshold=self.config.strong_match_threshold,
             loose_match_threshold=self.config.loose_match_threshold,
         )
+        publish_config = publish_config_from_env()
+        if publish_config is not None:
+            publish_dashboard_snapshot(
+                artifact_root=resolved_artifact_root,
+                data_dir=self.config.data_dir,
+                config=publish_config,
+            )
 
         result = PipelineRunResult(
             mode=self.config.mode,
@@ -200,6 +209,7 @@ class PipelineOrchestrator:
                 resolved_artifact_root,
                 data_dir=self.config.data_dir,
             ),
+            r2_published=publish_config is not None,
         )
         elapsed = datetime.now() - start_time
         self._log_banner(f"Pipeline completed successfully in {elapsed}")

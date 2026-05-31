@@ -8,6 +8,7 @@ CDT follows the same deployment pattern as the other IDI / FTM2J processors:
 - daily EventBridge Scheduler trigger
 - historical runs via ECS command overrides
 - durable state in S3
+- optional dashboard snapshot publishing to Cloudflare R2
 - shared logging and failure handling via `idi-ftm2j-shared`
 
 ## Runtime model
@@ -74,6 +75,17 @@ The orchestrator expects:
 - `OPENROUTER_API_KEY`
 - `SEC_USER_AGENT`
 
+When R2 publishing is enabled, the task also receives:
+
+- `R2_ACCOUNT_ID`
+- `R2_BUCKET_NAME`
+- `R2_OBJECT_PREFIX`
+- `R2_ACCESS_KEY_ID`
+- `R2_SECRET_ACCESS_KEY`
+
+The publisher builds dashboard JSON under `generated/` and only writes objects whose
+content changed.
+
 ## Deployment
 
 This repo includes in-repo deployment scaffolding aligned to the other processors:
@@ -91,6 +103,7 @@ Pulumi provisions:
 - CloudWatch log group
 - EventBridge schedule
 - Secrets Manager secrets for `OPENROUTER_API_KEY` and `SEC_USER_AGENT`
+- optional Secrets Manager secrets for Cloudflare R2 upload credentials
 
 Required Pulumi config:
 
@@ -107,6 +120,11 @@ Optional Pulumi config:
 - `idi:memory`
 - `idi:cron`
 - `idi:schedule_enabled`
+- `idi:r2_account_id`
+- `idi:r2_bucket_name`
+- `idi:r2_object_prefix`
+- `idi:r2_access_key_id` as secret
+- `idi:r2_secret_access_key` as secret
 
 For the full first-deploy flow, including local Pulumi authentication, `dev` stack values, and the manual ECS historical backfill command, see [docs/deployment-dev.md](docs/deployment-dev.md).
 

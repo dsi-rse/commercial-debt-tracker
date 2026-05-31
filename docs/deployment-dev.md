@@ -12,6 +12,7 @@ The `dev` stack provisions:
 - a CloudWatch log group
 - an EventBridge Scheduler schedule
 - Secrets Manager secrets for `OPENROUTER_API_KEY` and `SEC_USER_AGENT`
+- optional Secrets Manager secrets for Cloudflare R2 upload credentials
 
 The scheduled task runs `cdt-orchestrator daily`. Historical runs are manual ECS task invocations with a container command override.
 
@@ -96,6 +97,20 @@ pulumi config set idi:schedule_enabled false
 pulumi config set --secret idi:openrouter_api_key <openrouter-api-key>
 pulumi config set --secret idi:sec_user_agent "Trevor Spreadbury dsicorefacility_project3@uchicago.edu"
 ```
+
+To enable dashboard snapshot publishing into Cloudflare R2, also set:
+
+```bash
+pulumi config set idi:r2_account_id <cloudflare-account-id>
+pulumi config set idi:r2_bucket_name <r2-bucket-name>
+pulumi config set idi:r2_object_prefix generated
+pulumi config set --secret idi:r2_access_key_id <r2-access-key-id>
+pulumi config set --secret idi:r2_secret_access_key <r2-secret-access-key>
+```
+
+The ECS task will then publish `generated/index.json`, `generated/companies/*`, and
+`generated/debt-instruments/*` after a successful pipeline run. Unchanged objects are
+skipped.
 
 If the `dev` stack already exists, use `pulumi stack select dev` instead of `pulumi stack init dev`.
 

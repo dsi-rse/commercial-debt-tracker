@@ -76,23 +76,44 @@ aws.iam.RolePolicy(
 aws.iam.RolePolicy(
     "cdt-ecs-execution-secrets-policy",
     role=task_execution_role.id,
-    policy=pulumi.Output.json_dumps(
-        {
-            "Version": "2012-10-17",
-            "Statement": [
-                {
-                    "Effect": "Allow",
-                    "Action": [
-                        "secretsmanager:GetSecretValue",
-                        "secretsmanager:DescribeSecret",
-                    ],
-                    "Resource": [
-                        secrets.openrouter_api_key_secret.arn,
-                        secrets.sec_user_agent_secret.arn,
-                    ],
-                }
-            ],
-        }
+    policy=pulumi.Output.all(
+        openrouter_secret_arn=secrets.openrouter_api_key_secret.arn,
+        sec_user_agent_secret_arn=secrets.sec_user_agent_secret.arn,
+        r2_access_key_id_secret_arn=(
+            secrets.r2_access_key_id_secret.arn
+            if secrets.r2_access_key_id_secret is not None
+            else None
+        ),
+        r2_secret_access_key_secret_arn=(
+            secrets.r2_secret_access_key_secret.arn
+            if secrets.r2_secret_access_key_secret is not None
+            else None
+        ),
+    ).apply(
+        lambda args: json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": [
+                            "secretsmanager:GetSecretValue",
+                            "secretsmanager:DescribeSecret",
+                        ],
+                        "Resource": [
+                            arn
+                            for arn in [
+                                args["openrouter_secret_arn"],
+                                args["sec_user_agent_secret_arn"],
+                                args["r2_access_key_id_secret_arn"],
+                                args["r2_secret_access_key_secret_arn"],
+                            ]
+                            if arn is not None
+                        ],
+                    }
+                ],
+            }
+        )
     ),
 )
 

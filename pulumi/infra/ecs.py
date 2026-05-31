@@ -24,6 +24,16 @@ container_definitions = pulumi.Output.all(
     region=config.aws_region,
     openrouter_secret_arn=secrets.openrouter_api_key_secret.arn,
     sec_user_agent_secret_arn=secrets.sec_user_agent_secret.arn,
+    r2_access_key_id_secret_arn=(
+        secrets.r2_access_key_id_secret.arn
+        if secrets.r2_access_key_id_secret is not None
+        else None
+    ),
+    r2_secret_access_key_secret_arn=(
+        secrets.r2_secret_access_key_secret.arn
+        if secrets.r2_secret_access_key_secret is not None
+        else None
+    ),
 ).apply(
     lambda args: json.dumps(
         [
@@ -38,6 +48,21 @@ container_definitions = pulumi.Output.all(
                     {"name": "ARTIFACT_ROOT", "value": artifact_root},
                     {"name": "CDT_DEFAULT_CIK_FILE", "value": config.default_cik_file},
                     {"name": "PYTHONUNBUFFERED", "value": "1"},
+                    *(
+                        [
+                            {"name": "R2_ACCOUNT_ID", "value": config.r2_account_id},
+                            {"name": "R2_BUCKET_NAME", "value": config.r2_bucket_name},
+                            {
+                                "name": "R2_OBJECT_PREFIX",
+                                "value": config.r2_object_prefix,
+                            },
+                        ]
+                        if config.r2_account_id
+                        and config.r2_bucket_name
+                        and args["r2_access_key_id_secret_arn"]
+                        and args["r2_secret_access_key_secret_arn"]
+                        else []
+                    ),
                 ],
                 "secrets": [
                     {
@@ -48,6 +73,21 @@ container_definitions = pulumi.Output.all(
                         "name": "SEC_USER_AGENT",
                         "valueFrom": args["sec_user_agent_secret_arn"],
                     },
+                    *(
+                        [
+                            {
+                                "name": "R2_ACCESS_KEY_ID",
+                                "valueFrom": args["r2_access_key_id_secret_arn"],
+                            },
+                            {
+                                "name": "R2_SECRET_ACCESS_KEY",
+                                "valueFrom": args["r2_secret_access_key_secret_arn"],
+                            },
+                        ]
+                        if args["r2_access_key_id_secret_arn"]
+                        and args["r2_secret_access_key_secret_arn"]
+                        else []
+                    ),
                 ],
                 "logConfiguration": {
                     "logDriver": "awslogs",

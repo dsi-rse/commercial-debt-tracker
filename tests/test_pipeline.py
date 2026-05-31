@@ -108,6 +108,7 @@ def test_run_pipeline_uses_stage_backed_functions(
     monkeypatch.setattr(
         "cdt.pipeline.match_pending_mentions", fake_match_pending_mentions
     )
+    monkeypatch.setattr("cdt.pipeline.publish_config_from_env", lambda: None)
 
     result = run_pipeline(
         PipelineConfig(
@@ -130,6 +131,7 @@ def test_run_pipeline_uses_stage_backed_functions(
     assert result.extracted_rows == 1
     assert result.matched_rows == 1
     assert result.debt_instrument_rows == 1
+    assert result.r2_published is False
     assert calls == [
         ("ingest", {"320193"}),
         ("itemize", 11),
@@ -137,3 +139,77 @@ def test_run_pipeline_uses_stage_backed_functions(
         ("extract", 13),
         ("match", 14),
     ]
+
+
+def test_run_pipeline_publishes_snapshot_when_r2_is_configured(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pipeline publishes dashboard snapshot JSON when R2 config is present."""
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("320193\n", encoding="utf-8")
+    publish_calls: list[dict[str, object]] = []
+
+    def fake_run_ingest_pipeline(
+        config: object,
+        *,
+        ciks: set[str] | None = None,
+        s3_client: object | None = None,
+    ) -> tuple[pd.DataFrame, IngestRunResult]:
+        del config, ciks, s3_client
+        return pd.DataFrame(), IngestRunResult(
+            mode="daily",
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 1, 1),
+            ciks_count=1,
+            candidates_seen=0,
+            skipped_existing=0,
+            downloaded=0,
+            failures=0,
+            total_rows=0,
+            output_root=str(tmp_path),
+            documents_root=str(tmp_path / "documents"),
+            document_partitions=(),
+            failure_file=str(tmp_path / "failures" / "ingest_failures.json"),
+            run_manifest=str(tmp_path / "runs" / "ingest" / "run_id=1.json"),
+        )
+
+    monkeypatch.setattr("cdt.pipeline.run_ingest_pipeline", fake_run_ingest_pipeline)
+    monkeypatch.setattr(
+        "cdt.pipeline.itemize_pending_documents", lambda **kwargs: pd.DataFrame()
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.classify_pending_items", lambda **kwargs: pd.DataFrame()
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.extract_pending_items", lambda **kwargs: pd.DataFrame()
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.match_pending_mentions",
+        lambda **kwargs: {
+            "debt_instrument_mentions": pd.DataFrame(),
+            "debt_instrument": pd.DataFrame(),
+        },
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.publish_config_from_env",
+        lambda: object(),
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.publish_dashboard_snapshot",
+        lambda **kwargs: publish_calls.append(kwargs),
+    )
+
+    result = run_pipeline(
+        PipelineConfig(
+            mode="daily",
+            cik_file=str(cik_file),
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 1, 1),
+        )
+    )
+
+    assert result.r2_published is True
+    assert len(publish_calls) == 1
+    assert publish_calls[0]["artifact_root"] == result.artifact_root
+    assert publish_calls[0]["data_dir"] is None
