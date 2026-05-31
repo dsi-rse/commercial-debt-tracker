@@ -23,6 +23,7 @@ dependencies = [
 
 [project.scripts]
 cdt = "cdt.cli:main"
+cdt-orchestrator = "cdt.orchestrator:main"
 
 [dependency-groups]
 dev = [
@@ -32,6 +33,11 @@ dev = [
   "pytest~=7.4",
   "jupyterlab~=4.0.0",
   "ipykernel~=6.16",
+]
+pulumi = [
+  "pip>=25.0",
+  "pulumi>=3.0,<4.0",
+  "pulumi-aws>=6.0,<7.0",
 ]
 
 

@@ -1,5 +1,5 @@
 # This is a basic docker image for use in the clinic
-FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
 
 # Switch to root to update and install tools
 USER root

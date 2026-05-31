@@ -1,0 +1,35 @@
+"""Pulumi configuration and shared constants."""
+
+import pulumi_aws as aws
+
+import pulumi
+
+config = pulumi.Config("idi")
+project_name = pulumi.get_project()
+stack_name = pulumi.get_stack()
+app_name = config.get("app_name") or "cdt"
+name_prefix = f"{project_name}-{stack_name}-{app_name}"
+bucket_name = config.require("bucket_name")
+artifact_prefix = config.get("artifact_prefix") or f"cdt/{stack_name}"
+default_cik_file = config.require("default_cik_file")
+shared_dlq_name = config.require("shared_dlq_name")
+cpu = config.get("cpu") or "1024"
+memory = config.get("memory") or "4096"
+log_retention_days = int(config.get("log_retention_days") or "30")
+schedule_expression = config.get("cron") or "cron(0 8 * * ? *)"
+schedule_enabled = (config.get("schedule_enabled") or "false").lower() == "true"
+caller = aws.get_caller_identity()
+aws_region = pulumi.Config("aws").require("region")
+
+
+def tags(extra: dict | None = None) -> dict:
+    """Common resource tags."""
+    payload = {
+        "project": project_name,
+        "environment": stack_name,
+        "managed_by": "Pulumi",
+        "app_name": app_name,
+    }
+    if extra:
+        payload.update(extra)
+    return payload

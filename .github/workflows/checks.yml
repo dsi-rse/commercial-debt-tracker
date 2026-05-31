@@ -1,0 +1,77 @@
+name: Checks
+
+on:
+  pull_request:
+    branches: [main, dev]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PROJECT_DIR: .
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: latest
+          python-version: "3.13"
+      - name: Install dependencies
+        run: uv sync --all-groups
+      - name: Lint
+        run: uv run ruff check .
+      - name: Format check
+        run: uv run ruff format --check .
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: latest
+          python-version: "3.13"
+      - name: Install dependencies
+        run: uv sync --all-groups
+      - name: Test
+        run: uv run pytest -v
+
+  pulumi-preview:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      PULUMI_CONFIG_PASSPHRASE: ${{ secrets.PULUMI_CONFIG_PASSPHRASE }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: latest
+          python-version: "3.13"
+      - name: Install dependencies
+        run: uv sync --group pulumi
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_CHECKS }}
+          role-session-name: idi-github-ci
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-2' }}
+      - name: Pulumi preview
+        run: |
+          cd pulumi
+          pulumi login s3://${{ secrets.PULUMI_STATE_BUCKET }}
+          if [ "${{ github.base_ref }}" = "main" ]; then
+            pulumi stack select prod 2>/dev/null || pulumi stack init prod
+          else
+            pulumi stack select dev 2>/dev/null || pulumi stack init dev
+          fi
+          uv run pulumi preview --non-interactive

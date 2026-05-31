@@ -1,342 +1,148 @@
 # Commercial Debt Tracker
 
-Commercial Debt Tracker (CDT) is a multi-stage processor for finding debt-related disclosures in SEC 8-K filings, extracting structured debt-instrument mentions, and matching those mentions into filing-level instrument histories.
+Commercial Debt Tracker (CDT) is a file-native processor for finding debt-related disclosures in SEC 8-K filings, extracting structured debt-instrument mentions, and matching those mentions into instrument histories.
 
-The ingest stage consumes `manifest.json` artifacts produced by [`idi-sec-scraper`](https://github.com/dsi-clinic/idi-sec-scraper). CDT does not scrape SEC EDGAR directly; it indexes and optionally downloads only the 8-K complete-submission documents it needs from the shared scraper bucket.
+CDT follows the same deployment pattern as the other IDI / FTM2J processors:
 
-## Pipeline Overview
+- one ECS Fargate task running a container from ECR
+- daily EventBridge Scheduler trigger
+- historical runs via ECS command overrides
+- durable state in S3
+- shared logging and failure handling via `idi-ftm2j-shared`
 
-The current pipeline stages are:
+## Runtime model
 
-1. **Ingest**: read CIKs, scan scraper manifests, index matching 8-K complete-submission text files, and optionally download document batches
-2. **Itemize**: extract potentially relevant 8-K item sections
-3. **Classifier**: score item rows as `relevant` or `irrelevant`
-4. **Extractor**: run the LLM extraction workflow on relevant rows
-5. **Matcher**: group extracted mention rows into logical debt instruments
-
-Processing is resumable. SQLite stores stage progress, and ingest also maintains a permanent failure registry for upstream source artifacts that should not be retried.
-
-## Output Layout
-
-All generated artifacts live under `DATA_DIR`.
+CDT does not use SQLite or any other database. Canonical state is stored as Parquet partitions and run metadata under a single artifact root, typically:
 
 ```text
-{DATA_DIR}/
-  cdt.sqlite
-  documents/
-    document-batch-*.parquet
-  items/
-    item-batch-*.parquet
-  extractor_runs/
-    run-*/full.jsonl
-  failures/
-    ingest_failures.json
-  models/
-    classifier/tfidf-linear-svc/
+s3://<bucket>/<artifact-prefix>
 ```
 
-`cdt.sqlite` is the canonical pipeline state store. It tracks document rows, item rows, extraction status, matcher outputs, and related audit metadata.
+Production and beta filing scope are controlled by a CIK file stored in S3. The deployed orchestrator reads the default path from `CDT_DEFAULT_CIK_FILE`, and any run can override it with `--cik-file`.
 
-## Quick Start
-
-### Requirements
-
-- Python 3.13+
-- `uv`
-- AWS credentials with read access to the shared SEC scraper bucket
-
-### Installation
-
-```bash
-uv sync
-```
-
-For development dependencies:
-
-```bash
-uv sync --all-groups
-```
-
-### Environment
-
-Set `DATA_DIR` in `.env` or the shell before running CDT:
-
-```bash
-DATA_DIR=/path/to/commercial-debt-tracker/processor
-```
-
-Ingest uses the `idi-analysis` AWS profile by default. Override it with `--aws-profile` when needed.
-
-### Local Runtime
-
-The repo includes a simple Docker-based local environment:
-
-```bash
-docker compose build
-docker compose run --rm commercial-debt-tracker /bin/bash
-```
-
-The compose setup mounts the repo at `/project` and mounts `${DATA_DIR}` at `/data`.
-
-## End-to-End Pipeline
-
-`cdt pipeline` runs ingest, itemize, classifier, extractor, and matcher in sequence using the same `daily` and `historical` mode structure as the other FTM2J processor repos.
-
-Daily pipeline run for an explicit filing window:
-
-```bash
-uv run cdt pipeline \
-  --bucket idi-dev-processor-s3 \
-  --download \
-  --model-dir /path/to/tfidf-linear-svc \
-  daily 100K-ciks.txt \
-  --start-date 2024-01-01 \
-  --end-date 2024-01-31
-```
-
-Historical end-to-end run:
-
-```bash
-uv run cdt pipeline \
-  --model-dir /path/to/tfidf-linear-svc \
-  historical 100K-ciks.txt
-```
-
-Common pipeline options include:
-
-- ingest controls: `--bucket`, `--download`, `--failure-file`, `--aws-profile`, `--s3-prefix`
-- stage batch sizes: `--ingest-batch-size`, `--itemize-batch-size`, `--classify-batch-size`, `--extract-batch-size`, `--match-batch-size`
-- itemization scope: `--item-numbers`
-- classifier configuration: `--model-dir`
-- extractor configuration: `--model`, `--reasoning-effort`, `--max-attempts`
-- matcher configuration: `--strong-match-threshold`, `--loose-match-threshold`
-
-`daily` defaults both dates to yesterday when omitted. `historical` defaults to `1994-01-01` through today.
-
-## Ingest
-
-### What Ingest Reads
-
-Ingest expects the bucket layout written by `idi-sec-scraper`:
+Recommended input layout:
 
 ```text
-s3://{bucket}/
-  sec/
-    {YYYY-MM-DD}/
-      8-K/
-        {cik}/
-          {accession_without_dashes}/
-            manifest.json
-            ...
+s3://<bucket>/<artifact-prefix>/inputs/ciks/all.txt
+s3://<bucket>/<artifact-prefix>/inputs/ciks/beta-100k.txt
+s3://<bucket>/<artifact-prefix>/inputs/ciks/beta-10k.txt
+s3://<bucket>/<artifact-prefix>/inputs/ciks/beta-1k.txt
 ```
 
-Each `manifest.json` is treated as the source of truth for a filing. CDT selects the `COMPLETE SUBMISSION TEXT FILE` document entry from that manifest.
-
-### Modes
-
-`cdt ingest` follows the same mode structure used in the standalone processors:
-
-- `daily`: inclusive date window; if neither date is supplied, both default to yesterday
-- `historical`: full backfill window by default (`1994-01-01` through today), with optional bounds for partial backfills
-
-### Run
-
-Daily ingest for an explicit window:
-
-```bash
-uv run cdt ingest \
-  --bucket idi-dev-processor-s3 \
-  --download \
-  daily 100K-ciks.txt \
-  --start-date 2024-01-01 \
-  --end-date 2024-01-31
-```
-
-Daily ingest using the default yesterday window:
-
-```bash
-uv run cdt ingest daily 100K-ciks.txt
-```
-
-Historical ingest across the full CDT range:
-
-```bash
-uv run cdt ingest historical 100K-ciks.txt
-```
-
-Historical ingest for a bounded backfill:
-
-```bash
-uv run cdt ingest \
-  --batch-size 250 \
-  --download \
-  --log-file ingest.log \
-  historical 100K-ciks.txt \
-  --start-date 2024-01-01 \
-  --end-date 2024-12-31
-```
-
-Without `--download`, ingest only indexes matching resources in SQLite. With `--download`, it also writes append-only Parquet document batches under `documents/`.
-
-### CLI Reference
-
-Common ingest options must appear before the mode:
-
-| Flag | Default | Description |
-|---|---|---|
-| `--bucket` | `idi-dev-processor-s3` | Shared scraper bucket |
-| `--force` | `false` | Replace existing rows for requested accessions |
-| `--batch-size` | `100` | Matching documents processed per batch |
-| `--download` | `false` | Download matched document bodies into Parquet batches |
-| `--failure-file` | `{DATA_DIR}/failures/ingest_failures.json` | Permanent ingest failure registry path |
-| `--aws-profile` | `idi-analysis` | AWS profile used to create the S3 client |
-| `--s3-prefix` | `sec` | Top-level scraper prefix inside the bucket |
-| `--log-file` | disabled | Optional file logging for long-running runs |
-| `--quiet` | `false` | Suppress info-level progress logs |
-
-Mode-specific arguments:
-
-| Mode | Arguments | Behavior |
-|---|---|---|
-| `daily` | `cik_file`, optional `--start-date`, `--end-date` | Defaults both dates to yesterday when omitted; if either date is supplied, both are required |
-| `historical` | `cik_file`, optional `--start-date`, `--end-date` | Defaults to `1994-01-01` through today |
-
-### Failure Registry
-
-Ingest writes permanent source failures to:
+## Canonical datasets
 
 ```text
-{DATA_DIR}/failures/ingest_failures.json
+<artifact-root>/
+  documents/date=YYYY-MM-DD/shard=NNNN/part-0000.parquet
+  items/date=YYYY-MM-DD/shard=NNNN/part-0000.parquet
+  classifications/date=YYYY-MM-DD/shard=NNNN/part-0000.parquet
+  mentions/date=YYYY-MM-DD/shard=NNNN/part-0000.parquet
+  mention-matches/cik_shard=NNNN/part-0000.parquet
+  debt-instruments/cik_shard=NNNN/part-0000.parquet
+  extractor-runs/run_id=<run_id>/full.jsonl
+  runs/<stage>/run_id=<run_id>.json
+  failures/<stage>/failures.json
 ```
 
-These failures are distinct from SQLite pipeline state:
+Completion is determined by final partition presence, not by mutable status rows.
 
-- **SQLite** tracks document indexing and downstream stage status
-- **Failure registry** tracks source artifacts that should not be retried
+## CLI
 
-Currently ingest records permanent failures for:
-
-- unreadable manifests
-- invalid manifest payloads
-- manifests that do not contain a complete-submission document
-- document download failures in `--download` mode
-
-On rerun, ingest skips entries already recorded in the failure registry.
-
-## Itemize
-
-`cdt itemize` processes document rows that have not yet been itemized. It reads pending document rows from `cdt.sqlite`, loads the recorded S3 URI or local file path, extracts Form 8-K item sections, writes item batch Parquet files, and marks source documents as itemized.
+Local stage commands operate against a local artifact root:
 
 ```bash
-uv run cdt itemize --batch-size 100 --log-file itemize.log
+uv run cdt ingest --artifact-root ./data daily ./ciks.txt
+uv run cdt itemize --artifact-root ./data
+uv run cdt classifier --artifact-root ./data --model-dir ./models/classifier/tfidf-linear-svc
+uv run cdt extractor --artifact-root ./data
+uv run cdt matcher --artifact-root ./data
+uv run cdt pipeline --artifact-root ./data daily ./ciks.txt
 ```
 
-Itemization writes:
-
-```text
-{DATA_DIR}/items/item-batch-*.parquet
-```
-
-Use `--force` to re-itemize documents already marked itemized.
-
-## Classifier
-
-The classifier is binary: `relevant` or `irrelevant`.
-
-Train it with:
+The ECS-oriented entrypoint is:
 
 ```bash
-uv run cdt classifier train --train-csv path/to/training.csv
+uv run cdt-orchestrator daily
+uv run cdt-orchestrator historical --start-date 2024-01-01 --end-date 2024-12-31
 ```
 
-The training CSV must contain:
+The orchestrator expects:
 
-```text
-text
-label
-```
+- `ARTIFACT_ROOT`
+- `BUCKET_NAME`
+- `CDT_DEFAULT_CIK_FILE`
+- `OPENROUTER_API_KEY`
+- `SEC_USER_AGENT`
 
-`text` is the item text to score. `label` must be one of `relevant`, `irrelevant`, `true`, `false`, `t`, `f`, `1`, or `0`.
+## Deployment
 
-The default model output directory is:
+This repo includes in-repo deployment scaffolding aligned to the other processors:
 
-```text
-{DATA_DIR}/models/classifier/tfidf-linear-svc
-```
+- `dockerfiles/Dockerfile.orchestrator`
+- `.github/workflows/checks.yml`
+- `.github/workflows/deploy.yml`
+- `pulumi/`
 
-Run classification with:
+Pulumi provisions:
 
-```bash
-uv run cdt classifier
-```
+- ECR repository
+- ECS cluster and task definition
+- task execution and runtime IAM roles
+- CloudWatch log group
+- EventBridge schedule
+- Secrets Manager secrets for `OPENROUTER_API_KEY` and `SEC_USER_AGENT`
 
-That command reads pending item rows from `cdt.sqlite`, scores the corresponding item batch Parquet rows, and updates each item row in SQLite with classification metadata. Reruns skip rows already marked classified unless `--force` is used.
+Required Pulumi config:
 
-## Extractor
+- `idi:bucket_name`
+- `idi:default_cik_file`
+- `idi:shared_dlq_name`
+- `idi:openrouter_api_key` as secret
+- `idi:sec_user_agent` as secret
 
-`cdt extractor` processes item rows already classified as relevant. It reads pending rows from `cdt.sqlite`, loads the corresponding item text from the recorded item batch Parquet file, runs the OpenRouter-backed three-stage workflow (`ner`, `instrument_ie`, `instrument_relation`), persists extracted `debt_instrument_mentions` into SQLite, and writes a per-run `full.jsonl` audit log.
+Optional Pulumi config:
 
-Set the following environment variables before running the extractor:
+- `idi:artifact_prefix`
+- `idi:cpu`
+- `idi:memory`
+- `idi:cron`
+- `idi:schedule_enabled`
 
-```text
-OPENROUTER_API_KEY=...
-EXTRACTOR_MODEL=openai/gpt-5.4
-EXTRACTOR_REASONING=none
-```
-
-`OPENROUTER_API_TOKEN` is also accepted as a fallback key name. The model value is passed directly to OpenRouter, so provider-prefixed model IDs such as `openai/...` or `anthropic/...` can be swapped without code changes.
-
-Run extraction with:
-
-```bash
-uv run cdt extractor --batch-size 100 --log-file extractor.log
-```
-
-Useful flags:
-
-- `--force`: re-extract rows already marked `extracted` or `extraction_failed`
-- `--model`: override the OpenRouter model ID for this run
-- `--reasoning-effort`: override the requested OpenRouter reasoning effort
-- `--max-attempts`: validation retries per stage before the item is marked failed
-
-The extractor writes run artifacts under:
-
-```text
-{DATA_DIR}/extractor_runs/run-*/full.jsonl
-```
-
-`full.jsonl` contains per-item attempt history, raw stage responses, final status, and the extracted `debt_instrument_mentions` payload used to populate SQLite.
-
-## Matcher
-
-`cdt matcher` groups extracted `debt_instrument_mentions` into logical `debt_instrument` rows. Matching is conservative and same-issuer only: the stage compares mentions only within the same `cik`, derives direct mention matches first, and then builds amendment and split parent links between matched debt instruments.
-
-```bash
-uv run cdt matcher --batch-size 100
-```
-
-Useful flags:
-
-- `--force`: recompute matcher outputs for all extracted mentions
-
-By default, matcher reruns are idempotent and skip work when no `debt_instrument_mentions` remain with a null matcher status.
-
-Matcher writes to:
-
-- SQLite `debt_instrument`
-- SQLite view `active_debt_instruments`
-- additional `debt_instrument_mentions` columns including matcher status and candidate metadata
+For the full first-deploy flow, including local Pulumi authentication, `dev` stack values, and the manual ECS historical backfill command, see [docs/deployment-dev.md](docs/deployment-dev.md).
 
 ## Development
 
-Run tests with:
+Install dependencies and run checks:
 
 ```bash
+uv sync --all-groups
 uv run pytest
+uv run ruff check .
 ```
 
-Run linting with:
+The test suite runs entirely locally against filesystem-backed artifact roots.
+
+## Local deployment-style run
+
+Use the `Makefile` target to exercise the ECS-style orchestrator locally:
 
 ```bash
-uv run ruff check .
+make local-run
+```
+
+Default behavior:
+
+- runs `cdt-orchestrator daily`
+- uses `$(DATA_DIR)/local` as the artifact root
+- uses `idi-dev-processor-s3` as the source scraper bucket
+- uses `idi-analysis` as the AWS profile
+- uses `1000-ciks.txt` as the default CIK file
+
+Override values as needed:
+
+```bash
+make local-run LOCAL_CIK_FILE=./10K-ciks.txt
+make local-run LOCAL_MODE=historical LOCAL_RUN_ARGS="--start-date 2024-01-01 --end-date 2024-01-31"
+make local-run LOCAL_ARTIFACT_ROOT=./data/smoke LOCAL_RUN_ARGS="--cik-file ./100K-ciks.txt"
+make local-run LOCAL_AWS_PROFILE=other-profile
 ```

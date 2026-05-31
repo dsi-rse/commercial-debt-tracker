@@ -1,0 +1,14 @@
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+
+WORKDIR /app
+
+ENV UV_LINK_MODE=copy
+ENV PYTHONUNBUFFERED=1
+
+COPY pyproject.toml uv.lock ./
+COPY src ./src
+
+RUN uv sync --locked --no-dev
+
+ENTRYPOINT ["uv", "run", "cdt-orchestrator"]
+CMD ["--help"]

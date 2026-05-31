@@ -1,0 +1,15 @@
+encryptionsalt: v1:JWVjlpZ0/a0=:v1:su9qnBOMO94oCTpZ:188uRevUp9fFa07l0qWG4GUwhpPr0Q==
+config:
+  aws:region: us-east-2
+  idi:bucket_name: idi-dev-processor-s3
+  idi:artifact_prefix: commercial-debt-tracker/dev
+  idi:default_cik_file: s3://idi-dev-processor-s3/commercial-debt-tracker/dev/inputs/ciks/beta-1k.txt
+  idi:shared_dlq_name: idi-dev-ftm2j-shared-scheduler-dlq
+  idi:cpu: "1024"
+  idi:memory: "4096"
+  idi:cron: cron(0 7 * * ? *)
+  idi:schedule_enabled: "false"
+  idi:openrouter_api_key:
+    secure: v1:ALTA1KMMvt25ICoU:l6cxLg4HmieCztQ1cPEW2pamLvhFHvLnRqypkp+kGaHK2qGbbmx+dYzJtmQ9P6SM5mIh3+s0aQasTV74//r22ayHwwUt0T7Fn46zk/Gvhg/4TACbXmSCjlc=
+  idi:sec_user_agent:
+    secure: v1:X9F1OPBlXi6X2eUP:BTgVr3qgBjaJjJF9+0yYS645VT+Iz5J4jaw0SW2NAn3QVWHMk6Ay6jGVfheVFQUaFer2w0tpuL8EoUMXFKHecjll7U9zkGI=
