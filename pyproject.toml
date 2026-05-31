@@ -9,6 +9,7 @@ dynamic = ["version"]
 dependencies = [
   # project packages
   "boto3~=1.35",
+  "defusedxml~=0.7",
   "idi-ftm2j-shared>=0.1.4",
   "numpy~=2.2",
   "openrouter",

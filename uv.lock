@@ -329,6 +329,7 @@ name = "commercial-debt-tracker"
 source = { editable = "." }
 dependencies = [
     { name = "boto3" },
+    { name = "defusedxml" },
     { name = "idi-ftm2j-shared" },
     { name = "numpy" },
     { name = "openrouter" },
@@ -357,6 +358,7 @@ pulumi = [
 [package.metadata]
 requires-dist = [
     { name = "boto3", specifier = "~=1.35" },
+    { name = "defusedxml", specifier = "~=0.7" },
     { name = "idi-ftm2j-shared", git = "https://github.com/dsi-clinic/idi-ftm2j-shared.git?rev=v0.1.4" },
     { name = "numpy", specifier = "~=2.2" },
     { name = "openrouter" },
