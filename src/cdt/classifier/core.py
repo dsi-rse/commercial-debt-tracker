@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import pickle
-from collections import defaultdict
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Protocol, Self, runtime_checkable
@@ -14,15 +13,21 @@ import numpy as np
 import pandas as pd
 
 from cdt import settings
-from cdt.database import (
-    ITEM_STATUSES,
-    cdt_db_path,
-    connect_cdt_db,
-    mark_items_classified,
-    read_items,
+from cdt.datasets import (
+    dataset_root,
+    date_shard_partition_path,
+    iter_date_shard_partitions,
+    parse_date_shard_partition,
+    resolve_artifact_root,
+    run_manifest_path,
 )
-from cdt.itemizer.core import ITEM_COLUMNS
-from cdt.storage import read_table
+from cdt.itemizer.core import ITEM_COLUMNS, ITEM_DATASET_NAME
+from cdt.storage import (
+    artifact_exists,
+    read_table,
+    write_json_artifact,
+    write_partition_table,
+)
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_TARGET_RECALL = 0.99
@@ -33,6 +38,7 @@ MIN_CV_SPLITS = 2
 MODEL_NAME = "tfidf_linear_svc"
 MODEL_FILENAME = "model.pkl"
 METADATA_FILENAME = "metadata.json"
+CLASSIFICATION_DATASET_NAME = "classifications"
 CLASSIFIED_ITEM_COLUMNS = [*ITEM_COLUMNS, "label", "relevance", "classification_score"]
 
 
@@ -62,6 +68,19 @@ def default_model_dir(data_dir: Path | None = None) -> Path:
     """Return the default model artifact directory."""
     return (
         (data_dir or settings.DATA_DIR) / "models" / "classifier" / "tfidf-linear-svc"
+    )
+
+
+def classifications_root(
+    artifact_root: str | Path | None = None,
+    *,
+    data_dir: Path | None = None,
+) -> str:
+    """Return the canonical classifications dataset root."""
+    return dataset_root(
+        CLASSIFICATION_DATASET_NAME,
+        artifact_root=artifact_root,
+        data_dir=data_dir,
     )
 
 
@@ -149,58 +168,68 @@ def classify_items(
 
 def classify_pending_items(
     *,
+    artifact_root: str | Path | None = None,
     data_dir: Path | None = None,
     model_dir: Path | None = None,
     batch_size: int = 100,
     force: bool = False,
 ) -> pd.DataFrame:
-    """Classify pending item rows indexed in SQLite and update them in place."""
+    """Classify item partitions and persist canonical classification partitions."""
     if batch_size <= 0:
         msg = f"batch_size must be positive, got {batch_size}"
         raise ValueError(msg)
 
-    conn = connect_cdt_db(cdt_db_path(data_dir))
-    processed_item_ids: set[str] = set()
+    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     processed_frames: list[pd.DataFrame] = []
-    total_rows = 0
-    relevant_count = 0
-    irrelevant_count = 0
-    try:
-        while True:
-            index_rows = read_items(
-                conn,
-                statuses=ITEM_STATUSES if force else ("itemized",),
-                exclude_item_ids=processed_item_ids,
-                limit=batch_size,
-            )
-            if not index_rows:
-                break
-            batch_items = load_pending_item_batches(index_rows, data_dir=data_dir)
-            classified = classify_items(
-                batch_items,
-                data_dir=data_dir,
-                model_dir=model_dir,
-            )
-            mark_items_classified(
-                conn,
-                classified[
-                    ["item_id", "label", "relevance", "classification_score"]
-                ].to_dict("records"),
-            )
-            processed_frames.append(classified)
-            processed_item_ids.update(str(item_id) for item_id in classified["item_id"])
-            total_rows += len(classified)
-            relevant_count += int(classified["relevance"].sum())
-            irrelevant_count += int((~classified["relevance"]).sum())
-    finally:
-        conn.close()
+    partitions_written: list[str] = []
 
-    LOGGER.info(
-        "Classifier complete: total_classified=%s relevant=%s irrelevant=%s",
-        total_rows,
-        relevant_count,
-        irrelevant_count,
+    for item_path in iter_date_shard_partitions(
+        ITEM_DATASET_NAME,
+        artifact_root=resolved_root,
+        data_dir=data_dir,
+    ):
+        partition = parse_date_shard_partition(item_path)
+        target_path = date_shard_partition_path(
+            CLASSIFICATION_DATASET_NAME,
+            partition_date=partition["date"],
+            shard=partition["shard"],
+            artifact_root=resolved_root,
+            data_dir=data_dir,
+        )
+        if not force and artifact_exists(target_path):
+            continue
+        if len(partitions_written) >= batch_size:
+            break
+        batch_items = read_table(item_path, ITEM_COLUMNS).reindex(columns=ITEM_COLUMNS)
+        classified = classify_items(
+            batch_items,
+            data_dir=data_dir,
+            model_dir=model_dir,
+        )
+        write_partition_table(
+            classifications_root(resolved_root, data_dir=data_dir),
+            partition={"date": partition["date"], "shard": partition["shard"]},
+            table=classified.reindex(columns=CLASSIFIED_ITEM_COLUMNS),
+        )
+        processed_frames.append(classified)
+        partitions_written.append(target_path)
+
+    write_json_artifact(
+        run_manifest_path(
+            "classify",
+            "latest",
+            artifact_root=resolved_root,
+            data_dir=data_dir,
+        ),
+        {
+            "artifact_root": resolved_root,
+            "stage": "classify",
+            "batch_size": batch_size,
+            "force": force,
+            "partitions_written": partitions_written,
+        },
     )
+    LOGGER.info("Classifier complete: total_partitions=%s", len(partitions_written))
     if not processed_frames:
         return pd.DataFrame(columns=CLASSIFIED_ITEM_COLUMNS)
     return pd.concat(processed_frames, ignore_index=True).reindex(
@@ -407,41 +436,3 @@ def parse_label(value: str) -> int:
 def normalize_text(text: str) -> str:
     """Collapse repeated whitespace in free text."""
     return " ".join(text.split())
-
-
-def load_pending_item_batches(
-    index_rows: Sequence[dict[str, object]],
-    *,
-    data_dir: Path | None = None,
-) -> pd.DataFrame:
-    """Load item parquet rows referenced by SQLite index rows."""
-    if not index_rows:
-        return pd.DataFrame(columns=ITEM_COLUMNS)
-
-    item_ids_by_batch_path: dict[str, list[str]] = defaultdict(list)
-    item_id_order: list[str] = []
-    for row in index_rows:
-        batch_path = str(row["batch_path"])
-        item_id = str(row["item_id"])
-        item_ids_by_batch_path[batch_path].append(item_id)
-        item_id_order.append(item_id)
-
-    frames: list[pd.DataFrame] = []
-    for batch_path, item_ids in item_ids_by_batch_path.items():
-        path = Path(batch_path)
-        if not path.is_absolute():
-            path = (data_dir or settings.DATA_DIR) / path
-        batch = read_table(path, ITEM_COLUMNS).reindex(columns=ITEM_COLUMNS)
-        selected = batch.loc[batch["item_id"].isin(item_ids)]
-        missing_item_ids = set(item_ids).difference(selected["item_id"])
-        if missing_item_ids:
-            msg = (
-                f"Item batch {path} is missing expected item IDs: "
-                f"{sorted(missing_item_ids)}"
-            )
-            raise ValueError(msg)
-        frames.append(selected)
-
-    combined = pd.concat(frames, ignore_index=True)
-    ordered = combined.set_index("item_id").loc[item_id_order].reset_index()
-    return ordered.reindex(columns=ITEM_COLUMNS)

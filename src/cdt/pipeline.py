@@ -1,4 +1,4 @@
-"""Database-backed orchestration for the full CDT pipeline."""
+"""File-native orchestration for the full CDT pipeline."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Self
 
 from cdt.classifier import classify_pending_items, default_model_dir
+from cdt.datasets import resolve_artifact_root
 from cdt.extractor import (
     DEFAULT_MAX_ATTEMPTS,
     DEFAULT_MODEL,
@@ -21,11 +22,10 @@ from cdt.ingest import (
     DEFAULT_S3_PREFIX,
     IngestConfig,
     IngestRunResult,
+    default_failure_file,
     run_ingest_pipeline,
 )
-from cdt.ingest import (
-    DEFAULT_BATCH_SIZE as DEFAULT_INGEST_BATCH_SIZE,
-)
+from cdt.ingest import DEFAULT_BATCH_SIZE as DEFAULT_INGEST_BATCH_SIZE
 from cdt.itemizer import POTENTIALLY_RELEVANT_ITEM_NUMBERS, itemize_pending_documents
 from cdt.matcher import (
     DEFAULT_LOOSE_MATCH_THRESHOLD,
@@ -33,6 +33,7 @@ from cdt.matcher import (
     match_pending_mentions,
 )
 from cdt.shared import get_logger
+from cdt.storage import ArtifactPath, read_text_artifact
 
 ALL_TIME_START_DATE = date(1994, 1, 1)
 DEFAULT_STAGE_BATCH_SIZE = 100
@@ -45,14 +46,15 @@ class PipelineConfig:
     """Configuration for a single CDT pipeline invocation."""
 
     mode: str
-    cik_file: Path
+    cik_file: ArtifactPath
     bucket: str = DEFAULT_BUCKET
     start_date: date | None = None
     end_date: date | None = None
     data_dir: Path | None = None
+    artifact_root: ArtifactPath | None = None
     force: bool = False
     download: bool = False
-    failure_file: Path | None = None
+    failure_file: ArtifactPath | None = None
     aws_profile: str = DEFAULT_AWS_PROFILE
     s3_prefix: str = DEFAULT_S3_PREFIX
     ingest_batch_size: int = DEFAULT_INGEST_BATCH_SIZE
@@ -83,7 +85,8 @@ class PipelineRunResult:
     matched_rows: int
     debt_instrument_rows: int
     classifier_model_dir: Path
-    extractor_run_path: Path
+    artifact_root: str
+    extractor_run_path: str
 
 
 class PipelineOrchestrator:
@@ -114,8 +117,12 @@ class PipelineOrchestrator:
             self.config.end_date,
         )
         ciks = read_cik_file(self.config.cik_file)
+        resolved_artifact_root = resolve_artifact_root(
+            self.config.artifact_root,
+            data_dir=self.config.data_dir,
+        )
         self._log_banner(
-            f"Starting pipeline | mode={self.config.mode} | cik_file={self.config.cik_file.name}"
+            f"Starting pipeline | mode={self.config.mode} | cik_file={self.config.cik_file}"
         )
         self._log_config(resolved_start, resolved_end)
         start_time = datetime.now()
@@ -124,14 +131,19 @@ class PipelineOrchestrator:
             IngestConfig(
                 mode=self.config.mode,
                 bucket=self.config.bucket,
-                cik_file=self.config.cik_file,
+                cik_file=Path(str(self.config.cik_file)),
                 start_date=resolved_start,
                 end_date=resolved_end,
                 data_dir=self.config.data_dir,
+                output_root=resolved_artifact_root,
                 force=self.config.force,
                 batch_size=self.config.ingest_batch_size,
                 download=self.config.download,
-                failure_file=self.config.failure_file,
+                failure_file=self.config.failure_file
+                or default_failure_file(
+                    resolved_artifact_root,
+                    data_dir=self.config.data_dir,
+                ),
                 aws_profile=self.config.aws_profile,
                 s3_prefix=self.config.s3_prefix,
             ),
@@ -140,18 +152,21 @@ class PipelineOrchestrator:
         del ingest_table
 
         items = itemize_pending_documents(
+            artifact_root=resolved_artifact_root,
             data_dir=self.config.data_dir,
             batch_size=self.config.itemize_batch_size,
             force=self.config.force,
             item_numbers=self.config.item_numbers,
         )
         classified = classify_pending_items(
+            artifact_root=resolved_artifact_root,
             data_dir=self.config.data_dir,
             model_dir=self.config.classifier_model_dir,
             batch_size=self.config.classify_batch_size,
             force=self.config.force,
         )
         extracted = extract_pending_items(
+            artifact_root=resolved_artifact_root,
             data_dir=self.config.data_dir,
             batch_size=self.config.extract_batch_size,
             force=self.config.force,
@@ -160,6 +175,7 @@ class PipelineOrchestrator:
             max_attempts=self.config.extractor_max_attempts,
         )
         matched = match_pending_mentions(
+            artifact_root=resolved_artifact_root,
             data_dir=self.config.data_dir,
             batch_size=self.config.match_batch_size,
             force=self.config.force,
@@ -179,7 +195,11 @@ class PipelineOrchestrator:
             debt_instrument_rows=len(matched["debt_instrument"]),
             classifier_model_dir=self.config.classifier_model_dir
             or default_model_dir(self.config.data_dir),
-            extractor_run_path=extracted_tables_path(self.config.data_dir),
+            artifact_root=resolved_artifact_root,
+            extractor_run_path=extracted_tables_path(
+                resolved_artifact_root,
+                data_dir=self.config.data_dir,
+            ),
         )
         elapsed = datetime.now() - start_time
         self._log_banner(f"Pipeline completed successfully in {elapsed}")
@@ -191,9 +211,11 @@ def run_pipeline(config: PipelineConfig) -> PipelineRunResult:
     return PipelineOrchestrator(config).run()
 
 
-def read_cik_file(path: Path) -> set[str]:
-    """Read a one-CIK-per-line file."""
-    return {line.strip() for line in path.read_text().splitlines() if line.strip()}
+def read_cik_file(path: ArtifactPath) -> set[str]:
+    """Read a one-CIK-per-line file from local storage or S3."""
+    return {
+        line.strip() for line in read_text_artifact(path).splitlines() if line.strip()
+    }
 
 
 def resolve_mode_dates(

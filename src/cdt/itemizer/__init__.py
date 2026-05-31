@@ -6,7 +6,7 @@ from cdt.itemizer.core import (
     itemize_document_record,
     itemize_documents,
     itemize_pending_documents,
-    items_path,
+    items_root,
 )
 from cdt.itemizer.extract import DocumentText, ItemSection, extract_items_from_document
 
@@ -19,5 +19,5 @@ __all__ = [
     "itemize_document_record",
     "itemize_documents",
     "itemize_pending_documents",
-    "items_path",
+    "items_root",
 ]

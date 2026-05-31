@@ -6,8 +6,10 @@ from cdt.matcher.core import (
     DEFAULT_LOOSE_MATCH_THRESHOLD,
     DEFAULT_STRONG_MATCH_THRESHOLD,
     MATCHER_STATUSES,
+    debt_instruments_root,
     match_pending_mentions,
     match_tables,
+    mention_matches_root,
 )
 
 __all__ = [
@@ -16,6 +18,8 @@ __all__ = [
     "DEFAULT_STRONG_MATCH_THRESHOLD",
     "DEBT_INSTRUMENT_COLUMNS",
     "MATCHER_STATUSES",
+    "debt_instruments_root",
     "match_pending_mentions",
     "match_tables",
+    "mention_matches_root",
 ]

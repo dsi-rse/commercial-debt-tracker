@@ -56,9 +56,13 @@ def test_ingest_cli_reads_cik_file_and_calls_acquire(
             downloaded=1,
             failures=0,
             total_rows=1,
-            database_path=tmp_path / "cdt.sqlite",
-            documents_path=tmp_path / "documents",
-            failure_file=tmp_path / "failures" / "ingest_failures.json",
+            output_root=str(tmp_path),
+            documents_root=str(tmp_path / "documents"),
+            document_partitions=(
+                str(tmp_path / "documents" / "date=2024-01-01" / "part-0000.parquet"),
+            ),
+            failure_file=str(tmp_path / "failures" / "ingest_failures.json"),
+            run_manifest=str(tmp_path / "runs" / "ingest" / "run_id=1.json"),
         )
 
     monkeypatch.setattr(cli, "run_ingest_pipeline", fake_run_ingest_pipeline)
@@ -133,9 +137,11 @@ def test_ingest_cli_historical_defaults_to_all_time_date_range(
             downloaded=0,
             failures=0,
             total_rows=0,
-            database_path=tmp_path / "cdt.sqlite",
-            documents_path=tmp_path / "documents",
-            failure_file=tmp_path / "failures" / "ingest_failures.json",
+            output_root=str(tmp_path),
+            documents_root=str(tmp_path / "documents"),
+            document_partitions=(),
+            failure_file=str(tmp_path / "failures" / "ingest_failures.json"),
+            run_manifest=str(tmp_path / "runs" / "ingest" / "run_id=1.json"),
         )
 
     monkeypatch.setattr(cli, "run_ingest_pipeline", fake_run_ingest_pipeline)
@@ -180,9 +186,11 @@ def test_ingest_cli_daily_defaults_to_yesterday(
             downloaded=0,
             failures=0,
             total_rows=0,
-            database_path=tmp_path / "cdt.sqlite",
-            documents_path=tmp_path / "documents",
-            failure_file=tmp_path / "failures" / "ingest_failures.json",
+            output_root=str(tmp_path),
+            documents_root=str(tmp_path / "documents"),
+            document_partitions=(),
+            failure_file=str(tmp_path / "failures" / "ingest_failures.json"),
+            run_manifest=str(tmp_path / "runs" / "ingest" / "run_id=1.json"),
         )
 
     monkeypatch.setattr(cli, "run_ingest_pipeline", fake_run_ingest_pipeline)
@@ -280,9 +288,13 @@ def test_pipeline_cli_builds_pipeline_config(
             downloaded=3,
             failures=0,
             total_rows=3,
-            database_path=tmp_path / "cdt.sqlite",
-            documents_path=tmp_path / "documents",
-            failure_file=tmp_path / "failures" / "ingest_failures.json",
+            output_root=str(tmp_path),
+            documents_root=str(tmp_path / "documents"),
+            document_partitions=(
+                str(tmp_path / "documents" / "date=2024-01-01" / "part-0000.parquet"),
+            ),
+            failure_file=str(tmp_path / "failures" / "ingest_failures.json"),
+            run_manifest=str(tmp_path / "runs" / "ingest" / "run_id=1.json"),
         )
         return PipelineRunResult(
             mode=config.mode,
@@ -295,6 +307,7 @@ def test_pipeline_cli_builds_pipeline_config(
             matched_rows=2,
             debt_instrument_rows=1,
             classifier_model_dir=config.classifier_model_dir or tmp_path / "model",
+            artifact_root=str(tmp_path),
             extractor_run_path=tmp_path / "extractor_runs",
         )
 
@@ -358,10 +371,12 @@ def test_itemize_cli_calls_pending_itemizer(monkeypatch: pytest.MonkeyPatch) -> 
 
     def fake_itemize_pending_documents(
         *,
+        artifact_root: str | Path | None = None,
         batch_size: int,
         force: bool = False,
         item_numbers: tuple[str, ...] | None = None,
     ) -> pd.DataFrame:
+        del artifact_root
         calls.append(
             {
                 "batch_size": batch_size,
@@ -395,10 +410,12 @@ def test_itemize_cli_passes_custom_item_numbers(
 
     def fake_itemize_pending_documents(
         *,
+        artifact_root: str | Path | None = None,
         batch_size: int,
         force: bool = False,
         item_numbers: tuple[str, ...] | None = None,
     ) -> pd.DataFrame:
+        del artifact_root
         calls.append(
             {
                 "batch_size": batch_size,
@@ -434,10 +451,12 @@ def test_classifier_cli_calls_pending_classifier(
 
     def fake_classify_pending_items(
         *,
+        artifact_root: str | Path | None = None,
         batch_size: int,
         force: bool = False,
         model_dir: Path | None = None,
     ) -> pd.DataFrame:
+        del artifact_root
         calls.append(
             {
                 "batch_size": batch_size,
@@ -532,12 +551,14 @@ def test_extractor_cli_calls_pending_extractor(
 
     def fake_extract_pending_items(
         *,
+        artifact_root: str | Path | None = None,
         batch_size: int,
         force: bool = False,
         model: str | None = None,
         reasoning_effort: str | None = None,
         max_attempts: int,
     ) -> pd.DataFrame:
+        del artifact_root
         calls.append(
             {
                 "batch_size": batch_size,
@@ -587,9 +608,11 @@ def test_matcher_cli_calls_pending_matcher(
 
     def fake_match_pending_mentions(
         *,
+        artifact_root: str | Path | None = None,
         batch_size: int,
         force: bool = False,
     ) -> dict[str, pd.DataFrame]:
+        del artifact_root
         calls.append(
             {
                 "batch_size": batch_size,

@@ -8,6 +8,7 @@ from cdt.extractor.core import (
     extract_pending_items,
     extract_tables,
     extracted_tables_path,
+    mentions_root,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "extract_pending_items",
     "extract_tables",
     "extracted_tables_path",
+    "mentions_root",
 ]

@@ -65,9 +65,13 @@ def test_run_pipeline_uses_stage_backed_functions(
             downloaded=1,
             failures=0,
             total_rows=1,
-            database_path=tmp_path / "cdt.sqlite",
-            documents_path=tmp_path / "documents",
-            failure_file=tmp_path / "failures" / "ingest_failures.json",
+            output_root=str(tmp_path),
+            documents_root=str(tmp_path / "documents"),
+            document_partitions=(
+                str(tmp_path / "documents" / "date=2024-01-01" / "part-0000.parquet"),
+            ),
+            failure_file=str(tmp_path / "failures" / "ingest_failures.json"),
+            run_manifest=str(tmp_path / "runs" / "ingest" / "run_id=1.json"),
         )
 
     def fake_itemize_pending_documents(**kwargs: object) -> pd.DataFrame:
@@ -108,7 +112,7 @@ def test_run_pipeline_uses_stage_backed_functions(
     result = run_pipeline(
         PipelineConfig(
             mode="historical",
-            cik_file=cik_file,
+            cik_file=str(cik_file),
             start_date=date(2024, 1, 1),
             end_date=date(2024, 1, 31),
             download=True,

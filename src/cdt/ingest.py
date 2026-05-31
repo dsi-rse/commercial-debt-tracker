@@ -4,34 +4,31 @@ from __future__ import annotations
 
 import gzip
 import json
-import sqlite3
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Protocol, Self, cast
-from urllib.parse import urlparse
 
 import boto3
 import pandas as pd
 
 from cdt import settings
-from cdt.database import (
-    cdt_db_path,
-    connect_cdt_db,
-    read_document_accessions,
-    read_documents,
-    upsert_documents,
-)
 from cdt.shared import FailureClassifier, FailureRegistry, get_logger
-from cdt.storage import write_parquet_batch
+from cdt.storage import (
+    join_artifact_path,
+    normalize_artifact_path,
+    parse_s3_uri,
+    read_dataset,
+    write_json_artifact,
+    write_partition_table,
+)
 
 LOGGER = get_logger(__name__)
-DOCUMENT_COLUMNS = ["accession_number", "cik", "url", "text", "date"]
-DOCUMENT_INDEX_COLUMNS = [*DOCUMENT_COLUMNS, "resource_uri", "batch_path", "status"]
+DOCUMENT_COLUMNS = ["accession_number", "cik", "url", "text", "date", "resource_uri"]
 DEFAULT_BUCKET = "idi-dev-processor-s3"
-DEFAULT_AWS_PROFILE = "idi-analysis"
+DEFAULT_AWS_PROFILE = ""
 DEFAULT_S3_PREFIX = "sec"
 CDT_FORM_TYPE = "8-K"
 CDT_DOCUMENT_TYPE = "COMPLETE SUBMISSION TEXT FILE"
@@ -40,7 +37,11 @@ DEFAULT_BATCH_SIZE = 100
 PROGRESS_DAY_INTERVAL = 30
 MIN_MANIFEST_KEY_PARTS = 5
 MANIFEST_KEY_CIK_INDEX = 3
-DOCUMENT_BATCH_PREFIX = "document-batch"
+DEFAULT_OUTPUT_PREFIX = "cdt/dev"
+DOCUMENT_DATASET_NAME = "documents"
+RUN_DATASET_NAME = "runs"
+FAILURE_DATASET_NAME = "failures"
+DOCUMENT_PARTITION_SHARDS = 64
 
 
 class IngestFailureType(StrEnum):
@@ -58,7 +59,12 @@ class IngestFailureClassifier(FailureClassifier):
     @property
     def do_not_retry(self: Self) -> frozenset[IngestFailureType]:
         """Return non-retryable failure types."""
-        return frozenset(IngestFailureType)
+        return frozenset(
+            {
+                IngestFailureType.INVALID_MANIFEST,
+                IngestFailureType.DOCUMENT_NOT_FOUND,
+            }
+        )
 
     def classify_from_response(
         self: Self, response: dict, **kwargs: object
@@ -141,10 +147,11 @@ class IngestConfig:
     start_date: date
     end_date: date
     data_dir: Path | None = None
+    output_root: str | None = None
     force: bool = False
     batch_size: int = DEFAULT_BATCH_SIZE
     download: bool = False
-    failure_file: Path | None = None
+    failure_file: str | Path | None = None
     aws_profile: str = DEFAULT_AWS_PROFILE
     s3_prefix: str = DEFAULT_S3_PREFIX
 
@@ -162,29 +169,58 @@ class IngestRunResult:
     downloaded: int
     failures: int
     total_rows: int
-    database_path: Path
-    documents_path: Path
-    failure_file: Path
+    output_root: str
+    documents_root: str
+    document_partitions: tuple[str, ...]
+    failure_file: str
+    run_manifest: str
+
+    @property
+    def database_path(self: Self) -> str:
+        """Compatibility shim for legacy callers expecting a DB path."""
+        return self.run_manifest
+
+    @property
+    def documents_path(self: Self) -> str:
+        """Compatibility shim for legacy callers expecting a documents directory."""
+        return self.documents_root
 
 
-def documents_path(data_dir: Path | None = None) -> Path:
-    """Return the directory for document batch artifacts."""
-    return (data_dir or settings.DATA_DIR) / "documents"
+def default_output_root(data_dir: Path | None = None) -> str:
+    """Return the default local artifact root."""
+    return str(data_dir or settings.DATA_DIR)
 
 
-def documents_db_path(data_dir: Path | None = None) -> Path:
-    """Return the shared CDT SQLite database path."""
-    return cdt_db_path(data_dir)
+def documents_root(
+    output_root: str | None = None,
+    *,
+    data_dir: Path | None = None,
+) -> str:
+    """Return the root URI for canonical document dataset partitions."""
+    return join_artifact_path(
+        output_root or default_output_root(data_dir), DOCUMENT_DATASET_NAME
+    )
 
 
-def document_batches_path(data_dir: Path | None = None) -> Path:
-    """Return the directory for append-only document parquet batches."""
-    return documents_path(data_dir)
-
-
-def default_failure_file(data_dir: Path | None = None) -> Path:
+def default_failure_file(
+    output_root: str | None = None,
+    *,
+    data_dir: Path | None = None,
+) -> str:
     """Return the default ingest failure registry path."""
-    return (data_dir or settings.DATA_DIR) / "failures" / "ingest_failures.json"
+    root = output_root or default_output_root(data_dir)
+    return join_artifact_path(root, FAILURE_DATASET_NAME, "ingest", "failures.json")
+
+
+def default_run_manifest_path(
+    run_id: str,
+    *,
+    output_root: str | None = None,
+    data_dir: Path | None = None,
+) -> str:
+    """Return the default run-manifest location for one ingest execution."""
+    root = output_root or default_output_root(data_dir)
+    return join_artifact_path(root, RUN_DATASET_NAME, "ingest", f"run_id={run_id}.json")
 
 
 def normalize_accession_number(accession_number: str) -> str:
@@ -203,7 +239,7 @@ def acquire_documents(
     batch_size: int = DEFAULT_BATCH_SIZE,
     download: bool = False,
 ) -> pd.DataFrame:
-    """Acquire matching 8-K documents and update the canonical documents table."""
+    """Acquire matching 8-K documents and update canonical document partitions."""
     documents, _ = run_ingest_pipeline(
         IngestConfig(
             mode="historical",
@@ -212,6 +248,7 @@ def acquire_documents(
             start_date=date(year, 1, 1),
             end_date=date(year, 12, 31),
             data_dir=data_dir,
+            output_root=default_output_root(data_dir),
             force=force,
             batch_size=batch_size,
             download=download,
@@ -234,7 +271,7 @@ def acquire_documents_for_date_range(
     batch_size: int = DEFAULT_BATCH_SIZE,
     download: bool = False,
 ) -> pd.DataFrame:
-    """Acquire matching 8-K documents for a date range and update the table."""
+    """Acquire matching 8-K documents for a date range and update partitions."""
     documents, _ = run_ingest_pipeline(
         IngestConfig(
             mode="historical",
@@ -243,6 +280,7 @@ def acquire_documents_for_date_range(
             start_date=start_date,
             end_date=end_date,
             data_dir=data_dir,
+            output_root=default_output_root(data_dir),
             force=force,
             batch_size=batch_size,
             download=download,
@@ -265,11 +303,21 @@ def run_ingest_pipeline(
         raise ValueError(msg)
 
     client = s3_client or default_s3_client(config.aws_profile)
-    db_path = documents_db_path(config.data_dir)
-    conn = connect_document_db(db_path)
     normalized_ciks = _normalize_ciks(ciks)
-    failure_file = config.failure_file or default_failure_file(config.data_dir)
-    failure_file.parent.mkdir(parents=True, exist_ok=True)
+    output_root = config.output_root or default_output_root(config.data_dir)
+    documents_dataset_root = documents_root(output_root, data_dir=config.data_dir)
+    failure_file = config.failure_file or default_failure_file(
+        output_root,
+        data_dir=config.data_dir,
+    )
+    if not str(failure_file).startswith("s3://"):
+        Path(str(failure_file)).parent.mkdir(parents=True, exist_ok=True)
+    run_id = _run_id()
+    run_manifest = default_run_manifest_path(
+        run_id,
+        output_root=output_root,
+        data_dir=config.data_dir,
+    )
     failure_registry = FailureRegistry(
         str(failure_file),
         IngestFailureClassifier(),
@@ -285,36 +333,27 @@ def run_ingest_pipeline(
         config.download,
     )
 
-    existing_accessions = set() if config.force else read_document_accessions(conn)
+    existing_accessions = (
+        set() if config.force else _existing_accessions(documents_dataset_root)
+    )
     seen_accessions: set[str] = set()
-    pending_index_rows: list[dict[str, object]] = []
-    pending_download_rows: list[dict[str, str]] = []
+    pending_rows: list[dict[str, str]] = []
     candidates_seen = 0
     skipped_existing = 0
     downloaded = 0
     failures = 0
+    document_partitions_written: set[str] = set()
 
     def flush_pending_rows() -> None:
-        nonlocal pending_index_rows, pending_download_rows
-        if not pending_index_rows:
+        nonlocal pending_rows
+        if not pending_rows:
             return
-        batch_path: str | None = None
-        if config.download:
-            batch_path = str(
-                write_parquet_batch(
-                    document_batches_path(config.data_dir),
-                    DOCUMENT_BATCH_PREFIX,
-                    pd.DataFrame(pending_download_rows, columns=DOCUMENT_COLUMNS),
-                )
-            )
-        upsert_documents(
-            conn,
-            pending_index_rows,
-            batch_path=batch_path,
-            status="downloaded" if config.download else "indexed",
+        written = _write_document_partitions(
+            documents_dataset_root,
+            pd.DataFrame(pending_rows, columns=DOCUMENT_COLUMNS),
         )
-        pending_index_rows = []
-        pending_download_rows = []
+        document_partitions_written.update(written)
+        pending_rows = []
 
     for candidate in iter_document_candidates_for_date_range(
         client,
@@ -334,9 +373,17 @@ def run_ingest_pipeline(
             skipped_existing += 1
             continue
 
+        row = {
+            "accession_number": candidate.accession_number,
+            "cik": candidate.cik,
+            "url": candidate.url,
+            "date": candidate.date,
+            "resource_uri": candidate.resource_uri,
+            "text": "",
+        }
         if config.download:
             try:
-                pending_download_rows.append(_download_candidate(client, candidate))
+                row["text"] = _download_candidate(client, candidate)
             except Exception:
                 LOGGER.exception(
                     "Failed to download candidate: accession=%s resource=%s",
@@ -351,33 +398,49 @@ def run_ingest_pipeline(
                 continue
             downloaded += 1
 
-        pending_index_rows.append(
-            {
-                "accession_number": candidate.accession_number,
-                "cik": candidate.cik,
-                "url": candidate.url,
-                "resource_uri": candidate.resource_uri,
-                "date": candidate.date,
-            }
-        )
-        if len(pending_index_rows) >= config.batch_size:
+        pending_rows.append(row)
+        if len(pending_rows) >= config.batch_size:
             flush_pending_rows()
 
     flush_pending_rows()
     failure_registry.flush()
 
-    updated = read_documents_from_index(conn)
+    updated = read_dataset(documents_dataset_root, columns=DOCUMENT_COLUMNS)
+    filtered_updated = updated.loc[
+        updated["date"].between(
+            config.start_date.isoformat(),
+            config.end_date.isoformat(),
+        )
+    ].reset_index(drop=True)
+    write_json_artifact(
+        run_manifest,
+        {
+            "run_id": run_id,
+            "mode": config.mode,
+            "bucket": config.bucket,
+            "start_date": config.start_date.isoformat(),
+            "end_date": config.end_date.isoformat(),
+            "ciks_count": len(normalized_ciks or set()),
+            "candidates_seen": candidates_seen,
+            "skipped_existing": skipped_existing,
+            "downloaded": downloaded,
+            "failures": failures,
+            "output_root": output_root,
+            "documents_root": documents_dataset_root,
+            "document_partitions": sorted(document_partitions_written),
+            "failure_file": str(failure_file),
+        },
+    )
     LOGGER.info(
-        "Document acquisition complete: candidates=%s downloaded=%s skipped_existing=%s failures=%s rows=%s path=%s",
+        "Document acquisition complete: candidates=%s downloaded=%s skipped_existing=%s failures=%s rows=%s documents_root=%s",
         candidates_seen,
         downloaded,
         skipped_existing,
         failures,
-        len(updated),
-        db_path,
+        len(filtered_updated),
+        documents_dataset_root,
     )
-    conn.close()
-    return updated, IngestRunResult(
+    return filtered_updated.reindex(columns=DOCUMENT_COLUMNS), IngestRunResult(
         mode=config.mode,
         start_date=config.start_date,
         end_date=config.end_date,
@@ -386,10 +449,12 @@ def run_ingest_pipeline(
         skipped_existing=skipped_existing,
         downloaded=downloaded,
         failures=failures,
-        total_rows=len(updated),
-        database_path=db_path,
-        documents_path=document_batches_path(config.data_dir),
+        total_rows=len(filtered_updated),
+        output_root=output_root,
+        documents_root=documents_dataset_root,
+        document_partitions=tuple(sorted(document_partitions_written)),
         failure_file=failure_file,
+        run_manifest=run_manifest,
     )
 
 
@@ -493,7 +558,10 @@ def iter_filings(
 
 def default_s3_client(profile_name: str = DEFAULT_AWS_PROFILE) -> S3Client:
     """Return the default S3 client for the analysis account profile."""
-    return cast(S3Client, boto3.Session(profile_name=profile_name).client("s3"))
+    session = (
+        boto3.Session(profile_name=profile_name) if profile_name else boto3.Session()
+    )
+    return cast(S3Client, session.client("s3"))
 
 
 def s3_uri(bucket: str, key: str) -> str:
@@ -580,19 +648,10 @@ def _is_cdt_document(document: ScrapedDocument) -> bool:
     )
 
 
-def _download_candidate(
-    s3_client: S3Client, candidate: DocumentCandidate
-) -> dict[str, str]:
+def _download_candidate(s3_client: S3Client, candidate: DocumentCandidate) -> str:
     bucket, key = parse_s3_uri(candidate.resource_uri)
     body = s3_client.get_object(Bucket=bucket, Key=key)["Body"].read()
-    text = decode_document_bytes(body)
-    return {
-        "accession_number": candidate.accession_number,
-        "cik": candidate.cik,
-        "url": candidate.url,
-        "text": text,
-        "date": candidate.date,
-    }
+    return decode_document_bytes(body)
 
 
 def _record_failure(
@@ -611,61 +670,6 @@ def decode_document_bytes(body: bytes) -> str:
     if body.startswith(b"\x1f\x8b"):
         body = gzip.decompress(body)
     return body.decode("utf-8", errors="replace")
-
-
-def connect_document_db(path: Path) -> sqlite3.Connection:
-    """Connect to the shared CDT SQLite database and initialize its schema."""
-    return connect_cdt_db(path)
-
-
-def write_document_batch(
-    conn: sqlite3.Connection,
-    batches_path: Path,
-    rows: list[dict[str, str]],
-    *,
-    force: bool,
-) -> pd.DataFrame:
-    """Write one append-only parquet batch and update the SQLite index."""
-    del force
-    if not rows:
-        return read_documents_from_index(conn)
-
-    table = pd.DataFrame(rows, columns=DOCUMENT_COLUMNS)
-    batch_path = write_parquet_batch(
-        batches_path,
-        DOCUMENT_BATCH_PREFIX,
-        table,
-    )
-    index_rows = [
-        {
-            "accession_number": str(row["accession_number"]),
-            "cik": str(row["cik"]),
-            "url": str(row["url"]),
-            "resource_uri": str(row.get("resource_uri", row["url"])),
-            "date": str(row["date"]),
-        }
-        for row in rows
-    ]
-    upsert_documents(
-        conn,
-        index_rows,
-        batch_path=str(batch_path),
-        status="downloaded",
-    )
-    return read_documents_from_index(conn)
-
-
-def read_documents_from_index(conn: sqlite3.Connection) -> pd.DataFrame:
-    """Read indexed documents from the shared database."""
-    records = read_documents(
-        conn,
-        statuses=("indexed", "downloaded", "itemized"),
-    )
-    if not records:
-        return pd.DataFrame(columns=DOCUMENT_INDEX_COLUMNS)
-    table = pd.DataFrame(records)
-    table["text"] = ""
-    return table.reindex(columns=DOCUMENT_INDEX_COLUMNS)
 
 
 def _read_json_object(s3_client: S3Client, bucket: str, key: str) -> dict[str, object]:
@@ -757,15 +761,6 @@ def _failure_key_for_candidate(candidate: DocumentCandidate) -> tuple[str, str]:
     return parse_s3_uri(candidate.resource_uri)
 
 
-def parse_s3_uri(uri: str) -> tuple[str, str]:
-    """Split an s3 URI into bucket and key."""
-    parsed = urlparse(uri)
-    if parsed.scheme != "s3" or not parsed.netloc or not parsed.path:
-        msg = f"Expected an s3:// URI, got {uri!r}"
-        raise ValueError(msg)
-    return parsed.netloc, parsed.path.lstrip("/")
-
-
 def _days_in_year(year: int) -> list[date]:
     return list(_days_in_range(date(year, 1, 1), date(year, 12, 31)))
 
@@ -778,3 +773,77 @@ def _days_in_range(start: date, end: date) -> Iterator[date]:
     while current <= end:
         yield current
         current = current.fromordinal(current.toordinal() + 1)
+
+
+def _run_id() -> str:
+    return datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+
+
+def _partition_for_row(row: dict[str, str]) -> dict[str, str]:
+    accession_number = row["accession_number"]
+    shard = f"{hash(accession_number) % DOCUMENT_PARTITION_SHARDS:04d}"
+    return {
+        "date": row["date"],
+        "shard": shard,
+    }
+
+
+def _partition_path(dataset_root: str, partition: dict[str, str]) -> str:
+    partition_root = normalize_artifact_path(dataset_root).rstrip("/")
+    for key, value in partition.items():
+        partition_root = join_artifact_path(partition_root, f"{key}={value}")
+    return join_artifact_path(partition_root, "part-0000.parquet")
+
+
+def _existing_accessions(documents_dataset_root: str) -> set[str]:
+    table = read_dataset(documents_dataset_root, columns=DOCUMENT_COLUMNS)
+    if table.empty or "accession_number" not in table:
+        return set()
+    return set(table["accession_number"].astype(str))
+
+
+def _write_document_partitions(
+    documents_dataset_root: str,
+    table: pd.DataFrame,
+) -> set[str]:
+    written_paths: set[str] = set()
+    if table.empty:
+        return written_paths
+
+    grouped = table.groupby("date", sort=True)
+    for date_value, date_group in grouped:
+        for shard, shard_group in date_group.assign(
+            shard=date_group["accession_number"].map(
+                lambda value: f"{hash(str(value)) % DOCUMENT_PARTITION_SHARDS:04d}"
+            )
+        ).groupby("shard", sort=True):
+            partition = {"date": str(date_value), "shard": str(shard)}
+            path = _partition_path(documents_dataset_root, partition)
+            existing = read_dataset(
+                documents_dataset_root,
+                columns=DOCUMENT_COLUMNS,
+                partition_filter=partition,
+            )
+            merged = pd.concat(
+                [
+                    existing.reindex(columns=DOCUMENT_COLUMNS),
+                    shard_group.drop(columns=["shard"]).reindex(
+                        columns=DOCUMENT_COLUMNS
+                    ),
+                ],
+                ignore_index=True,
+            )
+            merged = merged.drop_duplicates(
+                subset=["accession_number"],
+                keep="last",
+            ).sort_values(
+                by=["date", "accession_number"],
+                kind="stable",
+            )
+            write_partition_table(
+                documents_dataset_root,
+                partition=partition,
+                table=merged.reindex(columns=DOCUMENT_COLUMNS),
+            )
+            written_paths.add(path)
+    return written_paths

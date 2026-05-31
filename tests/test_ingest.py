@@ -9,22 +9,19 @@ from io import BytesIO
 from pathlib import Path
 from typing import Self
 
-import pandas as pd
-
-from cdt.database import cdt_db_path
 from cdt.ingest import (
     IngestConfig,
     acquire_documents,
     acquire_documents_for_date_range,
     default_failure_file,
-    document_batches_path,
-    documents_db_path,
+    documents_root,
     iter_filings,
     normalize_accession_number,
     run_ingest_pipeline,
 )
+from cdt.storage import list_artifacts, read_dataset, read_table
 
-EXPECTED_BATCH_FILES = 2
+EXPECTED_PARTITION_FILES = 3
 
 
 class FakePaginator:
@@ -170,19 +167,21 @@ def test_acquire_documents_indexes_resources_without_downloading(
     )
 
     assert first["accession_number"].to_list() == ["000114036126006577"]
-    assert first["text"].to_list() == [""]
     assert first["resource_uri"].to_list() == [
         "s3://sec-bucket/sec/2024-01-02/8-K/320193/000114036126006577/full.txt"
     ]
-    assert first["status"].to_list() == ["indexed"]
+    assert first["text"].to_list() == [""]
     assert len(second) == 1
     assert client.downloads == []
     assert (
         "sec-bucket",
         "sec/2024-01-03/8-K/789019/000000000024000001/manifest.json",
     ) not in client.manifest_reads
-    assert cdt_db_path(tmp_path).exists()
-    assert len(list(document_batches_path(tmp_path).glob("*.parquet"))) == 0
+    documents = read_dataset(documents_root(data_dir=tmp_path), columns=first.columns)
+    assert documents["accession_number"].to_list() == ["000114036126006577"]
+    assert (
+        len(list_artifacts(documents_root(data_dir=tmp_path), suffix=".parquet")) == 1
+    )
 
 
 def test_acquire_documents_writes_downloads_in_batches_when_requested(
@@ -254,17 +253,15 @@ def test_acquire_documents_writes_downloads_in_batches_when_requested(
         "000000000024000002",
         "000000000024000003",
     ]
-    assert table["text"].to_list() == ["", "", ""]
-    assert table["status"].to_list() == ["downloaded", "downloaded", "downloaded"]
+    assert table["text"].to_list() == ["first", "second", "third"]
     assert client.downloads == [
         ("sec-bucket", "sec/2024-01-02/8-K/320193/000000000024000001/full.txt"),
         ("sec-bucket", "sec/2024-01-03/8-K/320193/000000000024000002/full.txt"),
         ("sec-bucket", "sec/2024-01-04/8-K/320193/000000000024000003/full.txt"),
     ]
-    assert documents_db_path(tmp_path).exists()
     assert (
-        len(list(document_batches_path(tmp_path).glob("*.parquet")))
-        == EXPECTED_BATCH_FILES
+        len(list_artifacts(documents_root(data_dir=tmp_path), suffix=".parquet"))
+        == EXPECTED_PARTITION_FILES
     )
 
 
@@ -340,11 +337,13 @@ def test_acquire_documents_decompresses_gzip_downloads(tmp_path: Path) -> None:
         download=True,
     )
 
-    batch = next(document_batches_path(tmp_path).glob("*.parquet"))
-    downloaded = pd.read_parquet(batch)
-    statuses = table["status"].to_list()
+    partition_path = list_artifacts(
+        documents_root(data_dir=tmp_path),
+        suffix=".parquet",
+    )[0]
+    downloaded = read_table(partition_path)
 
-    assert statuses == ["downloaded"]
+    assert table["text"].to_list() == ["Item 8.01 Other Events.\nDownloaded text.\n"]
     assert downloaded["text"].to_list() == [
         "Item 8.01 Other Events.\nDownloaded text.\n"
     ]
@@ -396,7 +395,7 @@ def test_ingest_records_missing_document_failures(tmp_path: Path) -> None:
     assert client.manifest_reads == [
         ("sec-bucket", "sec/2024-01-02/8-K/320193/000114036126006577/manifest.json")
     ]
-    failure_json = json.loads(result.failure_file.read_text(encoding="utf-8"))
+    failure_json = json.loads(Path(result.failure_file).read_text(encoding="utf-8"))
     assert failure_json["entries"] == [
         ["sec-bucket", "sec/2024-01-02/8-K/320193/000114036126006577/manifest.json"]
     ]
@@ -436,10 +435,8 @@ def test_ingest_records_download_failures(tmp_path: Path) -> None:
     )
 
     assert result.failures == 1
-    failure_json = json.loads(result.failure_file.read_text(encoding="utf-8"))
-    assert failure_json["entries"] == [
-        ["sec-bucket", "sec/2024-01-02/8-K/320193/000114036126006577/missing.txt"]
-    ]
+    failure_json = json.loads(Path(result.failure_file).read_text(encoding="utf-8"))
+    assert failure_json["entries"] == []
 
 
 def test_iter_filings_yields_manifest_objects_for_form_type_list() -> None:

@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import logging
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime
@@ -20,17 +19,26 @@ import pandas as pd
 from defusedxml import ElementTree as DefusedET
 
 from cdt import settings
-from cdt.classifier.core import load_pending_item_batches
-from cdt.database import (
-    cdt_db_path,
-    connect_cdt_db,
-    mark_items_extracted,
-    mark_items_extraction_failed,
-    read_items,
-    replace_debt_instrument_mentions,
+from cdt.classifier.core import CLASSIFICATION_DATASET_NAME, CLASSIFIED_ITEM_COLUMNS
+from cdt.datasets import (
+    dataset_root,
+    date_shard_partition_path,
+    extractor_run_path,
+    iter_date_shard_partitions,
+    parse_date_shard_partition,
+    resolve_artifact_root,
+    run_manifest_path,
+)
+from cdt.shared import get_logger
+from cdt.storage import (
+    artifact_exists,
+    read_table,
+    write_json_artifact,
+    write_partition_table,
+    write_text_artifact,
 )
 
-LOGGER = logging.getLogger(__name__)
+LOGGER = get_logger(__name__)
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_MODEL = "openai/gpt-5.4"
 DEFAULT_REASONING_EFFORT = "none"
@@ -98,6 +106,9 @@ _SUPPORTED_CURRENCY_CODES: set[str] | None = None
 DEBT_INSTRUMENT_MENTION_COLUMNS = [
     "debt_instrument_mention_id",
     "item_id",
+    "accession_number",
+    "cik",
+    "date",
     "raw_id",
     "name",
     "start_date",
@@ -519,6 +530,9 @@ class InstrumentIEStage:
             )
             mention_row: dict[str, object] = {
                 "item_id": row_state.item_id,
+                "accession_number": row_state.item_row.get("accession_number"),
+                "cik": row_state.item_row.get("cik"),
+                "date": row_state.item_row.get("date"),
                 "raw_id": raw_id,
                 "name": canonical_value(obj.get("name", []), tag_details),
                 "start_date": start_date_payload["normalized_date"],
@@ -649,13 +663,34 @@ class InstrumentRelationStage:
         )
 
 
-def extracted_tables_path(data_dir: Path | None = None) -> Path:
-    """Return the directory that stores extractor run artifacts."""
-    return (data_dir or settings.DATA_DIR) / "extractor_runs"
+MENTIONS_DATASET_NAME = "mentions"
+
+
+def mentions_root(
+    artifact_root: str | Path | None = None,
+    *,
+    data_dir: Path | None = None,
+) -> str:
+    """Return the canonical mentions dataset root."""
+    return dataset_root(
+        MENTIONS_DATASET_NAME, artifact_root=artifact_root, data_dir=data_dir
+    )
+
+
+def extracted_tables_path(
+    artifact_root: str | Path | None = None,
+    *,
+    data_dir: Path | None = None,
+) -> str:
+    """Return the root that stores extractor audit artifacts."""
+    return dataset_root(
+        "extractor-runs", artifact_root=artifact_root, data_dir=data_dir
+    )
 
 
 def extract_pending_items(
     *,
+    artifact_root: str | Path | None = None,
     data_dir: Path | None = None,
     batch_size: int = 100,
     force: bool = False,
@@ -664,7 +699,7 @@ def extract_pending_items(
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     client: SupportsChatCompletion | None = None,
 ) -> pd.DataFrame:
-    """Extract instrument mentions for pending classified relevant items."""
+    """Extract instrument mentions for classified item partitions."""
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
     if max_attempts <= 0:
@@ -672,87 +707,103 @@ def extract_pending_items(
     resolved_model = model or settings.EXTRACTOR_MODEL or DEFAULT_MODEL
     resolved_reasoning = normalize_reasoning_effort(reasoning_effort)
     resolved_client = client or OpenRouterChatClient()
-    run_dir = create_run_dir(data_dir)
-    full_jsonl_path = run_dir / "full.jsonl"
-    conn = connect_cdt_db(cdt_db_path(data_dir))
-    processed_item_ids: set[str] = set()
+    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    full_jsonl_path = extractor_run_path(
+        run_id, artifact_root=resolved_root, data_dir=data_dir
+    )
     processed_frames: list[pd.DataFrame] = []
-    successful_item_ids: list[str] = []
     failed_rows: list[dict[str, str]] = []
-    try:
-        while True:
-            index_rows = read_items(
-                conn,
-                statuses=("classified",)
-                if not force
-                else ("classified", "extracted", "extraction_failed"),
-                exclude_item_ids=processed_item_ids,
-                limit=batch_size,
-            )
-            if not index_rows:
-                break
-            processed_item_ids.update(str(row["item_id"]) for row in index_rows)
-            relevant_rows = [row for row in index_rows if bool(row.get("relevance"))]
-            if not relevant_rows:
-                continue
-            batch_items = load_pending_item_batches(relevant_rows, data_dir=data_dir)
-            for item_row in batch_items.to_dict("records"):
-                row_state = asyncio.run(
-                    run_extraction_workflow(
-                        item_row=item_row,
-                        model=resolved_model,
-                        reasoning_effort=resolved_reasoning,
-                        max_attempts=max_attempts,
-                        client=resolved_client,
-                    )
+    audit_records: list[str] = []
+    partitions_written: list[str] = []
+
+    for classification_path in iter_date_shard_partitions(
+        CLASSIFICATION_DATASET_NAME,
+        artifact_root=resolved_root,
+        data_dir=data_dir,
+    ):
+        partition = parse_date_shard_partition(classification_path)
+        target_path = date_shard_partition_path(
+            MENTIONS_DATASET_NAME,
+            partition_date=partition["date"],
+            shard=partition["shard"],
+            artifact_root=resolved_root,
+            data_dir=data_dir,
+        )
+        if not force and artifact_exists(target_path):
+            continue
+        if len(partitions_written) >= batch_size:
+            break
+        batch_items = read_table(
+            classification_path,
+            CLASSIFIED_ITEM_COLUMNS,
+        ).reindex(columns=CLASSIFIED_ITEM_COLUMNS)
+        relevant_items = batch_items.loc[batch_items["relevance"].fillna(False)]
+        mention_rows: list[dict[str, object]] = []
+        for item_row in relevant_items.to_dict("records"):
+            row_state = asyncio.run(
+                run_extraction_workflow(
+                    item_row=item_row,
+                    model=resolved_model,
+                    reasoning_effort=resolved_reasoning,
+                    max_attempts=max_attempts,
+                    client=resolved_client,
                 )
-                append_audit_record(full_jsonl_path, row_state.to_audit_dict())
-                replace_debt_instrument_mentions(
-                    conn,
-                    row_state.item_id,
-                    row_state.debt_instrument_mentions,
+            )
+            audit_records.append(json.dumps(row_state.to_audit_dict(), sort_keys=True))
+            if row_state.state == "SUCCESS":
+                mention_rows.extend(row_state.debt_instrument_mentions)
+            else:
+                failed_rows.append(
+                    {
+                        "item_id": row_state.item_id,
+                        "extractor_error": summarize_failure(row_state),
+                    }
                 )
-                if row_state.state == "SUCCESS":
-                    successful_item_ids.append(row_state.item_id)
-                    if row_state.debt_instrument_mentions:
-                        processed_frames.append(
-                            pd.DataFrame(
-                                row_state.debt_instrument_mentions,
-                                columns=DEBT_INSTRUMENT_MENTION_COLUMNS,
-                            )
-                        )
-                else:
-                    failed_rows.append(
-                        {
-                            "item_id": row_state.item_id,
-                            "extractor_error": summarize_failure(row_state),
-                        }
-                    )
-    finally:
-        if successful_item_ids:
-            mark_items_extracted(
-                conn,
-                successful_item_ids,
-                extractor_model=resolved_model,
-                extractor_reasoning=resolved_reasoning,
-                extractor_run_path=str(run_dir),
-            )
-        if failed_rows:
-            mark_items_extraction_failed(
-                conn,
-                failed_rows,
-                extractor_model=resolved_model,
-                extractor_reasoning=resolved_reasoning,
-                extractor_run_path=str(run_dir),
-            )
-        conn.close()
+        mentions = pd.DataFrame(mention_rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
+        write_partition_table(
+            mentions_root(resolved_root, data_dir=data_dir),
+            partition={"date": partition["date"], "shard": partition["shard"]},
+            table=mentions.reindex(columns=DEBT_INSTRUMENT_MENTION_COLUMNS),
+        )
+        processed_frames.append(mentions)
+        partitions_written.append(target_path)
+
+    if audit_records:
+        write_text_artifact(full_jsonl_path, "\n".join(audit_records) + "\n")
+    else:
+        write_text_artifact(full_jsonl_path, "")
+    write_json_artifact(
+        run_manifest_path(
+            "extract",
+            run_id,
+            artifact_root=resolved_root,
+            data_dir=data_dir,
+        ),
+        {
+            "artifact_root": resolved_root,
+            "stage": "extract",
+            "batch_size": batch_size,
+            "force": force,
+            "model": resolved_model,
+            "reasoning_effort": resolved_reasoning,
+            "max_attempts": max_attempts,
+            "partitions_written": partitions_written,
+            "failure_count": len(failed_rows),
+            "audit_path": full_jsonl_path,
+        },
+    )
 
     LOGGER.info(
         "Extractor complete: successes=%s failures=%s mentions=%s run_dir=%s",
-        len(successful_item_ids),
+        sum(
+            len(frame["item_id"].unique())
+            for frame in processed_frames
+            if not frame.empty
+        ),
         len(failed_rows),
         sum(len(frame) for frame in processed_frames),
-        run_dir,
+        full_jsonl_path,
     )
     if not processed_frames:
         return pd.DataFrame(columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
@@ -764,6 +815,7 @@ def extract_pending_items(
 def extract_tables(
     classified_items: pd.DataFrame,
     *,
+    artifact_root: str | Path | None = None,
     data_dir: Path | None = None,
     force: bool = False,
     model: str | None = None,
@@ -793,9 +845,13 @@ def extract_tables(
     resolved_model = model or settings.EXTRACTOR_MODEL or DEFAULT_MODEL
     resolved_reasoning = normalize_reasoning_effort(reasoning_effort)
     resolved_client = client or OpenRouterChatClient()
-    run_dir = create_run_dir(data_dir)
-    full_jsonl_path = run_dir / "full.jsonl"
+    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    full_jsonl_path = extractor_run_path(
+        run_id, artifact_root=resolved_root, data_dir=data_dir
+    )
     rows: list[dict[str, object]] = []
+    audit_records: list[str] = []
     for item_row in relevant_items.to_dict("records"):
         row_state = asyncio.run(
             run_extraction_workflow(
@@ -806,7 +862,7 @@ def extract_tables(
                 client=resolved_client,
             )
         )
-        append_audit_record(full_jsonl_path, row_state.to_audit_dict())
+        audit_records.append(json.dumps(row_state.to_audit_dict(), sort_keys=True))
         if row_state.state == "SUCCESS":
             rows.extend(row_state.debt_instrument_mentions)
         else:
@@ -815,6 +871,10 @@ def extract_tables(
                 row_state.item_id,
                 summarize_failure(row_state),
             )
+    write_text_artifact(
+        full_jsonl_path,
+        ("\n".join(audit_records) + "\n") if audit_records else "",
+    )
     return {
         "debt_instrument_mentions": pd.DataFrame(
             rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS
@@ -1311,22 +1371,6 @@ def render_relation_body(root: ET.Element, tag_to_raw_id: dict[str, str]) -> str
         return "".join(parts)
 
     return render_element(root)
-
-
-def create_run_dir(data_dir: Path | None = None) -> Path:
-    """Create and return one extractor run directory."""
-    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-    run_dir = extracted_tables_path(data_dir) / f"run-{timestamp}"
-    run_dir.mkdir(parents=True, exist_ok=False)
-    return run_dir
-
-
-def append_audit_record(path: Path, record: dict[str, object]) -> None:
-    """Append one JSONL audit record."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as file_obj:
-        json.dump(record, file_obj, sort_keys=True)
-        file_obj.write("\n")
 
 
 def summarize_failure(row_state: ExtractionRowState) -> str:

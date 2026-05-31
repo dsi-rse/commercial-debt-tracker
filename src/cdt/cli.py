@@ -12,46 +12,41 @@ from cdt.classifier import (
     DEFAULT_CV_SPLITS,
     DEFAULT_RANDOM_SEED,
     DEFAULT_TARGET_RECALL,
+    classifications_root,
     classify_pending_items,
     default_model_dir,
     train_classifier_model,
 )
-from cdt.database import cdt_db_path
 from cdt.extractor import (
     DEFAULT_MAX_ATTEMPTS as DEFAULT_EXTRACTOR_MAX_ATTEMPTS,
 )
-from cdt.extractor import (
-    DEFAULT_MODEL as DEFAULT_EXTRACTOR_MODEL,
-)
+from cdt.extractor import DEFAULT_MODEL as DEFAULT_EXTRACTOR_MODEL
 from cdt.extractor import (
     DEFAULT_REASONING_EFFORT as DEFAULT_EXTRACTOR_REASONING_EFFORT,
 )
-from cdt.extractor import (
-    extract_pending_items,
-    extracted_tables_path,
-)
+from cdt.extractor import extract_pending_items, extracted_tables_path, mentions_root
 from cdt.ingest import (
     DEFAULT_AWS_PROFILE,
     DEFAULT_BUCKET,
     IngestConfig,
-    documents_db_path,
-    documents_path,
+    default_output_root,
+    documents_root,
     run_ingest_pipeline,
 )
 from cdt.itemizer import (
     POTENTIALLY_RELEVANT_ITEM_NUMBERS,
     itemize_pending_documents,
-    items_path,
+    items_root,
 )
-from cdt.matcher import match_pending_mentions
+from cdt.matcher import (
+    debt_instruments_root,
+    match_pending_mentions,
+    mention_matches_root,
+)
 from cdt.pipeline import (
     ALL_TIME_START_DATE as PIPELINE_ALL_TIME_START_DATE,
 )
-from cdt.pipeline import (
-    PipelineConfig,
-    resolve_mode_dates,
-    run_pipeline,
-)
+from cdt.pipeline import PipelineConfig, resolve_mode_dates, run_pipeline
 
 ALL_TIME_START_DATE = date(1994, 1, 1)
 DEFAULT_BATCH_SIZE = 100
@@ -64,519 +59,216 @@ def main(argv: Sequence[str] | None = None) -> int:
     return int(args.func(args))
 
 
+def add_artifact_root_argument(parser: argparse.ArgumentParser) -> None:
+    """Add a shared artifact-root CLI argument."""
+    parser.add_argument(
+        "--artifact-root",
+        default=None,
+        help="Artifact root as a local path or s3:// URI. Defaults to DATA_DIR.",
+    )
+
+
+def add_logging_arguments(parser: argparse.ArgumentParser, *, noun: str) -> None:
+    """Add quiet/log-file arguments to a parser."""
+    parser.add_argument(
+        "--quiet", action="store_true", help="Suppress progress logging."
+    )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help=f"Optional path to write {noun} logs.",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the top-level command parser."""
     parser = argparse.ArgumentParser(prog="cdt")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     ingest_parser = subparsers.add_parser(
-        "ingest",
-        help="Index 8-K submission resources for CIKs.",
+        "ingest", help="Index 8-K submission resources for CIKs."
     )
+    add_artifact_root_argument(ingest_parser)
+    ingest_parser.add_argument("--bucket", default=DEFAULT_BUCKET)
+    ingest_parser.add_argument("--force", action="store_true")
     ingest_parser.add_argument(
-        "--bucket",
-        default=DEFAULT_BUCKET,
-        help=f"S3 bucket to read from. Defaults to {DEFAULT_BUCKET}.",
+        "--batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
     )
-    ingest_parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Replace existing rows for the requested accessions.",
-    )
-    ingest_parser.add_argument(
-        "--batch-size",
-        type=positive_int,
-        default=DEFAULT_BATCH_SIZE,
-        help=(
-            "Number of matching documents to process per batch. "
-            f"Defaults to {DEFAULT_BATCH_SIZE}."
-        ),
-    )
-    ingest_parser.add_argument(
-        "--download",
-        action="store_true",
-        help="Download matched documents into Parquet batch files.",
-    )
-    ingest_parser.add_argument(
-        "--failure-file",
-        type=Path,
-        default=None,
-        help="Optional path to write the permanent ingest failure registry.",
-    )
-    ingest_parser.add_argument(
-        "--aws-profile",
-        default=DEFAULT_AWS_PROFILE,
-        help=f"AWS profile name for S3 access. Defaults to {DEFAULT_AWS_PROFILE}.",
-    )
-    ingest_parser.add_argument(
-        "--s3-prefix",
-        default="sec",
-        help="Top-level scraper prefix inside the bucket. Defaults to sec.",
-    )
-    ingest_parser.add_argument(
-        "--quiet",
-        action="store_true",
-        help="Suppress progress logging.",
-    )
-    ingest_parser.add_argument(
-        "--log-file",
-        type=Path,
-        default=None,
-        help="Optional path to write logs for long-running ingests.",
-    )
-
+    ingest_parser.add_argument("--download", action="store_true")
+    ingest_parser.add_argument("--failure-file", default=None)
+    ingest_parser.add_argument("--aws-profile", default=DEFAULT_AWS_PROFILE)
+    ingest_parser.add_argument("--s3-prefix", default="sec")
+    add_logging_arguments(ingest_parser, noun="ingest")
     ingest_subparsers = ingest_parser.add_subparsers(dest="ingest_mode", required=True)
-
-    ingest_daily_parser = ingest_subparsers.add_parser(
-        "daily",
-        help="Index 8-K filings from a daily date window.",
-    )
-    ingest_daily_parser.add_argument(
-        "cik_file",
-        type=Path,
-        help="Path to a file containing one CIK per line.",
-    )
-    ingest_daily_parser.add_argument(
-        "--start-date",
-        type=parse_date,
-        default=None,
-        help="First filing date to include. Defaults to yesterday when omitted.",
-    )
-    ingest_daily_parser.add_argument(
-        "--end-date",
-        type=parse_date,
-        default=None,
-        help="Last filing date to include. Defaults to yesterday when omitted.",
-    )
-    ingest_daily_parser.set_defaults(func=run_ingest)
-
-    ingest_historical_parser = ingest_subparsers.add_parser(
-        "historical",
-        help="Index 8-K filings from the historical scraper archive.",
-    )
-    ingest_historical_parser.add_argument(
-        "cik_file",
-        type=Path,
-        help="Path to a file containing one CIK per line.",
-    )
-    ingest_historical_parser.add_argument(
-        "--start-date",
-        type=parse_date,
-        default=ALL_TIME_START_DATE,
-        help="First filing date to include. Defaults to 1994-01-01.",
-    )
-    ingest_historical_parser.add_argument(
-        "--end-date",
-        type=parse_date,
-        default=date.today(),
-        help="Last filing date to include. Defaults to today.",
-    )
-    ingest_historical_parser.set_defaults(func=run_ingest)
+    for mode_name, help_text in (
+        ("daily", "Index 8-K filings from a daily date window."),
+        ("historical", "Index 8-K filings from the historical scraper archive."),
+    ):
+        subparser = ingest_subparsers.add_parser(mode_name, help=help_text)
+        subparser.add_argument(
+            "cik_file", help="Local path or s3:// URI for one-CIK-per-line input."
+        )
+        subparser.add_argument(
+            "--start-date",
+            type=parse_date,
+            default=None if mode_name == "daily" else ALL_TIME_START_DATE,
+        )
+        subparser.add_argument(
+            "--end-date",
+            type=parse_date,
+            default=None if mode_name == "daily" else date.today(),
+        )
+        subparser.set_defaults(func=run_ingest)
 
     itemize_parser = subparsers.add_parser(
-        "itemize",
-        help="Extract 8-K item sections from tracked document resources.",
+        "itemize", help="Extract 8-K item sections from document partitions."
     )
+    add_artifact_root_argument(itemize_parser)
     itemize_parser.add_argument(
-        "--batch-size",
-        type=positive_int,
-        default=DEFAULT_BATCH_SIZE,
-        help=(
-            "Number of source documents to itemize per batch. "
-            f"Defaults to {DEFAULT_BATCH_SIZE}."
-        ),
+        "--batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
     )
-    itemize_parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Re-itemize documents already marked itemized.",
-    )
+    itemize_parser.add_argument("--force", action="store_true")
     itemize_parser.add_argument(
         "--item-numbers",
         type=parse_item_numbers,
         default=POTENTIALLY_RELEVANT_ITEM_NUMBERS,
-        help=(
-            "Comma-separated 8-K item numbers to save. "
-            "Defaults to potentially relevant items only."
-        ),
     )
-    itemize_parser.add_argument(
-        "--quiet",
-        action="store_true",
-        help="Suppress progress logging.",
-    )
-    itemize_parser.add_argument(
-        "--log-file",
-        type=Path,
-        default=None,
-        help="Optional path to write logs for long-running itemization.",
-    )
+    add_logging_arguments(itemize_parser, noun="itemization")
     itemize_parser.set_defaults(func=run_itemize)
 
     classifier_parser = subparsers.add_parser(
-        "classifier",
-        help="Train or run the binary item relevance classifier.",
+        "classifier", help="Train or run the binary item relevance classifier."
     )
+    add_artifact_root_argument(classifier_parser)
+    classifier_parser.add_argument(
+        "--batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
+    )
+    classifier_parser.add_argument("--force", action="store_true")
+    classifier_parser.add_argument("--model-dir", type=Path, default=None)
+    add_logging_arguments(classifier_parser, noun="classification")
     classifier_parser.set_defaults(func=run_classifier)
-    classifier_parser.add_argument(
-        "--batch-size",
-        type=positive_int,
-        default=DEFAULT_BATCH_SIZE,
-        help=(
-            "Number of item index rows to classify per batch. "
-            f"Defaults to {DEFAULT_BATCH_SIZE}."
-        ),
-    )
-    classifier_parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Re-classify rows already marked classified.",
-    )
-    classifier_parser.add_argument(
-        "--model-dir",
-        type=Path,
-        default=None,
-        help="Optional path to a trained classifier artifact directory.",
-    )
-    classifier_parser.add_argument(
-        "--quiet",
-        action="store_true",
-        help="Suppress progress logging.",
-    )
-    classifier_parser.add_argument(
-        "--log-file",
-        type=Path,
-        default=None,
-        help="Optional path to write logs for long-running classification.",
-    )
-
     classifier_subparsers = classifier_parser.add_subparsers(dest="classifier_command")
-    classifier_train_parser = classifier_subparsers.add_parser(
-        "train",
-        help="Train and persist the binary item relevance classifier.",
+    classifier_train_parser = classifier_subparsers.add_parser("train")
+    classifier_train_parser.add_argument("--train-csv", type=Path, required=True)
+    classifier_train_parser.add_argument("--model-dir", type=Path, default=None)
+    classifier_train_parser.add_argument(
+        "--target-recall", type=float, default=DEFAULT_TARGET_RECALL
     )
     classifier_train_parser.add_argument(
-        "--train-csv",
-        type=Path,
-        required=True,
-        help=(
-            "Training CSV path. The file must contain `text` and `label` " "columns."
-        ),
+        "--cv-splits", type=positive_int, default=DEFAULT_CV_SPLITS
     )
     classifier_train_parser.add_argument(
-        "--model-dir",
-        type=Path,
-        default=None,
-        help="Optional output directory for model artifacts.",
+        "--random-seed", type=int, default=DEFAULT_RANDOM_SEED
     )
-    classifier_train_parser.add_argument(
-        "--target-recall",
-        type=float,
-        default=DEFAULT_TARGET_RECALL,
-        help=(
-            "Minimum recall target used during threshold selection. "
-            f"Defaults to {DEFAULT_TARGET_RECALL:.2f}."
-        ),
-    )
-    classifier_train_parser.add_argument(
-        "--cv-splits",
-        type=positive_int,
-        default=DEFAULT_CV_SPLITS,
-        help=(
-            "Requested number of stratified cross-validation folds. "
-            f"Defaults to {DEFAULT_CV_SPLITS}."
-        ),
-    )
-    classifier_train_parser.add_argument(
-        "--random-seed",
-        type=int,
-        default=DEFAULT_RANDOM_SEED,
-        help=f"Random seed for model training. Defaults to {DEFAULT_RANDOM_SEED}.",
-    )
-    classifier_train_parser.add_argument(
-        "--quiet",
-        action="store_true",
-        help="Suppress progress logging.",
-    )
-    classifier_train_parser.add_argument(
-        "--log-file",
-        type=Path,
-        default=None,
-        help="Optional path to write training logs.",
-    )
+    add_logging_arguments(classifier_train_parser, noun="training")
     classifier_train_parser.set_defaults(func=run_classifier_train)
 
     extractor_parser = subparsers.add_parser(
-        "extractor",
-        help="Extract instrument mentions from relevant classified item rows.",
+        "extractor", help="Extract instrument mentions from classified item partitions."
     )
+    add_artifact_root_argument(extractor_parser)
+    extractor_parser.add_argument(
+        "--batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
+    )
+    extractor_parser.add_argument("--force", action="store_true")
+    extractor_parser.add_argument("--model", default=DEFAULT_EXTRACTOR_MODEL)
+    extractor_parser.add_argument(
+        "--reasoning-effort", default=DEFAULT_EXTRACTOR_REASONING_EFFORT
+    )
+    extractor_parser.add_argument(
+        "--max-attempts", type=positive_int, default=DEFAULT_EXTRACTOR_MAX_ATTEMPTS
+    )
+    add_logging_arguments(extractor_parser, noun="extraction")
     extractor_parser.set_defaults(func=run_extractor)
-    extractor_parser.add_argument(
-        "--batch-size",
-        type=positive_int,
-        default=DEFAULT_BATCH_SIZE,
-        help=(
-            "Number of item rows to extract per batch. "
-            f"Defaults to {DEFAULT_BATCH_SIZE}."
-        ),
-    )
-    extractor_parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Re-extract rows already marked extracted or extraction_failed.",
-    )
-    extractor_parser.add_argument(
-        "--model",
-        default=DEFAULT_EXTRACTOR_MODEL,
-        help=f"OpenRouter model ID to use. Defaults to {DEFAULT_EXTRACTOR_MODEL}.",
-    )
-    extractor_parser.add_argument(
-        "--reasoning-effort",
-        default=DEFAULT_EXTRACTOR_REASONING_EFFORT,
-        help=(
-            "OpenRouter reasoning effort to request. "
-            f"Defaults to {DEFAULT_EXTRACTOR_REASONING_EFFORT}."
-        ),
-    )
-    extractor_parser.add_argument(
-        "--max-attempts",
-        type=positive_int,
-        default=DEFAULT_EXTRACTOR_MAX_ATTEMPTS,
-        help=(
-            "Maximum prompt attempts per stage before marking the item failed. "
-            f"Defaults to {DEFAULT_EXTRACTOR_MAX_ATTEMPTS}."
-        ),
-    )
-    extractor_parser.add_argument(
-        "--quiet",
-        action="store_true",
-        help="Suppress progress logging.",
-    )
-    extractor_parser.add_argument(
-        "--log-file",
-        type=Path,
-        default=None,
-        help="Optional path to write extraction logs.",
-    )
 
     matcher_parser = subparsers.add_parser(
-        "matcher",
-        help="Group extracted instrument mentions into debt instruments.",
+        "matcher", help="Group extracted instrument mentions into debt instruments."
     )
+    add_artifact_root_argument(matcher_parser)
+    matcher_parser.add_argument(
+        "--batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
+    )
+    matcher_parser.add_argument("--force", action="store_true")
+    add_logging_arguments(matcher_parser, noun="matcher")
     matcher_parser.set_defaults(func=run_matcher)
-    matcher_parser.add_argument(
-        "--batch-size",
-        type=positive_int,
-        default=DEFAULT_BATCH_SIZE,
-        help=(
-            "Number of pending mention rows to match per batch. "
-            f"Defaults to {DEFAULT_BATCH_SIZE}."
-        ),
-    )
-    matcher_parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Recompute matcher outputs for all extracted instrument mentions.",
-    )
-    matcher_parser.add_argument(
-        "--quiet",
-        action="store_true",
-        help="Suppress progress logging.",
-    )
-    matcher_parser.add_argument(
-        "--log-file",
-        type=Path,
-        default=None,
-        help="Optional path to write matcher logs.",
-    )
 
     pipeline_parser = subparsers.add_parser(
-        "pipeline",
-        help="Run the full CDT pipeline end-to-end.",
+        "pipeline", help="Run the full CDT pipeline end-to-end."
+    )
+    add_artifact_root_argument(pipeline_parser)
+    pipeline_parser.add_argument("--bucket", default=DEFAULT_BUCKET)
+    pipeline_parser.add_argument("--force", action="store_true")
+    pipeline_parser.add_argument("--download", action="store_true")
+    pipeline_parser.add_argument("--failure-file", default=None)
+    pipeline_parser.add_argument("--aws-profile", default=DEFAULT_AWS_PROFILE)
+    pipeline_parser.add_argument("--s3-prefix", default="sec")
+    pipeline_parser.add_argument(
+        "--ingest-batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
     )
     pipeline_parser.add_argument(
-        "--bucket",
-        default=DEFAULT_BUCKET,
-        help=f"S3 bucket to read from. Defaults to {DEFAULT_BUCKET}.",
+        "--itemize-batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
     )
     pipeline_parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Re-run all stages against already-processed rows where supported.",
+        "--classify-batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
     )
     pipeline_parser.add_argument(
-        "--download",
-        action="store_true",
-        help="Download matched documents into Parquet batches during ingest.",
+        "--extract-batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
     )
     pipeline_parser.add_argument(
-        "--failure-file",
-        type=Path,
-        default=None,
-        help="Optional path to write the permanent ingest failure registry.",
-    )
-    pipeline_parser.add_argument(
-        "--aws-profile",
-        default=DEFAULT_AWS_PROFILE,
-        help=f"AWS profile name for S3 access. Defaults to {DEFAULT_AWS_PROFILE}.",
-    )
-    pipeline_parser.add_argument(
-        "--s3-prefix",
-        default="sec",
-        help="Top-level scraper prefix inside the bucket. Defaults to sec.",
-    )
-    pipeline_parser.add_argument(
-        "--ingest-batch-size",
-        type=positive_int,
-        default=DEFAULT_BATCH_SIZE,
-        help=f"Documents processed per ingest batch. Defaults to {DEFAULT_BATCH_SIZE}.",
-    )
-    pipeline_parser.add_argument(
-        "--itemize-batch-size",
-        type=positive_int,
-        default=DEFAULT_BATCH_SIZE,
-        help=f"Documents processed per itemize batch. Defaults to {DEFAULT_BATCH_SIZE}.",
-    )
-    pipeline_parser.add_argument(
-        "--classify-batch-size",
-        type=positive_int,
-        default=DEFAULT_BATCH_SIZE,
-        help=f"Items processed per classifier batch. Defaults to {DEFAULT_BATCH_SIZE}.",
-    )
-    pipeline_parser.add_argument(
-        "--extract-batch-size",
-        type=positive_int,
-        default=DEFAULT_BATCH_SIZE,
-        help=f"Items processed per extractor batch. Defaults to {DEFAULT_BATCH_SIZE}.",
-    )
-    pipeline_parser.add_argument(
-        "--match-batch-size",
-        type=positive_int,
-        default=DEFAULT_BATCH_SIZE,
-        help=f"Mentions processed per matcher batch. Defaults to {DEFAULT_BATCH_SIZE}.",
+        "--match-batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
     )
     pipeline_parser.add_argument(
         "--item-numbers",
         type=parse_item_numbers,
         default=POTENTIALLY_RELEVANT_ITEM_NUMBERS,
-        help="Comma-separated 8-K item numbers to save during itemization.",
+    )
+    pipeline_parser.add_argument("--model-dir", type=Path, default=None)
+    pipeline_parser.add_argument("--model", default=DEFAULT_EXTRACTOR_MODEL)
+    pipeline_parser.add_argument(
+        "--reasoning-effort", default=DEFAULT_EXTRACTOR_REASONING_EFFORT
     )
     pipeline_parser.add_argument(
-        "--model-dir",
-        type=Path,
-        default=None,
-        help="Optional path to a trained classifier artifact directory.",
+        "--max-attempts", type=positive_int, default=DEFAULT_EXTRACTOR_MAX_ATTEMPTS
     )
-    pipeline_parser.add_argument(
-        "--model",
-        default=DEFAULT_EXTRACTOR_MODEL,
-        help=f"OpenRouter model ID to use. Defaults to {DEFAULT_EXTRACTOR_MODEL}.",
-    )
-    pipeline_parser.add_argument(
-        "--reasoning-effort",
-        default=DEFAULT_EXTRACTOR_REASONING_EFFORT,
-        help=(
-            "OpenRouter reasoning effort to request. "
-            f"Defaults to {DEFAULT_EXTRACTOR_REASONING_EFFORT}."
-        ),
-    )
-    pipeline_parser.add_argument(
-        "--max-attempts",
-        type=positive_int,
-        default=DEFAULT_EXTRACTOR_MAX_ATTEMPTS,
-        help=(
-            "Maximum prompt attempts per stage before marking the item failed. "
-            f"Defaults to {DEFAULT_EXTRACTOR_MAX_ATTEMPTS}."
-        ),
-    )
-    pipeline_parser.add_argument(
-        "--strong-match-threshold",
-        type=float,
-        default=0.90,
-        help="Matcher threshold for automatic direct matches. Defaults to 0.90.",
-    )
-    pipeline_parser.add_argument(
-        "--loose-match-threshold",
-        type=float,
-        default=0.75,
-        help="Matcher threshold for recording loose candidates. Defaults to 0.75.",
-    )
-    pipeline_parser.add_argument(
-        "--quiet",
-        action="store_true",
-        help="Suppress progress logging.",
-    )
-    pipeline_parser.add_argument(
-        "--log-file",
-        type=Path,
-        default=None,
-        help="Optional path to write pipeline logs.",
-    )
-
+    pipeline_parser.add_argument("--strong-match-threshold", type=float, default=0.90)
+    pipeline_parser.add_argument("--loose-match-threshold", type=float, default=0.75)
+    add_logging_arguments(pipeline_parser, noun="pipeline")
     pipeline_subparsers = pipeline_parser.add_subparsers(
         dest="pipeline_mode", required=True
     )
-    pipeline_daily_parser = pipeline_subparsers.add_parser(
-        "daily",
-        help="Run the full pipeline for a daily filing window.",
-    )
-    pipeline_daily_parser.add_argument(
-        "cik_file",
-        type=Path,
-        help="Path to a file containing one CIK per line.",
-    )
-    pipeline_daily_parser.add_argument(
-        "--start-date",
-        type=parse_date,
-        default=None,
-        help="First filing date to include. Defaults to yesterday when omitted.",
-    )
-    pipeline_daily_parser.add_argument(
-        "--end-date",
-        type=parse_date,
-        default=None,
-        help="Last filing date to include. Defaults to yesterday when omitted.",
-    )
-    pipeline_daily_parser.set_defaults(func=run_pipeline_command)
-
-    pipeline_historical_parser = pipeline_subparsers.add_parser(
-        "historical",
-        help="Run the full pipeline for the historical filing range.",
-    )
-    pipeline_historical_parser.add_argument(
-        "cik_file",
-        type=Path,
-        help="Path to a file containing one CIK per line.",
-    )
-    pipeline_historical_parser.add_argument(
-        "--start-date",
-        type=parse_date,
-        default=PIPELINE_ALL_TIME_START_DATE,
-        help="First filing date to include. Defaults to 1994-01-01.",
-    )
-    pipeline_historical_parser.add_argument(
-        "--end-date",
-        type=parse_date,
-        default=date.today(),
-        help="Last filing date to include. Defaults to today.",
-    )
-    pipeline_historical_parser.set_defaults(func=run_pipeline_command)
+    for mode_name in ("daily", "historical"):
+        subparser = pipeline_subparsers.add_parser(mode_name)
+        subparser.add_argument(
+            "cik_file", help="Local path or s3:// URI for one-CIK-per-line input."
+        )
+        subparser.add_argument(
+            "--start-date",
+            type=parse_date,
+            default=None if mode_name == "daily" else PIPELINE_ALL_TIME_START_DATE,
+        )
+        subparser.add_argument(
+            "--end-date",
+            type=parse_date,
+            default=None if mode_name == "daily" else date.today(),
+        )
+        subparser.set_defaults(func=run_pipeline_command)
     return parser
 
 
 def run_ingest(args: argparse.Namespace) -> int:
     """Run the ingest subcommand."""
     configure_logging(quiet=args.quiet, log_file=args.log_file)
-    ciks = read_cik_file(args.cik_file)
     logger = logging.getLogger(__name__)
     try:
         start_date, end_date = resolve_ingest_dates(args)
         config = IngestConfig(
             mode=args.ingest_mode,
             bucket=args.bucket,
-            cik_file=args.cik_file,
+            cik_file=Path(str(args.cik_file)),
             start_date=start_date,
             end_date=end_date,
+            output_root=args.artifact_root or default_output_root(),
             force=args.force,
             batch_size=args.batch_size,
             download=args.download,
@@ -585,18 +277,15 @@ def run_ingest(args: argparse.Namespace) -> int:
             s3_prefix=args.s3_prefix,
         )
         logger.info(
-            "Starting ingest: mode=%s ciks=%s bucket=%s start_date=%s end_date=%s "
-            "batch_size=%s download=%s database=%s",
+            "Starting ingest: mode=%s bucket=%s start_date=%s end_date=%s batch_size=%s output_root=%s",
             config.mode,
-            len(ciks),
             config.bucket,
             config.start_date,
             config.end_date,
             config.batch_size,
-            config.download,
-            documents_db_path(),
+            config.output_root,
         )
-        _, result = run_ingest_pipeline(config, ciks=ciks)
+        _, result = run_ingest_pipeline(config, ciks=read_cik_file(args.cik_file))
     except ValueError as exc:
         logger.error("Invalid ingest arguments: %s", exc)
         return 2
@@ -604,20 +293,11 @@ def run_ingest(args: argparse.Namespace) -> int:
         logger.exception("Ingest failed")
         return 1
     print(
-        f"Indexed {result.total_rows} document rows for {len(ciks)} CIKs "
-        f"from {result.start_date} through {result.end_date}."
+        f"Indexed {result.total_rows} document rows from {result.start_date} through {result.end_date}."
     )
-    print(
-        f"Matched {result.candidates_seen} candidate filings, skipped "
-        f"{result.skipped_existing} existing accessions, and recorded {result.failures} failures."
-    )
-    print(f"Wrote {result.database_path}.")
-    if config.download:
-        print(f"Wrote document batches to {result.documents_path}.")
-    else:
-        print(
-            f"Document batches will be written under {documents_path()} when download mode is used."
-        )
+    print(f"Output root: {result.output_root}.")
+    print(f"Documents dataset: {result.documents_root}.")
+    print(f"Run manifest: {result.run_manifest}.")
     print(f"Failure registry: {result.failure_file}.")
     return 0
 
@@ -626,16 +306,18 @@ def run_itemize(args: argparse.Namespace) -> int:
     """Run the itemize subcommand."""
     configure_logging(quiet=args.quiet, log_file=args.log_file)
     logger = logging.getLogger(__name__)
+    artifact_root = args.artifact_root or default_output_root()
     try:
         logger.info(
-            "Starting itemization: batch_size=%s force=%s item_numbers=%s database=%s output=%s",
+            "Starting itemization: batch_size=%s force=%s item_numbers=%s documents=%s output=%s",
             args.batch_size,
             args.force,
             ",".join(args.item_numbers),
-            documents_db_path(),
-            items_path(),
+            documents_root(artifact_root),
+            items_root(artifact_root),
         )
         items = itemize_pending_documents(
+            artifact_root=artifact_root,
             batch_size=args.batch_size,
             force=args.force,
             item_numbers=args.item_numbers,
@@ -644,7 +326,7 @@ def run_itemize(args: argparse.Namespace) -> int:
         logger.exception("Itemization failed")
         return 1
     print(f"Itemized {len(items)} item rows.")
-    print(f"Wrote item batches to {items_path()}.")
+    print(f"Wrote item partitions to {items_root(artifact_root)}.")
     return 0
 
 
@@ -665,6 +347,7 @@ def run_pipeline_command(args: argparse.Namespace) -> int:
                 bucket=args.bucket,
                 start_date=start_date,
                 end_date=end_date,
+                artifact_root=args.artifact_root,
                 force=args.force,
                 download=args.download,
                 failure_file=args.failure_file,
@@ -691,17 +374,13 @@ def run_pipeline_command(args: argparse.Namespace) -> int:
         logger.exception("Pipeline failed")
         return 1
 
-    print(
-        f"Ran pipeline for {result.ingest.ciks_count} CIKs from {result.start_date} through {result.end_date}."
-    )
+    print(f"Ran pipeline from {result.start_date} through {result.end_date}.")
     print(
         f"Ingest indexed {result.ingest.total_rows} rows, itemized {result.itemized_rows}, "
-        f"classified {result.classified_rows}, extracted {result.extracted_rows}, "
-        f"and matched {result.matched_rows} mentions."
+        f"classified {result.classified_rows}, extracted {result.extracted_rows}, and matched {result.matched_rows} mentions."
     )
     print(
-        f"Debt instruments written: {result.debt_instrument_rows}. "
-        f"Classifier model dir: {result.classifier_model_dir}."
+        f"Artifact root: {result.artifact_root}. Debt instruments: {debt_instruments_root(result.artifact_root)}."
     )
     print(f"Extractor runs: {result.extractor_run_path}.")
     print(f"Failure registry: {result.ingest.failure_file}.")
@@ -712,16 +391,19 @@ def run_classifier(args: argparse.Namespace) -> int:
     """Run the classifier inference subcommand."""
     configure_logging(quiet=args.quiet, log_file=args.log_file)
     logger = logging.getLogger(__name__)
+    artifact_root = args.artifact_root or default_output_root()
     resolved_model_dir = args.model_dir or default_model_dir()
     try:
         logger.info(
-            "Starting classification: batch_size=%s force=%s database=%s model_dir=%s",
+            "Starting classification: batch_size=%s force=%s input=%s output=%s model_dir=%s",
             args.batch_size,
             args.force,
-            cdt_db_path(),
+            items_root(artifact_root),
+            classifications_root(artifact_root),
             resolved_model_dir,
         )
         items = classify_pending_items(
+            artifact_root=artifact_root,
             batch_size=args.batch_size,
             force=args.force,
             model_dir=args.model_dir,
@@ -730,7 +412,7 @@ def run_classifier(args: argparse.Namespace) -> int:
         logger.exception("Classification failed")
         return 1
     print(f"Classified {len(items)} item rows.")
-    print(f"Updated {cdt_db_path()}.")
+    print(f"Wrote classification partitions to {classifications_root(artifact_root)}.")
     return 0
 
 
@@ -741,8 +423,7 @@ def run_classifier_train(args: argparse.Namespace) -> int:
     resolved_model_dir = args.model_dir or default_model_dir()
     try:
         logger.info(
-            "Starting classifier training: train_csv=%s model_dir=%s "
-            "target_recall=%s cv_splits=%s random_seed=%s",
+            "Starting classifier training: train_csv=%s model_dir=%s target_recall=%s cv_splits=%s random_seed=%s",
             args.train_csv,
             resolved_model_dir,
             args.target_recall,
@@ -768,18 +449,21 @@ def run_extractor(args: argparse.Namespace) -> int:
     """Run the LLM extractor subcommand."""
     configure_logging(quiet=args.quiet, log_file=args.log_file)
     logger = logging.getLogger(__name__)
+    artifact_root = args.artifact_root or default_output_root()
     try:
         logger.info(
-            "Starting extraction: batch_size=%s force=%s database=%s model=%s reasoning_effort=%s max_attempts=%s output=%s",
+            "Starting extraction: batch_size=%s force=%s input=%s output=%s model=%s reasoning_effort=%s max_attempts=%s audit=%s",
             args.batch_size,
             args.force,
-            cdt_db_path(),
+            classifications_root(artifact_root),
+            mentions_root(artifact_root),
             args.model,
             args.reasoning_effort,
             args.max_attempts,
-            extracted_tables_path(),
+            extracted_tables_path(artifact_root),
         )
         mentions = extract_pending_items(
+            artifact_root=artifact_root,
             batch_size=args.batch_size,
             force=args.force,
             model=args.model,
@@ -790,8 +474,10 @@ def run_extractor(args: argparse.Namespace) -> int:
         logger.exception("Extraction failed")
         return 1
     print(f"Extracted {len(mentions)} instrument mention rows.")
-    print(f"Updated {cdt_db_path()}.")
-    print(f"Wrote full.jsonl audit output under {extracted_tables_path()}.")
+    print(f"Wrote canonical mentions to {mentions_root(artifact_root)}.")
+    print(
+        f"Wrote full.jsonl audit output under {extracted_tables_path(artifact_root)}."
+    )
     return 0
 
 
@@ -799,14 +485,18 @@ def run_matcher(args: argparse.Namespace) -> int:
     """Run the matcher subcommand."""
     configure_logging(quiet=args.quiet, log_file=args.log_file)
     logger = logging.getLogger(__name__)
+    artifact_root = args.artifact_root or default_output_root()
     try:
         logger.info(
-            "Starting matcher: batch_size=%s force=%s database=%s",
+            "Starting matcher: batch_size=%s force=%s input=%s mention_matches=%s debt_instruments=%s",
             args.batch_size,
             args.force,
-            cdt_db_path(),
+            mentions_root(artifact_root),
+            mention_matches_root(artifact_root),
+            debt_instruments_root(artifact_root),
         )
         tables = match_pending_mentions(
+            artifact_root=artifact_root,
             batch_size=args.batch_size,
             force=args.force,
         )
@@ -816,7 +506,8 @@ def run_matcher(args: argparse.Namespace) -> int:
     print(
         f"Matched {len(tables['debt_instrument_mentions'])} debt instrument mention rows."
     )
-    print(f"Updated {cdt_db_path()}.")
+    print(f"Wrote mention matches to {mention_matches_root(artifact_root)}.")
+    print(f"Wrote debt instruments to {debt_instruments_root(artifact_root)}.")
     return 0
 
 
@@ -835,9 +526,11 @@ def configure_logging(*, quiet: bool, log_file: Path | None = None) -> None:
     )
 
 
-def read_cik_file(path: Path) -> set[str]:
+def read_cik_file(path: str) -> set[str]:
     """Read a one-CIK-per-line file."""
-    return {line.strip() for line in path.read_text().splitlines() if line.strip()}
+    from cdt.pipeline import read_cik_file as _read_cik_file
+
+    return _read_cik_file(path)
 
 
 def resolve_ingest_dates(args: argparse.Namespace) -> tuple[date, date]:

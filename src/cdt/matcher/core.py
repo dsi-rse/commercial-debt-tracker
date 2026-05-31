@@ -11,14 +11,20 @@ from pathlib import Path
 
 import pandas as pd
 
-from cdt.database import (
-    cdt_db_path,
-    clear_matcher_assignments,
-    connect_cdt_db,
-    read_matcher_mentions,
-    replace_debt_instrument_rows,
-    update_matcher_results,
+from cdt.datasets import (
+    cik_shard_partition_path,
+    dataset_root,
+    resolve_artifact_root,
+    run_manifest_path,
+    shard_for_cik,
 )
+from cdt.extractor.core import (
+    DEBT_INSTRUMENT_MENTION_COLUMNS as EXTRACTED_MENTION_COLUMNS,
+)
+from cdt.extractor.core import (
+    MENTIONS_DATASET_NAME,
+)
+from cdt.storage import read_dataset, write_json_artifact, write_partition_table
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_LOOSE_MATCH_THRESHOLD = 0.75
@@ -62,6 +68,34 @@ DEBT_INSTRUMENT_COLUMNS = [
     "other_interested_parties_json",
     "possibly_related_json",
 ]
+MENTION_MATCH_DATASET_NAME = "mention-matches"
+DEBT_INSTRUMENT_DATASET_NAME = "debt-instruments"
+
+
+def mention_matches_root(
+    artifact_root: str | Path | None = None,
+    *,
+    data_dir: Path | None = None,
+) -> str:
+    """Return the canonical mention-matches dataset root."""
+    return dataset_root(
+        MENTION_MATCH_DATASET_NAME,
+        artifact_root=artifact_root,
+        data_dir=data_dir,
+    )
+
+
+def debt_instruments_root(
+    artifact_root: str | Path | None = None,
+    *,
+    data_dir: Path | None = None,
+) -> str:
+    """Return the canonical debt-instruments dataset root."""
+    return dataset_root(
+        DEBT_INSTRUMENT_DATASET_NAME,
+        artifact_root=artifact_root,
+        data_dir=data_dir,
+    )
 
 
 @dataclass(frozen=True)
@@ -105,69 +139,101 @@ class PreparedMention:
 
 def match_pending_mentions(
     *,
+    artifact_root: str | Path | None = None,
     data_dir: Path | None = None,
     batch_size: int = 100,
     force: bool = False,
     strong_match_threshold: float = DEFAULT_STRONG_MATCH_THRESHOLD,
     loose_match_threshold: float = DEFAULT_LOOSE_MATCH_THRESHOLD,
 ) -> dict[str, pd.DataFrame]:
-    """Match pending debt instrument mentions into debt instrument rows in SQLite."""
+    """Match canonical debt instrument mentions into canonical matcher outputs."""
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
-    mention_rows = _load_matcher_rows(
-        data_dir=data_dir, batch_size=batch_size, force=force
+    del force
+    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    mention_rows = read_dataset(
+        dataset_root(
+            MENTIONS_DATASET_NAME, artifact_root=resolved_root, data_dir=data_dir
+        ),
+        columns=EXTRACTED_MENTION_COLUMNS,
     )
-    if not mention_rows and not force:
+    if mention_rows.empty:
         return {
             "debt_instrument_mentions": pd.DataFrame(
                 columns=DEBT_INSTRUMENT_MENTION_COLUMNS
             ),
             "debt_instrument": pd.DataFrame(columns=DEBT_INSTRUMENT_COLUMNS),
         }
-    tables = match_tables(
-        pd.DataFrame(mention_rows),
-        strong_match_threshold=strong_match_threshold,
-        loose_match_threshold=loose_match_threshold,
+    mention_rows = mention_rows.copy()
+    mention_rows["cik_shard"] = (
+        mention_rows["cik"].fillna("").map(lambda value: shard_for_cik(str(value)))
     )
-    conn = connect_cdt_db(cdt_db_path(data_dir))
-    try:
-        clear_matcher_assignments(conn)
-        if not tables["debt_instrument_mentions"].empty:
-            update_matcher_results(
-                conn,
-                tables["debt_instrument_mentions"].to_dict("records"),
-            )
-        replace_debt_instrument_rows(
-            conn,
-            tables["debt_instrument"].to_dict("records"),
+    mention_frames: list[pd.DataFrame] = []
+    instrument_frames: list[pd.DataFrame] = []
+    partitions_written: list[str] = []
+    for cik_shard, shard_mentions in list(mention_rows.groupby("cik_shard"))[
+        :batch_size
+    ]:
+        tables = match_tables(
+            shard_mentions.drop(columns=["cik_shard"]),
+            strong_match_threshold=strong_match_threshold,
+            loose_match_threshold=loose_match_threshold,
         )
-    finally:
-        conn.close()
-    LOGGER.info(
-        "Matcher complete: mentions=%s debt_instruments=%s force=%s",
-        len(tables["debt_instrument_mentions"]),
-        len(tables["debt_instrument"]),
-        force,
+        mention_matches = tables["debt_instrument_mentions"].reindex(
+            columns=DEBT_INSTRUMENT_MENTION_COLUMNS
+        )
+        debt_instruments = tables["debt_instrument"].reindex(
+            columns=DEBT_INSTRUMENT_COLUMNS
+        )
+        write_partition_table(
+            mention_matches_root(resolved_root, data_dir=data_dir),
+            partition={"cik_shard": str(cik_shard)},
+            table=mention_matches,
+        )
+        write_partition_table(
+            debt_instruments_root(resolved_root, data_dir=data_dir),
+            partition={"cik_shard": str(cik_shard)},
+            table=debt_instruments,
+        )
+        mention_frames.append(mention_matches)
+        instrument_frames.append(debt_instruments)
+        partitions_written.append(
+            cik_shard_partition_path(
+                DEBT_INSTRUMENT_DATASET_NAME,
+                cik_shard=str(cik_shard),
+                artifact_root=resolved_root,
+                data_dir=data_dir,
+            )
+        )
+    write_json_artifact(
+        run_manifest_path(
+            "match",
+            "latest",
+            artifact_root=resolved_root,
+            data_dir=data_dir,
+        ),
+        {
+            "artifact_root": resolved_root,
+            "stage": "match",
+            "batch_size": batch_size,
+            "partitions_written": partitions_written,
+            "strong_match_threshold": strong_match_threshold,
+            "loose_match_threshold": loose_match_threshold,
+        },
     )
-    return tables
-
-
-def _load_matcher_rows(
-    *,
-    data_dir: Path | None,
-    batch_size: int,
-    force: bool,
-) -> list[dict[str, object]]:
-    conn = connect_cdt_db(cdt_db_path(data_dir))
-    try:
-        if force:
-            return read_matcher_mentions(conn, pending_only=False)
-        pending_rows = read_matcher_mentions(conn, pending_only=True, limit=batch_size)
-        if not pending_rows:
-            return []
-        return read_matcher_mentions(conn, pending_only=False)
-    finally:
-        conn.close()
+    LOGGER.info(
+        "Matcher complete: mention_rows=%s debt_instruments=%s",
+        sum(len(frame) for frame in mention_frames),
+        sum(len(frame) for frame in instrument_frames),
+    )
+    return {
+        "debt_instrument_mentions": pd.concat(mention_frames, ignore_index=True)
+        if mention_frames
+        else pd.DataFrame(columns=DEBT_INSTRUMENT_MENTION_COLUMNS),
+        "debt_instrument": pd.concat(instrument_frames, ignore_index=True)
+        if instrument_frames
+        else pd.DataFrame(columns=DEBT_INSTRUMENT_COLUMNS),
+    }
 
 
 def match_tables(
