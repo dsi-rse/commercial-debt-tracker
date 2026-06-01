@@ -4,18 +4,25 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "commercial-debt-tracker"
-requires-python = ">=3.12"
+requires-python = ">=3.13"
 dynamic = ["version"]
 dependencies = [
   # project packages
   "boto3~=1.35",
+  "idi-ftm2j-shared>=0.1.4",
   "numpy~=2.2",
+  "openrouter",
   "pandas~=2.2",
+  "pycountry~=24.6",
   "pyarrow>=22.0",
+  "scikit-learn~=1.5",
   
   "python-dotenv~=1.0.0",
   
 ]
+
+[project.scripts]
+cdt = "cdt.cli:main"
 
 [dependency-groups]
 dev = [
@@ -67,3 +74,9 @@ convention = "google"
 
 [tool.pytest.ini_options]
 python_files = "test_*.py"
+
+[tool.uv.sources]
+idi-ftm2j-shared = { git = "https://github.com/dsi-clinic/idi-ftm2j-shared.git", rev = "v0.1.4" }
+
+[tool.ruff.lint.extend-per-file-ignores]
+"tests/*" = ["PLR2004"]

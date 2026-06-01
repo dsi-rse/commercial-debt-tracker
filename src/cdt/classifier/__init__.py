@@ -1,5 +1,21 @@
-"""Stub classifier stage for SEC 8-K items."""
+"""Binary classifier stage for SEC 8-K items."""
 
-from cdt.classifier.core import classified_items_path, classify_items
+from cdt.classifier.core import (
+    DEFAULT_CV_SPLITS,
+    DEFAULT_RANDOM_SEED,
+    DEFAULT_TARGET_RECALL,
+    classify_items,
+    classify_pending_items,
+    default_model_dir,
+    train_classifier_model,
+)
 
-__all__ = ["classified_items_path", "classify_items"]
+__all__ = [
+    "DEFAULT_CV_SPLITS",
+    "DEFAULT_RANDOM_SEED",
+    "DEFAULT_TARGET_RECALL",
+    "classify_items",
+    "classify_pending_items",
+    "default_model_dir",
+    "train_classifier_model",
+]
