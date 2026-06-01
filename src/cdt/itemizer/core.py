@@ -9,12 +9,15 @@ from time import perf_counter
 import pandas as pd
 
 from cdt.datasets import (
+    completion_registry_path,
     dataset_root,
     date_shard_partition_path,
     iter_date_shard_partitions,
+    load_completed_partitions,
     parse_date_shard_partition,
     resolve_artifact_root,
     run_manifest_path,
+    save_completed_partitions,
 )
 from cdt.ingest import DOCUMENT_COLUMNS, decode_document_bytes, default_s3_client
 from cdt.itemizer.extract import DocumentText, ItemSection, extract_items_from_document
@@ -134,7 +137,16 @@ def itemize_pending_documents(
     selected_item_numbers = normalize_item_numbers(item_numbers)
     processed_frames: list[pd.DataFrame] = []
     processed_partitions: list[str] = []
+    completed_document_paths = (
+        set()
+        if force
+        else load_completed_partitions(
+            "itemize", artifact_root=resolved_root, data_dir=data_dir
+        )
+    )
+    visited_document_paths: set[str] = set()
     total_documents = 0
+    empty_partitions = 0
     shared_s3_client = s3_client
     pending_document_paths: list[str] = []
 
@@ -153,6 +165,8 @@ def itemize_pending_documents(
         )
         if not force and artifact_exists(target_path):
             continue
+        if not force and document_path in completed_document_paths:
+            continue
         pending_document_paths.append(document_path)
 
     total_partitions = len(pending_document_paths)
@@ -164,6 +178,7 @@ def itemize_pending_documents(
             partition = parse_date_shard_partition(document_path)
             partition_label = f"date={partition['date']} shard={partition['shard']}"
             partition_start = perf_counter()
+            visited_document_paths.add(document_path)
             documents = read_table(document_path, DOCUMENT_COLUMNS).reindex(
                 columns=DOCUMENT_COLUMNS
             )
@@ -178,30 +193,42 @@ def itemize_pending_documents(
                 s3_client=shared_s3_client,
                 item_numbers=selected_item_numbers,
             )
-            write_partition_table(
-                items_root(resolved_root, data_dir=data_dir),
-                partition={"date": partition["date"], "shard": partition["shard"]},
-                table=items.reindex(columns=ITEM_COLUMNS),
-            )
-            processed_frames.append(items)
-            processed_partitions.append(
-                date_shard_partition_path(
-                    ITEM_DATASET_NAME,
-                    partition_date=partition["date"],
-                    shard=partition["shard"],
-                    artifact_root=resolved_root,
-                    data_dir=data_dir,
+            if items.empty:
+                empty_partitions += 1
+            else:
+                write_partition_table(
+                    items_root(resolved_root, data_dir=data_dir),
+                    partition={"date": partition["date"], "shard": partition["shard"]},
+                    table=items.reindex(columns=ITEM_COLUMNS),
                 )
-            )
+                processed_frames.append(items)
+                processed_partitions.append(
+                    date_shard_partition_path(
+                        ITEM_DATASET_NAME,
+                        partition_date=partition["date"],
+                        shard=partition["shard"],
+                        artifact_root=resolved_root,
+                        data_dir=data_dir,
+                    )
+                )
             LOGGER.info(
-                "Itemize partition complete: %s progress=%s/%s documents=%s items=%s elapsed=%.1fs",
+                "Itemize partition complete: %s progress=%s/%s documents=%s items=%s wrote_output=%s elapsed=%.1fs",
                 partition_label,
                 partition_index,
                 total_partitions,
                 len(documents),
                 len(items),
+                not items.empty,
                 perf_counter() - partition_start,
             )
+
+    updated_completed_paths = completed_document_paths | visited_document_paths
+    save_completed_partitions(
+        "itemize",
+        updated_completed_paths,
+        artifact_root=resolved_root,
+        data_dir=data_dir,
+    )
 
     manifest = {
         "artifact_root": resolved_root,
@@ -210,7 +237,12 @@ def itemize_pending_documents(
         "force": force,
         "item_numbers": list(selected_item_numbers),
         "documents_processed": total_documents,
+        "partitions_visited": sorted(visited_document_paths),
         "partitions_written": processed_partitions,
+        "empty_partitions_skipped_from_write": empty_partitions,
+        "completion_registry": completion_registry_path(
+            "itemize", artifact_root=resolved_root, data_dir=data_dir
+        ),
     }
     write_json_artifact(
         run_manifest_path(

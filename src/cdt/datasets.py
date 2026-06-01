@@ -10,12 +10,15 @@ from pathlib import Path
 from cdt import settings
 from cdt.storage import (
     ArtifactPath,
+    artifact_exists,
     join_artifact_path,
     list_artifacts,
     normalize_artifact_path,
+    read_json_artifact,
+    write_json_artifact,
 )
 
-ITEMIZE_CLASSIFY_EXTRACT_SHARDS = 64
+ITEMIZE_CLASSIFY_EXTRACT_SHARDS = 8
 MATCH_SHARDS = 64
 PARTITION_PATTERN = re.compile(
     r"(?P<dataset>[a-z\-]+)/date=(?P<date>\d{4}-\d{2}-\d{2})/shard=(?P<shard>\d{4})/part-0000\.parquet$"
@@ -64,6 +67,61 @@ def run_manifest_path(
         "runs",
         stage_name,
         f"run_id={run_id}.json",
+    )
+
+
+def completion_registry_path(
+    stage_name: str,
+    *,
+    artifact_root: ArtifactPath | None = None,
+    data_dir: Path | None = None,
+) -> str:
+    """Return the path for one stage completion registry."""
+    return join_artifact_path(
+        resolve_artifact_root(artifact_root, data_dir=data_dir),
+        "runs",
+        stage_name,
+        "completed-partitions.json",
+    )
+
+
+def load_completed_partitions(
+    stage_name: str,
+    *,
+    artifact_root: ArtifactPath | None = None,
+    data_dir: Path | None = None,
+) -> set[str]:
+    """Load completed source partitions for one stage."""
+    path = completion_registry_path(
+        stage_name, artifact_root=artifact_root, data_dir=data_dir
+    )
+    if not artifact_exists(path):
+        return set()
+    payload = read_json_artifact(path)
+    if not isinstance(payload, dict):
+        return set()
+    values = payload.get("source_partitions", [])
+    if not isinstance(values, list):
+        return set()
+    return {str(value) for value in values if str(value).strip()}
+
+
+def save_completed_partitions(
+    stage_name: str,
+    source_partitions: set[str],
+    *,
+    artifact_root: ArtifactPath | None = None,
+    data_dir: Path | None = None,
+) -> str:
+    """Persist completed source partitions for one stage."""
+    return write_json_artifact(
+        completion_registry_path(
+            stage_name, artifact_root=artifact_root, data_dir=data_dir
+        ),
+        {
+            "stage": stage_name,
+            "source_partitions": sorted(source_partitions),
+        },
     )
 
 

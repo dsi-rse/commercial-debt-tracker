@@ -15,12 +15,15 @@ import pandas as pd
 
 from cdt import settings
 from cdt.datasets import (
+    completion_registry_path,
     dataset_root,
     date_shard_partition_path,
     iter_date_shard_partitions,
+    load_completed_partitions,
     parse_date_shard_partition,
     resolve_artifact_root,
     run_manifest_path,
+    save_completed_partitions,
 )
 from cdt.itemizer.core import ITEM_COLUMNS, ITEM_DATASET_NAME
 from cdt.storage import (
@@ -183,6 +186,15 @@ def classify_pending_items(
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     processed_frames: list[pd.DataFrame] = []
     partitions_written: list[str] = []
+    completed_item_paths = (
+        set()
+        if force
+        else load_completed_partitions(
+            "classify", artifact_root=resolved_root, data_dir=data_dir
+        )
+    )
+    visited_item_paths: set[str] = set()
+    empty_partitions = 0
     pending_item_paths: list[str] = []
 
     for item_path in iter_date_shard_partitions(
@@ -200,6 +212,8 @@ def classify_pending_items(
         )
         if not force and artifact_exists(target_path):
             continue
+        if not force and item_path in completed_item_paths:
+            continue
         pending_item_paths.append(item_path)
 
     total_partitions = len(pending_item_paths)
@@ -209,6 +223,7 @@ def classify_pending_items(
             partition = parse_date_shard_partition(item_path)
             partition_label = f"date={partition['date']} shard={partition['shard']}"
             partition_start = perf_counter()
+            visited_item_paths.add(item_path)
             batch_items = read_table(item_path, ITEM_COLUMNS).reindex(
                 columns=ITEM_COLUMNS
             )
@@ -217,31 +232,43 @@ def classify_pending_items(
                 data_dir=data_dir,
                 model_dir=model_dir,
             )
-            write_partition_table(
-                classifications_root(resolved_root, data_dir=data_dir),
-                partition={"date": partition["date"], "shard": partition["shard"]},
-                table=classified.reindex(columns=CLASSIFIED_ITEM_COLUMNS),
-            )
-            processed_frames.append(classified)
-            partitions_written.append(
-                date_shard_partition_path(
-                    CLASSIFICATION_DATASET_NAME,
-                    partition_date=partition["date"],
-                    shard=partition["shard"],
-                    artifact_root=resolved_root,
-                    data_dir=data_dir,
+            if classified.empty:
+                empty_partitions += 1
+            else:
+                write_partition_table(
+                    classifications_root(resolved_root, data_dir=data_dir),
+                    partition={"date": partition["date"], "shard": partition["shard"]},
+                    table=classified.reindex(columns=CLASSIFIED_ITEM_COLUMNS),
                 )
-            )
+                processed_frames.append(classified)
+                partitions_written.append(
+                    date_shard_partition_path(
+                        CLASSIFICATION_DATASET_NAME,
+                        partition_date=partition["date"],
+                        shard=partition["shard"],
+                        artifact_root=resolved_root,
+                        data_dir=data_dir,
+                    )
+                )
             relevant_count = int(classified["relevance"].fillna(False).sum())
             LOGGER.info(
-                "Classification partition complete: %s progress=%s/%s items=%s relevant=%s elapsed=%.1fs",
+                "Classification partition complete: %s progress=%s/%s items=%s relevant=%s wrote_output=%s elapsed=%.1fs",
                 partition_label,
                 partition_index,
                 total_partitions,
                 len(batch_items),
                 relevant_count,
+                not classified.empty,
                 perf_counter() - partition_start,
             )
+
+    updated_completed_paths = completed_item_paths | visited_item_paths
+    save_completed_partitions(
+        "classify",
+        updated_completed_paths,
+        artifact_root=resolved_root,
+        data_dir=data_dir,
+    )
 
     write_json_artifact(
         run_manifest_path(
@@ -255,7 +282,12 @@ def classify_pending_items(
             "stage": "classify",
             "batch_size": batch_size,
             "force": force,
+            "partitions_visited": sorted(visited_item_paths),
             "partitions_written": partitions_written,
+            "empty_partitions_skipped_from_write": empty_partitions,
+            "completion_registry": completion_registry_path(
+                "classify", artifact_root=resolved_root, data_dir=data_dir
+            ),
         },
     )
     LOGGER.info("Classifier complete: total_partitions=%s", len(partitions_written))

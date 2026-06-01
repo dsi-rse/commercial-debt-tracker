@@ -22,13 +22,16 @@ from defusedxml import ElementTree as DefusedET
 from cdt import settings
 from cdt.classifier.core import CLASSIFICATION_DATASET_NAME, CLASSIFIED_ITEM_COLUMNS
 from cdt.datasets import (
+    completion_registry_path,
     dataset_root,
     date_shard_partition_path,
     extractor_run_path,
     iter_date_shard_partitions,
+    load_completed_partitions,
     parse_date_shard_partition,
     resolve_artifact_root,
     run_manifest_path,
+    save_completed_partitions,
 )
 from cdt.shared import get_logger
 from cdt.storage import (
@@ -720,6 +723,15 @@ def extract_pending_items(
     failed_rows: list[dict[str, str]] = []
     audit_records: list[str] = []
     partitions_written: list[str] = []
+    completed_classification_paths = (
+        set()
+        if force
+        else load_completed_partitions(
+            "extract", artifact_root=resolved_root, data_dir=data_dir
+        )
+    )
+    visited_classification_paths: set[str] = set()
+    empty_partitions = 0
     pending_classification_paths: list[str] = []
 
     for classification_path in iter_date_shard_partitions(
@@ -737,6 +749,8 @@ def extract_pending_items(
         )
         if not force and artifact_exists(target_path):
             continue
+        if not force and classification_path in completed_classification_paths:
+            continue
         pending_classification_paths.append(classification_path)
 
     total_partitions = len(pending_classification_paths)
@@ -750,6 +764,7 @@ def extract_pending_items(
             partition = parse_date_shard_partition(classification_path)
             partition_label = f"date={partition['date']} shard={partition['shard']}"
             partition_start = perf_counter()
+            visited_classification_paths.add(classification_path)
             batch_items = read_table(
                 classification_path,
                 CLASSIFIED_ITEM_COLUMNS,
@@ -800,31 +815,45 @@ def extract_pending_items(
             mentions = pd.DataFrame(
                 mention_rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS
             )
-            write_partition_table(
-                mentions_root(resolved_root, data_dir=data_dir),
-                partition={"date": partition["date"], "shard": partition["shard"]},
-                table=mentions.reindex(columns=DEBT_INSTRUMENT_MENTION_COLUMNS),
-            )
-            processed_frames.append(mentions)
-            partitions_written.append(
-                date_shard_partition_path(
-                    MENTIONS_DATASET_NAME,
-                    partition_date=partition["date"],
-                    shard=partition["shard"],
-                    artifact_root=resolved_root,
-                    data_dir=data_dir,
+            if mentions.empty:
+                empty_partitions += 1
+            else:
+                write_partition_table(
+                    mentions_root(resolved_root, data_dir=data_dir),
+                    partition={"date": partition["date"], "shard": partition["shard"]},
+                    table=mentions.reindex(columns=DEBT_INSTRUMENT_MENTION_COLUMNS),
                 )
-            )
+                processed_frames.append(mentions)
+                partitions_written.append(
+                    date_shard_partition_path(
+                        MENTIONS_DATASET_NAME,
+                        partition_date=partition["date"],
+                        shard=partition["shard"],
+                        artifact_root=resolved_root,
+                        data_dir=data_dir,
+                    )
+                )
             LOGGER.info(
-                "Extraction partition complete: %s progress=%s/%s classified_items=%s relevant_items=%s mentions=%s elapsed=%.1fs",
+                "Extraction partition complete: %s progress=%s/%s classified_items=%s relevant_items=%s mentions=%s wrote_output=%s elapsed=%.1fs",
                 partition_label,
                 partition_index,
                 total_partitions,
                 len(batch_items),
                 total_relevant_items,
                 len(mentions),
+                not mentions.empty,
                 perf_counter() - partition_start,
             )
+
+    updated_completed_paths = (
+        completed_classification_paths | visited_classification_paths
+    )
+    save_completed_partitions(
+        "extract",
+        updated_completed_paths,
+        artifact_root=resolved_root,
+        data_dir=data_dir,
+    )
 
     if audit_records:
         write_text_artifact(full_jsonl_path, "\n".join(audit_records) + "\n")
@@ -845,9 +874,14 @@ def extract_pending_items(
             "model": resolved_model,
             "reasoning_effort": resolved_reasoning,
             "max_attempts": max_attempts,
+            "partitions_visited": sorted(visited_classification_paths),
             "partitions_written": partitions_written,
+            "empty_partitions_skipped_from_write": empty_partitions,
             "failure_count": len(failed_rows),
             "audit_path": full_jsonl_path,
+            "completion_registry": completion_registry_path(
+                "extract", artifact_root=resolved_root, data_dir=data_dir
+            ),
         },
     )
 

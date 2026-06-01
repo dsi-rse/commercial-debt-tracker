@@ -47,15 +47,16 @@ Notes:
 
 - date shards are derived from accession number hashes
 - CIK shards are derived from CIK hashes
-- both currently use 64 shards
+- date-partitioned datasets currently use 8 shards
+- CIK-sharded datasets currently use 64 shards
 
 ### What "Partition", "Shard", and "Batch" Mean
 
 - A `partition` is one physical parquet file at a canonical path such as `documents/date=2026-05-31/shard=0017/part-0000.parquet`.
-- A `shard` is the hash bucket inside a dataset's partitioning scheme. CDT currently uses 64 shards, rendered as `0000` through `0063`.
-- For date-partitioned datasets, all rows for the same filing date are split across 64 shard files by hashed accession number.
+- A `shard` is the hash bucket inside a dataset's partitioning scheme. Date-partitioned datasets currently use 8 shards, rendered as `0000` through `0007`. CIK-sharded datasets use 64 shards, rendered as `0000` through `0063`.
+- For date-partitioned datasets, all rows for the same filing date are split across 8 shard files by hashed accession number.
 - For CIK-sharded datasets, rows are split across 64 shard files by hashed CIK, regardless of filing date.
-- A `batch` is not a second storage layer. It is just the amount of work one pipeline invocation chooses to process before stopping.
+- A `batch` is not a second storage layer. It is just the internal chunk size one pipeline invocation uses while draining all work in scope.
 
 ### Date-Partitioned Stages
 
@@ -77,6 +78,7 @@ Practical implication:
 - one parquet file usually represents "one filing date, one shard bucket"
 - the number of rows in that file is variable and depends on how many filings hashed into that bucket
 - downstream stages preserve the partition shape rather than reshuffling by a new key
+- stages may mark a source partition completed without writing an output parquet when that partition produces zero downstream rows
 
 ### CIK-Sharded Stages
 
@@ -256,7 +258,7 @@ The ingest stage maintains a permanent failure registry at:
 ## Operational Semantics
 
 - canonical truth is the partition data, not the run manifest
-- stage completion is inferred from output partition presence
+- stage completion is inferred from output partition presence plus stage completion registries for zero-row outputs
 - `force=false` skips already-written partitions
 - local runs and deployed runs use the same layout and code paths
 - the default operating model is one active writer per environment

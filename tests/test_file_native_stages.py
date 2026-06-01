@@ -9,16 +9,18 @@ import pytest
 
 from cdt.classifier import classifications_root, classify_pending_items
 from cdt.classifier import core as classifier_core
+from cdt.datasets import shard_for_accession
 from cdt.extractor import extract_pending_items, mentions_root
 from cdt.extractor.core import ExtractionRowState
 from cdt.ingest import DOCUMENT_COLUMNS
+from cdt.itemizer import core as itemizer_core
 from cdt.itemizer import itemize_pending_documents, items_root
 from cdt.matcher import (
     debt_instruments_root,
     match_pending_mentions,
     mention_matches_root,
 )
-from cdt.storage import read_dataset, write_partition_table
+from cdt.storage import artifact_exists, read_dataset, write_partition_table
 
 
 class FakeModel:
@@ -28,6 +30,12 @@ class FakeModel:
         """Return a single strong-positive score."""
         del texts
         return [2.0]
+
+
+def test_shard_for_accession_uses_eight_date_shards() -> None:
+    """Date-partitioned stages should only use shards 0000 through 0007."""
+    shards = {shard_for_accession(str(index)) for index in range(200)}
+    assert shards == {f"{index:04d}" for index in range(8)}
 
 
 def seed_document_partition(tmp_path: Path) -> str:
@@ -136,6 +144,33 @@ def test_itemize_pending_documents_drains_all_partitions(tmp_path: Path) -> None
     ]
 
 
+def test_itemize_pending_documents_skips_empty_outputs_on_rerun(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empty itemize results should not write parquet and should not rerun."""
+    seed_document_partition(tmp_path)
+    calls = 0
+
+    def fake_itemize_documents(*args: object, **kwargs: object) -> pd.DataFrame:
+        nonlocal calls
+        del args, kwargs
+        calls += 1
+        return pd.DataFrame(columns=itemizer_core.ITEM_COLUMNS)
+
+    monkeypatch.setattr(itemizer_core, "itemize_documents", fake_itemize_documents)
+
+    first = itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
+    second = itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
+
+    assert first.empty
+    assert second.empty
+    assert calls == 1
+    assert not artifact_exists(
+        items_root(tmp_path) + "/date=2024-01-02/shard=0001/part-0000.parquet"
+    )
+
+
 def test_classify_pending_items_writes_canonical_partitions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -175,6 +210,34 @@ def test_classify_pending_items_drains_all_partitions(
     written = read_dataset(classifications_root(tmp_path))
     assert len(classified) == 2
     assert written["label"].to_list().count("relevant") == 2
+
+
+def test_classify_pending_items_skips_empty_outputs_on_rerun(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empty classifier results should not write parquet and should not rerun."""
+    seed_document_partition(tmp_path)
+    itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
+    calls = 0
+
+    def fake_classify_items(*args: object, **kwargs: object) -> pd.DataFrame:
+        nonlocal calls
+        del args, kwargs
+        calls += 1
+        return pd.DataFrame(columns=classifier_core.CLASSIFIED_ITEM_COLUMNS)
+
+    monkeypatch.setattr(classifier_core, "classify_items", fake_classify_items)
+
+    first = classify_pending_items(artifact_root=tmp_path, batch_size=5)
+    second = classify_pending_items(artifact_root=tmp_path, batch_size=5)
+
+    assert first.empty
+    assert second.empty
+    assert calls == 1
+    assert not artifact_exists(
+        classifications_root(tmp_path) + "/date=2024-01-02/shard=0001/part-0000.parquet"
+    )
 
 
 def test_extract_pending_items_writes_mentions_and_audit(
@@ -302,6 +365,55 @@ def test_extract_pending_items_drains_all_partitions(
     ]
     audit_files = list((tmp_path / "extractor-runs").glob("run_id=*/full.jsonl"))
     assert len(audit_files) == 1
+
+
+def test_extract_pending_items_skips_empty_outputs_on_rerun(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empty extraction results should not write parquet and should not rerun."""
+    seed_document_partition(tmp_path)
+    itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
+    monkeypatch.setattr(
+        classifier_core,
+        "load_training_artifacts",
+        lambda path: (FakeModel(), 0.5, {"threshold": 0.5}),
+    )
+    classify_pending_items(artifact_root=tmp_path, batch_size=5)
+    calls = 0
+
+    async def fake_run_extraction_workflow(
+        **kwargs: object,
+    ) -> ExtractionRowState:
+        nonlocal calls
+        item_row = kwargs["item_row"]
+        calls += 1
+        row_state = ExtractionRowState(item_row=item_row, stage_name="instrument_ie")
+        row_state.finish("SUCCESS")
+        return row_state
+
+    monkeypatch.setattr(
+        "cdt.extractor.core.run_extraction_workflow",
+        fake_run_extraction_workflow,
+    )
+
+    first = extract_pending_items(
+        artifact_root=tmp_path,
+        batch_size=5,
+        client=None,
+    )
+    second = extract_pending_items(
+        artifact_root=tmp_path,
+        batch_size=5,
+        client=None,
+    )
+
+    assert first.empty
+    assert second.empty
+    assert calls == 1
+    assert not artifact_exists(
+        mentions_root(tmp_path) + "/date=2024-01-02/shard=0001/part-0000.parquet"
+    )
 
 
 def test_match_pending_mentions_writes_match_datasets(tmp_path: Path) -> None:
