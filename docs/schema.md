@@ -49,6 +49,72 @@ Notes:
 - CIK shards are derived from CIK hashes
 - both currently use 64 shards
 
+### What "Partition", "Shard", and "Batch" Mean
+
+- A `partition` is one physical parquet file at a canonical path such as `documents/date=2026-05-31/shard=0017/part-0000.parquet`.
+- A `shard` is the hash bucket inside a dataset's partitioning scheme. CDT currently uses 64 shards, rendered as `0000` through `0063`.
+- For date-partitioned datasets, all rows for the same filing date are split across 64 shard files by hashed accession number.
+- For CIK-sharded datasets, rows are split across 64 shard files by hashed CIK, regardless of filing date.
+- A `batch` is not a second storage layer. It is just the amount of work one pipeline invocation chooses to process before stopping.
+
+### Date-Partitioned Stages
+
+`documents`, `items`, `classifications`, and `mentions` all use the same path shape:
+
+```text
+<artifact-root>/<dataset>/date=YYYY-MM-DD/shard=NNNN/part-0000.parquet
+```
+
+How rows land there:
+
+- `documents`: rows are grouped by filing `date`, then by `shard_for_accession(accession_number)`.
+- `items`: each item row is written to the same `date` and `shard` partition as its parent document partition.
+- `classifications`: each classified row is written to the same `date` and `shard` partition as its source item partition.
+- `mentions`: each extracted mention row is written to the same `date` and `shard` partition as its source classification partition.
+
+Practical implication:
+
+- one parquet file usually represents "one filing date, one shard bucket"
+- the number of rows in that file is variable and depends on how many filings hashed into that bucket
+- downstream stages preserve the partition shape rather than reshuffling by a new key
+
+### CIK-Sharded Stages
+
+`mention-matches` and `debt-instruments` use this path shape:
+
+```text
+<artifact-root>/<dataset>/cik_shard=NNNN/part-0000.parquet
+```
+
+How rows land there:
+
+- the matcher reads all `mentions`
+- each mention is assigned to `shard_for_cik(cik)`
+- all mentions for companies whose CIK hashes to the same shard are processed together
+- the matcher writes one `mention-matches` parquet and one `debt-instruments` parquet for that `cik_shard`
+
+Practical implication:
+
+- matching is company-scoped, not filing-date-scoped
+- rows from many filing dates can coexist in the same `cik_shard` parquet
+- this lets the matcher compare debt mentions across time for the same issuer
+
+### How `batch_size` Works
+
+`batch_size` controls how much pending work a single invocation processes. It does not control parquet file size.
+
+- `itemize`: processes up to `batch_size` pending `documents` partitions.
+- `classify`: processes up to `batch_size` pending `items` partitions.
+- `extract`: processes up to `batch_size` pending `classifications` partitions.
+- `match`: processes up to `batch_size` pending `cik_shard` groups.
+- `ingest`: different from the other stages; here `batch_size` is a row buffer threshold for flushing accumulated document rows to their target partitions.
+
+Examples:
+
+- if `extract_batch_size=100`, one extractor run can process at most 100 pending `date/shard` parquet partitions
+- if `match_batch_size=100`, one matcher run can process at most 100 pending `cik_shard` groups, though only 64 shards currently exist
+- if `ingest_batch_size=100`, ingest flushes after accumulating roughly 100 document rows, and those rows may be written into multiple `date/shard` partition files
+
 ## Dataset Schemas
 
 ### `documents`
