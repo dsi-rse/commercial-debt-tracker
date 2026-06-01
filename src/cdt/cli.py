@@ -137,61 +137,61 @@ def build_parser() -> argparse.ArgumentParser:
     add_logging_arguments(itemize_parser, noun="itemization")
     itemize_parser.set_defaults(func=run_itemize)
 
-    classifier_parser = subparsers.add_parser(
-        "classifier", help="Train or run the binary item relevance classifier."
+    classify_parser = subparsers.add_parser(
+        "classify", help="Train or run binary item relevance classification."
     )
-    add_artifact_root_argument(classifier_parser)
-    classifier_parser.add_argument(
+    add_artifact_root_argument(classify_parser)
+    classify_parser.add_argument(
         "--batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
     )
-    classifier_parser.add_argument("--force", action="store_true")
-    classifier_parser.add_argument("--model-dir", type=Path, default=None)
-    add_logging_arguments(classifier_parser, noun="classification")
-    classifier_parser.set_defaults(func=run_classifier)
-    classifier_subparsers = classifier_parser.add_subparsers(dest="classifier_command")
-    classifier_train_parser = classifier_subparsers.add_parser("train")
-    classifier_train_parser.add_argument("--train-csv", type=Path, required=True)
-    classifier_train_parser.add_argument("--model-dir", type=Path, default=None)
-    classifier_train_parser.add_argument(
+    classify_parser.add_argument("--force", action="store_true")
+    classify_parser.add_argument("--model-dir", type=Path, default=None)
+    add_logging_arguments(classify_parser, noun="classification")
+    classify_parser.set_defaults(func=run_classifier)
+    classify_subparsers = classify_parser.add_subparsers(dest="classify_command")
+    classify_train_parser = classify_subparsers.add_parser("train")
+    classify_train_parser.add_argument("--train-csv", type=Path, required=True)
+    classify_train_parser.add_argument("--model-dir", type=Path, default=None)
+    classify_train_parser.add_argument(
         "--target-recall", type=float, default=DEFAULT_TARGET_RECALL
     )
-    classifier_train_parser.add_argument(
+    classify_train_parser.add_argument(
         "--cv-splits", type=positive_int, default=DEFAULT_CV_SPLITS
     )
-    classifier_train_parser.add_argument(
+    classify_train_parser.add_argument(
         "--random-seed", type=int, default=DEFAULT_RANDOM_SEED
     )
-    add_logging_arguments(classifier_train_parser, noun="training")
-    classifier_train_parser.set_defaults(func=run_classifier_train)
+    add_logging_arguments(classify_train_parser, noun="training")
+    classify_train_parser.set_defaults(func=run_classifier_train)
 
-    extractor_parser = subparsers.add_parser(
-        "extractor", help="Extract instrument mentions from classified item partitions."
+    extract_parser = subparsers.add_parser(
+        "extract", help="Extract instrument mentions from classified item partitions."
     )
-    add_artifact_root_argument(extractor_parser)
-    extractor_parser.add_argument(
+    add_artifact_root_argument(extract_parser)
+    extract_parser.add_argument(
         "--batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
     )
-    extractor_parser.add_argument("--force", action="store_true")
-    extractor_parser.add_argument("--model", default=DEFAULT_EXTRACTOR_MODEL)
-    extractor_parser.add_argument(
+    extract_parser.add_argument("--force", action="store_true")
+    extract_parser.add_argument("--model", default=DEFAULT_EXTRACTOR_MODEL)
+    extract_parser.add_argument(
         "--reasoning-effort", default=DEFAULT_EXTRACTOR_REASONING_EFFORT
     )
-    extractor_parser.add_argument(
+    extract_parser.add_argument(
         "--max-attempts", type=positive_int, default=DEFAULT_EXTRACTOR_MAX_ATTEMPTS
     )
-    add_logging_arguments(extractor_parser, noun="extraction")
-    extractor_parser.set_defaults(func=run_extractor)
+    add_logging_arguments(extract_parser, noun="extraction")
+    extract_parser.set_defaults(func=run_extractor)
 
-    matcher_parser = subparsers.add_parser(
-        "matcher", help="Group extracted instrument mentions into debt instruments."
+    match_parser = subparsers.add_parser(
+        "match", help="Group extracted instrument mentions into debt instruments."
     )
-    add_artifact_root_argument(matcher_parser)
-    matcher_parser.add_argument(
+    add_artifact_root_argument(match_parser)
+    match_parser.add_argument(
         "--batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
     )
-    matcher_parser.add_argument("--force", action="store_true")
-    add_logging_arguments(matcher_parser, noun="matcher")
-    matcher_parser.set_defaults(func=run_matcher)
+    match_parser.add_argument("--force", action="store_true")
+    add_logging_arguments(match_parser, noun="matching")
+    match_parser.set_defaults(func=run_matcher)
 
     pipeline_parser = subparsers.add_parser(
         "pipeline", help="Run the full CDT pipeline end-to-end."

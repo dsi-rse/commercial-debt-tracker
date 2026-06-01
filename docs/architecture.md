@@ -10,11 +10,11 @@ The pipeline runs in five stages:
    Reads scraper-managed filing manifests from S3, selects 8-K complete submission text files for the configured CIK set, and writes canonical `documents` partitions.
 2. `itemize`
    Extracts only the 8-K items CDT cares about today: `1.01`, `1.02`, `2.03`, `2.04`, `7.01`, and `8.01`.
-3. `classifier`
+3. `classify`
    Uses a local TF-IDF plus linear SVC model to mark item sections as relevant or irrelevant before any LLM call.
-4. `extractor`
+4. `extract`
    Uses OpenRouter-backed chat completions to extract structured debt-instrument mentions from relevant items, and writes a full per-run audit log.
-5. `matcher`
+5. `match`
    Consolidates mention rows into debt instruments and writes instrument-level outputs partitioned by CIK shard.
 
 The stage-oriented CLI is `cdt`. The deployment-oriented entrypoint is `cdt-orchestrator`, which simply resolves defaults and runs the same pipeline code used locally.
@@ -38,9 +38,9 @@ The stage boundaries are mostly cost and recovery boundaries.
 
 - `ingest` is pure acquisition and can be rerun without recomputing extraction.
 - `itemize` reduces each filing to the sections the downstream pipeline cares about.
-- `classifier` keeps LLM cost under control by filtering out obviously irrelevant items first.
-- `extractor` is isolated because it is the most expensive and least deterministic stage; it also records `extractor-runs/run_id=.../full.jsonl` for auditability.
-- `matcher` is deterministic and cheap enough to rerun from mention outputs.
+- `classify` keeps LLM cost under control by filtering out obviously irrelevant items first.
+- `extract` is isolated because it is the most expensive and least deterministic stage; it also records `extractor-runs/run_id=.../full.jsonl` for auditability.
+- `match` is deterministic and cheap enough to rerun from mention outputs.
 
 ## Daily Versus Historical Runs
 

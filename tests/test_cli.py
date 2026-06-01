@@ -444,10 +444,10 @@ def test_itemize_cli_passes_custom_item_numbers(
     ]
 
 
-def test_classifier_cli_calls_pending_classifier(
+def test_classify_cli_calls_pending_classifier(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The classifier command passes batch, force, and model_dir options through."""
+    """The classify command passes batch, force, and model_dir options through."""
     calls: list[dict[str, object]] = []
 
     def fake_classify_pending_items(
@@ -469,17 +469,17 @@ def test_classifier_cli_calls_pending_classifier(
 
     monkeypatch.setattr(cli, "classify_pending_items", fake_classify_pending_items)
 
-    status = cli.main(["classifier", "--batch-size", "25", "--force", "--quiet"])
+    status = cli.main(["classify", "--batch-size", "25", "--force", "--quiet"])
 
     assert status == 0
     assert calls == [{"batch_size": 25, "force": True, "model_dir": None}]
 
 
-def test_classifier_train_cli_calls_training(
+def test_classify_train_cli_calls_training(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The classifier training command forwards resolved defaults and options."""
+    """The classify train command forwards resolved defaults and options."""
     calls: list[dict[str, object]] = []
     train_csv = tmp_path / "annotations.csv"
     model_dir = tmp_path / "model"
@@ -508,7 +508,7 @@ def test_classifier_train_cli_calls_training(
 
     status = cli.main(
         [
-            "classifier",
+            "classify",
             "train",
             "--train-csv",
             str(train_csv),
@@ -534,20 +534,20 @@ def test_classifier_train_cli_calls_training(
     ]
 
 
-def test_classifier_train_cli_requires_train_csv() -> None:
+def test_classify_train_cli_requires_train_csv() -> None:
     """Training should fail argument parsing without an explicit CSV path."""
     parser = cli.build_parser()
 
     with pytest.raises(SystemExit) as exc_info:
-        parser.parse_args(["classifier", "train"])
+        parser.parse_args(["classify", "train"])
 
     assert exc_info.value.code == ARGPARSE_USAGE_ERROR
 
 
-def test_extractor_cli_calls_pending_extractor(
+def test_extract_cli_calls_pending_extractor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The extractor command forwards batch and model options."""
+    """The extract command forwards batch and model options."""
     calls: list[dict[str, object]] = []
 
     def fake_extract_pending_items(
@@ -575,7 +575,7 @@ def test_extractor_cli_calls_pending_extractor(
 
     status = cli.main(
         [
-            "extractor",
+            "extract",
             "--batch-size",
             "25",
             "--force",
@@ -601,10 +601,10 @@ def test_extractor_cli_calls_pending_extractor(
     ]
 
 
-def test_matcher_cli_calls_pending_matcher(
+def test_match_cli_calls_pending_matcher(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The matcher command forwards batch and force options."""
+    """The match command forwards batch and force options."""
     calls: list[dict[str, object]] = []
 
     def fake_match_pending_mentions(
@@ -629,7 +629,7 @@ def test_matcher_cli_calls_pending_matcher(
 
     monkeypatch.setattr(cli, "match_pending_mentions", fake_match_pending_mentions)
 
-    status = cli.main(["matcher", "--batch-size", "25", "--force", "--quiet"])
+    status = cli.main(["match", "--batch-size", "25", "--force", "--quiet"])
 
     assert status == 0
     assert calls == [{"batch_size": 25, "force": True}]
