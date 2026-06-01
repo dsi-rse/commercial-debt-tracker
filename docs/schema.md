@@ -55,12 +55,12 @@ Notes:
 
 Columns:
 
-- `accession_number`
-- `cik`
-- `url`
-- `text`
-- `date`
-- `resource_uri`
+- `accession_number`: SEC accession number normalized by removing dashes; stable document key.
+- `cik`: SEC Central Index Key for the filing issuer.
+- `url`: SEC source URL for the complete submission text file.
+- `text`: Decoded filing text when the document body is stored inline in the dataset.
+- `date`: Filing date in `YYYY-MM-DD` format.
+- `resource_uri`: Alternate storage location for the filing text when `text` is omitted, typically a local path or `s3://` URI.
 
 Primary key: `accession_number`
 
@@ -68,21 +68,21 @@ Primary key: `accession_number`
 
 Columns:
 
-- `item_id`
-- `item`
-- `accession_number`
-- `cik`
-- `url`
-- `text`
-- `date`
-- `resource_uri`
-- `item_information`
-- `extraction_status`
-- `duplicate_resolution`
-- `section_heading`
-- `start_line`
-- `end_line`
-- `section_char_count`
+- `item_id`: Deterministic item identifier built from `accession_number` and the SEC item number.
+- `item`: SEC 8-K item number for the extracted section, for example `1.01` or `2.03`.
+- `accession_number`: Parent filing accession number.
+- `cik`: Filing issuer CIK copied from the parent document.
+- `url`: SEC source URL copied from the parent document.
+- `text`: Extracted text for the item section only.
+- `date`: Filing date copied from the parent document.
+- `resource_uri`: Reserved pointer for externally stored item text; currently written as `null` by the itemizer.
+- `item_information`: Free-text item label parsed from the filing, such as the descriptive name that follows an item number.
+- `extraction_status`: Itemizer status describing how confidently the section boundary was extracted.
+- `duplicate_resolution`: Notes how duplicate or repeated item sections were resolved.
+- `section_heading`: Raw heading text associated with the extracted section.
+- `start_line`: 1-based line number where the item section starts in the filing text.
+- `end_line`: 1-based line number where the item section ends in the filing text.
+- `section_char_count`: Character count for the extracted section text.
 
 Primary key: `item_id`
 
@@ -90,10 +90,10 @@ Primary key: `item_id`
 
 Columns:
 
-- all `items` columns
-- `label`
-- `relevance`
-- `classification_score`
+- all `items` columns: The full item row is carried forward unchanged.
+- `label`: Classifier output label, currently `relevant` or `irrelevant`.
+- `relevance`: Boolean convenience flag derived from `label`.
+- `classification_score`: Raw model decision score used to threshold relevance; higher means more likely relevant.
 
 Primary key: `item_id`
 
@@ -101,24 +101,24 @@ Primary key: `item_id`
 
 Columns:
 
-- `debt_instrument_mention_id`
-- `item_id`
-- `accession_number`
-- `cik`
-- `date`
-- `raw_id`
-- `name`
-- `start_date`
-- `end_date`
-- `amount`
-- `amendment_of`
-- `split_of`
-- `lenders_json`
-- `other_interested_parties_json`
-- `name_json`
-- `start_date_json`
-- `end_date_json`
-- `amount_json`
+- `debt_instrument_mention_id`: Deterministic identifier for one extracted debt-instrument mention.
+- `item_id`: Source item section identifier.
+- `accession_number`: Filing accession number for the source item.
+- `cik`: Issuer CIK for the source item.
+- `date`: Filing date for the source item in `YYYY-MM-DD` format.
+- `raw_id`: Row-local extractor identifier used inside a single item during relation extraction.
+- `name`: Canonicalized debt instrument name text extracted from the item.
+- `start_date`: Normalized instrument start or issuance date when present.
+- `end_date`: Normalized maturity, termination, or end date when present.
+- `amount`: Normalized principal or commitment amount when present.
+- `amendment_of`: `debt_instrument_mention_id` of the mention this row amends, when the extractor found that relation.
+- `split_of`: `debt_instrument_mention_id` of the mention this row splits from, when the extractor found that relation.
+- `lenders_json`: JSON array of lender or counterparty mention clusters with evidence text.
+- `other_interested_parties_json`: JSON array of additional related-party clusters with evidence text.
+- `name_json`: JSON payload describing the evidence tags and surface text used to construct `name`.
+- `start_date_json`: JSON payload containing normalized start-date value plus extraction evidence.
+- `end_date_json`: JSON payload containing normalized end-date value plus extraction evidence.
+- `amount_json`: JSON payload containing normalized amount value plus extraction evidence.
 
 Primary key: `debt_instrument_mention_id`
 
@@ -126,27 +126,27 @@ Primary key: `debt_instrument_mention_id`
 
 Columns:
 
-- `debt_instrument_mention_id`
-- `debt_instrument_id`
-- `matcher_status`
+- `debt_instrument_mention_id`: Mention-level identifier from the `mentions` dataset.
+- `debt_instrument_id`: Canonical debt instrument entity the matcher assigned the mention to.
+- `matcher_status`: Match outcome for the mention, currently `singleton`, `matched`, or `ambiguous`.
 
 ### `debt-instruments`
 
 Columns:
 
-- `debt_instrument_id`
-- `cik`
-- `seed_debt_instrument_mention_id`
-- `amendment_of_debt_instrument_id`
-- `split_of_debt_instrument_id`
-- `name`
-- `start_date`
-- `end_date`
-- `amount`
-- `direct_mentions_json`
-- `lenders_json`
-- `other_interested_parties_json`
-- `possibly_related_json`
+- `debt_instrument_id`: Canonical entity identifier for one consolidated debt instrument history.
+- `cik`: Issuer CIK shared by the instrument's directly matched mentions.
+- `seed_debt_instrument_mention_id`: First direct mention used as the representative seed for the instrument record.
+- `amendment_of_debt_instrument_id`: Parent instrument ID when this instrument is an amendment lineage child.
+- `split_of_debt_instrument_id`: Parent instrument ID when this instrument is a split lineage child.
+- `name`: Matcher-selected canonical instrument name derived from the instrument's direct mentions.
+- `start_date`: Matcher-selected canonical start date derived from the instrument's direct mentions.
+- `end_date`: Matcher-selected canonical end date derived from the instrument's direct mentions.
+- `amount`: Matcher-selected canonical amount derived from the instrument's direct mentions.
+- `direct_mentions_json`: JSON array of directly assigned `debt_instrument_mention_id` values for this instrument.
+- `lenders_json`: JSON aggregation of lender clusters carried forward from the instrument's direct mentions.
+- `other_interested_parties_json`: JSON aggregation of other related-party clusters carried forward from the instrument's direct mentions.
+- `possibly_related_json`: JSON array of advisory mention IDs that look related but were not directly matched into the instrument.
 
 Primary key: `debt_instrument_id`
 
