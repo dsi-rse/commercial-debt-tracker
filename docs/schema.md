@@ -101,18 +101,18 @@ Practical implication:
 
 ### How `batch_size` Works
 
-`batch_size` controls how much pending work a single invocation processes. It does not control parquet file size.
+`batch_size` controls the chunk size used while draining pending work in one invocation. It does not control parquet file size.
 
-- `itemize`: processes up to `batch_size` pending `documents` partitions.
-- `classify`: processes up to `batch_size` pending `items` partitions.
-- `extract`: processes up to `batch_size` pending `classifications` partitions.
-- `match`: processes up to `batch_size` pending `cik_shard` groups.
+- `itemize`: processes all pending `documents` partitions, in chunks of up to `batch_size` partitions at a time.
+- `classify`: processes all pending `items` partitions, in chunks of up to `batch_size` partitions at a time.
+- `extract`: processes all pending `classifications` partitions, in chunks of up to `batch_size` partitions at a time.
+- `match`: processes all `cik_shard` groups present in the mentions dataset, in chunks of up to `batch_size` shard groups at a time.
 - `ingest`: different from the other stages; here `batch_size` is a row buffer threshold for flushing accumulated document rows to their target partitions.
 
 Examples:
 
-- if `extract_batch_size=100`, one extractor run can process at most 100 pending `date/shard` parquet partitions
-- if `match_batch_size=100`, one matcher run can process at most 100 pending `cik_shard` groups, though only 64 shards currently exist
+- if `extract_batch_size=100`, one extractor run drains all pending `date/shard` parquet partitions, processing them in chunks of up to 100 partitions
+- if `match_batch_size=100`, one matcher run drains all shard groups, processing them in chunks of up to 100 groups, though only 64 shards currently exist
 - if `ingest_batch_size=100`, ingest flushes after accumulating roughly 100 document rows, and those rows may be written into multiple `date/shard` partition files
 
 ## Dataset Schemas

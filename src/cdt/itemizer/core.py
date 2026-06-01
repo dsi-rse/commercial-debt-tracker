@@ -154,52 +154,54 @@ def itemize_pending_documents(
         if not force and artifact_exists(target_path):
             continue
         pending_document_paths.append(document_path)
-        if len(pending_document_paths) >= batch_size:
-            break
 
     total_partitions = len(pending_document_paths)
-    for partition_index, document_path in enumerate(pending_document_paths, start=1):
-        partition = parse_date_shard_partition(document_path)
-        partition_label = f"date={partition['date']} shard={partition['shard']}"
-        partition_start = perf_counter()
-        documents = read_table(document_path, DOCUMENT_COLUMNS).reindex(
-            columns=DOCUMENT_COLUMNS
-        )
-        total_documents += len(documents)
-        shared_s3_client = _ensure_s3_client(
-            shared_s3_client,
-            documents.to_dict("records"),
-        )
-        items = itemize_documents(
-            documents,
-            data_dir=data_dir,
-            s3_client=shared_s3_client,
-            item_numbers=selected_item_numbers,
-        )
-        write_partition_table(
-            items_root(resolved_root, data_dir=data_dir),
-            partition={"date": partition["date"], "shard": partition["shard"]},
-            table=items.reindex(columns=ITEM_COLUMNS),
-        )
-        processed_frames.append(items)
-        processed_partitions.append(
-            date_shard_partition_path(
-                ITEM_DATASET_NAME,
-                partition_date=partition["date"],
-                shard=partition["shard"],
-                artifact_root=resolved_root,
-                data_dir=data_dir,
+    for chunk_start in range(0, total_partitions, batch_size):
+        chunk_paths = pending_document_paths[chunk_start : chunk_start + batch_size]
+        for partition_index, document_path in enumerate(
+            chunk_paths, start=chunk_start + 1
+        ):
+            partition = parse_date_shard_partition(document_path)
+            partition_label = f"date={partition['date']} shard={partition['shard']}"
+            partition_start = perf_counter()
+            documents = read_table(document_path, DOCUMENT_COLUMNS).reindex(
+                columns=DOCUMENT_COLUMNS
             )
-        )
-        LOGGER.info(
-            "Itemize partition complete: %s progress=%s/%s documents=%s items=%s elapsed=%.1fs",
-            partition_label,
-            partition_index,
-            total_partitions,
-            len(documents),
-            len(items),
-            perf_counter() - partition_start,
-        )
+            total_documents += len(documents)
+            shared_s3_client = _ensure_s3_client(
+                shared_s3_client,
+                documents.to_dict("records"),
+            )
+            items = itemize_documents(
+                documents,
+                data_dir=data_dir,
+                s3_client=shared_s3_client,
+                item_numbers=selected_item_numbers,
+            )
+            write_partition_table(
+                items_root(resolved_root, data_dir=data_dir),
+                partition={"date": partition["date"], "shard": partition["shard"]},
+                table=items.reindex(columns=ITEM_COLUMNS),
+            )
+            processed_frames.append(items)
+            processed_partitions.append(
+                date_shard_partition_path(
+                    ITEM_DATASET_NAME,
+                    partition_date=partition["date"],
+                    shard=partition["shard"],
+                    artifact_root=resolved_root,
+                    data_dir=data_dir,
+                )
+            )
+            LOGGER.info(
+                "Itemize partition complete: %s progress=%s/%s documents=%s items=%s elapsed=%.1fs",
+                partition_label,
+                partition_index,
+                total_partitions,
+                len(documents),
+                len(items),
+                perf_counter() - partition_start,
+            )
 
     manifest = {
         "artifact_root": resolved_root,

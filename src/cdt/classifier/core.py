@@ -201,45 +201,47 @@ def classify_pending_items(
         if not force and artifact_exists(target_path):
             continue
         pending_item_paths.append(item_path)
-        if len(pending_item_paths) >= batch_size:
-            break
 
     total_partitions = len(pending_item_paths)
-    for partition_index, item_path in enumerate(pending_item_paths, start=1):
-        partition = parse_date_shard_partition(item_path)
-        partition_label = f"date={partition['date']} shard={partition['shard']}"
-        partition_start = perf_counter()
-        batch_items = read_table(item_path, ITEM_COLUMNS).reindex(columns=ITEM_COLUMNS)
-        classified = classify_items(
-            batch_items,
-            data_dir=data_dir,
-            model_dir=model_dir,
-        )
-        write_partition_table(
-            classifications_root(resolved_root, data_dir=data_dir),
-            partition={"date": partition["date"], "shard": partition["shard"]},
-            table=classified.reindex(columns=CLASSIFIED_ITEM_COLUMNS),
-        )
-        processed_frames.append(classified)
-        partitions_written.append(
-            date_shard_partition_path(
-                CLASSIFICATION_DATASET_NAME,
-                partition_date=partition["date"],
-                shard=partition["shard"],
-                artifact_root=resolved_root,
-                data_dir=data_dir,
+    for chunk_start in range(0, total_partitions, batch_size):
+        chunk_paths = pending_item_paths[chunk_start : chunk_start + batch_size]
+        for partition_index, item_path in enumerate(chunk_paths, start=chunk_start + 1):
+            partition = parse_date_shard_partition(item_path)
+            partition_label = f"date={partition['date']} shard={partition['shard']}"
+            partition_start = perf_counter()
+            batch_items = read_table(item_path, ITEM_COLUMNS).reindex(
+                columns=ITEM_COLUMNS
             )
-        )
-        relevant_count = int(classified["relevance"].fillna(False).sum())
-        LOGGER.info(
-            "Classification partition complete: %s progress=%s/%s items=%s relevant=%s elapsed=%.1fs",
-            partition_label,
-            partition_index,
-            total_partitions,
-            len(batch_items),
-            relevant_count,
-            perf_counter() - partition_start,
-        )
+            classified = classify_items(
+                batch_items,
+                data_dir=data_dir,
+                model_dir=model_dir,
+            )
+            write_partition_table(
+                classifications_root(resolved_root, data_dir=data_dir),
+                partition={"date": partition["date"], "shard": partition["shard"]},
+                table=classified.reindex(columns=CLASSIFIED_ITEM_COLUMNS),
+            )
+            processed_frames.append(classified)
+            partitions_written.append(
+                date_shard_partition_path(
+                    CLASSIFICATION_DATASET_NAME,
+                    partition_date=partition["date"],
+                    shard=partition["shard"],
+                    artifact_root=resolved_root,
+                    data_dir=data_dir,
+                )
+            )
+            relevant_count = int(classified["relevance"].fillna(False).sum())
+            LOGGER.info(
+                "Classification partition complete: %s progress=%s/%s items=%s relevant=%s elapsed=%.1fs",
+                partition_label,
+                partition_index,
+                total_partitions,
+                len(batch_items),
+                relevant_count,
+                perf_counter() - partition_start,
+            )
 
     write_json_artifact(
         run_manifest_path(

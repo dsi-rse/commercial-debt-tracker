@@ -172,53 +172,55 @@ def match_pending_mentions(
     mention_frames: list[pd.DataFrame] = []
     instrument_frames: list[pd.DataFrame] = []
     partitions_written: list[str] = []
-    shard_groups = list(mention_rows.groupby("cik_shard"))[:batch_size]
+    shard_groups = list(mention_rows.groupby("cik_shard"))
     total_partitions = len(shard_groups)
-    for partition_index, (cik_shard, shard_mentions) in enumerate(
-        shard_groups, start=1
-    ):
-        partition_start = perf_counter()
-        tables = match_tables(
-            shard_mentions.drop(columns=["cik_shard"]),
-            strong_match_threshold=strong_match_threshold,
-            loose_match_threshold=loose_match_threshold,
-        )
-        mention_matches = tables["debt_instrument_mentions"].reindex(
-            columns=DEBT_INSTRUMENT_MENTION_COLUMNS
-        )
-        debt_instruments = tables["debt_instrument"].reindex(
-            columns=DEBT_INSTRUMENT_COLUMNS
-        )
-        write_partition_table(
-            mention_matches_root(resolved_root, data_dir=data_dir),
-            partition={"cik_shard": str(cik_shard)},
-            table=mention_matches,
-        )
-        write_partition_table(
-            debt_instruments_root(resolved_root, data_dir=data_dir),
-            partition={"cik_shard": str(cik_shard)},
-            table=debt_instruments,
-        )
-        mention_frames.append(mention_matches)
-        instrument_frames.append(debt_instruments)
-        partitions_written.append(
-            cik_shard_partition_path(
-                DEBT_INSTRUMENT_DATASET_NAME,
-                cik_shard=str(cik_shard),
-                artifact_root=resolved_root,
-                data_dir=data_dir,
+    for chunk_start in range(0, total_partitions, batch_size):
+        chunk_groups = shard_groups[chunk_start : chunk_start + batch_size]
+        for partition_index, (cik_shard, shard_mentions) in enumerate(
+            chunk_groups, start=chunk_start + 1
+        ):
+            partition_start = perf_counter()
+            tables = match_tables(
+                shard_mentions.drop(columns=["cik_shard"]),
+                strong_match_threshold=strong_match_threshold,
+                loose_match_threshold=loose_match_threshold,
             )
-        )
-        LOGGER.info(
-            "Matcher partition complete: cik_shard=%s progress=%s/%s mentions=%s matched_rows=%s debt_instruments=%s elapsed=%.1fs",
-            cik_shard,
-            partition_index,
-            total_partitions,
-            len(shard_mentions),
-            len(mention_matches),
-            len(debt_instruments),
-            perf_counter() - partition_start,
-        )
+            mention_matches = tables["debt_instrument_mentions"].reindex(
+                columns=DEBT_INSTRUMENT_MENTION_COLUMNS
+            )
+            debt_instruments = tables["debt_instrument"].reindex(
+                columns=DEBT_INSTRUMENT_COLUMNS
+            )
+            write_partition_table(
+                mention_matches_root(resolved_root, data_dir=data_dir),
+                partition={"cik_shard": str(cik_shard)},
+                table=mention_matches,
+            )
+            write_partition_table(
+                debt_instruments_root(resolved_root, data_dir=data_dir),
+                partition={"cik_shard": str(cik_shard)},
+                table=debt_instruments,
+            )
+            mention_frames.append(mention_matches)
+            instrument_frames.append(debt_instruments)
+            partitions_written.append(
+                cik_shard_partition_path(
+                    DEBT_INSTRUMENT_DATASET_NAME,
+                    cik_shard=str(cik_shard),
+                    artifact_root=resolved_root,
+                    data_dir=data_dir,
+                )
+            )
+            LOGGER.info(
+                "Matcher partition complete: cik_shard=%s progress=%s/%s mentions=%s matched_rows=%s debt_instruments=%s elapsed=%.1fs",
+                cik_shard,
+                partition_index,
+                total_partitions,
+                len(shard_mentions),
+                len(mention_matches),
+                len(debt_instruments),
+                perf_counter() - partition_start,
+            )
     write_json_artifact(
         run_manifest_path(
             "match",
