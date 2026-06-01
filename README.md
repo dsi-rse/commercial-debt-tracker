@@ -1,166 +1,93 @@
 # Commercial Debt Tracker
 
-Commercial Debt Tracker (CDT) is a file-native processor for finding debt-related disclosures in SEC 8-K filings, extracting structured debt-instrument mentions, and matching those mentions into instrument histories.
+Commercial Debt Tracker (CDT) processes SEC 8-K filings to build a file-native history of debt instruments. It:
 
-CDT follows the same deployment pattern as the other IDI / FTM2J processors:
+- ingests complete submission text files for a configured CIK universe
+- itemizes the 8-K sections most likely to contain debt disclosures
+- classifies those sections for debt relevance
+- uses an LLM-backed extractor to produce structured debt-instrument mentions
+- matches mentions into instrument-level histories
+- optionally publishes dashboard snapshot JSON to Cloudflare R2
 
-- one ECS Fargate task running a container from ECR
-- daily EventBridge Scheduler trigger
-- historical runs via ECS command overrides
-- durable state in S3
-- optional dashboard snapshot publishing to Cloudflare R2
-- shared logging and failure handling via `idi-ftm2j-shared`
+## Repository Map
 
-## Runtime model
+- [docs/architecture.md](docs/architecture.md): what the pipeline does and why it is designed this way
+- [docs/deployment.md](docs/deployment.md): how production deployment works, including CI/CD and manual historical runs
+- [docs/deployment-dev.md](docs/deployment-dev.md): first-time `dev` deployment walkthrough
+- [docs/schema.md](docs/schema.md): canonical artifact layout and dataset schemas
+- [DataPolicy.md](DataPolicy.md): data handling expectations
 
-CDT does not use SQLite or any other database. Canonical state is stored as Parquet partitions and run metadata under a single artifact root, typically:
+## Runtime Model
 
-```text
-s3://<bucket>/<artifact-prefix>
-```
+CDT is intentionally file-native. Canonical state lives under one artifact root as Parquet partitions plus JSON and JSONL manifests, usually in S3 for deployed runs and under `data/` for local runs.
 
-Production and beta filing scope are controlled by a CIK file stored in S3. The deployed orchestrator reads the default path from `CDT_DEFAULT_CIK_FILE`, and any run can override it with `--cik-file`.
+This avoids a mutable database dependency and keeps reruns deterministic:
 
-Recommended input layout:
+- date-partitioned stages write `documents`, `items`, `classifications`, and `mentions`
+- CIK-sharded matcher outputs write `mention-matches` and `debt-instruments`
+- stage manifests and extractor audit logs are written alongside those datasets
 
-```text
-s3://<bucket>/<artifact-prefix>/inputs/ciks/all.txt
-s3://<bucket>/<artifact-prefix>/inputs/ciks/beta-100k.txt
-s3://<bucket>/<artifact-prefix>/inputs/ciks/beta-10k.txt
-s3://<bucket>/<artifact-prefix>/inputs/ciks/beta-1k.txt
-```
+See [docs/schema.md](docs/schema.md) for the concrete layout.
 
-## Canonical datasets
+## Deployment Summary
 
-```text
-<artifact-root>/
-  documents/date=YYYY-MM-DD/shard=NNNN/part-0000.parquet
-  items/date=YYYY-MM-DD/shard=NNNN/part-0000.parquet
-  classifications/date=YYYY-MM-DD/shard=NNNN/part-0000.parquet
-  mentions/date=YYYY-MM-DD/shard=NNNN/part-0000.parquet
-  mention-matches/cik_shard=NNNN/part-0000.parquet
-  debt-instruments/cik_shard=NNNN/part-0000.parquet
-  extractor-runs/run_id=<run_id>/full.jsonl
-  runs/<stage>/run_id=<run_id>.json
-  failures/<stage>/failures.json
-```
+The deployed service is a single ECS Fargate task running `cdt-orchestrator`, with:
 
-Completion is determined by final partition presence, not by mutable status rows.
+- a container image built from [dockerfiles/Dockerfile.orchestrator](dockerfiles/Dockerfile.orchestrator)
+- infrastructure provisioned from [`pulumi/`](pulumi/)
+- a daily EventBridge Scheduler trigger that runs `cdt-orchestrator daily`
+- manual historical backfills via ECS task command overrides or the `run-historical` GitHub Actions workflow
 
-## CLI
+The GitHub Actions deployment path is:
 
-Local stage commands operate against a local artifact root:
+1. build and push the orchestrator image to GHCR
+2. run `pulumi up`
+3. sync the `:latest` image from GHCR into the Pulumi-managed ECR repository
 
-```bash
-uv run cdt ingest --artifact-root ./data daily ./ciks.txt
-uv run cdt itemize --artifact-root ./data
-uv run cdt classifier --artifact-root ./data --model-dir ./models/classifier/tfidf-linear-svc
-uv run cdt extractor --artifact-root ./data
-uv run cdt matcher --artifact-root ./data
-uv run cdt pipeline --artifact-root ./data daily ./ciks.txt
-```
+Full details are in [docs/deployment.md](docs/deployment.md).
 
-The ECS-oriented entrypoint is:
+## Local Development
+
+Install dependencies and run the checks:
 
 ```bash
-uv run cdt-orchestrator daily
-uv run cdt-orchestrator historical --start-date 2024-01-01 --end-date 2024-12-31
+uv sync --all-groups
+uv run ruff check .
+uv run pytest -v
 ```
 
-The orchestrator expects:
+Main local entrypoints:
+
+```bash
+uv run cdt pipeline --artifact-root ./data historical ./1000-ciks.txt --start-date 2024-01-01 --end-date 2024-01-31
+uv run cdt-orchestrator daily --artifact-root ./data/local --cik-file ./1000-ciks.txt
+make local-run
+```
+
+Notes:
+
+- `cdt` is the stage-oriented CLI for local and ad hoc runs.
+- `cdt-orchestrator` is the deployment-oriented entrypoint used by ECS.
+- `make local-run` exercises the orchestrator with deployment-like environment variables from `.env`.
+
+## Required Runtime Configuration
+
+Deployed runs require:
 
 - `ARTIFACT_ROOT`
 - `BUCKET_NAME`
 - `CDT_DEFAULT_CIK_FILE`
 - `OPENROUTER_API_KEY`
-- `SEC_USER_AGENT`
 
-When R2 publishing is enabled, the task also receives:
+Optional runtime configuration:
 
+- `AWS_PROFILE` for local runs against AWS
+- `EXTRACTOR_MODEL`
+- `EXTRACTOR_REASONING`
 - `R2_ACCOUNT_ID`
 - `R2_BUCKET_NAME`
 - `R2_OBJECT_PREFIX`
 - `R2_ACCESS_KEY_ID`
 - `R2_SECRET_ACCESS_KEY`
 
-The publisher builds dashboard JSON under `generated/` and only writes objects whose
-content changed.
-
-## Deployment
-
-This repo includes in-repo deployment scaffolding aligned to the other processors:
-
-- `dockerfiles/Dockerfile.orchestrator`
-- `.github/workflows/checks.yml`
-- `.github/workflows/deploy.yml`
-- `pulumi/`
-
-Pulumi provisions:
-
-- ECR repository
-- ECS cluster and task definition
-- task execution and runtime IAM roles
-- CloudWatch log group
-- EventBridge schedule
-- Secrets Manager secrets for `OPENROUTER_API_KEY` and `SEC_USER_AGENT`
-- optional Secrets Manager secrets for Cloudflare R2 upload credentials
-
-Required Pulumi config:
-
-- `idi:bucket_name`
-- `idi:default_cik_file`
-- `idi:shared_dlq_name`
-- `idi:openrouter_api_key` as secret
-- `idi:sec_user_agent` as secret
-
-Optional Pulumi config:
-
-- `idi:artifact_prefix`
-- `idi:cpu`
-- `idi:memory`
-- `idi:cron`
-- `idi:schedule_enabled`
-- `idi:r2_account_id`
-- `idi:r2_bucket_name`
-- `idi:r2_object_prefix`
-- `idi:r2_access_key_id` as secret
-- `idi:r2_secret_access_key` as secret
-
-For the full first-deploy flow, including local Pulumi authentication, `dev` stack values, and the manual ECS historical backfill command, see [docs/deployment-dev.md](docs/deployment-dev.md).
-
-## Development
-
-Install dependencies and run checks:
-
-```bash
-uv sync --all-groups
-uv run pytest
-uv run ruff check .
-```
-
-The test suite runs entirely locally against filesystem-backed artifact roots.
-
-## Local deployment-style run
-
-Use the `Makefile` target to exercise the ECS-style orchestrator locally:
-
-```bash
-make local-run
-```
-
-Default behavior:
-
-- runs `cdt-orchestrator daily`
-- uses `$(DATA_DIR)/local` as the artifact root
-- uses `idi-dev-processor-s3` as the source scraper bucket
-- uses `idi-analysis` as the AWS profile
-- uses `1000-ciks.txt` as the default CIK file
-
-Override values as needed:
-
-```bash
-make local-run LOCAL_CIK_FILE=./10K-ciks.txt
-make local-run LOCAL_MODE=historical LOCAL_RUN_ARGS="--start-date 2024-01-01 --end-date 2024-01-31"
-make local-run LOCAL_ARTIFACT_ROOT=./data/smoke LOCAL_RUN_ARGS="--cik-file ./100K-ciks.txt"
-make local-run LOCAL_AWS_PROFILE=other-profile
-```
+Pulumi also provisions a `SEC_USER_AGENT` secret into the ECS task to match the shared processor deployment pattern, even though CDT itself currently reads filings from scraper-managed S3 rather than calling SEC endpoints directly.

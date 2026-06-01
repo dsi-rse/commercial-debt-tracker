@@ -1,8 +1,8 @@
 # CDT Storage Schema
 
-CDT is a file-native pipeline. Canonical state lives in Parquet datasets and JSON/JSONL run artifacts under one artifact root.
+CDT writes canonical artifacts under one artifact root. That root can be a local directory or an `s3://` prefix.
 
-## Root layout
+## Root Layout
 
 ```text
 <artifact-root>/
@@ -17,20 +17,39 @@ CDT is a file-native pipeline. Canonical state lives in Parquet datasets and JSO
   failures/
 ```
 
-## Date/shard datasets
+## Partitioning Rules
 
-These datasets use deterministic `date` and `shard` partitions:
+Date-partitioned datasets:
 
 - `documents`
 - `items`
 - `classifications`
 - `mentions`
 
-Canonical file shape:
+Canonical path shape:
 
 ```text
 <artifact-root>/<dataset>/date=YYYY-MM-DD/shard=NNNN/part-0000.parquet
 ```
+
+CIK-sharded datasets:
+
+- `mention-matches`
+- `debt-instruments`
+
+Canonical path shape:
+
+```text
+<artifact-root>/<dataset>/cik_shard=NNNN/part-0000.parquet
+```
+
+Notes:
+
+- date shards are derived from accession number hashes
+- CIK shards are derived from CIK hashes
+- both currently use 64 shards
+
+## Dataset Schemas
 
 ### `documents`
 
@@ -51,7 +70,12 @@ Columns:
 
 - `item_id`
 - `item`
-- document columns above
+- `accession_number`
+- `cik`
+- `url`
+- `text`
+- `date`
+- `resource_uri`
 - `item_information`
 - `extraction_status`
 - `duplicate_resolution`
@@ -66,7 +90,7 @@ Primary key: `item_id`
 
 Columns:
 
-- item columns above
+- all `items` columns
 - `label`
 - `relevance`
 - `classification_score`
@@ -98,19 +122,6 @@ Columns:
 
 Primary key: `debt_instrument_mention_id`
 
-## CIK-shard datasets
-
-These datasets are written by matcher:
-
-- `mention-matches`
-- `debt-instruments`
-
-Canonical file shape:
-
-```text
-<artifact-root>/<dataset>/cik_shard=NNNN/part-0000.parquet
-```
-
 ### `mention-matches`
 
 Columns:
@@ -137,29 +148,49 @@ Columns:
 - `other_interested_parties_json`
 - `possibly_related_json`
 
-## Run metadata
+Primary key: `debt_instrument_id`
 
-Stage manifests:
+## Run Metadata
+
+### Ingest manifests
+
+Ingest writes one manifest per run with a generated timestamp-based run ID:
 
 ```text
-<artifact-root>/runs/<stage>/run_id=<run_id>.json
+<artifact-root>/runs/ingest/run_id=<run_id>.json
 ```
 
-Extractor audit logs:
+### Itemize, classify, and match manifests
+
+These stages currently overwrite a `latest` manifest:
 
 ```text
+<artifact-root>/runs/itemize/run_id=latest.json
+<artifact-root>/runs/classify/run_id=latest.json
+<artifact-root>/runs/match/run_id=latest.json
+```
+
+### Extractor manifests and audit logs
+
+Extractor writes a per-run manifest and a matching full audit log:
+
+```text
+<artifact-root>/runs/extract/run_id=<run_id>.json
 <artifact-root>/extractor-runs/run_id=<run_id>/full.jsonl
 ```
 
-Permanent failure registries:
+### Failure registries
+
+The ingest stage maintains a permanent failure registry at:
 
 ```text
-<artifact-root>/failures/<stage>/failures.json
+<artifact-root>/failures/ingest/failures.json
 ```
 
-## Processing rules
+## Operational Semantics
 
-- final partition presence is the completion signal
-- partitions are rewritten deterministically
-- run manifests are advisory
-- one active writer per environment is the default operating model
+- canonical truth is the partition data, not the run manifest
+- stage completion is inferred from output partition presence
+- `force=false` skips already-written partitions
+- local runs and deployed runs use the same layout and code paths
+- the default operating model is one active writer per environment

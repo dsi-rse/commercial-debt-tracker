@@ -1,5 +1,7 @@
 # Dev Deployment Guide
 
+This guide is the concrete first-deploy companion to [docs/deployment.md](deployment.md). Use it when standing up or refreshing the `dev` environment.
+
 This guide documents the first `dev` deployment flow for CDT, including the initial Pulumi setup and a manual historical backfill.
 
 ## What Gets Deployed
@@ -108,9 +110,7 @@ pulumi config set --secret idi:r2_access_key_id <r2-access-key-id>
 pulumi config set --secret idi:r2_secret_access_key <r2-secret-access-key>
 ```
 
-The ECS task will then publish `generated/index.json`, `generated/companies/*`, and
-`generated/debt-instruments/*` after a successful pipeline run. Unchanged objects are
-skipped.
+The ECS task will then publish `generated/index.json`, `generated/companies/*`, and `generated/debt-instruments/*` after a successful pipeline run. Unchanged objects are skipped.
 
 If the `dev` stack already exists, use `pulumi stack select dev` instead of `pulumi stack init dev`.
 
