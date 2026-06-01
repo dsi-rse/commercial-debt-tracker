@@ -1,0 +1,129 @@
+name: Run Historical ECS Task
+
+on:
+  workflow_dispatch:
+    inputs:
+      stack:
+        description: Pulumi stack / deployment environment
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - prod
+      start_date:
+        description: Historical run start date in YYYY-MM-DD format
+        required: true
+        type: string
+      end_date:
+        description: Historical run end date in YYYY-MM-DD format
+        required: true
+        type: string
+      cik_file:
+        description: Local or s3:// path to one-CIK-per-line input file
+        required: true
+        type: string
+      force:
+        description: Recompute partitions even if outputs already exist
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  run-historical:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      PULUMI_CONFIG_PASSPHRASE: ${{ secrets.PULUMI_CONFIG_PASSPHRASE }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: latest
+          python-version: "3.13"
+      - name: Install Pulumi dependencies
+        run: uv sync --group pulumi
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEPLOY }}
+          role-session-name: idi-github-ci
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-2' }}
+      - name: Validate dates
+        run: |
+          set -euo pipefail
+          [[ "${{ inputs.start_date }}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]
+          [[ "${{ inputs.end_date }}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]
+      - name: Login to Pulumi backend
+        run: pulumi login s3://${{ secrets.PULUMI_STATE_BUCKET }}
+        working-directory: pulumi
+      - name: Select Pulumi stack
+        run: pulumi stack select ${{ inputs.stack }}
+        working-directory: pulumi
+      - name: Load ECS stack outputs
+        id: stack
+        run: |
+          set -euo pipefail
+          echo "cluster_name=$(pulumi stack output ecs_cluster_name)" >> "$GITHUB_OUTPUT"
+          echo "task_definition_arn=$(pulumi stack output task_definition_arn)" >> "$GITHUB_OUTPUT"
+          echo "security_group_id=$(pulumi stack output security_group_id)" >> "$GITHUB_OUTPUT"
+          echo "primary_subnet_id=$(pulumi stack output primary_subnet_id)" >> "$GITHUB_OUTPUT"
+          echo "log_group_name=$(pulumi stack output log_group_name)" >> "$GITHUB_OUTPUT"
+        working-directory: pulumi
+      - name: Start historical ECS task
+        id: run-task
+        run: |
+          set -euo pipefail
+
+          overrides_json="$(jq -n \
+            --arg start_date "${{ inputs.start_date }}" \
+            --arg end_date "${{ inputs.end_date }}" \
+            --arg cik_file "${{ inputs.cik_file }}" \
+            --argjson force "${{ inputs.force }}" \
+            '{
+              containerOverrides: [
+                {
+                  name: "cdt-orchestrator",
+                  command: (
+                    ["historical", "--cik-file", $cik_file, "--start-date", $start_date, "--end-date", $end_date]
+                    + (if $force then ["--force"] else [] end)
+                  )
+                }
+              ]
+            }')"
+
+          run_output="$(aws ecs run-task \
+            --cluster "${{ steps.stack.outputs.cluster_name }}" \
+            --launch-type FARGATE \
+            --task-definition "${{ steps.stack.outputs.task_definition_arn }}" \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ steps.stack.outputs.primary_subnet_id }}],securityGroups=[${{ steps.stack.outputs.security_group_id }}],assignPublicIp=ENABLED}" \
+            --overrides "$overrides_json")"
+
+          failure_count="$(jq '.failures | length' <<<"$run_output")"
+          if [ "$failure_count" -gt 0 ]; then
+            jq '.failures' <<<"$run_output"
+            exit 1
+          fi
+
+          task_arn="$(jq -r '.tasks[0].taskArn' <<<"$run_output")"
+          if [ -z "$task_arn" ] || [ "$task_arn" = "null" ]; then
+            echo "$run_output"
+            exit 1
+          fi
+
+          echo "task_arn=$task_arn" >> "$GITHUB_OUTPUT"
+      - name: Summarize launch
+        run: |
+          {
+            echo "### Historical ECS task started"
+            echo
+            echo "- Stack: \`${{ inputs.stack }}\`"
+            echo "- Start date: \`${{ inputs.start_date }}\`"
+            echo "- End date: \`${{ inputs.end_date }}\`"
+            echo "- CIK file: \`${{ inputs.cik_file }}\`"
+            echo "- Force: \`${{ inputs.force }}\`"
+            echo "- Task ARN: \`${{ steps.run-task.outputs.task_arn }}\`"
+            echo "- Log group: \`${{ steps.stack.outputs.log_group_name }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
