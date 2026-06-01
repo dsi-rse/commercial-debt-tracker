@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime
 from importlib import resources
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Protocol, cast
 from xml.etree import ElementTree as ET
 
@@ -102,6 +103,7 @@ COMMON_CURRENCY_CODES = {
     "ZAR",
 }
 CURRENCY_CODE_LENGTH = 3
+EXTRACTOR_PROGRESS_LOG_INTERVAL = 10
 _SUPPORTED_CURRENCY_CODES: set[str] | None = None
 DEBT_INSTRUMENT_MENTION_COLUMNS = [
     "debt_instrument_mention_id",
@@ -718,6 +720,7 @@ def extract_pending_items(
     failed_rows: list[dict[str, str]] = []
     audit_records: list[str] = []
     partitions_written: list[str] = []
+    pending_classification_paths: list[str] = []
 
     for classification_path in iter_date_shard_partitions(
         CLASSIFICATION_DATASET_NAME,
@@ -734,15 +737,27 @@ def extract_pending_items(
         )
         if not force and artifact_exists(target_path):
             continue
-        if len(partitions_written) >= batch_size:
+        pending_classification_paths.append(classification_path)
+        if len(pending_classification_paths) >= batch_size:
             break
+
+    total_partitions = len(pending_classification_paths)
+    for partition_index, classification_path in enumerate(
+        pending_classification_paths, start=1
+    ):
+        partition = parse_date_shard_partition(classification_path)
+        partition_label = f"date={partition['date']} shard={partition['shard']}"
+        partition_start = perf_counter()
         batch_items = read_table(
             classification_path,
             CLASSIFIED_ITEM_COLUMNS,
         ).reindex(columns=CLASSIFIED_ITEM_COLUMNS)
         relevant_items = batch_items.loc[batch_items["relevance"].fillna(False)]
         mention_rows: list[dict[str, object]] = []
-        for item_row in relevant_items.to_dict("records"):
+        partition_failures = 0
+        relevant_records = relevant_items.to_dict("records")
+        total_relevant_items = len(relevant_records)
+        for item_index, item_row in enumerate(relevant_records, start=1):
             row_state = asyncio.run(
                 run_extraction_workflow(
                     item_row=item_row,
@@ -762,6 +777,22 @@ def extract_pending_items(
                         "extractor_error": summarize_failure(row_state),
                     }
                 )
+                partition_failures += 1
+            if (
+                item_index == total_relevant_items
+                or item_index % EXTRACTOR_PROGRESS_LOG_INTERVAL == 0
+            ):
+                LOGGER.info(
+                    "Extractor item progress: %s partition=%s/%s items=%s/%s mentions=%s failures=%s elapsed=%.1fs",
+                    partition_label,
+                    partition_index,
+                    total_partitions,
+                    item_index,
+                    total_relevant_items,
+                    len(mention_rows),
+                    partition_failures,
+                    perf_counter() - partition_start,
+                )
         mentions = pd.DataFrame(mention_rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
         write_partition_table(
             mentions_root(resolved_root, data_dir=data_dir),
@@ -769,7 +800,25 @@ def extract_pending_items(
             table=mentions.reindex(columns=DEBT_INSTRUMENT_MENTION_COLUMNS),
         )
         processed_frames.append(mentions)
-        partitions_written.append(target_path)
+        partitions_written.append(
+            date_shard_partition_path(
+                MENTIONS_DATASET_NAME,
+                partition_date=partition["date"],
+                shard=partition["shard"],
+                artifact_root=resolved_root,
+                data_dir=data_dir,
+            )
+        )
+        LOGGER.info(
+            "Extraction partition complete: %s progress=%s/%s classified_items=%s relevant_items=%s mentions=%s elapsed=%.1fs",
+            partition_label,
+            partition_index,
+            total_partitions,
+            len(batch_items),
+            total_relevant_items,
+            len(mentions),
+            perf_counter() - partition_start,
+        )
 
     if audit_records:
         write_text_artifact(full_jsonl_path, "\n".join(audit_records) + "\n")

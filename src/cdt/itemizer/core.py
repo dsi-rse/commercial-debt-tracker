@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from pathlib import Path
+from time import perf_counter
 
 import pandas as pd
 
@@ -135,6 +136,7 @@ def itemize_pending_documents(
     processed_partitions: list[str] = []
     total_documents = 0
     shared_s3_client = s3_client
+    pending_document_paths: list[str] = []
 
     for document_path in iter_date_shard_partitions(
         "documents",
@@ -151,10 +153,15 @@ def itemize_pending_documents(
         )
         if not force and artifact_exists(target_path):
             continue
-        processed_partitions.append(target_path)
-        if len(processed_partitions) > batch_size:
-            processed_partitions.pop()
+        pending_document_paths.append(document_path)
+        if len(pending_document_paths) >= batch_size:
             break
+
+    total_partitions = len(pending_document_paths)
+    for partition_index, document_path in enumerate(pending_document_paths, start=1):
+        partition = parse_date_shard_partition(document_path)
+        partition_label = f"date={partition['date']} shard={partition['shard']}"
+        partition_start = perf_counter()
         documents = read_table(document_path, DOCUMENT_COLUMNS).reindex(
             columns=DOCUMENT_COLUMNS
         )
@@ -175,6 +182,24 @@ def itemize_pending_documents(
             table=items.reindex(columns=ITEM_COLUMNS),
         )
         processed_frames.append(items)
+        processed_partitions.append(
+            date_shard_partition_path(
+                ITEM_DATASET_NAME,
+                partition_date=partition["date"],
+                shard=partition["shard"],
+                artifact_root=resolved_root,
+                data_dir=data_dir,
+            )
+        )
+        LOGGER.info(
+            "Itemize partition complete: %s progress=%s/%s documents=%s items=%s elapsed=%.1fs",
+            partition_label,
+            partition_index,
+            total_partitions,
+            len(documents),
+            len(items),
+            perf_counter() - partition_start,
+        )
 
     manifest = {
         "artifact_root": resolved_root,

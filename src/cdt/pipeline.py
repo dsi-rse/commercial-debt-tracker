@@ -111,6 +111,22 @@ class PipelineOrchestrator:
         for key, value in config_values.items():
             self.logger.info("%s: %s", key, value)
 
+    def _log_stage_start(self: Self, stage_name: str, **details: object) -> None:
+        detail_text = " ".join(f"{key}={value}" for key, value in details.items())
+        self.logger.info(
+            "Starting stage: %s%s",
+            stage_name,
+            f" | {detail_text}" if detail_text else "",
+        )
+
+    def _log_stage_complete(self: Self, stage_name: str, **details: object) -> None:
+        detail_text = " ".join(f"{key}={value}" for key, value in details.items())
+        self.logger.info(
+            "Completed stage: %s%s",
+            stage_name,
+            f" | {detail_text}" if detail_text else "",
+        )
+
     def run(self: Self) -> PipelineRunResult:
         """Execute the full CDT pipeline."""
         resolved_start, resolved_end = resolve_mode_dates(
@@ -129,6 +145,11 @@ class PipelineOrchestrator:
         self._log_config(resolved_start, resolved_end)
         start_time = datetime.now()
 
+        self._log_stage_start(
+            "ingest",
+            batch_size=self.config.ingest_batch_size,
+            download=self.config.download,
+        )
         ingest_table, ingest_result = run_ingest_pipeline(
             IngestConfig(
                 mode=self.config.mode,
@@ -152,7 +173,18 @@ class PipelineOrchestrator:
             ciks=ciks,
         )
         del ingest_table
+        self._log_stage_complete(
+            "ingest",
+            rows=ingest_result.total_rows,
+            candidates=ingest_result.candidates_seen,
+            partitions=len(ingest_result.document_partitions),
+            failures=ingest_result.failures,
+        )
 
+        self._log_stage_start(
+            "itemize",
+            batch_size=self.config.itemize_batch_size,
+        )
         items = itemize_pending_documents(
             artifact_root=resolved_artifact_root,
             data_dir=self.config.data_dir,
@@ -160,12 +192,25 @@ class PipelineOrchestrator:
             force=self.config.force,
             item_numbers=self.config.item_numbers,
         )
+        self._log_stage_complete("itemize", rows=len(items))
+
+        self._log_stage_start(
+            "classify",
+            batch_size=self.config.classify_batch_size,
+        )
         classified = classify_pending_items(
             artifact_root=resolved_artifact_root,
             data_dir=self.config.data_dir,
             model_dir=self.config.classifier_model_dir,
             batch_size=self.config.classify_batch_size,
             force=self.config.force,
+        )
+        self._log_stage_complete("classify", rows=len(classified))
+
+        self._log_stage_start(
+            "extract",
+            batch_size=self.config.extract_batch_size,
+            model=self.config.extractor_model,
         )
         extracted = extract_pending_items(
             artifact_root=resolved_artifact_root,
@@ -176,6 +221,12 @@ class PipelineOrchestrator:
             reasoning_effort=self.config.extractor_reasoning_effort,
             max_attempts=self.config.extractor_max_attempts,
         )
+        self._log_stage_complete("extract", rows=len(extracted))
+
+        self._log_stage_start(
+            "match",
+            batch_size=self.config.match_batch_size,
+        )
         matched = match_pending_mentions(
             artifact_root=resolved_artifact_root,
             data_dir=self.config.data_dir,
@@ -184,13 +235,20 @@ class PipelineOrchestrator:
             strong_match_threshold=self.config.strong_match_threshold,
             loose_match_threshold=self.config.loose_match_threshold,
         )
+        self._log_stage_complete(
+            "match",
+            mention_rows=len(matched["debt_instrument_mentions"]),
+            debt_instruments=len(matched["debt_instrument"]),
+        )
         publish_config = publish_config_from_env()
         if publish_config is not None:
+            self._log_stage_start("publish-r2")
             publish_dashboard_snapshot(
                 artifact_root=resolved_artifact_root,
                 data_dir=self.config.data_dir,
                 config=publish_config,
             )
+            self._log_stage_complete("publish-r2")
 
         result = PipelineRunResult(
             mode=self.config.mode,

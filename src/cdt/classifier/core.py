@@ -7,6 +7,7 @@ import logging
 import pickle
 from collections.abc import Sequence
 from pathlib import Path
+from time import perf_counter
 from typing import Protocol, Self, runtime_checkable
 
 import numpy as np
@@ -182,6 +183,7 @@ def classify_pending_items(
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     processed_frames: list[pd.DataFrame] = []
     partitions_written: list[str] = []
+    pending_item_paths: list[str] = []
 
     for item_path in iter_date_shard_partitions(
         ITEM_DATASET_NAME,
@@ -198,8 +200,15 @@ def classify_pending_items(
         )
         if not force and artifact_exists(target_path):
             continue
-        if len(partitions_written) >= batch_size:
+        pending_item_paths.append(item_path)
+        if len(pending_item_paths) >= batch_size:
             break
+
+    total_partitions = len(pending_item_paths)
+    for partition_index, item_path in enumerate(pending_item_paths, start=1):
+        partition = parse_date_shard_partition(item_path)
+        partition_label = f"date={partition['date']} shard={partition['shard']}"
+        partition_start = perf_counter()
         batch_items = read_table(item_path, ITEM_COLUMNS).reindex(columns=ITEM_COLUMNS)
         classified = classify_items(
             batch_items,
@@ -212,7 +221,25 @@ def classify_pending_items(
             table=classified.reindex(columns=CLASSIFIED_ITEM_COLUMNS),
         )
         processed_frames.append(classified)
-        partitions_written.append(target_path)
+        partitions_written.append(
+            date_shard_partition_path(
+                CLASSIFICATION_DATASET_NAME,
+                partition_date=partition["date"],
+                shard=partition["shard"],
+                artifact_root=resolved_root,
+                data_dir=data_dir,
+            )
+        )
+        relevant_count = int(classified["relevance"].fillna(False).sum())
+        LOGGER.info(
+            "Classification partition complete: %s progress=%s/%s items=%s relevant=%s elapsed=%.1fs",
+            partition_label,
+            partition_index,
+            total_partitions,
+            len(batch_items),
+            relevant_count,
+            perf_counter() - partition_start,
+        )
 
     write_json_artifact(
         run_manifest_path(

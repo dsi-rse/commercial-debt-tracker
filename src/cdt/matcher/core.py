@@ -8,6 +8,7 @@ import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
+from time import perf_counter
 
 import pandas as pd
 
@@ -171,9 +172,12 @@ def match_pending_mentions(
     mention_frames: list[pd.DataFrame] = []
     instrument_frames: list[pd.DataFrame] = []
     partitions_written: list[str] = []
-    for cik_shard, shard_mentions in list(mention_rows.groupby("cik_shard"))[
-        :batch_size
-    ]:
+    shard_groups = list(mention_rows.groupby("cik_shard"))[:batch_size]
+    total_partitions = len(shard_groups)
+    for partition_index, (cik_shard, shard_mentions) in enumerate(
+        shard_groups, start=1
+    ):
+        partition_start = perf_counter()
         tables = match_tables(
             shard_mentions.drop(columns=["cik_shard"]),
             strong_match_threshold=strong_match_threshold,
@@ -204,6 +208,16 @@ def match_pending_mentions(
                 artifact_root=resolved_root,
                 data_dir=data_dir,
             )
+        )
+        LOGGER.info(
+            "Matcher partition complete: cik_shard=%s progress=%s/%s mentions=%s matched_rows=%s debt_instruments=%s elapsed=%.1fs",
+            cik_shard,
+            partition_index,
+            total_partitions,
+            len(shard_mentions),
+            len(mention_matches),
+            len(debt_instruments),
+            perf_counter() - partition_start,
         )
     write_json_artifact(
         run_manifest_path(

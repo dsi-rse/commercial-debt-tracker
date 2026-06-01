@@ -343,16 +343,27 @@ def run_ingest_pipeline(
     downloaded = 0
     failures = 0
     document_partitions_written: set[str] = set()
+    flush_count = 0
 
     def flush_pending_rows() -> None:
-        nonlocal pending_rows
+        nonlocal pending_rows, flush_count
         if not pending_rows:
             return
+        flush_count += 1
         written = _write_document_partitions(
             documents_dataset_root,
             pd.DataFrame(pending_rows, columns=DOCUMENT_COLUMNS),
         )
         document_partitions_written.update(written)
+        LOGGER.info(
+            "Ingest batch complete: batch=%s rows=%s partitions_written=%s total_candidates=%s total_downloaded=%s total_failures=%s",
+            flush_count,
+            len(pending_rows),
+            len(written),
+            candidates_seen,
+            downloaded,
+            failures,
+        )
         pending_rows = []
 
     for candidate in iter_document_candidates_for_date_range(
