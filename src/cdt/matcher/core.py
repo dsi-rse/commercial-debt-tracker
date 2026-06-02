@@ -1,4 +1,4 @@
-"""Matcher stage for consolidating debt instrument mentions into debt instruments."""
+"""Matcher stage for consolidating debt instrument mentions into stable clusters."""
 
 from __future__ import annotations
 
@@ -22,15 +22,16 @@ from cdt.datasets import (
 from cdt.extractor.core import (
     DEBT_INSTRUMENT_MENTION_COLUMNS as EXTRACTED_MENTION_COLUMNS,
 )
-from cdt.extractor.core import (
-    MENTIONS_DATASET_NAME,
-)
+from cdt.extractor.core import MENTIONS_DATASET_NAME
 from cdt.storage import read_dataset, write_json_artifact, write_partition_table
 
 LOGGER = logging.getLogger(__name__)
-DEFAULT_LOOSE_MATCH_THRESHOLD = 0.75
-DEFAULT_STRONG_MATCH_THRESHOLD = 0.90
-MATCHER_STATUSES = ("singleton", "matched", "ambiguous")
+DEFAULT_RELATED_THRESHOLD = 0.75
+DEFAULT_MEMBERSHIP_THRESHOLD = 0.90
+DEFAULT_AMBIGUITY_MARGIN = 0.05
+DEFAULT_LENDER_SUPPORT_THRESHOLD = 0.5
+MATCHER_SCHEMA_VERSION = 2
+EDGE_TYPES = ("member", "related", "ambiguous_candidate")
 GENERIC_LENDER_TERMS = frozenset(
     {
         "lender",
@@ -49,10 +50,14 @@ GENERIC_LENDER_TERMS = frozenset(
         "trustees",
     }
 )
-DEBT_INSTRUMENT_MENTION_COLUMNS = [
+MENTION_CLUSTER_EDGE_COLUMNS = [
     "debt_instrument_mention_id",
     "debt_instrument_id",
-    "matcher_status",
+    "edge_type",
+    "match_score",
+    "candidate_rank",
+    "match_via",
+    "evaluated_run_id",
 ]
 DEBT_INSTRUMENT_COLUMNS = [
     "debt_instrument_id",
@@ -64,13 +69,24 @@ DEBT_INSTRUMENT_COLUMNS = [
     "start_date",
     "end_date",
     "amount",
-    "direct_mentions_json",
     "lenders_json",
     "other_interested_parties_json",
-    "possibly_related_json",
 ]
-MENTION_MATCH_DATASET_NAME = "mention-matches"
+MENTION_CLUSTER_EDGE_DATASET_NAME = "mention-cluster-edges"
 DEBT_INSTRUMENT_DATASET_NAME = "debt-instruments"
+
+
+def mention_cluster_edges_root(
+    artifact_root: str | Path | None = None,
+    *,
+    data_dir: Path | None = None,
+) -> str:
+    """Return the canonical mention-cluster-edges dataset root."""
+    return dataset_root(
+        MENTION_CLUSTER_EDGE_DATASET_NAME,
+        artifact_root=artifact_root,
+        data_dir=data_dir,
+    )
 
 
 def mention_matches_root(
@@ -78,12 +94,8 @@ def mention_matches_root(
     *,
     data_dir: Path | None = None,
 ) -> str:
-    """Return the canonical mention-matches dataset root."""
-    return dataset_root(
-        MENTION_MATCH_DATASET_NAME,
-        artifact_root=artifact_root,
-        data_dir=data_dir,
-    )
+    """Backward-compatible alias for the canonical mention-cluster-edges root."""
+    return mention_cluster_edges_root(artifact_root=artifact_root, data_dir=data_dir)
 
 
 def debt_instruments_root(
@@ -100,21 +112,8 @@ def debt_instruments_root(
 
 
 @dataclass(frozen=True)
-class MentionSurface:
-    """Normalized matching surface for one mention or one-hop lineage neighbor."""
-
-    source_mention_id: str
-    match_via: str
-    normalized_amount: str | None
-    normalized_start_date: str | None
-    normalized_end_date: str | None
-    normalized_name_fingerprint: str | None
-    lender_signature: str
-
-
-@dataclass(frozen=True)
 class PreparedMention:
-    """Denormalized mention record used during matching."""
+    """Normalized mention record used during incremental cluster assignment."""
 
     debt_instrument_mention_id: str
     item_id: str
@@ -135,7 +134,49 @@ class PreparedMention:
     normalized_end_date: str | None
     normalized_name_fingerprint: str | None
     lender_signature: str
-    lender_evidence_state: str
+
+
+@dataclass
+class ClusterProfile:
+    """Cached cluster state used while matching mentions incrementally."""
+
+    debt_instrument_id: str
+    cik: str
+    seed_mention_id: str
+    member_ids: list[str]
+    normalized_amounts: set[str]
+    normalized_start_dates: set[str]
+    normalized_name_fingerprints: set[str]
+    lender_signatures: set[str]
+
+    def add_member(self: ClusterProfile, mention: PreparedMention) -> None:
+        """Update the cluster cache with one newly accepted member."""
+        if mention.debt_instrument_mention_id not in self.member_ids:
+            self.member_ids.append(mention.debt_instrument_mention_id)
+        if mention.normalized_amount:
+            self.normalized_amounts.add(mention.normalized_amount)
+        if mention.normalized_start_date:
+            self.normalized_start_dates.add(mention.normalized_start_date)
+        if mention.normalized_name_fingerprint:
+            self.normalized_name_fingerprints.add(mention.normalized_name_fingerprint)
+        if mention.lender_signature:
+            self.lender_signatures.add(mention.lender_signature)
+
+
+@dataclass(frozen=True)
+class CandidateScore:
+    """One scored mention-to-cluster candidate relationship."""
+
+    debt_instrument_id: str
+    match_score: float
+    support_family: str | None
+
+    @property
+    def base_match_via(self: CandidateScore) -> str:
+        """Return the explanation family without the outcome prefix."""
+        if self.support_family is None:
+            return "amount_start"
+        return f"amount_start+{self.support_family}"
 
 
 def match_pending_mentions(
@@ -144,13 +185,13 @@ def match_pending_mentions(
     data_dir: Path | None = None,
     batch_size: int = 100,
     force: bool = False,
-    strong_match_threshold: float = DEFAULT_STRONG_MATCH_THRESHOLD,
-    loose_match_threshold: float = DEFAULT_LOOSE_MATCH_THRESHOLD,
+    strong_match_threshold: float = DEFAULT_MEMBERSHIP_THRESHOLD,
+    loose_match_threshold: float = DEFAULT_RELATED_THRESHOLD,
+    ambiguity_margin: float = DEFAULT_AMBIGUITY_MARGIN,
 ) -> dict[str, pd.DataFrame]:
     """Match canonical debt instrument mentions into canonical matcher outputs."""
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
-    del force
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     mention_rows = read_dataset(
         dataset_root(
@@ -161,7 +202,7 @@ def match_pending_mentions(
     if mention_rows.empty:
         return {
             "debt_instrument_mentions": pd.DataFrame(
-                columns=DEBT_INSTRUMENT_MENTION_COLUMNS
+                columns=MENTION_CLUSTER_EDGE_COLUMNS
             ),
             "debt_instrument": pd.DataFrame(columns=DEBT_INSTRUMENT_COLUMNS),
         }
@@ -169,7 +210,7 @@ def match_pending_mentions(
     mention_rows["cik_shard"] = (
         mention_rows["cik"].fillna("").map(lambda value: shard_for_cik(str(value)))
     )
-    mention_frames: list[pd.DataFrame] = []
+    edge_frames: list[pd.DataFrame] = []
     instrument_frames: list[pd.DataFrame] = []
     partitions_written: list[str] = []
     shard_groups = list(mention_rows.groupby("cik_shard"))
@@ -180,28 +221,43 @@ def match_pending_mentions(
             chunk_groups, start=chunk_start + 1
         ):
             partition_start = perf_counter()
+            if force:
+                existing_edges = pd.DataFrame(columns=MENTION_CLUSTER_EDGE_COLUMNS)
+                existing_instruments = pd.DataFrame(columns=DEBT_INSTRUMENT_COLUMNS)
+            else:
+                existing_edges = read_dataset(
+                    mention_cluster_edges_root(resolved_root, data_dir=data_dir),
+                    partition_filter={"cik_shard": str(cik_shard)},
+                )
+                existing_instruments = read_dataset(
+                    debt_instruments_root(resolved_root, data_dir=data_dir),
+                    partition_filter={"cik_shard": str(cik_shard)},
+                )
             tables = match_tables(
                 shard_mentions.drop(columns=["cik_shard"]),
+                existing_edges=existing_edges,
+                existing_instruments=existing_instruments,
                 strong_match_threshold=strong_match_threshold,
                 loose_match_threshold=loose_match_threshold,
+                ambiguity_margin=ambiguity_margin,
             )
-            mention_matches = tables["debt_instrument_mentions"].reindex(
-                columns=DEBT_INSTRUMENT_MENTION_COLUMNS
+            mention_cluster_edges = tables["debt_instrument_mentions"].reindex(
+                columns=MENTION_CLUSTER_EDGE_COLUMNS
             )
             debt_instruments = tables["debt_instrument"].reindex(
                 columns=DEBT_INSTRUMENT_COLUMNS
             )
             write_partition_table(
-                mention_matches_root(resolved_root, data_dir=data_dir),
+                mention_cluster_edges_root(resolved_root, data_dir=data_dir),
                 partition={"cik_shard": str(cik_shard)},
-                table=mention_matches,
+                table=mention_cluster_edges,
             )
             write_partition_table(
                 debt_instruments_root(resolved_root, data_dir=data_dir),
                 partition={"cik_shard": str(cik_shard)},
                 table=debt_instruments,
             )
-            mention_frames.append(mention_matches)
+            edge_frames.append(mention_cluster_edges)
             instrument_frames.append(debt_instruments)
             partitions_written.append(
                 cik_shard_partition_path(
@@ -212,12 +268,12 @@ def match_pending_mentions(
                 )
             )
             LOGGER.info(
-                "Matcher partition complete: cik_shard=%s progress=%s/%s mentions=%s matched_rows=%s debt_instruments=%s elapsed=%.1fs",
+                "Matcher partition complete: cik_shard=%s progress=%s/%s mentions=%s edge_rows=%s debt_instruments=%s elapsed=%.1fs",
                 cik_shard,
                 partition_index,
                 total_partitions,
                 len(shard_mentions),
-                len(mention_matches),
+                len(mention_cluster_edges),
                 len(debt_instruments),
                 perf_counter() - partition_start,
             )
@@ -233,19 +289,21 @@ def match_pending_mentions(
             "stage": "match",
             "batch_size": batch_size,
             "partitions_written": partitions_written,
-            "strong_match_threshold": strong_match_threshold,
-            "loose_match_threshold": loose_match_threshold,
+            "membership_threshold": strong_match_threshold,
+            "related_threshold": loose_match_threshold,
+            "ambiguity_margin": ambiguity_margin,
+            "schema_version": MATCHER_SCHEMA_VERSION,
         },
     )
     LOGGER.info(
-        "Matcher complete: mention_rows=%s debt_instruments=%s",
-        sum(len(frame) for frame in mention_frames),
+        "Matcher complete: edge_rows=%s debt_instruments=%s",
+        sum(len(frame) for frame in edge_frames),
         sum(len(frame) for frame in instrument_frames),
     )
     return {
-        "debt_instrument_mentions": pd.concat(mention_frames, ignore_index=True)
-        if mention_frames
-        else pd.DataFrame(columns=DEBT_INSTRUMENT_MENTION_COLUMNS),
+        "debt_instrument_mentions": pd.concat(edge_frames, ignore_index=True)
+        if edge_frames
+        else pd.DataFrame(columns=MENTION_CLUSTER_EDGE_COLUMNS),
         "debt_instrument": pd.concat(instrument_frames, ignore_index=True)
         if instrument_frames
         else pd.DataFrame(columns=DEBT_INSTRUMENT_COLUMNS),
@@ -255,19 +313,17 @@ def match_pending_mentions(
 def match_tables(
     debt_instrument_mentions: pd.DataFrame,
     *,
-    strong_match_threshold: float = DEFAULT_STRONG_MATCH_THRESHOLD,
-    loose_match_threshold: float = DEFAULT_LOOSE_MATCH_THRESHOLD,
+    existing_edges: pd.DataFrame | None = None,
+    existing_instruments: pd.DataFrame | None = None,
+    strong_match_threshold: float = DEFAULT_MEMBERSHIP_THRESHOLD,
+    loose_match_threshold: float = DEFAULT_RELATED_THRESHOLD,
+    ambiguity_margin: float = DEFAULT_AMBIGUITY_MARGIN,
 ) -> dict[str, pd.DataFrame]:
-    """Match in-memory debt instrument mentions into debt instruments."""
-    if debt_instrument_mentions.empty:
-        return {
-            "debt_instrument_mentions": pd.DataFrame(
-                columns=DEBT_INSTRUMENT_MENTION_COLUMNS
-            ),
-            "debt_instrument": pd.DataFrame(columns=DEBT_INSTRUMENT_COLUMNS),
-        }
+    """Match in-memory debt instrument mentions into stable debt instrument clusters."""
     if strong_match_threshold < loose_match_threshold:
         raise ValueError("strong_match_threshold must be >= loose_match_threshold")
+    if ambiguity_margin < 0:
+        raise ValueError("ambiguity_margin must be non-negative")
 
     rows = sorted(
         debt_instrument_mentions.to_dict("records"),
@@ -278,106 +334,101 @@ def match_tables(
             str(row.get("debt_instrument_mention_id") or ""),
         ),
     )
+    if not rows and (existing_edges is None or existing_edges.empty):
+        return {
+            "debt_instrument_mentions": pd.DataFrame(
+                columns=MENTION_CLUSTER_EDGE_COLUMNS
+            ),
+            "debt_instrument": pd.DataFrame(columns=DEBT_INSTRUMENT_COLUMNS),
+        }
+
     mention_index = {
         str(row["debt_instrument_mention_id"]): prepare_mention(row) for row in rows
     }
-    direct_members: dict[str, list[str]] = {}
-    mention_results: list[dict[str, object]] = []
+    edge_rows = (
+        existing_edges.copy()
+        if existing_edges is not None and not existing_edges.empty
+        else pd.DataFrame(columns=MENTION_CLUSTER_EDGE_COLUMNS)
+    )
+    instrument_rows = (
+        existing_instruments.copy()
+        if existing_instruments is not None and not existing_instruments.empty
+        else pd.DataFrame(columns=DEBT_INSTRUMENT_COLUMNS)
+    )
+    processed_mentions = {
+        str(row["debt_instrument_mention_id"])
+        for row in edge_rows.to_dict("records")
+        if str(row.get("edge_type")) == "member"
+    }
+    profiles = build_cluster_profiles(
+        mention_index=mention_index,
+        existing_edges=edge_rows,
+        existing_instruments=instrument_rows,
+    )
+    new_edge_rows: list[dict[str, object]] = []
 
     for mention_id in sorted(
         mention_index, key=lambda key: mention_sort_key(mention_index[key])
     ):
+        if mention_id in processed_mentions:
+            continue
         mention = mention_index[mention_id]
         if mention.cik is None:
             continue
-        new_instrument_id = mention.debt_instrument_mention_id
-        direct_members.setdefault(
-            new_instrument_id, [mention.debt_instrument_mention_id]
+        candidates = score_candidates_for_mention(
+            mention,
+            profiles,
+            strong_match_threshold=strong_match_threshold,
+            loose_match_threshold=loose_match_threshold,
         )
-        candidates = []
-        for debt_instrument_id, member_ids in direct_members.items():
-            if debt_instrument_id == new_instrument_id:
-                continue
-            candidate_members = [mention_index[member_id] for member_id in member_ids]
-            if not candidate_members or candidate_members[0].cik != mention.cik:
-                continue
-            candidate = score_candidate(mention, candidate_members, mention_index)
-            if candidate is not None:
-                candidates.append(
-                    candidate | {"debt_instrument_id": debt_instrument_id}
-                )
-        candidates.sort(
-            key=lambda candidate: (
-                1 if bool(candidate["auto_match"]) else 0,
-                float(candidate["lender_similarity"]),
-                str(candidate["debt_instrument_id"]),
-            ),
-            reverse=True,
+        chosen_cluster_id, chosen_edge_rows = resolve_candidates(
+            mention,
+            candidates,
+            strong_match_threshold=strong_match_threshold,
+            loose_match_threshold=loose_match_threshold,
+            ambiguity_margin=ambiguity_margin,
+            evaluated_run_id="latest",
         )
-        strong_candidates = [
-            candidate
-            for candidate in candidates
-            if bool(candidate["auto_match"])
-            or float(candidate["lender_similarity"]) >= strong_match_threshold
-        ]
-        loose_candidates = [
-            candidate
-            for candidate in candidates
-            if loose_match_threshold
-            <= float(candidate["lender_similarity"])
-            < strong_match_threshold
-        ]
-        if len(strong_candidates) == 1:
-            chosen_instrument_id = str(strong_candidates[0]["debt_instrument_id"])
-            direct_members[chosen_instrument_id].append(
-                mention.debt_instrument_mention_id
+        new_edge_rows.extend(chosen_edge_rows)
+        if chosen_cluster_id not in profiles:
+            profiles[chosen_cluster_id] = build_empty_profile(
+                chosen_cluster_id, mention
             )
-            del direct_members[new_instrument_id]
-            mention_results.append(
-                {
-                    "debt_instrument_mention_id": mention.debt_instrument_mention_id,
-                    "debt_instrument_id": chosen_instrument_id,
-                    "matcher_status": "matched",
-                }
-            )
-            continue
-        potential_matches = [
-            {
-                "amount_match": True,
-                "debt_instrument_id": candidate["debt_instrument_id"],
-                "lender_similarity": candidate["lender_similarity"],
-                "match_via": candidate["match_via"],
-                "start_date_match": True,
-            }
-            for candidate in (
-                strong_candidates if len(strong_candidates) > 1 else loose_candidates
-            )
-        ]
-        mention_results.append(
-            {
-                "debt_instrument_mention_id": mention.debt_instrument_mention_id,
-                "debt_instrument_id": new_instrument_id,
-                "matcher_status": "ambiguous" if potential_matches else "singleton",
-            }
-        )
+        profiles[chosen_cluster_id].add_member(mention)
 
-    mention_to_instrument = {
-        row["debt_instrument_mention_id"]: row["debt_instrument_id"]
-        for row in mention_results
+    edge_frames = []
+    if not edge_rows.empty:
+        edge_frames.append(edge_rows.reindex(columns=MENTION_CLUSTER_EDGE_COLUMNS))
+    if new_edge_rows:
+        edge_frames.append(
+            pd.DataFrame(new_edge_rows, columns=MENTION_CLUSTER_EDGE_COLUMNS)
+        )
+    combined_edges = (
+        pd.concat(edge_frames, ignore_index=True)
+        if edge_frames
+        else pd.DataFrame(columns=MENTION_CLUSTER_EDGE_COLUMNS)
+    )
+    member_edges = combined_edges[combined_edges["edge_type"] == "member"].copy()
+    member_map = {
+        str(row["debt_instrument_mention_id"]): str(row["debt_instrument_id"])
+        for row in member_edges.to_dict("records")
     }
-    normalized_members = normalize_instrument_members(direct_members, mention_index)
+    normalized_members = build_member_groups(member_map)
     parent_links = derive_parent_links(
-        normalized_members, mention_index, mention_to_instrument
+        normalized_members,
+        mention_index,
+        member_map,
+        existing_instruments=instrument_rows,
     )
     debt_instrument_rows = build_debt_instrument_rows(
         normalized_members,
         mention_index,
         parent_links,
-        loose_match_threshold=loose_match_threshold,
+        existing_instruments=instrument_rows,
     )
     return {
-        "debt_instrument_mentions": pd.DataFrame(
-            mention_results, columns=DEBT_INSTRUMENT_MENTION_COLUMNS
+        "debt_instrument_mentions": combined_edges.reindex(
+            columns=MENTION_CLUSTER_EDGE_COLUMNS
         ),
         "debt_instrument": pd.DataFrame(
             debt_instrument_rows, columns=DEBT_INSTRUMENT_COLUMNS
@@ -385,42 +436,373 @@ def match_tables(
     }
 
 
-def normalize_instrument_members(
-    direct_members: dict[str, list[str]],
+def build_cluster_profiles(
+    *,
     mention_index: dict[str, PreparedMention],
-) -> dict[str, list[str]]:
-    """Rekey direct-member groups to the earliest mention ID in each group."""
-    normalized: dict[str, list[str]] = {}
-    for member_ids in direct_members.values():
-        ordered_member_ids = sorted(
-            member_ids, key=lambda item: mention_sort_key(mention_index[item])
+    existing_edges: pd.DataFrame,
+    existing_instruments: pd.DataFrame,
+) -> dict[str, ClusterProfile]:
+    """Construct incremental cluster profiles from existing member edges."""
+    member_rows = [
+        row
+        for row in existing_edges.to_dict("records")
+        if str(row.get("edge_type")) == "member"
+    ]
+    members_by_instrument: dict[str, list[str]] = {}
+    for row in member_rows:
+        members_by_instrument.setdefault(str(row["debt_instrument_id"]), []).append(
+            str(row["debt_instrument_mention_id"])
         )
-        normalized[ordered_member_ids[0]] = ordered_member_ids
-    return normalized
+    instrument_rows = {
+        str(row["debt_instrument_id"]): row
+        for row in existing_instruments.to_dict("records")
+    }
+    profiles: dict[str, ClusterProfile] = {}
+    for debt_instrument_id, instrument_row in instrument_rows.items():
+        member_ids = sorted(members_by_instrument.get(debt_instrument_id, []))
+        seed_mention_id = str(
+            instrument_row.get(
+                "seed_debt_instrument_mention_id",
+                member_ids[0] if member_ids else debt_instrument_id,
+            )
+        )
+        profile = ClusterProfile(
+            debt_instrument_id=debt_instrument_id,
+            cik=coerce_optional_text(instrument_row.get("cik")) or "",
+            seed_mention_id=seed_mention_id,
+            member_ids=list(member_ids),
+            normalized_amounts=set(),
+            normalized_start_dates=set(),
+            normalized_name_fingerprints=set(),
+            lender_signatures=set(),
+        )
+        normalized_amount = normalize_amount(
+            coerce_optional_text(instrument_row.get("amount"))
+        )
+        if normalized_amount:
+            profile.normalized_amounts.add(normalized_amount)
+        normalized_start_date = normalize_date(
+            coerce_optional_text(instrument_row.get("start_date"))
+        )
+        if normalized_start_date:
+            profile.normalized_start_dates.add(normalized_start_date)
+        normalized_name = normalize_name_fingerprint(
+            coerce_optional_text(instrument_row.get("name"))
+        )
+        if normalized_name:
+            profile.normalized_name_fingerprints.add(normalized_name)
+        lenders = lender_signature(instrument_row.get("lenders_json"))
+        if lenders:
+            profile.lender_signatures.add(lenders)
+        for member_id in member_ids:
+            mention = mention_index.get(member_id)
+            if mention is not None:
+                profile.add_member(mention)
+        profiles[debt_instrument_id] = profile
+
+    for debt_instrument_id, member_ids in members_by_instrument.items():
+        if debt_instrument_id in profiles:
+            continue
+        ordered_member_ids = sorted(
+            [member_id for member_id in member_ids if member_id in mention_index],
+            key=lambda mention_id: mention_sort_key(mention_index[mention_id]),
+        )
+        if not ordered_member_ids:
+            continue
+        seed_mention_id = str(
+            instrument_rows.get(debt_instrument_id, {}).get(
+                "seed_debt_instrument_mention_id", ordered_member_ids[0]
+            )
+        )
+        seed_mention = mention_index[ordered_member_ids[0]]
+        profile = ClusterProfile(
+            debt_instrument_id=debt_instrument_id,
+            cik=seed_mention.cik or "",
+            seed_mention_id=seed_mention_id,
+            member_ids=[],
+            normalized_amounts=set(),
+            normalized_start_dates=set(),
+            normalized_name_fingerprints=set(),
+            lender_signatures=set(),
+        )
+        for member_id in ordered_member_ids:
+            profile.add_member(mention_index[member_id])
+        profiles[debt_instrument_id] = profile
+    return profiles
+
+
+def build_empty_profile(
+    debt_instrument_id: str,
+    mention: PreparedMention,
+) -> ClusterProfile:
+    """Create an empty profile for a newly created singleton cluster."""
+    return ClusterProfile(
+        debt_instrument_id=debt_instrument_id,
+        cik=mention.cik or "",
+        seed_mention_id=debt_instrument_id,
+        member_ids=[],
+        normalized_amounts=set(),
+        normalized_start_dates=set(),
+        normalized_name_fingerprints=set(),
+        lender_signatures=set(),
+    )
+
+
+def score_candidates_for_mention(
+    mention: PreparedMention,
+    profiles: dict[str, ClusterProfile],
+    *,
+    strong_match_threshold: float,
+    loose_match_threshold: float,
+) -> list[CandidateScore]:
+    """Return scored candidate clusters for one mention."""
+    del strong_match_threshold
+    del loose_match_threshold
+    if (
+        mention.cik is None
+        or mention.normalized_amount is None
+        or mention.normalized_start_date is None
+    ):
+        return []
+    candidates: list[CandidateScore] = []
+    for profile in profiles.values():
+        if profile.cik != mention.cik:
+            continue
+        if mention.normalized_amount not in profile.normalized_amounts:
+            continue
+        if mention.normalized_start_date not in profile.normalized_start_dates:
+            continue
+        lender_similarity = max(
+            (
+                lender_similarity_score(mention.lender_signature, candidate_signature)
+                for candidate_signature in profile.lender_signatures
+                if mention.lender_signature and candidate_signature
+            ),
+            default=0.0,
+        )
+        name_support = (
+            1.0
+            if mention.normalized_name_fingerprint
+            and mention.normalized_name_fingerprint
+            in profile.normalized_name_fingerprints
+            else 0.0
+        )
+        support_family: str | None = None
+        support_strength = 0.0
+        if lender_similarity >= DEFAULT_LENDER_SUPPORT_THRESHOLD:
+            support_family = "lenders"
+            support_strength = lender_similarity
+        if name_support > support_strength:
+            support_family = "name"
+            support_strength = name_support
+        match_score = round(min(1.0, 0.75 + 0.25 * support_strength), 4)
+        candidates.append(
+            CandidateScore(
+                debt_instrument_id=profile.debt_instrument_id,
+                match_score=match_score,
+                support_family=support_family,
+            )
+        )
+    return sorted(
+        candidates,
+        key=lambda candidate: (-candidate.match_score, candidate.debt_instrument_id),
+    )
+
+
+def resolve_candidates(
+    mention: PreparedMention,
+    candidates: list[CandidateScore],
+    *,
+    strong_match_threshold: float,
+    loose_match_threshold: float,
+    ambiguity_margin: float,
+    evaluated_run_id: str,
+) -> tuple[str, list[dict[str, object]]]:
+    """Resolve one mention into one member edge plus optional related edges."""
+    qualifying_members = [
+        candidate
+        for candidate in candidates
+        if candidate.match_score >= strong_match_threshold
+    ]
+    if qualifying_members:
+        top_candidate = qualifying_members[0]
+        close_competitors = [
+            candidate
+            for candidate in qualifying_members[1:]
+            if top_candidate.match_score - candidate.match_score <= ambiguity_margin
+        ]
+        if not close_competitors:
+            edge_rows = [
+                build_edge_row(
+                    mention_id=mention.debt_instrument_mention_id,
+                    debt_instrument_id=top_candidate.debt_instrument_id,
+                    edge_type="member",
+                    match_score=top_candidate.match_score,
+                    candidate_rank=1,
+                    match_via=render_match_via("member", top_candidate.support_family),
+                    evaluated_run_id=evaluated_run_id,
+                )
+            ]
+            for rank, candidate in enumerate(candidates[1:], start=2):
+                if candidate.match_score < loose_match_threshold:
+                    continue
+                edge_rows.append(
+                    build_edge_row(
+                        mention_id=mention.debt_instrument_mention_id,
+                        debt_instrument_id=candidate.debt_instrument_id,
+                        edge_type="related",
+                        match_score=candidate.match_score,
+                        candidate_rank=rank,
+                        match_via=render_match_via("related", candidate.support_family),
+                        evaluated_run_id=evaluated_run_id,
+                    )
+                )
+            return top_candidate.debt_instrument_id, edge_rows
+
+        new_cluster_id = mention.debt_instrument_mention_id
+        edge_rows = [
+            build_edge_row(
+                mention_id=mention.debt_instrument_mention_id,
+                debt_instrument_id=new_cluster_id,
+                edge_type="member",
+                match_score=1.0,
+                candidate_rank=1,
+                match_via="member:seed",
+                evaluated_run_id=evaluated_run_id,
+            )
+        ]
+        for rank, candidate in enumerate(qualifying_members, start=1):
+            edge_rows.append(
+                build_edge_row(
+                    mention_id=mention.debt_instrument_mention_id,
+                    debt_instrument_id=candidate.debt_instrument_id,
+                    edge_type="ambiguous_candidate",
+                    match_score=candidate.match_score,
+                    candidate_rank=rank,
+                    match_via=render_match_via("ambiguous", candidate.support_family),
+                    evaluated_run_id=evaluated_run_id,
+                )
+            )
+        return new_cluster_id, edge_rows
+
+    related_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.match_score >= loose_match_threshold
+    ]
+    new_cluster_id = mention.debt_instrument_mention_id
+    edge_rows = [
+        build_edge_row(
+            mention_id=mention.debt_instrument_mention_id,
+            debt_instrument_id=new_cluster_id,
+            edge_type="member",
+            match_score=1.0,
+            candidate_rank=1,
+            match_via="member:seed",
+            evaluated_run_id=evaluated_run_id,
+        )
+    ]
+    for rank, candidate in enumerate(related_candidates, start=1):
+        edge_rows.append(
+            build_edge_row(
+                mention_id=mention.debt_instrument_mention_id,
+                debt_instrument_id=candidate.debt_instrument_id,
+                edge_type="related",
+                match_score=candidate.match_score,
+                candidate_rank=rank,
+                match_via=render_match_via("related", candidate.support_family),
+                evaluated_run_id=evaluated_run_id,
+            )
+        )
+    return new_cluster_id, edge_rows
+
+
+def build_edge_row(
+    *,
+    mention_id: str,
+    debt_instrument_id: str,
+    edge_type: str,
+    match_score: float,
+    candidate_rank: int,
+    match_via: str,
+    evaluated_run_id: str,
+) -> dict[str, object]:
+    """Return one persisted edge row."""
+    return {
+        "debt_instrument_mention_id": mention_id,
+        "debt_instrument_id": debt_instrument_id,
+        "edge_type": edge_type,
+        "match_score": match_score,
+        "candidate_rank": candidate_rank,
+        "match_via": match_via,
+        "evaluated_run_id": evaluated_run_id,
+    }
+
+
+def render_match_via(outcome: str, support_family: str | None) -> str:
+    """Render one stable explanation-family label for an edge."""
+    base = f"{outcome}:amount_start"
+    if support_family is None:
+        return base
+    return f"{base}+{support_family}"
+
+
+def build_member_groups(member_map: dict[str, str]) -> dict[str, list[str]]:
+    """Group mention IDs by assigned debt instrument ID."""
+    members: dict[str, list[str]] = {}
+    for mention_id, debt_instrument_id in member_map.items():
+        members.setdefault(debt_instrument_id, []).append(mention_id)
+    return {
+        debt_instrument_id: sorted(member_ids)
+        for debt_instrument_id, member_ids in members.items()
+    }
 
 
 def derive_parent_links(
-    normalized_members: dict[str, list[str]],
+    member_groups: dict[str, list[str]],
     mention_index: dict[str, PreparedMention],
     mention_to_instrument: dict[str, str],
+    *,
+    existing_instruments: pd.DataFrame | None = None,
 ) -> dict[str, dict[str, str | None]]:
     """Map mention-level lineage onto debt instrument parent links."""
+    existing_rows = (
+        {
+            str(row["debt_instrument_id"]): row
+            for row in existing_instruments.to_dict("records")
+        }
+        if existing_instruments is not None and not existing_instruments.empty
+        else {}
+    )
     parent_links: dict[str, dict[str, str | None]] = {}
-    for debt_instrument_id, member_ids in normalized_members.items():
-        amendment_parents = {
-            mention_to_instrument[parent_id]
-            for member_id in member_ids
-            for parent_id in [mention_index[member_id].amendment_of]
-            if parent_id in mention_to_instrument
-            and mention_to_instrument[parent_id] != debt_instrument_id
-        }
-        split_parents = {
-            mention_to_instrument[parent_id]
-            for member_id in member_ids
-            for parent_id in [mention_index[member_id].split_of]
-            if parent_id in mention_to_instrument
-            and mention_to_instrument[parent_id] != debt_instrument_id
-        }
+    for debt_instrument_id, member_ids in member_groups.items():
+        existing_row = existing_rows.get(debt_instrument_id, {})
+        amendment_parents = set()
+        split_parents = set()
+        existing_amendment = coerce_optional_text(
+            existing_row.get("amendment_of_debt_instrument_id")
+        )
+        if existing_amendment:
+            amendment_parents.add(existing_amendment)
+        existing_split = coerce_optional_text(
+            existing_row.get("split_of_debt_instrument_id")
+        )
+        if existing_split:
+            split_parents.add(existing_split)
+        for member_id in member_ids:
+            mention = mention_index.get(member_id)
+            if mention is None:
+                continue
+            if (
+                mention.amendment_of in mention_to_instrument
+                and mention_to_instrument[mention.amendment_of] != debt_instrument_id
+            ):
+                amendment_parents.add(mention_to_instrument[mention.amendment_of])
+            if (
+                mention.split_of in mention_to_instrument
+                and mention_to_instrument[mention.split_of] != debt_instrument_id
+            ):
+                split_parents.add(mention_to_instrument[mention.split_of])
         if len(amendment_parents) > 1 or len(split_parents) > 1:
             parent_links[debt_instrument_id] = {
                 "amendment_of_debt_instrument_id": None,
@@ -441,31 +823,62 @@ def derive_parent_links(
 
 
 def build_debt_instrument_rows(
-    normalized_members: dict[str, list[str]],
+    member_groups: dict[str, list[str]],
     mention_index: dict[str, PreparedMention],
     parent_links: dict[str, dict[str, str | None]],
     *,
-    loose_match_threshold: float,
+    existing_instruments: pd.DataFrame | None = None,
 ) -> list[dict[str, object]]:
-    """Build persisted debt instrument rows from direct groups and parent links."""
+    """Build persisted debt instrument rows from member groups and lineage."""
+    existing_rows = (
+        {
+            str(row["debt_instrument_id"]): row
+            for row in existing_instruments.to_dict("records")
+        }
+        if existing_instruments is not None and not existing_instruments.empty
+        else {}
+    )
     rows: list[dict[str, object]] = []
-    for debt_instrument_id, direct_member_ids in sorted(normalized_members.items()):
-        cumulative_mentions = cumulative_member_ids(
-            debt_instrument_id,
-            normalized_members,
-            parent_links,
-        )
-        ordered_cumulative_mentions = sorted(
-            cumulative_mentions,
+    for debt_instrument_id, member_ids in sorted(member_groups.items()):
+        existing_row = existing_rows.get(debt_instrument_id, {})
+        present_member_ids = [
+            member_id for member_id in member_ids if member_id in mention_index
+        ]
+        ordered_member_ids = sorted(
+            present_member_ids,
             key=lambda mention_id: mention_recency_key(mention_index[mention_id]),
             reverse=True,
         )
-        direct_mentions_json = json.dumps(direct_member_ids, sort_keys=True)
+        if present_member_ids:
+            seed_mention = mention_index[
+                min(
+                    present_member_ids,
+                    key=lambda mention_id: mention_sort_key(mention_index[mention_id]),
+                )
+            ]
+            seed_mention_id = (
+                coerce_optional_text(
+                    existing_row.get("seed_debt_instrument_mention_id")
+                )
+                or seed_mention.debt_instrument_mention_id
+            )
+            cik = coerce_optional_text(existing_row.get("cik")) or seed_mention.cik
+        else:
+            seed_mention = None
+            seed_mention_id = coerce_optional_text(
+                existing_row.get("seed_debt_instrument_mention_id")
+            )
+            cik = coerce_optional_text(existing_row.get("cik"))
+        if seed_mention_id is None or cik is None:
+            continue
         lenders_json = json.dumps(
             dedupe_party_clusters(
                 [
-                    mention_index[mention_id].lenders_json
-                    for mention_id in ordered_cumulative_mentions
+                    str(existing_row.get("lenders_json") or "[]"),
+                    *[
+                        mention_index[mention_id].lenders_json
+                        for mention_id in present_member_ids
+                    ],
                 ]
             ),
             sort_keys=True,
@@ -473,102 +886,43 @@ def build_debt_instrument_rows(
         other_interested_parties_json = json.dumps(
             dedupe_party_clusters(
                 [
-                    mention_index[mention_id].other_interested_parties_json
-                    for mention_id in ordered_cumulative_mentions
+                    str(existing_row.get("other_interested_parties_json") or "[]"),
+                    *[
+                        mention_index[mention_id].other_interested_parties_json
+                        for mention_id in present_member_ids
+                    ],
                 ]
-            ),
-            sort_keys=True,
-        )
-        possibly_related_json = json.dumps(
-            find_possibly_related_mentions(
-                debt_instrument_id,
-                cumulative_mentions,
-                mention_index,
-                loose_match_threshold=loose_match_threshold,
             ),
             sort_keys=True,
         )
         rows.append(
             {
                 "debt_instrument_id": debt_instrument_id,
-                "cik": mention_index[direct_member_ids[0]].cik,
-                "seed_debt_instrument_mention_id": direct_member_ids[0],
-                "amendment_of_debt_instrument_id": parent_links[debt_instrument_id][
-                    "amendment_of_debt_instrument_id"
-                ],
-                "split_of_debt_instrument_id": parent_links[debt_instrument_id][
-                    "split_of_debt_instrument_id"
-                ],
-                "name": first_non_null(
-                    ordered_cumulative_mentions, mention_index, "name"
-                ),
+                "cik": cik,
+                "seed_debt_instrument_mention_id": seed_mention_id,
+                "amendment_of_debt_instrument_id": parent_links.get(
+                    debt_instrument_id, {}
+                ).get("amendment_of_debt_instrument_id"),
+                "split_of_debt_instrument_id": parent_links.get(
+                    debt_instrument_id, {}
+                ).get("split_of_debt_instrument_id"),
+                "name": first_non_null(ordered_member_ids, mention_index, "name")
+                or coerce_optional_text(existing_row.get("name")),
                 "start_date": first_non_null(
-                    ordered_cumulative_mentions, mention_index, "start_date"
-                ),
+                    ordered_member_ids, mention_index, "start_date"
+                )
+                or coerce_optional_text(existing_row.get("start_date")),
                 "end_date": first_non_null(
-                    ordered_cumulative_mentions, mention_index, "end_date"
-                ),
-                "amount": first_non_null(
-                    ordered_cumulative_mentions, mention_index, "amount"
-                ),
-                "direct_mentions_json": direct_mentions_json,
+                    ordered_member_ids, mention_index, "end_date"
+                )
+                or coerce_optional_text(existing_row.get("end_date")),
+                "amount": first_non_null(ordered_member_ids, mention_index, "amount")
+                or coerce_optional_text(existing_row.get("amount")),
                 "lenders_json": lenders_json,
                 "other_interested_parties_json": other_interested_parties_json,
-                "possibly_related_json": possibly_related_json,
             }
         )
     return rows
-
-
-def cumulative_member_ids(
-    debt_instrument_id: str,
-    normalized_members: dict[str, list[str]],
-    parent_links: dict[str, dict[str, str | None]],
-) -> list[str]:
-    """Return cumulative direct member mentions across the ancestor chain."""
-    cumulative: list[str] = []
-    seen_states: set[str] = set()
-    current_id: str | None = debt_instrument_id
-    while current_id and current_id not in seen_states:
-        seen_states.add(current_id)
-        cumulative.extend(normalized_members.get(current_id, []))
-        parent = parent_links.get(current_id, {})
-        current_id = parent.get("amendment_of_debt_instrument_id") or parent.get(
-            "split_of_debt_instrument_id"
-        )
-    return sorted(set(cumulative))
-
-
-def find_possibly_related_mentions(
-    debt_instrument_id: str,
-    cumulative_mentions: list[str],
-    mention_index: dict[str, PreparedMention],
-    *,
-    loose_match_threshold: float,
-) -> list[str]:
-    """Return advisory related mention IDs for one debt instrument."""
-    del debt_instrument_id
-    owned = set(cumulative_mentions)
-    owned_mentions = [mention_index[mention_id] for mention_id in cumulative_mentions]
-    owned_cik = owned_mentions[0].cik if owned_mentions else None
-    related_ids: list[str] = []
-    for candidate in mention_index.values():
-        if candidate.debt_instrument_mention_id in owned:
-            continue
-        if candidate.cik != owned_cik:
-            continue
-        if not candidate.lender_signature:
-            continue
-        if any(
-            lender_similarity_score(
-                candidate.lender_signature, owned_mention.lender_signature
-            )
-            >= loose_match_threshold
-            for owned_mention in owned_mentions
-            if owned_mention.lender_signature
-        ):
-            related_ids.append(candidate.debt_instrument_mention_id)
-    return sorted(set(related_ids))
 
 
 def first_non_null(
@@ -576,7 +930,7 @@ def first_non_null(
     mention_index: dict[str, PreparedMention],
     field_name: str,
 ) -> str | None:
-    """Return the newest non-null field value across cumulative mentions."""
+    """Return the newest non-null field value across member mentions."""
     for mention_id in ordered_mention_ids:
         value = getattr(mention_index[mention_id], field_name)
         if value is not None:
@@ -585,7 +939,7 @@ def first_non_null(
 
 
 def dedupe_party_clusters(payloads: list[str]) -> list[dict[str, object]]:
-    """Return newest-first deduped party cluster payloads."""
+    """Return deduped party cluster payloads."""
     deduped: dict[str, dict[str, object]] = {}
     for payload in payloads:
         for cluster in parse_cluster_list(payload):
@@ -650,12 +1004,11 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
             coerce_optional_text(row.get("name"))
         ),
         lender_signature=lender_signature(row.get("lenders_json")),
-        lender_evidence_state=lender_evidence_state(row.get("lenders_json")),
     )
 
 
 def mention_sort_key(mention: PreparedMention) -> tuple[str, str, str, str]:
-    """Return deterministic processing order for direct matching."""
+    """Return deterministic processing order for cluster assignment."""
     return (
         mention.date or "",
         mention.accession_number or "",
@@ -674,94 +1027,6 @@ def mention_recency_key(mention: PreparedMention) -> tuple[str, str, str, str]:
     )
 
 
-def score_candidate(
-    mention: PreparedMention,
-    candidate_members: list[PreparedMention],
-    mention_index: dict[str, PreparedMention],
-) -> dict[str, object] | None:
-    """Return the best candidate score when normalized terms match exactly."""
-    best: dict[str, object] | None = None
-    for mention_surface in build_surfaces(mention, mention_index):
-        if (
-            not mention_surface.normalized_amount
-            or not mention_surface.normalized_start_date
-        ):
-            continue
-        for candidate_member in candidate_members:
-            for candidate_surface in build_surfaces(candidate_member, mention_index):
-                if (
-                    mention_surface.normalized_amount
-                    != candidate_surface.normalized_amount
-                ):
-                    continue
-                if (
-                    mention_surface.normalized_start_date
-                    != candidate_surface.normalized_start_date
-                ):
-                    continue
-                match_via = (
-                    f"{mention_surface.match_via}->{candidate_surface.match_via}"
-                )
-                lender_similarity = lender_similarity_score(
-                    mention_surface.lender_signature,
-                    candidate_surface.lender_signature,
-                )
-                lender_usable = (
-                    mention.lender_evidence_state == "usable"
-                    and candidate_member.lender_evidence_state == "usable"
-                )
-                if lender_usable:
-                    candidate = {
-                        "auto_match": False,
-                        "lender_similarity": lender_similarity,
-                        "match_via": match_via,
-                    }
-                    if best is None or lender_similarity > float(
-                        best["lender_similarity"]
-                    ):
-                        best = candidate
-                    continue
-                if (
-                    mention_surface.normalized_name_fingerprint
-                    and mention_surface.normalized_name_fingerprint
-                    == candidate_surface.normalized_name_fingerprint
-                    and end_dates_are_compatible(
-                        mention_surface.normalized_end_date,
-                        candidate_surface.normalized_end_date,
-                    )
-                ):
-                    candidate = {
-                        "auto_match": True,
-                        "lender_similarity": lender_similarity,
-                        "match_via": f"{match_via}:name_fingerprint_fallback",
-                    }
-                    if best is None or not bool(best["auto_match"]):
-                        best = candidate
-    return best
-
-
-def build_surfaces(
-    mention: PreparedMention,
-    mention_index: dict[str, PreparedMention],
-) -> list[MentionSurface]:
-    """Return self-only matching surfaces for one mention state."""
-    del mention_index
-    return [surface_for(mention, match_via="self")]
-
-
-def surface_for(mention: PreparedMention, *, match_via: str) -> MentionSurface:
-    """Build one normalized matching surface."""
-    return MentionSurface(
-        source_mention_id=mention.debt_instrument_mention_id,
-        match_via=match_via,
-        normalized_amount=mention.normalized_amount,
-        normalized_start_date=mention.normalized_start_date,
-        normalized_end_date=mention.normalized_end_date,
-        normalized_name_fingerprint=mention.normalized_name_fingerprint,
-        lender_signature=mention.lender_signature,
-    )
-
-
 def coerce_optional_text(value: object) -> str | None:
     """Return one trimmed string or None."""
     if value is None:
@@ -771,7 +1036,7 @@ def coerce_optional_text(value: object) -> str | None:
 
 
 def normalize_amount(value: str | None) -> str | None:
-    """Normalize amount strings for exact matcher comparisons."""
+    """Normalize amount strings for matcher comparisons."""
     if value is None:
         return None
     lowered = value.lower()
@@ -792,7 +1057,7 @@ def normalize_amount(value: str | None) -> str | None:
 
 
 def normalize_date(value: str | None) -> str | None:
-    """Normalize date strings for exact matcher comparisons."""
+    """Normalize date strings for matcher comparisons."""
     if value is None:
         return None
     text = value.strip()
@@ -824,7 +1089,7 @@ def normalize_date(value: str | None) -> str | None:
 
 
 def normalize_name_fingerprint(value: str | None) -> str | None:
-    """Normalize debt-instrument names for exact fallback matching."""
+    """Normalize debt-instrument names for exact comparisons."""
     if value is None:
         return None
     text = value.lower()
@@ -833,17 +1098,6 @@ def normalize_name_fingerprint(value: str | None) -> str | None:
     text = re.sub(r"[^a-z0-9%]+", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text or None
-
-
-def lender_evidence_state(value: object) -> str:
-    """Return whether lender evidence is usable, generic-only, or missing."""
-    clusters = parse_cluster_list(str(value or "[]"))
-    if not clusters:
-        return "missing"
-    usable_keys = [key for key in lender_keys(value) if key not in GENERIC_LENDER_TERMS]
-    if usable_keys:
-        return "usable"
-    return "generic_only"
 
 
 def lender_keys(value: object) -> list[str]:

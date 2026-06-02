@@ -309,7 +309,6 @@ def test_pipeline_cli_builds_pipeline_config(
             classifier_model_dir=config.classifier_model_dir or tmp_path / "model",
             artifact_root=str(tmp_path),
             extractor_run_path=tmp_path / "extractor_runs",
-            r2_published=False,
         )
 
     monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
@@ -612,12 +611,18 @@ def test_match_cli_calls_pending_matcher(
         artifact_root: str | Path | None = None,
         batch_size: int,
         force: bool = False,
+        strong_match_threshold: float = 0.9,
+        loose_match_threshold: float = 0.75,
+        ambiguity_margin: float = 0.05,
     ) -> dict[str, pd.DataFrame]:
         del artifact_root
         calls.append(
             {
                 "batch_size": batch_size,
                 "force": force,
+                "strong": strong_match_threshold,
+                "loose": loose_match_threshold,
+                "ambiguity": ambiguity_margin,
             }
         )
         return {
@@ -632,7 +637,15 @@ def test_match_cli_calls_pending_matcher(
     status = cli.main(["match", "--batch-size", "25", "--force", "--quiet"])
 
     assert status == 0
-    assert calls == [{"batch_size": 25, "force": True}]
+    assert calls == [
+        {
+            "batch_size": 25,
+            "force": True,
+            "strong": 0.9,
+            "loose": 0.75,
+            "ambiguity": 0.05,
+        }
+    ]
 
 
 def test_parse_date_rejects_non_iso_date() -> None:

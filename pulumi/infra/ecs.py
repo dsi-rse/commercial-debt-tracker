@@ -10,6 +10,7 @@ from . import config, ecr, iam, logs, secrets
 
 CONTAINER_NAME = "cdt-orchestrator"
 artifact_root = f"s3://{config.bucket_name}/{config.artifact_prefix}"
+final_database_root = f"s3://{config.bucket_name}/{config.final_database_prefix}"
 
 cluster = aws.ecs.Cluster(
     "cdt-ecs-cluster",
@@ -46,6 +47,7 @@ container_definitions = pulumi.Output.all(
                     {"name": "AWS_REGION", "value": args["region"]},
                     {"name": "BUCKET_NAME", "value": config.bucket_name},
                     {"name": "ARTIFACT_ROOT", "value": artifact_root},
+                    {"name": "FINAL_DATABASE_ROOT", "value": final_database_root},
                     {"name": "CDT_DEFAULT_CIK_FILE", "value": config.default_cik_file},
                     {"name": "PYTHONUNBUFFERED", "value": "1"},
                     *(

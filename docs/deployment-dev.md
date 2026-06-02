@@ -24,9 +24,10 @@ These are the current recommended `dev` values:
 
 ```text
 aws:region = us-east-2
-idi:bucket_name = idi-dev-processor-s3
-idi:artifact_prefix = commercial-debt-tracker/dev
-idi:default_cik_file = s3://idi-dev-processor-s3/commercial-debt-tracker/dev/inputs/ciks/beta-1k.txt
+idi:bucket_name = idi-dev-ftm2j-shared-processor-storage
+idi:artifact_prefix = processors/cdt
+idi:final_database_prefix = database/cdt
+idi:default_cik_file = s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/inputs/ciks/beta-1k.txt
 idi:shared_dlq_name = idi-dev-ftm2j-shared-scheduler-dlq
 idi:cpu = 1024
 idi:memory = 4096
@@ -76,7 +77,7 @@ For the first `dev` deploy, use the repository's `1000-ciks.txt` file as the def
 ```bash
 aws s3 cp \
   1000-ciks.txt \
-  s3://idi-dev-processor-s3/commercial-debt-tracker/dev/inputs/ciks/beta-1k.txt
+  s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/inputs/ciks/beta-1k.txt
 ```
 
 The deployed daily job and any manual historical run can override the CIK file, but this path is the default `dev` value.
@@ -88,9 +89,10 @@ Run these commands from the `pulumi/` directory:
 ```bash
 pulumi stack init dev
 pulumi config set aws:region us-east-2
-pulumi config set idi:bucket_name idi-dev-processor-s3
-pulumi config set idi:artifact_prefix commercial-debt-tracker/dev
-pulumi config set idi:default_cik_file s3://idi-dev-processor-s3/commercial-debt-tracker/dev/inputs/ciks/beta-1k.txt
+pulumi config set idi:bucket_name idi-dev-ftm2j-shared-processor-storage
+pulumi config set idi:artifact_prefix processors/cdt
+pulumi config set idi:final_database_prefix database/cdt
+pulumi config set idi:default_cik_file s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/inputs/ciks/beta-1k.txt
 pulumi config set idi:shared_dlq_name idi-dev-ftm2j-shared-scheduler-dlq
 pulumi config set idi:cpu 1024
 pulumi config set idi:memory 4096
@@ -171,7 +173,7 @@ aws ecs run-task \
         "name": "cdt-orchestrator",
         "command": [
           "historical",
-          "--cik-file", "s3://idi-dev-processor-s3/commercial-debt-tracker/dev/inputs/ciks/beta-1k.txt",
+          "--cik-file", "s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/inputs/ciks/beta-1k.txt",
           "--start-date", "2024-01-01",
           "--end-date", "2024-01-31"
         ]
@@ -197,13 +199,20 @@ pulumi stack output log_group_name
 Expected `dev` artifacts:
 
 ```text
-s3://idi-dev-processor-s3/commercial-debt-tracker/dev/documents/...
-s3://idi-dev-processor-s3/commercial-debt-tracker/dev/items/...
-s3://idi-dev-processor-s3/commercial-debt-tracker/dev/classifications/...
-s3://idi-dev-processor-s3/commercial-debt-tracker/dev/mentions/...
-s3://idi-dev-processor-s3/commercial-debt-tracker/dev/mention-matches/...
-s3://idi-dev-processor-s3/commercial-debt-tracker/dev/debt-instruments/...
-s3://idi-dev-processor-s3/commercial-debt-tracker/dev/runs/...
+s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/documents/...
+s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/items/...
+s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/classifications/...
+s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/mentions/...
+s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/mention-cluster-edges/...
+s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/debt-instruments/...
+s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/runs/...
+
+Final snapshots are also written to:
+
+s3://idi-dev-ftm2j-shared-processor-storage/database/cdt/items/latest.parquet
+s3://idi-dev-ftm2j-shared-processor-storage/database/cdt/debt-instruments/latest.parquet
+s3://idi-dev-ftm2j-shared-processor-storage/database/cdt/debt-instrument-mentions/latest.parquet
+s3://idi-dev-ftm2j-shared-processor-storage/database/cdt/mention-cluster-edges/latest.parquet
 ```
 
 ## Enable the Daily Schedule

@@ -23,7 +23,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cdt-orchestrator")
     parser.add_argument("--artifact-root", default=os.environ.get("ARTIFACT_ROOT"))
     parser.add_argument(
-        "--bucket", default=os.environ.get("BUCKET_NAME", "idi-dev-processor-s3")
+        "--final-database-root", default=os.environ.get("FINAL_DATABASE_ROOT")
+    )
+    parser.add_argument(
+        "--bucket",
+        default=os.environ.get("BUCKET_NAME", "idi-dev-ftm2j-shared-processor-storage"),
     )
     parser.add_argument("--aws-profile", default=os.environ.get("AWS_PROFILE", ""))
     parser.add_argument("--force", action="store_true")
@@ -67,6 +71,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             start_date=args.start_date,
             end_date=args.end_date,
             artifact_root=args.artifact_root,
+            final_database_root=args.final_database_root,
             force=args.force,
             ingest_batch_size=args.ingest_batch_size,
             itemize_batch_size=args.itemize_batch_size,

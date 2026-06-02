@@ -8,13 +8,26 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from cdt.classifier import core as classifier_core
+from cdt.extractor.core import ExtractionRowState
 from cdt.ingest import IngestRunResult
+from cdt.matcher import debt_instruments_root, mention_matches_root
 from cdt.pipeline import (
     ALL_TIME_START_DATE,
     PipelineConfig,
     resolve_mode_dates,
     run_pipeline,
 )
+from cdt.storage import read_dataset, read_table, write_partition_table
+
+
+class FakeModel:
+    """Classifier stub returning one relevant score."""
+
+    def decision_function(self: FakeModel, texts: list[str]) -> list[float]:
+        """Return a strong-positive score for the seeded test document."""
+        del texts
+        return [2.0]
 
 
 def test_resolve_mode_dates_daily_defaults_to_yesterday() -> None:
@@ -108,8 +121,6 @@ def test_run_pipeline_uses_stage_backed_functions(
     monkeypatch.setattr(
         "cdt.pipeline.match_pending_mentions", fake_match_pending_mentions
     )
-    monkeypatch.setattr("cdt.pipeline.publish_config_from_env", lambda: None)
-
     result = run_pipeline(
         PipelineConfig(
             mode="historical",
@@ -131,7 +142,6 @@ def test_run_pipeline_uses_stage_backed_functions(
     assert result.extracted_rows == 1
     assert result.matched_rows == 1
     assert result.debt_instrument_rows == 1
-    assert result.r2_published is False
     assert calls == [
         ("ingest", {"320193"}),
         ("itemize", 11),
@@ -141,14 +151,13 @@ def test_run_pipeline_uses_stage_backed_functions(
     ]
 
 
-def test_run_pipeline_publishes_snapshot_when_r2_is_configured(
+def test_run_pipeline_processes_small_seeded_batch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The pipeline publishes dashboard snapshot JSON when R2 config is present."""
+    """The full pipeline should complete on one seeded document batch."""
     cik_file = tmp_path / "ciks.txt"
     cik_file.write_text("320193\n", encoding="utf-8")
-    publish_calls: list[dict[str, object]] = []
 
     def fake_run_ingest_pipeline(
         config: object,
@@ -156,60 +165,127 @@ def test_run_pipeline_publishes_snapshot_when_r2_is_configured(
         ciks: set[str] | None = None,
         s3_client: object | None = None,
     ) -> tuple[pd.DataFrame, IngestRunResult]:
-        del config, ciks, s3_client
-        return pd.DataFrame(), IngestRunResult(
-            mode="daily",
+        del config, s3_client
+        document_rows = pd.DataFrame(
+            [
+                {
+                    "accession_number": "000114036126006577",
+                    "cik": "320193",
+                    "url": "https://sec.example/full.txt",
+                    "text": """
+ITEM INFORMATION: Other Events
+<DOCUMENT>
+<TYPE>8-K
+<TEXT>
+Item 8.01 Other Events.
+This is the extracted event text.
+</TEXT>
+</DOCUMENT>
+""",
+                    "date": "2024-01-02",
+                    "resource_uri": None,
+                }
+            ]
+        )
+        document_partition = write_partition_table(
+            tmp_path / "documents",
+            partition={"date": "2024-01-02", "shard": "0001"},
+            table=document_rows,
+        )
+        return document_rows, IngestRunResult(
+            mode="historical",
             start_date=date(2024, 1, 1),
-            end_date=date(2024, 1, 1),
-            ciks_count=1,
-            candidates_seen=0,
+            end_date=date(2024, 1, 31),
+            ciks_count=len(ciks or set()),
+            candidates_seen=1,
             skipped_existing=0,
-            downloaded=0,
+            downloaded=1,
             failures=0,
-            total_rows=0,
+            total_rows=1,
             output_root=str(tmp_path),
             documents_root=str(tmp_path / "documents"),
-            document_partitions=(),
+            document_partitions=(document_partition,),
             failure_file=str(tmp_path / "failures" / "ingest_failures.json"),
             run_manifest=str(tmp_path / "runs" / "ingest" / "run_id=1.json"),
         )
 
+    async def fake_run_extraction_workflow(
+        **kwargs: object,
+    ) -> ExtractionRowState:
+        item_row = kwargs["item_row"]
+        row_state = ExtractionRowState(item_row=item_row, stage_name="instrument_ie")
+        row_state.debt_instrument_mentions = [
+            {
+                "debt_instrument_mention_id": "m-1",
+                "item_id": item_row["item_id"],
+                "accession_number": item_row["accession_number"],
+                "cik": item_row["cik"],
+                "date": item_row["date"],
+                "raw_id": "i-1",
+                "name": "Term Loan",
+                "start_date": "2024-01-01",
+                "end_date": None,
+                "amount": "$100 million",
+                "amendment_of": None,
+                "split_of": None,
+                "lenders_json": '[{"mentions": [{"text": "Acme Bank"}]}]',
+                "other_interested_parties_json": "[]",
+                "name_json": "{}",
+                "start_date_json": "{}",
+                "end_date_json": "{}",
+                "amount_json": "{}",
+            }
+        ]
+        row_state.finish("SUCCESS")
+        return row_state
+
     monkeypatch.setattr("cdt.pipeline.run_ingest_pipeline", fake_run_ingest_pipeline)
     monkeypatch.setattr(
-        "cdt.pipeline.itemize_pending_documents", lambda **kwargs: pd.DataFrame()
+        classifier_core,
+        "load_training_artifacts",
+        lambda path: (FakeModel(), 0.5, {"threshold": 0.5}),
     )
     monkeypatch.setattr(
-        "cdt.pipeline.classify_pending_items", lambda **kwargs: pd.DataFrame()
-    )
-    monkeypatch.setattr(
-        "cdt.pipeline.extract_pending_items", lambda **kwargs: pd.DataFrame()
-    )
-    monkeypatch.setattr(
-        "cdt.pipeline.match_pending_mentions",
-        lambda **kwargs: {
-            "debt_instrument_mentions": pd.DataFrame(),
-            "debt_instrument": pd.DataFrame(),
-        },
-    )
-    monkeypatch.setattr(
-        "cdt.pipeline.publish_config_from_env",
-        lambda: object(),
-    )
-    monkeypatch.setattr(
-        "cdt.pipeline.publish_dashboard_snapshot",
-        lambda **kwargs: publish_calls.append(kwargs),
+        "cdt.extractor.core.run_extraction_workflow",
+        fake_run_extraction_workflow,
     )
 
     result = run_pipeline(
         PipelineConfig(
-            mode="daily",
+            mode="historical",
             cik_file=str(cik_file),
             start_date=date(2024, 1, 1),
-            end_date=date(2024, 1, 1),
+            end_date=date(2024, 1, 31),
+            download=True,
+            ingest_batch_size=1,
+            itemize_batch_size=1,
+            classify_batch_size=1,
+            extract_batch_size=1,
+            match_batch_size=1,
+            artifact_root=str(tmp_path),
+            final_database_root=str(tmp_path / "database" / "cdt"),
         )
     )
 
-    assert result.r2_published is True
-    assert len(publish_calls) == 1
-    assert publish_calls[0]["artifact_root"] == result.artifact_root
-    assert publish_calls[0]["data_dir"] is None
+    written_matches = read_dataset(mention_matches_root(tmp_path))
+    written_instruments = read_dataset(debt_instruments_root(tmp_path))
+    final_items = read_table(tmp_path / "database" / "cdt" / "items" / "latest.parquet")
+    final_mentions = read_table(
+        tmp_path / "database" / "cdt" / "debt-instrument-mentions" / "latest.parquet"
+    )
+    final_edges = read_table(
+        tmp_path / "database" / "cdt" / "mention-cluster-edges" / "latest.parquet"
+    )
+    final_instruments = read_table(
+        tmp_path / "database" / "cdt" / "debt-instruments" / "latest.parquet"
+    )
+    assert result.itemized_rows == 1
+    assert result.classified_rows == 1
+    assert result.extracted_rows == 1
+    assert result.matched_rows == 1
+    assert written_matches["edge_type"].to_list() == ["member"]
+    assert written_instruments["debt_instrument_id"].to_list() == ["m-1"]
+    assert final_items["item_id"].to_list() == ["000114036126006577-8-01"]
+    assert final_mentions["debt_instrument_mention_id"].to_list() == ["m-1"]
+    assert final_edges["debt_instrument_mention_id"].to_list() == ["m-1"]
+    assert final_instruments["debt_instrument_id"].to_list() == ["m-1"]
