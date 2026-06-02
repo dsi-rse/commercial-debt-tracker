@@ -18,7 +18,7 @@ from cdt.pipeline import (
     resolve_mode_dates,
     run_pipeline,
 )
-from cdt.storage import read_dataset, write_partition_table
+from cdt.storage import read_dataset, read_table, write_partition_table
 
 
 class FakeModel:
@@ -263,14 +263,29 @@ This is the extracted event text.
             extract_batch_size=1,
             match_batch_size=1,
             artifact_root=str(tmp_path),
+            final_database_root=str(tmp_path / "database" / "cdt"),
         )
     )
 
     written_matches = read_dataset(mention_matches_root(tmp_path))
     written_instruments = read_dataset(debt_instruments_root(tmp_path))
+    final_items = read_table(tmp_path / "database" / "cdt" / "items" / "latest.parquet")
+    final_mentions = read_table(
+        tmp_path / "database" / "cdt" / "debt-instrument-mentions" / "latest.parquet"
+    )
+    final_edges = read_table(
+        tmp_path / "database" / "cdt" / "mention-cluster-edges" / "latest.parquet"
+    )
+    final_instruments = read_table(
+        tmp_path / "database" / "cdt" / "debt-instruments" / "latest.parquet"
+    )
     assert result.itemized_rows == 1
     assert result.classified_rows == 1
     assert result.extracted_rows == 1
     assert result.matched_rows == 1
     assert written_matches["edge_type"].to_list() == ["member"]
     assert written_instruments["debt_instrument_id"].to_list() == ["m-1"]
+    assert final_items["item_id"].to_list() == ["000114036126006577-8-01"]
+    assert final_mentions["debt_instrument_mention_id"].to_list() == ["m-1"]
+    assert final_edges["debt_instrument_mention_id"].to_list() == ["m-1"]
+    assert final_instruments["debt_instrument_id"].to_list() == ["m-1"]

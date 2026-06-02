@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -15,6 +16,7 @@ from cdt.extractor import (
     DEFAULT_REASONING_EFFORT,
     extract_pending_items,
     extracted_tables_path,
+    mentions_root,
 )
 from cdt.ingest import (
     DEFAULT_AWS_PROFILE,
@@ -26,15 +28,34 @@ from cdt.ingest import (
     run_ingest_pipeline,
 )
 from cdt.ingest import DEFAULT_BATCH_SIZE as DEFAULT_INGEST_BATCH_SIZE
-from cdt.itemizer import POTENTIALLY_RELEVANT_ITEM_NUMBERS, itemize_pending_documents
+from cdt.itemizer import (
+    POTENTIALLY_RELEVANT_ITEM_NUMBERS,
+    itemize_pending_documents,
+    items_root,
+)
 from cdt.matcher import (
     DEFAULT_AMBIGUITY_MARGIN,
     DEFAULT_MEMBERSHIP_THRESHOLD,
     DEFAULT_RELATED_THRESHOLD,
+    debt_instruments_root,
     match_pending_mentions,
+    mention_cluster_edges_root,
 )
 from cdt.shared import get_logger
-from cdt.storage import ArtifactPath, read_text_artifact
+from cdt.storage import (
+    ArtifactPath,
+    join_artifact_path,
+    read_dataset,
+    read_text_artifact,
+    write_table,
+)
+
+FINAL_OUTPUT_TABLES: dict[str, Callable[[str | Path | None], str]] = {
+    "items": items_root,
+    "debt-instruments": debt_instruments_root,
+    "debt-instrument-mentions": mentions_root,
+    "mention-cluster-edges": mention_cluster_edges_root,
+}
 
 ALL_TIME_START_DATE = date(1994, 1, 1)
 DEFAULT_STAGE_BATCH_SIZE = 100
@@ -53,6 +74,7 @@ class PipelineConfig:
     end_date: date | None = None
     data_dir: Path | None = None
     artifact_root: ArtifactPath | None = None
+    final_database_root: ArtifactPath | None = None
     force: bool = False
     download: bool = False
     failure_file: ArtifactPath | None = None
@@ -266,6 +288,20 @@ class PipelineOrchestrator:
                 data_dir=self.config.data_dir,
             ),
         )
+        self._log_stage_start(
+            "finalize",
+            output_root=self.config.final_database_root,
+        )
+        final_outputs = write_final_output_tables(
+            artifact_root=resolved_artifact_root,
+            final_database_root=self.config.final_database_root,
+            data_dir=self.config.data_dir,
+        )
+        self._log_stage_complete(
+            "finalize",
+            tables=len(final_outputs),
+            output_root=self.config.final_database_root,
+        )
         elapsed = datetime.now() - start_time
         self._log_banner(f"Pipeline completed successfully in {elapsed}")
         return result
@@ -304,3 +340,23 @@ def resolve_mode_dates(
         msg = "--end-date is required when --start-date is provided"
         raise ValueError(msg)
     return start_date, end_date
+
+
+def write_final_output_tables(
+    *,
+    artifact_root: ArtifactPath,
+    final_database_root: ArtifactPath | None,
+    data_dir: Path | None = None,
+) -> dict[str, str]:
+    """Materialize final latest parquet snapshots for downstream database loads."""
+    if final_database_root is None:
+        return {}
+
+    written_paths: dict[str, str] = {}
+    for table_name, dataset_root_fn in FINAL_OUTPUT_TABLES.items():
+        table = read_dataset(dataset_root_fn(artifact_root, data_dir=data_dir))
+        output_path = join_artifact_path(
+            final_database_root, table_name, "latest.parquet"
+        )
+        written_paths[table_name] = write_table(output_path, table)
+    return written_paths

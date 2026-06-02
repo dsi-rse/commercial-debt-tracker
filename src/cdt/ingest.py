@@ -27,7 +27,7 @@ from cdt.storage import (
 
 LOGGER = get_logger(__name__)
 DOCUMENT_COLUMNS = ["accession_number", "cik", "url", "text", "date", "resource_uri"]
-DEFAULT_BUCKET = "idi-dev-processor-s3"
+DEFAULT_BUCKET = "idi-dev-ftm2j-shared-processor-storage"
 DEFAULT_AWS_PROFILE = ""
 DEFAULT_S3_PREFIX = "sec"
 CDT_FORM_TYPE = "8-K"
@@ -37,7 +37,7 @@ DEFAULT_BATCH_SIZE = 100
 PROGRESS_DAY_INTERVAL = 30
 MIN_MANIFEST_KEY_PARTS = 5
 MANIFEST_KEY_CIK_INDEX = 3
-DEFAULT_OUTPUT_PREFIX = "cdt/dev"
+DEFAULT_OUTPUT_PREFIX = "processors/cdt"
 DOCUMENT_DATASET_NAME = "documents"
 RUN_DATASET_NAME = "runs"
 FAILURE_DATASET_NAME = "failures"

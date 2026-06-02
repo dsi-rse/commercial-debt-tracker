@@ -69,6 +69,14 @@ def add_artifact_root_argument(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Artifact root as a local path or s3:// URI. Defaults to DATA_DIR.",
     )
+    parser.add_argument(
+        "--final-database-root",
+        default=None,
+        help=(
+            "Optional final table root as a local path or s3:// URI. "
+            "When set, writes latest.parquet files under {root}/{table}/."
+        ),
+    )
 
 
 def add_logging_arguments(parser: argparse.ArgumentParser, *, noun: str) -> None:
@@ -373,6 +381,7 @@ def run_pipeline_command(args: argparse.Namespace) -> int:
                 start_date=start_date,
                 end_date=end_date,
                 artifact_root=args.artifact_root,
+                final_database_root=args.final_database_root,
                 force=args.force,
                 download=args.download,
                 failure_file=args.failure_file,
