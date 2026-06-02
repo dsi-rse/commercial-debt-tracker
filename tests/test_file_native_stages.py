@@ -20,6 +20,7 @@ from cdt.matcher import (
     match_pending_mentions,
     mention_matches_root,
 )
+from cdt.matcher.core import match_tables
 from cdt.storage import artifact_exists, read_dataset, write_partition_table
 
 
@@ -117,6 +118,41 @@ This is the extracted event text.
             )
         )
     return paths
+
+
+def build_mention_row(
+    *,
+    mention_id: str,
+    item_id: str,
+    accession_number: str,
+    cik: str,
+    date: str,
+    name: str,
+    start_date: str,
+    amount: str,
+    lenders_json: str = "[]",
+) -> dict[str, object]:
+    """Return one canonical mention row for matcher tests."""
+    return {
+        "debt_instrument_mention_id": mention_id,
+        "item_id": item_id,
+        "accession_number": accession_number,
+        "cik": cik,
+        "date": date,
+        "raw_id": "i-1",
+        "name": name,
+        "start_date": start_date,
+        "end_date": None,
+        "amount": amount,
+        "amendment_of": None,
+        "split_of": None,
+        "lenders_json": lenders_json,
+        "other_interested_parties_json": "[]",
+        "name_json": "{}",
+        "start_date_json": "{}",
+        "end_date_json": "{}",
+        "amount_json": "{}",
+    }
 
 
 def test_itemize_pending_documents_writes_canonical_partitions(tmp_path: Path) -> None:
@@ -420,26 +456,17 @@ def test_match_pending_mentions_writes_match_datasets(tmp_path: Path) -> None:
     """Matcher should consume mention dataset and write match outputs."""
     mention_rows = pd.DataFrame(
         [
-            {
-                "debt_instrument_mention_id": "m-1",
-                "item_id": "item-1",
-                "accession_number": "0001",
-                "cik": "320193",
-                "date": "2024-01-02",
-                "raw_id": "i-1",
-                "name": "Term Loan",
-                "start_date": "2024-01-01",
-                "end_date": None,
-                "amount": "$100 million",
-                "amendment_of": None,
-                "split_of": None,
-                "lenders_json": '[{"mentions": [{"text": "Acme Bank"}], "tag_ids": ["tag-l-1"]}]',
-                "other_interested_parties_json": "[]",
-                "name_json": "{}",
-                "start_date_json": "{}",
-                "end_date_json": "{}",
-                "amount_json": "{}",
-            }
+            build_mention_row(
+                mention_id="m-1",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2024-01-02",
+                name="Term Loan",
+                start_date="2024-01-01",
+                amount="$100 million",
+                lenders_json='[{"mentions": [{"text": "Acme Bank"}], "tag_ids": ["tag-l-1"]}]',
+            )
         ]
     )
     write_partition_table(
@@ -453,7 +480,7 @@ def test_match_pending_mentions_writes_match_datasets(tmp_path: Path) -> None:
     written_matches = read_dataset(mention_matches_root(tmp_path))
     written_instruments = read_dataset(debt_instruments_root(tmp_path))
     assert len(tables["debt_instrument_mentions"]) == 1
-    assert written_matches["matcher_status"].to_list() == ["singleton"]
+    assert written_matches["edge_type"].to_list() == ["member"]
     assert written_instruments["debt_instrument_id"].to_list() == ["m-1"]
 
 
@@ -461,46 +488,28 @@ def test_match_pending_mentions_drains_all_shards(tmp_path: Path) -> None:
     """Matcher should process all shard groups across chunks."""
     mention_rows = pd.DataFrame(
         [
-            {
-                "debt_instrument_mention_id": "m-1",
-                "item_id": "item-1",
-                "accession_number": "0001",
-                "cik": "320193",
-                "date": "2024-01-02",
-                "raw_id": "i-1",
-                "name": "Term Loan",
-                "start_date": "2024-01-01",
-                "end_date": None,
-                "amount": "$100 million",
-                "amendment_of": None,
-                "split_of": None,
-                "lenders_json": '[{"mentions": [{"text": "Acme Bank"}], "tag_ids": ["tag-l-1"]}]',
-                "other_interested_parties_json": "[]",
-                "name_json": "{}",
-                "start_date_json": "{}",
-                "end_date_json": "{}",
-                "amount_json": "{}",
-            },
-            {
-                "debt_instrument_mention_id": "m-2",
-                "item_id": "item-2",
-                "accession_number": "0002",
-                "cik": "789019",
-                "date": "2024-01-03",
-                "raw_id": "i-1",
-                "name": "Revolving Credit Facility",
-                "start_date": "2024-01-01",
-                "end_date": None,
-                "amount": "$250 million",
-                "amendment_of": None,
-                "split_of": None,
-                "lenders_json": '[{"mentions": [{"text": "Contoso Bank"}], "tag_ids": ["tag-l-2"]}]',
-                "other_interested_parties_json": "[]",
-                "name_json": "{}",
-                "start_date_json": "{}",
-                "end_date_json": "{}",
-                "amount_json": "{}",
-            },
+            build_mention_row(
+                mention_id="m-1",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2024-01-02",
+                name="Term Loan",
+                start_date="2024-01-01",
+                amount="$100 million",
+                lenders_json='[{"mentions": [{"text": "Acme Bank"}], "tag_ids": ["tag-l-1"]}]',
+            ),
+            build_mention_row(
+                mention_id="m-2",
+                item_id="item-2",
+                accession_number="0002",
+                cik="789019",
+                date="2024-01-03",
+                name="Revolving Credit Facility",
+                start_date="2024-01-01",
+                amount="$250 million",
+                lenders_json='[{"mentions": [{"text": "Contoso Bank"}], "tag_ids": ["tag-l-2"]}]',
+            ),
         ]
     )
     write_partition_table(
@@ -527,3 +536,131 @@ def test_match_pending_mentions_drains_all_shards(tmp_path: Path) -> None:
         "m-1",
         "m-2",
     ]
+
+
+def test_match_pending_mentions_force_rebuilds_existing_memberships(
+    tmp_path: Path,
+) -> None:
+    """Force reruns should discard stale member assignments for the shard."""
+    mention_rows = pd.DataFrame(
+        [
+            build_mention_row(
+                mention_id="m-1",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2024-01-01",
+                name="Alpha Loan",
+                start_date="2024-01-01",
+                amount="$100 million",
+            ),
+            build_mention_row(
+                mention_id="m-2",
+                item_id="item-2",
+                accession_number="0002",
+                cik="320193",
+                date="2024-01-02",
+                name="Beta Facility",
+                start_date="2024-01-01",
+                amount="$100 million",
+            ),
+        ]
+    )
+    write_partition_table(
+        tmp_path / "mentions",
+        partition={"date": "2024-01-01", "shard": "0001"},
+        table=mention_rows.iloc[[0]],
+    )
+    write_partition_table(
+        tmp_path / "mentions",
+        partition={"date": "2024-01-02", "shard": "0001"},
+        table=mention_rows.iloc[[1]],
+    )
+
+    first = match_pending_mentions(
+        artifact_root=tmp_path,
+        batch_size=5,
+        strong_match_threshold=0.75,
+        loose_match_threshold=0.75,
+    )
+    assert {
+        row["debt_instrument_mention_id"]: row["debt_instrument_id"]
+        for row in first["debt_instrument_mentions"]
+        .query("edge_type == 'member'")
+        .to_dict("records")
+    } == {"m-1": "m-1", "m-2": "m-1"}
+
+    second = match_pending_mentions(
+        artifact_root=tmp_path,
+        batch_size=5,
+        force=True,
+        strong_match_threshold=0.90,
+        loose_match_threshold=0.75,
+    )
+
+    written_matches = read_dataset(mention_matches_root(tmp_path)).sort_values(
+        ["debt_instrument_mention_id", "edge_type", "debt_instrument_id"]
+    )
+    written_instruments = read_dataset(debt_instruments_root(tmp_path)).sort_values(
+        "debt_instrument_id"
+    )
+    assert {
+        row["debt_instrument_mention_id"]: row["debt_instrument_id"]
+        for row in second["debt_instrument_mentions"]
+        .query("edge_type == 'member'")
+        .to_dict("records")
+    } == {"m-1": "m-1", "m-2": "m-2"}
+    assert written_matches["edge_type"].to_list() == ["member", "member", "related"]
+    assert written_matches["debt_instrument_id"].to_list() == ["m-1", "m-2", "m-1"]
+    assert written_instruments["debt_instrument_id"].to_list() == ["m-1", "m-2"]
+
+
+def test_match_tables_supports_incremental_batches_against_existing_clusters() -> None:
+    """Delta batches should match against existing clusters without full history."""
+    existing_mentions = pd.DataFrame(
+        [
+            build_mention_row(
+                mention_id="m-1",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2024-01-01",
+                name="Alpha Loan",
+                start_date="2024-01-01",
+                amount="$100 million",
+                lenders_json='[{"mentions": [{"text": "Acme Bank"}]}]',
+            )
+        ]
+    )
+    existing_tables = match_tables(existing_mentions)
+
+    new_mentions = pd.DataFrame(
+        [
+            build_mention_row(
+                mention_id="m-2",
+                item_id="item-2",
+                accession_number="0002",
+                cik="320193",
+                date="2024-01-02",
+                name="Alpha Loan",
+                start_date="2024-01-01",
+                amount="$100 million",
+                lenders_json='[{"mentions": [{"text": "Acme Bank"}]}]',
+            )
+        ]
+    )
+    tables = match_tables(
+        new_mentions,
+        existing_edges=existing_tables["debt_instrument_mentions"],
+        existing_instruments=existing_tables["debt_instrument"],
+        strong_match_threshold=0.90,
+        loose_match_threshold=0.75,
+    )
+
+    member_edges = tables["debt_instrument_mentions"].query("edge_type == 'member'")
+    assert {
+        row["debt_instrument_mention_id"]: row["debt_instrument_id"]
+        for row in member_edges.to_dict("records")
+    } == {"m-1": "m-1", "m-2": "m-1"}
+    assert tables["debt_instrument"]["debt_instrument_id"].to_list() == ["m-1"]
+    assert tables["debt_instrument"]["name"].to_list() == ["Alpha Loan"]

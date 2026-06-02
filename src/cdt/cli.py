@@ -39,9 +39,12 @@ from cdt.itemizer import (
     items_root,
 )
 from cdt.matcher import (
+    DEFAULT_AMBIGUITY_MARGIN,
+    DEFAULT_MEMBERSHIP_THRESHOLD,
+    DEFAULT_RELATED_THRESHOLD,
     debt_instruments_root,
     match_pending_mentions,
-    mention_matches_root,
+    mention_cluster_edges_root,
 )
 from cdt.pipeline import (
     ALL_TIME_START_DATE as PIPELINE_ALL_TIME_START_DATE,
@@ -190,6 +193,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
     )
     match_parser.add_argument("--force", action="store_true")
+    match_parser.add_argument(
+        "--strong-match-threshold",
+        type=float,
+        default=DEFAULT_MEMBERSHIP_THRESHOLD,
+    )
+    match_parser.add_argument(
+        "--loose-match-threshold",
+        type=float,
+        default=DEFAULT_RELATED_THRESHOLD,
+    )
+    match_parser.add_argument(
+        "--ambiguity-margin",
+        type=float,
+        default=DEFAULT_AMBIGUITY_MARGIN,
+    )
     add_logging_arguments(match_parser, noun="matching")
     match_parser.set_defaults(func=run_matcher)
 
@@ -231,8 +249,15 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline_parser.add_argument(
         "--max-attempts", type=positive_int, default=DEFAULT_EXTRACTOR_MAX_ATTEMPTS
     )
-    pipeline_parser.add_argument("--strong-match-threshold", type=float, default=0.90)
-    pipeline_parser.add_argument("--loose-match-threshold", type=float, default=0.75)
+    pipeline_parser.add_argument(
+        "--strong-match-threshold", type=float, default=DEFAULT_MEMBERSHIP_THRESHOLD
+    )
+    pipeline_parser.add_argument(
+        "--loose-match-threshold", type=float, default=DEFAULT_RELATED_THRESHOLD
+    )
+    pipeline_parser.add_argument(
+        "--ambiguity-margin", type=float, default=DEFAULT_AMBIGUITY_MARGIN
+    )
     add_logging_arguments(pipeline_parser, noun="pipeline")
     pipeline_subparsers = pipeline_parser.add_subparsers(
         dest="pipeline_mode", required=True
@@ -365,6 +390,7 @@ def run_pipeline_command(args: argparse.Namespace) -> int:
                 extractor_max_attempts=args.max_attempts,
                 strong_match_threshold=args.strong_match_threshold,
                 loose_match_threshold=args.loose_match_threshold,
+                ambiguity_margin=args.ambiguity_margin,
             )
         )
     except ValueError as exc:
@@ -488,25 +514,30 @@ def run_matcher(args: argparse.Namespace) -> int:
     artifact_root = args.artifact_root or default_output_root()
     try:
         logger.info(
-            "Starting matcher: batch_size=%s force=%s input=%s mention_matches=%s debt_instruments=%s",
+            "Starting matcher: batch_size=%s force=%s input=%s mention_cluster_edges=%s debt_instruments=%s",
             args.batch_size,
             args.force,
             mentions_root(artifact_root),
-            mention_matches_root(artifact_root),
+            mention_cluster_edges_root(artifact_root),
             debt_instruments_root(artifact_root),
         )
         tables = match_pending_mentions(
             artifact_root=artifact_root,
             batch_size=args.batch_size,
             force=args.force,
+            strong_match_threshold=args.strong_match_threshold,
+            loose_match_threshold=args.loose_match_threshold,
+            ambiguity_margin=args.ambiguity_margin,
         )
     except Exception:
         logger.exception("Matcher failed")
         return 1
     print(
-        f"Matched {len(tables['debt_instrument_mentions'])} debt instrument mention rows."
+        f"Matched {len(tables['debt_instrument_mentions'])} mention-cluster edge rows."
     )
-    print(f"Wrote mention matches to {mention_matches_root(artifact_root)}.")
+    print(
+        f"Wrote mention-cluster edges to {mention_cluster_edges_root(artifact_root)}."
+    )
     print(f"Wrote debt instruments to {debt_instruments_root(artifact_root)}.")
     return 0
 

@@ -28,11 +28,11 @@ from cdt.ingest import (
 from cdt.ingest import DEFAULT_BATCH_SIZE as DEFAULT_INGEST_BATCH_SIZE
 from cdt.itemizer import POTENTIALLY_RELEVANT_ITEM_NUMBERS, itemize_pending_documents
 from cdt.matcher import (
-    DEFAULT_LOOSE_MATCH_THRESHOLD,
-    DEFAULT_STRONG_MATCH_THRESHOLD,
+    DEFAULT_AMBIGUITY_MARGIN,
+    DEFAULT_MEMBERSHIP_THRESHOLD,
+    DEFAULT_RELATED_THRESHOLD,
     match_pending_mentions,
 )
-from cdt.r2_publisher import publish_config_from_env, publish_dashboard_snapshot
 from cdt.shared import get_logger
 from cdt.storage import ArtifactPath, read_text_artifact
 
@@ -68,8 +68,9 @@ class PipelineConfig:
     extractor_model: str = DEFAULT_MODEL
     extractor_reasoning_effort: str = DEFAULT_REASONING_EFFORT
     extractor_max_attempts: int = DEFAULT_MAX_ATTEMPTS
-    strong_match_threshold: float = DEFAULT_STRONG_MATCH_THRESHOLD
-    loose_match_threshold: float = DEFAULT_LOOSE_MATCH_THRESHOLD
+    strong_match_threshold: float = DEFAULT_MEMBERSHIP_THRESHOLD
+    loose_match_threshold: float = DEFAULT_RELATED_THRESHOLD
+    ambiguity_margin: float = DEFAULT_AMBIGUITY_MARGIN
 
 
 @dataclass(frozen=True)
@@ -88,7 +89,6 @@ class PipelineRunResult:
     classifier_model_dir: Path
     artifact_root: str
     extractor_run_path: str
-    r2_published: bool
 
 
 class PipelineOrchestrator:
@@ -234,21 +234,19 @@ class PipelineOrchestrator:
             force=self.config.force,
             strong_match_threshold=self.config.strong_match_threshold,
             loose_match_threshold=self.config.loose_match_threshold,
+            ambiguity_margin=self.config.ambiguity_margin,
         )
         self._log_stage_complete(
             "match",
-            mention_rows=len(matched["debt_instrument_mentions"]),
+            edge_rows=len(matched["debt_instrument_mentions"]),
             debt_instruments=len(matched["debt_instrument"]),
         )
-        publish_config = publish_config_from_env()
-        if publish_config is not None:
-            self._log_stage_start("publish-r2")
-            publish_dashboard_snapshot(
-                artifact_root=resolved_artifact_root,
-                data_dir=self.config.data_dir,
-                config=publish_config,
-            )
-            self._log_stage_complete("publish-r2")
+        member_edge_rows = matched["debt_instrument_mentions"]
+        matched_mentions = (
+            int((member_edge_rows["edge_type"] == "member").sum())
+            if "edge_type" in member_edge_rows
+            else len(member_edge_rows)
+        )
 
         result = PipelineRunResult(
             mode=self.config.mode,
@@ -258,7 +256,7 @@ class PipelineOrchestrator:
             itemized_rows=len(items),
             classified_rows=len(classified),
             extracted_rows=len(extracted),
-            matched_rows=len(matched["debt_instrument_mentions"]),
+            matched_rows=matched_mentions,
             debt_instrument_rows=len(matched["debt_instrument"]),
             classifier_model_dir=self.config.classifier_model_dir
             or default_model_dir(self.config.data_dir),
@@ -267,7 +265,6 @@ class PipelineOrchestrator:
                 resolved_artifact_root,
                 data_dir=self.config.data_dir,
             ),
-            r2_published=publish_config is not None,
         )
         elapsed = datetime.now() - start_time
         self._log_banner(f"Pipeline completed successfully in {elapsed}")
