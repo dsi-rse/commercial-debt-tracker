@@ -89,6 +89,7 @@ Required `idi:` Pulumi config:
 
 Common optional config:
 
+- `output_bucket_name`
 - `artifact_prefix`
 - `final_database_prefix`
 - `app_name`
@@ -103,21 +104,29 @@ Common optional config:
 - `r2_access_key_id` as a secret
 - `r2_secret_access_key` as a secret
 
+The ingest source bucket passed to the container is:
+
+```text
+<bucket_name>
+```
+
 The artifact root passed to the container is derived from:
 
 ```text
-s3://<bucket_name>/<artifact_prefix>
+s3://<output_bucket_name or bucket_name>/<artifact_prefix>
 ```
 
 The final database root passed to the container is derived from:
 
 ```text
-s3://<bucket_name>/<final_database_prefix>
+s3://<output_bucket_name or bucket_name>/<final_database_prefix>
 ```
 
 If `artifact_prefix` is omitted, Pulumi defaults it to `processors/cdt`.
 
 If `final_database_prefix` is omitted, Pulumi defaults it to `database/cdt`.
+
+If `output_bucket_name` is omitted, Pulumi reuses `bucket_name` for outputs.
 
 ## Daily Operations
 

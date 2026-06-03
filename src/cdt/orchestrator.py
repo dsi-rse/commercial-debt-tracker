@@ -27,7 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--bucket",
-        default=os.environ.get("BUCKET_NAME", "idi-dev-ftm2j-shared-processor-storage"),
+        default=os.environ.get("BUCKET_NAME", "idi-dev-processor-s3"),
     )
     parser.add_argument("--aws-profile", default=os.environ.get("AWS_PROFILE", ""))
     parser.add_argument("--force", action="store_true")

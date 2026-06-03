@@ -10,6 +10,7 @@ stack_name = pulumi.get_stack()
 app_name = config.get("app_name") or "cdt"
 name_prefix = f"{project_name}-{stack_name}-{app_name}"
 bucket_name = config.require("bucket_name")
+output_bucket_name = config.get("output_bucket_name") or bucket_name
 artifact_prefix = config.get("artifact_prefix") or "processors/cdt"
 final_database_prefix = config.get("final_database_prefix") or "database/cdt"
 default_cik_file = config.require("default_cik_file")

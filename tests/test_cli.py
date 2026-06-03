@@ -122,6 +122,7 @@ def test_ingest_cli_historical_defaults_to_all_time_date_range(
         calls.append(
             {
                 "mode": config.mode,
+                "bucket": config.bucket,
                 "start_date": config.start_date,
                 "end_date": config.end_date,
                 "download": config.download,
@@ -152,6 +153,7 @@ def test_ingest_cli_historical_defaults_to_all_time_date_range(
     assert calls == [
         {
             "mode": "historical",
+            "bucket": cli.DEFAULT_BUCKET,
             "start_date": cli.ALL_TIME_START_DATE,
             "end_date": date.today(),
             "download": False,
@@ -344,6 +346,56 @@ def test_pipeline_cli_builds_pipeline_config(
             "model_dir": tmp_path / "model",
         }
     ]
+
+
+def test_pipeline_cli_defaults_to_source_bucket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pipeline defaults should keep the scraper source bucket."""
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("320193\n", encoding="utf-8")
+    calls: list[str] = []
+
+    def fake_run_pipeline(config: cli.PipelineConfig) -> PipelineRunResult:
+        calls.append(config.bucket)
+        ingest_result = IngestRunResult(
+            mode=config.mode,
+            start_date=config.start_date or date(2024, 1, 1),
+            end_date=config.end_date or date(2024, 1, 31),
+            ciks_count=1,
+            candidates_seen=0,
+            skipped_existing=0,
+            downloaded=0,
+            failures=0,
+            total_rows=0,
+            output_root=str(tmp_path),
+            documents_root=str(tmp_path / "documents"),
+            document_partitions=(),
+            failure_file=str(tmp_path / "failures" / "ingest_failures.json"),
+            run_manifest=str(tmp_path / "runs" / "ingest" / "run_id=1.json"),
+        )
+        return PipelineRunResult(
+            mode=config.mode,
+            start_date=ingest_result.start_date,
+            end_date=ingest_result.end_date,
+            ingest=ingest_result,
+            itemized_rows=0,
+            classified_rows=0,
+            extracted_rows=0,
+            matched_rows=0,
+            debt_instrument_rows=0,
+            classifier_model_dir=tmp_path / "model",
+            artifact_root=str(tmp_path),
+            extractor_run_path=str(tmp_path / "extractor_runs"),
+        )
+
+    monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
+
+    status = cli.main(["pipeline", "--quiet", "historical", str(cik_file)])
+
+    assert status == 0
+    assert calls == [cli.DEFAULT_BUCKET]
 
 
 def test_pipeline_cli_daily_rejects_partial_date_range(tmp_path: Path) -> None:

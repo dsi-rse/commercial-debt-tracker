@@ -9,8 +9,8 @@ import pulumi
 from . import config, ecr, iam, logs, secrets
 
 CONTAINER_NAME = "cdt-orchestrator"
-artifact_root = f"s3://{config.bucket_name}/{config.artifact_prefix}"
-final_database_root = f"s3://{config.bucket_name}/{config.final_database_prefix}"
+artifact_root = f"s3://{config.output_bucket_name}/{config.artifact_prefix}"
+final_database_root = f"s3://{config.output_bucket_name}/{config.final_database_prefix}"
 
 cluster = aws.ecs.Cluster(
     "cdt-ecs-cluster",

@@ -135,20 +135,21 @@ task_role = aws.iam.Role(
     tags=config.tags(),
 )
 
-bucket = aws.s3.get_bucket_output(bucket=config.bucket_name)
+source_bucket = aws.s3.get_bucket_output(bucket=config.bucket_name)
+output_bucket = aws.s3.get_bucket_output(bucket=config.output_bucket_name)
 
 aws.iam.RolePolicy(
     "cdt-ecs-task-s3-policy",
     role=task_role.id,
-    policy=bucket.arn.apply(
-        lambda arn: json.dumps(
+    policy=pulumi.Output.all(source_bucket.arn, output_bucket.arn).apply(
+        lambda arns: json.dumps(
             {
                 "Version": "2012-10-17",
                 "Statement": [
                     {
                         "Effect": "Allow",
                         "Action": ["s3:ListBucket"],
-                        "Resource": arn,
+                        "Resource": sorted(set(arns)),
                     },
                     {
                         "Effect": "Allow",
@@ -162,7 +163,7 @@ aws.iam.RolePolicy(
                             "s3:CompleteMultipartUpload",
                             "s3:ListMultipartUploadParts",
                         ],
-                        "Resource": f"{arn}/*",
+                        "Resource": [f"{arn}/*" for arn in sorted(set(arns))],
                     },
                 ],
             }
