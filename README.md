@@ -19,7 +19,7 @@ Commercial Debt Tracker (CDT) processes SEC 8-K filings to build a file-native h
 
 ## Runtime Model
 
-CDT is intentionally file-native. Canonical state lives under one artifact root as Parquet partitions plus JSON and JSONL manifests, usually in S3 for deployed runs and under `data/` for local runs.
+CDT is intentionally file-native. Canonical state lives under one artifact root as Parquet partitions plus JSON and JSONL manifests, usually in S3 for deployed runs and under `data/` for local runs. The pipeline can also write optional final snapshot parquet files under a separate final database root.
 
 This avoids a mutable database dependency and keeps reruns deterministic:
 
@@ -27,7 +27,7 @@ This avoids a mutable database dependency and keeps reruns deterministic:
 - CIK-sharded matcher outputs write `mention-matches` and `debt-instruments`
 - stage manifests and extractor audit logs are written alongside those datasets
 
-See [docs/schema.md](docs/schema.md) for the concrete layout.
+See [docs/schema.md](docs/schema.md) for the concrete layout, including the optional `latest.parquet` final snapshots.
 
 ## Deployment Summary
 

@@ -23,6 +23,7 @@ The task definition injects these environment variables directly:
 - `AWS_REGION`
 - `BUCKET_NAME`
 - `ARTIFACT_ROOT`
+- `FINAL_DATABASE_ROOT`
 - `CDT_DEFAULT_CIK_FILE`
 - `PYTHONUNBUFFERED`
 
@@ -89,6 +90,7 @@ Required `idi:` Pulumi config:
 Common optional config:
 
 - `artifact_prefix`
+- `final_database_prefix`
 - `app_name`
 - `cpu`
 - `memory`
@@ -107,7 +109,15 @@ The artifact root passed to the container is derived from:
 s3://<bucket_name>/<artifact_prefix>
 ```
 
-If `artifact_prefix` is omitted, Pulumi defaults it to `cdt/<stack>`.
+The final database root passed to the container is derived from:
+
+```text
+s3://<bucket_name>/<final_database_prefix>
+```
+
+If `artifact_prefix` is omitted, Pulumi defaults it to `processors/cdt`.
+
+If `final_database_prefix` is omitted, Pulumi defaults it to `database/cdt`.
 
 ## Daily Operations
 
@@ -117,7 +127,15 @@ Normal daily processing is:
 2. EventBridge Scheduler runs one ECS task per day
 3. the task executes `cdt-orchestrator daily`
 4. outputs land under the configured artifact root in S3
-5. if R2 credentials are present, dashboard snapshot JSON is published after matching
+5. if `FINAL_DATABASE_ROOT` is set, four final parquet snapshots are written:
+   `items/latest.parquet`, `debt-instruments/latest.parquet`,
+   `debt-instrument-mentions/latest.parquet`, and
+   `mention-cluster-edges/latest.parquet`
+6. if R2 credentials are present, dashboard snapshot JSON is published after matching
+
+Local note:
+
+- local runs do not write final snapshots unless you pass `--final-database-root` or set `FINAL_DATABASE_ROOT`
 
 The scheduler state is controlled by the Pulumi `idi:schedule_enabled` setting.
 
