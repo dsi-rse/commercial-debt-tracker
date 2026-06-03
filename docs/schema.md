@@ -2,6 +2,8 @@
 
 CDT writes canonical artifacts under one artifact root. That root can be a local directory or an `s3://` prefix.
 
+The pipeline can also write optional final snapshot parquet files under a separate final database root. Those snapshots are flattened table-wide exports intended for downstream database loading and are not the canonical working state for the pipeline.
+
 ## Root Layout
 
 ```text
@@ -10,11 +12,21 @@ CDT writes canonical artifacts under one artifact root. That root can be a local
   items/
   classifications/
   mentions/
-  mention-matches/
+  mention-cluster-edges/
   debt-instruments/
   extractor-runs/
   runs/
   failures/
+```
+
+Optional final snapshot layout:
+
+```text
+<final-database-root>/
+  items/latest.parquet
+  debt-instruments/latest.parquet
+  debt-instrument-mentions/latest.parquet
+  mention-cluster-edges/latest.parquet
 ```
 
 ## Partitioning Rules
@@ -34,7 +46,7 @@ Canonical path shape:
 
 CIK-sharded datasets:
 
-- `mention-matches`
+- `mention-cluster-edges`
 - `debt-instruments`
 
 Canonical path shape:
@@ -82,7 +94,7 @@ Practical implication:
 
 ### CIK-Sharded Stages
 
-`mention-matches` and `debt-instruments` use this path shape:
+`mention-cluster-edges` and `debt-instruments` use this path shape:
 
 ```text
 <artifact-root>/<dataset>/cik_shard=NNNN/part-0000.parquet
@@ -93,7 +105,7 @@ How rows land there:
 - the matcher reads all `mentions`
 - each mention is assigned to `shard_for_cik(cik)`
 - all mentions for companies whose CIK hashes to the same shard are processed together
-- the matcher writes one `mention-matches` parquet and one `debt-instruments` parquet for that `cik_shard`
+- the matcher writes one `mention-cluster-edges` parquet and one `debt-instruments` parquet for that `cik_shard`
 
 Practical implication:
 
@@ -190,13 +202,17 @@ Columns:
 
 Primary key: `debt_instrument_mention_id`
 
-### `mention-matches`
+### `mention-cluster-edges`
 
 Columns:
 
 - `debt_instrument_mention_id`: Mention-level identifier from the `mentions` dataset.
 - `debt_instrument_id`: Canonical debt instrument entity the matcher assigned the mention to.
-- `matcher_status`: Match outcome for the mention, currently `singleton`, `matched`, or `ambiguous`.
+- `edge_type`: Relationship type, currently `member`, `related`, or `ambiguous_candidate`.
+- `match_score`: Numeric matcher confidence score for the candidate relationship.
+- `candidate_rank`: Rank of this candidate among evaluated instrument candidates for the mention.
+- `match_via`: Short explanation of which feature family drove the match decision.
+- `evaluated_run_id`: Matcher run identifier that evaluated the relationship.
 
 ### `debt-instruments`
 
@@ -258,6 +274,8 @@ The ingest stage maintains a permanent failure registry at:
 ## Operational Semantics
 
 - canonical truth is the partition data, not the run manifest
+- final snapshot parquet files are derived convenience outputs, not the canonical working state
+- local runs only write final snapshots when `--final-database-root` or `FINAL_DATABASE_ROOT` is set
 - stage completion is inferred from output partition presence plus stage completion registries for zero-row outputs
 - `force=false` skips already-written partitions
 - local runs and deployed runs use the same layout and code paths

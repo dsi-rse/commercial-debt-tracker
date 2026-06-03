@@ -19,6 +19,15 @@ The pipeline runs in five stages:
 
 The stage-oriented CLI is `cdt`. The deployment-oriented entrypoint is `cdt-orchestrator`, which simply resolves defaults and runs the same pipeline code used locally.
 
+After matching, the pipeline can optionally materialize four final snapshot tables for downstream consumers:
+
+- `items/latest.parquet`
+- `debt-instruments/latest.parquet`
+- `debt-instrument-mentions/latest.parquet`
+- `mention-cluster-edges/latest.parquet`
+
+Those files are written only when a final database root is configured.
+
 ## Why CDT Is File-Native
 
 CDT stores canonical state as Parquet, JSON, and JSONL artifacts under one root instead of using SQLite or another mutable database.
@@ -31,6 +40,8 @@ That choice is visible throughout the code:
 - the same pipeline can target either local paths or `s3://` URIs
 
 This makes the system easier to rerun, inspect, diff, and backfill in batch environments like ECS.
+
+The final snapshot parquet files are intentionally not used as pipeline inputs. They are convenience exports derived from the canonical partition datasets.
 
 ## Why The Pipeline Is Split This Way
 

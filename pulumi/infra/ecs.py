@@ -14,7 +14,7 @@ final_database_root = f"s3://{config.bucket_name}/{config.final_database_prefix}
 
 cluster = aws.ecs.Cluster(
     "cdt-ecs-cluster",
-    name=f"{config.name_prefix}-cluster",
+    name=f"idi-{config.stack_name}-{config.app_name}-cluster",
     settings=[aws.ecs.ClusterSettingArgs(name="containerInsights", value="enabled")],
     tags=config.tags(),
 )
