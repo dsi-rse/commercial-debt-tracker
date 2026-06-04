@@ -20,14 +20,15 @@ endif
 
 # local runtime defaults
 LOCAL_MODE ?= daily
-LOCAL_ARTIFACT_ROOT ?= $(DATA_DIR)/local
+LOCAL_ARTIFACT_ROOT ?= $(DATA_DIR)/commercial-debt-tracker/local
+LOCAL_FINAL_DATABASE_ROOT ?= $(DATA_DIR)/commercial-debt-tracker/database/cdt
 LOCAL_BUCKET_NAME ?= idi-dev-processor-s3
 LOCAL_AWS_PROFILE ?= idi-analysis
 LOCAL_CIK_FILE ?= $(current_abs_path)1000-ciks.txt
 LOCAL_RUN_ARGS ?=
 
 # Build Docker image
-.PHONY: build-only run-interactive run-notebook local-run
+.PHONY: build-only run-interactive run-notebook local-run local-pipeline
 
 # Build Docker image 
 build-only: 
@@ -43,8 +44,13 @@ run-notebooks: build-only
 
 local-run:
 	mkdir -p "$(LOCAL_ARTIFACT_ROOT)"
+	mkdir -p "$(LOCAL_FINAL_DATABASE_ROOT)"
 	ARTIFACT_ROOT="$(LOCAL_ARTIFACT_ROOT)" \
+	FINAL_DATABASE_ROOT="$(LOCAL_FINAL_DATABASE_ROOT)" \
 	BUCKET_NAME="$(LOCAL_BUCKET_NAME)" \
 	AWS_PROFILE="$(LOCAL_AWS_PROFILE)" \
 	CDT_DEFAULT_CIK_FILE="$(LOCAL_CIK_FILE)" \
 	uv run cdt-orchestrator --aws-profile "$(LOCAL_AWS_PROFILE)" $(LOCAL_MODE) $(LOCAL_RUN_ARGS)
+
+local-pipeline:
+	bash scripts/local-pipeline.sh

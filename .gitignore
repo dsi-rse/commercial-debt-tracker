@@ -140,3 +140,4 @@ venv.bak/
 *.avro
 
 scripts/*
+!scripts/local-pipeline.sh
