@@ -14,3 +14,10 @@ Important rules:
 4. The stripped text must match the input exactly.
 5. Do not add attributes or extra commentary.
 6. If you are unsure whether a span should be tagged, leave the text unchanged rather than rewriting it.
+7. Do not tag obvious equity or equity-linked securities as `debt_instrument`. Examples that should usually remain untagged as debt instruments include `Common Stock`, `Class A Common Stock`, `Underlying Shares`, `Additional Shares`, `Partnership Shares`, `Fee Shares`, and `warrants`.
+8. If a sentence mentions both a true debt instrument and equity or warrant consideration, tag only the true debt instrument as `debt_instrument`.
+
+Examples:
+- In `the Company issued convertible debentures and warrants to purchase Class A Common Stock`, tag `convertible debentures` as `debt_instrument`, but do not tag `warrants` or `Class A Common Stock` as `debt_instrument`.
+- In `Era invested in subordinated convertible notes due 2027`, tag `subordinated convertible notes due 2027` as `debt_instrument`.
+- In `the Company will issue Underlying Shares and Additional Shares`, do not tag `Underlying Shares` or `Additional Shares` as `debt_instrument`.

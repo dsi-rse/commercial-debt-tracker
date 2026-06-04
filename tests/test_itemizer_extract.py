@@ -14,6 +14,7 @@ def test_extract_items_from_complete_submission() -> None:
     document = DocumentText(
         accession_number="0001",
         cik="320193",
+        company_name="Example Inc.",
         url="https://sec.example/full.txt",
         date="2024-01-02",
         text="""
@@ -46,6 +47,7 @@ def test_extract_items_marks_unmapped_item_information() -> None:
     document = DocumentText(
         accession_number="0001",
         cik="320193",
+        company_name="Example Inc.",
         url="https://sec.example/full.txt",
         date="2024-01-02",
         text="ITEM INFORMATION: Not A Real Item\nItem 8.01 Other Events",
@@ -62,6 +64,7 @@ def test_extract_items_marks_missing_heading() -> None:
     document = DocumentText(
         accession_number="0001",
         cik="320193",
+        company_name="Example Inc.",
         url="https://sec.example/full.txt",
         date="2024-01-02",
         text="ITEM INFORMATION: Other Events\nNo matching heading here.",

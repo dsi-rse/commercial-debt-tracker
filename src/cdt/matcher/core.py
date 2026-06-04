@@ -65,6 +65,7 @@ DEBT_INSTRUMENT_COLUMNS = [
     "company_name",
     "seed_debt_instrument_mention_id",
     "amendment_of_debt_instrument_id",
+    "retired_of_debt_instrument_id",
     "split_of_debt_instrument_id",
     "name",
     "start_date",
@@ -128,6 +129,7 @@ class PreparedMention:
     end_date: str | None
     amount: str | None
     amendment_of: str | None
+    retired_of: str | None
     split_of: str | None
     lenders_json: str
     other_interested_parties_json: str
@@ -570,6 +572,12 @@ def score_candidates_for_mention(
     for profile in profiles.values():
         if profile.cik != mention.cik:
             continue
+        if mention.amendment_of and mention.amendment_of in profile.member_ids:
+            continue
+        if mention.retired_of and mention.retired_of in profile.member_ids:
+            continue
+        if mention.split_of and mention.split_of in profile.member_ids:
+            continue
         if mention.normalized_amount not in profile.normalized_amounts:
             continue
         if mention.normalized_start_date not in profile.normalized_start_dates:
@@ -780,12 +788,18 @@ def derive_parent_links(
     for debt_instrument_id, member_ids in member_groups.items():
         existing_row = existing_rows.get(debt_instrument_id, {})
         amendment_parents = set()
+        retired_parents = set()
         split_parents = set()
         existing_amendment = coerce_optional_text(
             existing_row.get("amendment_of_debt_instrument_id")
         )
         if existing_amendment:
             amendment_parents.add(existing_amendment)
+        existing_retired = coerce_optional_text(
+            existing_row.get("retired_of_debt_instrument_id")
+        )
+        if existing_retired:
+            retired_parents.add(existing_retired)
         existing_split = coerce_optional_text(
             existing_row.get("split_of_debt_instrument_id")
         )
@@ -801,24 +815,40 @@ def derive_parent_links(
             ):
                 amendment_parents.add(mention_to_instrument[mention.amendment_of])
             if (
+                mention.retired_of in mention_to_instrument
+                and mention_to_instrument[mention.retired_of] != debt_instrument_id
+            ):
+                retired_parents.add(mention_to_instrument[mention.retired_of])
+            if (
                 mention.split_of in mention_to_instrument
                 and mention_to_instrument[mention.split_of] != debt_instrument_id
             ):
                 split_parents.add(mention_to_instrument[mention.split_of])
-        if len(amendment_parents) > 1 or len(split_parents) > 1:
+        if (
+            len(amendment_parents) > 1
+            or len(retired_parents) > 1
+            or len(split_parents) > 1
+        ):
             parent_links[debt_instrument_id] = {
                 "amendment_of_debt_instrument_id": None,
+                "retired_of_debt_instrument_id": None,
                 "split_of_debt_instrument_id": None,
             }
             continue
-        if amendment_parents and split_parents:
+        parent_types_present = sum(
+            bool(parent_set)
+            for parent_set in (amendment_parents, retired_parents, split_parents)
+        )
+        if parent_types_present > 1:
             parent_links[debt_instrument_id] = {
                 "amendment_of_debt_instrument_id": None,
+                "retired_of_debt_instrument_id": None,
                 "split_of_debt_instrument_id": None,
             }
             continue
         parent_links[debt_instrument_id] = {
             "amendment_of_debt_instrument_id": next(iter(amendment_parents), None),
+            "retired_of_debt_instrument_id": next(iter(retired_parents), None),
             "split_of_debt_instrument_id": next(iter(split_parents), None),
         }
     return parent_links
@@ -909,6 +939,9 @@ def build_debt_instrument_rows(
                 "amendment_of_debt_instrument_id": parent_links.get(
                     debt_instrument_id, {}
                 ).get("amendment_of_debt_instrument_id"),
+                "retired_of_debt_instrument_id": parent_links.get(
+                    debt_instrument_id, {}
+                ).get("retired_of_debt_instrument_id"),
                 "split_of_debt_instrument_id": parent_links.get(
                     debt_instrument_id, {}
                 ).get("split_of_debt_instrument_id"),
@@ -928,7 +961,17 @@ def build_debt_instrument_rows(
                 "other_interested_parties_json": other_interested_parties_json,
             }
         )
-    return rows
+    rows_by_id = {str(row["debt_instrument_id"]): row for row in rows}
+    for _child_id, row in rows_by_id.items():
+        parent_id = coerce_optional_text(row.get("retired_of_debt_instrument_id"))
+        if not parent_id or parent_id not in rows_by_id:
+            continue
+        child_end_date = coerce_optional_text(row.get("end_date"))
+        if child_end_date and not coerce_optional_text(
+            rows_by_id[parent_id].get("end_date")
+        ):
+            rows_by_id[parent_id]["end_date"] = child_end_date
+    return [rows_by_id[str(row["debt_instrument_id"])] for row in rows]
 
 
 def first_non_null(
@@ -997,6 +1040,7 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
         end_date=coerce_optional_text(row.get("end_date")),
         amount=coerce_optional_text(row.get("amount")),
         amendment_of=coerce_optional_text(row.get("amendment_of")),
+        retired_of=coerce_optional_text(row.get("retired_of")),
         split_of=coerce_optional_text(row.get("split_of")),
         lenders_json=str(row.get("lenders_json") or "[]"),
         other_interested_parties_json=str(

@@ -56,7 +56,7 @@ INSTRUMENT_SINGLE_VALUE_PROPERTIES = {
     "name": {"debt_instrument"},
 }
 STANDARDIZED_SINGLE_VALUE_PROPERTIES = {"start_date", "end_date", "amount"}
-INSTRUMENT_RELATION_TYPES = {"amendment_of", "split_of"}
+INSTRUMENT_RELATION_TYPES = {"amendment_of", "retired_of", "split_of"}
 NUMERIC_STRING_PATTERN = re.compile(r"^\d+(?:\.\d+)?$")
 ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 MONTH_MAP = {
@@ -121,6 +121,7 @@ DEBT_INSTRUMENT_MENTION_COLUMNS = [
     "end_date",
     "amount",
     "amendment_of",
+    "retired_of",
     "split_of",
     "lenders_json",
     "other_interested_parties_json",
@@ -398,7 +399,6 @@ class InstrumentIEStage:
 
         _, _, tag_details = parse_tag_details(row_state.ner_tagged_xml)
         failures: list[str] = []
-        name_tags_used: set[str] = set()
         for index, obj in enumerate(data):
             if not isinstance(obj, dict):
                 failures.append(f"Entry {index} is not a JSON object.")
@@ -418,6 +418,15 @@ class InstrumentIEStage:
                             value=obj[property_name],
                         )
                     )
+                    if property_name in STANDARDIZED_SINGLE_VALUE_PROPERTIES:
+                        failures.extend(
+                            validate_standardized_single_value_cardinality(
+                                index=index,
+                                property_name=property_name,
+                                value=obj[property_name],
+                                tag_details=tag_details,
+                            )
+                        )
                 if not isinstance(tag_ids, list):
                     failures.append(
                         f"Entry {index}: '{property_name}' evidence must be a list of tag IDs."
@@ -440,9 +449,6 @@ class InstrumentIEStage:
                         failures.append(
                             f"Entry {index}: '{property_name}' tag {tag_id} is type '{tag_info['type']}', expected {expected}."
                         )
-                if property_name == "name":
-                    name_tags_used.update(tag_ids)
-
             for property_name in ("lenders", "other_interested_parties"):
                 if property_name not in obj:
                     continue
@@ -474,38 +480,6 @@ class InstrumentIEStage:
                             failures.append(
                                 f"Entry {index}: '{property_name}'[{cluster_index}] tag {tag_id} must be person or organization."
                             )
-
-        instrument_tag_ids = {
-            tag_id
-            for tag_id, info in tag_details.items()
-            if info["type"] in INSTRUMENT_ENTITY_TAG_TYPES
-        }
-        missing = instrument_tag_ids.difference(name_tags_used)
-        if missing:
-            failures.append(
-                "Missing debt_instrument tags in 'name': " + ", ".join(sorted(missing))
-            )
-
-        counts: dict[str, int] = {}
-        for obj in data:
-            if isinstance(obj, dict):
-                name_value = obj.get("name", [])
-                if not isinstance(name_value, list):
-                    continue
-                if not all(isinstance(tag_id, str) for tag_id in name_value):
-                    continue
-                for tag_id in name_value:
-                    counts[tag_id] = counts.get(tag_id, 0) + 1
-        duplicates = [
-            tag_id
-            for tag_id, count in counts.items()
-            if tag_id in instrument_tag_ids and count > 1
-        ]
-        if duplicates:
-            failures.append(
-                "Debt instrument tags appear in multiple 'name' clusters: "
-                + ", ".join(sorted(duplicates))
-            )
         return failures
 
     def postprocess(self, row_state: ExtractionRowState) -> None:
@@ -550,6 +524,7 @@ class InstrumentIEStage:
                 "end_date": end_date_payload["normalized_date"],
                 "amount": amount_payload["normalized_amount"],
                 "amendment_of": None,
+                "retired_of": None,
                 "split_of": None,
                 "lenders_json": json.dumps(
                     cluster_payload_list(obj.get("lenders", []), tag_details),
@@ -585,8 +560,10 @@ class InstrumentIEStage:
             "Your previous instrument extraction output failed validation.\n"
             f"Validation errors: {failures}\n"
             "Retry requirements:\n"
-            "- Return one JSON object per distinct debt instrument mention cluster.\n"
-            "- Every debt_instrument tag must appear exactly once in a name cluster.\n"
+            "- Return one JSON object per concrete debt instrument described as its own obligation.\n"
+            "- Ignore collective labels or contextual references that should not become standalone debt instruments.\n"
+            "- If one object would have multiple distinct start dates or amounts, split it into separate debt instrument objects.\n"
+            "- Shared evidence tags may appear in more than one object when the text supports that.\n"
             "- Do not return agreements as output objects.\n"
             "- Return only valid JSON."
         )
@@ -630,7 +607,7 @@ class InstrumentRelationStage:
                 continue
             if rel_type not in INSTRUMENT_RELATION_TYPES:
                 failures.append(
-                    f"Invalid relation type: {rel_type}. Must be amendment_of or split_of."
+                    f"Invalid relation type: {rel_type}. Must be amendment_of, retired_of, or split_of."
                 )
             if rel_from not in instrument_ids or rel_to not in instrument_ids:
                 failures.append(
@@ -669,7 +646,7 @@ class InstrumentRelationStage:
             "Retry requirements:\n"
             "- Return a JSON array.\n"
             "- Each relation must have from, to, and type.\n"
-            "- Use only amendment_of or split_of.\n"
+            "- Use only amendment_of, retired_of, or split_of.\n"
             "- Use only instrument IDs from the input."
         )
 
@@ -1179,6 +1156,47 @@ def validate_standardized_single_value_shape(
     return failures
 
 
+def validate_standardized_single_value_cardinality(
+    *,
+    index: int,
+    property_name: str,
+    value: object,
+    tag_details: dict[str, dict[str, object]],
+) -> list[str]:
+    """Validate that one standardized single-value payload does not encode conflicts."""
+    if not isinstance(value, dict):
+        return []
+    evidence = value.get("evidence")
+    if not isinstance(evidence, list):
+        return []
+    evidence_texts = [
+        str(tag_details[tag_id]["text"])
+        for tag_id in evidence
+        if isinstance(tag_id, str) and tag_id in tag_details
+    ]
+    if property_name == "amount":
+        normalized_values = {
+            parsed
+            for parsed in (normalized_amount_from_text(text) for text in evidence_texts)
+            if parsed is not None
+        }
+    else:
+        normalized_values = {
+            parsed
+            for parsed in (normalized_date_from_text(text) for text in evidence_texts)
+            if parsed is not None
+        }
+    if len(normalized_values) <= 1:
+        return []
+    return [
+        (
+            f"Entry {index}: '{property_name}' contains multiple distinct normalized "
+            "values. Split this into separate debt instrument objects instead of "
+            "combining them."
+        )
+    ]
+
+
 def iter_instrument_entries(
     data: list[dict[str, Any]],
     tag_details: dict[str, dict[str, object]],
@@ -1442,7 +1460,12 @@ def relation_prompt_xml(row_state: ExtractionRowState) -> str:
     for mention in row_state.debt_instrument_mentions:
         payload = json.loads(str(mention["name_json"]))
         for tag_id in payload.get("tag_ids", []):
-            tag_to_raw_id[str(tag_id)] = str(mention["raw_id"])
+            key = str(tag_id)
+            raw_id = str(mention["raw_id"])
+            if key not in tag_to_raw_id:
+                tag_to_raw_id[key] = raw_id
+            else:
+                tag_to_raw_id[key] = f"{tag_to_raw_id[key]}||{raw_id}"
     body = render_relation_body(root, tag_to_raw_id)
     return f"<body>{body}</body>"
 
@@ -1456,9 +1479,10 @@ def render_relation_body(root: ET.Element, tag_to_raw_id: dict[str, str]) -> str
             rendered = render_element(child)
             tag_id = child.attrib.get("id")
             if child.tag == "debt_instrument" and tag_id in tag_to_raw_id:
-                parts.append(
-                    f'<debt_instrument instrument-id="{tag_to_raw_id[tag_id]}">{rendered}</debt_instrument>'
-                )
+                for instrument_id in tag_to_raw_id[tag_id].split("||"):
+                    parts.append(
+                        f'<debt_instrument instrument-id="{instrument_id}">{rendered}</debt_instrument>'
+                    )
             else:
                 parts.append(rendered)
             parts.append(child.tail or "")

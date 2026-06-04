@@ -11,7 +11,11 @@ from cdt.classifier import classifications_root, classify_pending_items
 from cdt.classifier import core as classifier_core
 from cdt.datasets import shard_for_accession
 from cdt.extractor import extract_pending_items, mentions_root
-from cdt.extractor.core import ExtractionRowState
+from cdt.extractor.core import (
+    ExtractionRowState,
+    InstrumentIEStage,
+    InstrumentRelationStage,
+)
 from cdt.ingest import DOCUMENT_COLUMNS
 from cdt.itemizer import core as itemizer_core
 from cdt.itemizer import itemize_pending_documents, items_root
@@ -148,6 +152,7 @@ def build_mention_row(
         "end_date": None,
         "amount": amount,
         "amendment_of": None,
+        "retired_of": None,
         "split_of": None,
         "lenders_json": lenders_json,
         "other_interested_parties_json": "[]",
@@ -311,6 +316,7 @@ def test_extract_pending_items_writes_mentions_and_audit(
                 "end_date": None,
                 "amount": "$100 million",
                 "amendment_of": None,
+                "retired_of": None,
                 "split_of": None,
                 "lenders_json": "[]",
                 "other_interested_parties_json": "[]",
@@ -373,6 +379,7 @@ def test_extract_pending_items_drains_all_partitions(
                 "end_date": None,
                 "amount": "$100 million",
                 "amendment_of": None,
+                "retired_of": None,
                 "split_of": None,
                 "lenders_json": "[]",
                 "other_interested_parties_json": "[]",
@@ -453,6 +460,106 @@ def test_extract_pending_items_skips_empty_outputs_on_rerun(
     assert not artifact_exists(
         mentions_root(tmp_path) + "/date=2024-01-02/shard=0001/part-0000.parquet"
     )
+
+
+def test_instrument_ie_validate_allows_shared_evidence_and_skipped_collective_tags() -> (
+    None
+):
+    """Shared evidence and skipped collective labels should validate successfully."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = """
+<body>
+On <date id="tag-d-1">March 17, 2025</date>, the Company issued a
+<debt_instrument id="tag-i-1">Senior Subordinated Convertible Promissory Note</debt_instrument>
+(the <debt_instrument id="tag-i-2">Initial Exchange Note</debt_instrument>)
+in an aggregate principal amount of <amount id="tag-a-1">$5.5 million</amount>
+to <organization id="tag-o-1">EGT 11 LLC</organization>.
+On <date id="tag-d-2">March 20, 2025</date>, the Company issued a
+<debt_instrument id="tag-i-1b">Senior Subordinated Convertible Promissory Note</debt_instrument>
+(the <debt_instrument id="tag-i-3">Subsequent Exchange Note</debt_instrument>)
+in an aggregate principal amount of <amount id="tag-a-2">$269,000</amount>
+to <organization id="tag-o-1b">EGT 11 LLC</organization>.
+Together, the <debt_instrument id="tag-i-4">Exchange Notes</debt_instrument> were outstanding.
+</body>
+""".strip()
+    response = """
+[
+  {
+    "name": ["tag-i-1", "tag-i-2"],
+    "start_date": {"evidence": ["tag-d-1"], "normalized_date": "2025-03-17"},
+    "amount": {"evidence": ["tag-a-1"], "normalized_amount": "5500000", "currency": "USD"},
+    "lenders": [["tag-o-1"]],
+    "other_interested_parties": []
+  },
+  {
+    "name": ["tag-i-1b", "tag-i-3"],
+    "start_date": {"evidence": ["tag-d-2"], "normalized_date": "2025-03-20"},
+    "amount": {"evidence": ["tag-a-2"], "normalized_amount": "269000", "currency": "USD"},
+    "lenders": [["tag-o-1b"]],
+    "other_interested_parties": []
+  }
+]
+""".strip()
+
+    failures = InstrumentIEStage().validate(row_state, response)
+
+    assert failures == []
+
+
+def test_instrument_ie_validate_rejects_conflicting_start_dates() -> None:
+    """One extracted object cannot carry two distinct start dates."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = """
+<body>
+The <debt_instrument id="tag-i-1">Senior Subordinated Convertible Promissory Note</debt_instrument>
+was issued on <date id="tag-d-1">March 17, 2025</date> and <date id="tag-d-2">March 20, 2025</date>.
+</body>
+""".strip()
+    response = """
+[
+  {
+    "name": ["tag-i-1"],
+    "start_date": {"evidence": ["tag-d-1", "tag-d-2"], "normalized_date": "2025-03-17"}
+  }
+]
+""".strip()
+
+    failures = InstrumentIEStage().validate(row_state, response)
+
+    assert any("multiple distinct normalized values" in failure for failure in failures)
+
+
+def test_instrument_relation_stage_accepts_retired_of() -> None:
+    """Relation validation and postprocessing should support retired_of."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_relation",
+    )
+    row_state.debt_instrument_mentions = [
+        {
+            "debt_instrument_mention_id": "m-1",
+            "raw_id": "i-1",
+        },
+        {
+            "debt_instrument_mention_id": "m-2",
+            "raw_id": "i-2",
+        },
+    ]
+    response = '[{"from": "i-2", "to": "i-1", "type": "retired_of"}]'
+
+    failures = InstrumentRelationStage().validate(row_state, response)
+    assert failures == []
+
+    row_state.stage_responses["instrument_relation"] = response
+    InstrumentRelationStage().postprocess(row_state)
+
+    assert row_state.debt_instrument_mentions[1]["retired_of"] == "m-1"
 
 
 def test_match_pending_mentions_writes_match_datasets(tmp_path: Path) -> None:
@@ -668,3 +775,61 @@ def test_match_tables_supports_incremental_batches_against_existing_clusters() -
     assert tables["debt_instrument"]["debt_instrument_id"].to_list() == ["m-1"]
     assert tables["debt_instrument"]["name"].to_list() == ["Alpha Loan"]
     assert tables["debt_instrument"]["company_name"].to_list() == ["Example Inc."]
+
+
+def test_match_tables_retired_of_keeps_separate_clusters_and_updates_parent_end_date() -> (
+    None
+):
+    """Retirement lineage should not collapse into one cluster and should end-date the parent."""
+    mentions = pd.DataFrame(
+        [
+            {
+                **build_mention_row(
+                    mention_id="m-1",
+                    item_id="item-1",
+                    accession_number="0001",
+                    cik="320193",
+                    date="2024-01-01",
+                    name="Term Loan",
+                    start_date="2024-01-01",
+                    amount="$100 million",
+                    lenders_json='[{"mentions": [{"text": "Acme Bank"}]}]',
+                ),
+                "end_date": None,
+            },
+            {
+                **build_mention_row(
+                    mention_id="m-2",
+                    item_id="item-2",
+                    accession_number="0002",
+                    cik="320193",
+                    date="2024-03-01",
+                    name="Term Loan",
+                    start_date="2024-01-01",
+                    amount="$100 million",
+                    lenders_json='[{"mentions": [{"text": "Acme Bank"}]}]',
+                ),
+                "end_date": "2024-03-01",
+                "retired_of": "m-1",
+            },
+        ]
+    )
+
+    tables = match_tables(
+        mentions,
+        strong_match_threshold=0.90,
+        loose_match_threshold=0.75,
+    )
+
+    member_edges = tables["debt_instrument_mentions"].query("edge_type == 'member'")
+    assert {
+        row["debt_instrument_mention_id"]: row["debt_instrument_id"]
+        for row in member_edges.to_dict("records")
+    } == {"m-1": "m-1", "m-2": "m-2"}
+
+    instruments = {
+        row["debt_instrument_id"]: row
+        for row in tables["debt_instrument"].to_dict("records")
+    }
+    assert instruments["m-2"]["retired_of_debt_instrument_id"] == "m-1"
+    assert instruments["m-1"]["end_date"] == "2024-03-01"

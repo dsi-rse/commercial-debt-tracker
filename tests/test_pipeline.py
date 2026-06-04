@@ -229,6 +229,7 @@ This is the extracted event text.
                 "end_date": None,
                 "amount": "$100 million",
                 "amendment_of": None,
+                "retired_of": None,
                 "split_of": None,
                 "lenders_json": '[{"mentions": [{"text": "Acme Bank"}]}]',
                 "other_interested_parties_json": "[]",
