@@ -59,7 +59,7 @@ Historical runs are never scheduled automatically.
 GitHub Actions currently defines three operational workflows:
 
 - `.github/workflows/checks.yml`
-  Runs Ruff, pytest, and `pulumi preview` on pull requests and manual dispatch.
+  Runs Ruff, pytest, dependency and CodeQL security checks, and `pulumi preview` on pull requests and manual dispatch.
 - `.github/workflows/deploy.yml`
   Runs on pushes to `main` and `dev`, plus manual dispatch.
 - `.github/workflows/run-historical.yml`
@@ -69,7 +69,7 @@ GitHub Actions currently defines three operational workflows:
 
 1. build and push the orchestrator image to GHCR as `ghcr.io/<owner>/cdt-orchestrator`
 2. run `pulumi up` against the `prod` stack for `main` or the `dev` stack for `dev`
-3. copy the GHCR `:latest` image into the Pulumi-managed ECR repository
+3. copy the GHCR image into the Pulumi-managed ECR repository as both `:latest` and `:${GITHUB_SHA}`
 
 This split matters:
 
@@ -98,6 +98,7 @@ Common optional config:
 - `cron`
 - `schedule_enabled`
 - `log_retention_days`
+- `ecr_image_retention_count`
 - `r2_account_id`
 - `r2_bucket_name`
 - `r2_object_prefix`

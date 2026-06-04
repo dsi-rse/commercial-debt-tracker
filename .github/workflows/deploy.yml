@@ -127,7 +127,10 @@ jobs:
           GHCR_IMAGE: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
         run: |
           ECR_IMAGE="$(pulumi stack output ecr_repo_url):latest"
+          ECR_SHA_IMAGE="$(pulumi stack output ecr_repo_url):${GITHUB_SHA}"
           docker pull "$GHCR_IMAGE"
           docker tag "$GHCR_IMAGE" "$ECR_IMAGE"
+          docker tag "$GHCR_IMAGE" "$ECR_SHA_IMAGE"
           docker push "$ECR_IMAGE"
+          docker push "$ECR_SHA_IMAGE"
         working-directory: pulumi

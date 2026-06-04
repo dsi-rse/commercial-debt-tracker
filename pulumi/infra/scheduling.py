@@ -82,7 +82,6 @@ schedule = aws.scheduler.Schedule(
             task_definition_arn=ecs.task_definition.arn,
             launch_type="FARGATE",
             platform_version="LATEST",
-            enable_execute_command=True,
             propagate_tags="TASK_DEFINITION",
             network_configuration=aws.scheduler.ScheduleTargetEcsParametersNetworkConfigurationArgs(
                 assign_public_ip=True,

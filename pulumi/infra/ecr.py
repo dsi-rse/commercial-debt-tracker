@@ -31,11 +31,13 @@ ecr_lifecycle_policy = aws.ecr.LifecyclePolicy(
             "rules": [
                 {
                     "rulePriority": 1,
-                    "description": "Keep the last five images",
+                    "description": (
+                        f"Keep the last {config.ecr_image_retention_count} images"
+                    ),
                     "selection": {
                         "tagStatus": "any",
                         "countType": "imageCountMoreThan",
-                        "countNumber": 5,
+                        "countNumber": config.ecr_image_retention_count,
                     },
                     "action": {"type": "expire"},
                 }

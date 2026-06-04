@@ -18,6 +18,7 @@ shared_dlq_name = config.require("shared_dlq_name")
 cpu = config.get("cpu") or "1024"
 memory = config.get("memory") or "4096"
 log_retention_days = int(config.get("log_retention_days") or "30")
+ecr_image_retention_count = int(config.get("ecr_image_retention_count") or "5")
 schedule_expression = config.get("cron") or "cron(0 8 * * ? *)"
 schedule_enabled = (config.get("schedule_enabled") or "false").lower() == "true"
 r2_account_id = config.get("r2_account_id")

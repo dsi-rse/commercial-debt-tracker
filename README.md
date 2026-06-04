@@ -42,7 +42,7 @@ The GitHub Actions deployment path is:
 
 1. build and push the orchestrator image to GHCR
 2. run `pulumi up`
-3. sync the `:latest` image from GHCR into the Pulumi-managed ECR repository
+3. sync the GHCR image into the Pulumi-managed ECR repository as both `:latest` and `:${GITHUB_SHA}`
 
 Full details are in [docs/deployment.md](docs/deployment.md).
 

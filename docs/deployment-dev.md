@@ -32,6 +32,7 @@ idi:default_cik_file = s3://idi-dev-ftm2j-shared-processor-storage/processors/cd
 idi:shared_dlq_name = idi-dev-ftm2j-shared-scheduler-dlq
 idi:cpu = 1024
 idi:memory = 4096
+idi:ecr_image_retention_count = 5
 idi:cron = cron(0 7 * * ? *)
 idi:schedule_enabled = false
 ```
@@ -98,6 +99,7 @@ pulumi config set idi:default_cik_file s3://idi-dev-ftm2j-shared-processor-stora
 pulumi config set idi:shared_dlq_name idi-dev-ftm2j-shared-scheduler-dlq
 pulumi config set idi:cpu 1024
 pulumi config set idi:memory 4096
+pulumi config set idi:ecr_image_retention_count 5
 pulumi config set idi:cron "cron(0 7 * * ? *)"
 pulumi config set idi:schedule_enabled false
 pulumi config set --secret idi:openrouter_api_key <openrouter-api-key>
