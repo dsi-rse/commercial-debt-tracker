@@ -137,6 +137,7 @@ Columns:
 
 - `accession_number`: SEC accession number normalized by removing dashes; stable document key.
 - `cik`: SEC Central Index Key for the filing issuer.
+- `company_name`: Filing issuer display name from the upstream SEC manifest.
 - `url`: SEC source URL for the complete submission text file.
 - `text`: Decoded filing text when the document body is stored inline in the dataset.
 - `date`: Filing date in `YYYY-MM-DD` format.
@@ -152,6 +153,7 @@ Columns:
 - `item`: SEC 8-K item number for the extracted section, for example `1.01` or `2.03`.
 - `accession_number`: Parent filing accession number.
 - `cik`: Filing issuer CIK copied from the parent document.
+- `company_name`: Filing issuer display name copied from the parent document.
 - `url`: SEC source URL copied from the parent document.
 - `text`: Extracted text for the item section only.
 - `date`: Filing date copied from the parent document.
@@ -185,6 +187,7 @@ Columns:
 - `item_id`: Source item section identifier.
 - `accession_number`: Filing accession number for the source item.
 - `cik`: Issuer CIK for the source item.
+- `company_name`: Issuer display name for the source item.
 - `date`: Filing date for the source item in `YYYY-MM-DD` format.
 - `raw_id`: Row-local extractor identifier used inside a single item during relation extraction.
 - `name`: Canonicalized debt instrument name text extracted from the item.
@@ -220,6 +223,7 @@ Columns:
 
 - `debt_instrument_id`: Canonical entity identifier for one consolidated debt instrument history.
 - `cik`: Issuer CIK shared by the instrument's directly matched mentions.
+- `company_name`: Issuer display name shared by the instrument's directly matched mentions.
 - `seed_debt_instrument_mention_id`: First direct mention used as the representative seed for the instrument record.
 - `amendment_of_debt_instrument_id`: Parent instrument ID when this instrument is an amendment lineage child.
 - `split_of_debt_instrument_id`: Parent instrument ID when this instrument is a split lineage child.

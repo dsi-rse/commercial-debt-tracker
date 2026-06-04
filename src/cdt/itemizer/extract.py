@@ -74,6 +74,7 @@ class DocumentText:
     Attributes:
         accession_number: Normalized SEC accession number.
         cik: SEC Central Index Key with no leading zeros.
+        company_name: Filing issuer display name from the source manifest.
         url: Source SEC URL for the document.
         text: Complete submission text.
         date: Filing date in ISO ``YYYY-MM-DD`` format.
@@ -81,6 +82,7 @@ class DocumentText:
 
     accession_number: str
     cik: str
+    company_name: str
     url: str
     text: str
     date: str
@@ -142,6 +144,7 @@ class ItemSection:
     Attributes:
         accession_number: SEC accession number for the source document.
         cik: SEC Central Index Key for the source filer.
+        company_name: Filing issuer display name for the source filer.
         date: Filing date in ISO ``YYYY-MM-DD`` format.
         url: Source SEC URL for the document.
         item_information: Normalized ``ITEM INFORMATION`` caption.
@@ -159,6 +162,7 @@ class ItemSection:
 
     accession_number: str
     cik: str
+    company_name: str
     date: str
     url: str
     item_information: str
@@ -205,6 +209,7 @@ def extract_items_from_document(document: DocumentText) -> list[ItemSection]:
             ItemSection(
                 accession_number=document.accession_number,
                 cik=document.cik,
+                company_name=document.company_name,
                 date=document.date,
                 url=document.url,
                 item_information=item_information,

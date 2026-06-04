@@ -167,6 +167,7 @@ def test_acquire_documents_indexes_resources_without_downloading(
     )
 
     assert first["accession_number"].to_list() == ["000114036126006577"]
+    assert first["company_name"].to_list() == [""]
     assert first["resource_uri"].to_list() == [
         "s3://sec-bucket/sec/2024-01-02/8-K/320193/000114036126006577/full.txt"
     ]
@@ -179,6 +180,7 @@ def test_acquire_documents_indexes_resources_without_downloading(
     ) not in client.manifest_reads
     documents = read_dataset(documents_root(data_dir=tmp_path), columns=first.columns)
     assert documents["accession_number"].to_list() == ["000114036126006577"]
+    assert documents["company_name"].to_list() == [""]
     assert (
         len(list_artifacts(documents_root(data_dir=tmp_path), suffix=".parquet")) == 1
     )

@@ -113,6 +113,7 @@ DEBT_INSTRUMENT_MENTION_COLUMNS = [
     "item_id",
     "accession_number",
     "cik",
+    "company_name",
     "date",
     "raw_id",
     "name",
@@ -540,6 +541,8 @@ class InstrumentIEStage:
                 "item_id": row_state.item_id,
                 "accession_number": row_state.item_row.get("accession_number"),
                 "cik": row_state.item_row.get("cik"),
+                # Preserve filer display metadata for downstream instrument pages.
+                "company_name": row_state.item_row.get("company_name"),
                 "date": row_state.item_row.get("date"),
                 "raw_id": raw_id,
                 "name": canonical_value(obj.get("name", []), tag_details),

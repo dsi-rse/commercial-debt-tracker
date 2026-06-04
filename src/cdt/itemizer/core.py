@@ -289,6 +289,7 @@ def itemize_document_record(
         DocumentText(
             accession_number=str(document["accession_number"]),
             cik=str(document["cik"]),
+            company_name=str(document.get("company_name") or ""),
             url=str(document["url"]),
             text=text,
             date=str(document["date"]),
@@ -310,6 +311,7 @@ def item_row(section: ItemSection) -> dict[str, object]:
         "item": section.item_number,
         "accession_number": section.accession_number,
         "cik": section.cik,
+        "company_name": section.company_name,
         "url": section.url,
         "text": section.section_text,
         "date": section.date,

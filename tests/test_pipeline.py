@@ -171,6 +171,7 @@ def test_run_pipeline_processes_small_seeded_batch(
                 {
                     "accession_number": "000114036126006577",
                     "cik": "320193",
+                    "company_name": "Example Inc.",
                     "url": "https://sec.example/full.txt",
                     "text": """
 ITEM INFORMATION: Other Events
@@ -220,6 +221,7 @@ This is the extracted event text.
                 "item_id": item_row["item_id"],
                 "accession_number": item_row["accession_number"],
                 "cik": item_row["cik"],
+                "company_name": item_row["company_name"],
                 "date": item_row["date"],
                 "raw_id": "i-1",
                 "name": "Term Loan",
@@ -286,6 +288,9 @@ This is the extracted event text.
     assert written_matches["edge_type"].to_list() == ["member"]
     assert written_instruments["debt_instrument_id"].to_list() == ["m-1"]
     assert final_items["item_id"].to_list() == ["000114036126006577-8-01"]
+    assert final_items["company_name"].to_list() == ["Example Inc."]
     assert final_mentions["debt_instrument_mention_id"].to_list() == ["m-1"]
+    assert final_mentions["company_name"].to_list() == ["Example Inc."]
     assert final_edges["debt_instrument_mention_id"].to_list() == ["m-1"]
     assert final_instruments["debt_instrument_id"].to_list() == ["m-1"]
+    assert final_instruments["company_name"].to_list() == ["Example Inc."]

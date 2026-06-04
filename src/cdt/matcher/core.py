@@ -62,6 +62,7 @@ MENTION_CLUSTER_EDGE_COLUMNS = [
 DEBT_INSTRUMENT_COLUMNS = [
     "debt_instrument_id",
     "cik",
+    "company_name",
     "seed_debt_instrument_mention_id",
     "amendment_of_debt_instrument_id",
     "split_of_debt_instrument_id",
@@ -120,6 +121,7 @@ class PreparedMention:
     raw_id: str
     accession_number: str | None
     cik: str | None
+    company_name: str | None
     date: str | None
     name: str | None
     start_date: str | None
@@ -899,6 +901,10 @@ def build_debt_instrument_rows(
             {
                 "debt_instrument_id": debt_instrument_id,
                 "cik": cik,
+                "company_name": first_non_null(
+                    ordered_member_ids, mention_index, "company_name"
+                )
+                or coerce_optional_text(existing_row.get("company_name")),
                 "seed_debt_instrument_mention_id": seed_mention_id,
                 "amendment_of_debt_instrument_id": parent_links.get(
                     debt_instrument_id, {}
@@ -984,6 +990,7 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
         raw_id=str(row["raw_id"]),
         accession_number=coerce_optional_text(row.get("accession_number")),
         cik=coerce_optional_text(row.get("cik")),
+        company_name=coerce_optional_text(row.get("company_name")),
         date=coerce_optional_text(row.get("date")),
         name=coerce_optional_text(row.get("name")),
         start_date=coerce_optional_text(row.get("start_date")),

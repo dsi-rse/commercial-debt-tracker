@@ -46,6 +46,7 @@ def seed_document_partition(tmp_path: Path) -> str:
             {
                 "accession_number": "000114036126006577",
                 "cik": "320193",
+                "company_name": "Example Inc.",
                 "url": "https://sec.example/full.txt",
                 "text": """
 ITEM INFORMATION: Other Events
@@ -93,6 +94,7 @@ def seed_document_partitions(tmp_path: Path) -> list[str]:
                 {
                     "accession_number": accession_number,
                     "cik": cik,
+                    "company_name": "Example Inc.",
                     "url": "https://sec.example/full.txt",
                     "text": """
 ITEM INFORMATION: Other Events
@@ -138,6 +140,7 @@ def build_mention_row(
         "item_id": item_id,
         "accession_number": accession_number,
         "cik": cik,
+        "company_name": "Example Inc.",
         "date": date,
         "raw_id": "i-1",
         "name": name,
@@ -664,3 +667,4 @@ def test_match_tables_supports_incremental_batches_against_existing_clusters() -
     } == {"m-1": "m-1", "m-2": "m-1"}
     assert tables["debt_instrument"]["debt_instrument_id"].to_list() == ["m-1"]
     assert tables["debt_instrument"]["name"].to_list() == ["Alpha Loan"]
+    assert tables["debt_instrument"]["company_name"].to_list() == ["Example Inc."]

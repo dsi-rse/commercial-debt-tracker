@@ -26,7 +26,15 @@ from cdt.storage import (
 )
 
 LOGGER = get_logger(__name__)
-DOCUMENT_COLUMNS = ["accession_number", "cik", "url", "text", "date", "resource_uri"]
+DOCUMENT_COLUMNS = [
+    "accession_number",
+    "cik",
+    "company_name",
+    "url",
+    "text",
+    "date",
+    "resource_uri",
+]
 DEFAULT_BUCKET = "idi-dev-processor-s3"
 DEFAULT_AWS_PROFILE = ""
 DEFAULT_S3_PREFIX = "sec"
@@ -104,6 +112,7 @@ class DocumentCandidate:
 
     accession_number: str
     cik: str
+    company_name: str
     url: str
     resource_uri: str
     date: str
@@ -387,6 +396,7 @@ def run_ingest_pipeline(
         row = {
             "accession_number": candidate.accession_number,
             "cik": candidate.cik,
+            "company_name": candidate.company_name,
             "url": candidate.url,
             "date": candidate.date,
             "resource_uri": candidate.resource_uri,
@@ -601,6 +611,7 @@ def _candidate_from_filing(
     return DocumentCandidate(
         accession_number=normalize_accession_number(filing.accession_number),
         cik=filing.cik,
+        company_name=filing.company_name,
         url=document.url,
         resource_uri=normalize_s3_uri(bucket, document.s3_key),
         date=filing.filing_date.isoformat(),
