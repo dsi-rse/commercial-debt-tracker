@@ -57,16 +57,20 @@ Canonical path shape:
 
 Notes:
 
-- date shards are derived from accession number hashes
+- `documents` shards currently use Python's process-level `hash(accession_number)` modulo 64
+- `items`, `classifications`, and `mentions` preserve their source document `date` and `shard`
 - CIK shards are derived from CIK hashes
-- date-partitioned datasets currently use 8 shards
+- `documents` currently use 64 date shards
+- downstream date-partitioned datasets currently preserve whichever document shards they read
 - CIK-sharded datasets currently use 64 shards
+- Changing `documents` to stable accession hashing would require migration or forced reruns of existing document partitions.
 
 ### What "Partition", "Shard", and "Batch" Mean
 
 - A `partition` is one physical parquet file at a canonical path such as `documents/date=2026-05-31/shard=0017/part-0000.parquet`.
-- A `shard` is the hash bucket inside a dataset's partitioning scheme. Date-partitioned datasets currently use 8 shards, rendered as `0000` through `0007`. CIK-sharded datasets use 64 shards, rendered as `0000` through `0063`.
-- For date-partitioned datasets, all rows for the same filing date are split across 8 shard files by hashed accession number.
+- A `shard` is the hash bucket inside a dataset's partitioning scheme. `documents` currently use 64 shards, rendered as `0000` through `0063`. Downstream date-partitioned datasets preserve source document shard values. CIK-sharded datasets also use 64 shards, rendered as `0000` through `0063`.
+- For `documents`, all rows for the same filing date are split across 64 shard files by Python `hash(accession_number)`.
+- For `items`, `classifications`, and `mentions`, rows keep the `date` and `shard` partition of their upstream source partition.
 - For CIK-sharded datasets, rows are split across 64 shard files by hashed CIK, regardless of filing date.
 - A `batch` is not a second storage layer. It is just the internal chunk size one pipeline invocation uses while draining all work in scope.
 
@@ -80,7 +84,7 @@ Notes:
 
 How rows land there:
 
-- `documents`: rows are grouped by filing `date`, then by `shard_for_accession(accession_number)`.
+- `documents`: rows are grouped by filing `date`, then by Python `hash(accession_number) % 64`.
 - `items`: each item row is written to the same `date` and `shard` partition as its parent document partition.
 - `classifications`: each classified row is written to the same `date` and `shard` partition as its source item partition.
 - `mentions`: each extracted mention row is written to the same `date` and `shard` partition as its source classification partition.
@@ -279,7 +283,8 @@ The ingest stage maintains a permanent failure registry at:
 
 - canonical truth is the partition data, not the run manifest
 - final snapshot parquet files are derived convenience outputs, not the canonical working state
-- local runs only write final snapshots when `--final-database-root` or `FINAL_DATABASE_ROOT` is set
+- `cdt pipeline` writes final snapshots only when `--final-database-root` is passed
+- `cdt-orchestrator` writes final snapshots when `FINAL_DATABASE_ROOT` is set or `--final-database-root` is passed before the mode
 - stage completion is inferred from output partition presence plus stage completion registries for zero-row outputs
 - `force=false` skips already-written partitions
 - local runs and deployed runs use the same layout and code paths

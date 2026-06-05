@@ -12,7 +12,6 @@ The deployed stack contains:
 - a CloudWatch log group
 - one EventBridge Scheduler schedule for daily runs
 - Secrets Manager secrets for `OPENROUTER_API_KEY` and `SEC_USER_AGENT`
-- optional Secrets Manager secrets for Cloudflare R2 publishing credentials
 
 The ECS task runs the `cdt-orchestrator` console script from [dockerfiles/Dockerfile.orchestrator](../dockerfiles/Dockerfile.orchestrator).
 
@@ -31,14 +30,6 @@ It injects these secrets:
 
 - `OPENROUTER_API_KEY`
 - `SEC_USER_AGENT`
-
-When R2 publishing is configured, it also injects:
-
-- `R2_ACCOUNT_ID`
-- `R2_BUCKET_NAME`
-- `R2_OBJECT_PREFIX`
-- `R2_ACCESS_KEY_ID`
-- `R2_SECRET_ACCESS_KEY`
 
 The scheduler target overrides the container command to:
 
@@ -99,11 +90,8 @@ Common optional config:
 - `schedule_enabled`
 - `log_retention_days`
 - `ecr_image_retention_count`
-- `r2_account_id`
-- `r2_bucket_name`
-- `r2_object_prefix`
-- `r2_access_key_id` as a secret
-- `r2_secret_access_key` as a secret
+
+The Pulumi code still contains optional R2 passthrough config from an older deployment shape. Those values are not used by CDT for publishing; configure the dashboard publisher stack in `../commercial-debt-tracker-dashboard` when R2 JSON publishing is needed.
 
 The ingest source bucket passed to the container is:
 
@@ -141,11 +129,12 @@ Normal daily processing is:
    `items/latest.parquet`, `debt-instruments/latest.parquet`,
    `debt-instrument-mentions/latest.parquet`, and
    `mention-cluster-edges/latest.parquet`
-6. if R2 credentials are present, dashboard snapshot JSON is published after matching
+6. the dashboard publisher in `../commercial-debt-tracker-dashboard` can then read those parquet snapshots and publish `generated/*` JSON to R2
 
 Local note:
 
-- local runs do not write final snapshots unless you pass `--final-database-root` or set `FINAL_DATABASE_ROOT`
+- `cdt pipeline` does not read `FINAL_DATABASE_ROOT`; pass `--final-database-root` to write final snapshots from that CLI.
+- `cdt-orchestrator` reads `FINAL_DATABASE_ROOT`, and also accepts `--final-database-root` as a top-level option before `daily` or `historical`.
 
 The scheduler state is controlled by the Pulumi `idi:schedule_enabled` setting.
 

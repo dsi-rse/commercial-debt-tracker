@@ -98,12 +98,13 @@ The matcher uses deterministic surfaces derived from:
 
 This is a pragmatic middle ground: simpler than a graph database or long-lived entity service, but enough to build useful instrument histories from noisy filing text.
 
-## Optional Dashboard Publishing
+## Dashboard Handoff
 
-When the R2 environment variables are present, the pipeline publishes a denormalized dashboard snapshot after matching succeeds. The publisher writes:
+After matching succeeds, CDT can write final parquet snapshots for dashboard and database consumers:
 
-- `index.json`
-- `companies/<cik>.json`
-- `debt-instruments/<instrument_id>.json`
+- `items/latest.parquet`
+- `debt-instruments/latest.parquet`
+- `debt-instrument-mentions/latest.parquet`
+- `mention-cluster-edges/latest.parquet`
 
-It only uploads objects whose content changed, which keeps publish runs cheap and idempotent.
+The processor does not publish Cloudflare R2 JSON directly. The `../commercial-debt-tracker-dashboard` repository owns the publisher that reads these final parquet snapshots and writes `generated/*` JSON to R2.

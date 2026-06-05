@@ -7,7 +7,7 @@ Commercial Debt Tracker (CDT) processes SEC 8-K filings to build a file-native h
 - classifies those sections for debt relevance
 - uses an LLM-backed extractor to produce structured debt-instrument mentions
 - matches mentions into instrument-level histories
-- optionally publishes dashboard snapshot JSON to Cloudflare R2
+- optionally writes dashboard-facing final parquet snapshots
 
 ## Repository Map
 
@@ -24,7 +24,7 @@ CDT is intentionally file-native. Canonical state lives under one artifact root 
 This avoids a mutable database dependency and keeps reruns deterministic:
 
 - date-partitioned stages write `documents`, `items`, `classifications`, and `mentions`
-- CIK-sharded matcher outputs write `mention-matches` and `debt-instruments`
+- CIK-sharded matcher outputs write `mention-cluster-edges` and `debt-instruments`
 - stage manifests and extractor audit logs are written alongside those datasets
 
 See [docs/schema.md](docs/schema.md) for the concrete layout, including the optional `latest.parquet` final snapshots.
@@ -60,7 +60,7 @@ Main local entrypoints:
 
 ```bash
 uv run cdt pipeline --artifact-root ./data historical ./1000-ciks.txt --start-date 2024-01-01 --end-date 2024-01-31
-uv run cdt-orchestrator daily --artifact-root ./data/local --cik-file ./1000-ciks.txt
+uv run cdt-orchestrator --artifact-root ./data/local daily --cik-file ./1000-ciks.txt
 make local-run
 ./scripts/local-pipeline.sh historical --start-date 2024-01-01 --end-date 2024-01-31
 ```
@@ -69,6 +69,8 @@ Notes:
 
 - `cdt` is the stage-oriented CLI for local and ad hoc runs.
 - `cdt-orchestrator` is the deployment-oriented entrypoint used by ECS.
+- `cdt pipeline` writes final snapshots only when `--final-database-root` is passed.
+- `cdt-orchestrator` reads `FINAL_DATABASE_ROOT` from the environment, or accepts `--final-database-root` before the mode.
 - `make local-run` and `./scripts/local-pipeline.sh` exercise the orchestrator with deployment-like environment variables from `.env`.
 - The shared local convention is `DATA_DIR/commercial-debt-tracker/local` for canonical artifacts and `DATA_DIR/commercial-debt-tracker/database/cdt` for dashboard-consumable `latest.parquet` outputs.
 
@@ -127,10 +129,5 @@ Optional runtime configuration:
 - `AWS_PROFILE` for local runs against AWS
 - `EXTRACTOR_MODEL`
 - `EXTRACTOR_REASONING`
-- `R2_ACCOUNT_ID`
-- `R2_BUCKET_NAME`
-- `R2_OBJECT_PREFIX`
-- `R2_ACCESS_KEY_ID`
-- `R2_SECRET_ACCESS_KEY`
 
 Pulumi also provisions a `SEC_USER_AGENT` secret into the ECS task to match the shared processor deployment pattern, even though CDT itself currently reads filings from scraper-managed S3 rather than calling SEC endpoints directly.

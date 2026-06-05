@@ -1,5 +1,5 @@
 ### Notebook directory
 
-This should contain information about what is done in each notebook
+This directory is reserved for exploratory notebooks.
 
-* `Test.ipynb` : This is a test notebook to demonstrate how to use this repository.
+There are currently no tracked notebooks in this repository.
