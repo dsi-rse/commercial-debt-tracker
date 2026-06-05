@@ -148,6 +148,8 @@ There are two supported historical paths:
    Run `aws ecs run-task` with a container override command beginning with `historical`.
 
 The GitHub workflow uses Pulumi outputs to resolve the cluster, task definition, subnet, and security group before launching the task.
+For manual AWS CLI runs, export `PULUMI_CONFIG_PASSPHRASE` before reading Pulumi outputs; the passphrase is stored in the Core Facility Bitwarden.
+See [docs/deployment-dev.md](deployment-dev.md) for a complete command that logs into the S3 Pulumi backend, selects the stack, and starts an ECS historical task.
 
 ## Operational Guidance
 

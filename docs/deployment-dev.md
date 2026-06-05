@@ -63,6 +63,8 @@ eval "$(AWS_PROFILE=idi-analysis aws configure export-credentials --format env)"
 export PULUMI_CONFIG_PASSPHRASE='your-passphrase'
 ```
 
+The passphrase is stored in the Core Facility Bitwarden.
+
 4. Log Pulumi into the shared S3 backend:
 
 ```bash
@@ -143,14 +145,20 @@ Because `idi:schedule_enabled` should be `false` for the first deploy, nothing r
 
 ## Run a Historical Backfill Manually
 
-Use the deployed ECS task definition with a container command override. First, capture the relevant Pulumi outputs:
+Use the deployed ECS task definition with a container command override. From the repository's `pulumi/` directory, log into the Pulumi backend, select the stack, and capture the relevant Pulumi outputs:
 
 ```bash
+export PULUMI_CONFIG_PASSPHRASE='your-passphrase'
+pulumi login s3://idi-ftm2j-dev-pulumi-state/commercial-debt-tracker
+pulumi stack select dev
+
 CLUSTER_NAME="$(pulumi stack output ecs_cluster_name)"
 TASK_DEFINITION_ARN="$(pulumi stack output task_definition_arn)"
 SECURITY_GROUP_ID="$(pulumi stack output security_group_id)"
 PRIMARY_SUBNET_ID="$(pulumi stack output primary_subnet_id)"
 ```
+
+The Pulumi config passphrase is required to read stack secrets and is stored in the Core Facility Bitwarden.
 
 Then start a manual historical run:
 
@@ -180,6 +188,38 @@ Recommended first manual run:
 - use `beta-1k.txt`
 - use a one-month window
 - inspect the output before widening the date range or CIK set
+
+For a larger 50K-CIK historical run from 2016 through today, use the same ECS task launch pattern with the 50K CIK file:
+
+```bash
+export PULUMI_CONFIG_PASSPHRASE='your-passphrase'
+pulumi login s3://idi-ftm2j-dev-pulumi-state/commercial-debt-tracker
+pulumi stack select dev
+
+CLUSTER_NAME="$(pulumi stack output ecs_cluster_name)"
+TASK_DEFINITION_ARN="$(pulumi stack output task_definition_arn)"
+SECURITY_GROUP_ID="$(pulumi stack output security_group_id)"
+PRIMARY_SUBNET_ID="$(pulumi stack output primary_subnet_id)"
+
+aws ecs run-task \
+  --cluster "$CLUSTER_NAME" \
+  --launch-type FARGATE \
+  --task-definition "$TASK_DEFINITION_ARN" \
+  --network-configuration "awsvpcConfiguration={subnets=[$PRIMARY_SUBNET_ID],securityGroups=[$SECURITY_GROUP_ID],assignPublicIp=ENABLED}" \
+  --overrides "{
+    \"containerOverrides\": [
+      {
+        \"name\": \"cdt-orchestrator\",
+        \"command\": [
+          \"historical\",
+          \"--cik-file\", \"s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/inputs/ciks/beta-50k.txt\",
+          \"--start-date\", \"2016-01-01\",
+          \"--end-date\", \"$(date +%F)\"
+        ]
+      }
+    ]
+  }"
+```
 
 ## Check Logs and Artifacts
 
