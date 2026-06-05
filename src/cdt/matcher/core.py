@@ -1082,6 +1082,11 @@ def coerce_optional_text(value: object) -> str | None:
     """Return one trimmed string or None."""
     if value is None:
         return None
+    try:
+        if pd.isna(value):
+            return None
+    except TypeError:
+        pass
     text = str(value).strip()
     return text or None
 

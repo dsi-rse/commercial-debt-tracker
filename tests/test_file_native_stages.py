@@ -24,7 +24,7 @@ from cdt.matcher import (
     match_pending_mentions,
     mention_matches_root,
 )
-from cdt.matcher.core import match_tables
+from cdt.matcher.core import coerce_optional_text, match_tables
 from cdt.storage import artifact_exists, read_dataset, write_partition_table
 
 
@@ -775,6 +775,34 @@ def test_match_tables_supports_incremental_batches_against_existing_clusters() -
     assert tables["debt_instrument"]["debt_instrument_id"].to_list() == ["m-1"]
     assert tables["debt_instrument"]["name"].to_list() == ["Alpha Loan"]
     assert tables["debt_instrument"]["company_name"].to_list() == ["Example Inc."]
+
+
+def test_coerce_optional_text_treats_pandas_nan_as_missing() -> None:
+    """Matcher text coercion should drop pandas null sentinels."""
+    assert coerce_optional_text(pd.NA) is None
+    assert coerce_optional_text(float("nan")) is None
+
+
+def test_match_tables_does_not_emit_literal_nan_company_names() -> None:
+    """Matched instruments should keep missing filer names as null, not 'nan'."""
+    mention = build_mention_row(
+        mention_id="m-1",
+        item_id="item-1",
+        accession_number="0001",
+        cik="320193",
+        date="2024-01-01",
+        name="Alpha Loan",
+        start_date="2024-01-01",
+        amount="$100 million",
+        lenders_json='[{"mentions": [{"text": "Acme Bank"}]}]',
+    )
+    mention["company_name"] = pd.NA
+
+    mentions = pd.DataFrame([mention])
+
+    tables = match_tables(mentions)
+
+    assert tables["debt_instrument"]["company_name"].to_list() == [None]
 
 
 def test_match_tables_retired_of_keeps_separate_clusters_and_updates_parent_end_date() -> (
