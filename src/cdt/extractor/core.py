@@ -1,6 +1,6 @@
 """LLM-backed extractor stage for relevant SEC 8-K items."""
 
-# ruff: noqa: ANN101, D102, D105, D107
+# ruff: noqa: ANN101, ANN102, D102, D105, D107
 
 from __future__ import annotations
 
@@ -235,6 +235,51 @@ class ExtractionRowState:
             "state": self.state,
             "attempts": attempts,
         }
+
+    def to_state_dict(self) -> dict[str, object]:
+        """Return a JSON-serializable snapshot for resumable batch extraction.
+
+        Unlike ``to_audit_dict`` this preserves everything the resumable state
+        machine needs to continue after a process exit: the in-flight
+        ``current_attempt`` (which ``__post_init__`` rebuilds blank), the current
+        stage, ``ner_tagged_xml``, partial mentions, and a native-typed copy of
+        the item fields the stages consume.
+        """
+        return {
+            "item_row": {
+                key: coerce_native(self.item_row.get(key))
+                for key in STATE_ITEM_ROW_FIELDS
+            },
+            "all_attempts": [attempt.to_dict() for attempt in self.all_attempts],
+            "stage_responses": dict(self.stage_responses),
+            "debt_instrument_mentions": self.debt_instrument_mentions,
+            "ner_tagged_xml": self.ner_tagged_xml,
+            "state": self.state,
+            "current_attempt": self.current_attempt.to_dict(),
+        }
+
+    @classmethod
+    def from_state_dict(cls, payload: dict[str, object]) -> ExtractionRowState:
+        """Rebuild a row state previously produced by ``to_state_dict``."""
+        current_attempt = AttemptRecord(
+            **cast(dict[str, Any], payload["current_attempt"])
+        )
+        row_state = cls(
+            item_row=cast(dict[str, object], payload["item_row"]),
+            stage_name=current_attempt.stage_name,
+        )
+        row_state.all_attempts = [
+            AttemptRecord(**cast(dict[str, Any], attempt))
+            for attempt in cast(list[dict[str, object]], payload["all_attempts"])
+        ]
+        row_state.stage_responses = cast(dict[str, str], payload["stage_responses"])
+        row_state.debt_instrument_mentions = cast(
+            list[dict[str, object]], payload["debt_instrument_mentions"]
+        )
+        row_state.ner_tagged_xml = cast(str | None, payload["ner_tagged_xml"])
+        row_state.state = cast(str | None, payload["state"])
+        row_state.current_attempt = current_attempt
+        return row_state
 
 
 class StageSpec(Protocol):
@@ -653,6 +698,41 @@ class InstrumentRelationStage:
 
 MENTIONS_DATASET_NAME = "mentions"
 
+# The ordered extraction stages. They are stateless singletons; the resumable
+# state machine and the synchronous workflow both drive this same list so that
+# audit semantics stay identical across the live and batch backends.
+EXTRACTOR_STAGES: list[StageSpec] = [
+    NERStage(),
+    InstrumentIEStage(),
+    InstrumentRelationStage(),
+]
+STAGE_BY_NAME: dict[str, StageSpec] = {stage.name: stage for stage in EXTRACTOR_STAGES}
+STAGE_INDEX: dict[str, int] = {
+    stage.name: index for index, stage in enumerate(EXTRACTOR_STAGES)
+}
+# Only the item fields the stages actually read are persisted in batch job state.
+STATE_ITEM_ROW_FIELDS = (
+    "item_id",
+    "text",
+    "accession_number",
+    "cik",
+    "company_name",
+    "date",
+    "item",
+)
+
+
+def coerce_native(value: object) -> str | None:
+    """Coerce one pandas/numpy scalar to a JSON-safe native string or None."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return str(value)
+
 
 def mentions_root(
     artifact_root: str | Path | None = None,
@@ -674,6 +754,58 @@ def extracted_tables_path(
     return dataset_root(
         "extractor-runs", artifact_root=artifact_root, data_dir=data_dir
     )
+
+
+def collect_pending_extract_items(
+    *,
+    artifact_root: str | Path | None = None,
+    data_dir: Path | None = None,
+    force: bool = False,
+) -> tuple[list[tuple[dict[str, str | None], str, str]], set[str]]:
+    """Collect relevant items awaiting extraction across pending partitions.
+
+    Returns ``(entries, claimed_paths)`` where each entry is a native-typed item
+    row plus its originating ``(date, shard)``, and ``claimed_paths`` is the set of
+    classification partitions the caller will mark completed once every item in
+    them is terminal. Mirrors the pending-partition selection in
+    ``extract_pending_items`` so the batch backend claims the same work.
+    """
+    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    completed = (
+        set()
+        if force
+        else load_completed_partitions(
+            "extract", artifact_root=resolved_root, data_dir=data_dir
+        )
+    )
+    entries: list[tuple[dict[str, str | None], str, str]] = []
+    claimed_paths: set[str] = set()
+    for classification_path in iter_date_shard_partitions(
+        CLASSIFICATION_DATASET_NAME, artifact_root=resolved_root, data_dir=data_dir
+    ):
+        partition = parse_date_shard_partition(classification_path)
+        target_path = date_shard_partition_path(
+            MENTIONS_DATASET_NAME,
+            partition_date=partition["date"],
+            shard=partition["shard"],
+            artifact_root=resolved_root,
+            data_dir=data_dir,
+        )
+        if not force and artifact_exists(target_path):
+            continue
+        if not force and classification_path in completed:
+            continue
+        claimed_paths.add(classification_path)
+        batch_items = read_table(classification_path, CLASSIFIED_ITEM_COLUMNS).reindex(
+            columns=CLASSIFIED_ITEM_COLUMNS
+        )
+        relevant_items = batch_items.loc[batch_items["relevance"].fillna(False)]
+        for item_row in relevant_items.to_dict("records"):
+            coerced = {
+                key: coerce_native(item_row.get(key)) for key in STATE_ITEM_ROW_FIELDS
+            }
+            entries.append((coerced, partition["date"], partition["shard"]))
+    return entries, claimed_paths
 
 
 def extract_pending_items(
@@ -883,6 +1015,119 @@ def extract_pending_items(
     )
 
 
+def finalize_extract_outputs(
+    row_entries: list[tuple[ExtractionRowState, str, str]],
+    *,
+    claimed_classification_paths: set[str],
+    run_id: str,
+    model: str,
+    reasoning_effort: str,
+    max_attempts: int,
+    artifact_root: str | Path | None = None,
+    data_dir: Path | None = None,
+) -> pd.DataFrame:
+    """Write mention partitions, audit log, and manifests for a completed job.
+
+    This is the batch backend's analogue of the tail of ``extract_pending_items``.
+    Every row in ``row_entries`` must already be terminal; ``claimed_classification_
+    paths`` are marked completed as a set since a job finalizes all its partitions
+    at once. Mentions are regrouped by their originating ``(date, shard)`` partition.
+    """
+    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    mentions_by_partition: dict[tuple[str, str], list[dict[str, object]]] = {}
+    audit_records: list[str] = []
+    failed_rows: list[dict[str, str]] = []
+    for row_state, partition_date, shard in row_entries:
+        audit_records.append(json.dumps(row_state.to_audit_dict(), sort_keys=True))
+        if row_state.state == "SUCCESS":
+            mentions_by_partition.setdefault((partition_date, shard), []).extend(
+                row_state.debt_instrument_mentions
+            )
+        else:
+            failed_rows.append(
+                {
+                    "item_id": row_state.item_id,
+                    "extractor_error": summarize_failure(row_state),
+                }
+            )
+        # Ensure a visited-but-empty partition still exists as a key so we do not
+        # lose track of which partitions the job covered.
+        mentions_by_partition.setdefault((partition_date, shard), [])
+
+    processed_frames: list[pd.DataFrame] = []
+    partitions_written: list[str] = []
+    empty_partitions = 0
+    for (partition_date, shard), mention_rows in sorted(mentions_by_partition.items()):
+        mentions = pd.DataFrame(mention_rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
+        if mentions.empty:
+            empty_partitions += 1
+            continue
+        write_partition_table(
+            mentions_root(resolved_root, data_dir=data_dir),
+            partition={"date": partition_date, "shard": shard},
+            table=mentions.reindex(columns=DEBT_INSTRUMENT_MENTION_COLUMNS),
+        )
+        processed_frames.append(mentions)
+        partitions_written.append(
+            date_shard_partition_path(
+                MENTIONS_DATASET_NAME,
+                partition_date=partition_date,
+                shard=shard,
+                artifact_root=resolved_root,
+                data_dir=data_dir,
+            )
+        )
+
+    completed = load_completed_partitions(
+        "extract", artifact_root=resolved_root, data_dir=data_dir
+    ) | set(claimed_classification_paths)
+    save_completed_partitions(
+        "extract", completed, artifact_root=resolved_root, data_dir=data_dir
+    )
+
+    full_jsonl_path = extractor_run_path(
+        run_id, artifact_root=resolved_root, data_dir=data_dir
+    )
+    write_text_artifact(
+        full_jsonl_path,
+        ("\n".join(audit_records) + "\n") if audit_records else "",
+    )
+    write_json_artifact(
+        run_manifest_path(
+            "extract", run_id, artifact_root=resolved_root, data_dir=data_dir
+        ),
+        {
+            "artifact_root": resolved_root,
+            "stage": "extract",
+            "backend": "batch",
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "max_attempts": max_attempts,
+            "partitions_completed": sorted(claimed_classification_paths),
+            "partitions_written": partitions_written,
+            "empty_partitions_skipped_from_write": empty_partitions,
+            "failure_count": len(failed_rows),
+            "audit_path": full_jsonl_path,
+            "completion_registry": completion_registry_path(
+                "extract", artifact_root=resolved_root, data_dir=data_dir
+            ),
+        },
+    )
+    LOGGER.info(
+        "Batch extractor finalize complete: rows=%s successes=%s failures=%s mentions=%s audit=%s",
+        len(row_entries),
+        len(row_entries) - len(failed_rows),
+        len(failed_rows),
+        sum(len(frame) for frame in processed_frames),
+        full_jsonl_path,
+    )
+    if not processed_frames:
+        return pd.DataFrame(columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
+    return pd.concat(processed_frames, ignore_index=True).reindex(
+        columns=DEBT_INSTRUMENT_MENTION_COLUMNS
+    )
+
+
 def extract_tables(
     classified_items: pd.DataFrame,
     *,
@@ -952,6 +1197,84 @@ def extract_tables(
     }
 
 
+def record_stage_error(row_state: ExtractionRowState, message: str) -> None:
+    """Mark the current attempt as a terminal ERROR for one row."""
+    row_state.current_attempt.validation_errors = [message]
+    row_state.current_attempt.status = "ERROR"
+    row_state.finish("ERROR")
+
+
+def _begin_stage(row_state: ExtractionRowState, stage: StageSpec) -> bool:
+    """Populate the current attempt's messages via ``stage.preprocess``.
+
+    Returns True on success. On a preprocess exception the row is finished as a
+    terminal ERROR (matching the synchronous workflow) and False is returned.
+    """
+    row_state.current_attempt.stage_name = stage.name
+    row_state.current_attempt.messages = []
+    try:
+        row_state.add_messages(stage.preprocess(row_state))
+    except Exception as exc:  # noqa: BLE001
+        record_stage_error(row_state, f"{type(exc).__name__}: {exc}")
+        return False
+    return True
+
+
+def initial_messages(row_state: ExtractionRowState) -> list[dict[str, str]] | None:
+    """Prepare the first request for a fresh row.
+
+    Returns the messages for the first LLM call, or None if the row terminates
+    before any call (a preprocess failure on the first stage).
+    """
+    if not _begin_stage(row_state, EXTRACTOR_STAGES[0]):
+        return None
+    return list(row_state.current_attempt.messages)
+
+
+def handle_response(
+    row_state: ExtractionRowState,
+    response: str,
+    *,
+    max_attempts: int,
+) -> list[dict[str, str]] | None:
+    """Advance one row given the response to its outstanding request.
+
+    Applies the current stage's validate/postprocess, then either advances to the
+    next stage, schedules a retry, or terminates the row. Returns the messages for
+    the next LLM call, or None when the row has reached a terminal state.
+    """
+    stage = STAGE_BY_NAME[row_state.current_attempt.stage_name]
+    stage_index = STAGE_INDEX[stage.name]
+    row_state.add_response(response)
+    failures = stage.validate(row_state, response)
+    row_state.add_validation(failures)
+    if not failures:
+        stage.postprocess(row_state)
+        if stage.early_stop(row_state):
+            row_state.finish("SUCCESS")
+            return None
+        if stage_index == len(EXTRACTOR_STAGES) - 1:
+            row_state.finish("SUCCESS")
+            return None
+        next_stage = EXTRACTOR_STAGES[stage_index + 1]
+        if (
+            next_stage.name == "instrument_relation"
+            and len(row_state.debt_instrument_mentions) <= 1
+        ):
+            row_state.finish("SUCCESS")
+            return None
+        row_state.next_stage(next_stage.name)
+        if not _begin_stage(row_state, next_stage):
+            return None
+        return list(row_state.current_attempt.messages)
+
+    if row_state.current_attempt.attempt_index >= max_attempts:
+        row_state.finish("FAILED")
+        return None
+    row_state.retry(stage.build_retry_message(failures))
+    return list(row_state.current_attempt.messages)
+
+
 async def run_extraction_workflow(
     *,
     item_row: dict[str, object],
@@ -960,67 +1283,23 @@ async def run_extraction_workflow(
     max_attempts: int,
     client: SupportsChatCompletion | None = None,
 ) -> ExtractionRowState:
-    """Run the three-stage extraction workflow for one item row."""
+    """Run the three-stage extraction workflow for one item row (live backend)."""
     resolved_client = client or OpenRouterChatClient()
-    stages: list[StageSpec] = [
-        NERStage(),
-        InstrumentIEStage(),
-        InstrumentRelationStage(),
-    ]
-    row_state = ExtractionRowState(item_row=item_row, stage_name=stages[0].name)
-    for stage_index, stage in enumerate(stages):
-        row_state.current_attempt.stage_name = stage.name
-        row_state.current_attempt.messages = []
+    row_state = ExtractionRowState(
+        item_row=item_row, stage_name=EXTRACTOR_STAGES[0].name
+    )
+    messages = initial_messages(row_state)
+    while messages is not None:
         try:
-            row_state.add_messages(stage.preprocess(row_state))
+            response = await resolved_client.complete(
+                messages=messages,
+                model=model,
+                reasoning_effort=reasoning_effort,
+            )
         except Exception as exc:  # noqa: BLE001
-            row_state.current_attempt.validation_errors = [
-                f"{type(exc).__name__}: {exc}"
-            ]
-            row_state.current_attempt.status = "ERROR"
-            row_state.finish("ERROR")
+            record_stage_error(row_state, f"{type(exc).__name__}: {exc}")
             return row_state
-
-        while True:
-            try:
-                response = await resolved_client.complete(
-                    messages=row_state.current_attempt.messages,
-                    model=model,
-                    reasoning_effort=reasoning_effort,
-                )
-            except Exception as exc:  # noqa: BLE001
-                row_state.current_attempt.validation_errors = [
-                    f"{type(exc).__name__}: {exc}"
-                ]
-                row_state.current_attempt.status = "ERROR"
-                row_state.finish("ERROR")
-                return row_state
-
-            row_state.add_response(response)
-            failures = stage.validate(row_state, response)
-            row_state.add_validation(failures)
-            if not failures:
-                stage.postprocess(row_state)
-                if stage.early_stop(row_state):
-                    row_state.finish("SUCCESS")
-                    return row_state
-                if stage_index == len(stages) - 1:
-                    row_state.finish("SUCCESS")
-                    return row_state
-                if (
-                    stages[stage_index + 1].name == "instrument_relation"
-                    and len(row_state.debt_instrument_mentions) <= 1
-                ):
-                    row_state.finish("SUCCESS")
-                    return row_state
-                row_state.next_stage(stages[stage_index + 1].name)
-                break
-
-            if row_state.current_attempt.attempt_index >= max_attempts:
-                row_state.finish("FAILED")
-                return row_state
-            row_state.retry(stage.build_retry_message(failures))
-    row_state.finish("SUCCESS")
+        messages = handle_response(row_state, response, max_attempts=max_attempts)
     return row_state
 
 
@@ -1097,6 +1376,41 @@ def extract_response_text(response: object) -> str:
                     text_parts.append(text)
         return "".join(text_parts)
     raise RuntimeError("OpenRouter response content was not text.")
+
+
+def extract_batch_response_text(line: dict[str, object]) -> str:
+    """Extract the assistant text from one OpenAI Batch output JSONL line.
+
+    Batch results are plain JSON dicts (not SDK objects). Per-request failures
+    surface either as a top-level ``error`` or a non-200 ``response.status_code``;
+    both raise so the caller can mark the row terminal ERROR.
+    """
+    error = line.get("error")
+    if error:
+        raise RuntimeError(f"Batch request error: {error}")
+    response = cast(dict[str, object], line.get("response") or {})
+    status_code = response.get("status_code")
+    if status_code != 200:  # noqa: PLR2004
+        raise RuntimeError(
+            f"Batch request returned status {status_code}: {response.get('body')}"
+        )
+    body = cast(dict[str, object], response.get("body") or {})
+    choices = cast(list[dict[str, object]], body.get("choices") or [])
+    if not choices:
+        raise RuntimeError("Batch response did not include choices.")
+    message = cast(dict[str, object], choices[0].get("message") or {})
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                text_parts.append(part)
+            elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                text_parts.append(part["text"])
+        return "".join(text_parts)
+    raise RuntimeError("Batch response content was not text.")
 
 
 def collapse_whitespace(value: str) -> str:
