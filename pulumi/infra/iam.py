@@ -137,38 +137,43 @@ task_role = aws.iam.Role(
     tags=config.tags(),
 )
 
-source_bucket = aws.s3.get_bucket_output(bucket=config.bucket_name)
-output_bucket = aws.s3.get_bucket_output(bucket=config.output_bucket_name)
+# S3 bucket ARNs are deterministic, so construct them directly rather than a
+# plan-time aws.s3.get_bucket lookup, which would require cross-account read access
+# to the scraper-managed source bucket just to obtain an ARN (see issue #7).
+bucket_arns = sorted(
+    {
+        f"arn:aws:s3:::{config.bucket_name}",
+        f"arn:aws:s3:::{config.output_bucket_name}",
+    }
+)
 
 aws.iam.RolePolicy(
     "cdt-ecs-task-s3-policy",
     role=task_role.id,
-    policy=pulumi.Output.all(source_bucket.arn, output_bucket.arn).apply(
-        lambda arns: json.dumps(
-            {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Action": ["s3:ListBucket"],
-                        "Resource": sorted(set(arns)),
-                    },
-                    {
-                        "Effect": "Allow",
-                        "Action": [
-                            "s3:GetObject",
-                            "s3:PutObject",
-                            "s3:DeleteObject",
-                            "s3:AbortMultipartUpload",
-                            "s3:CreateMultipartUpload",
-                            "s3:UploadPart",
-                            "s3:CompleteMultipartUpload",
-                            "s3:ListMultipartUploadParts",
-                        ],
-                        "Resource": [f"{arn}/*" for arn in sorted(set(arns))],
-                    },
-                ],
-            }
-        )
+    policy=json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": ["s3:ListBucket"],
+                    "Resource": bucket_arns,
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "s3:GetObject",
+                        "s3:PutObject",
+                        "s3:DeleteObject",
+                        "s3:AbortMultipartUpload",
+                        "s3:CreateMultipartUpload",
+                        "s3:UploadPart",
+                        "s3:CompleteMultipartUpload",
+                        "s3:ListMultipartUploadParts",
+                    ],
+                    "Resource": [f"{arn}/*" for arn in bucket_arns],
+                },
+            ],
+        }
     ),
 )
