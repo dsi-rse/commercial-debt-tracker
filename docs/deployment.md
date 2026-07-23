@@ -10,8 +10,8 @@ The deployed stack contains:
 - one ECS cluster and Fargate task definition
 - task execution and runtime IAM roles
 - a CloudWatch log group
-- one EventBridge Scheduler schedule for daily runs
-- Secrets Manager secrets for `OPENROUTER_API_KEY` and `SEC_USER_AGENT`
+- two EventBridge Scheduler schedules: a daily `cdt-orchestrator daily` and an hourly `cdt-orchestrator poll`
+- Secrets Manager secrets for `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, and `SEC_USER_AGENT`
 
 The ECS task runs the `cdt-orchestrator` console script from [dockerfiles/Dockerfile.orchestrator](../dockerfiles/Dockerfile.orchestrator).
 
@@ -28,22 +28,22 @@ The task definition injects these environment variables directly:
 
 It injects these secrets:
 
+- `OPENAI_API_KEY`
 - `OPENROUTER_API_KEY`
 - `SEC_USER_AGENT`
 
-The scheduler target overrides the container command to:
-
-```text
-daily
-```
-
-That means scheduled production runs are always equivalent to:
+The daily scheduler target overrides the container command to `daily`, and the hourly
+poll scheduler target overrides it to `poll`. Scheduled production runs are therefore
+equivalent to:
 
 ```bash
-cdt-orchestrator daily
+cdt-orchestrator daily   # daily schedule: ingest/itemize/classify + match/finalize, submits no extract
+cdt-orchestrator poll    # hourly schedule: advances the OpenAI batch extract job one step
 ```
 
-Historical runs are never scheduled automatically.
+`daily` uses the OpenAI batch extract backend by default and defers extraction to the
+poller. Historical runs are never scheduled automatically and use the synchronous
+OpenRouter backend.
 
 ## CI/CD Flow
 
@@ -75,8 +75,15 @@ Required `idi:` Pulumi config:
 - `bucket_name`
 - `default_cik_file`
 - `shared_dlq_name`
+- `openai_api_key` as a secret
 - `openrouter_api_key` as a secret
 - `sec_user_agent` as a secret
+
+Set the OpenAI key with:
+
+```bash
+pulumi config set --secret idi:openai_api_key <key>
+```
 
 Common optional config:
 
@@ -86,8 +93,9 @@ Common optional config:
 - `app_name`
 - `cpu`
 - `memory`
-- `cron`
-- `schedule_enabled`
+- `cron` (daily schedule; default `cron(0 8 * * ? *)`)
+- `poll_cron` (hourly extract poll; default `cron(30 * * * ? *)`, offset from the daily run)
+- `schedule_enabled` (gates both the daily and poll schedules)
 - `log_retention_days`
 - `ecr_image_retention_count`
 
@@ -122,14 +130,23 @@ If `output_bucket_name` is omitted, Pulumi reuses `bucket_name` for outputs.
 Normal daily processing is:
 
 1. GitHub deploys code and infrastructure
-2. EventBridge Scheduler runs one ECS task per day
-3. the task executes `cdt-orchestrator daily`
-4. outputs land under the configured artifact root in S3
-5. if `FINAL_DATABASE_ROOT` is set, four final parquet snapshots are written:
-   `items/latest.parquet`, `debt-instruments/latest.parquet`,
-   `debt-instrument-mentions/latest.parquet`, and
+2. the daily EventBridge Scheduler runs one ECS task that executes `cdt-orchestrator daily`:
+   ingest → itemize → classify, then match + finalize on existing mentions. It submits no
+   extract batch itself.
+3. the hourly EventBridge Scheduler runs `cdt-orchestrator poll`, which starts an OpenAI
+   batch extract job when classified work is pending and advances it one step per tick
+   (extraction can span multiple hours/days per its 24h batch windows)
+4. when an extract job completes, that poll tick writes new `mentions` partitions and
+   re-runs match + finalize
+5. outputs land under the configured artifact root in S3, and if `FINAL_DATABASE_ROOT` is
+   set, four final parquet snapshots are written: `items/latest.parquet`,
+   `debt-instruments/latest.parquet`, `debt-instrument-mentions/latest.parquet`, and
    `mention-cluster-edges/latest.parquet`
 6. the dashboard publisher in `../commercial-debt-tracker-dashboard` can then read those parquet snapshots and publish `generated/*` JSON to R2
+
+Because extraction is asynchronous, final snapshots for a given filing date can lag the
+daily run by up to a few days. The daily run still refreshes match/final outputs from
+whatever mentions already exist, so previously extracted instruments stay current.
 
 Local note:
 

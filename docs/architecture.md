@@ -13,7 +13,7 @@ The pipeline runs in five stages:
 3. `classify`
    Uses a local TF-IDF plus linear SVC model to mark item sections as relevant or irrelevant before any LLM call.
 4. `extract`
-   Uses OpenRouter-backed chat completions to extract structured debt-instrument mentions from relevant items, and writes a full per-run audit log.
+   Extracts structured debt-instrument mentions from relevant items and writes a full per-run audit log. Two backends exist: a synchronous `live` backend (OpenRouter chat completions) and the deployed `batch` backend (OpenAI Batch API). See "Extractor Design" below.
 5. `match`
    Consolidates mention rows into debt instruments and writes instrument-level outputs partitioned by CIK shard.
 
@@ -53,16 +53,26 @@ The stage boundaries are mostly cost and recovery boundaries.
 - `extract` is isolated because it is the most expensive and least deterministic stage; it also records `extractor-runs/run_id=.../full.jsonl` for auditability.
 - `match` is deterministic and cheap enough to rerun from mention outputs.
 
-## Daily Versus Historical Runs
+## Daily Versus Historical Versus Poll Runs
 
-Two execution modes exist:
+Three execution modes exist:
 
 - `daily`
-  Defaults to yesterday's filing date when no dates are provided.
+  Defaults to yesterday's filing date when no dates are provided. With the default
+  `batch` backend it runs ingest → itemize → classify and refreshes match/final
+  snapshots, but does not run the LLM extract stage; extraction is submitted and
+  advanced asynchronously by `poll`.
+- `poll`
+  Runs on an hourly schedule and advances the OpenAI batch extract job by one tick
+  (see "Extractor Design"). It never ingests; it only moves extraction forward and,
+  when a job completes, re-runs match + finalize.
 - `historical`
-  Requires explicit dates in the deployed orchestrator and is intended for backfills.
+  Requires explicit dates and is intended for backfills. Historical always uses the
+  synchronous `live` extract backend so a single command produces final outputs.
 
-The scheduler only runs `daily`. Historical runs are manual by design so wide backfills are deliberate, observable operations.
+The scheduler runs `daily` (once a day) and `poll` (hourly). Historical runs are manual
+by design so wide backfills are deliberate, observable operations. `daily
+--extractor-backend live` restores the original fully synchronous single-run behavior.
 
 ## Classifier Design
 
@@ -83,6 +93,39 @@ The extractor uses a multi-step validation workflow rather than accepting raw mo
 - every attempt is recorded in the extractor audit log
 
 This is why CDT can tolerate LLM use in a batch pipeline without treating the model output as unverified truth.
+
+### Live versus batch backends
+
+The stage objects (`preprocess`/`validate`/`postprocess`/`early_stop`/`build_retry_message`)
+are pure and backend-agnostic. Two backends drive them:
+
+- The `live` backend (`OpenRouterChatClient`) runs the workflow synchronously, one item
+  and one LLM call at a time. It is used for local development, `cdt extract`,
+  `cdt pipeline`, and `historical` runs.
+- The `batch` backend (`OpenAIBatchClient`) drives the same stages asynchronously through
+  OpenAI's Batch API (~50% cheaper, up to 24h per round). This is the deployed default.
+
+### The batch extract state machine
+
+Because each item flows through several sequential stages, each retryable, and each batch
+round can take up to a day, a single run can span many days. Rather than block an ECS task
+for days, extraction is a resumable, file-native state machine advanced by the hourly
+`poll` tick. `poll` is the sole writer of extract-job state, so it never races the daily
+schedule.
+
+Each tick:
+
+1. reconciles any OpenAI batch tagged with the active job but not yet recorded (crash recovery),
+2. folds results from any completed batch into per-item states via the same
+   validate/postprocess/retry logic as the live backend,
+3. submits the next batch for every item still needing a call (advancing and retrying together),
+4. persists item states before creating batches, so a crash is always recoverable,
+5. and, when every item is terminal, writes the `mentions` partitions, audit log, and
+   completion registry, then clears the active-job marker so match + finalize can run.
+
+Whole-batch failures terminate their items rather than looping forever; expired batches
+salvage whatever completed and re-submit the rest. Job state lives under
+`extract-batches/` (see [schema.md](schema.md)).
 
 ## Matcher Design
 

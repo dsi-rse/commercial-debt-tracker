@@ -15,6 +15,7 @@ The pipeline can also write optional final snapshot parquet files under a separa
   mention-cluster-edges/
   debt-instruments/
   extractor-runs/
+  extract-batches/
   runs/
   failures/
 ```
@@ -270,6 +271,24 @@ Extractor writes a per-run manifest and a matching full audit log:
 <artifact-root>/runs/extract/run_id=<run_id>.json
 <artifact-root>/extractor-runs/run_id=<run_id>/full.jsonl
 ```
+
+### Extract batch job state
+
+The OpenAI batch extract backend keeps its resumable, file-native job state under
+`extract-batches/`. Only the hourly `poll` run writes here.
+
+```text
+<artifact-root>/extract-batches/
+  active.json                        # {"job_id": ...}; job_id is null when idle
+  job_id=<run_id>/manifest.json      # static job config + claimed classification partitions
+  job_id=<run_id>/state.jsonl        # one line per item: source partition + resumable row state
+  job_id=<run_id>/batches.json       # in-flight OpenAI batches, seen batch ids, tick counter
+  job_id=<run_id>/ticks/tick=<n>.json  # per-tick audit counts
+```
+
+When a job finishes, its mentions are written to the canonical `mentions` partitions and its
+audit log to `extractor-runs/run_id=<run_id>/full.jsonl`, exactly like the synchronous
+backend. `state.jsonl` and `batches.json` are working state, not canonical outputs.
 
 ### Failure registries
 
