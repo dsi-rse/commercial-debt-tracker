@@ -24,3 +24,5 @@ config:
     secure: v1:2sWon0zNba5YzKwF:KdPSiAjBIzQvRCAcfQkv9TFFovBhnh69kYp7ZPcnbptt/Cgvcft+/sH6aRk8AtlzhxjNm52+PnMWT2nCtrQwh2VzSNYc6hURNMyIdttP4xc=
   idi:r2_account_id:
     secure: v1:S+wdreBEEi6P7v4L:FD6V3cfme81ZseiwCkAZWt1kmIjQmwnYypi8InpSNyujf/inZdjoF0/krVVtqTYQ
+  idi:openai_api_key:
+    secure: v1:PC/thd4iayGR794A:bIyoe5nxnusKD4h9sO3qo6XmROzmu5ZXfyX17qGVwqGAmhNig3sNaqP433/mrEpNCvC7q0gPhvlJDtF1S7uYFKg/8pdU8ii7G3jszE9R0UYRbMGnkr9+IN6mFiucEKVXvYu9fmxoeOFFPjL5S+LxM3zlNSs5bVT7ZgOvoDymQKbKrfBze72A19U5w8bFbwIjqxwlur7zmgY3VsWdgcgmpNlqv3uZ+btsDFT3Mc3TyZO/JXpI
