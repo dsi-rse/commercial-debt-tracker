@@ -1,0 +1,514 @@
+"""Tests for the OpenAI Batch extraction backend and resumable state machine."""
+
+# ruff: noqa: ANN101, D102, D107
+
+from __future__ import annotations
+
+import asyncio
+import json
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+from cdt.classifier import classifications_root
+from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
+from cdt.datasets import completion_registry_path
+from cdt.extractor import advance_extract_job, mentions_root
+from cdt.extractor.batch import (
+    BatchStatus,
+    JobState,
+    RowEntry,
+    _reconcile_orphans,
+    active_job_path,
+    build_request_body,
+    normalize_batch_model,
+)
+from cdt.extractor.core import (
+    ExtractionRowState,
+    extract_batch_response_text,
+    handle_response,
+    initial_messages,
+    load_prompt,
+    run_extraction_workflow,
+)
+from cdt.storage import (
+    artifact_exists,
+    read_dataset,
+    read_json_artifact,
+    write_partition_table,
+)
+
+# --------------------------------------------------------------------------- #
+# Canned prompts/responses that exercise all three stages deterministically
+# --------------------------------------------------------------------------- #
+
+NODEBT_TEXT = "This is the extracted event text."
+NODEBT_NER = "<body>This is the extracted event text.</body>"
+
+MULTI_TEXT = "Company entered into a Term Loan on January 1, 2024."
+MULTI_NER = (
+    "<body>Company entered into a <debt_instrument>Term Loan</debt_instrument> "
+    "on <date>January 1, 2024</date>.</body>"
+)
+MULTI_IE = json.dumps(
+    [
+        {
+            "name": ["tag-1"],
+            "start_date": {"evidence": ["tag-2"], "normalized_date": "2024-01-01"},
+        }
+    ]
+)
+
+_NER_PROMPT = load_prompt("ner")
+_IE_PROMPT = load_prompt("instrument_ie")
+_RELATION_PROMPT = load_prompt("instrument_relation")
+
+
+def _detect_stage(body: dict[str, object]) -> str:
+    system = body["messages"][0]["content"]  # type: ignore[index]
+    if system == _NER_PROMPT:
+        return "ner"
+    if system == _IE_PROMPT:
+        return "instrument_ie"
+    if system == _RELATION_PROMPT:
+        return "instrument_relation"
+    raise AssertionError("Unrecognized system prompt in request body.")
+
+
+def _item_row(item_id: str, text: str) -> dict[str, str | None]:
+    return {
+        "item_id": item_id,
+        "text": text,
+        "accession_number": "000000000000000000",
+        "cik": "320193",
+        "company_name": "Example Inc.",
+        "date": "2024-01-02",
+        "item": "8.01",
+    }
+
+
+def seed_classification(
+    tmp_path: Path,
+    items: list[dict[str, object]],
+    *,
+    date: str = "2024-01-02",
+    shard: str = "0001",
+) -> str:
+    """Write one canonical classification partition for the given items."""
+    rows: list[dict[str, object]] = []
+    for item in items:
+        row: dict[str, object] = {column: None for column in CLASSIFIED_ITEM_COLUMNS}
+        row.update(
+            {
+                "item_id": item["item_id"],
+                "text": item.get("text", ""),
+                "accession_number": item.get("accession_number", "000000000000000000"),
+                "cik": item.get("cik", "320193"),
+                "company_name": "Example Inc.",
+                "date": date,
+                "item": "8.01",
+                "label": "relevant" if item.get("relevance", True) else "irrelevant",
+                "relevance": item.get("relevance", True),
+                "classification_score": 1.0,
+            }
+        )
+        rows.append(row)
+    table = pd.DataFrame(rows).reindex(columns=CLASSIFIED_ITEM_COLUMNS)
+    return write_partition_table(
+        classifications_root(tmp_path),
+        partition={"date": date, "shard": shard},
+        table=table,
+    )
+
+
+class FakeBatchClient:
+    """In-memory SupportsBatchClient that completes batches immediately.
+
+    ``scripts`` maps item_id -> {stage_name: response_spec}. A spec is either a
+    string (successful assistant text), ``("error", message)``, or ``("missing",)``
+    to omit the result. ``forced_status`` overrides the OpenAI status for a batch
+    by its submission index (0-based).
+    """
+
+    def __init__(
+        self,
+        scripts: dict[str, dict[str, object]],
+        *,
+        forced_status: dict[int, str] | None = None,
+    ) -> None:
+        self.scripts = scripts
+        self.forced_status = forced_status or {}
+        self.batches: dict[str, dict[str, object]] = {}
+        self._submit_count = 0
+        self.submitted: list[tuple[str, list[str]]] = []
+
+    def submit(
+        self, requests: list[dict[str, object]], *, metadata: dict[str, str]
+    ) -> str:
+        index = self._submit_count
+        self._submit_count += 1
+        batch_id = f"batch-{index}"
+        status = self.forced_status.get(index, "completed")
+        out_lines: list[str] = []
+        err_lines: list[str] = []
+        if status not in {"failed", "cancelled", "expired"}:
+            for request in requests:
+                custom_id = str(request["custom_id"])
+                stage = _detect_stage(request["body"])  # type: ignore[arg-type]
+                spec = self.scripts[custom_id][stage]
+                if isinstance(spec, tuple) and spec[0] == "error":
+                    err_lines.append(
+                        json.dumps(
+                            {"custom_id": custom_id, "error": {"message": spec[1]}}
+                        )
+                    )
+                elif isinstance(spec, tuple) and spec[0] == "missing":
+                    continue
+                else:
+                    out_lines.append(
+                        json.dumps(
+                            {
+                                "custom_id": custom_id,
+                                "response": {
+                                    "status_code": 200,
+                                    "body": {
+                                        "choices": [{"message": {"content": str(spec)}}]
+                                    },
+                                },
+                            }
+                        )
+                    )
+        self.batches[batch_id] = {
+            "status": status,
+            "metadata": metadata,
+            "input": requests,
+            "out": "\n".join(out_lines),
+            "err": "\n".join(err_lines),
+        }
+        self.submitted.append(
+            (batch_id, [str(request["custom_id"]) for request in requests])
+        )
+        return batch_id
+
+    def retrieve(self, batch_id: str) -> BatchStatus:
+        record = self.batches[batch_id]
+        return BatchStatus(
+            id=batch_id,
+            status=str(record["status"]),
+            input_file_id=f"{batch_id}-in",
+            output_file_id=f"{batch_id}-out" if record["out"] else None,
+            error_file_id=f"{batch_id}-err" if record["err"] else None,
+        )
+
+    def download_file(self, file_id: str) -> str:
+        batch_id, kind = file_id.rsplit("-", 1)
+        record = self.batches[batch_id]
+        if kind == "out":
+            return str(record["out"])
+        if kind == "err":
+            return str(record["err"])
+        if kind == "in":
+            return "\n".join(
+                json.dumps(request)
+                for request in list(record["input"])  # type: ignore[arg-type]
+            )
+        raise KeyError(file_id)
+
+    def list_job_batches(self, job_id: str) -> list[BatchStatus]:
+        return [
+            self.retrieve(batch_id)
+            for batch_id, record in self.batches.items()
+            if dict(record["metadata"]).get("job_id") == job_id  # type: ignore[arg-type]
+        ]
+
+
+class ScriptedChatClient:
+    """Fake SupportsChatCompletion returning a fixed response sequence."""
+
+    def __init__(self, responses: list[str]) -> None:
+        self.responses = responses
+        self.index = 0
+
+    async def complete(
+        self, *, messages: list[dict[str, str]], model: str, reasoning_effort: str
+    ) -> str:
+        del messages, model, reasoning_effort
+        response = self.responses[self.index]
+        self.index += 1
+        return response
+
+
+def _drive_resumable(
+    item_row: dict[str, object], responses: list[str], max_attempts: int
+) -> ExtractionRowState:
+    row_state = ExtractionRowState(item_row=item_row, stage_name="ner")
+    messages = initial_messages(row_state)
+    index = 0
+    while messages is not None:
+        response = responses[index]
+        index += 1
+        messages = handle_response(row_state, response, max_attempts=max_attempts)
+    return row_state
+
+
+# --------------------------------------------------------------------------- #
+# Resumable state-machine parity with the synchronous workflow
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "text,responses",
+    [
+        (NODEBT_TEXT, [NODEBT_NER]),
+        (MULTI_TEXT, [MULTI_NER, MULTI_IE]),
+        ("bad", ["not xml", "still not xml", "nope"]),
+    ],
+)
+def test_resumable_matches_sync_workflow(text: str, responses: list[str]) -> None:
+    """The resumable machine must produce the same audit as the sync loop."""
+    item_row = _item_row("item-1", text)
+    sync_state = asyncio.run(
+        run_extraction_workflow(
+            item_row=dict(item_row),
+            model="m",
+            reasoning_effort="none",
+            max_attempts=3,
+            client=ScriptedChatClient(list(responses)),
+        )
+    )
+    resumable_state = _drive_resumable(dict(item_row), list(responses), max_attempts=3)
+    assert resumable_state.to_audit_dict() == sync_state.to_audit_dict()
+
+
+def test_early_stop_and_multi_stage_states() -> None:
+    """Confirm the crafted responses reach the intended terminal states."""
+    nodebt = _drive_resumable(_item_row("a", NODEBT_TEXT), [NODEBT_NER], 3)
+    assert nodebt.state == "SUCCESS"
+    assert nodebt.debt_instrument_mentions == []
+
+    multi = _drive_resumable(_item_row("b", MULTI_TEXT), [MULTI_NER, MULTI_IE], 3)
+    assert multi.state == "SUCCESS"
+    assert len(multi.debt_instrument_mentions) == 1
+    assert multi.debt_instrument_mentions[0]["name"] == "Term Loan"
+
+
+# --------------------------------------------------------------------------- #
+# state.jsonl round-trip
+# --------------------------------------------------------------------------- #
+
+
+def test_state_dict_round_trip_midflight() -> None:
+    """Serializing a mid-flight row and resuming yields the same result."""
+    row_state = ExtractionRowState(
+        item_row=_item_row("b", MULTI_TEXT), stage_name="ner"
+    )
+    initial_messages(row_state)
+    # Advance past NER so the row is mid-flight awaiting the instrument_ie response.
+    handle_response(row_state, MULTI_NER, max_attempts=3)
+    assert row_state.state is None
+    assert row_state.current_attempt.stage_name == "instrument_ie"
+
+    restored = ExtractionRowState.from_state_dict(row_state.to_state_dict())
+    assert restored.to_state_dict() == row_state.to_state_dict()
+
+    finished = handle_response(restored, MULTI_IE, max_attempts=3)
+    assert finished is None
+    assert restored.state == "SUCCESS"
+    assert len(restored.debt_instrument_mentions) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Full poll-driven job lifecycle
+# --------------------------------------------------------------------------- #
+
+
+def _advance(tmp_path: Path, client: FakeBatchClient) -> object:
+    return advance_extract_job(
+        batch_client=client,
+        artifact_root=tmp_path,
+        model="gpt-5.4",
+        reasoning_effort="none",
+        max_attempts=3,
+    )
+
+
+def test_job_lifecycle_completes_and_writes_mentions(tmp_path: Path) -> None:
+    """A two-item job advances across ticks and finalizes mentions."""
+    seed_classification(
+        tmp_path,
+        [
+            {"item_id": "item-nodebt", "text": NODEBT_TEXT},
+            {"item_id": "item-multi", "text": MULTI_TEXT},
+        ],
+    )
+    client = FakeBatchClient(
+        {
+            "item-nodebt": {"ner": NODEBT_NER},
+            "item-multi": {"ner": MULTI_NER, "instrument_ie": MULTI_IE},
+        }
+    )
+
+    first = _advance(tmp_path, client)
+    assert first.status == "submitted"
+    assert artifact_exists(active_job_path(str(tmp_path)))
+
+    second = _advance(tmp_path, client)
+    assert second.status == "submitted"
+
+    third = _advance(tmp_path, client)
+    assert third.status == "completed"
+
+    written = read_dataset(mentions_root(tmp_path))
+    assert written["name"].to_list() == ["Term Loan"]
+
+    completed = read_json_artifact(
+        completion_registry_path("extract", artifact_root=tmp_path)
+    )
+    assert len(completed["source_partitions"]) == 1
+
+    # Active marker cleared; a subsequent tick is idle (nothing pending).
+    idle = _advance(tmp_path, client)
+    assert idle.status == "idle"
+
+
+def test_empty_job_finalizes_immediately(tmp_path: Path) -> None:
+    """A partition with no relevant items completes in one tick with no batch."""
+    seed_classification(
+        tmp_path, [{"item_id": "item-x", "text": NODEBT_TEXT, "relevance": False}]
+    )
+    client = FakeBatchClient({})
+
+    result = _advance(tmp_path, client)
+
+    assert result.status == "completed"
+    assert client.submitted == []
+    completed = read_json_artifact(
+        completion_registry_path("extract", artifact_root=tmp_path)
+    )
+    assert len(completed["source_partitions"]) == 1
+
+
+def test_request_error_terminates_row(tmp_path: Path) -> None:
+    """A per-request error marks the row ERROR without blocking completion."""
+    seed_classification(tmp_path, [{"item_id": "item-multi", "text": MULTI_TEXT}])
+    client = FakeBatchClient({"item-multi": {"ner": ("error", "content filtered")}})
+
+    assert _advance(tmp_path, client).status == "submitted"
+    assert _advance(tmp_path, client).status == "completed"
+
+    assert read_dataset(mentions_root(tmp_path)).empty
+    audit = list((tmp_path / "extractor-runs").glob("run_id=*/full.jsonl"))
+    assert len(audit) == 1
+    assert '"state": "ERROR"' in audit[0].read_text(encoding="utf-8")
+
+
+def test_expired_batch_resubmits_missing_items(tmp_path: Path) -> None:
+    """An expired batch salvages nothing and resubmits the item next tick."""
+    seed_classification(tmp_path, [{"item_id": "item-multi", "text": MULTI_TEXT}])
+    client = FakeBatchClient(
+        {"item-multi": {"ner": MULTI_NER, "instrument_ie": MULTI_IE}},
+        forced_status={0: "expired"},
+    )
+
+    statuses = [_advance(tmp_path, client).status for _ in range(4)]
+
+    assert statuses[-1] == "completed"
+    # The NER request was submitted twice: the expired batch and its resubmission.
+    ner_submissions = [ids for _, ids in client.submitted if "item-multi" in ids]
+    assert len(ner_submissions) >= 3  # b0 (expired NER), b1 (NER), b2 (IE)
+    assert read_dataset(mentions_root(tmp_path))["name"].to_list() == ["Term Loan"]
+
+
+def test_failed_batch_marks_rows_error(tmp_path: Path) -> None:
+    """A whole-batch failure terminates its rows rather than looping forever."""
+    seed_classification(tmp_path, [{"item_id": "item-multi", "text": MULTI_TEXT}])
+    client = FakeBatchClient(
+        {"item-multi": {"ner": MULTI_NER}}, forced_status={0: "failed"}
+    )
+
+    assert _advance(tmp_path, client).status == "submitted"
+    assert _advance(tmp_path, client).status == "completed"
+    assert read_dataset(mentions_root(tmp_path)).empty
+
+
+def test_reconcile_adopts_orphan_batch(tmp_path: Path) -> None:
+    """A batch tagged for the job but never recorded is adopted on the next tick."""
+    client = FakeBatchClient({"item-1": {"ner": NODEBT_NER}})
+    row_state = ExtractionRowState(
+        item_row=_item_row("item-1", NODEBT_TEXT), stage_name="ner"
+    )
+    initial_messages(row_state)
+    orphan_id = client.submit(
+        [
+            {
+                "custom_id": "item-1",
+                "method": "POST",
+                "url": "/v1/chat/completions",
+                "body": {
+                    "model": "gpt-5.4",
+                    "messages": row_state.current_attempt.messages,
+                },
+            }
+        ],
+        metadata={"job_id": "J", "tick": "0"},
+    )
+    job = JobState(
+        job_id="J",
+        model="gpt-5.4",
+        reasoning_effort="none",
+        max_attempts=3,
+        claimed_partitions=[],
+        rows={"item-1": RowEntry(row_state=row_state, date="2024-01-02", shard="0001")},
+    )
+
+    _reconcile_orphans(str(tmp_path), job, client)
+
+    assert [record.batch_id for record in job.batches] == [orphan_id]
+    assert job.batches[0].custom_ids == ["item-1"]
+    assert orphan_id in job.all_batch_ids
+
+
+# --------------------------------------------------------------------------- #
+# Small unit helpers
+# --------------------------------------------------------------------------- #
+
+
+def test_extract_batch_response_text_variants() -> None:
+    """Success lines return text; error and non-200 lines raise."""
+    ok = {
+        "custom_id": "x",
+        "response": {
+            "status_code": 200,
+            "body": {"choices": [{"message": {"content": "hi"}}]},
+        },
+    }
+    assert extract_batch_response_text(ok) == "hi"
+
+    with pytest.raises(RuntimeError):
+        extract_batch_response_text({"custom_id": "x", "error": {"message": "boom"}})
+
+    with pytest.raises(RuntimeError):
+        extract_batch_response_text(
+            {"custom_id": "x", "response": {"status_code": 400, "body": {}}}
+        )
+
+
+def test_build_request_body_reasoning_and_model() -> None:
+    """Model prefixes are stripped and reasoning_effort is mapped/validated."""
+    assert normalize_batch_model("openai/gpt-5.4") == "gpt-5.4"
+    assert normalize_batch_model("gpt-5.4") == "gpt-5.4"
+
+    body = build_request_body(
+        [{"role": "user", "content": "x"}],
+        model="openai/gpt-5.4",
+        reasoning_effort="none",
+    )
+    assert body == {"model": "gpt-5.4", "messages": [{"role": "user", "content": "x"}]}
+
+    body = build_request_body([], model="gpt-5.4", reasoning_effort="medium")
+    assert body["reasoning_effort"] == "medium"
+    assert "temperature" not in body
+
+    with pytest.raises(ValueError, match="reasoning_effort"):
+        build_request_body([], model="gpt-5.4", reasoning_effort="ludicrous")
