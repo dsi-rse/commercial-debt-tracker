@@ -12,10 +12,10 @@ The `dev` stack provisions:
 - an ECS Fargate cluster and task definition
 - IAM roles for ECS execution and runtime access
 - a CloudWatch log group
-- an EventBridge Scheduler schedule
-- Secrets Manager secrets for `OPENROUTER_API_KEY` and `SEC_USER_AGENT`
+- two EventBridge Scheduler schedules: a daily `cdt-orchestrator daily` and an hourly `cdt-orchestrator poll`
+- Secrets Manager secrets for `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, and `SEC_USER_AGENT`
 
-The scheduled task runs `cdt-orchestrator daily`. Historical runs are manual ECS task invocations with a container command override.
+The daily task runs `cdt-orchestrator daily`; the hourly task runs `cdt-orchestrator poll` to advance the OpenAI batch extract job. Historical runs are manual ECS task invocations with a container command override.
 
 ## Dev Values
 
@@ -40,6 +40,36 @@ Notes:
 
 - `cron(0 7 * * ? *)` runs at `2:00 AM CDT` on May 31, 2026. Because EventBridge Scheduler cron expressions are UTC-based here, that becomes `1:00 AM CST` in winter.
 - `idi:schedule_enabled = false` is deliberate for the first deploy. Create the infrastructure, run a manual task, inspect outputs, and only then enable the daily schedule.
+
+## Local Setup (direnv + make)
+
+The quickest local setup uses [direnv](https://direnv.net) and the `make infra-*`
+targets, so you never re-export AWS creds or the Pulumi passphrase by hand.
+
+1. Copy `.envrc.example` to `.envrc` (or use the committed `.envrc` as-is) and put your
+   secrets in `.env` (gitignored) — at minimum `PULUMI_CONFIG_PASSPHRASE` (from the Core
+   Facility Bitwarden) and `OPENAI_API_KEY`. Then trust the directory:
+
+```bash
+direnv allow
+```
+
+`.envrc` loads `.env` and exports `AWS_PROFILE=idi-analysis`, `AWS_REGION=us-east-2`, and
+`AWS_SDK_LOAD_CONFIG=1`, so AWS resolves the SSO profile (and its cached token) directly —
+no exported temporary credentials that vanish between shells.
+
+2. Log into the S3 Pulumi backend once per session and preview/deploy:
+
+```bash
+make infra-login      # aws sso login if the session is dead, then pulumi login s3://...
+make infra-preview    # preview the dev stack (PULUMI_STACK=prod to target prod)
+make infra-up         # deploy
+```
+
+`make infra-outputs` prints stack outputs. The `infra-*` targets inline the AWS profile and
+region, so they work even in a fresh shell without direnv.
+
+The rest of this section documents the equivalent manual steps.
 
 ## Prerequisites
 
@@ -104,8 +134,12 @@ pulumi config set idi:ecr_image_retention_count 5
 pulumi config set idi:cron "cron(0 7 * * ? *)"
 pulumi config set idi:schedule_enabled false
 pulumi config set --secret idi:openrouter_api_key <openrouter-api-key>
+pulumi config set --secret idi:openai_api_key <openai-api-key>
 pulumi config set --secret idi:sec_user_agent "Trevor Spreadbury dsicorefacility_project3@uchicago.edu"
 ```
+
+`idi:openai_api_key` is required — it powers the deployed OpenAI batch extract poller. The
+optional `idi:poll_cron` (default `cron(30 * * * ? *)`) controls the hourly poll schedule.
 
 This processor stack does not publish Cloudflare R2 JSON. It writes final parquet snapshots under `idi:final_database_prefix`; the dashboard publisher stack in `../commercial-debt-tracker-dashboard` reads those snapshots and updates R2.
 
