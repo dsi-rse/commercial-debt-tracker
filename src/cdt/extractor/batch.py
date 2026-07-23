@@ -1,0 +1,699 @@
+"""OpenAI Batch API backend and poll-driven state machine for extraction.
+
+The synchronous extractor (``cdt.extractor.core``) drives the same stage objects
+through live OpenRouter chat completions. This module instead advances those
+stages asynchronously through OpenAI's Batch API, which is ~50% cheaper but can
+take up to 24h per round. Because the workflow is several sequential, retryable
+stages, a single item can take many rounds, so the state machine is fully
+resumable and file-native: an hourly ``poll`` tick loads job state from the
+artifact root, folds any completed OpenAI batch results into row states, submits
+the next batch for rows that still need a call, and persists everything back.
+
+Layout under ``{artifact_root}/extract-batches/``::
+
+    active.json                 # {"job_id": ...}; absent when idle
+    job_id=<id>/manifest.json   # static job config + claimed partitions
+    job_id=<id>/state.jsonl     # one line per item: source partition + row state
+    job_id=<id>/batches.json    # in-flight batches, seen batch ids, tick counter
+    job_id=<id>/ticks/tick=<n>.json  # per-tick audit counts
+
+Only the ``poll`` mode ever mutates this state, so there is no shared-writer race
+with the ``daily`` schedule.
+"""
+
+# ruff: noqa: ANN101, ANN102, D102, D105, D107
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Protocol, cast
+
+import pandas as pd
+
+from cdt import settings
+from cdt.datasets import dataset_root, resolve_artifact_root
+from cdt.extractor.core import (
+    DEBT_INSTRUMENT_MENTION_COLUMNS,
+    DEFAULT_MAX_ATTEMPTS,
+    ExtractionRowState,
+    collect_pending_extract_items,
+    extract_batch_response_text,
+    finalize_extract_outputs,
+    handle_response,
+    initial_messages,
+    record_stage_error,
+)
+from cdt.shared import get_logger
+from cdt.storage import (
+    ArtifactPath,
+    artifact_exists,
+    join_artifact_path,
+    read_json_artifact,
+    read_text_artifact,
+    write_json_artifact,
+    write_text_artifact,
+)
+
+LOGGER = get_logger(__name__)
+
+EXTRACT_BATCHES_DATASET = "extract-batches"
+ACTIVE_JOB_FILENAME = "active.json"
+BATCH_ENDPOINT = "/v1/chat/completions"
+BATCH_COMPLETION_WINDOW = "24h"
+MAX_CUSTOM_ID_LENGTH = 64
+# Stay comfortably under OpenAI's 50k-requests-per-batch limit.
+DEFAULT_MAX_REQUESTS_PER_BATCH = 40_000
+DEFAULT_BATCH_MODEL = "gpt-5.4"
+# OpenAI reasoning_effort vocabulary (distinct from OpenRouter's "none"/"xhigh").
+OPENAI_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
+# OpenAI batch statuses whose results we fold into row states.
+RESULT_STATUSES = frozenset({"completed", "expired"})
+# OpenAI batch statuses that terminate a batch without usable results.
+FATAL_STATUSES = frozenset({"failed", "cancelled"})
+TERMINAL_STATUSES = RESULT_STATUSES | FATAL_STATUSES
+
+
+@dataclass
+class BatchStatus:
+    """Minimal view of one OpenAI batch."""
+
+    id: str
+    status: str
+    input_file_id: str | None = None
+    output_file_id: str | None = None
+    error_file_id: str | None = None
+
+
+class SupportsBatchClient(Protocol):
+    """Protocol for OpenAI-Batch-compatible clients (fakeable in tests)."""
+
+    def submit(
+        self, requests: list[dict[str, object]], *, metadata: dict[str, str]
+    ) -> str:
+        """Upload requests and create a batch; return its id."""
+
+    def retrieve(self, batch_id: str) -> BatchStatus:
+        """Return the current status of one batch."""
+
+    def download_file(self, file_id: str) -> str:
+        """Return the raw JSONL text of one batch file."""
+
+    def list_job_batches(self, job_id: str) -> list[BatchStatus]:
+        """Return all batches tagged with ``job_id`` in their metadata."""
+
+
+class OpenAIBatchClient:
+    """OpenAI Batch API client used by the deployed extractor."""
+
+    def __init__(self, *, api_key: str | None = None) -> None:
+        self.api_key = api_key or settings.OPENAI_API_KEY
+        if not self.api_key:
+            raise RuntimeError("OPENAI_API_KEY is required for the batch extractor.")
+
+    def _client(self) -> object:
+        from openai import OpenAI
+
+        return OpenAI(api_key=self.api_key)
+
+    def submit(
+        self, requests: list[dict[str, object]], *, metadata: dict[str, str]
+    ) -> str:
+        client = self._client()
+        body = ("\n".join(json.dumps(request) for request in requests)).encode("utf-8")
+        upload = client.files.create(file=("batch.jsonl", body), purpose="batch")  # type: ignore[attr-defined]
+        batch = client.batches.create(  # type: ignore[attr-defined]
+            input_file_id=upload.id,
+            endpoint=BATCH_ENDPOINT,
+            completion_window=BATCH_COMPLETION_WINDOW,
+            metadata=metadata,
+        )
+        return batch.id
+
+    def retrieve(self, batch_id: str) -> BatchStatus:
+        batch = self._client().batches.retrieve(batch_id)  # type: ignore[attr-defined]
+        return _batch_status_from_object(batch)
+
+    def download_file(self, file_id: str) -> str:
+        return self._client().files.content(file_id).text  # type: ignore[attr-defined]
+
+    def list_job_batches(self, job_id: str) -> list[BatchStatus]:
+        batches: list[BatchStatus] = []
+        for batch in self._client().batches.list(limit=100):  # type: ignore[attr-defined]
+            metadata = getattr(batch, "metadata", None) or {}
+            if metadata.get("job_id") == job_id:
+                batches.append(_batch_status_from_object(batch))
+        return batches
+
+
+def _batch_status_from_object(batch: object) -> BatchStatus:
+    """Build a BatchStatus from an OpenAI SDK batch object."""
+    return BatchStatus(
+        id=batch.id,  # type: ignore[attr-defined]
+        status=batch.status,  # type: ignore[attr-defined]
+        input_file_id=getattr(batch, "input_file_id", None),
+        output_file_id=getattr(batch, "output_file_id", None),
+        error_file_id=getattr(batch, "error_file_id", None),
+    )
+
+
+def normalize_batch_model(model: str) -> str:
+    """Strip any provider prefix so an OpenRouter slug becomes a native id."""
+    return model.split("/", 1)[1] if "/" in model else model
+
+
+def build_request_body(
+    messages: list[dict[str, str]], *, model: str, reasoning_effort: str
+) -> dict[str, object]:
+    """Build one ``/v1/chat/completions`` request body for the batch endpoint.
+
+    ``temperature`` is intentionally omitted (gpt-5-class reasoning models reject
+    ``temperature != 1``); ``reasoning_effort`` is included only for the OpenAI
+    vocabulary and skipped for the OpenRouter-ism ``"none"``.
+    """
+    body: dict[str, object] = {
+        "model": normalize_batch_model(model),
+        "messages": messages,
+    }
+    effort = (reasoning_effort or "").strip().lower()
+    if effort and effort != "none":
+        if effort not in OPENAI_REASONING_EFFORTS:
+            allowed = ", ".join(sorted(OPENAI_REASONING_EFFORTS))
+            raise ValueError(
+                f"Unsupported OpenAI reasoning_effort {effort!r}; expected one of "
+                f"{allowed} or 'none'."
+            )
+        body["reasoning_effort"] = effort
+    return body
+
+
+# --------------------------------------------------------------------------- #
+# File-native job state
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class RowEntry:
+    """One item's resumable state plus its originating partition."""
+
+    row_state: ExtractionRowState
+    date: str
+    shard: str
+
+
+@dataclass
+class BatchRecord:
+    """One in-flight OpenAI batch and the item custom_ids it carries."""
+
+    batch_id: str
+    tick: int
+    custom_ids: list[str]
+
+
+@dataclass
+class JobState:
+    """In-memory snapshot of one extract job during a tick."""
+
+    job_id: str
+    model: str
+    reasoning_effort: str
+    max_attempts: int
+    claimed_partitions: list[str]
+    rows: dict[str, RowEntry]
+    batches: list[BatchRecord] = field(default_factory=list)
+    all_batch_ids: list[str] = field(default_factory=list)
+    tick: int = 0
+
+
+@dataclass
+class ExtractTickResult:
+    """Outcome of one ``advance_extract_job`` tick."""
+
+    status: str  # idle | submitted | waiting | completed
+    job_id: str | None = None
+    submitted_batches: int = 0
+    folded_rows: int = 0
+    awaiting_rows: int = 0
+    in_flight_batches: int = 0
+    terminal_rows: int = 0
+    mentions: pd.DataFrame | None = None
+
+
+def batches_root(
+    artifact_root: ArtifactPath | None = None, *, data_dir: Path | None = None
+) -> str:
+    """Return the root that stores extract batch job state."""
+    return dataset_root(
+        EXTRACT_BATCHES_DATASET, artifact_root=artifact_root, data_dir=data_dir
+    )
+
+
+def active_job_path(root: str) -> str:
+    """Return the path of the single-active-job marker for an artifact root."""
+    return join_artifact_path(root, EXTRACT_BATCHES_DATASET, ACTIVE_JOB_FILENAME)
+
+
+def _job_dir(root: str, job_id: str) -> str:
+    return join_artifact_path(root, EXTRACT_BATCHES_DATASET, f"job_id={job_id}")
+
+
+def _manifest_path(root: str, job_id: str) -> str:
+    return join_artifact_path(_job_dir(root, job_id), "manifest.json")
+
+
+def _state_path(root: str, job_id: str) -> str:
+    return join_artifact_path(_job_dir(root, job_id), "state.jsonl")
+
+
+def _batches_path(root: str, job_id: str) -> str:
+    return join_artifact_path(_job_dir(root, job_id), "batches.json")
+
+
+def _tick_path(root: str, job_id: str, tick: int) -> str:
+    return join_artifact_path(_job_dir(root, job_id), "ticks", f"tick={tick}.json")
+
+
+def _read_active_job(root: str) -> str | None:
+    path = active_job_path(root)
+    if not artifact_exists(path):
+        return None
+    payload = cast(dict[str, object], read_json_artifact(path))
+    job_id = payload.get("job_id")
+    return str(job_id) if job_id else None
+
+
+def _new_job_id() -> str:
+    return datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+
+
+def _serialize_state_jsonl(rows: dict[str, RowEntry]) -> str:
+    lines = [
+        json.dumps(
+            {
+                "source": {"date": entry.date, "shard": entry.shard},
+                "row": entry.row_state.to_state_dict(),
+            },
+            sort_keys=True,
+        )
+        for entry in rows.values()
+    ]
+    return ("\n".join(lines) + "\n") if lines else ""
+
+
+def _load_state_jsonl(text: str) -> dict[str, RowEntry]:
+    rows: dict[str, RowEntry] = {}
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        payload = json.loads(line)
+        row_state = ExtractionRowState.from_state_dict(payload["row"])
+        source = payload["source"]
+        rows[row_state.item_id] = RowEntry(
+            row_state=row_state, date=source["date"], shard=source["shard"]
+        )
+    return rows
+
+
+def _load_job_state(root: str, job_id: str) -> JobState:
+    manifest = cast(dict[str, object], read_json_artifact(_manifest_path(root, job_id)))
+    rows = _load_state_jsonl(read_text_artifact(_state_path(root, job_id)))
+    batches_payload = cast(
+        dict[str, object], read_json_artifact(_batches_path(root, job_id))
+    )
+    batches = [
+        BatchRecord(
+            batch_id=str(record["batch_id"]),
+            tick=int(cast(int, record["tick"])),
+            custom_ids=[str(cid) for cid in cast(list[object], record["custom_ids"])],
+        )
+        for record in cast(list[dict[str, object]], batches_payload.get("batches", []))
+    ]
+    return JobState(
+        job_id=job_id,
+        model=str(manifest["model"]),
+        reasoning_effort=str(manifest["reasoning_effort"]),
+        max_attempts=int(cast(int, manifest["max_attempts"])),
+        claimed_partitions=[
+            str(path) for path in cast(list[object], manifest["claimed_partitions"])
+        ],
+        rows=rows,
+        batches=batches,
+        all_batch_ids=[
+            str(bid)
+            for bid in cast(list[object], batches_payload.get("all_batch_ids", []))
+        ],
+        tick=int(cast(int, batches_payload.get("tick", 0))),
+    )
+
+
+def _save_state(root: str, job: JobState) -> None:
+    write_text_artifact(_state_path(root, job.job_id), _serialize_state_jsonl(job.rows))
+
+
+def _save_batches(root: str, job: JobState) -> None:
+    write_json_artifact(
+        _batches_path(root, job.job_id),
+        {
+            "tick": job.tick,
+            "all_batch_ids": job.all_batch_ids,
+            "batches": [
+                {
+                    "batch_id": record.batch_id,
+                    "tick": record.tick,
+                    "custom_ids": record.custom_ids,
+                }
+                for record in job.batches
+            ],
+        },
+    )
+
+
+def _parse_jsonl_by_custom_id(text: str) -> dict[str, dict[str, object]]:
+    results: dict[str, dict[str, object]] = {}
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        payload = json.loads(line)
+        custom_id = payload.get("custom_id")
+        if custom_id is not None:
+            results[str(custom_id)] = payload
+    return results
+
+
+# --------------------------------------------------------------------------- #
+# The tick
+# --------------------------------------------------------------------------- #
+
+
+def _create_job(
+    root: str,
+    *,
+    data_dir: Path | None,
+    model: str,
+    reasoning_effort: str,
+    max_attempts: int,
+    force: bool,
+) -> JobState | None:
+    """Start a new job from pending classification partitions, or None if idle."""
+    entries, claimed_paths = collect_pending_extract_items(
+        artifact_root=root, data_dir=data_dir, force=force
+    )
+    if not claimed_paths:
+        return None
+    job_id = _new_job_id()
+    rows: dict[str, RowEntry] = {}
+    for item_row, partition_date, shard in entries:
+        row_state = ExtractionRowState(
+            item_row=cast(dict[str, object], item_row),
+            stage_name="ner",
+        )
+        # Prime the first request; a preprocess failure terminates the row now.
+        initial_messages(row_state)
+        item_id = row_state.item_id
+        if len(item_id) > MAX_CUSTOM_ID_LENGTH:
+            raise ValueError(
+                f"item_id {item_id!r} exceeds the {MAX_CUSTOM_ID_LENGTH}-char "
+                "OpenAI custom_id limit."
+            )
+        rows[item_id] = RowEntry(row_state=row_state, date=partition_date, shard=shard)
+    job = JobState(
+        job_id=job_id,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        max_attempts=max_attempts,
+        claimed_partitions=sorted(claimed_paths),
+        rows=rows,
+    )
+    write_json_artifact(
+        _manifest_path(root, job_id),
+        {
+            "job_id": job_id,
+            "created_at": job_id,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "max_attempts": max_attempts,
+            "claimed_partitions": job.claimed_partitions,
+        },
+    )
+    _save_state(root, job)
+    write_json_artifact(active_job_path(root), {"job_id": job_id})
+    LOGGER.info(
+        "Started extract job %s: items=%s partitions=%s",
+        job_id,
+        len(rows),
+        len(claimed_paths),
+    )
+    return job
+
+
+def _reconcile_orphans(root: str, job: JobState, client: SupportsBatchClient) -> None:
+    """Adopt any batch tagged with this job_id that we never recorded (crash gap)."""
+    known = set(job.all_batch_ids)
+    for status in client.list_job_batches(job.job_id):
+        if status.id in known:
+            continue
+        LOGGER.warning("Adopting orphan batch %s for job %s", status.id, job.job_id)
+        custom_ids: list[str] = []
+        if status.input_file_id:
+            custom_ids = list(
+                _parse_jsonl_by_custom_id(client.download_file(status.input_file_id))
+            )
+        job.batches.append(
+            BatchRecord(batch_id=status.id, tick=job.tick, custom_ids=custom_ids)
+        )
+        job.all_batch_ids.append(status.id)
+
+
+def _fold_completed_batches(job: JobState, client: SupportsBatchClient) -> int:
+    """Poll in-flight batches; fold terminal ones into row states.
+
+    Returns the number of rows advanced. Batches still running are left in place.
+    """
+    folded = 0
+    still_in_flight: list[BatchRecord] = []
+    for record in job.batches:
+        status = client.retrieve(record.batch_id)
+        if status.status not in TERMINAL_STATUSES:
+            still_in_flight.append(record)
+            continue
+        results: dict[str, dict[str, object]] = {}
+        if status.status in RESULT_STATUSES:
+            for file_id in (status.output_file_id, status.error_file_id):
+                if file_id:
+                    results.update(
+                        _parse_jsonl_by_custom_id(client.download_file(file_id))
+                    )
+        for custom_id in record.custom_ids:
+            entry = job.rows.get(custom_id)
+            if entry is None or entry.row_state.state is not None:
+                continue
+            line = results.get(custom_id)
+            if line is not None:
+                try:
+                    text = extract_batch_response_text(line)
+                except Exception as exc:  # noqa: BLE001
+                    record_stage_error(entry.row_state, str(exc))
+                else:
+                    handle_response(
+                        entry.row_state, text, max_attempts=job.max_attempts
+                    )
+                folded += 1
+            elif status.status in FATAL_STATUSES:
+                # Whole-batch failure (usually bad input): terminate, don't loop.
+                record_stage_error(
+                    entry.row_state, f"OpenAI batch {status.status}: {record.batch_id}"
+                )
+                folded += 1
+            # else expired-and-missing: leave awaiting so it re-submits next tick.
+        if status.status in FATAL_STATUSES:
+            LOGGER.error(
+                "OpenAI batch %s ended as %s for job %s",
+                record.batch_id,
+                status.status,
+                job.job_id,
+            )
+    job.batches = still_in_flight
+    return folded
+
+
+def _awaiting_rows(job: JobState) -> list[RowEntry]:
+    """Non-terminal rows not currently carried by an in-flight batch."""
+    in_flight = {cid for record in job.batches for cid in record.custom_ids}
+    return [
+        entry
+        for item_id, entry in job.rows.items()
+        if entry.row_state.state is None and item_id not in in_flight
+    ]
+
+
+def _submit_awaiting(
+    job: JobState,
+    awaiting: list[RowEntry],
+    client: SupportsBatchClient,
+    *,
+    max_requests_per_batch: int,
+) -> int:
+    """Submit awaiting rows in one or more batches. Returns batches submitted."""
+    submitted = 0
+    for start in range(0, len(awaiting), max_requests_per_batch):
+        chunk = awaiting[start : start + max_requests_per_batch]
+        requests = [
+            {
+                "custom_id": entry.row_state.item_id,
+                "method": "POST",
+                "url": BATCH_ENDPOINT,
+                "body": build_request_body(
+                    entry.row_state.current_attempt.messages,
+                    model=job.model,
+                    reasoning_effort=job.reasoning_effort,
+                ),
+            }
+            for entry in chunk
+        ]
+        batch_id = client.submit(
+            requests,
+            metadata={"job_id": job.job_id, "tick": str(job.tick)},
+        )
+        job.batches.append(
+            BatchRecord(
+                batch_id=batch_id,
+                tick=job.tick,
+                custom_ids=[entry.row_state.item_id for entry in chunk],
+            )
+        )
+        job.all_batch_ids.append(batch_id)
+        submitted += 1
+    return submitted
+
+
+def advance_extract_job(
+    *,
+    batch_client: SupportsBatchClient,
+    artifact_root: ArtifactPath | None = None,
+    data_dir: Path | None = None,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    max_requests_per_batch: int = DEFAULT_MAX_REQUESTS_PER_BATCH,
+    force: bool = False,
+) -> ExtractTickResult:
+    """Advance the extract job by one tick.
+
+    If no job is active, start one from pending classification partitions. Fold any
+    completed OpenAI batches into row states, submit the next batch for rows still
+    needing a call, then persist state. When every row is terminal, write the
+    mention partitions + audit log + completion registry and clear the active-job
+    marker (match/finalize is the orchestrator's responsibility).
+    """
+    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    resolved_model = model or settings.EXTRACTOR_BATCH_MODEL or DEFAULT_BATCH_MODEL
+    resolved_reasoning = (
+        reasoning_effort
+        if reasoning_effort is not None
+        else settings.EXTRACTOR_BATCH_REASONING
+    )
+
+    active_job_id = _read_active_job(resolved_root)
+    if active_job_id is None:
+        job = _create_job(
+            resolved_root,
+            data_dir=data_dir,
+            model=resolved_model,
+            reasoning_effort=resolved_reasoning,
+            max_attempts=max_attempts,
+            force=force,
+        )
+        if job is None:
+            return ExtractTickResult(status="idle")
+        folded = 0
+    else:
+        job = _load_job_state(resolved_root, active_job_id)
+        _reconcile_orphans(resolved_root, job, batch_client)
+        folded = _fold_completed_batches(job, batch_client)
+
+    job.tick += 1
+    awaiting = _awaiting_rows(job)
+
+    # Durable-before-side-effect: persist row states before creating any batch, so a
+    # crash after submit is recoverable via orphan reconciliation next tick.
+    _save_state(resolved_root, job)
+    submitted = _submit_awaiting(
+        job, awaiting, batch_client, max_requests_per_batch=max_requests_per_batch
+    )
+    _save_batches(resolved_root, job)
+
+    terminal_rows = sum(
+        1 for entry in job.rows.values() if entry.row_state.state is not None
+    )
+    write_json_artifact(
+        _tick_path(resolved_root, job.job_id, job.tick),
+        {
+            "tick": job.tick,
+            "folded_rows": folded,
+            "submitted_batches": submitted,
+            "awaiting_rows": len(awaiting),
+            "in_flight_batches": len(job.batches),
+            "terminal_rows": terminal_rows,
+            "total_rows": len(job.rows),
+        },
+    )
+
+    if not job.batches and len(awaiting) == 0:
+        mentions = _finalize_job(resolved_root, job, data_dir=data_dir)
+        return ExtractTickResult(
+            status="completed",
+            job_id=job.job_id,
+            folded_rows=folded,
+            submitted_batches=submitted,
+            terminal_rows=terminal_rows,
+            mentions=mentions,
+        )
+
+    LOGGER.info(
+        "Extract job %s tick=%s folded=%s submitted=%s in_flight=%s terminal=%s/%s",
+        job.job_id,
+        job.tick,
+        folded,
+        submitted,
+        len(job.batches),
+        terminal_rows,
+        len(job.rows),
+    )
+    return ExtractTickResult(
+        status="submitted" if submitted else "waiting",
+        job_id=job.job_id,
+        folded_rows=folded,
+        submitted_batches=submitted,
+        awaiting_rows=len(awaiting),
+        in_flight_batches=len(job.batches),
+        terminal_rows=terminal_rows,
+    )
+
+
+def _finalize_job(root: str, job: JobState, *, data_dir: Path | None) -> pd.DataFrame:
+    """Write mentions/audit/completion for a finished job and clear the marker."""
+    row_entries = [
+        (entry.row_state, entry.date, entry.shard) for entry in job.rows.values()
+    ]
+    mentions = finalize_extract_outputs(
+        row_entries,
+        claimed_classification_paths=set(job.claimed_partitions),
+        run_id=job.job_id,
+        model=job.model,
+        reasoning_effort=job.reasoning_effort,
+        max_attempts=job.max_attempts,
+        artifact_root=root,
+        data_dir=data_dir,
+    )
+    # Removing the active marker frees the next tick to start a fresh job. Use an
+    # empty-body write since storage has no delete helper; absence is not required.
+    write_json_artifact(active_job_path(root), {"job_id": None})
+    LOGGER.info(
+        "Extract job %s complete: rows=%s mentions=%s",
+        job.job_id,
+        len(job.rows),
+        len(mentions),
+    )
+    return mentions.reindex(columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
