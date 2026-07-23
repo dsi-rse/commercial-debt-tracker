@@ -12,6 +12,7 @@ dependencies = [
   "defusedxml~=0.7",
   "idi-ftm2j-shared>=0.1.4",
   "numpy~=2.2",
+  "openai~=1.0",
   "openrouter",
   "pandas~=2.2",
   "pycountry~=24.6",

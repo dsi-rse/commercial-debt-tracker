@@ -28,5 +28,10 @@ DATA_DIR = resolve_path(Path(os.environ.get("DATA_DIR", str(DEFAULT_DATA_DIR))))
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get(
     "OPENROUTER_API_TOKEN"
 )
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 EXTRACTOR_MODEL = os.environ.get("EXTRACTOR_MODEL", "openai/gpt-5.4")
 EXTRACTOR_REASONING = os.environ.get("EXTRACTOR_REASONING", "none")
+# OpenAI Batch API uses native model ids (no provider prefix) and a reasoning_effort
+# vocabulary distinct from OpenRouter's. These configure the deployed batch backend.
+EXTRACTOR_BATCH_MODEL = os.environ.get("EXTRACTOR_BATCH_MODEL", "gpt-5.4")
+EXTRACTOR_BATCH_REASONING = os.environ.get("EXTRACTOR_BATCH_REASONING", "none")
