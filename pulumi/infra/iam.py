@@ -78,6 +78,7 @@ aws.iam.RolePolicy(
     role=task_execution_role.id,
     policy=pulumi.Output.all(
         openrouter_secret_arn=secrets.openrouter_api_key_secret.arn,
+        openai_secret_arn=secrets.openai_api_key_secret.arn,
         sec_user_agent_secret_arn=secrets.sec_user_agent_secret.arn,
         r2_access_key_id_secret_arn=(
             secrets.r2_access_key_id_secret.arn
@@ -104,6 +105,7 @@ aws.iam.RolePolicy(
                             arn
                             for arn in [
                                 args["openrouter_secret_arn"],
+                                args["openai_secret_arn"],
                                 args["sec_user_agent_secret_arn"],
                                 args["r2_access_key_id_secret_arn"],
                                 args["r2_secret_access_key_secret_arn"],

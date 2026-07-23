@@ -24,6 +24,7 @@ container_definitions = pulumi.Output.all(
     log_group_name=logs.log_group.name,
     region=config.aws_region,
     openrouter_secret_arn=secrets.openrouter_api_key_secret.arn,
+    openai_secret_arn=secrets.openai_api_key_secret.arn,
     sec_user_agent_secret_arn=secrets.sec_user_agent_secret.arn,
     r2_access_key_id_secret_arn=(
         secrets.r2_access_key_id_secret.arn
@@ -70,6 +71,10 @@ container_definitions = pulumi.Output.all(
                     {
                         "name": "OPENROUTER_API_KEY",
                         "valueFrom": args["openrouter_secret_arn"],
+                    },
+                    {
+                        "name": "OPENAI_API_KEY",
+                        "valueFrom": args["openai_secret_arn"],
                     },
                     {
                         "name": "SEC_USER_AGENT",
