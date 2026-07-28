@@ -281,9 +281,16 @@ The OpenAI batch extract backend keeps its resumable, file-native job state unde
 <artifact-root>/extract-batches/
   active.json                        # {"job_id": ...}; job_id is null when idle
   job_id=<run_id>/manifest.json      # static job config + claimed classification partitions
-  job_id=<run_id>/state.jsonl        # one line per item: source partition + resumable row state
+  job_id=<run_id>/state.jsonl        # one line per item: source partition + pending request
+                                     # marker + expiry resubmission counter + resumable row state
   job_id=<run_id>/batches.json       # in-flight OpenAI batches, seen batch ids, tick counter
   job_id=<run_id>/ticks/tick=<n>.json  # per-tick audit counts
+```
+
+The orchestrator also keeps advisory locks directly under the artifact root:
+
+```text
+locks/pipeline-writer.json           # single-writer lease: {holder, acquired_at, expires_at}
 ```
 
 When a job finishes, its mentions are written to the canonical `mentions` partitions and its

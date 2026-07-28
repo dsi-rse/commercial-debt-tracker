@@ -110,22 +110,29 @@ are pure and backend-agnostic. Two backends drive them:
 Because each item flows through several sequential stages, each retryable, and each batch
 round can take up to a day, a single run can span many days. Rather than block an ECS task
 for days, extraction is a resumable, file-native state machine advanced by the hourly
-`poll` tick. `poll` is the sole writer of extract-job state, so it never races the daily
-schedule.
+`poll` tick. Every poll tick runs under a single `pipeline-writer` lease (`cdt.lease`,
+built on S3 conditional writes), so a tick that outlives its hour — or an EventBridge
+retry — cannot overlap the next one, and `daily`'s match/finalize cannot interleave with a
+completing poll's; a run that finds the lease held reports `locked` and skips its turn.
 
 Each tick:
 
 1. reconciles any OpenAI batch tagged with the active job but not yet recorded (crash recovery),
 2. folds results from any completed batch into per-item states via the same
-   validate/postprocess/retry logic as the live backend,
-3. submits the next batch for every item still needing a call (advancing and retrying together),
-4. persists item states before creating batches, so a crash is always recoverable,
+   validate/postprocess/retry logic as the live backend — a result only applies if it
+   matches the request the item is recorded as waiting on, so replaying a stale batch
+   is a no-op,
+3. submits the next batch for every item still needing a call (advancing and retrying
+   together), chunked by both request count and bytes to stay under OpenAI's per-file
+   limits,
+4. persists item states and batch records at every transition, so a crash at any point
+   is recoverable,
 5. and, when every item is terminal, writes the `mentions` partitions, audit log, and
    completion registry, then clears the active-job marker so match + finalize can run.
 
 Whole-batch failures terminate their items rather than looping forever; expired batches
-salvage whatever completed and re-submit the rest. Job state lives under
-`extract-batches/` (see [schema.md](schema.md)).
+salvage whatever completed and re-submit the rest, up to a per-item cap of consecutive
+expired rounds. Job state lives under `extract-batches/` (see [schema.md](schema.md)).
 
 ## Matcher Design
 
