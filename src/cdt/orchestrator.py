@@ -101,6 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
     poll.add_argument("--match-batch-size", type=positive_int, default=100)
     poll.add_argument("--max-attempts", type=positive_int, default=DEFAULT_MAX_ATTEMPTS)
     poll.add_argument("--max-requests-per-batch", type=positive_int, default=None)
+    poll.add_argument("--max-batch-bytes", type=positive_int, default=None)
     return parser
 
 
@@ -175,6 +176,8 @@ def run_poll(args: argparse.Namespace) -> int:
         }
         if args.max_requests_per_batch is not None:
             tick_kwargs["max_requests_per_batch"] = args.max_requests_per_batch
+        if args.max_batch_bytes is not None:
+            tick_kwargs["max_batch_bytes"] = args.max_batch_bytes
         result = advance_extract_job(**tick_kwargs)
         LOGGER.info(
             "Poll tick complete: status=%s job=%s folded=%s submitted=%s in_flight=%s terminal=%s",

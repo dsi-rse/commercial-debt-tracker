@@ -557,6 +557,110 @@ def test_state_jsonl_round_trip_preserves_pending() -> None:
     assert loaded_legacy["item-1"].pending is None
 
 
+def _ner_request_size(item_id: str, text: str) -> int:
+    """Serialized JSONL line size of one NER batch request, as submitted."""
+    row_state = ExtractionRowState(item_row=_item_row(item_id, text), stage_name="ner")
+    initial_messages(row_state)
+    request = {
+        "custom_id": item_id,
+        "method": "POST",
+        "url": "/v1/chat/completions",
+        "body": build_request_body(
+            row_state.current_attempt.messages,
+            model="gpt-5.4",
+            reasoning_effort="none",
+        ),
+    }
+    return len(json.dumps(request).encode("utf-8")) + 1
+
+
+def test_submit_splits_batches_on_byte_budget(tmp_path: Path) -> None:
+    """Two requests that don't fit one byte budget go out as two batches."""
+    seed_classification(
+        tmp_path,
+        [
+            {"item_id": "item-nodebt", "text": NODEBT_TEXT},
+            {"item_id": "item-multi", "text": MULTI_TEXT},
+        ],
+    )
+    client = FakeBatchClient(
+        {
+            "item-nodebt": {"ner": NODEBT_NER},
+            "item-multi": {"ner": MULTI_NER, "instrument_ie": MULTI_IE},
+        }
+    )
+    # Big enough for either single request, too small for both together.
+    budget = (
+        max(
+            _ner_request_size("item-nodebt", NODEBT_TEXT),
+            _ner_request_size("item-multi", MULTI_TEXT),
+        )
+        + 10
+    )
+
+    first = advance_extract_job(
+        batch_client=client,
+        artifact_root=tmp_path,
+        model="gpt-5.4",
+        reasoning_effort="none",
+        max_attempts=3,
+        max_batch_bytes=budget,
+    )
+
+    assert first.status == "submitted"
+    assert first.submitted_batches == 2
+    assert [ids for _, ids in client.submitted] == [["item-nodebt"], ["item-multi"]]
+
+    # The job still runs to completion on later ticks (default budget: the
+    # instrument_ie request has a different size than the NER one).
+    statuses = []
+    while (status := _advance(tmp_path, client).status) != "completed":
+        statuses.append(status)
+        assert len(statuses) < 10
+    assert read_dataset(mentions_root(tmp_path))["name"].to_list() == ["Term Loan"]
+
+
+def test_oversized_request_terminates_row_not_job(tmp_path: Path) -> None:
+    """A single request over the budget errors its row; the job still finishes."""
+    client = FakeBatchClient(
+        {"item-multi": {"ner": MULTI_NER, "instrument_ie": MULTI_IE}}
+    )
+    # Roomy enough for every stage's request for item-multi, far too small for
+    # item-huge, whose text alone exceeds it.
+    budget = _ner_request_size("item-multi", MULTI_TEXT) + 300_000
+    seed_classification(
+        tmp_path,
+        [
+            {"item_id": "item-huge", "text": "x" * (2 * budget)},
+            {"item_id": "item-multi", "text": MULTI_TEXT},
+        ],
+    )
+
+    statuses = [
+        advance_extract_job(
+            batch_client=client,
+            artifact_root=tmp_path,
+            model="gpt-5.4",
+            reasoning_effort="none",
+            max_attempts=3,
+            max_batch_bytes=budget,
+        ).status
+        for _ in range(3)
+    ]
+
+    assert statuses[-1] == "completed"
+    # Only item-multi was ever submitted; item-huge terminated without a batch.
+    for _, ids in client.submitted:
+        assert "item-huge" not in ids
+    audit = list((tmp_path / "extractor-runs").glob("run_id=*/full.jsonl"))
+    records = {
+        json.loads(line)["item_id"]: json.loads(line)
+        for line in audit[0].read_text(encoding="utf-8").splitlines()
+    }
+    assert records["item-huge"]["state"] == "ERROR"
+    assert records["item-multi"]["state"] == "SUCCESS"
+
+
 def test_reconcile_adopts_orphan_batch(tmp_path: Path) -> None:
     """A batch tagged for the job but never recorded is adopted on the next tick."""
     client = FakeBatchClient({"item-1": {"ner": NODEBT_NER}})

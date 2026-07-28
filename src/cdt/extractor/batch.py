@@ -18,8 +18,9 @@ Layout under ``{artifact_root}/extract-batches/``::
     job_id=<id>/batches.json    # in-flight batches, seen batch ids, tick counter
     job_id=<id>/ticks/tick=<n>.json  # per-tick audit counts
 
-Only the ``poll`` mode ever mutates this state, so there is no shared-writer race
-with the ``daily`` schedule.
+Only the ``poll`` mode ever mutates this state, and the orchestrator runs each
+poll tick under the single ``pipeline-writer`` lease (``cdt.lease``), so
+overlapping ticks and the ``daily`` schedule's match/finalize cannot race it.
 """
 
 # ruff: noqa: ANN101, ANN102, D102, D105, D107
@@ -67,6 +68,9 @@ BATCH_COMPLETION_WINDOW = "24h"
 MAX_CUSTOM_ID_LENGTH = 64
 # Stay comfortably under OpenAI's 50k-requests-per-batch limit.
 DEFAULT_MAX_REQUESTS_PER_BATCH = 40_000
+# OpenAI also caps batch input files by size (200 MB); chunk at half that so
+# a batch never wedges the job on the byte limit.
+DEFAULT_MAX_BATCH_BYTES = 100 * 1024 * 1024
 DEFAULT_BATCH_MODEL = "gpt-5.4"
 # OpenAI reasoning_effort vocabulary (distinct from OpenRouter's "none"/"xhigh").
 OPENAI_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
@@ -578,6 +582,63 @@ def _awaiting_rows(job: JobState) -> list[RowEntry]:
     ]
 
 
+def _build_requests(
+    job: JobState, awaiting: list[RowEntry], *, max_batch_bytes: int
+) -> list[tuple[RowEntry, dict[str, object], int]]:
+    """Build one request per awaiting row, with its serialized JSONL line size.
+
+    A single request that alone exceeds the byte budget can never be submitted;
+    its row is terminated rather than wedging the job on every tick.
+    """
+    buildable: list[tuple[RowEntry, dict[str, object], int]] = []
+    for entry in awaiting:
+        request: dict[str, object] = {
+            "custom_id": entry.row_state.item_id,
+            "method": "POST",
+            "url": BATCH_ENDPOINT,
+            "body": build_request_body(
+                entry.row_state.current_attempt.messages,
+                model=job.model,
+                reasoning_effort=job.reasoning_effort,
+            ),
+        }
+        size = len(json.dumps(request).encode("utf-8")) + 1  # newline
+        if size > max_batch_bytes:
+            record_stage_error(
+                entry.row_state,
+                f"Batch request of {size} bytes exceeds the "
+                f"{max_batch_bytes}-byte per-batch budget.",
+            )
+            continue
+        buildable.append((entry, request, size))
+    return buildable
+
+
+def _plan_chunks(
+    requests: list[tuple[RowEntry, dict[str, object], int]],
+    *,
+    max_requests_per_batch: int,
+    max_batch_bytes: int,
+) -> list[list[tuple[RowEntry, dict[str, object]]]]:
+    """Pack requests into batches bounded by both request count and bytes."""
+    chunks: list[list[tuple[RowEntry, dict[str, object]]]] = []
+    current: list[tuple[RowEntry, dict[str, object]]] = []
+    current_bytes = 0
+    for entry, request, size in requests:
+        if current and (
+            len(current) >= max_requests_per_batch
+            or current_bytes + size > max_batch_bytes
+        ):
+            chunks.append(current)
+            current = []
+            current_bytes = 0
+        current.append((entry, request))
+        current_bytes += size
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 def _submit_awaiting(
     root: str,
     job: JobState,
@@ -585,6 +646,7 @@ def _submit_awaiting(
     client: SupportsBatchClient,
     *,
     max_requests_per_batch: int,
+    max_batch_bytes: int,
 ) -> int:
     """Submit awaiting rows in one or more batches. Returns batches submitted.
 
@@ -592,33 +654,27 @@ def _submit_awaiting(
     mid-submission loses at most the very last batch — which orphan
     reconciliation recovers by its job_id tag next tick.
     """
+    requests = _build_requests(job, awaiting, max_batch_bytes=max_batch_bytes)
+    if len(requests) < len(awaiting):
+        # Oversized rows were terminated above; persist before any submit.
+        _save_state(root, job)
     submitted = 0
-    for start in range(0, len(awaiting), max_requests_per_batch):
-        chunk = awaiting[start : start + max_requests_per_batch]
-        requests = [
-            {
-                "custom_id": entry.row_state.item_id,
-                "method": "POST",
-                "url": BATCH_ENDPOINT,
-                "body": build_request_body(
-                    entry.row_state.current_attempt.messages,
-                    model=job.model,
-                    reasoning_effort=job.reasoning_effort,
-                ),
-            }
-            for entry in chunk
-        ]
+    for chunk in _plan_chunks(
+        requests,
+        max_requests_per_batch=max_requests_per_batch,
+        max_batch_bytes=max_batch_bytes,
+    ):
         batch_id = client.submit(
-            requests,
+            [request for _, request in chunk],
             metadata={"job_id": job.job_id, "tick": str(job.tick)},
         )
-        for entry in chunk:
+        for entry, _ in chunk:
             entry.pending = _pending_marker(batch_id, entry)
         job.batches.append(
             BatchRecord(
                 batch_id=batch_id,
                 tick=job.tick,
-                custom_ids=[entry.row_state.item_id for entry in chunk],
+                custom_ids=[entry.row_state.item_id for entry, _ in chunk],
             )
         )
         job.all_batch_ids.append(batch_id)
@@ -637,6 +693,7 @@ def advance_extract_job(
     reasoning_effort: str | None = None,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     max_requests_per_batch: int = DEFAULT_MAX_REQUESTS_PER_BATCH,
+    max_batch_bytes: int = DEFAULT_MAX_BATCH_BYTES,
     force: bool = False,
 ) -> ExtractTickResult:
     """Advance the extract job by one tick.
@@ -689,7 +746,11 @@ def advance_extract_job(
         awaiting,
         batch_client,
         max_requests_per_batch=max_requests_per_batch,
+        max_batch_bytes=max_batch_bytes,
     )
+    # Recompute after submitting: submitted rows are now pending and oversized
+    # rows were terminated, so anything left here could not be dispatched.
+    still_awaiting = _awaiting_rows(job)
 
     terminal_rows = sum(
         1 for entry in job.rows.values() if entry.row_state.state is not None
@@ -707,7 +768,7 @@ def advance_extract_job(
         },
     )
 
-    if not job.batches and len(awaiting) == 0:
+    if not job.batches and not still_awaiting:
         mentions = _finalize_job(resolved_root, job, data_dir=data_dir)
         return ExtractTickResult(
             status="completed",
