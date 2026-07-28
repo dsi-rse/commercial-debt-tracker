@@ -8,6 +8,7 @@ import pytest
 
 import cdt.orchestrator as orch
 from cdt.extractor import ExtractTickResult
+from cdt.lease import acquire_lease
 
 
 def test_poll_finalizes_on_completion(
@@ -50,6 +51,62 @@ def test_poll_skips_finalize_when_waiting(
 
     assert orch.main(["--artifact-root", str(tmp_path), "poll"]) == 0
     assert calls == ["advance"]
+
+
+def test_poll_skips_tick_when_lease_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A poll tick that cannot acquire the pipeline-writer lease does nothing."""
+    monkeypatch.setattr(
+        orch,
+        "advance_extract_job",
+        lambda **kwargs: pytest.fail("tick must not run while the lease is held"),
+    )
+    held = acquire_lease(tmp_path, orch.PIPELINE_WRITER_LEASE)
+    assert held is not None
+
+    assert orch.main(["--artifact-root", str(tmp_path), "poll"]) == 0
+
+
+def test_poll_releases_lease_after_tick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lease is released even on an ordinary tick, freeing the next run."""
+    monkeypatch.setattr(orch, "OpenAIBatchClient", lambda: object())
+    monkeypatch.setattr(
+        orch,
+        "advance_extract_job",
+        lambda **kwargs: ExtractTickResult(status="waiting"),
+    )
+
+    assert orch.main(["--artifact-root", str(tmp_path), "poll"]) == 0
+
+    assert acquire_lease(tmp_path, orch.PIPELINE_WRITER_LEASE) is not None
+
+
+def test_daily_batch_skips_match_when_lease_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Daily skips match/finalize (but still prepares) when a poll holds the lease."""
+    calls: list[str] = []
+    monkeypatch.setattr(
+        orch,
+        "run_prepare_stages",
+        lambda config: (calls.append("prepare"), tmp_path)[1],
+    )
+    monkeypatch.setattr(
+        orch,
+        "run_match_and_finalize",
+        lambda **kwargs: pytest.fail("match must not run while the lease is held"),
+    )
+    held = acquire_lease(tmp_path, orch.PIPELINE_WRITER_LEASE)
+    assert held is not None
+
+    assert (
+        orch.main(["--artifact-root", str(tmp_path), "daily", "--cik-file", "c.txt"])
+        == 0
+    )
+    assert calls == ["prepare"]
 
 
 def test_daily_batch_defers_extract(

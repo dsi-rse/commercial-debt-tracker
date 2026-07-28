@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import re
@@ -124,6 +125,100 @@ def read_text_artifact(path: ArtifactPath) -> str:
         body = boto3.client("s3").get_object(Bucket=bucket, Key=key)["Body"].read()
         return body.decode("utf-8")
     return Path(normalized).read_text(encoding="utf-8")
+
+
+# S3 error codes raised when a conditional write loses: 412 on a failed
+# precondition, 409 when racing another in-flight conditional write.
+_CONDITIONAL_WRITE_LOST_CODES = frozenset(
+    {"PreconditionFailed", "ConditionalRequestConflict", "412", "409"}
+)
+
+
+def _json_body(payload: dict[str, object]) -> bytes:
+    return json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+
+
+def write_json_artifact_if_absent(
+    path: ArtifactPath, payload: dict[str, object]
+) -> bool:
+    """Create a JSON artifact only if it does not exist; return whether we won.
+
+    Uses S3 conditional ``PutObject`` (``If-None-Match: *``) or an exclusive
+    local create, so exactly one of several concurrent callers succeeds.
+    """
+    body = _json_body(payload)
+    normalized = normalize_artifact_path(path)
+    if is_s3_uri(normalized):
+        bucket, key = parse_s3_uri(normalized)
+        client = boto3.client("s3")
+        try:
+            client.put_object(Bucket=bucket, Key=key, Body=body, IfNoneMatch="*")
+        except client.exceptions.ClientError as error:  # type: ignore[attr-defined]
+            code = error.response.get("Error", {}).get("Code")
+            if code in _CONDITIONAL_WRITE_LOST_CODES:
+                return False
+            raise
+        return True
+    local_path = Path(normalized)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with local_path.open("xb") as handle:
+            handle.write(body)
+    except FileExistsError:
+        return False
+    return True
+
+
+def read_json_artifact_versioned(
+    path: ArtifactPath,
+) -> tuple[dict[str, object] | list[object], str]:
+    """Read a JSON artifact plus an opaque version token for conditional replace."""
+    normalized = normalize_artifact_path(path)
+    if is_s3_uri(normalized):
+        bucket, key = parse_s3_uri(normalized)
+        response = boto3.client("s3").get_object(Bucket=bucket, Key=key)
+        body = response["Body"].read()
+        return (
+            cast(dict[str, object] | list[object], json.loads(body.decode("utf-8"))),
+            str(response["ETag"]),
+        )
+    body = Path(normalized).read_bytes()
+    version = hashlib.sha256(body).hexdigest()
+    return (
+        cast(dict[str, object] | list[object], json.loads(body.decode("utf-8"))),
+        version,
+    )
+
+
+def replace_json_artifact_if_match(
+    path: ArtifactPath, payload: dict[str, object], *, version: str
+) -> bool:
+    """Replace a JSON artifact only if it still has ``version``; return success.
+
+    ``version`` is the token from ``read_json_artifact_versioned`` (S3 ETag or a
+    local content hash). On S3 this is an atomic compare-and-swap; locally it is
+    a best-effort check acceptable for single-user development.
+    """
+    body = _json_body(payload)
+    normalized = normalize_artifact_path(path)
+    if is_s3_uri(normalized):
+        bucket, key = parse_s3_uri(normalized)
+        client = boto3.client("s3")
+        try:
+            client.put_object(Bucket=bucket, Key=key, Body=body, IfMatch=version)
+        except client.exceptions.ClientError as error:  # type: ignore[attr-defined]
+            code = error.response.get("Error", {}).get("Code")
+            if code in _CONDITIONAL_WRITE_LOST_CODES:
+                return False
+            raise
+        return True
+    local_path = Path(normalized)
+    if not local_path.exists():
+        return False
+    if hashlib.sha256(local_path.read_bytes()).hexdigest() != version:
+        return False
+    local_path.write_bytes(body)
+    return True
 
 
 def write_json_artifact(path: ArtifactPath, payload: dict[str, object]) -> str:

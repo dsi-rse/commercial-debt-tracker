@@ -6,8 +6,13 @@ Deployment uses two schedules:
   With the default ``batch`` backend it does NOT run the LLM extract stage; that is
   handed to the asynchronous OpenAI Batch poller.
 - ``poll`` runs hourly, advancing the OpenAI batch extract job by one tick and, when
-  a job completes, re-running match + finalize. ``poll`` is the sole owner of extract
-  job state, so it never races the ``daily`` schedule.
+  a job completes, re-running match + finalize.
+
+A single ``pipeline-writer`` lease (``cdt.lease``) serializes every mutator of
+extract job state and the match/final snapshots: a poll tick that outlives its
+hour (or an EventBridge retry) cannot overlap the next tick, and ``daily``'s
+match/finalize cannot interleave with a completing poll's. A run that finds the
+lease held skips its turn (``locked``) and the next scheduled run picks it up.
 
 ``historical`` (and ``daily --extractor-backend live``) keep the original fully
 synchronous pipeline that extracts live via OpenRouter.
@@ -22,6 +27,7 @@ from collections.abc import Sequence
 from cdt.cli import configure_logging, parse_date, positive_int
 from cdt.datasets import resolve_artifact_root
 from cdt.extractor import DEFAULT_MAX_ATTEMPTS, OpenAIBatchClient, advance_extract_job
+from cdt.lease import acquire_lease, release_lease
 from cdt.pipeline import (
     PipelineConfig,
     run_match_and_finalize,
@@ -31,6 +37,11 @@ from cdt.pipeline import (
 from cdt.shared import get_logger
 
 LOGGER = get_logger(__name__)
+
+# One lease serializes every writer of extract job state and match/final
+# snapshots: poll ticks (hourly schedule + EventBridge retries) and daily's
+# match/finalize.
+PIPELINE_WRITER_LEASE = "pipeline-writer"
 
 
 def default_cik_file() -> str:
@@ -119,45 +130,71 @@ def run_daily_batch(args: argparse.Namespace) -> int:
     artifact_root = run_prepare_stages(config)
     # Keep final snapshots fresh from whatever mentions already exist; the in-flight
     # batch job (advanced by ``poll``) will refresh them again when it completes.
-    run_match_and_finalize(
-        artifact_root=artifact_root,
-        final_database_root=args.final_database_root,
-        batch_size=args.match_batch_size,
-        force=args.force,
-    )
+    lease = acquire_lease(artifact_root, PIPELINE_WRITER_LEASE)
+    if lease is None:
+        LOGGER.warning(
+            "Pipeline-writer lease is held (a poll tick is running); skipping "
+            "match/finalize — the poll schedule will refresh snapshots."
+        )
+    else:
+        try:
+            run_match_and_finalize(
+                artifact_root=artifact_root,
+                final_database_root=args.final_database_root,
+                batch_size=args.match_batch_size,
+                force=args.force,
+            )
+        finally:
+            release_lease(lease)
     print(artifact_root)
     return 0
 
 
 def run_poll(args: argparse.Namespace) -> int:
-    """Advance the OpenAI batch extract job by one tick; finalize on completion."""
+    """Advance the OpenAI batch extract job by one tick; finalize on completion.
+
+    The whole tick (including the completion-triggered match/finalize) runs
+    under the pipeline-writer lease; if another run holds it, this tick is
+    skipped and reports ``locked``.
+    """
     resolved_root = resolve_artifact_root(args.artifact_root)
-    tick_kwargs: dict[str, object] = {
-        "batch_client": OpenAIBatchClient(),
-        "artifact_root": resolved_root,
-        "max_attempts": args.max_attempts,
-        "force": args.force,
-    }
-    if args.max_requests_per_batch is not None:
-        tick_kwargs["max_requests_per_batch"] = args.max_requests_per_batch
-    result = advance_extract_job(**tick_kwargs)
-    LOGGER.info(
-        "Poll tick complete: status=%s job=%s folded=%s submitted=%s in_flight=%s terminal=%s",
-        result.status,
-        result.job_id,
-        result.folded_rows,
-        result.submitted_batches,
-        result.in_flight_batches,
-        result.terminal_rows,
-    )
-    if result.status == "completed":
-        run_match_and_finalize(
-            artifact_root=resolved_root,
-            final_database_root=args.final_database_root,
-            batch_size=args.match_batch_size,
-            force=args.force,
+    lease = acquire_lease(resolved_root, PIPELINE_WRITER_LEASE)
+    if lease is None:
+        LOGGER.warning(
+            "Pipeline-writer lease is held; skipping this poll tick — the next "
+            "scheduled tick will pick the job up."
         )
-    print(result.status)
+        print("locked")
+        return 0
+    try:
+        tick_kwargs: dict[str, object] = {
+            "batch_client": OpenAIBatchClient(),
+            "artifact_root": resolved_root,
+            "max_attempts": args.max_attempts,
+            "force": args.force,
+        }
+        if args.max_requests_per_batch is not None:
+            tick_kwargs["max_requests_per_batch"] = args.max_requests_per_batch
+        result = advance_extract_job(**tick_kwargs)
+        LOGGER.info(
+            "Poll tick complete: status=%s job=%s folded=%s submitted=%s in_flight=%s terminal=%s",
+            result.status,
+            result.job_id,
+            result.folded_rows,
+            result.submitted_batches,
+            result.in_flight_batches,
+            result.terminal_rows,
+        )
+        if result.status == "completed":
+            run_match_and_finalize(
+                artifact_root=resolved_root,
+                final_database_root=args.final_database_root,
+                batch_size=args.match_batch_size,
+                force=args.force,
+            )
+        print(result.status)
+    finally:
+        release_lease(lease)
     return 0
 
 
