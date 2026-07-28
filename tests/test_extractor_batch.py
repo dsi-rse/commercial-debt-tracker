@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -19,6 +21,7 @@ from cdt.extractor.batch import (
     BatchRecord,
     BatchStatus,
     JobState,
+    OpenAIBatchClient,
     RowEntry,
     _fold_completed_batches,
     _load_state_jsonl,
@@ -219,7 +222,10 @@ class FakeBatchClient:
             )
         raise KeyError(file_id)
 
-    def list_job_batches(self, job_id: str) -> list[BatchStatus]:
+    def list_job_batches(
+        self, job_id: str, *, created_after: object = None
+    ) -> list[BatchStatus]:
+        del created_after  # in-memory fake keeps no timestamps
         return [
             self.retrieve(batch_id)
             for batch_id, record in self.batches.items()
@@ -733,6 +739,45 @@ def test_reconcile_adopts_orphan_batch(tmp_path: Path) -> None:
         "stage": "ner",
         "attempt_index": 0,
     }
+
+
+def test_openai_client_bounds_orphan_scan(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Listing stops at the created_after cutoff instead of walking all history."""
+    cutoff = datetime(2026, 7, 1, tzinfo=UTC)
+
+    def _sdk_batch(batch_id: str, created_at: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            id=batch_id,
+            status="completed",
+            created_at=created_at,
+            metadata={"job_id": "J"},
+            input_file_id=None,
+            output_file_id=None,
+            error_file_id=None,
+        )
+
+    def _batches_newest_first(limit: int) -> object:
+        del limit
+
+        def _iterate() -> object:
+            yield _sdk_batch("b-new", int(cutoff.timestamp()) + 100)
+            yield _sdk_batch("b-old", int(cutoff.timestamp()) - 100)
+            pytest.fail("scan iterated past the created_after cutoff")
+
+        return _iterate()
+
+    client = OpenAIBatchClient(api_key="test-key")
+    monkeypatch.setattr(
+        OpenAIBatchClient,
+        "_client",
+        lambda self: SimpleNamespace(
+            batches=SimpleNamespace(list=_batches_newest_first)
+        ),
+    )
+
+    found = client.list_job_batches("J", created_after=cutoff)
+
+    assert [status.id for status in found] == ["b-new"]
 
 
 # --------------------------------------------------------------------------- #

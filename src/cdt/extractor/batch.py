@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -109,8 +109,10 @@ class SupportsBatchClient(Protocol):
     def download_file(self, file_id: str) -> str:
         """Return the raw JSONL text of one batch file."""
 
-    def list_job_batches(self, job_id: str) -> list[BatchStatus]:
-        """Return all batches tagged with ``job_id`` in their metadata."""
+    def list_job_batches(
+        self, job_id: str, *, created_after: datetime
+    ) -> list[BatchStatus]:
+        """Return batches tagged with ``job_id`` created after the cutoff."""
 
 
 class OpenAIBatchClient:
@@ -147,9 +149,17 @@ class OpenAIBatchClient:
     def download_file(self, file_id: str) -> str:
         return self._client().files.content(file_id).text  # type: ignore[attr-defined]
 
-    def list_job_batches(self, job_id: str) -> list[BatchStatus]:
+    def list_job_batches(
+        self, job_id: str, *, created_after: datetime
+    ) -> list[BatchStatus]:
+        # The SDK cursor auto-paginates newest-first over the whole account's
+        # batch history; stop at the cutoff so the scan is bounded by this
+        # job's lifetime rather than growing with every batch ever created.
+        cutoff = created_after.timestamp()
         batches: list[BatchStatus] = []
         for batch in self._client().batches.list(limit=100):  # type: ignore[attr-defined]
+            if getattr(batch, "created_at", 0) < cutoff:
+                break
             metadata = getattr(batch, "metadata", None) or {}
             if metadata.get("job_id") == job_id:
                 batches.append(_batch_status_from_object(batch))
@@ -306,6 +316,16 @@ def _read_active_job(root: str) -> str | None:
 
 def _new_job_id() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+
+
+def _job_created_at(job_id: str) -> datetime:
+    """Recover a job's creation time from its timestamp-shaped id."""
+    try:
+        return datetime.strptime(job_id, "%Y%m%dT%H%M%S%fZ").replace(tzinfo=UTC)
+    except ValueError:
+        # Unknown id shape: fall back to an unbounded scan rather than miss
+        # orphans.
+        return datetime.fromtimestamp(0, tz=UTC)
 
 
 def _serialize_state_jsonl(rows: dict[str, RowEntry]) -> str:
@@ -483,7 +503,9 @@ def _reconcile_orphans(root: str, job: JobState, client: SupportsBatchClient) ->
     fold normally instead of being discarded as stale.
     """
     known = set(job.all_batch_ids)
-    for status in client.list_job_batches(job.job_id):
+    # An hour of margin absorbs clock skew between this host and the API.
+    cutoff = _job_created_at(job.job_id) - timedelta(hours=1)
+    for status in client.list_job_batches(job.job_id, created_after=cutoff):
         if status.id in known:
             continue
         LOGGER.warning("Adopting orphan batch %s for job %s", status.id, job.job_id)
