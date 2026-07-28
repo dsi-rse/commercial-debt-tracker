@@ -16,10 +16,14 @@ from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
 from cdt.datasets import completion_registry_path
 from cdt.extractor import advance_extract_job, mentions_root
 from cdt.extractor.batch import (
+    BatchRecord,
     BatchStatus,
     JobState,
     RowEntry,
+    _fold_completed_batches,
+    _load_state_jsonl,
     _reconcile_orphans,
+    _serialize_state_jsonl,
     active_job_path,
     build_request_body,
     normalize_batch_model,
@@ -221,6 +225,26 @@ class FakeBatchClient:
             for batch_id, record in self.batches.items()
             if dict(record["metadata"]).get("job_id") == job_id  # type: ignore[arg-type]
         ]
+
+
+class FlakySubmitClient(FakeBatchClient):
+    """FakeBatchClient whose submit raises on selected call indexes (0-based)."""
+
+    def __init__(
+        self, scripts: dict[str, dict[str, object]], *, fail_on_calls: set[int]
+    ) -> None:
+        super().__init__(scripts)
+        self.fail_on_calls = fail_on_calls
+        self.submit_calls = 0
+
+    def submit(
+        self, requests: list[dict[str, object]], *, metadata: dict[str, str]
+    ) -> str:
+        call = self.submit_calls
+        self.submit_calls += 1
+        if call in self.fail_on_calls:
+            raise RuntimeError("simulated submit failure")
+        return super().submit(requests, metadata=metadata)
 
 
 class ScriptedChatClient:
@@ -432,6 +456,107 @@ def test_failed_batch_marks_rows_error(tmp_path: Path) -> None:
     assert read_dataset(mentions_root(tmp_path)).empty
 
 
+def test_failed_submit_does_not_refold_previous_batch(tmp_path: Path) -> None:
+    """A submit failure after folding must not replay the folded batch.
+
+    Regression test for the crash-between-fold-and-submit window: the folded
+    batch must be durably removed from batches.json before submitting, and the
+    row's advanced stage must survive the failed tick without a burned attempt.
+    """
+    seed_classification(tmp_path, [{"item_id": "item-multi", "text": MULTI_TEXT}])
+    client = FlakySubmitClient(
+        {"item-multi": {"ner": MULTI_NER, "instrument_ie": MULTI_IE}},
+        # Call 0 = the NER submit; call 1 = the instrument_ie submit right
+        # after the NER batch is folded.
+        fail_on_calls={1},
+    )
+
+    assert _advance(tmp_path, client).status == "submitted"
+    with pytest.raises(RuntimeError, match="simulated submit failure"):
+        _advance(tmp_path, client)
+
+    # Recovery tick: no re-fold of the terminal NER batch, just the IE submit.
+    assert _advance(tmp_path, client).status == "submitted"
+    assert _advance(tmp_path, client).status == "completed"
+
+    assert read_dataset(mentions_root(tmp_path))["name"].to_list() == ["Term Loan"]
+    audit_paths = list((tmp_path / "extractor-runs").glob("run_id=*/full.jsonl"))
+    assert len(audit_paths) == 1
+    record = json.loads(audit_paths[0].read_text(encoding="utf-8"))
+    assert record["state"] == "SUCCESS"
+    # Exactly one clean attempt per stage: a re-fold would have burned an
+    # instrument_ie attempt on the stale NER response.
+    assert [(a["stage_name"], a["status"]) for a in record["attempts"]] == [
+        ("ner", "SUCCESS"),
+        ("instrument_ie", "SUCCESS"),
+    ]
+
+
+def test_stale_batch_result_is_ignored() -> None:
+    """A terminal batch a row is no longer pending on folds as a no-op."""
+    client = FakeBatchClient({"item-1": {"ner": MULTI_NER}})
+    row_state = ExtractionRowState(
+        item_row=_item_row("item-1", MULTI_TEXT), stage_name="ner"
+    )
+    initial_messages(row_state)
+    batch_id = client.submit(
+        [
+            {
+                "custom_id": "item-1",
+                "method": "POST",
+                "url": "/v1/chat/completions",
+                "body": {
+                    "model": "gpt-5.4",
+                    "messages": row_state.current_attempt.messages,
+                },
+            }
+        ],
+        metadata={"job_id": "J", "tick": "0"},
+    )
+    # The row already folded this batch and advanced to instrument_ie.
+    handle_response(row_state, MULTI_NER, max_attempts=3)
+    assert row_state.current_attempt.stage_name == "instrument_ie"
+    entry = RowEntry(row_state=row_state, date="2024-01-02", shard="0001")
+    job = JobState(
+        job_id="J",
+        model="gpt-5.4",
+        reasoning_effort="none",
+        max_attempts=3,
+        claimed_partitions=[],
+        rows={"item-1": entry},
+        batches=[BatchRecord(batch_id=batch_id, tick=0, custom_ids=["item-1"])],
+        all_batch_ids=[batch_id],
+    )
+
+    folded = _fold_completed_batches(job, client)
+
+    assert folded == 0
+    assert job.batches == []  # stale record pruned
+    assert row_state.state is None
+    assert row_state.current_attempt.stage_name == "instrument_ie"
+    assert row_state.current_attempt.attempt_index == 0  # no attempt burned
+
+
+def test_state_jsonl_round_trip_preserves_pending() -> None:
+    """Pending survives serialization; legacy lines without it load as None."""
+    row_state = ExtractionRowState(
+        item_row=_item_row("item-1", MULTI_TEXT), stage_name="ner"
+    )
+    initial_messages(row_state)
+    pending = {"batch_id": "batch-0", "stage": "ner", "attempt_index": 0}
+    entry = RowEntry(
+        row_state=row_state, date="2024-01-02", shard="0001", pending=pending
+    )
+
+    loaded = _load_state_jsonl(_serialize_state_jsonl({"item-1": entry}))
+    assert loaded["item-1"].pending == pending
+
+    legacy_line = json.loads(_serialize_state_jsonl({"item-1": entry}).splitlines()[0])
+    del legacy_line["pending"]
+    loaded_legacy = _load_state_jsonl(json.dumps(legacy_line) + "\n")
+    assert loaded_legacy["item-1"].pending is None
+
+
 def test_reconcile_adopts_orphan_batch(tmp_path: Path) -> None:
     """A batch tagged for the job but never recorded is adopted on the next tick."""
     client = FakeBatchClient({"item-1": {"ner": NODEBT_NER}})
@@ -467,6 +592,12 @@ def test_reconcile_adopts_orphan_batch(tmp_path: Path) -> None:
     assert [record.batch_id for record in job.batches] == [orphan_id]
     assert job.batches[0].custom_ids == ["item-1"]
     assert orphan_id in job.all_batch_ids
+    # pending is re-attached so the adopted batch's results fold normally.
+    assert job.rows["item-1"].pending == {
+        "batch_id": orphan_id,
+        "stage": "ner",
+        "attempt_index": 0,
+    }
 
 
 # --------------------------------------------------------------------------- #

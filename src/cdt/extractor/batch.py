@@ -13,7 +13,8 @@ Layout under ``{artifact_root}/extract-batches/``::
 
     active.json                 # {"job_id": ...}; absent when idle
     job_id=<id>/manifest.json   # static job config + claimed partitions
-    job_id=<id>/state.jsonl     # one line per item: source partition + row state
+    job_id=<id>/state.jsonl     # one line per item: source partition + pending
+                                # request marker + row state
     job_id=<id>/batches.json    # in-flight batches, seen batch ids, tick counter
     job_id=<id>/ticks/tick=<n>.json  # per-tick audit counts
 
@@ -196,11 +197,19 @@ def build_request_body(
 
 @dataclass
 class RowEntry:
-    """One item's resumable state plus its originating partition."""
+    """One item's resumable state plus its originating partition.
+
+    ``pending`` records the outstanding request the row is waiting on
+    (``{"batch_id", "stage", "attempt_index"}``); it is set at submit time and
+    cleared when that batch's result is folded. Folding only applies a result
+    whose batch matches ``pending``, so re-delivery of a stale batch result
+    (crash replay, adopted orphan) is a no-op rather than a mis-stage fold.
+    """
 
     row_state: ExtractionRowState
     date: str
     shard: str
+    pending: dict[str, object] | None = None
 
 
 @dataclass
@@ -293,6 +302,7 @@ def _serialize_state_jsonl(rows: dict[str, RowEntry]) -> str:
         json.dumps(
             {
                 "source": {"date": entry.date, "shard": entry.shard},
+                "pending": entry.pending,
                 "row": entry.row_state.to_state_dict(),
             },
             sort_keys=True,
@@ -311,7 +321,10 @@ def _load_state_jsonl(text: str) -> dict[str, RowEntry]:
         row_state = ExtractionRowState.from_state_dict(payload["row"])
         source = payload["source"]
         rows[row_state.item_id] = RowEntry(
-            row_state=row_state, date=source["date"], shard=source["shard"]
+            row_state=row_state,
+            date=source["date"],
+            shard=source["shard"],
+            pending=cast(dict[str, object] | None, payload.get("pending")),
         )
     return rows
 
@@ -449,7 +462,13 @@ def _create_job(
 
 
 def _reconcile_orphans(root: str, job: JobState, client: SupportsBatchClient) -> None:
-    """Adopt any batch tagged with this job_id that we never recorded (crash gap)."""
+    """Adopt any batch tagged with this job_id that we never recorded (crash gap).
+
+    An orphan can only be the most recent submission (every recorded submit
+    persists ``batches.json`` immediately), so its rows' saved states still hold
+    exactly the messages it carries; re-attaching ``pending`` lets its results
+    fold normally instead of being discarded as stale.
+    """
     known = set(job.all_batch_ids)
     for status in client.list_job_batches(job.job_id):
         if status.id in known:
@@ -460,10 +479,27 @@ def _reconcile_orphans(root: str, job: JobState, client: SupportsBatchClient) ->
             custom_ids = list(
                 _parse_jsonl_by_custom_id(client.download_file(status.input_file_id))
             )
+        for custom_id in custom_ids:
+            entry = job.rows.get(custom_id)
+            if (
+                entry is not None
+                and entry.row_state.state is None
+                and entry.pending is None
+            ):
+                entry.pending = _pending_marker(status.id, entry)
         job.batches.append(
             BatchRecord(batch_id=status.id, tick=job.tick, custom_ids=custom_ids)
         )
         job.all_batch_ids.append(status.id)
+
+
+def _pending_marker(batch_id: str, entry: RowEntry) -> dict[str, object]:
+    """Describe the request a row is waiting on in the given batch."""
+    return {
+        "batch_id": batch_id,
+        "stage": entry.row_state.current_attempt.stage_name,
+        "attempt_index": entry.row_state.current_attempt.attempt_index,
+    }
 
 
 def _fold_completed_batches(job: JobState, client: SupportsBatchClient) -> int:
@@ -489,6 +525,20 @@ def _fold_completed_batches(job: JobState, client: SupportsBatchClient) -> int:
             entry = job.rows.get(custom_id)
             if entry is None or entry.row_state.state is not None:
                 continue
+            if (
+                entry.pending is None
+                or entry.pending.get("batch_id") != record.batch_id
+            ):
+                # The row is not waiting on this batch (stale record replayed
+                # after a partial tick): discard rather than mis-stage fold.
+                LOGGER.warning(
+                    "Ignoring stale result for %s from batch %s (pending=%s)",
+                    custom_id,
+                    record.batch_id,
+                    entry.pending,
+                )
+                continue
+            entry.pending = None
             line = results.get(custom_id)
             if line is not None:
                 try:
@@ -506,7 +556,8 @@ def _fold_completed_batches(job: JobState, client: SupportsBatchClient) -> int:
                     entry.row_state, f"OpenAI batch {status.status}: {record.batch_id}"
                 )
                 folded += 1
-            # else expired-and-missing: leave awaiting so it re-submits next tick.
+            # else expired-and-missing: pending is cleared, so the row is
+            # awaiting again and re-submits next tick.
         if status.status in FATAL_STATUSES:
             LOGGER.error(
                 "OpenAI batch %s ended as %s for job %s",
@@ -519,23 +570,28 @@ def _fold_completed_batches(job: JobState, client: SupportsBatchClient) -> int:
 
 
 def _awaiting_rows(job: JobState) -> list[RowEntry]:
-    """Non-terminal rows not currently carried by an in-flight batch."""
-    in_flight = {cid for record in job.batches for cid in record.custom_ids}
+    """Non-terminal rows with no outstanding batch request."""
     return [
         entry
-        for item_id, entry in job.rows.items()
-        if entry.row_state.state is None and item_id not in in_flight
+        for entry in job.rows.values()
+        if entry.row_state.state is None and entry.pending is None
     ]
 
 
 def _submit_awaiting(
+    root: str,
     job: JobState,
     awaiting: list[RowEntry],
     client: SupportsBatchClient,
     *,
     max_requests_per_batch: int,
 ) -> int:
-    """Submit awaiting rows in one or more batches. Returns batches submitted."""
+    """Submit awaiting rows in one or more batches. Returns batches submitted.
+
+    State and the batch record are persisted after every chunk, so a crash
+    mid-submission loses at most the very last batch — which orphan
+    reconciliation recovers by its job_id tag next tick.
+    """
     submitted = 0
     for start in range(0, len(awaiting), max_requests_per_batch):
         chunk = awaiting[start : start + max_requests_per_batch]
@@ -556,6 +612,8 @@ def _submit_awaiting(
             requests,
             metadata={"job_id": job.job_id, "tick": str(job.tick)},
         )
+        for entry in chunk:
+            entry.pending = _pending_marker(batch_id, entry)
         job.batches.append(
             BatchRecord(
                 batch_id=batch_id,
@@ -564,6 +622,8 @@ def _submit_awaiting(
             )
         )
         job.all_batch_ids.append(batch_id)
+        _save_state(root, job)
+        _save_batches(root, job)
         submitted += 1
     return submitted
 
@@ -616,13 +676,20 @@ def advance_extract_job(
     job.tick += 1
     awaiting = _awaiting_rows(job)
 
-    # Durable-before-side-effect: persist row states before creating any batch, so a
-    # crash after submit is recoverable via orphan reconciliation next tick.
+    # Durable-before-side-effect: persist the folded row states AND the pruned
+    # batch list before creating any batch. A terminal batch must never survive
+    # in batches.json once its results are folded (it would be re-folded on the
+    # next tick if a later submit fails), and a crash after submit is
+    # recoverable via orphan reconciliation next tick.
     _save_state(resolved_root, job)
-    submitted = _submit_awaiting(
-        job, awaiting, batch_client, max_requests_per_batch=max_requests_per_batch
-    )
     _save_batches(resolved_root, job)
+    submitted = _submit_awaiting(
+        resolved_root,
+        job,
+        awaiting,
+        batch_client,
+        max_requests_per_batch=max_requests_per_batch,
+    )
 
     terminal_rows = sum(
         1 for entry in job.rows.values() if entry.row_state.state is not None
