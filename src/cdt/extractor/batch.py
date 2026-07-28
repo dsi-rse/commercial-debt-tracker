@@ -71,6 +71,9 @@ DEFAULT_MAX_REQUESTS_PER_BATCH = 40_000
 # OpenAI also caps batch input files by size (200 MB); chunk at half that so
 # a batch never wedges the job on the byte limit.
 DEFAULT_MAX_BATCH_BYTES = 100 * 1024 * 1024
+# A row whose batch expires without a result re-submits next tick; each round
+# costs another 24h window, so cap the rounds instead of looping forever.
+DEFAULT_MAX_RESUBMISSIONS = 3
 DEFAULT_BATCH_MODEL = "gpt-5.4"
 # OpenAI reasoning_effort vocabulary (distinct from OpenRouter's "none"/"xhigh").
 OPENAI_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
@@ -208,12 +211,16 @@ class RowEntry:
     cleared when that batch's result is folded. Folding only applies a result
     whose batch matches ``pending``, so re-delivery of a stale batch result
     (crash replay, adopted orphan) is a no-op rather than a mis-stage fold.
+
+    ``resubmissions`` counts consecutive expired-without-result rounds; it
+    resets whenever a real result folds and terminates the row at the cap.
     """
 
     row_state: ExtractionRowState
     date: str
     shard: str
     pending: dict[str, object] | None = None
+    resubmissions: int = 0
 
 
 @dataclass
@@ -307,6 +314,7 @@ def _serialize_state_jsonl(rows: dict[str, RowEntry]) -> str:
             {
                 "source": {"date": entry.date, "shard": entry.shard},
                 "pending": entry.pending,
+                "resubmissions": entry.resubmissions,
                 "row": entry.row_state.to_state_dict(),
             },
             sort_keys=True,
@@ -329,6 +337,7 @@ def _load_state_jsonl(text: str) -> dict[str, RowEntry]:
             date=source["date"],
             shard=source["shard"],
             pending=cast(dict[str, object] | None, payload.get("pending")),
+            resubmissions=int(cast(int, payload.get("resubmissions", 0))),
         )
     return rows
 
@@ -506,7 +515,12 @@ def _pending_marker(batch_id: str, entry: RowEntry) -> dict[str, object]:
     }
 
 
-def _fold_completed_batches(job: JobState, client: SupportsBatchClient) -> int:
+def _fold_completed_batches(
+    job: JobState,
+    client: SupportsBatchClient,
+    *,
+    max_resubmissions: int = DEFAULT_MAX_RESUBMISSIONS,
+) -> int:
     """Poll in-flight batches; fold terminal ones into row states.
 
     Returns the number of rows advanced. Batches still running are left in place.
@@ -545,6 +559,7 @@ def _fold_completed_batches(job: JobState, client: SupportsBatchClient) -> int:
             entry.pending = None
             line = results.get(custom_id)
             if line is not None:
+                entry.resubmissions = 0
                 try:
                     text = extract_batch_response_text(line)
                 except Exception as exc:  # noqa: BLE001
@@ -560,8 +575,18 @@ def _fold_completed_batches(job: JobState, client: SupportsBatchClient) -> int:
                     entry.row_state, f"OpenAI batch {status.status}: {record.batch_id}"
                 )
                 folded += 1
-            # else expired-and-missing: pending is cleared, so the row is
-            # awaiting again and re-submits next tick.
+            else:
+                # Expired-and-missing: pending is cleared so the row re-submits
+                # next tick — but each round costs a 24h window, so terminate at
+                # the cap instead of blocking the job forever.
+                entry.resubmissions += 1
+                if entry.resubmissions >= max_resubmissions:
+                    record_stage_error(
+                        entry.row_state,
+                        f"Batch request expired {entry.resubmissions} times "
+                        "without a result.",
+                    )
+                    folded += 1
         if status.status in FATAL_STATUSES:
             LOGGER.error(
                 "OpenAI batch %s ended as %s for job %s",
@@ -694,6 +719,7 @@ def advance_extract_job(
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     max_requests_per_batch: int = DEFAULT_MAX_REQUESTS_PER_BATCH,
     max_batch_bytes: int = DEFAULT_MAX_BATCH_BYTES,
+    max_resubmissions: int = DEFAULT_MAX_RESUBMISSIONS,
     force: bool = False,
 ) -> ExtractTickResult:
     """Advance the extract job by one tick.
@@ -728,7 +754,9 @@ def advance_extract_job(
     else:
         job = _load_job_state(resolved_root, active_job_id)
         _reconcile_orphans(resolved_root, job, batch_client)
-        folded = _fold_completed_batches(job, batch_client)
+        folded = _fold_completed_batches(
+            job, batch_client, max_resubmissions=max_resubmissions
+        )
 
     job.tick += 1
     awaiting = _awaiting_rows(job)

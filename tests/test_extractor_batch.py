@@ -444,6 +444,37 @@ def test_expired_batch_resubmits_missing_items(tmp_path: Path) -> None:
     assert read_dataset(mentions_root(tmp_path))["name"].to_list() == ["Term Loan"]
 
 
+def test_repeatedly_expired_row_terminates_at_cap(tmp_path: Path) -> None:
+    """A row whose batches keep expiring stops resubmitting at the cap."""
+    seed_classification(tmp_path, [{"item_id": "item-multi", "text": MULTI_TEXT}])
+    client = FakeBatchClient(
+        {"item-multi": {"ner": MULTI_NER, "instrument_ie": MULTI_IE}},
+        forced_status={0: "expired", 1: "expired", 2: "expired", 3: "expired"},
+    )
+
+    def _tick() -> object:
+        return advance_extract_job(
+            batch_client=client,
+            artifact_root=tmp_path,
+            model="gpt-5.4",
+            reasoning_effort="none",
+            max_attempts=3,
+            max_resubmissions=3,
+        )
+
+    assert _tick().status == "submitted"  # b0 (expires)
+    assert _tick().status == "submitted"  # fold expiry 1, resubmit b1 (expires)
+    assert _tick().status == "submitted"  # fold expiry 2, resubmit b2 (expires)
+    # Third consecutive expiry hits the cap: terminate instead of resubmitting.
+    assert _tick().status == "completed"
+
+    assert len(client.submitted) == 3
+    audit = list((tmp_path / "extractor-runs").glob("run_id=*/full.jsonl"))
+    record = json.loads(audit[0].read_text(encoding="utf-8"))
+    assert record["state"] == "ERROR"
+    assert "expired 3 times" in json.dumps(record["attempts"])
+
+
 def test_failed_batch_marks_rows_error(tmp_path: Path) -> None:
     """A whole-batch failure terminates its rows rather than looping forever."""
     seed_classification(tmp_path, [{"item_id": "item-multi", "text": MULTI_TEXT}])
