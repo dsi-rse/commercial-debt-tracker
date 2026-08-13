@@ -74,7 +74,6 @@ DEFAULT_MAX_BATCH_BYTES = 100 * 1024 * 1024
 # A row whose batch expires without a result re-submits next tick; each round
 # costs another 24h window, so cap the rounds instead of looping forever.
 DEFAULT_MAX_RESUBMISSIONS = 3
-DEFAULT_BATCH_MODEL = "gpt-5.4"
 # OpenAI reasoning_effort vocabulary (distinct from OpenRouter's "none"/"xhigh").
 OPENAI_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
 # OpenAI batch statuses whose results we fold into row states.
@@ -753,7 +752,7 @@ def advance_extract_job(
     marker (match/finalize is the orchestrator's responsibility).
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
-    resolved_model = model or settings.EXTRACTOR_BATCH_MODEL or DEFAULT_BATCH_MODEL
+    resolved_model = model or settings.EXTRACTOR_BATCH_MODEL
     resolved_reasoning = (
         reasoning_effort
         if reasoning_effort is not None

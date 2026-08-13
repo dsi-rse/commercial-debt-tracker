@@ -44,7 +44,7 @@ from cdt.storage import (
 
 LOGGER = get_logger(__name__)
 DEFAULT_MAX_ATTEMPTS = 3
-DEFAULT_MODEL = "openai/gpt-5.4"
+DEFAULT_MODEL = settings.DEFAULT_EXTRACTOR_MODEL
 DEFAULT_REASONING_EFFORT = "none"
 REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 INSTRUMENT_ENTITY_TAG_TYPES = {"debt_instrument"}
@@ -824,7 +824,7 @@ def extract_pending_items(
         raise ValueError(f"batch_size must be positive, got {batch_size}")
     if max_attempts <= 0:
         raise ValueError(f"max_attempts must be positive, got {max_attempts}")
-    resolved_model = model or settings.EXTRACTOR_MODEL or DEFAULT_MODEL
+    resolved_model = model or settings.EXTRACTOR_MODEL
     resolved_reasoning = normalize_reasoning_effort(reasoning_effort)
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
@@ -1158,7 +1158,7 @@ def extract_tables(
                 columns=DEBT_INSTRUMENT_MENTION_COLUMNS
             )
         }
-    resolved_model = model or settings.EXTRACTOR_MODEL or DEFAULT_MODEL
+    resolved_model = model or settings.EXTRACTOR_MODEL
     resolved_reasoning = normalize_reasoning_effort(reasoning_effort)
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")

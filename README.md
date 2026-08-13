@@ -135,8 +135,10 @@ Deployed runs require:
 Optional runtime configuration:
 
 - `AWS_PROFILE` for local runs against AWS
-- `EXTRACTOR_MODEL` and `EXTRACTOR_REASONING` (live OpenRouter backend)
-- `EXTRACTOR_BATCH_MODEL` (default `gpt-5.4`) and `EXTRACTOR_BATCH_REASONING` (OpenAI batch backend)
+- `EXTRACTOR_MODEL` (default `openai/gpt-5.4`) and `EXTRACTOR_REASONING` (live OpenRouter backend)
+- `EXTRACTOR_BATCH_MODEL` and `EXTRACTOR_BATCH_REASONING` (OpenAI batch backend).
+  `EXTRACTOR_BATCH_MODEL` defaults to `EXTRACTOR_MODEL` with the provider prefix
+  stripped, so setting `EXTRACTOR_MODEL` alone moves both backends.
 - `EXTRACTOR_BACKEND` (`batch` default, or `live`) — also settable per run with
   `cdt-orchestrator --extractor-backend {live,batch} daily`
 
