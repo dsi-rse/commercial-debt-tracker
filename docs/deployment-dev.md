@@ -46,9 +46,10 @@ Notes:
 The quickest local setup uses [direnv](https://direnv.net) and the `make infra-*`
 targets, so you never re-export AWS creds or the Pulumi passphrase by hand.
 
-1. Copy `.envrc.example` to `.envrc` (or use the committed `.envrc` as-is) and put your
-   secrets in `.env` (gitignored) — at minimum `PULUMI_CONFIG_PASSPHRASE` (from the Core
-   Facility Bitwarden) and `OPENAI_API_KEY`. Then trust the directory:
+1. Copy `.envrc.example` to `.envrc` (both `.env` and `.envrc` are gitignored, so the AWS
+   profile stays a local choice) and put your secrets in `.env` — at minimum
+   `PULUMI_CONFIG_PASSPHRASE` (from the Core Facility Bitwarden) and `OPENAI_API_KEY`.
+   Then trust the directory:
 
 ```bash
 direnv allow

@@ -113,6 +113,8 @@ celerybeat-schedule
 
 # Environments
 .env
+# .envrc exports a machine-specific AWS profile/region; copy .envrc.example instead.
+.envrc
 .venv
 env/
 venv/
