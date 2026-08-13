@@ -138,7 +138,9 @@ Optional runtime configuration:
 - `EXTRACTOR_MODEL` (default `openai/gpt-5.4`) and `EXTRACTOR_REASONING` (live OpenRouter backend)
 - `EXTRACTOR_BATCH_MODEL` and `EXTRACTOR_BATCH_REASONING` (OpenAI batch backend).
   `EXTRACTOR_BATCH_MODEL` defaults to `EXTRACTOR_MODEL` with the provider prefix
-  stripped, so setting `EXTRACTOR_MODEL` alone moves both backends.
+  stripped, so setting `EXTRACTOR_MODEL` alone moves both backends. Reasoning effort
+  is configured in OpenRouter's vocabulary for both backends and translated for
+  OpenAI (`none` → `minimal`, `xhigh` → `high`).
 - `EXTRACTOR_BACKEND` (`batch` default, or `live`) — also settable per run with
   `cdt-orchestrator --extractor-backend {live,batch} daily`
 

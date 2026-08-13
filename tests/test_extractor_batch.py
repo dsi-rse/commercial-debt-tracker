@@ -35,12 +35,14 @@ from cdt.extractor.batch import (
     normalize_batch_model,
 )
 from cdt.extractor.core import (
+    EXTRACTOR_TEMPERATURE,
     ExtractionRowState,
     extract_batch_response_text,
     handle_response,
     initial_messages,
     load_prompt,
     run_extraction_workflow,
+    sampling_params,
 )
 from cdt.storage import (
     artifact_exists,
@@ -813,19 +815,64 @@ def test_build_request_body_reasoning_and_model() -> None:
     assert normalize_batch_model("openai/gpt-5.4") == "gpt-5.4"
     assert normalize_batch_model("gpt-5.4") == "gpt-5.4"
 
+    # OpenRouter's "none" becomes OpenAI's lowest effort rather than being
+    # dropped, which would leave the batch on the model default (medium).
     body = build_request_body(
         [{"role": "user", "content": "x"}],
         model="openai/gpt-5.4",
         reasoning_effort="none",
     )
-    assert body == {"model": "gpt-5.4", "messages": [{"role": "user", "content": "x"}]}
+    assert body == {
+        "model": "gpt-5.4",
+        "messages": [{"role": "user", "content": "x"}],
+        "reasoning_effort": "minimal",
+    }
 
     body = build_request_body([], model="gpt-5.4", reasoning_effort="medium")
     assert body["reasoning_effort"] == "medium"
     assert "temperature" not in body
 
+    # xhigh is an OpenRouter-only level; it maps down to OpenAI's ceiling.
+    body = build_request_body([], model="gpt-5.4", reasoning_effort="xhigh")
+    assert body["reasoning_effort"] == "high"
+
+    # A non-reasoning model can honor temperature, so both backends send it.
+    body = build_request_body([], model="openai/gpt-4.1-mini", reasoning_effort="")
+    assert body["temperature"] == EXTRACTOR_TEMPERATURE
+    assert "reasoning_effort" not in body
+
     with pytest.raises(ValueError, match="reasoning_effort"):
         build_request_body([], model="gpt-5.4", reasoning_effort="ludicrous")
+
+
+def test_sampling_params_match_across_backends() -> None:
+    """Both backends resolve temperature from one shared policy."""
+    assert sampling_params("openai/gpt-5.4") == {}
+    assert sampling_params("gpt-5.4") == {}
+    assert sampling_params("o3-mini") == {}
+    assert sampling_params("openai/gpt-4.1-mini") == {
+        "temperature": EXTRACTOR_TEMPERATURE
+    }
+
+
+def test_unsupported_reasoning_effort_fails_before_job_creation(
+    tmp_path: Path,
+) -> None:
+    """A bad effort raises on the tick, leaving no half-created job behind."""
+    seed_classification(tmp_path, [{"item_id": "item-multi", "text": MULTI_TEXT}])
+    client = FakeBatchClient({"item-multi": {"ner": MULTI_NER}})
+
+    with pytest.raises(ValueError, match="reasoning_effort"):
+        advance_extract_job(
+            batch_client=client,
+            artifact_root=tmp_path,
+            model="gpt-5.4",
+            reasoning_effort="ludicrous",
+            max_attempts=3,
+        )
+
+    assert not client.submitted
+    assert not Path(active_job_path(str(tmp_path))).exists()
 
 
 def test_force_warns_when_a_job_is_already_active(

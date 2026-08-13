@@ -105,6 +105,19 @@ are pure and backend-agnostic. Two backends drive them:
 - The `batch` backend (`OpenAIBatchClient`) drives the same stages asynchronously through
   OpenAI's Batch API (~50% cheaper, up to 24h per round). This is the deployed default.
 
+Because the two backends talk to different APIs, the request parameters they share are
+resolved in one place so the same model cannot behave differently depending on which
+backend ran it:
+
+- Sampling comes from `sampling_params(model)`. Reasoning models (`gpt-5`, `o1`, `o3`,
+  `o4` families, matched on the native id) reject `temperature != 1`, so temperature is
+  sent only to models that can honor it; for those it is pinned to `0.0`.
+- Reasoning effort is configured in OpenRouter's vocabulary and translated for OpenAI by
+  `openai_reasoning_effort`: `none` → `minimal` and `xhigh` → `high`. Translating rather
+  than dropping matters — an omitted `reasoning_effort` leaves a `gpt-5` batch on the API
+  default (`medium`) while the live backend ran with reasoning off. An effort neither
+  vocabulary accepts raises on the poll tick before a job is created.
+
 ### The batch extract state machine
 
 Because each item flows through several sequential stages, each retryable, and each batch

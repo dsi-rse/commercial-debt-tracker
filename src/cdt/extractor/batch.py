@@ -46,7 +46,9 @@ from cdt.extractor.core import (
     finalize_extract_outputs,
     handle_response,
     initial_messages,
+    native_model_id,
     record_stage_error,
+    sampling_params,
 )
 from cdt.shared import get_logger
 from cdt.storage import (
@@ -76,6 +78,11 @@ DEFAULT_MAX_BATCH_BYTES = 100 * 1024 * 1024
 DEFAULT_MAX_RESUBMISSIONS = 3
 # OpenAI reasoning_effort vocabulary (distinct from OpenRouter's "none"/"xhigh").
 OPENAI_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
+# Efforts the live backend accepts that OpenAI does not. Translating beats
+# dropping: omitting reasoning_effort would leave a batch on the API default
+# (medium) while the live backend ran with reasoning off, so the same config
+# would silently cost and reason differently across backends.
+OPENROUTER_TO_OPENAI_REASONING = {"none": "minimal", "xhigh": "high"}
 # OpenAI batch statuses whose results we fold into row states.
 RESULT_STATUSES = frozenset({"completed", "expired"})
 # OpenAI batch statuses that terminate a batch without usable results.
@@ -178,7 +185,28 @@ def _batch_status_from_object(batch: object) -> BatchStatus:
 
 def normalize_batch_model(model: str) -> str:
     """Strip any provider prefix so an OpenRouter slug becomes a native id."""
-    return model.split("/", 1)[1] if "/" in model else model
+    return native_model_id(model)
+
+
+def openai_reasoning_effort(reasoning_effort: str) -> str:
+    """Translate a configured reasoning effort into OpenAI's vocabulary.
+
+    Returns ``""`` when no effort is configured, so the caller omits the field
+    and takes the model default. Raises for a value neither vocabulary accepts,
+    which lets a bad config fail before a job is created.
+    """
+    effort = (reasoning_effort or "").strip().lower()
+    if not effort:
+        return ""
+    translated = OPENROUTER_TO_OPENAI_REASONING.get(effort, effort)
+    if translated not in OPENAI_REASONING_EFFORTS:
+        allowed = ", ".join(
+            sorted(OPENAI_REASONING_EFFORTS | set(OPENROUTER_TO_OPENAI_REASONING))
+        )
+        raise ValueError(
+            f"Unsupported OpenAI reasoning_effort {effort!r}; expected one of {allowed}."
+        )
+    return translated
 
 
 def build_request_body(
@@ -186,22 +214,17 @@ def build_request_body(
 ) -> dict[str, object]:
     """Build one ``/v1/chat/completions`` request body for the batch endpoint.
 
-    ``temperature`` is intentionally omitted (gpt-5-class reasoning models reject
-    ``temperature != 1``); ``reasoning_effort`` is included only for the OpenAI
-    vocabulary and skipped for the OpenRouter-ism ``"none"``.
+    Sampling params come from the shared ``sampling_params`` policy so this body
+    matches what the live backend sends for the same model, and the configured
+    effort is translated into OpenAI's vocabulary.
     """
     body: dict[str, object] = {
-        "model": normalize_batch_model(model),
+        "model": native_model_id(model),
         "messages": messages,
+        **sampling_params(model),
     }
-    effort = (reasoning_effort or "").strip().lower()
-    if effort and effort != "none":
-        if effort not in OPENAI_REASONING_EFFORTS:
-            allowed = ", ".join(sorted(OPENAI_REASONING_EFFORTS))
-            raise ValueError(
-                f"Unsupported OpenAI reasoning_effort {effort!r}; expected one of "
-                f"{allowed} or 'none'."
-            )
+    effort = openai_reasoning_effort(reasoning_effort)
+    if effort:
         body["reasoning_effort"] = effort
     return body
 
@@ -758,6 +781,15 @@ def advance_extract_job(
         if reasoning_effort is not None
         else settings.EXTRACTOR_BATCH_REASONING
     )
+    # Fail on the config, not mid-tick: an effort OpenAI rejects would otherwise
+    # surface only once the first request body is built, after a job exists.
+    translated_reasoning = openai_reasoning_effort(resolved_reasoning)
+    if translated_reasoning != resolved_reasoning.strip().lower():
+        LOGGER.info(
+            "Translated reasoning effort %r to OpenAI's %r for the batch backend.",
+            resolved_reasoning,
+            translated_reasoning or "<model default>",
+        )
 
     active_job_id = _read_active_job(resolved_root)
     if active_job_id is None:

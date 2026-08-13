@@ -47,6 +47,12 @@ DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_MODEL = settings.DEFAULT_EXTRACTOR_MODEL
 DEFAULT_REASONING_EFFORT = "none"
 REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
+EXTRACTOR_TEMPERATURE = 0.0
+# Reasoning models take a reasoning_effort and reject temperature != 1, so both
+# backends must decide sampling params the same way or the same model produces
+# different output live versus in batch. Prefixes are matched against the native
+# id, so both "gpt-5.4" and "openai/gpt-5.4" resolve identically.
+REASONING_MODEL_PREFIXES = ("gpt-5", "o1", "o3", "o4")
 INSTRUMENT_ENTITY_TAG_TYPES = {"debt_instrument"}
 LENDER_TAG_TYPES = {"person", "organization"}
 INSTRUMENT_SINGLE_VALUE_PROPERTIES = {
@@ -328,7 +334,7 @@ class OpenRouterChatClient:
             "messages": messages,
             "model": model,
             "stream": False,
-            "temperature": 0.0,
+            **sampling_params(model),
         }
         if reasoning_effort:
             request_kwargs["reasoning"] = {"effort": reasoning_effort}
@@ -1826,3 +1832,25 @@ def normalize_reasoning_effort(reasoning_effort: str | None) -> str:
             f"Unsupported reasoning effort {resolved!r}; expected one of {allowed}"
         )
     return resolved
+
+
+def native_model_id(model: str) -> str:
+    """Strip any provider prefix so an OpenRouter slug becomes a native id."""
+    return model.split("/", 1)[1] if "/" in model else model
+
+
+def is_reasoning_model(model: str) -> bool:
+    """Return True for model families that take reasoning_effort over temperature."""
+    return native_model_id(model).lower().startswith(REASONING_MODEL_PREFIXES)
+
+
+def sampling_params(model: str) -> dict[str, object]:
+    """Return the sampling params to send with one extract call.
+
+    Shared by both backends. Reasoning models reject ``temperature != 1``, so
+    temperature is only sent to models that can honor it; for those, pinning it
+    to 0 keeps extraction as reproducible as the provider allows.
+    """
+    if is_reasoning_model(model):
+        return {}
+    return {"temperature": EXTRACTOR_TEMPERATURE}
