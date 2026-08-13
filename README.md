@@ -79,6 +79,8 @@ Notes:
 - `cdt pipeline` writes final snapshots only when `--final-database-root` is passed.
 - `cdt-orchestrator` reads `FINAL_DATABASE_ROOT` from the environment, or accepts `--final-database-root` before the mode.
 - `make local-run` and `./scripts/local-pipeline.sh` exercise the orchestrator with deployment-like environment variables from `.env`.
+- `cdt show-extract-job` inspects the async batch extract job; `cdt reset-extract-job --yes`
+  clears a wedged one. See [docs/architecture.md](docs/architecture.md).
 - The shared local convention is `DATA_DIR/commercial-debt-tracker/local` for canonical artifacts and `DATA_DIR/commercial-debt-tracker/database/cdt` for dashboard-consumable `latest.parquet` outputs.
 
 ## Dashboard Handoff

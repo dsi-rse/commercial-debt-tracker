@@ -27,7 +27,7 @@ from collections.abc import Sequence
 from cdt.cli import configure_logging, parse_date, positive_int
 from cdt.datasets import resolve_artifact_root
 from cdt.extractor import DEFAULT_MAX_ATTEMPTS, OpenAIBatchClient, advance_extract_job
-from cdt.lease import acquire_lease, release_lease
+from cdt.lease import PIPELINE_WRITER_LEASE, acquire_lease, release_lease
 from cdt.pipeline import (
     DEFAULT_STAGE_BATCH_SIZE,
     PipelineConfig,
@@ -38,11 +38,6 @@ from cdt.pipeline import (
 from cdt.shared import get_logger
 
 LOGGER = get_logger(__name__)
-
-# One lease serializes every writer of extract job state and match/final
-# snapshots: poll ticks (hourly schedule + EventBridge retries) and daily's
-# match/finalize.
-PIPELINE_WRITER_LEASE = "pipeline-writer"
 
 
 def default_cik_file() -> str:

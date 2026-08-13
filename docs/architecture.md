@@ -143,9 +143,27 @@ Each tick:
 5. and, when every item is terminal, writes the `mentions` partitions, audit log, and
    completion registry, then clears the active-job marker so match + finalize can run.
 
-Whole-batch failures terminate their items rather than looping forever; expired batches
-salvage whatever completed and re-submit the rest, up to a per-item cap of consecutive
-expired rounds. Job state lives under `extract-batches/` (see [schema.md](schema.md)).
+Whole-batch failures terminate their items rather than looping forever, recording the
+per-request reasons from the batch's error file (or, failing that, its batch-level
+errors); expired batches salvage whatever completed and re-submit the rest, up to a
+per-item cap of consecutive expired rounds. Job state lives under `extract-batches/`
+(see [schema.md](schema.md)).
+
+If `active.json` names a job directory that was deleted or only partially written, the
+tick cannot load it. Rather than raising the same way forever, it logs the reason, clears
+the marker, and reports `reset`; the next tick starts a fresh job over the same
+classification partitions, which are still unclaimed because the completion registry is
+only written when a job finishes. Any batch the abandoned job left in flight is lost
+spend — orphan reconciliation is scoped per job, so a new job will not adopt it.
+
+Two `cdt` commands cover the same ground manually:
+
+- `cdt show-extract-job` reports the active job (rows, terminal rows, in-flight batches,
+  claimed partitions), or `corrupt` with the reason. Read-only, and exits non-zero on a
+  corrupt job so a health check fails loudly.
+- `cdt reset-extract-job --yes` clears the marker immediately, taking the
+  `pipeline-writer` lease first so it cannot race a running tick. Without `--yes` it only
+  reports what a reset would abandon. The job directory is left in place for inspection.
 
 ## Matcher Design
 

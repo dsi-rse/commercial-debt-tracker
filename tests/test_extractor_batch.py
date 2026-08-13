@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shutil
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,7 +20,12 @@ import cdt.extractor.batch as batch_module
 from cdt.classifier import classifications_root
 from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
 from cdt.datasets import completion_registry_path
-from cdt.extractor import advance_extract_job, mentions_root
+from cdt.extractor import (
+    advance_extract_job,
+    describe_active_job,
+    mentions_root,
+    reset_active_job,
+)
 from cdt.extractor.batch import (
     BatchRecord,
     BatchStatus,
@@ -1008,3 +1014,107 @@ def test_force_warns_when_a_job_is_already_active(
         )
     assert "Ignoring force=True" in caplog.text
     assert created.job_id in caplog.text
+
+
+# --------------------------------------------------------------------------- #
+# Corrupt/missing job state recovery
+# --------------------------------------------------------------------------- #
+
+
+def _seed_active_job(tmp_path: Path, client: FakeBatchClient) -> str:
+    """Create a job with one in-flight batch and return its job id."""
+    seed_classification(tmp_path, [{"item_id": "item-multi", "text": MULTI_TEXT}])
+    result = advance_extract_job(
+        batch_client=client,
+        artifact_root=tmp_path,
+        model="gpt-5.4",
+        reasoning_effort="none",
+        max_attempts=3,
+    )
+    assert result.status == "submitted"
+    assert result.job_id is not None
+    return result.job_id
+
+
+def test_missing_job_directory_self_heals(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    propagate_logger: Callable[[logging.Logger], None],
+) -> None:
+    """A deleted job directory clears the marker instead of wedging every tick."""
+    propagate_logger(batch_module.LOGGER)
+    client = FakeBatchClient(
+        {"item-multi": {"ner": MULTI_NER, "instrument_ie": MULTI_IE}}
+    )
+    job_id = _seed_active_job(tmp_path, client)
+
+    shutil.rmtree(tmp_path / "extract-batches" / f"job_id={job_id}")
+
+    with caplog.at_level("ERROR"):
+        reset_tick = _advance(tmp_path, client)
+    assert reset_tick.status == "reset"
+    assert reset_tick.job_id == job_id
+    assert "Clearing the active extract job marker" in caplog.text
+
+    # The very next tick makes progress again on the same partitions.
+    assert _advance(tmp_path, client).status == "submitted"
+    while (status := _advance(tmp_path, client).status) != "completed":
+        assert status in {"submitted", "waiting"}
+    assert read_dataset(mentions_root(tmp_path))["name"].to_list() == ["Term Loan"]
+
+
+def test_truncated_manifest_self_heals(tmp_path: Path) -> None:
+    """A partially written manifest is treated as corrupt, not a crash."""
+    client = FakeBatchClient({"item-multi": {"ner": MULTI_NER}})
+    job_id = _seed_active_job(tmp_path, client)
+
+    manifest = tmp_path / "extract-batches" / f"job_id={job_id}" / "manifest.json"
+    # Valid JSON, but missing every key _load_job_state indexes.
+    manifest.write_text('{"job_id": "x"}', encoding="utf-8")
+
+    assert _advance(tmp_path, client).status == "reset"
+
+
+def test_unparseable_state_jsonl_self_heals(tmp_path: Path) -> None:
+    """Garbage in state.jsonl is recoverable rather than permanent."""
+    client = FakeBatchClient({"item-multi": {"ner": MULTI_NER}})
+    job_id = _seed_active_job(tmp_path, client)
+
+    state = tmp_path / "extract-batches" / f"job_id={job_id}" / "state.jsonl"
+    state.write_text("{not json at all\n", encoding="utf-8")
+
+    assert _advance(tmp_path, client).status == "reset"
+
+
+def test_describe_active_job_reports_idle_active_and_corrupt(tmp_path: Path) -> None:
+    """The read-only summary covers all three states without mutating anything."""
+    assert describe_active_job(tmp_path).status == "idle"
+
+    client = FakeBatchClient({"item-multi": {"ner": MULTI_NER}})
+    job_id = _seed_active_job(tmp_path, client)
+
+    summary = describe_active_job(tmp_path)
+    assert summary.status == "active"
+    assert summary.job_id == job_id
+    assert summary.total_rows == 1
+    assert summary.in_flight_batches == 1
+    assert summary.claimed_partitions == 1
+
+    shutil.rmtree(tmp_path / "extract-batches" / f"job_id={job_id}")
+    corrupt = describe_active_job(tmp_path)
+    assert corrupt.status == "corrupt"
+    assert corrupt.job_id == job_id
+    assert "missing" in corrupt.detail
+    # Reporting must not have cleared the marker.
+    assert read_json_artifact(active_job_path(str(tmp_path)))["job_id"] == job_id
+
+
+def test_reset_active_job_clears_marker_and_keeps_state(tmp_path: Path) -> None:
+    """The admin reset frees the next tick but leaves the job dir for inspection."""
+    client = FakeBatchClient({"item-multi": {"ner": MULTI_NER}})
+    job_id = _seed_active_job(tmp_path, client)
+
+    assert reset_active_job(tmp_path) == job_id
+    assert (tmp_path / "extract-batches" / f"job_id={job_id}" / "state.jsonl").exists()
+    assert describe_active_job(tmp_path).status == "idle"
+    assert reset_active_job(tmp_path) is None

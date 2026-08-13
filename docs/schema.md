@@ -275,7 +275,8 @@ Extractor writes a per-run manifest and a matching full audit log:
 ### Extract batch job state
 
 The OpenAI batch extract backend keeps its resumable, file-native job state under
-`extract-batches/`. Only the hourly `poll` run writes here.
+`extract-batches/`. The hourly `poll` run is the only writer, apart from the
+`cdt reset-extract-job` admin command, which rewrites `active.json` under the same lease.
 
 ```text
 <artifact-root>/extract-batches/
@@ -296,6 +297,12 @@ locks/pipeline-writer.json           # single-writer lease: {holder, acquired_at
 When a job finishes, its mentions are written to the canonical `mentions` partitions and its
 audit log to `extractor-runs/run_id=<run_id>/full.jsonl`, exactly like the synchronous
 backend. `state.jsonl` and `batches.json` are working state, not canonical outputs.
+
+A `job_id=<run_id>/` directory is never deleted, including when a job is abandoned as
+corrupt, so a wedged poller leaves its evidence behind. Only `active.json` decides which
+job a tick advances: it is set to `{"job_id": null}` on completion or reset, which
+`_read_active_job` treats the same as an absent marker (a write, not a delete, so no
+delete permission on the artifact bucket is needed).
 
 ### Failure registries
 

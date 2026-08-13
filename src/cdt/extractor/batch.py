@@ -33,12 +33,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol, cast
 
-import pandas as pd
-
 from cdt import settings
 from cdt.datasets import dataset_root, resolve_artifact_root
 from cdt.extractor.core import (
-    DEBT_INSTRUMENT_MENTION_COLUMNS,
     DEFAULT_MAX_ATTEMPTS,
     ExtractionRowState,
     collect_pending_extract_items,
@@ -88,6 +85,10 @@ RESULT_STATUSES = frozenset({"completed", "expired"})
 # OpenAI batch statuses that terminate a batch without usable results.
 FATAL_STATUSES = frozenset({"failed", "cancelled"})
 TERMINAL_STATUSES = RESULT_STATUSES | FATAL_STATUSES
+
+
+class CorruptJobStateError(RuntimeError):
+    """Raised when the job directory named by active.json cannot be loaded."""
 
 
 @dataclass
@@ -313,14 +314,28 @@ class JobState:
 class ExtractTickResult:
     """Outcome of one ``advance_extract_job`` tick."""
 
-    status: str  # idle | submitted | waiting | completed
+    status: str  # idle | submitted | waiting | completed | reset
     job_id: str | None = None
     submitted_batches: int = 0
     folded_rows: int = 0
     awaiting_rows: int = 0
     in_flight_batches: int = 0
     terminal_rows: int = 0
-    mentions: pd.DataFrame | None = None
+
+
+@dataclass
+class ActiveJobSummary:
+    """Read-only view of the active extract job, for operators."""
+
+    status: str  # idle | active | corrupt
+    job_id: str | None = None
+    detail: str = ""
+    tick: int = 0
+    total_rows: int = 0
+    terminal_rows: int = 0
+    awaiting_rows: int = 0
+    in_flight_batches: int = 0
+    claimed_partitions: int = 0
 
 
 def batches_root(
@@ -364,6 +379,16 @@ def _read_active_job(root: str) -> str | None:
     payload = cast(dict[str, object], read_json_artifact(path))
     job_id = payload.get("job_id")
     return str(job_id) if job_id else None
+
+
+def _clear_active_job(root: str) -> None:
+    """Free the next tick to start a fresh job.
+
+    Writes ``{"job_id": null}`` rather than deleting: ``_read_active_job`` treats
+    a null marker and an absent one identically, and a write needs no delete
+    permission on the artifact bucket.
+    """
+    write_json_artifact(active_job_path(root), {"job_id": None})
 
 
 def _new_job_id() -> str:
@@ -415,6 +440,32 @@ def _load_state_jsonl(text: str) -> dict[str, RowEntry]:
 
 
 def _load_job_state(root: str, job_id: str) -> JobState:
+    """Load one job's state, or raise CorruptJobStateError if it is unusable.
+
+    Every read and key access here can fail on a job directory that was deleted
+    or only partially written (a crash between the manifest and state writes).
+    Raising one recognizable error lets the caller self-heal instead of failing
+    the same way on every future tick.
+    """
+    try:
+        return _read_job_state(root, job_id)
+    except CorruptJobStateError:
+        raise
+    except Exception as exc:
+        raise CorruptJobStateError(
+            f"Extract job state under {_job_dir(root, job_id)} is unreadable: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _read_job_state(root: str, job_id: str) -> JobState:
+    for path in (
+        _manifest_path(root, job_id),
+        _state_path(root, job_id),
+        _batches_path(root, job_id),
+    ):
+        if not artifact_exists(path):
+            raise CorruptJobStateError(f"Extract job {job_id} is missing {path}.")
     manifest = cast(dict[str, object], read_json_artifact(_manifest_path(root, job_id)))
     rows = _load_state_jsonl(read_text_artifact(_state_path(root, job_id)))
     batches_payload = cast(
@@ -808,6 +859,58 @@ def _submit_awaiting(
     return submitted
 
 
+def describe_active_job(
+    artifact_root: ArtifactPath | None = None, *, data_dir: Path | None = None
+) -> ActiveJobSummary:
+    """Summarize the active extract job without mutating anything.
+
+    Reports ``corrupt`` rather than raising when the job directory is unusable,
+    so an operator can diagnose a stuck poller before deciding to reset it.
+    """
+    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    job_id = _read_active_job(resolved_root)
+    if job_id is None:
+        return ActiveJobSummary(status="idle")
+    try:
+        job = _load_job_state(resolved_root, job_id)
+    except CorruptJobStateError as exc:
+        return ActiveJobSummary(status="corrupt", job_id=job_id, detail=str(exc))
+    return ActiveJobSummary(
+        status="active",
+        job_id=job_id,
+        tick=job.tick,
+        total_rows=len(job.rows),
+        terminal_rows=sum(
+            1 for entry in job.rows.values() if entry.row_state.state is not None
+        ),
+        awaiting_rows=len(_awaiting_rows(job)),
+        in_flight_batches=len(job.batches),
+        claimed_partitions=len(job.claimed_partitions),
+    )
+
+
+def reset_active_job(
+    artifact_root: ArtifactPath | None = None, *, data_dir: Path | None = None
+) -> str | None:
+    """Clear the active-job marker; returns the abandoned job id, or None if idle.
+
+    The job's own directory is left on disk for inspection. Callers must hold the
+    pipeline-writer lease, or a concurrent poll tick could rewrite the marker.
+    """
+    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    job_id = _read_active_job(resolved_root)
+    if job_id is None:
+        return None
+    _clear_active_job(resolved_root)
+    LOGGER.warning(
+        "Cleared the active extract job marker for %s; its state remains under %s. "
+        "The next poll tick starts a fresh job from unclaimed partitions.",
+        job_id,
+        _job_dir(resolved_root, job_id),
+    )
+    return job_id
+
+
 def advance_extract_job(
     *,
     batch_client: SupportsBatchClient,
@@ -868,7 +971,24 @@ def advance_extract_job(
                 active_job_id,
                 active_job_path(resolved_root),
             )
-        job = _load_job_state(resolved_root, active_job_id)
+        try:
+            job = _load_job_state(resolved_root, active_job_id)
+        except CorruptJobStateError as exc:
+            # Self-heal rather than raising here on every future tick. Nothing
+            # downstream is corrupted by this: the completion registry is only
+            # written when a job finishes, so the abandoned job's partitions are
+            # still unclaimed and the next tick re-extracts them. Any batch the
+            # dead job left in flight is money already spent — orphan
+            # reconciliation is per-job, so a fresh job will not adopt it.
+            LOGGER.error(
+                "Clearing the active extract job marker: %s. The next tick will "
+                "start a fresh job from the same classification partitions; any "
+                "batch still in flight for %s is abandoned.",
+                exc,
+                active_job_id,
+            )
+            _clear_active_job(resolved_root)
+            return ExtractTickResult(status="reset", job_id=active_job_id)
         _reconcile_orphans(resolved_root, job, batch_client)
         folded = _fold_completed_batches(
             job, batch_client, max_resubmissions=max_resubmissions
@@ -913,14 +1033,13 @@ def advance_extract_job(
     )
 
     if not job.batches and not still_awaiting:
-        mentions = _finalize_job(resolved_root, job, data_dir=data_dir)
+        _finalize_job(resolved_root, job, data_dir=data_dir)
         return ExtractTickResult(
             status="completed",
             job_id=job.job_id,
             folded_rows=folded,
             submitted_batches=submitted,
             terminal_rows=terminal_rows,
-            mentions=mentions,
         )
 
     LOGGER.info(
@@ -944,8 +1063,13 @@ def advance_extract_job(
     )
 
 
-def _finalize_job(root: str, job: JobState, *, data_dir: Path | None) -> pd.DataFrame:
-    """Write mentions/audit/completion for a finished job and clear the marker."""
+def _finalize_job(root: str, job: JobState, *, data_dir: Path | None) -> None:
+    """Write mentions/audit/completion for a finished job and clear the marker.
+
+    ``finalize_extract_outputs`` has already written the canonical mentions
+    partitions, so the frame it returns is only used for the summary count here;
+    callers read the mentions back from the artifact root like any other stage.
+    """
     row_entries = [
         (entry.row_state, entry.date, entry.shard) for entry in job.rows.values()
     ]
@@ -959,13 +1083,10 @@ def _finalize_job(root: str, job: JobState, *, data_dir: Path | None) -> pd.Data
         artifact_root=root,
         data_dir=data_dir,
     )
-    # Removing the active marker frees the next tick to start a fresh job. Use an
-    # empty-body write since storage has no delete helper; absence is not required.
-    write_json_artifact(active_job_path(root), {"job_id": None})
+    _clear_active_job(root)
     LOGGER.info(
         "Extract job %s complete: rows=%s mentions=%s",
         job.job_id,
         len(job.rows),
         len(mentions),
     )
-    return mentions.reindex(columns=DEBT_INSTRUMENT_MENTION_COLUMNS)

@@ -34,6 +34,10 @@ LOGGER = get_logger(__name__)
 
 # A poll tick is normally minutes; the TTL only gates recovery after a crash.
 DEFAULT_LEASE_TTL_SECONDS = 2 * 60 * 60
+# One lease serializes every writer of extract job state and match/final
+# snapshots: poll ticks (hourly schedule + EventBridge retries), daily's
+# match/finalize, and the admin reset command.
+PIPELINE_WRITER_LEASE = "pipeline-writer"
 _EXPIRED = "1970-01-01T00:00:00+00:00"
 
 
