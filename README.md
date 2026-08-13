@@ -66,8 +66,8 @@ uv run pytest -v
 Main local entrypoints:
 
 ```bash
-uv run cdt pipeline --artifact-root ./data historical ./1000-ciks.txt --start-date 2024-01-01 --end-date 2024-01-31
-uv run cdt-orchestrator --artifact-root ./data/local daily --cik-file ./1000-ciks.txt
+uv run cdt pipeline --artifact-root ./data historical ./data/ciks/1000-ciks.txt --start-date 2024-01-01 --end-date 2024-01-31
+uv run cdt-orchestrator --artifact-root ./data/local daily --cik-file ./data/ciks/1000-ciks.txt
 make local-run
 ./scripts/local-pipeline.sh historical --start-date 2024-01-01 --end-date 2024-01-31
 ```

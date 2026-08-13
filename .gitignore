@@ -139,5 +139,9 @@ venv.bak/
 # data files
 *.avro
 
+# CIK universes and ad hoc CIK tables
+data/ciks/
+data/important-8K-filers.csv
+
 scripts/*
 !scripts/local-pipeline.sh

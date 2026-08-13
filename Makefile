@@ -24,7 +24,7 @@ LOCAL_ARTIFACT_ROOT ?= $(DATA_DIR)/commercial-debt-tracker/local
 LOCAL_FINAL_DATABASE_ROOT ?= $(DATA_DIR)/commercial-debt-tracker/database/cdt
 LOCAL_BUCKET_NAME ?= idi-dev-processor-s3
 LOCAL_AWS_PROFILE ?= idi-analysis
-LOCAL_CIK_FILE ?= $(current_abs_path)1000-ciks.txt
+LOCAL_CIK_FILE ?= $(current_abs_path)data/ciks/1000-ciks.txt
 LOCAL_RUN_ARGS ?=
 
 # Pulumi / infra defaults. The AWS profile + SSO token cache are durable across

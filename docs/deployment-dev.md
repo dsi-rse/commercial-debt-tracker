@@ -105,11 +105,12 @@ cd ..
 
 ## Upload the Beta CIK File
 
-For the first `dev` deploy, use the repository's `1000-ciks.txt` file as the default run scope:
+For the first `dev` deploy, use the local `data/ciks/1000-ciks.txt` file as the default run scope. CIK
+universes live under `data/ciks/`, which is gitignored, so fetch or regenerate the file if it is absent:
 
 ```bash
 aws s3 cp \
-  1000-ciks.txt \
+  data/ciks/1000-ciks.txt \
   s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/inputs/ciks/beta-1k.txt
 ```
 
