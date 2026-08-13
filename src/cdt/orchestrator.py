@@ -29,6 +29,7 @@ from cdt.datasets import resolve_artifact_root
 from cdt.extractor import DEFAULT_MAX_ATTEMPTS, OpenAIBatchClient, advance_extract_job
 from cdt.lease import acquire_lease, release_lease
 from cdt.pipeline import (
+    DEFAULT_STAGE_BATCH_SIZE,
     PipelineConfig,
     run_match_and_finalize,
     run_pipeline,
@@ -53,11 +54,30 @@ def default_cik_file() -> str:
 
 
 def _add_stage_batch_size_arguments(subparser: argparse.ArgumentParser) -> None:
-    subparser.add_argument("--ingest-batch-size", type=positive_int, default=100)
-    subparser.add_argument("--itemize-batch-size", type=positive_int, default=100)
-    subparser.add_argument("--classify-batch-size", type=positive_int, default=100)
-    subparser.add_argument("--extract-batch-size", type=positive_int, default=100)
-    subparser.add_argument("--match-batch-size", type=positive_int, default=100)
+    subparser.add_argument(
+        "--ingest-batch-size", type=positive_int, default=DEFAULT_STAGE_BATCH_SIZE
+    )
+    subparser.add_argument(
+        "--itemize-batch-size", type=positive_int, default=DEFAULT_STAGE_BATCH_SIZE
+    )
+    subparser.add_argument(
+        "--classify-batch-size", type=positive_int, default=DEFAULT_STAGE_BATCH_SIZE
+    )
+    # Defaults to None so a daily batch-backend run can tell an explicit override
+    # (which it must warn about) from the unset default.
+    subparser.add_argument(
+        "--extract-batch-size",
+        type=positive_int,
+        default=None,
+        help=(
+            "rows per synchronous extract batch; applies to historical and "
+            f"'daily --extractor-backend live' only (default {DEFAULT_STAGE_BATCH_SIZE}). "
+            "The batch backend chunks by --max-requests-per-batch on poll instead."
+        ),
+    )
+    subparser.add_argument(
+        "--match-batch-size", type=positive_int, default=DEFAULT_STAGE_BATCH_SIZE
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -72,7 +92,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("BUCKET_NAME", "idi-dev-processor-s3"),
     )
     parser.add_argument("--aws-profile", default=os.environ.get("AWS_PROFILE", ""))
-    parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "reprocess partitions already in the completion registry. On poll this "
+            "only applies when a new extract job is created; an already-active job "
+            "keeps its claimed partitions."
+        ),
+    )
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument(
         "--extractor-backend",
@@ -120,13 +148,24 @@ def _pipeline_config(args: argparse.Namespace) -> PipelineConfig:
         ingest_batch_size=args.ingest_batch_size,
         itemize_batch_size=args.itemize_batch_size,
         classify_batch_size=args.classify_batch_size,
-        extract_batch_size=args.extract_batch_size,
+        extract_batch_size=(
+            args.extract_batch_size
+            if args.extract_batch_size is not None
+            else DEFAULT_STAGE_BATCH_SIZE
+        ),
         match_batch_size=args.match_batch_size,
     )
 
 
 def run_daily_batch(args: argparse.Namespace) -> int:
     """Run daily ingest/itemize/classify plus match/finalize, deferring extract."""
+    if args.extract_batch_size is not None:
+        LOGGER.warning(
+            "Ignoring --extract-batch-size=%s: the batch backend defers extraction "
+            "to poll, which chunks by --max-requests-per-batch/--max-batch-bytes. "
+            "Use --extractor-backend live to size synchronous extract batches.",
+            args.extract_batch_size,
+        )
     config = _pipeline_config(args)
     artifact_root = run_prepare_stages(config)
     # Keep final snapshots fresh from whatever mentions already exist; the in-flight

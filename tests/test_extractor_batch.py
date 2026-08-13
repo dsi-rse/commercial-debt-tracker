@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +15,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
+import cdt.extractor.batch as batch_module
 from cdt.classifier import classifications_root
 from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
 from cdt.datasets import completion_registry_path
@@ -823,3 +826,43 @@ def test_build_request_body_reasoning_and_model() -> None:
 
     with pytest.raises(ValueError, match="reasoning_effort"):
         build_request_body([], model="gpt-5.4", reasoning_effort="ludicrous")
+
+
+def test_force_warns_when_a_job_is_already_active(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    propagate_logger: Callable[[logging.Logger], None],
+) -> None:
+    """Force only applies at job creation, so a mid-job force must not go silent."""
+    propagate_logger(batch_module.LOGGER)
+    seed_classification(tmp_path, [{"item_id": "item-multi", "text": MULTI_TEXT}])
+    client = FakeBatchClient(
+        {"item-multi": {"ner": MULTI_NER, "instrument_ie": MULTI_IE}}
+    )
+
+    # First tick creates the job; force is honored here and must stay quiet.
+    with caplog.at_level("WARNING"):
+        created = advance_extract_job(
+            batch_client=client,
+            artifact_root=tmp_path,
+            model="gpt-5.4",
+            reasoning_effort="none",
+            max_attempts=3,
+            force=True,
+        )
+    assert created.status == "submitted"
+    assert "Ignoring force=True" not in caplog.text
+
+    # Second tick has an active job, so force is inert and must warn.
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        advance_extract_job(
+            batch_client=client,
+            artifact_root=tmp_path,
+            model="gpt-5.4",
+            reasoning_effort="none",
+            max_attempts=3,
+            force=True,
+        )
+    assert "Ignoring force=True" in caplog.text
+    assert created.job_id in caplog.text

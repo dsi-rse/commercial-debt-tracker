@@ -773,6 +773,14 @@ def advance_extract_job(
             return ExtractTickResult(status="idle")
         folded = 0
     else:
+        if force:
+            LOGGER.warning(
+                "Ignoring force=True: extract job %s is already active and keeps the "
+                "partitions it claimed at creation. Let it finish (or clear %s) "
+                "before forcing a re-extract.",
+                active_job_id,
+                active_job_path(resolved_root),
+            )
         job = _load_job_state(resolved_root, active_job_id)
         _reconcile_orphans(resolved_root, job, batch_client)
         folded = _fold_completed_batches(

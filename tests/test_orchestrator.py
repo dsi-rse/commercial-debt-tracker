@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -168,3 +170,64 @@ def test_daily_live_runs_full_pipeline(
         == 0
     )
     assert calls == ["pipeline"]
+
+
+def test_daily_batch_warns_on_extract_batch_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    propagate_logger: Callable[[logging.Logger], None],
+) -> None:
+    """--extract-batch-size is inert under the batch backend, so it must warn."""
+    propagate_logger(orch.LOGGER)
+    # main() calls basicConfig(force=True), which would drop caplog's handler.
+    monkeypatch.setattr(orch, "configure_logging", lambda **kwargs: None)
+    monkeypatch.setattr(orch, "run_prepare_stages", lambda config: str(tmp_path))
+    monkeypatch.setattr(orch, "run_match_and_finalize", lambda **kwargs: None)
+
+    with caplog.at_level("WARNING"):
+        assert (
+            orch.main(
+                [
+                    "--artifact-root",
+                    str(tmp_path),
+                    "daily",
+                    "--cik-file",
+                    "c.txt",
+                    "--extract-batch-size",
+                    "25",
+                ]
+            )
+            == 0
+        )
+
+    assert "Ignoring --extract-batch-size=25" in caplog.text
+
+
+def test_daily_batch_quiet_without_extract_batch_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    propagate_logger: Callable[[logging.Logger], None],
+) -> None:
+    """The unset default must not warn, and still reaches the pipeline config."""
+    propagate_logger(orch.LOGGER)
+    monkeypatch.setattr(orch, "configure_logging", lambda **kwargs: None)
+    seen: list[int] = []
+    monkeypatch.setattr(
+        orch,
+        "run_prepare_stages",
+        lambda config: (seen.append(config.extract_batch_size), str(tmp_path))[1],
+    )
+    monkeypatch.setattr(orch, "run_match_and_finalize", lambda **kwargs: None)
+
+    with caplog.at_level("WARNING"):
+        assert (
+            orch.main(
+                ["--artifact-root", str(tmp_path), "daily", "--cik-file", "c.txt"]
+            )
+            == 0
+        )
+
+    assert seen == [orch.DEFAULT_STAGE_BATCH_SIZE]
+    assert "--extract-batch-size" not in caplog.text
