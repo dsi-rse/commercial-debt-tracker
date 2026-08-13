@@ -26,6 +26,7 @@ from cdt.extractor.batch import (
     JobState,
     OpenAIBatchClient,
     RowEntry,
+    _batch_error_messages,
     _fold_completed_batches,
     _load_state_jsonl,
     _reconcile_orphans,
@@ -141,6 +142,10 @@ class FakeBatchClient:
     string (successful assistant text), ``("error", message)``, or ``("missing",)``
     to omit the result. ``forced_status`` overrides the OpenAI status for a batch
     by its submission index (0-based).
+
+    ``batch_errors`` and ``fatal_request_errors`` model what a real failed batch
+    can still expose: batch-level errors on the batch object, and per-request
+    lines in its error file. Both are keyed by submission index.
     """
 
     def __init__(
@@ -148,12 +153,17 @@ class FakeBatchClient:
         scripts: dict[str, dict[str, object]],
         *,
         forced_status: dict[int, str] | None = None,
+        batch_errors: dict[int, list[str]] | None = None,
+        fatal_request_errors: dict[int, dict[str, str]] | None = None,
     ) -> None:
         self.scripts = scripts
         self.forced_status = forced_status or {}
+        self.batch_errors = batch_errors or {}
+        self.fatal_request_errors = fatal_request_errors or {}
         self.batches: dict[str, dict[str, object]] = {}
         self._submit_count = 0
         self.submitted: list[tuple[str, list[str]]] = []
+        self.downloaded: list[str] = []
 
     def submit(
         self, requests: list[dict[str, object]], *, metadata: dict[str, str]
@@ -191,12 +201,19 @@ class FakeBatchClient:
                             }
                         )
                     )
+        # A fatal batch produces no results, but can still explain itself
+        # per request in its error file.
+        for custom_id, message in (self.fatal_request_errors.get(index) or {}).items():
+            err_lines.append(
+                json.dumps({"custom_id": custom_id, "error": {"message": message}})
+            )
         self.batches[batch_id] = {
             "status": status,
             "metadata": metadata,
             "input": requests,
             "out": "\n".join(out_lines),
             "err": "\n".join(err_lines),
+            "errors": list(self.batch_errors.get(index, [])),
         }
         self.submitted.append(
             (batch_id, [str(request["custom_id"]) for request in requests])
@@ -211,9 +228,11 @@ class FakeBatchClient:
             input_file_id=f"{batch_id}-in",
             output_file_id=f"{batch_id}-out" if record["out"] else None,
             error_file_id=f"{batch_id}-err" if record["err"] else None,
+            errors=list(record.get("errors") or []),  # type: ignore[arg-type]
         )
 
     def download_file(self, file_id: str) -> str:
+        self.downloaded.append(file_id)
         batch_id, kind = file_id.rsplit("-", 1)
         record = self.batches[batch_id]
         if kind == "out":
@@ -496,6 +515,82 @@ def test_failed_batch_marks_rows_error(tmp_path: Path) -> None:
     assert _advance(tmp_path, client).status == "submitted"
     assert _advance(tmp_path, client).status == "completed"
     assert read_dataset(mentions_root(tmp_path)).empty
+
+
+def test_failed_batch_records_per_request_diagnostics(tmp_path: Path) -> None:
+    """A failed batch's error file is still read, so rows get the real reason."""
+    seed_classification(tmp_path, [{"item_id": "item-multi", "text": MULTI_TEXT}])
+    client = FakeBatchClient(
+        {"item-multi": {"ner": MULTI_NER}},
+        forced_status={0: "failed"},
+        fatal_request_errors={0: {"item-multi": "context_length_exceeded"}},
+    )
+
+    assert _advance(tmp_path, client).status == "submitted"
+    assert _advance(tmp_path, client).status == "completed"
+
+    assert "batch-0-err" in client.downloaded
+    audit = list((tmp_path / "extractor-runs").glob("run_id=*/full.jsonl"))
+    record = json.loads(audit[0].read_text(encoding="utf-8"))
+    assert record["state"] == "ERROR"
+    assert "context_length_exceeded" in json.dumps(record["attempts"])
+
+
+def test_failed_batch_falls_back_to_batch_level_errors(tmp_path: Path) -> None:
+    """With no error file, the batch-level errors land in the row's audit record."""
+    seed_classification(tmp_path, [{"item_id": "item-multi", "text": MULTI_TEXT}])
+    client = FakeBatchClient(
+        {"item-multi": {"ner": MULTI_NER}},
+        forced_status={0: "failed"},
+        batch_errors={0: ["invalid_json_line: could not parse (input line 1)"]},
+    )
+
+    assert _advance(tmp_path, client).status == "submitted"
+    assert _advance(tmp_path, client).status == "completed"
+
+    audit = list((tmp_path / "extractor-runs").glob("run_id=*/full.jsonl"))
+    record = json.loads(audit[0].read_text(encoding="utf-8"))
+    attempts = json.dumps(record["attempts"])
+    assert record["state"] == "ERROR"
+    assert "invalid_json_line" in attempts
+    assert "input line 1" in attempts
+
+
+def test_unreadable_diagnostics_file_does_not_strand_rows(tmp_path: Path) -> None:
+    """A download failure degrades to the generic reason instead of raising."""
+    seed_classification(tmp_path, [{"item_id": "item-multi", "text": MULTI_TEXT}])
+
+    class BrokenDownloadClient(FakeBatchClient):
+        def download_file(self, file_id: str) -> str:
+            if file_id.endswith("-err"):
+                raise RuntimeError("403 while fetching error file")
+            return super().download_file(file_id)
+
+    client = BrokenDownloadClient(
+        {"item-multi": {"ner": MULTI_NER}},
+        forced_status={0: "failed"},
+        fatal_request_errors={0: {"item-multi": "context_length_exceeded"}},
+    )
+
+    assert _advance(tmp_path, client).status == "submitted"
+    assert _advance(tmp_path, client).status == "completed"
+
+    audit = list((tmp_path / "extractor-runs").glob("run_id=*/full.jsonl"))
+    record = json.loads(audit[0].read_text(encoding="utf-8"))
+    assert record["state"] == "ERROR"
+    assert "OpenAI batch failed" in json.dumps(record["attempts"])
+
+
+def test_batch_error_messages_reads_sdk_and_dict_shapes() -> None:
+    """batch.errors is flattened from either an SDK object or a plain dict."""
+    assert _batch_error_messages(None) == []
+    assert _batch_error_messages(
+        {"data": [{"code": "invalid_url", "message": "bad endpoint", "line": 7}]}
+    ) == ["invalid_url: bad endpoint (input line 7)"]
+    sdk_like = SimpleNamespace(
+        data=[SimpleNamespace(code=None, message="no code here", line=None)]
+    )
+    assert _batch_error_messages(sdk_like) == ["no code here"]
 
 
 def test_failed_submit_does_not_refold_previous_batch(tmp_path: Path) -> None:

@@ -99,6 +99,9 @@ class BatchStatus:
     input_file_id: str | None = None
     output_file_id: str | None = None
     error_file_id: str | None = None
+    # Batch-level failures (bad input file, malformed lines). Often the only
+    # diagnostic a `failed` batch has, since it may never produce an error file.
+    errors: list[str] = field(default_factory=list)
 
 
 class SupportsBatchClient(Protocol):
@@ -172,6 +175,32 @@ class OpenAIBatchClient:
         return batches
 
 
+def _field(item: object, name: str) -> object:
+    """Read one field from an SDK object or the equivalent plain dict."""
+    if isinstance(item, dict):
+        return item.get(name)
+    return getattr(item, name, None)
+
+
+def _batch_error_messages(errors: object) -> list[str]:
+    """Flatten an OpenAI ``batch.errors`` payload into readable messages."""
+    if errors is None:
+        return []
+    messages: list[str] = []
+    for item in cast(list[object], _field(errors, "data") or []):
+        code = _field(item, "code")
+        line = _field(item, "line")
+        rendered = (
+            f"{code}: {_field(item, 'message')}"
+            if code
+            else str(_field(item, "message"))
+        )
+        if line is not None:
+            rendered = f"{rendered} (input line {line})"
+        messages.append(rendered)
+    return messages
+
+
 def _batch_status_from_object(batch: object) -> BatchStatus:
     """Build a BatchStatus from an OpenAI SDK batch object."""
     return BatchStatus(
@@ -180,6 +209,7 @@ def _batch_status_from_object(batch: object) -> BatchStatus:
         input_file_id=getattr(batch, "input_file_id", None),
         output_file_id=getattr(batch, "output_file_id", None),
         error_file_id=getattr(batch, "error_file_id", None),
+        errors=_batch_error_messages(getattr(batch, "errors", None)),
     )
 
 
@@ -559,6 +589,14 @@ def _pending_marker(batch_id: str, entry: RowEntry) -> dict[str, object]:
     }
 
 
+def _fatal_batch_error(status: BatchStatus) -> str:
+    """Describe a failed/cancelled batch for a row that got no result line."""
+    detail = (
+        "; ".join(status.errors) if status.errors else "no batch-level errors reported"
+    )
+    return f"OpenAI batch {status.status}: {status.id} ({detail})"
+
+
 def _fold_completed_batches(
     job: JobState,
     client: SupportsBatchClient,
@@ -576,13 +614,25 @@ def _fold_completed_batches(
         if status.status not in TERMINAL_STATUSES:
             still_in_flight.append(record)
             continue
+        # Fetch whatever the batch produced, whatever its terminal status. A
+        # failed/cancelled batch can still have an error file whose per-request
+        # lines say why, which beats a generic "batch failed" on every row.
         results: dict[str, dict[str, object]] = {}
-        if status.status in RESULT_STATUSES:
-            for file_id in (status.output_file_id, status.error_file_id):
-                if file_id:
-                    results.update(
-                        _parse_jsonl_by_custom_id(client.download_file(file_id))
-                    )
+        for file_id in (status.output_file_id, status.error_file_id):
+            if not file_id:
+                continue
+            try:
+                results.update(_parse_jsonl_by_custom_id(client.download_file(file_id)))
+            except Exception as exc:  # noqa: BLE001
+                # Diagnostics are best-effort: a download failure must not strand
+                # the rows this batch owns.
+                LOGGER.warning(
+                    "Could not read file %s for batch %s (%s): %s",
+                    file_id,
+                    record.batch_id,
+                    status.status,
+                    exc,
+                )
         for custom_id in record.custom_ids:
             entry = job.rows.get(custom_id)
             if entry is None or entry.row_state.state is not None:
@@ -615,9 +665,9 @@ def _fold_completed_batches(
                 folded += 1
             elif status.status in FATAL_STATUSES:
                 # Whole-batch failure (usually bad input): terminate, don't loop.
-                record_stage_error(
-                    entry.row_state, f"OpenAI batch {status.status}: {record.batch_id}"
-                )
+                # No per-request line for this row, so carry the batch-level
+                # errors into its audit record instead of a bare status.
+                record_stage_error(entry.row_state, _fatal_batch_error(status))
                 folded += 1
             else:
                 # Expired-and-missing: pending is cleared so the row re-submits
@@ -633,10 +683,15 @@ def _fold_completed_batches(
                     folded += 1
         if status.status in FATAL_STATUSES:
             LOGGER.error(
-                "OpenAI batch %s ended as %s for job %s",
+                "OpenAI batch %s ended as %s for job %s: errors=[%s] "
+                "per_request_diagnostics=%s/%s error_file=%s",
                 record.batch_id,
                 status.status,
                 job.job_id,
+                "; ".join(status.errors) or "none reported",
+                len(results),
+                len(record.custom_ids),
+                status.error_file_id or "none",
             )
     job.batches = still_in_flight
     return folded
