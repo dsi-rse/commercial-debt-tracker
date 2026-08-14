@@ -138,8 +138,10 @@ task_role = aws.iam.Role(
 )
 
 # S3 bucket ARNs are deterministic, so construct them directly rather than a
-# plan-time aws.s3.get_bucket lookup, which would require cross-account read access
-# to the scraper-managed source bucket just to obtain an ARN (see issue #7).
+# plan-time aws.s3.get_bucket lookup, which would require read access to the
+# scraper-managed source bucket just to obtain an ARN (see issue #7). The set
+# collapses to one ARN when the source and output buckets are the same bucket,
+# which is the dev configuration.
 bucket_arns = sorted(
     {
         f"arn:aws:s3:::{config.bucket_name}",

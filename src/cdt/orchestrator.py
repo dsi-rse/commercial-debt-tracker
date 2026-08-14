@@ -27,6 +27,7 @@ from collections.abc import Sequence
 from cdt.cli import configure_logging, parse_date, positive_int
 from cdt.datasets import resolve_artifact_root
 from cdt.extractor import DEFAULT_MAX_ATTEMPTS, OpenAIBatchClient, advance_extract_job
+from cdt.ingest import DEFAULT_BUCKET
 from cdt.lease import PIPELINE_WRITER_LEASE, acquire_lease, release_lease
 from cdt.pipeline import (
     DEFAULT_STAGE_BATCH_SIZE,
@@ -84,7 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--bucket",
-        default=os.environ.get("BUCKET_NAME", "idi-dev-processor-s3"),
+        default=os.environ.get("BUCKET_NAME") or DEFAULT_BUCKET,
     )
     parser.add_argument("--aws-profile", default=os.environ.get("AWS_PROFILE", ""))
     parser.add_argument(

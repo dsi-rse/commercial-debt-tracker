@@ -23,7 +23,7 @@ These are the current recommended `dev` values:
 
 ```text
 aws:region = us-east-2
-idi:bucket_name = idi-dev-processor-s3
+idi:bucket_name = idi-dev-ftm2j-shared-processor-storage
 idi:output_bucket_name = idi-dev-ftm2j-shared-processor-storage
 idi:artifact_prefix = processors/cdt
 idi:final_database_prefix = database/cdt
@@ -124,7 +124,7 @@ Run these commands from the `pulumi/` directory:
 ```bash
 pulumi stack init dev
 pulumi config set aws:region us-east-2
-pulumi config set idi:bucket_name idi-dev-processor-s3
+pulumi config set idi:bucket_name idi-dev-ftm2j-shared-processor-storage
 pulumi config set idi:output_bucket_name idi-dev-ftm2j-shared-processor-storage
 pulumi config set idi:artifact_prefix processors/cdt
 pulumi config set idi:final_database_prefix database/cdt

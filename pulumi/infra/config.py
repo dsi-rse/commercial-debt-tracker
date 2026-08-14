@@ -9,6 +9,10 @@ project_name = pulumi.get_project()
 stack_name = pulumi.get_stack()
 app_name = config.get("app_name") or "cdt"
 name_prefix = f"{project_name}-{stack_name}-{app_name}"
+# ``bucket_name`` is the SEC scraper's bucket that ingest reads (prefix ``sec/``);
+# ``output_bucket_name`` is where CDT writes its own artifacts. In dev they are the
+# same bucket, separated only by prefix, so the task role cannot be scoped
+# read-only by bucket — only by prefix (see issue #8).
 bucket_name = config.require("bucket_name")
 output_bucket_name = config.get("output_bucket_name") or bucket_name
 artifact_prefix = config.get("artifact_prefix") or "processors/cdt"

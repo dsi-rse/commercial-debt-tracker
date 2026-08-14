@@ -35,7 +35,10 @@ DOCUMENT_COLUMNS = [
     "date",
     "resource_uri",
 ]
-DEFAULT_BUCKET = "idi-dev-processor-s3"
+# The SEC scraper's output bucket, which CDT reads. In dev this is the same
+# bucket CDT writes its own artifacts to, separated only by prefix: the scraper
+# owns `sec/`, CDT owns `processors/cdt/` and `database/cdt/`.
+DEFAULT_BUCKET = "idi-dev-ftm2j-shared-processor-storage"
 DEFAULT_AWS_PROFILE = ""
 DEFAULT_S3_PREFIX = "sec"
 CDT_FORM_TYPE = "8-K"

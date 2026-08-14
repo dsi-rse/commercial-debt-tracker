@@ -1,7 +1,7 @@
 encryptionsalt: v1:JWVjlpZ0/a0=:v1:su9qnBOMO94oCTpZ:188uRevUp9fFa07l0qWG4GUwhpPr0Q==
 config:
   aws:region: us-east-2
-  idi:bucket_name: idi-dev-processor-s3
+  idi:bucket_name: idi-dev-ftm2j-shared-processor-storage
   idi:output_bucket_name: idi-dev-ftm2j-shared-processor-storage
   idi:artifact_prefix: processors/cdt
   idi:final_database_prefix: database/cdt
