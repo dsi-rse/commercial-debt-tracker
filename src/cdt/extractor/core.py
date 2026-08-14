@@ -28,10 +28,12 @@ from cdt.datasets import (
     extractor_run_path,
     iter_date_shard_partitions,
     load_completed_partitions,
+    load_row_failures,
     parse_date_shard_partition,
     resolve_artifact_root,
     run_manifest_path,
     save_completed_partitions,
+    save_row_failures,
 )
 from cdt.shared import get_logger
 from cdt.storage import (
@@ -838,7 +840,8 @@ def extract_pending_items(
         run_id, artifact_root=resolved_root, data_dir=data_dir
     )
     processed_frames: list[pd.DataFrame] = []
-    failed_rows: list[dict[str, str]] = []
+    failed_rows: dict[str, dict[str, object]] = {}
+    succeeded_item_ids: set[str] = set()
     audit_records: list[str] = []
     partitions_written: list[str] = []
     completed_classification_paths = (
@@ -906,13 +909,15 @@ def extract_pending_items(
                     json.dumps(row_state.to_audit_dict(), sort_keys=True)
                 )
                 if row_state.state == "SUCCESS":
+                    succeeded_item_ids.add(row_state.item_id)
                     mention_rows.extend(row_state.debt_instrument_mentions)
                 else:
-                    failed_rows.append(
-                        {
-                            "item_id": row_state.item_id,
-                            "extractor_error": summarize_failure(row_state),
-                        }
+                    failed_rows[row_state.item_id] = _failure_record(
+                        row_state,
+                        partition_date=partition["date"],
+                        shard=partition["shard"],
+                        run_id=run_id,
+                        backend="live",
                     )
                     partition_failures += 1
                 if (
@@ -972,6 +977,12 @@ def extract_pending_items(
         artifact_root=resolved_root,
         data_dir=data_dir,
     )
+    failure_registry, total_known_failures = _merge_row_failures(
+        failed_rows,
+        succeeded_item_ids,
+        artifact_root=resolved_root,
+        data_dir=data_dir,
+    )
 
     if audit_records:
         write_text_artifact(full_jsonl_path, "\n".join(audit_records) + "\n")
@@ -1000,11 +1011,13 @@ def extract_pending_items(
             "completion_registry": completion_registry_path(
                 "extract", artifact_root=resolved_root, data_dir=data_dir
             ),
+            "failure_registry": failure_registry,
         },
     )
 
     LOGGER.info(
-        "Extractor complete: successes=%s failures=%s mentions=%s run_dir=%s",
+        "Extractor complete: successes=%s failures=%s mentions=%s run_dir=%s "
+        "failure_registry=%s (%s total)",
         sum(
             len(frame["item_id"].unique())
             for frame in processed_frames
@@ -1013,6 +1026,8 @@ def extract_pending_items(
         len(failed_rows),
         sum(len(frame) for frame in processed_frames),
         full_jsonl_path,
+        failure_registry,
+        total_known_failures,
     )
     if not processed_frames:
         return pd.DataFrame(columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
@@ -1042,19 +1057,22 @@ def finalize_extract_outputs(
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     mentions_by_partition: dict[tuple[str, str], list[dict[str, object]]] = {}
     audit_records: list[str] = []
-    failed_rows: list[dict[str, str]] = []
+    failed_rows: dict[str, dict[str, object]] = {}
+    succeeded_item_ids: set[str] = set()
     for row_state, partition_date, shard in row_entries:
         audit_records.append(json.dumps(row_state.to_audit_dict(), sort_keys=True))
         if row_state.state == "SUCCESS":
+            succeeded_item_ids.add(row_state.item_id)
             mentions_by_partition.setdefault((partition_date, shard), []).extend(
                 row_state.debt_instrument_mentions
             )
         else:
-            failed_rows.append(
-                {
-                    "item_id": row_state.item_id,
-                    "extractor_error": summarize_failure(row_state),
-                }
+            failed_rows[row_state.item_id] = _failure_record(
+                row_state,
+                partition_date=partition_date,
+                shard=shard,
+                run_id=run_id,
+                backend="batch",
             )
         # Ensure a visited-but-empty partition still exists as a key so we do not
         # lose track of which partitions the job covered.
@@ -1090,6 +1108,14 @@ def finalize_extract_outputs(
     save_completed_partitions(
         "extract", completed, artifact_root=resolved_root, data_dir=data_dir
     )
+    # Claiming the partitions above marks these rows done for good, so record the
+    # ones that produced nothing before that fact is only visible in the audit log.
+    failure_registry, total_known_failures = _merge_row_failures(
+        failed_rows,
+        succeeded_item_ids,
+        artifact_root=resolved_root,
+        data_dir=data_dir,
+    )
 
     full_jsonl_path = extractor_run_path(
         run_id, artifact_root=resolved_root, data_dir=data_dir
@@ -1117,15 +1143,19 @@ def finalize_extract_outputs(
             "completion_registry": completion_registry_path(
                 "extract", artifact_root=resolved_root, data_dir=data_dir
             ),
+            "failure_registry": failure_registry,
         },
     )
     LOGGER.info(
-        "Batch extractor finalize complete: rows=%s successes=%s failures=%s mentions=%s audit=%s",
+        "Batch extractor finalize complete: rows=%s successes=%s failures=%s "
+        "mentions=%s audit=%s failure_registry=%s (%s total)",
         len(row_entries),
         len(row_entries) - len(failed_rows),
         len(failed_rows),
         sum(len(frame) for frame in processed_frames),
         full_jsonl_path,
+        failure_registry,
+        total_known_failures,
     )
     if not processed_frames:
         return pd.DataFrame(columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
@@ -1832,6 +1862,54 @@ def normalize_reasoning_effort(reasoning_effort: str | None) -> str:
             f"Unsupported reasoning effort {resolved!r}; expected one of {allowed}"
         )
     return resolved
+
+
+def _failure_record(
+    row_state: ExtractionRowState,
+    *,
+    partition_date: str,
+    shard: str,
+    run_id: str,
+    backend: str,
+) -> dict[str, object]:
+    """Build one failure-registry entry for a terminal non-SUCCESS row."""
+    return {
+        "item_id": row_state.item_id,
+        "accession_number": row_state.item_row.get("accession_number"),
+        "cik": row_state.item_row.get("cik"),
+        "date": partition_date,
+        "shard": shard,
+        "state": row_state.state,
+        "stage": row_state.current_attempt.stage_name,
+        "run_id": run_id,
+        "backend": backend,
+        "error": summarize_failure(row_state),
+    }
+
+
+def _merge_row_failures(
+    failures: dict[str, dict[str, object]],
+    succeeded_item_ids: set[str],
+    *,
+    artifact_root: str,
+    data_dir: Path | None,
+) -> tuple[str, int]:
+    """Merge this run's row outcomes into the extract failure registry.
+
+    Failures are added or refreshed; rows that succeeded this run clear any
+    earlier entry, so a re-extract that fixes a row does not leave a stale
+    failure behind. Returns the registry path and its total entry count.
+    """
+    registry = load_row_failures(
+        "extract", artifact_root=artifact_root, data_dir=data_dir
+    )
+    for item_id in succeeded_item_ids:
+        registry.pop(item_id, None)
+    registry.update(failures)
+    path = save_row_failures(
+        "extract", registry, artifact_root=artifact_root, data_dir=data_dir
+    )
+    return path, len(registry)
 
 
 def native_model_id(model: str) -> str:

@@ -19,7 +19,7 @@ import pytest
 import cdt.extractor.batch as batch_module
 from cdt.classifier import classifications_root
 from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
-from cdt.datasets import completion_registry_path
+from cdt.datasets import completion_registry_path, load_row_failures
 from cdt.extractor import (
     advance_extract_job,
     describe_active_job,
@@ -1118,3 +1118,57 @@ def test_reset_active_job_clears_marker_and_keeps_state(tmp_path: Path) -> None:
     assert (tmp_path / "extract-batches" / f"job_id={job_id}" / "state.jsonl").exists()
     assert describe_active_job(tmp_path).status == "idle"
     assert reset_active_job(tmp_path) is None
+
+
+def test_batch_failures_are_recorded_in_the_failure_registry(tmp_path: Path) -> None:
+    """Rows a fatal batch drops are recorded as a work-list, not just audited."""
+    seed_classification(
+        tmp_path,
+        [
+            {"item_id": "item-ok", "text": MULTI_TEXT},
+            {"item_id": "item-bad", "text": MULTI_TEXT},
+        ],
+    )
+    client = FakeBatchClient(
+        {
+            "item-ok": {"ner": MULTI_NER, "instrument_ie": MULTI_IE},
+            "item-bad": {"ner": ("error", "content filtered")},
+        }
+    )
+
+    while (status := _advance(tmp_path, client).status) != "completed":
+        assert status in {"submitted", "waiting"}
+
+    failures = load_row_failures("extract", artifact_root=tmp_path)
+    assert list(failures) == ["item-bad"]
+    entry = failures["item-bad"]
+    assert entry["backend"] == "batch"
+    assert entry["state"] == "ERROR"
+    assert "content filtered" in str(entry["error"])
+    assert entry["date"] == "2024-01-02"
+    assert entry["shard"] == "0001"
+    # The successful row is absent, and its mentions still landed.
+    assert read_dataset(mentions_root(tmp_path))["name"].to_list() == ["Term Loan"]
+
+
+def test_failure_registry_survives_across_jobs(tmp_path: Path) -> None:
+    """A second job's failures accumulate rather than replacing the first's."""
+    seed_classification(
+        tmp_path, [{"item_id": "item-a", "text": MULTI_TEXT}], shard="0001"
+    )
+    client = FakeBatchClient({"item-a": {"ner": ("error", "first failure")}})
+    while _advance(tmp_path, client).status != "completed":
+        pass
+
+    seed_classification(
+        tmp_path, [{"item_id": "item-b", "text": MULTI_TEXT}], shard="0002"
+    )
+    client = FakeBatchClient({"item-b": {"ner": ("error", "second failure")}})
+    while _advance(tmp_path, client).status != "completed":
+        pass
+
+    failures = load_row_failures("extract", artifact_root=tmp_path)
+    assert sorted(failures) == ["item-a", "item-b"]
+    assert failures["item-a"]["shard"] == "0001"
+    assert failures["item-b"]["shard"] == "0002"
+    assert failures["item-a"]["run_id"] != failures["item-b"]["run_id"]

@@ -94,6 +94,13 @@ The extractor uses a multi-step validation workflow rather than accepting raw mo
 
 This is why CDT can tolerate LLM use in a batch pipeline without treating the model output as unverified truth.
 
+A row that ends non-SUCCESS produces no mentions, but its partition is still marked
+completed, so it is never revisited. Both backends therefore record dropped rows in
+`failures/extract/failures.json` (see [schema.md](schema.md)) with their source partition,
+stage, and error. That registry is diagnostic — nothing reads it to schedule work — but it
+turns "silently short a few mentions" into a countable list. Retrying those rows remains a
+manual, partition-granular `--force` operation.
+
 ### Live versus batch backends
 
 The stage objects (`preprocess`/`validate`/`postprocess`/`early_stop`/`build_retry_message`)

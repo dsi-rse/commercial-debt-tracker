@@ -312,6 +312,46 @@ The ingest stage maintains a permanent failure registry at:
 <artifact-root>/failures/ingest/failures.json
 ```
 
+The extract stage maintains an equivalent row-level registry, written by both the `live`
+and `batch` backends:
+
+```text
+<artifact-root>/failures/extract/failures.json
+```
+
+```json
+{
+  "stage": "extract",
+  "failure_count": 1,
+  "failures": {
+    "<item_id>": {
+      "item_id": "...",
+      "accession_number": "...",
+      "cik": "...",
+      "date": "2024-01-02",
+      "shard": "0001",
+      "state": "ERROR",
+      "stage": "ner",
+      "run_id": "20260814T134326943342Z",
+      "backend": "batch",
+      "error": "..."
+    }
+  }
+}
+```
+
+This registry exists because a finished extract run marks all of its claimed
+classification partitions completed regardless of individual row outcomes, so rows that
+produced no mentions are never revisited. It is **diagnostic, not control flow**: nothing
+reads it to decide what to process, and writing it does not change which partitions are
+skipped. What it provides is a durable, queryable work-list of dropped rows — previously
+recoverable only by parsing every `extractor-runs/run_id=*/full.jsonl` audit file.
+
+Entries are keyed by `item_id` and accumulate across runs. A row that succeeds in a later
+run (typically a `--force` re-extract) has its entry removed, so the registry always
+reflects the latest known outcome per row rather than a growing history. Retrying the
+listed rows is still manual, and still partition-granular via `--force`.
+
 ## Operational Semantics
 
 - canonical truth is the partition data, not the run manifest

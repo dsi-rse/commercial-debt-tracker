@@ -9,7 +9,11 @@ import pytest
 
 from cdt.classifier import classifications_root, classify_pending_items
 from cdt.classifier import core as classifier_core
-from cdt.datasets import shard_for_accession
+from cdt.datasets import (
+    completion_registry_path,
+    load_row_failures,
+    shard_for_accession,
+)
 from cdt.extractor import extract_pending_items, mentions_root
 from cdt.extractor.core import (
     ExtractionRowState,
@@ -25,7 +29,12 @@ from cdt.matcher import (
     mention_matches_root,
 )
 from cdt.matcher.core import coerce_optional_text, match_tables
-from cdt.storage import artifact_exists, read_dataset, write_partition_table
+from cdt.storage import (
+    artifact_exists,
+    read_dataset,
+    read_json_artifact,
+    write_partition_table,
+)
 
 
 class FakeModel:
@@ -861,3 +870,81 @@ def test_match_tables_retired_of_keeps_separate_clusters_and_updates_parent_end_
     }
     assert instruments["m-2"]["retired_of_debt_instrument_id"] == "m-1"
     assert instruments["m-1"]["end_date"] == "2024-03-01"
+
+
+def test_extract_failures_are_recorded_and_cleared(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dropped row lands in the failure registry; a later success clears it."""
+    seed_document_partition(tmp_path)
+    itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
+    monkeypatch.setattr(
+        classifier_core,
+        "load_training_artifacts",
+        lambda path: (FakeModel(), 0.5, {"threshold": 0.5}),
+    )
+    classify_pending_items(artifact_root=tmp_path, batch_size=5)
+
+    async def failing_workflow(**kwargs: object) -> ExtractionRowState:
+        row_state = ExtractionRowState(
+            item_row=kwargs["item_row"], stage_name="instrument_ie"
+        )
+        row_state.add_validation(["instrument_ie did not return valid JSON"])
+        row_state.finish("ERROR")
+        return row_state
+
+    monkeypatch.setattr("cdt.extractor.core.run_extraction_workflow", failing_workflow)
+    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+
+    # The partition is registered complete even though the row produced nothing,
+    # which is exactly why the failure has to be recorded somewhere durable.
+    assert (
+        "extract"
+        in read_json_artifact(
+            completion_registry_path("extract", artifact_root=tmp_path)
+        )["stage"]
+    )
+    failures = load_row_failures("extract", artifact_root=tmp_path)
+    assert len(failures) == 1
+    entry = next(iter(failures.values()))
+    assert entry["backend"] == "live"
+    assert entry["state"] == "ERROR"
+    assert entry["error"] == "instrument_ie did not return valid JSON"
+    assert entry["date"] and entry["shard"]
+
+    async def succeeding_workflow(**kwargs: object) -> ExtractionRowState:
+        item_row = kwargs["item_row"]
+        row_state = ExtractionRowState(item_row=item_row, stage_name="instrument_ie")
+        row_state.debt_instrument_mentions = [
+            {
+                "debt_instrument_mention_id": "m-1",
+                "item_id": item_row["item_id"],
+                "accession_number": item_row["accession_number"],
+                "cik": item_row["cik"],
+                "date": item_row["date"],
+                "raw_id": "i-1",
+                "name": "Term Loan",
+                "start_date": None,
+                "end_date": None,
+                "amount": None,
+                "amendment_of": None,
+                "retired_of": None,
+                "split_of": None,
+                "lenders_json": "[]",
+                "other_interested_parties_json": "[]",
+                "name_json": "{}",
+                "start_date_json": "{}",
+                "end_date_json": "{}",
+                "amount_json": "{}",
+            }
+        ]
+        row_state.finish("SUCCESS")
+        return row_state
+
+    monkeypatch.setattr(
+        "cdt.extractor.core.run_extraction_workflow", succeeding_workflow
+    )
+    extract_pending_items(artifact_root=tmp_path, batch_size=5, force=True, client=None)
+
+    assert load_row_failures("extract", artifact_root=tmp_path) == {}
