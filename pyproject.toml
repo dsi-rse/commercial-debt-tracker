@@ -84,7 +84,7 @@ convention = "google"
 python_files = "test_*.py"
 
 [tool.uv.sources]
-idi-ftm2j-shared = { git = "https://github.com/dsi-clinic/idi-ftm2j-shared.git", rev = "v0.1.4" }
+idi-ftm2j-shared = { git = "https://github.com/dsi-rse/idi-ftm2j-shared.git", rev = "v0.1.4" }
 
 [tool.ruff.lint.extend-per-file-ignores]
 "tests/*" = ["PLR2004"]

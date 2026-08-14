@@ -360,7 +360,7 @@ pulumi = [
 requires-dist = [
     { name = "boto3", specifier = "~=1.35" },
     { name = "defusedxml", specifier = "~=0.7" },
-    { name = "idi-ftm2j-shared", git = "https://github.com/dsi-clinic/idi-ftm2j-shared.git?rev=v0.1.4" },
+    { name = "idi-ftm2j-shared", git = "https://github.com/dsi-rse/idi-ftm2j-shared.git?rev=v0.1.4" },
     { name = "numpy", specifier = "~=2.2" },
     { name = "openai", specifier = "~=1.0" },
     { name = "openrouter" },
@@ -645,7 +645,7 @@ wheels = [
 [[package]]
 name = "idi-ftm2j-shared"
 version = "0.1.4"
-source = { git = "https://github.com/dsi-clinic/idi-ftm2j-shared.git?rev=v0.1.4#ab301ebf2af9c7e81c5c28344877ce1644e073e9" }
+source = { git = "https://github.com/dsi-rse/idi-ftm2j-shared.git?rev=v0.1.4#ab301ebf2af9c7e81c5c28344877ce1644e073e9" }
 dependencies = [
     { name = "boto3" },
     { name = "requests" },
