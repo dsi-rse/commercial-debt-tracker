@@ -11,6 +11,13 @@ two racing acquirers can never both win.
 Losing the lease is not an error: callers skip their turn and the next
 scheduled run picks the work up. The TTL only matters after a crash — releases
 happen in a ``finally`` — so it is sized generously above a normal tick.
+
+Releasing marks the lock object expired rather than deleting it, so the steady
+state is a lease that exists and is free. Two different situations therefore
+reach the same compare-and-swap: a normal handoff from a holder that released,
+and a rescue from a holder that died still holding it. Only the second is worth a
+warning, and they are told apart by the exact ``_EXPIRED`` stamp a release writes
+(see ``_log_takeover``).
 """
 
 from __future__ import annotations
@@ -73,6 +80,33 @@ def _current_expiry(payload: object) -> datetime | None:
         return None
 
 
+def _was_released(payload: object) -> bool:
+    """True when the previous holder released cleanly rather than dying.
+
+    ``release_lease`` stamps exactly ``_EXPIRED``, a value no live lease can hold,
+    so it distinguishes a normal handoff from a TTL rescue. A corrupt payload
+    counts as not-released: unreadable lock state is worth reporting.
+    """
+    return isinstance(payload, dict) and str(payload.get("expires_at")) == _EXPIRED
+
+
+def _log_takeover(name: str, previous: object) -> None:
+    """Log a lease takeover at a level matching what actually happened."""
+    holder = previous.get("holder") if isinstance(previous, dict) else None
+    if _was_released(previous):
+        # The overwhelmingly common path: every tick after the first takes over a
+        # lease its predecessor released on the way out. Logging that at WARNING
+        # would bury the case below under ~24 false alarms a day.
+        LOGGER.debug("Acquired released lease %s (previous holder %s)", name, holder)
+        return
+    LOGGER.warning(
+        "Stole lease %s from holder %s: it expired without being released, so that "
+        "run likely died mid-tick — check for a lost run.",
+        name,
+        holder,
+    )
+
+
 def acquire_lease(
     artifact_root: ArtifactPath,
     name: str,
@@ -91,11 +125,10 @@ def acquire_lease(
     expiry = _current_expiry(current)
     if expiry is not None and expiry > now:
         return None
-    # Expired (or corrupt): compare-and-swap so only one stealer wins.
+    # Expired, released, or corrupt: compare-and-swap so only one taker wins.
     if not replace_json_artifact_if_match(path, payload, version=version):
         return None
-    previous = current.get("holder") if isinstance(current, dict) else None
-    LOGGER.warning("Stole expired lease %s from holder %s", name, previous)
+    _log_takeover(name, current)
     return Lease(path=path, holder=holder, expires_at=str(payload["expires_at"]))
 
 

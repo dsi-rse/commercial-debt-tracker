@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
+import cdt.lease as lease_module
 from cdt.lease import acquire_lease, lease_path, release_lease
 
 
@@ -79,3 +84,64 @@ def test_ttl_written_into_payload(tmp_path: Path) -> None:
     payload = json.loads(Path(lease.path).read_text())
     expiry = datetime.fromisoformat(payload["expires_at"])
     assert before + timedelta(minutes=59) < expiry < before + timedelta(minutes=61)
+
+
+def test_normal_handoff_does_not_warn(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    propagate_logger: Callable[[logging.Logger], None],
+) -> None:
+    """Consecutive released-then-reacquired ticks must stay quiet.
+
+    Regression test for #32: releasing marks the lock expired rather than
+    deleting it, so every tick after the first takes the compare-and-swap path.
+    Warning there produced ~24 false alarms a day on the hourly poller and made a
+    real crash-recovery steal indistinguishable from routine operation.
+    """
+    propagate_logger(lease_module.LOGGER)
+
+    with caplog.at_level(logging.DEBUG, logger=lease_module.LOGGER.name):
+        for _ in range(3):
+            lease = acquire_lease(tmp_path, "writer")
+            assert lease is not None
+            release_lease(lease)
+
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+    assert "Acquired released lease" in caplog.text
+
+
+def test_crashed_holder_still_warns(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    propagate_logger: Callable[[logging.Logger], None],
+) -> None:
+    """Taking over from a holder that never released is still a WARNING."""
+    propagate_logger(lease_module.LOGGER)
+    crashed = acquire_lease(tmp_path, "writer", ttl_seconds=0)
+    assert crashed is not None  # never released: simulates a died-mid-tick run
+
+    with caplog.at_level(logging.DEBUG, logger=lease_module.LOGGER.name):
+        stolen = acquire_lease(tmp_path, "writer")
+
+    assert stolen is not None
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    assert "expired without being released" in warnings[0].getMessage()
+    assert crashed.holder in warnings[0].getMessage()
+
+
+def test_corrupt_lease_warns(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    propagate_logger: Callable[[logging.Logger], None],
+) -> None:
+    """Unreadable lock state is reported, not silently taken over."""
+    propagate_logger(lease_module.LOGGER)
+    path = Path(lease_path(tmp_path, "writer"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"holder": "old", "expires_at": "not a date"}))
+
+    with caplog.at_level(logging.DEBUG, logger=lease_module.LOGGER.name):
+        assert acquire_lease(tmp_path, "writer") is not None
+
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING]
