@@ -17,6 +17,10 @@ bucket_name = config.require("bucket_name")
 output_bucket_name = config.get("output_bucket_name") or bucket_name
 artifact_prefix = config.get("artifact_prefix") or "processors/cdt"
 final_database_prefix = config.get("final_database_prefix") or "database/cdt"
+# The scraper-owned prefix ingest reads. MUST match cdt.ingest.DEFAULT_S3_PREFIX:
+# Pulumi cannot import the package, so the two are coupled by convention. If they
+# drift, the task role denies every GetObject ingest attempts.
+source_prefix = config.get("source_prefix") or "sec"
 default_cik_file = config.require("default_cik_file")
 shared_dlq_name = config.require("shared_dlq_name")
 cpu = config.get("cpu") or "1024"

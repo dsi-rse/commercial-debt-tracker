@@ -15,6 +15,25 @@ The deployed stack contains:
 
 The ECS task runs the `cdt-orchestrator` console script from [dockerfiles/Dockerfile.orchestrator](../dockerfiles/Dockerfile.orchestrator).
 
+### Task role S3 scope
+
+The scraper's source data and CDT's own artifacts can live in the same bucket (they do in
+`dev`), so the task role scopes object permissions **by prefix rather than by bucket**:
+
+| Prefix | Permission |
+| --- | --- |
+| `{source_prefix}/` (default `sec/`) | `GetObject` only — scraper-owned, CDT never writes here |
+| `{artifact_prefix}/` (default `processors/cdt/`) | read + write + delete + multipart |
+| `{final_database_prefix}/` (default `database/cdt/`) | read + write + delete + multipart |
+
+`s3:ListBucket` remains bucket-level: it is a bucket-level action that can only be
+narrowed with an `s3:prefix` condition, not a resource path, and an incomplete prefix list
+would produce silent empty listings rather than an error.
+
+`idi:source_prefix` must match `cdt.ingest.DEFAULT_S3_PREFIX` — Pulumi cannot import the
+package, so the two are coupled by convention. A mismatch denies every read ingest
+attempts.
+
 ## Runtime Entry Point
 
 The task definition injects these environment variables directly:

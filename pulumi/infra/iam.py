@@ -149,6 +149,21 @@ bucket_arns = sorted(
     }
 )
 
+# Object permissions are scoped by prefix, not by bucket, because in dev the
+# scraper's source bucket and CDT's output bucket are the same bucket (see #8).
+# Splitting by bucket there would grant PutObject/DeleteObject over the scraper's
+# whole archive — every form type back to 2016 — which CDT only ever reads.
+source_read_arns = [f"arn:aws:s3:::{config.bucket_name}/{config.source_prefix}/*"]
+# Everything CDT writes lives under one of these two prefixes: canonical
+# artifacts (datasets, run manifests, completion + failure registries, extract
+# job state, locks) and the final dashboard snapshots.
+output_write_arns = sorted(
+    {
+        f"arn:aws:s3:::{config.output_bucket_name}/{config.artifact_prefix}/*",
+        f"arn:aws:s3:::{config.output_bucket_name}/{config.final_database_prefix}/*",
+    }
+)
+
 aws.iam.RolePolicy(
     "cdt-ecs-task-s3-policy",
     role=task_role.id,
@@ -157,11 +172,24 @@ aws.iam.RolePolicy(
             "Version": "2012-10-17",
             "Statement": [
                 {
+                    # ListBucket is a bucket-level action: it cannot be scoped by
+                    # resource path, only by an s3:prefix condition. Left
+                    # unconstrained for now — tightening it means enumerating
+                    # every prefix the code lists under, and a wrong list yields
+                    # silent empty listings rather than an error (see #8).
+                    "Sid": "ListBuckets",
                     "Effect": "Allow",
                     "Action": ["s3:ListBucket"],
                     "Resource": bucket_arns,
                 },
                 {
+                    "Sid": "ReadScraperSource",
+                    "Effect": "Allow",
+                    "Action": ["s3:GetObject"],
+                    "Resource": source_read_arns,
+                },
+                {
+                    "Sid": "WriteOwnArtifacts",
                     "Effect": "Allow",
                     "Action": [
                         "s3:GetObject",
@@ -173,7 +201,7 @@ aws.iam.RolePolicy(
                         "s3:CompleteMultipartUpload",
                         "s3:ListMultipartUploadParts",
                     ],
-                    "Resource": [f"{arn}/*" for arn in bucket_arns],
+                    "Resource": output_write_arns,
                 },
             ],
         }
