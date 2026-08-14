@@ -73,13 +73,16 @@ DEFAULT_MAX_BATCH_BYTES = 100 * 1024 * 1024
 # A row whose batch expires without a result re-submits next tick; each round
 # costs another 24h window, so cap the rounds instead of looping forever.
 DEFAULT_MAX_RESUBMISSIONS = 3
-# OpenAI reasoning_effort vocabulary (distinct from OpenRouter's "none"/"xhigh").
-OPENAI_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
-# Efforts the live backend accepts that OpenAI does not. Translating beats
-# dropping: omitting reasoning_effort would leave a batch on the API default
-# (medium) while the live backend ran with reasoning off, so the same config
-# would silently cost and reason differently across backends.
-OPENROUTER_TO_OPENAI_REASONING = {"none": "minimal", "xhigh": "high"}
+# reasoning_effort values gpt-5-class models accept, quoted verbatim from the API's
+# own rejection message: "Supported values are: 'none', 'low', 'medium', 'high',
+# and 'xhigh'." Note this is NOT the union of every OpenAI model's vocabulary —
+# 'minimal' is valid on some models and rejected here with a 400 (see #31).
+OPENAI_REASONING_EFFORTS = frozenset({"none", "low", "medium", "high", "xhigh"})
+# The vocabularies otherwise align, so the configured effort passes through
+# unchanged (including "none", which disables reasoning on both backends rather
+# than silently falling back to the API default). Only OpenRouter's "minimal" has
+# no equivalent, and it maps to the nearest supported level.
+OPENROUTER_TO_OPENAI_REASONING = {"minimal": "low"}
 # OpenAI batch statuses whose results we fold into row states.
 RESULT_STATUSES = frozenset({"completed", "expired"})
 # OpenAI batch statuses that terminate a batch without usable results.
@@ -220,11 +223,13 @@ def normalize_batch_model(model: str) -> str:
 
 
 def openai_reasoning_effort(reasoning_effort: str) -> str:
-    """Translate a configured reasoning effort into OpenAI's vocabulary.
+    """Resolve a configured reasoning effort to one OpenAI accepts.
 
-    Returns ``""`` when no effort is configured, so the caller omits the field
-    and takes the model default. Raises for a value neither vocabulary accepts,
-    which lets a bad config fail before a job is created.
+    Mostly a pass-through: the OpenRouter and gpt-5 vocabularies align except for
+    ``minimal``. Returns ``""`` when nothing is configured, so the caller omits
+    the field and takes the model default. Raises for a value neither vocabulary
+    accepts, which lets a bad config fail before a job is created rather than as
+    a per-request 400 after a batch is already paid for.
     """
     effort = (reasoning_effort or "").strip().lower()
     if not effort:

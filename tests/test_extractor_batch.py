@@ -40,9 +40,11 @@ from cdt.extractor.batch import (
     active_job_path,
     build_request_body,
     normalize_batch_model,
+    openai_reasoning_effort,
 )
 from cdt.extractor.core import (
     EXTRACTOR_TEMPERATURE,
+    REASONING_EFFORTS,
     ExtractionRowState,
     extract_batch_response_text,
     handle_response,
@@ -916,8 +918,9 @@ def test_build_request_body_reasoning_and_model() -> None:
     assert normalize_batch_model("openai/gpt-5.4") == "gpt-5.4"
     assert normalize_batch_model("gpt-5.4") == "gpt-5.4"
 
-    # OpenRouter's "none" becomes OpenAI's lowest effort rather than being
-    # dropped, which would leave the batch on the model default (medium).
+    # "none" is a value gpt-5.4 accepts, so it must reach the API unchanged:
+    # sending "minimal" instead earned a 400 on every request (#31), and dropping
+    # the field would silently fall back to the model default.
     body = build_request_body(
         [{"role": "user", "content": "x"}],
         model="openai/gpt-5.4",
@@ -926,16 +929,20 @@ def test_build_request_body_reasoning_and_model() -> None:
     assert body == {
         "model": "gpt-5.4",
         "messages": [{"role": "user", "content": "x"}],
-        "reasoning_effort": "minimal",
+        "reasoning_effort": "none",
     }
 
     body = build_request_body([], model="gpt-5.4", reasoning_effort="medium")
     assert body["reasoning_effort"] == "medium"
     assert "temperature" not in body
 
-    # xhigh is an OpenRouter-only level; it maps down to OpenAI's ceiling.
+    # xhigh is supported natively; mapping it down to high would lose effort.
     body = build_request_body([], model="gpt-5.4", reasoning_effort="xhigh")
-    assert body["reasoning_effort"] == "high"
+    assert body["reasoning_effort"] == "xhigh"
+
+    # minimal is the one OpenRouter level gpt-5.4 rejects, so it maps to low.
+    body = build_request_body([], model="gpt-5.4", reasoning_effort="minimal")
+    assert body["reasoning_effort"] == "low"
 
     # A non-reasoning model can honor temperature, so both backends send it.
     body = build_request_body([], model="openai/gpt-4.1-mini", reasoning_effort="")
@@ -944,6 +951,24 @@ def test_build_request_body_reasoning_and_model() -> None:
 
     with pytest.raises(ValueError, match="reasoning_effort"):
         build_request_body([], model="gpt-5.4", reasoning_effort="ludicrous")
+
+
+def test_openai_reasoning_vocabulary_matches_the_api() -> None:
+    """Pin the accepted efforts to what the API itself reported.
+
+    Verbatim from a real 400 on gpt-5.4: "Supported values are: 'none', 'low',
+    'medium', 'high', and 'xhigh'." Every OpenRouter level must resolve into this
+    set, or the batch is paid for and then rejected per request (#31).
+    """
+    assert set(batch_module.OPENAI_REASONING_EFFORTS) == {
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+    }
+    for effort in REASONING_EFFORTS:
+        assert openai_reasoning_effort(effort) in batch_module.OPENAI_REASONING_EFFORTS
 
 
 def test_sampling_params_match_across_backends() -> None:
