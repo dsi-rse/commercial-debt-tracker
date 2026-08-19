@@ -124,10 +124,14 @@ def test_crashed_holder_still_warns(
         stolen = acquire_lease(tmp_path, "writer")
 
     assert stolen is not None
-    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    # pytest >= 9 attaches caplog's handler to the named logger as well as the
+    # root, so a propagating record is captured twice. Count distinct messages so
+    # the assertion tests the lease code rather than caplog's plumbing.
+    warnings = {r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING}
     assert len(warnings) == 1
-    assert "expired without being released" in warnings[0].getMessage()
-    assert crashed.holder in warnings[0].getMessage()
+    message = warnings.pop()
+    assert "expired without being released" in message
+    assert crashed.holder in message
 
 
 def test_corrupt_lease_warns(
