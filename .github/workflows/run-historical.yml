@@ -32,6 +32,10 @@ on:
 jobs:
   run-historical:
     runs-on: ubuntu-latest
+    # Setting `environment:` is what makes the env-scoped AWS_ROLE_ARN_DEPLOY
+    # secret and PULUMI_STATE_BUCKET variable resolve, and it puts a prod run
+    # behind that environment's approval gate.
+    environment: ${{ inputs.stack }}
     permissions:
       id-token: write
       contents: read
@@ -50,14 +54,14 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEPLOY }}
           role-session-name: idi-github-ci
-          aws-region: ${{ secrets.AWS_REGION || 'us-east-2' }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-2' }}
       - name: Validate dates
         run: |
           set -euo pipefail
           [[ "${{ inputs.start_date }}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]
           [[ "${{ inputs.end_date }}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]
       - name: Login to Pulumi backend
-        run: pulumi login s3://${{ secrets.PULUMI_STATE_BUCKET }}
+        run: pulumi login s3://${{ vars.PULUMI_STATE_BUCKET }}
         working-directory: pulumi
       - name: Select Pulumi stack
         run: pulumi stack select ${{ inputs.stack }}
