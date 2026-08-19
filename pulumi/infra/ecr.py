@@ -12,15 +12,18 @@ ecr_registry = pulumi.Output.from_input(config.caller.account_id).apply(
     lambda account_id: f"{account_id}.dkr.ecr.{config.aws_region}.amazonaws.com"
 )
 
+# The repo name carries the image name (`-orchestrator`) so it matches what the
+# shared pipeline's sync-ecr job pushes to:
+# {pulumi_project}-{stack}-{app_name}-{image_name}.
 ecr_repo = aws.ecr.Repository(
     "cdt-ecr",
-    name=config.name_prefix,
+    name=f"{config.name_prefix}-orchestrator",
     force_delete=True,
     tags=config.tags(),
 )
 
 orchestrator_image = ecr_registry.apply(
-    lambda registry: f"{registry}/{config.name_prefix}:latest"
+    lambda registry: f"{registry}/{config.name_prefix}-orchestrator:latest"
 )
 
 ecr_lifecycle_policy = aws.ecr.LifecyclePolicy(
