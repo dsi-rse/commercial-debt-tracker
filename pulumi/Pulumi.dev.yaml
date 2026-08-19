@@ -1,12 +1,12 @@
 encryptionsalt: v1:JWVjlpZ0/a0=:v1:su9qnBOMO94oCTpZ:188uRevUp9fFa07l0qWG4GUwhpPr0Q==
+# Committed variable config for the dev stack. The processor bucket and scheduler
+# DLQ are read from SSM (/idi/dev/shared/*), so they are NOT set here; the paths
+# below are bucket-relative keys resolved against that shared bucket.
 config:
   aws:region: us-east-2
-  idi:bucket_name: idi-dev-ftm2j-shared-processor-storage
-  idi:output_bucket_name: idi-dev-ftm2j-shared-processor-storage
   idi:artifact_prefix: processors/cdt
   idi:final_database_prefix: database/cdt
-  idi:default_cik_file: s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/inputs/ciks/beta-1k.txt
-  idi:shared_dlq_name: idi-dev-ftm2j-shared-scheduler-dlq
+  idi:default_cik_key: processors/cdt/inputs/ciks/beta-1k.txt
   idi:cpu: "1024"
   idi:memory: "4096"
   idi:ecr_image_retention_count: "5"

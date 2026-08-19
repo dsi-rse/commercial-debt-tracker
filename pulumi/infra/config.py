@@ -9,11 +9,18 @@ project_name = pulumi.get_project()
 stack_name = pulumi.get_stack()
 app_name = config.get("app_name") or "cdt"
 name_prefix = f"{project_name}-{stack_name}-{app_name}"
+# Shared values are published to SSM (/idi/<stack>/shared/*) by the shared stack
+# and read here, so there is one source of truth instead of a committed literal
+# per repo. A committed literal is what broke every ingest entrypoint in #30: the
+# name drifted to a bucket that never existed and nothing could detect it.
+#
 # ``bucket_name`` is the SEC scraper's bucket that ingest reads (prefix ``sec/``);
-# ``output_bucket_name`` is where CDT writes its own artifacts. In dev they are the
-# same bucket, separated only by prefix, so the task role cannot be scoped
-# read-only by bucket — only by prefix (see issue #8).
-bucket_name = config.require("bucket_name")
+# ``output_bucket_name`` is where CDT writes its own artifacts, defaulting to the
+# same shared bucket. Today they are that one bucket, separated only by prefix, so
+# the task role cannot be scoped read-only by bucket — only by prefix (see #8).
+bucket_name = aws.ssm.get_parameter(
+    name=f"/idi/{stack_name}/shared/processor_bucket_name"
+).value
 output_bucket_name = config.get("output_bucket_name") or bucket_name
 artifact_prefix = config.get("artifact_prefix") or "processors/cdt"
 final_database_prefix = config.get("final_database_prefix") or "database/cdt"
@@ -21,8 +28,10 @@ final_database_prefix = config.get("final_database_prefix") or "database/cdt"
 # Pulumi cannot import the package, so the two are coupled by convention. If they
 # drift, the task role denies every GetObject ingest attempts.
 source_prefix = config.get("source_prefix") or "sec"
-default_cik_file = config.require("default_cik_file")
-shared_dlq_name = config.require("shared_dlq_name")
+# Bucket-relative so the bucket name stays out of the committed stack files;
+# the orchestrator wants a full s3:// URI.
+default_cik_file = f"s3://{bucket_name}/{config.require('default_cik_key')}"
+shared_dlq_name = aws.ssm.get_parameter(name=f"/idi/{stack_name}/shared/dlq_name").value
 cpu = config.get("cpu") or "1024"
 memory = config.get("memory") or "4096"
 log_retention_days = int(config.get("log_retention_days") or "30")
