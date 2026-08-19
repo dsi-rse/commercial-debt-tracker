@@ -13,7 +13,7 @@ The `dev` stack provisions:
 - IAM roles for ECS execution and runtime access
 - a CloudWatch log group
 - two EventBridge Scheduler schedules: a daily `cdt-orchestrator daily` and an hourly `cdt-orchestrator poll`
-- Secrets Manager secrets for `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, and `SEC_USER_AGENT`
+- SSM SecureString parameters holding `OPENAI_API_KEY` and `OPENROUTER_API_KEY` under `/idi/dev/cdt/secrets/`
 
 The daily task runs `cdt-orchestrator daily`; the hourly task runs `cdt-orchestrator poll` to advance the OpenAI batch extract job. Historical runs are manual ECS task invocations with a container command override.
 
@@ -23,18 +23,19 @@ These are the current recommended `dev` values:
 
 ```text
 aws:region = us-east-2
-idi:bucket_name = idi-dev-ftm2j-shared-processor-storage
-idi:output_bucket_name = idi-dev-ftm2j-shared-processor-storage
 idi:artifact_prefix = processors/cdt
 idi:final_database_prefix = database/cdt
-idi:default_cik_file = s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/inputs/ciks/beta-1k.txt
-idi:shared_dlq_name = idi-dev-ftm2j-shared-scheduler-dlq
+idi:default_cik_key = processors/cdt/inputs/ciks/beta-1k.txt
 idi:cpu = 1024
 idi:memory = 4096
 idi:ecr_image_retention_count = 5
 idi:cron = cron(0 7 * * ? *)
 idi:schedule_enabled = false
 ```
+
+These are already committed in `pulumi/Pulumi.dev.yaml`; the bucket and DLQ names
+are read from `/idi/dev/shared/*` in SSM and the API keys are SecureStrings, so
+neither appears above.
 
 Notes:
 
@@ -119,33 +120,33 @@ The deployed daily job and any manual historical run can override the CIK file, 
 
 ## Create and Configure the Pulumi Stack
 
-Run these commands from the `pulumi/` directory:
+`pulumi/Pulumi.dev.yaml` is committed, so a fresh checkout needs no `pulumi config
+set` calls — select the stack and go:
 
 ```bash
-pulumi stack init dev
-pulumi config set aws:region us-east-2
-pulumi config set idi:bucket_name idi-dev-ftm2j-shared-processor-storage
-pulumi config set idi:output_bucket_name idi-dev-ftm2j-shared-processor-storage
-pulumi config set idi:artifact_prefix processors/cdt
-pulumi config set idi:final_database_prefix database/cdt
-pulumi config set idi:default_cik_file s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/inputs/ciks/beta-1k.txt
-pulumi config set idi:shared_dlq_name idi-dev-ftm2j-shared-scheduler-dlq
-pulumi config set idi:cpu 1024
-pulumi config set idi:memory 4096
-pulumi config set idi:ecr_image_retention_count 5
-pulumi config set idi:cron "cron(0 7 * * ? *)"
-pulumi config set idi:schedule_enabled false
-pulumi config set --secret idi:openrouter_api_key <openrouter-api-key>
-pulumi config set --secret idi:openai_api_key <openai-api-key>
-pulumi config set --secret idi:sec_user_agent "Trevor Spreadbury dsicorefacility_project3@uchicago.edu"
+pulumi stack select dev   # or `pulumi stack init dev` on a brand-new backend
 ```
 
-`idi:openai_api_key` is required — it powers the deployed OpenAI batch extract poller. The
-optional `idi:poll_cron` (default `cron(30 * * * ? *)`) controls the hourly poll schedule.
+The two API keys are SSM SecureStrings, not stack config. The first `pulumi up`
+creates them holding a placeholder; set the real values once per environment, and
+again whenever they rotate:
+
+```bash
+aws ssm put-parameter --name /idi/dev/cdt/secrets/openai_api_key \
+  --type SecureString --value '<openai-api-key>' --overwrite
+aws ssm put-parameter --name /idi/dev/cdt/secrets/openrouter_api_key \
+  --type SecureString --value '<openrouter-api-key>' --overwrite
+```
+
+A task that starts while a parameter still holds the placeholder will fail to
+authenticate against that provider; the value is re-read at each task launch, so
+fixing it needs no deploy. Both keys belong in the Core Facility Bitwarden.
+
+The OpenAI key powers the deployed batch extract poller and is required. The
+optional `idi:poll_cron` (default `cron(30 * * * ? *)`) controls the hourly poll
+schedule.
 
 This processor stack does not publish Cloudflare R2 JSON. It writes final parquet snapshots under `idi:final_database_prefix`; the dashboard publisher stack in `../commercial-debt-tracker-dashboard` reads those snapshots and updates R2.
-
-If the `dev` stack already exists, use `pulumi stack select dev` instead of `pulumi stack init dev`.
 
 ## Preview and Deploy
 
@@ -293,4 +294,4 @@ pulumi config set idi:schedule_enabled true
 uv run pulumi up
 ```
 
-At that point the scheduler will run `daily` mode automatically using the default CIK file configured in `idi:default_cik_file`.
+At that point the scheduler will run `daily` mode automatically using the default CIK file configured in `idi:default_cik_key`.
