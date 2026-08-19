@@ -12,17 +12,3 @@ config:
   idi:ecr_image_retention_count: "5"
   idi:cron: cron(0 7 * * ? *)
   idi:schedule_enabled: "false"
-  idi:openrouter_api_key:
-    secure: v1:ALTA1KMMvt25ICoU:l6cxLg4HmieCztQ1cPEW2pamLvhFHvLnRqypkp+kGaHK2qGbbmx+dYzJtmQ9P6SM5mIh3+s0aQasTV74//r22ayHwwUt0T7Fn46zk/Gvhg/4TACbXmSCjlc=
-  idi:sec_user_agent:
-    secure: v1:X9F1OPBlXi6X2eUP:BTgVr3qgBjaJjJF9+0yYS645VT+Iz5J4jaw0SW2NAn3QVWHMk6Ay6jGVfheVFQUaFer2w0tpuL8EoUMXFKHecjll7U9zkGI=
-  idi:r2_bucket_name: commercial-debt-tracker-data
-  idi:r2_object_prefix: generated
-  idi:r2_access_key_id:
-    secure: v1:/420KMlNGzAb3qzj:IIOKkZVcbE5h6qrPi4G7AwnuIy//KsGdblr6YgVEnRkaEXAxTuKpu2lscgWGzI1W
-  idi:r2_secret_access_key:
-    secure: v1:2sWon0zNba5YzKwF:KdPSiAjBIzQvRCAcfQkv9TFFovBhnh69kYp7ZPcnbptt/Cgvcft+/sH6aRk8AtlzhxjNm52+PnMWT2nCtrQwh2VzSNYc6hURNMyIdttP4xc=
-  idi:r2_account_id:
-    secure: v1:S+wdreBEEi6P7v4L:FD6V3cfme81ZseiwCkAZWt1kmIjQmwnYypi8InpSNyujf/inZdjoF0/krVVtqTYQ
-  idi:openai_api_key:
-    secure: v1:PC/thd4iayGR794A:bIyoe5nxnusKD4h9sO3qo6XmROzmu5ZXfyX17qGVwqGAmhNig3sNaqP433/mrEpNCvC7q0gPhvlJDtF1S7uYFKg/8pdU8ii7G3jszE9R0UYRbMGnkr9+IN6mFiucEKVXvYu9fmxoeOFFPjL5S+LxM3zlNSs5bVT7ZgOvoDymQKbKrfBze72A19U5w8bFbwIjqxwlur7zmgY3VsWdgcgmpNlqv3uZ+btsDFT3Mc3TyZO/JXpI

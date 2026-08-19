@@ -41,9 +41,6 @@ schedule_expression = config.get("cron") or "cron(0 8 * * ? *)"
 # run so the daily classify writes settle first. It shares ``schedule_enabled``.
 poll_schedule_expression = config.get("poll_cron") or "cron(30 * * * ? *)"
 schedule_enabled = (config.get("schedule_enabled") or "false").lower() == "true"
-r2_account_id = config.get("r2_account_id")
-r2_bucket_name = config.get("r2_bucket_name")
-r2_object_prefix = config.get("r2_object_prefix") or "generated"
 caller = aws.get_caller_identity()
 aws_region = pulumi.Config("aws").require("region")
 
