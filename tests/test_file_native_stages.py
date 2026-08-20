@@ -17,6 +17,7 @@ from cdt.extractor.core import (
     InstrumentIEStage,
     InstrumentRelationStage,
     is_rate_like_amount_text,
+    load_prompt,
     normalized_maturity_from_text,
 )
 from cdt.ingest import DOCUMENT_COLUMNS
@@ -1059,6 +1060,14 @@ def test_instrument_ie_postprocess_drops_rate_amount() -> None:
     assert payload["currency"] is None
     # Evidence is preserved so the dropped value stays auditable.
     assert payload["tag_ids"] == ["tag-a-rate"]
+
+
+def test_instrument_ie_prompt_requires_one_object_per_class() -> None:
+    """The IE prompt must keep telling the model to split multi-class offerings."""
+    prompt = load_prompt("instrument_ie")
+
+    assert "one object per class, tranche, or series" in prompt
+    assert "Class A-1" in prompt
 
 
 def test_instrument_relation_stage_accepts_retired_of() -> None:
