@@ -89,6 +89,7 @@ MATURITY_YEAR_PATTERN = re.compile(
     re.IGNORECASE,
 )
 YEAR_ONLY_MATURITY_SUFFIX = "-12-31"
+RATE_TEXT_MARKERS = ("%", "basis point")
 ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 MONTH_MAP = {
     "january": "01",
@@ -455,6 +456,14 @@ class InstrumentIEStage:
                             validate_standardized_single_value_cardinality(
                                 index=index,
                                 property_name=property_name,
+                                value=obj[property_name],
+                                tag_details=tag_details,
+                            )
+                        )
+                    if property_name == "amount":
+                        failures.extend(
+                            validate_amount_is_not_rate(
+                                index=index,
                                 value=obj[property_name],
                                 tag_details=tag_details,
                             )
@@ -1293,6 +1302,37 @@ def validate_lenders_complete(*, index: int, obj: dict[str, Any]) -> list[str]:
     return failures
 
 
+def validate_amount_is_not_rate(
+    *,
+    index: int,
+    value: object,
+    tag_details: dict[str, dict[str, object]],
+) -> list[str]:
+    """Reject an amount whose evidence only describes a rate, margin, or fee."""
+    if not isinstance(value, dict):
+        return []
+    evidence = value.get("evidence")
+    if not isinstance(evidence, list):
+        return []
+    evidence_texts = [
+        collapse_whitespace(str(tag_details[tag_id]["text"]))
+        for tag_id in evidence
+        if isinstance(tag_id, str) and tag_id in tag_details
+    ]
+    if not evidence_texts or not all(
+        is_rate_like_amount_text(text) for text in evidence_texts
+    ):
+        return []
+    quoted = ", ".join(f"'{text}'" for text in evidence_texts)
+    return [
+        (
+            f"Entry {index}: 'amount' evidence {quoted} describes an interest rate, "
+            "margin, or fee rather than a principal or commitment amount. Cite the "
+            "principal or commitment amount instead, or omit 'amount'."
+        )
+    ]
+
+
 def iter_instrument_entries(
     data: list[dict[str, Any]],
     tag_details: dict[str, dict[str, object]],
@@ -1448,6 +1488,18 @@ def currency_candidates_from_text(text: str | None) -> set[str]:
     return candidates
 
 
+def is_rate_like_amount_text(text: str | None) -> bool:
+    """Return whether one amount evidence string reads as a rate, margin, or fee."""
+    if not text:
+        return False
+    lowered = text.lower()
+    if currency_candidates_from_text(text):
+        return False
+    if any(re.search(rf"\b{word}\b", lowered) for word in AMOUNT_MULTIPLIERS):
+        return False
+    return any(marker in lowered for marker in RATE_TEXT_MARKERS)
+
+
 def normalized_date_from_text(text: str | None) -> str | None:
     """Parse one date mention into ISO format."""
     if not text:
@@ -1509,6 +1561,10 @@ def standardized_amount_payload(
     parsed_currency_candidates = currency_candidates_from_text(evidence_text)
     model_amount = value.get("normalized_amount") if isinstance(value, dict) else None
     model_currency = value.get("currency") if isinstance(value, dict) else None
+    if is_rate_like_amount_text(evidence_text):
+        # Rates, margins, and fees are not principal amounts.
+        parsed_amount = None
+        parsed_currency_candidates = set()
 
     payload["normalized_amount"] = (
         model_amount

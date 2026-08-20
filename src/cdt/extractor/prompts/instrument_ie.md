@@ -43,6 +43,7 @@ For party properties, return one object per coreference cluster:
 - For `name`, return one list of tag ids representing a single coreference cluster.
 - Every `lenders` cluster must carry a `kind`, and every `other_interested_parties` cluster must carry a `role`.
 - `lenders_complete` must be `true` or `false`, and may be returned only when `lenders` is present.
+- `amount` is the principal or commitment amount only. Interest rates, margins, spreads, fees, discounts, and per-annum percentages are never `amount`. Omit `amount` when the document states no principal or commitment amount.
 - For `amount.normalized_amount`, return only digits and at most one decimal point, or `null`.
 - For `amount.currency`, return one 3-letter ISO 4217 currency code or `null`.
 - For `start_date.normalized_date` and `end_date.normalized_date`, return `YYYY-MM-DD` or `null`.
@@ -77,6 +78,7 @@ Party rules:
 Examples:
 - If a document describes `3.875% senior notes due 2028` and gives no separate maturity date, return that instrument's `debt_instrument` tag id as `end_date.evidence` with `normalized_date` `2028-12-31` and `derived_from_name` `true`.
 - If a document describes `senior notes due October 1, 2028` and tags `October 1, 2028` as a date, cite the `date` tag id with `normalized_date` `2028-10-01`.
+- If a credit agreement says ABR Loans bear interest at `0.875% per annum`, do not return `0.875` as the `amount`. Omit `amount` unless the document states that loan's principal or commitment amount.
 - If a document says the company issued an initial note on March 17, 2025 for $5.5 million and a subsequent note on March 20, 2025 for $269,000, both called `Senior Subordinated Convertible Promissory Note`, return two objects.
 - If a document later refers collectively to those instruments as `Exchange Notes`, do not return a third `Exchange Notes` object.
 - If a document says prior notes were retired in full, do not return a new object just for that contextual mention unless the filing separately describes a concrete debt instrument state for it.

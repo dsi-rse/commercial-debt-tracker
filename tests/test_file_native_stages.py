@@ -16,6 +16,7 @@ from cdt.extractor.core import (
     ExtractionRowState,
     InstrumentIEStage,
     InstrumentRelationStage,
+    is_rate_like_amount_text,
     normalized_maturity_from_text,
 )
 from cdt.ingest import DOCUMENT_COLUMNS
@@ -961,6 +962,103 @@ def test_instrument_ie_postprocess_drops_end_date_that_contradicts_evidence() ->
     # name maturity fills the gap instead.
     assert mention["end_date"] == "2028-12-31"
     assert payload["derived_from_name"] is True
+
+
+RATE_AMOUNT_XML = """
+<body>
+<debt_instrument id="tag-i-1">ABR Loan</debt_instrument> borrowings bear interest at
+<amount id="tag-a-rate">0.875% per annum</amount> and the facility provides for
+<amount id="tag-a-principal">$500.0 million</amount> of commitments.
+</body>
+""".strip()
+
+
+def rate_amount_row_state() -> ExtractionRowState:
+    """Return one instrument_ie row state with both a rate and a principal amount."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = RATE_AMOUNT_XML
+    return row_state
+
+
+def test_is_rate_like_amount_text_separates_rates_from_principal() -> None:
+    """Rate detection should key on percentages without currency or scale words."""
+    assert is_rate_like_amount_text("0.875% per annum") is True
+    assert is_rate_like_amount_text("5.75%") is True
+    assert is_rate_like_amount_text("175 basis points") is True
+    assert is_rate_like_amount_text("$500.0 million") is False
+    assert is_rate_like_amount_text("$500,000,000 (100% of principal)") is False
+    assert is_rate_like_amount_text("100% of the outstanding 30.0 million") is False
+    assert is_rate_like_amount_text(None) is False
+
+
+def test_instrument_ie_validate_rejects_rate_only_amount_evidence() -> None:
+    """An amount citing only a rate should fail validation and retry."""
+    response = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "amount": {
+                    "evidence": ["tag-a-rate"],
+                    "normalized_amount": "0.875",
+                    "currency": None,
+                },
+            }
+        ]
+    )
+
+    failures = InstrumentIEStage().validate(rate_amount_row_state(), response)
+
+    assert any(
+        "describes an interest rate, margin, or fee" in failure for failure in failures
+    )
+
+
+def test_instrument_ie_validate_accepts_principal_amount_evidence() -> None:
+    """A principal amount should still validate."""
+    response = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "amount": {
+                    "evidence": ["tag-a-principal"],
+                    "normalized_amount": "500000000",
+                    "currency": "USD",
+                },
+            }
+        ]
+    )
+
+    assert InstrumentIEStage().validate(rate_amount_row_state(), response) == []
+
+
+def test_instrument_ie_postprocess_drops_rate_amount() -> None:
+    """A rate that slips past validation should not be stored as an amount."""
+    row_state = rate_amount_row_state()
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "amount": {
+                    "evidence": ["tag-a-rate"],
+                    "normalized_amount": "0.875",
+                    "currency": "USD",
+                },
+            }
+        ]
+    )
+
+    InstrumentIEStage().postprocess(row_state)
+
+    mention = row_state.debt_instrument_mentions[0]
+    payload = json.loads(str(mention["amount_json"]))
+    assert mention["amount"] is None
+    assert payload["normalized_amount"] is None
+    assert payload["currency"] is None
+    # Evidence is preserved so the dropped value stays auditable.
+    assert payload["tag_ids"] == ["tag-a-rate"]
 
 
 def test_instrument_relation_stage_accepts_retired_of() -> None:
