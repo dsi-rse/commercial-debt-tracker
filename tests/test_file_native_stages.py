@@ -15,6 +15,7 @@ from cdt.extractor.core import (
     ExtractionRowState,
     InstrumentIEStage,
     InstrumentRelationStage,
+    load_prompt,
 )
 from cdt.ingest import DOCUMENT_COLUMNS
 from cdt.itemizer import core as itemizer_core
@@ -533,6 +534,14 @@ was issued on <date id="tag-d-1">March 17, 2025</date> and <date id="tag-d-2">Ma
     failures = InstrumentIEStage().validate(row_state, response)
 
     assert any("multiple distinct normalized values" in failure for failure in failures)
+
+
+def test_instrument_ie_prompt_requires_one_object_per_class() -> None:
+    """The IE prompt must keep telling the model to split multi-class offerings."""
+    prompt = load_prompt("instrument_ie")
+
+    assert "one object per class, tranche, or series" in prompt
+    assert "Class A-1" in prompt
 
 
 def test_instrument_relation_stage_accepts_retired_of() -> None:
