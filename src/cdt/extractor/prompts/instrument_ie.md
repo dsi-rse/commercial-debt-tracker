@@ -43,6 +43,7 @@ For party properties, return one object per coreference cluster:
 - For `name`, return one list of tag ids representing a single coreference cluster.
 - Every `lenders` cluster must carry a `kind`, and every `other_interested_parties` cluster must carry a `role`.
 - `lenders_complete` must be `true` or `false`, and may be returned only when `lenders` is present.
+- Do not use an aggregate amount that covers several instruments as the `amount` of any one of them. When the document states only a combined total for a group, such as the total principal subject to one amendment, omit `amount` on the individual instruments.
 - `amount` is the principal or commitment amount only. Interest rates, margins, spreads, fees, discounts, and per-annum percentages are never `amount`. Omit `amount` when the document states no principal or commitment amount.
 - For `amount.normalized_amount`, return only digits and at most one decimal point, or `null`.
 - For `amount.currency`, return one 3-letter ISO 4217 currency code or `null`.
@@ -54,7 +55,8 @@ For party properties, return one object per coreference cluster:
 - Return only valid JSON with no extra text.
 
 Selection rules:
-- Ignore debt-like mentions that are only contextual references to older debt being retired, repaid, cancelled, exchanged, refinanced, or discussed as background.
+- Ignore debt-like mentions that are only passing background to some other transaction, such as older debt mentioned in a sentence about how a new financing will be used.
+- When the filing's subject is a specific named instrument being redeemed, repaid, cancelled, exchanged, refinanced, terminated, or amended, return that instrument and record what the filing states about it. The retirement or amendment itself is information about that instrument, not a reason to drop it.
 - Ignore collective labels that only group multiple concrete instruments described elsewhere in the same document, such as `Exchange Notes` or generic `Notes`, when the underlying instruments can be extracted separately.
 - Ignore non-debt securities even if they appear in the same financing disclosure.
 - A returned object should correspond to one coherent debt instrument.
@@ -77,6 +79,7 @@ Party rules:
 - Underwriters, initial purchasers, placement agents, and sales agents in a public offering or Rule 144A resale belong in `other_interested_parties` with `role: "underwriter"`, never in `lenders`, because they resell the debt rather than hold it.
 - In a note purchase agreement or private placement sold directly to investors, the `purchasers` ARE the lenders. Return them in `lenders`, using `kind: "named"` when they are named and `kind: "collective"` when the document only refers to `the Purchasers`.
 - Guarantors belong in `other_interested_parties` with `role: "guarantor"`.
+- A named party the document identifies as the holder, noteholder, payee, purchaser, or counterparty of the debt is a `named` lender, even when the document never uses the word `lender`. The rules above about parties that are never lenders cover agents, trustees, and underwriters only.
 - Use `role: "other"` only when the party is clearly related to the instrument but none of the other roles fit.
 
 Examples:
