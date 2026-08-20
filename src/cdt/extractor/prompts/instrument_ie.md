@@ -34,6 +34,7 @@ For standardized single-value properties, use these object shapes:
 - `lenders` and `other_interested_parties` may contain only `person` or `organization` tag ids.
 - For `name`, return one list of tag ids representing a single coreference cluster.
 - For multi-value properties, return a list of lists, where each inner list is one coreference cluster.
+- `amount` is the principal or commitment amount only. Interest rates, margins, spreads, fees, discounts, and per-annum percentages are never `amount`. Omit `amount` when the document states no principal or commitment amount.
 - For `amount.normalized_amount`, return only digits and at most one decimal point, or `null`.
 - For `amount.currency`, return one 3-letter ISO 4217 currency code or `null`.
 - For `start_date.normalized_date` and `end_date.normalized_date`, return `YYYY-MM-DD` or `null`.
@@ -51,6 +52,7 @@ Selection rules:
 - Any property evidence may be shared across multiple returned objects when the text says the property applies to all of them, including `name`, `start_date`, `end_date`, `amount`, `lenders`, and `other_interested_parties`.
 
 Examples:
+- If a credit agreement says ABR Loans bear interest at `0.875% per annum`, do not return `0.875` as the `amount`. Omit `amount` unless the document states that loan's principal or commitment amount.
 - If a document says the company issued an initial note on March 17, 2025 for $5.5 million and a subsequent note on March 20, 2025 for $269,000, both called `Senior Subordinated Convertible Promissory Note`, return two objects.
 - If a document later refers collectively to those instruments as `Exchange Notes`, do not return a third `Exchange Notes` object.
 - If a document says prior notes were retired in full, do not return a new object just for that contextual mention unless the filing separately describes a concrete debt instrument state for it.
