@@ -51,13 +51,25 @@ INSTRUMENT_ENTITY_TAG_TYPES = {"debt_instrument"}
 LENDER_TAG_TYPES = {"person", "organization"}
 INSTRUMENT_SINGLE_VALUE_PROPERTIES = {
     "start_date": {"date"},
-    "end_date": {"date"},
+    # NER tags maturity phrases like "notes due 2028" inside the instrument name,
+    # so end_date evidence may cite that name span instead of a standalone date.
+    "end_date": {"date", "debt_instrument"},
     "amount": {"amount"},
     "name": {"debt_instrument"},
 }
+MATURITY_EVIDENCE_TAG_TYPES = {"debt_instrument"}
 STANDARDIZED_SINGLE_VALUE_PROPERTIES = {"start_date", "end_date", "amount"}
 INSTRUMENT_RELATION_TYPES = {"amendment_of", "retired_of", "split_of"}
 NUMERIC_STRING_PATTERN = re.compile(r"^\d+(?:\.\d+)?$")
+MATURITY_FULL_DATE_PATTERN = re.compile(
+    r"\bdue\s+(?:on\s+)?(?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2}),?\s+(?P<year>\d{4})",
+    re.IGNORECASE,
+)
+MATURITY_YEAR_PATTERN = re.compile(
+    r"\bdue\s+(?:in\s+)?(?P<year>\d{4})\b",
+    re.IGNORECASE,
+)
+YEAR_ONLY_MATURITY_SUFFIX = "-12-31"
 ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 MONTH_MAP = {
     "january": "01",
@@ -507,9 +519,11 @@ class InstrumentIEStage:
                 obj.get("start_date"),
                 tag_details,
             )
-            end_date_payload = standardized_date_payload(
+            name_text = canonical_value(obj.get("name", []), tag_details)
+            end_date_payload = standardized_end_date_payload(
                 obj.get("end_date"),
                 tag_details,
+                name_text=name_text,
             )
             mention_row: dict[str, object] = {
                 "item_id": row_state.item_id,
@@ -519,7 +533,7 @@ class InstrumentIEStage:
                 "company_name": row_state.item_row.get("company_name"),
                 "date": row_state.item_row.get("date"),
                 "raw_id": raw_id,
-                "name": canonical_value(obj.get("name", []), tag_details),
+                "name": name_text,
                 "start_date": start_date_payload["normalized_date"],
                 "end_date": end_date_payload["normalized_date"],
                 "amount": amount_payload["normalized_amount"],
@@ -1153,6 +1167,11 @@ def validate_standardized_single_value_shape(
             failures.append(
                 f"Entry {index}: '{property_name}.normalized_date' must be YYYY-MM-DD or null."
             )
+        derived_from_name = value.get("derived_from_name")
+        if derived_from_name is not None and not isinstance(derived_from_name, bool):
+            failures.append(
+                f"Entry {index}: '{property_name}.derived_from_name' must be true or false."
+            )
     return failures
 
 
@@ -1172,7 +1191,10 @@ def validate_standardized_single_value_cardinality(
     evidence_texts = [
         str(tag_details[tag_id]["text"])
         for tag_id in evidence
-        if isinstance(tag_id, str) and tag_id in tag_details
+        if isinstance(tag_id, str)
+        and tag_id in tag_details
+        # Name spans carrying an embedded maturity are not comparable date mentions.
+        and tag_details[tag_id]["type"] not in MATURITY_EVIDENCE_TAG_TYPES
     ]
     if property_name == "amount":
         normalized_values = {
@@ -1364,10 +1386,39 @@ def normalized_date_from_text(text: str | None) -> str | None:
     )
     if not match:
         return None
-    month = MONTH_MAP.get(match.group("month").lower())
+    return iso_date_from_parts(
+        match.group("year"), match.group("month"), match.group("day")
+    )
+
+
+def normalized_maturity_from_text(text: str | None) -> str | None:
+    """Parse one maturity phrase such as 'notes due 2028' into ISO format."""
+    if not text:
+        return None
+    full_dates = {
+        normalized
+        for normalized in (
+            iso_date_from_parts(
+                match.group("year"), match.group("month"), match.group("day")
+            )
+            for match in MATURITY_FULL_DATE_PATTERN.finditer(text)
+        )
+        if normalized is not None
+    }
+    if full_dates:
+        return full_dates.pop() if len(full_dates) == 1 else None
+    years = {match.group("year") for match in MATURITY_YEAR_PATTERN.finditer(text)}
+    if len(years) != 1:
+        return None
+    return f"{years.pop()}{YEAR_ONLY_MATURITY_SUFFIX}"
+
+
+def iso_date_from_parts(year: str, month_name: str, day: str) -> str | None:
+    """Return one ISO date built from year, month name, and day parts."""
+    month = MONTH_MAP.get(month_name.lower())
     if month is None:
         return None
-    normalized = f"{match.group('year')}-{month}-{int(match.group('day')):02d}"
+    normalized = f"{year}-{month}-{int(day):02d}"
     return normalized if is_valid_iso_date(normalized) else None
 
 
@@ -1402,18 +1453,47 @@ def standardized_amount_payload(
 def standardized_date_payload(
     value: object,
     tag_details: dict[str, dict[str, object]],
+    *,
+    allow_maturity_phrase: bool = False,
 ) -> dict[str, object]:
     """Return evidence payload plus validated normalized date field."""
     evidence_tag_ids = single_value_evidence_tag_ids(value)
     payload = cluster_payload(evidence_tag_ids, tag_details)
     evidence_text = canonical_value(evidence_tag_ids, tag_details)
     parsed_date = normalized_date_from_text(evidence_text)
+    if parsed_date is None and allow_maturity_phrase:
+        parsed_date = normalized_maturity_from_text(evidence_text)
     model_date = value.get("normalized_date") if isinstance(value, dict) else None
     payload["normalized_date"] = (
         model_date
         if isinstance(model_date, str) and model_date == parsed_date
         else None
     )
+    return payload
+
+
+def standardized_end_date_payload(
+    value: object,
+    tag_details: dict[str, dict[str, object]],
+    *,
+    name_text: str | None,
+) -> dict[str, object]:
+    """Return the end-date payload, falling back to the maturity in the name."""
+    payload = standardized_date_payload(
+        value,
+        tag_details,
+        allow_maturity_phrase=True,
+    )
+    mentions = cast(list[dict[str, object]], payload["mentions"])
+    derived_from_name = payload["normalized_date"] is not None and any(
+        mention["type"] in MATURITY_EVIDENCE_TAG_TYPES for mention in mentions
+    )
+    if payload["normalized_date"] is None:
+        derived_date = normalized_maturity_from_text(name_text)
+        if derived_date is not None:
+            payload["normalized_date"] = derived_date
+            derived_from_name = True
+    payload["derived_from_name"] = derived_from_name
     return payload
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -15,6 +16,7 @@ from cdt.extractor.core import (
     ExtractionRowState,
     InstrumentIEStage,
     InstrumentRelationStage,
+    normalized_maturity_from_text,
 )
 from cdt.ingest import DOCUMENT_COLUMNS
 from cdt.itemizer import core as itemizer_core
@@ -533,6 +535,196 @@ was issued on <date id="tag-d-1">March 17, 2025</date> and <date id="tag-d-2">Ma
     failures = InstrumentIEStage().validate(row_state, response)
 
     assert any("multiple distinct normalized values" in failure for failure in failures)
+
+
+MATURITY_IN_NAME_XML = """
+<body>
+On <date id="tag-d-1">March 17, 2025</date>, the Company issued
+<debt_instrument id="tag-i-1">3.875% senior notes due 2028</debt_instrument>
+in an aggregate principal amount of <amount id="tag-a-1">$500 million</amount>.
+</body>
+""".strip()
+
+
+def maturity_row_state() -> ExtractionRowState:
+    """Return one instrument_ie row state whose instrument name carries a maturity."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = MATURITY_IN_NAME_XML
+    return row_state
+
+
+def maturity_mention(response: str) -> dict[str, object]:
+    """Run instrument_ie postprocessing on one response and return its mention."""
+    row_state = maturity_row_state()
+    row_state.stage_responses["instrument_ie"] = response
+    InstrumentIEStage().postprocess(row_state)
+    assert len(row_state.debt_instrument_mentions) == 1
+    return row_state.debt_instrument_mentions[0]
+
+
+def test_normalized_maturity_from_text_parses_due_phrases() -> None:
+    """Maturity parsing should cover year-only, full-date, and ambiguous names."""
+    assert normalized_maturity_from_text("3.875% senior notes due 2028") == "2028-12-31"
+    assert (
+        normalized_maturity_from_text("senior notes due October 1, 2028")
+        == "2028-10-01"
+    )
+    assert normalized_maturity_from_text("notes due in 2030") == "2030-12-31"
+    assert normalized_maturity_from_text("notes due 2028 and notes due 2031") is None
+    assert normalized_maturity_from_text("3.875% senior notes") is None
+    assert normalized_maturity_from_text("Series 2025-B Notes") is None
+
+
+def test_instrument_ie_validate_accepts_name_span_as_end_date_evidence() -> None:
+    """The instrument name span is valid end_date evidence when maturity is embedded."""
+    response = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "end_date": {
+                    "evidence": ["tag-i-1"],
+                    "normalized_date": "2028-12-31",
+                    "derived_from_name": True,
+                },
+            }
+        ]
+    )
+
+    assert InstrumentIEStage().validate(maturity_row_state(), response) == []
+
+
+def test_instrument_ie_validate_still_rejects_name_span_as_start_date_evidence() -> (
+    None
+):
+    """Only end_date may cite a debt_instrument tag."""
+    response = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "start_date": {
+                    "evidence": ["tag-i-1"],
+                    "normalized_date": "2028-12-31",
+                },
+            }
+        ]
+    )
+
+    failures = InstrumentIEStage().validate(maturity_row_state(), response)
+
+    assert any("expected date" in failure for failure in failures)
+
+
+def test_instrument_ie_validate_rejects_non_boolean_derived_from_name() -> None:
+    """The derived_from_name flag must be boolean when present."""
+    response = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "end_date": {
+                    "evidence": ["tag-i-1"],
+                    "normalized_date": "2028-12-31",
+                    "derived_from_name": "yes",
+                },
+            }
+        ]
+    )
+
+    failures = InstrumentIEStage().validate(maturity_row_state(), response)
+
+    assert any("derived_from_name' must be true or false" in f for f in failures)
+
+
+def test_instrument_ie_postprocess_keeps_name_derived_end_date() -> None:
+    """A maturity cited from the name span should survive normalization."""
+    mention = maturity_mention(
+        json.dumps(
+            [
+                {
+                    "name": ["tag-i-1"],
+                    "end_date": {
+                        "evidence": ["tag-i-1"],
+                        "normalized_date": "2028-12-31",
+                        "derived_from_name": True,
+                    },
+                }
+            ]
+        )
+    )
+
+    assert mention["end_date"] == "2028-12-31"
+    payload = json.loads(str(mention["end_date_json"]))
+    assert payload["tag_ids"] == ["tag-i-1"]
+    assert payload["derived_from_name"] is True
+
+
+def test_instrument_ie_postprocess_backfills_end_date_from_name() -> None:
+    """A missing end_date should fall back to the maturity in the instrument name."""
+    mention = maturity_mention(
+        json.dumps(
+            [
+                {
+                    "name": ["tag-i-1"],
+                    "start_date": {
+                        "evidence": ["tag-d-1"],
+                        "normalized_date": "2025-03-17",
+                    },
+                }
+            ]
+        )
+    )
+
+    assert mention["end_date"] == "2028-12-31"
+    payload = json.loads(str(mention["end_date_json"]))
+    assert payload["tag_ids"] == []
+    assert payload["derived_from_name"] is True
+
+
+def test_instrument_ie_postprocess_leaves_end_date_null_without_maturity() -> None:
+    """Names without a maturity phrase should not gain an invented end date."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = """
+<body>
+The Company issued <debt_instrument id="tag-i-1">3.875% senior notes</debt_instrument>
+on <date id="tag-d-1">March 17, 2025</date>.
+</body>
+""".strip()
+    row_state.stage_responses["instrument_ie"] = json.dumps([{"name": ["tag-i-1"]}])
+
+    InstrumentIEStage().postprocess(row_state)
+
+    mention = row_state.debt_instrument_mentions[0]
+    assert mention["end_date"] is None
+    assert json.loads(str(mention["end_date_json"]))["derived_from_name"] is False
+
+
+def test_instrument_ie_postprocess_drops_end_date_that_contradicts_evidence() -> None:
+    """A normalized date that does not match its evidence text is still dropped."""
+    mention = maturity_mention(
+        json.dumps(
+            [
+                {
+                    "name": ["tag-i-1"],
+                    "end_date": {
+                        "evidence": ["tag-d-1"],
+                        "normalized_date": "2028-12-31",
+                    },
+                }
+            ]
+        )
+    )
+
+    payload = json.loads(str(mention["end_date_json"]))
+    assert payload["tag_ids"] == ["tag-d-1"]
+    # The cited date tag says March 17, 2025, so the model value is rejected and the
+    # name maturity fills the gap instead.
+    assert mention["end_date"] == "2028-12-31"
+    assert payload["derived_from_name"] is True
 
 
 def test_instrument_relation_stage_accepts_retired_of() -> None:
