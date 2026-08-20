@@ -31,6 +31,7 @@ from cdt.matcher import (
 from cdt.matcher.core import (
     aggregate_lenders_complete,
     coerce_optional_text,
+    company_names_by_cik,
     lender_signature,
     match_tables,
 )
@@ -147,6 +148,7 @@ def build_mention_row(
     amount: str,
     lenders_json: str = "[]",
     lenders_complete: bool = False,
+    company_name: str | None = "Example Inc.",
 ) -> dict[str, object]:
     """Return one canonical mention row for matcher tests."""
     return {
@@ -154,7 +156,7 @@ def build_mention_row(
         "item_id": item_id,
         "accession_number": accession_number,
         "cik": cik,
-        "company_name": "Example Inc.",
+        "company_name": company_name,
         "date": date,
         "raw_id": "i-1",
         "name": name,
@@ -1127,6 +1129,98 @@ def test_match_pending_mentions_writes_match_datasets(tmp_path: Path) -> None:
     assert len(tables["debt_instrument_mentions"]) == 1
     assert written_matches["edge_type"].to_list() == ["member"]
     assert written_instruments["debt_instrument_id"].to_list() == ["m-1"]
+
+
+def test_company_names_by_cik_takes_the_newest_known_name() -> None:
+    """CIK name resolution should ignore missing values and prefer newer filings."""
+    mention_rows = pd.DataFrame(
+        [
+            build_mention_row(
+                mention_id="m-1",
+                item_id="item-1",
+                accession_number="0001",
+                cik="2078008",
+                date="2024-01-02",
+                name="Term Loan",
+                start_date="2024-01-01",
+                amount="$100 million",
+                company_name=None,
+            ),
+            build_mention_row(
+                mention_id="m-2",
+                item_id="item-2",
+                accession_number="0002",
+                cik="2078008",
+                date="2024-02-02",
+                name="Revolver",
+                start_date="2024-02-01",
+                amount="$50 million",
+                company_name="Versigent PLC",
+            ),
+            build_mention_row(
+                mention_id="m-3",
+                item_id="item-3",
+                accession_number="0003",
+                cik="320193",
+                date="2024-03-02",
+                name="Senior Notes",
+                start_date="2024-03-01",
+                amount="$1 billion",
+            ),
+        ]
+    )
+
+    assert company_names_by_cik(mention_rows) == {
+        "2078008": "Versigent PLC",
+        "320193": "Example Inc.",
+    }
+
+
+def test_match_tables_backfills_company_name_from_cik() -> None:
+    """An instrument seeded by a mention without display metadata is still named."""
+    mention_rows = pd.DataFrame(
+        [
+            build_mention_row(
+                mention_id="m-1",
+                item_id="item-1",
+                accession_number="0001",
+                cik="2078008",
+                date="2024-01-02",
+                name="6.125% senior unsecured notes due 2031",
+                start_date="2024-01-01",
+                amount="$400 million",
+                company_name=None,
+            ),
+            build_mention_row(
+                mention_id="m-2",
+                item_id="item-2",
+                accession_number="0002",
+                cik="2078008",
+                date="2024-02-02",
+                name="Revolving Credit Facility",
+                start_date="2024-02-01",
+                amount="$50 million",
+                company_name="Versigent PLC",
+            ),
+        ]
+    )
+
+    tables = match_tables(mention_rows)
+
+    instruments = tables["debt_instrument"].set_index("debt_instrument_id")
+    assert len(instruments) == 2
+    assert instruments.loc["m-1", "company_name"] == "Versigent PLC"
+    assert instruments.loc["m-2", "company_name"] == "Versigent PLC"
+
+
+def test_coerce_optional_text_treats_nan_like_text_as_missing() -> None:
+    """Literal placeholder strings must never reach a dashboard-facing column."""
+    assert coerce_optional_text("nan") is None
+    assert coerce_optional_text("NaN") is None
+    assert coerce_optional_text("None") is None
+    assert coerce_optional_text("N/A") is None
+    assert coerce_optional_text("  ") is None
+    assert coerce_optional_text("Nantucket Bank") == "Nantucket Bank"
 
 
 def test_match_pending_mentions_drains_all_shards(tmp_path: Path) -> None:

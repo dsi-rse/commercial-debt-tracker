@@ -228,7 +228,7 @@ Columns:
 
 - `debt_instrument_id`: Canonical entity identifier for one consolidated debt instrument history.
 - `cik`: Issuer CIK shared by the instrument's directly matched mentions.
-- `company_name`: Issuer display name shared by the instrument's directly matched mentions.
+- `company_name`: Issuer display name resolved from the instrument's directly matched mentions, falling back to the newest name any mention for the same CIK carries.
 - `seed_debt_instrument_mention_id`: First direct mention used as the representative seed for the instrument record.
 - `amendment_of_debt_instrument_id`: Parent instrument ID when this instrument is an amendment lineage child.
 - `split_of_debt_instrument_id`: Parent instrument ID when this instrument is a split lineage child.
