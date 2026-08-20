@@ -32,6 +32,7 @@ DEFAULT_AMBIGUITY_MARGIN = 0.05
 DEFAULT_LENDER_SUPPORT_THRESHOLD = 0.5
 MATCHER_SCHEMA_VERSION = 2
 EDGE_TYPES = ("member", "related", "ambiguous_candidate")
+MISSING_TEXT_VALUES = frozenset({"nan", "none", "null", "<na>", "n/a"})
 GENERIC_LENDER_TERMS = frozenset(
     {
         "lender",
@@ -211,6 +212,7 @@ def match_pending_mentions(
             "debt_instrument": pd.DataFrame(columns=DEBT_INSTRUMENT_COLUMNS),
         }
     mention_rows = mention_rows.copy()
+    company_names = company_names_by_cik(mention_rows)
     mention_rows["cik_shard"] = (
         mention_rows["cik"].fillna("").map(lambda value: shard_for_cik(str(value)))
     )
@@ -244,6 +246,7 @@ def match_pending_mentions(
                 strong_match_threshold=strong_match_threshold,
                 loose_match_threshold=loose_match_threshold,
                 ambiguity_margin=ambiguity_margin,
+                company_names=company_names,
             )
             mention_cluster_edges = tables["debt_instrument_mentions"].reindex(
                 columns=MENTION_CLUSTER_EDGE_COLUMNS
@@ -322,6 +325,7 @@ def match_tables(
     strong_match_threshold: float = DEFAULT_MEMBERSHIP_THRESHOLD,
     loose_match_threshold: float = DEFAULT_RELATED_THRESHOLD,
     ambiguity_margin: float = DEFAULT_AMBIGUITY_MARGIN,
+    company_names: dict[str, str] | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Match in-memory debt instrument mentions into stable debt instrument clusters."""
     if strong_match_threshold < loose_match_threshold:
@@ -429,6 +433,7 @@ def match_tables(
         mention_index,
         parent_links,
         existing_instruments=instrument_rows,
+        company_names=company_names or company_names_by_cik(debt_instrument_mentions),
     )
     return {
         "debt_instrument_mentions": combined_edges.reindex(
@@ -860,6 +865,7 @@ def build_debt_instrument_rows(
     parent_links: dict[str, dict[str, str | None]],
     *,
     existing_instruments: pd.DataFrame | None = None,
+    company_names: dict[str, str] | None = None,
 ) -> list[dict[str, object]]:
     """Build persisted debt instrument rows from member groups and lineage."""
     existing_rows = (
@@ -931,10 +937,13 @@ def build_debt_instrument_rows(
             {
                 "debt_instrument_id": debt_instrument_id,
                 "cik": cik,
+                # Fall back to the filer name any mention for this CIK carries, so
+                # one member mention without display metadata cannot blank the page.
                 "company_name": first_non_null(
                     ordered_member_ids, mention_index, "company_name"
                 )
-                or coerce_optional_text(existing_row.get("company_name")),
+                or coerce_optional_text(existing_row.get("company_name"))
+                or (company_names or {}).get(cik),
                 "seed_debt_instrument_mention_id": seed_mention_id,
                 "amendment_of_debt_instrument_id": parent_links.get(
                     debt_instrument_id, {}
@@ -972,6 +981,26 @@ def build_debt_instrument_rows(
         ):
             rows_by_id[parent_id]["end_date"] = child_end_date
     return [rows_by_id[str(row["debt_instrument_id"])] for row in rows]
+
+
+def company_names_by_cik(mention_rows: pd.DataFrame) -> dict[str, str]:
+    """Return the newest known filer display name for each CIK."""
+    if mention_rows.empty or "company_name" not in mention_rows.columns:
+        return {}
+    newest: dict[str, tuple[tuple[str, str], str]] = {}
+    for row in mention_rows.to_dict("records"):
+        cik = coerce_optional_text(row.get("cik"))
+        company_name = coerce_optional_text(row.get("company_name"))
+        if cik is None or company_name is None:
+            continue
+        recency = (
+            str(row.get("date") or ""),
+            str(row.get("accession_number") or ""),
+        )
+        current = newest.get(cik)
+        if current is None or recency > current[0]:
+            newest[cik] = (recency, company_name)
+    return {cik: company_name for cik, (_recency, company_name) in newest.items()}
 
 
 def first_non_null(
@@ -1088,6 +1117,8 @@ def coerce_optional_text(value: object) -> str | None:
     except TypeError:
         pass
     text = str(value).strip()
+    if text.lower() in MISSING_TEXT_VALUES:
+        return None
     return text or None
 
 
