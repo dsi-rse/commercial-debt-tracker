@@ -62,11 +62,13 @@ Selection rules:
 - Multiple returned objects may share the same `name` evidence tags when the text clearly describes multiple distinct instruments using the same name phrase.
 - A securities offering that lists multiple classes, tranches, or series, such as `Class A-1`, `Class A-2a`, `Class A-3`, or `Series A` and `Series B`, is multiple debt instruments. Return one object per class, tranche, or series, even when the document names them together in one sentence, and even when only some of them state their own amount or maturity.
 - Each object's `name` must refer to a single class, tranche, or series. Never merge several of them into one object, and never return an extra object for the group label, such as `Asset Backed Notes` or `Notes`, that only collects them.
+- Split by class only when the document gives each class its own identity, such as its own tagged name, amount, or maturity. When several classes appear only inside one combined tagged span and the document states nothing specific to any single class, return one object for that span rather than repeating the same object several times.
 - Any property evidence may be shared across multiple returned objects when the text says the property applies to all of them, including `name`, `start_date`, `end_date`, `amount`, `lenders`, and `other_interested_parties`.
 
 Party rules:
 - Use `kind: "named"` for a cluster that identifies a specific lender by name, such as `JPMorgan Chase Bank, N.A.` or `EGT 11 LLC`.
 - Use `kind: "collective"` for a cluster whose surface text only describes the group without identifying anyone, such as `the Lenders`, `the other lenders party thereto`, `the holders`, `certain financial institutions`, or `the purchasers`.
+- A defined term that stands for a list of parties the document just named, such as `(collectively, the "Purchasers")` or `the Lenders listed on Schedule A`, is a coreference of those named parties rather than a `collective` cluster. Put its tag ids in the `named` clusters they refer to, or leave them out. Reserve `collective` for a group the document never enumerates.
 - Return `lenders_complete: true` when the document names every lender, which is the normal case when all `lenders` clusters are `named`.
 - Return `lenders_complete: false` when the document signals additional undisclosed lenders, which is the normal case when any `lenders` cluster is `collective` or when the text hedges with wording such as `certain lenders`, `including`, or `and others`.
 - The filer, issuer, borrower, or obligor is never its own lender. Put it in `other_interested_parties` with `role: "borrower"` only when the document treats it as a distinct party worth recording, and otherwise omit it.

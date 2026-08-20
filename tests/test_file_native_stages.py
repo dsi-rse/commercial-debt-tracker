@@ -1064,6 +1064,29 @@ def test_instrument_ie_postprocess_drops_rate_amount() -> None:
     assert payload["tag_ids"] == ["tag-a-rate"]
 
 
+def test_instrument_ie_postprocess_drops_duplicate_identical_mentions() -> None:
+    """Objects that differ in no extracted property must not duplicate a mention row."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = """
+<body>
+The trust issued
+<debt_instrument id="tag-i-1">Class A-1 Notes, Class A-2 Notes, and Class A-3 Notes</debt_instrument>.
+</body>
+""".strip()
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [{"name": ["tag-i-1"]}, {"name": ["tag-i-1"]}, {"name": ["tag-i-1"]}]
+    )
+
+    InstrumentIEStage().postprocess(row_state)
+
+    mentions = row_state.debt_instrument_mentions
+    assert len(mentions) == 1
+    assert mentions[0]["raw_id"] == "i-1"
+
+
 def test_instrument_ie_prompt_requires_one_object_per_class() -> None:
     """The IE prompt must keep telling the model to split multi-class offerings."""
     prompt = load_prompt("instrument_ie")

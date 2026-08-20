@@ -522,6 +522,7 @@ class InstrumentIEStage:
             cast(list[dict[str, Any]], data), tag_details
         )
         mentions: list[dict[str, object]] = []
+        seen_mention_ids: set[str] = set()
         for index, obj in mention_entries:
             raw_id = raw_id_for(index)
             amount_payload = standardized_amount_payload(
@@ -575,10 +576,17 @@ class InstrumentIEStage:
                 "end_date_json": json.dumps(end_date_payload, sort_keys=True),
                 "amount_json": json.dumps(amount_payload, sort_keys=True),
             }
-            mention_row["debt_instrument_mention_id"] = debt_instrument_mention_id_for(
+            mention_id = debt_instrument_mention_id_for(
                 row_state.item_id,
                 mention_row,
             )
+            if mention_id in seen_mention_ids:
+                # Objects that differ in no extracted property are the same mention.
+                # One name span covering several note classes produces these, and they
+                # would otherwise write duplicate primary keys.
+                continue
+            seen_mention_ids.add(mention_id)
+            mention_row["debt_instrument_mention_id"] = mention_id
             mentions.append(mention_row)
         row_state.debt_instrument_mentions = mentions
 
