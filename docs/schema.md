@@ -205,7 +205,7 @@ Columns:
 - `other_interested_parties_json`: JSON array of additional related-party clusters with evidence text. Each cluster carries a `role` of `agent`, `trustee`, `underwriter`, `guarantor`, `borrower`, or `other`.
 - `name_json`: JSON payload describing the evidence tags and surface text used to construct `name`.
 - `start_date_json`: JSON payload containing normalized start-date value plus extraction evidence.
-- `end_date_json`: JSON payload containing normalized end-date value plus extraction evidence.
+- `end_date_json`: JSON payload containing normalized end-date value plus extraction evidence, including `derived_from_name`, which is true when the maturity came from the instrument name such as `notes due 2028` rather than a standalone date mention. Year-only maturities normalize to `YYYY-12-31`.
 - `amount_json`: JSON payload containing normalized amount value plus extraction evidence.
 
 Primary key: `debt_instrument_mention_id`
