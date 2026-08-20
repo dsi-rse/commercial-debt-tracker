@@ -49,6 +49,25 @@ DEFAULT_REASONING_EFFORT = "none"
 REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 INSTRUMENT_ENTITY_TAG_TYPES = {"debt_instrument"}
 LENDER_TAG_TYPES = {"person", "organization"}
+LENDER_CLUSTER_KINDS = {"named", "collective"}
+DEFAULT_LENDER_CLUSTER_KIND = "named"
+OTHER_PARTY_ROLES = {
+    "agent",
+    "trustee",
+    "underwriter",
+    "guarantor",
+    "borrower",
+    "other",
+}
+DEFAULT_OTHER_PARTY_ROLE = "other"
+PARTY_PROPERTY_ANNOTATIONS = {
+    "lenders": ("kind", LENDER_CLUSTER_KINDS, DEFAULT_LENDER_CLUSTER_KIND),
+    "other_interested_parties": (
+        "role",
+        OTHER_PARTY_ROLES,
+        DEFAULT_OTHER_PARTY_ROLE,
+    ),
+}
 INSTRUMENT_SINGLE_VALUE_PROPERTIES = {
     "start_date": {"date"},
     "end_date": {"date"},
@@ -124,6 +143,7 @@ DEBT_INSTRUMENT_MENTION_COLUMNS = [
     "retired_of",
     "split_of",
     "lenders_json",
+    "lenders_complete",
     "other_interested_parties_json",
     "name_json",
     "start_date_json",
@@ -449,37 +469,21 @@ class InstrumentIEStage:
                         failures.append(
                             f"Entry {index}: '{property_name}' tag {tag_id} is type '{tag_info['type']}', expected {expected}."
                         )
-            for property_name in ("lenders", "other_interested_parties"):
-                if property_name not in obj:
-                    continue
-                values = obj[property_name]
-                if not isinstance(values, list):
-                    failures.append(
-                        f"Entry {index}: '{property_name}' must be a list of lists."
+            for property_name in PARTY_PROPERTY_ANNOTATIONS:
+                failures.extend(
+                    validate_party_property(
+                        index=index,
+                        property_name=property_name,
+                        obj=obj,
+                        tag_details=tag_details,
                     )
-                    continue
-                for cluster_index, cluster in enumerate(values):
-                    if not isinstance(cluster, list):
-                        failures.append(
-                            f"Entry {index}: '{property_name}'[{cluster_index}] must be a list of tag IDs."
-                        )
-                        continue
-                    if not all(isinstance(tag_id, str) for tag_id in cluster):
-                        failures.append(
-                            f"Entry {index}: '{property_name}'[{cluster_index}] must contain string tag IDs only."
-                        )
-                        continue
-                    for tag_id in cluster:
-                        tag_info = tag_details.get(tag_id)
-                        if tag_info is None:
-                            failures.append(
-                                f"Entry {index}: '{property_name}'[{cluster_index}] contains unknown tag ID {tag_id}."
-                            )
-                            continue
-                        if tag_info["type"] not in LENDER_TAG_TYPES:
-                            failures.append(
-                                f"Entry {index}: '{property_name}'[{cluster_index}] tag {tag_id} must be person or organization."
-                            )
+                )
+            failures.extend(
+                validate_lenders_complete(
+                    index=index,
+                    obj=obj,
+                )
+            )
         return failures
 
     def postprocess(self, row_state: ExtractionRowState) -> None:
@@ -511,6 +515,10 @@ class InstrumentIEStage:
                 obj.get("end_date"),
                 tag_details,
             )
+            lender_clusters, lenders_complete = lender_payloads_and_completeness(
+                obj,
+                tag_details,
+            )
             mention_row: dict[str, object] = {
                 "item_id": row_state.item_id,
                 "accession_number": row_state.item_row.get("accession_number"),
@@ -526,14 +534,13 @@ class InstrumentIEStage:
                 "amendment_of": None,
                 "retired_of": None,
                 "split_of": None,
-                "lenders_json": json.dumps(
-                    cluster_payload_list(obj.get("lenders", []), tag_details),
-                    sort_keys=True,
-                ),
+                "lenders_json": json.dumps(lender_clusters, sort_keys=True),
+                "lenders_complete": lenders_complete,
                 "other_interested_parties_json": json.dumps(
-                    cluster_payload_list(
+                    party_cluster_payload_list(
                         obj.get("other_interested_parties", []),
                         tag_details,
+                        property_name="other_interested_parties",
                     ),
                     sort_keys=True,
                 ),
@@ -1197,6 +1204,73 @@ def validate_standardized_single_value_cardinality(
     ]
 
 
+def validate_party_property(
+    *,
+    index: int,
+    property_name: str,
+    obj: dict[str, Any],
+    tag_details: dict[str, dict[str, object]],
+) -> list[str]:
+    """Validate one party property against the annotated cluster shape."""
+    if property_name not in obj:
+        return []
+    value = obj[property_name]
+    annotation_key, allowed_annotations, _default = PARTY_PROPERTY_ANNOTATIONS[
+        property_name
+    ]
+    expected_annotations = ", ".join(sorted(allowed_annotations))
+    if not isinstance(value, list):
+        return [
+            f"Entry {index}: '{property_name}' must be a list of cluster objects "
+            f'shaped like {{"tag_ids": ["tag-..."], "{annotation_key}": "..."}}.'
+        ]
+    failures: list[str] = []
+    for cluster_index, cluster in enumerate(value):
+        location = f"Entry {index}: '{property_name}'[{cluster_index}]"
+        if not isinstance(cluster, dict):
+            failures.append(
+                f"{location} must be an object with 'tag_ids' and "
+                f"'{annotation_key}' keys."
+            )
+            continue
+        annotation = cluster.get(annotation_key)
+        if annotation not in allowed_annotations:
+            failures.append(
+                f"{location} '{annotation_key}' must be one of {expected_annotations}."
+            )
+        tag_ids = cluster.get("tag_ids")
+        if not isinstance(tag_ids, list):
+            failures.append(f"{location} 'tag_ids' must be a list of tag IDs.")
+            continue
+        if not all(isinstance(tag_id, str) for tag_id in tag_ids):
+            failures.append(f"{location} 'tag_ids' must contain string tag IDs only.")
+            continue
+        for tag_id in tag_ids:
+            tag_info = tag_details.get(tag_id)
+            if tag_info is None:
+                failures.append(f"{location} contains unknown tag ID {tag_id}.")
+                continue
+            if tag_info["type"] not in LENDER_TAG_TYPES:
+                failures.append(
+                    f"{location} tag {tag_id} must be person or organization."
+                )
+    return failures
+
+
+def validate_lenders_complete(*, index: int, obj: dict[str, Any]) -> list[str]:
+    """Validate the optional lenders_complete flag."""
+    if "lenders_complete" not in obj:
+        return []
+    failures: list[str] = []
+    if not isinstance(obj["lenders_complete"], bool):
+        failures.append(f"Entry {index}: 'lenders_complete' must be true or false.")
+    if "lenders" not in obj:
+        failures.append(
+            f"Entry {index}: 'lenders_complete' may be returned only with 'lenders'."
+        )
+    return failures
+
+
 def iter_instrument_entries(
     data: list[dict[str, Any]],
     tag_details: dict[str, dict[str, object]],
@@ -1237,6 +1311,7 @@ def debt_instrument_mention_id_for(
         "end_date": mention_row.get("end_date"),
         "end_date_json": normalize_json_text(mention_row.get("end_date_json")),
         "item_id": item_id,
+        "lenders_complete": mention_row.get("lenders_complete"),
         "lenders_json": normalize_json_text(mention_row.get("lenders_json")),
         "name_json": normalize_json_text(mention_row.get("name_json")),
         "name": mention_row.get("name"),
@@ -1441,14 +1516,54 @@ def cluster_payload(
     }
 
 
-def cluster_payload_list(
+def party_cluster_payload_list(
     clusters: object,
     tag_details: dict[str, dict[str, object]],
+    *,
+    property_name: str,
 ) -> list[dict[str, object]]:
-    """Return rich details for a list of clusters."""
+    """Return annotated party clusters carrying their kind or role."""
+    annotation_key, allowed_annotations, default_annotation = (
+        PARTY_PROPERTY_ANNOTATIONS[property_name]
+    )
     if not isinstance(clusters, list):
         return []
-    return [cluster_payload(cluster, tag_details) for cluster in clusters]
+    payloads: list[dict[str, object]] = []
+    for cluster in clusters:
+        if isinstance(cluster, dict):
+            tag_ids = cluster.get("tag_ids")
+            annotation = cluster.get(annotation_key)
+        else:
+            # Tolerate the legacy bare tag-id list shape when replaying old responses.
+            tag_ids = cluster
+            annotation = None
+        payload = cluster_payload(tag_ids, tag_details)
+        if not payload["tag_ids"]:
+            continue
+        payload[annotation_key] = (
+            annotation if annotation in allowed_annotations else default_annotation
+        )
+        payloads.append(payload)
+    return payloads
+
+
+def lender_payloads_and_completeness(
+    obj: dict[str, Any],
+    tag_details: dict[str, dict[str, object]],
+) -> tuple[list[dict[str, object]], bool]:
+    """Return named lender clusters plus whether the lender list is complete."""
+    clusters = party_cluster_payload_list(
+        obj.get("lenders", []),
+        tag_details,
+        property_name="lenders",
+    )
+    named = [cluster for cluster in clusters if cluster["kind"] == "named"]
+    has_collective = len(named) < len(clusters)
+    declared_complete = obj.get("lenders_complete")
+    complete = bool(named) and not has_collective
+    if complete and declared_complete is False:
+        complete = False
+    return named, complete
 
 
 def relation_prompt_xml(row_state: ExtractionRowState) -> str:

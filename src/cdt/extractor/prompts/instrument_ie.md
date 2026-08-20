@@ -18,6 +18,7 @@ For each object, extract these properties when present:
 - `end_date`
 - `amount`
 - `lenders`
+- `lenders_complete`
 - `other_interested_parties`
 
 For standardized single-value properties, use these object shapes:
@@ -25,15 +26,21 @@ For standardized single-value properties, use these object shapes:
 - `end_date`: `{ "evidence": ["tag-..."], "normalized_date": "YYYY-MM-DD" | null }`
 - `amount`: `{ "evidence": ["tag-..."], "normalized_amount": "12345.67" | null, "currency": "USD" | null }`
 
+For party properties, return one object per coreference cluster:
+- `lenders`: `[{ "tag_ids": ["tag-..."], "kind": "named" | "collective" }]`
+- `lenders_complete`: `true` | `false`
+- `other_interested_parties`: `[{ "tag_ids": ["tag-..."], "role": "agent" | "trustee" | "underwriter" | "guarantor" | "borrower" | "other" }]`
+
 ## Hard Rules
 - Return one JSON object per concrete debt instrument described as its own obligation in the document.
 - Do not return agreements as objects.
 - `name` may contain only `debt_instrument` tag ids.
 - `start_date.evidence` and `end_date.evidence` may contain only `date` tag ids.
 - `amount.evidence` may contain only `amount` tag ids.
-- `lenders` and `other_interested_parties` may contain only `person` or `organization` tag ids.
+- `lenders` and `other_interested_parties` cluster `tag_ids` may contain only `person` or `organization` tag ids.
 - For `name`, return one list of tag ids representing a single coreference cluster.
-- For multi-value properties, return a list of lists, where each inner list is one coreference cluster.
+- Every `lenders` cluster must carry a `kind`, and every `other_interested_parties` cluster must carry a `role`.
+- `lenders_complete` must be `true` or `false`, and may be returned only when `lenders` is present.
 - For `amount.normalized_amount`, return only digits and at most one decimal point, or `null`.
 - For `amount.currency`, return one 3-letter ISO 4217 currency code or `null`.
 - For `start_date.normalized_date` and `end_date.normalized_date`, return `YYYY-MM-DD` or `null`.
@@ -50,7 +57,25 @@ Selection rules:
 - Multiple returned objects may share the same `name` evidence tags when the text clearly describes multiple distinct instruments using the same name phrase.
 - Any property evidence may be shared across multiple returned objects when the text says the property applies to all of them, including `name`, `start_date`, `end_date`, `amount`, `lenders`, and `other_interested_parties`.
 
+Party rules:
+- Use `kind: "named"` for a cluster that identifies a specific lender by name, such as `JPMorgan Chase Bank, N.A.` or `EGT 11 LLC`.
+- Use `kind: "collective"` for a cluster whose surface text only describes the group without identifying anyone, such as `the Lenders`, `the other lenders party thereto`, `the holders`, `certain financial institutions`, or `the purchasers`.
+- Return `lenders_complete: true` when the document names every lender, which is the normal case when all `lenders` clusters are `named`.
+- Return `lenders_complete: false` when the document signals additional undisclosed lenders, which is the normal case when any `lenders` cluster is `collective` or when the text hedges with wording such as `certain lenders`, `including`, or `and others`.
+- The filer, issuer, borrower, or obligor is never its own lender. Put it in `other_interested_parties` with `role: "borrower"` only when the document treats it as a distinct party worth recording, and otherwise omit it.
+- An administrative agent, collateral agent, or paying agent belongs in `other_interested_parties` with `role: "agent"`. Include it in `lenders` only when the document also describes it as a lender or purchaser of that instrument, for example `as a Lender and as Administrative Agent`.
+- An indenture trustee or collateral trustee belongs in `other_interested_parties` with `role: "trustee"`, never in `lenders`.
+- Underwriters, initial purchasers, placement agents, and sales agents in a public offering or Rule 144A resale belong in `other_interested_parties` with `role: "underwriter"`, never in `lenders`, because they resell the debt rather than hold it.
+- In a note purchase agreement or private placement sold directly to investors, the `purchasers` ARE the lenders. Return them in `lenders`, using `kind: "named"` when they are named and `kind: "collective"` when the document only refers to `the Purchasers`.
+- Guarantors belong in `other_interested_parties` with `role: "guarantor"`.
+- Use `role: "other"` only when the party is clearly related to the instrument but none of the other roles fit.
+
 Examples:
 - If a document says the company issued an initial note on March 17, 2025 for $5.5 million and a subsequent note on March 20, 2025 for $269,000, both called `Senior Subordinated Convertible Promissory Note`, return two objects.
 - If a document later refers collectively to those instruments as `Exchange Notes`, do not return a third `Exchange Notes` object.
 - If a document says prior notes were retired in full, do not return a new object just for that contextual mention unless the filing separately describes a concrete debt instrument state for it.
+- If a credit agreement says the lenders are `JPMorgan Chase Bank, N.A.` and `the other lenders party thereto`, return both clusters, `kind: "named"` for Chase and `kind: "collective"` for the other lenders, with `lenders_complete: false`.
+- If the document says the lenders are `JPMorgan Chase Bank, N.A.` and `Wells Fargo Bank, National Association` with no collective phrase, return two `named` clusters with `lenders_complete: true`.
+- If the document only says the notes were sold to `the Holders`, return one `collective` cluster with `lenders_complete: false`.
+- If a note purchase agreement says the company sold notes to `Metropolitan Life Insurance Company` and `the other purchasers named therein`, return Metropolitan Life as `named` and the other purchasers as `collective`, with `lenders_complete: false`.
+- If an indenture names `The Bank of New York Mellon` as trustee and the notes were sold through underwriters, return no `lenders` clusters, and return the trustee with `role: "trustee"` and the underwriters with `role: "underwriter"`.

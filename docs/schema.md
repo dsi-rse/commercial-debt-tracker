@@ -200,8 +200,9 @@ Columns:
 - `amount`: Normalized principal or commitment amount when present.
 - `amendment_of`: `debt_instrument_mention_id` of the mention this row amends, when the extractor found that relation.
 - `split_of`: `debt_instrument_mention_id` of the mention this row splits from, when the extractor found that relation.
-- `lenders_json`: JSON array of lender or counterparty mention clusters with evidence text.
-- `other_interested_parties_json`: JSON array of additional related-party clusters with evidence text.
+- `lenders_json`: JSON array of named lender or counterparty mention clusters with evidence text. Each cluster carries `kind: "named"`; collective phrases such as `the other lenders party thereto` are dropped from this column and recorded through `lenders_complete` instead.
+- `lenders_complete`: Boolean flag that is true only when the mention names at least one lender and signals no additional undisclosed lenders. A false value with an empty `lenders_json` means the lenders were not disclosed.
+- `other_interested_parties_json`: JSON array of additional related-party clusters with evidence text. Each cluster carries a `role` of `agent`, `trustee`, `underwriter`, `guarantor`, `borrower`, or `other`.
 - `name_json`: JSON payload describing the evidence tags and surface text used to construct `name`.
 - `start_date_json`: JSON payload containing normalized start-date value plus extraction evidence.
 - `end_date_json`: JSON payload containing normalized end-date value plus extraction evidence.
@@ -236,8 +237,9 @@ Columns:
 - `end_date`: Matcher-selected canonical end date derived from the instrument's direct mentions.
 - `amount`: Matcher-selected canonical amount derived from the instrument's direct mentions.
 - `direct_mentions_json`: JSON array of directly assigned `debt_instrument_mention_id` values for this instrument.
-- `lenders_json`: JSON aggregation of lender clusters carried forward from the instrument's direct mentions.
-- `other_interested_parties_json`: JSON aggregation of other related-party clusters carried forward from the instrument's direct mentions.
+- `lenders_json`: JSON aggregation of named lender clusters carried forward from the instrument's direct mentions.
+- `lenders_complete`: Boolean flag that is true only when every lender-bearing mention of the instrument named all of its lenders.
+- `other_interested_parties_json`: JSON aggregation of other related-party clusters carried forward from the instrument's direct mentions, each with its `role`.
 - `possibly_related_json`: JSON array of advisory mention IDs that look related but were not directly matched into the instrument.
 
 Primary key: `debt_instrument_id`

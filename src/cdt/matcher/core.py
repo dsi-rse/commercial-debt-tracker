@@ -30,7 +30,8 @@ DEFAULT_RELATED_THRESHOLD = 0.75
 DEFAULT_MEMBERSHIP_THRESHOLD = 0.90
 DEFAULT_AMBIGUITY_MARGIN = 0.05
 DEFAULT_LENDER_SUPPORT_THRESHOLD = 0.5
-MATCHER_SCHEMA_VERSION = 2
+COLLECTIVE_LENDER_KIND = "collective"
+MATCHER_SCHEMA_VERSION = 3
 EDGE_TYPES = ("member", "related", "ambiguous_candidate")
 GENERIC_LENDER_TERMS = frozenset(
     {
@@ -72,6 +73,7 @@ DEBT_INSTRUMENT_COLUMNS = [
     "end_date",
     "amount",
     "lenders_json",
+    "lenders_complete",
     "other_interested_parties_json",
 ]
 MENTION_CLUSTER_EDGE_DATASET_NAME = "mention-cluster-edges"
@@ -132,6 +134,7 @@ class PreparedMention:
     retired_of: str | None
     split_of: str | None
     lenders_json: str
+    lenders_complete: bool
     other_interested_parties_json: str
     normalized_amount: str | None
     normalized_start_date: str | None
@@ -903,18 +906,24 @@ def build_debt_instrument_rows(
             cik = coerce_optional_text(existing_row.get("cik"))
         if seed_mention_id is None or cik is None:
             continue
-        lenders_json = json.dumps(
-            dedupe_party_clusters(
-                [
-                    str(existing_row.get("lenders_json") or "[]"),
-                    *[
-                        mention_index[mention_id].lenders_json
-                        for mention_id in present_member_ids
-                    ],
-                ]
+        lender_payloads = [
+            (
+                str(existing_row.get("lenders_json") or "[]"),
+                coerce_flag(existing_row.get("lenders_complete")),
             ),
+            *[
+                (
+                    mention_index[mention_id].lenders_json,
+                    mention_index[mention_id].lenders_complete,
+                )
+                for mention_id in present_member_ids
+            ],
+        ]
+        lenders_json = json.dumps(
+            dedupe_party_clusters([payload for payload, _complete in lender_payloads]),
             sort_keys=True,
         )
+        lenders_complete = aggregate_lenders_complete(lender_payloads)
         other_interested_parties_json = json.dumps(
             dedupe_party_clusters(
                 [
@@ -958,6 +967,7 @@ def build_debt_instrument_rows(
                 "amount": first_non_null(ordered_member_ids, mention_index, "amount")
                 or coerce_optional_text(existing_row.get("amount")),
                 "lenders_json": lenders_json,
+                "lenders_complete": lenders_complete,
                 "other_interested_parties_json": other_interested_parties_json,
             }
         )
@@ -985,6 +995,14 @@ def first_non_null(
         if value is not None:
             return value
     return None
+
+
+def aggregate_lenders_complete(payloads: list[tuple[str, bool]]) -> bool:
+    """Return whether every lender-bearing contribution named all of its lenders."""
+    contributions = [
+        complete for payload, complete in payloads if parse_cluster_list(payload)
+    ]
+    return bool(contributions) and all(contributions)
 
 
 def dedupe_party_clusters(payloads: list[str]) -> list[dict[str, object]]:
@@ -1043,6 +1061,7 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
         retired_of=coerce_optional_text(row.get("retired_of")),
         split_of=coerce_optional_text(row.get("split_of")),
         lenders_json=str(row.get("lenders_json") or "[]"),
+        lenders_complete=coerce_flag(row.get("lenders_complete")),
         other_interested_parties_json=str(
             row.get("other_interested_parties_json") or "[]"
         ),
@@ -1076,6 +1095,18 @@ def mention_recency_key(mention: PreparedMention) -> tuple[str, str, str, str]:
         mention.item_id,
         mention.debt_instrument_mention_id,
     )
+
+
+def coerce_flag(value: object) -> bool:
+    """Return one boolean flag, treating missing parquet values as False."""
+    if value is None:
+        return False
+    try:
+        if pd.isna(value):
+            return False
+    except TypeError:
+        pass
+    return bool(value)
 
 
 def coerce_optional_text(value: object) -> str | None:
@@ -1157,9 +1188,11 @@ def normalize_name_fingerprint(value: str | None) -> str | None:
 
 
 def lender_keys(value: object) -> list[str]:
-    """Return normalized lender cluster keys in deterministic order."""
+    """Return normalized named-lender cluster keys in deterministic order."""
     keys: list[str] = []
     for cluster in parse_cluster_list(str(value or "[]")):
+        if cluster.get("kind") == COLLECTIVE_LENDER_KIND:
+            continue
         key = cluster_canonical_key(cluster)
         if key:
             keys.append(key)
