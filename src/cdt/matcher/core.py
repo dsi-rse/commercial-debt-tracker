@@ -23,7 +23,12 @@ from cdt.extractor.core import (
     DEBT_INSTRUMENT_MENTION_COLUMNS as EXTRACTED_MENTION_COLUMNS,
 )
 from cdt.extractor.core import MENTIONS_DATASET_NAME
-from cdt.storage import read_dataset, write_json_artifact, write_partition_table
+from cdt.storage import (
+    coerce_dataset_text,
+    read_dataset,
+    write_json_artifact,
+    write_partition_table,
+)
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_RELATED_THRESHOLD = 0.75
@@ -33,7 +38,6 @@ DEFAULT_LENDER_SUPPORT_THRESHOLD = 0.5
 COLLECTIVE_LENDER_KIND = "collective"
 MATCHER_SCHEMA_VERSION = 3
 EDGE_TYPES = ("member", "related", "ambiguous_candidate")
-MISSING_TEXT_VALUES = frozenset({"nan", "none", "null", "<na>", "n/a"})
 GENERIC_LENDER_TERMS = frozenset(
     {
         "lender",
@@ -1139,18 +1143,8 @@ def coerce_flag(value: object) -> bool:
 
 
 def coerce_optional_text(value: object) -> str | None:
-    """Return one trimmed string or None."""
-    if value is None:
-        return None
-    try:
-        if pd.isna(value):
-            return None
-    except TypeError:
-        pass
-    text = str(value).strip()
-    if text.lower() in MISSING_TEXT_VALUES:
-        return None
-    return text or None
+    """Return one trimmed string or None, treating placeholder text as missing."""
+    return coerce_dataset_text(value)
 
 
 def normalize_amount(value: str | None) -> str | None:

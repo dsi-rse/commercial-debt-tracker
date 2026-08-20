@@ -4,6 +4,8 @@ CDT writes canonical artifacts under one artifact root. That root can be a local
 
 The pipeline can also write optional final snapshot parquet files under a separate final database root. Those snapshots are flattened table-wide exports intended for downstream database loading and are not the canonical working state for the pipeline.
 
+Text columns are normalized on the way into a snapshot: a cell whose whole value is a placeholder such as `nan`, `none`, `null`, `<na>`, or `n/a` is written as a null. Partitions written before a column existed, or by a stage that stringified a missing value, would otherwise publish the placeholder as if it were real text.
+
 ## Root Layout
 
 ```text

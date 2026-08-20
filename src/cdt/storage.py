@@ -153,6 +153,28 @@ def write_text_artifact(path: ArtifactPath, body: str) -> str:
     return str(local_path)
 
 
+MISSING_TEXT_VALUES = frozenset({"nan", "none", "null", "<na>", "n/a"})
+
+
+def coerce_dataset_text(value: object) -> str | None:
+    """Return one trimmed dataset text value, or None when it carries no name.
+
+    Parquet round-trips a missing value as NaN, and ``str(float("nan"))`` is the
+    literal text ``nan``, so placeholder strings are treated as missing too.
+    """
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    if text.lower() in MISSING_TEXT_VALUES:
+        return None
+    return text or None
+
+
 def read_table(
     path: ArtifactPath, columns: Sequence[str] | None = None
 ) -> pd.DataFrame:

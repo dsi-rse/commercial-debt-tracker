@@ -8,6 +8,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Self
 
+import pandas as pd
+
 from cdt.classifier import classify_pending_items, default_model_dir
 from cdt.datasets import resolve_artifact_root
 from cdt.extractor import (
@@ -44,6 +46,7 @@ from cdt.matcher import (
 from cdt.shared import get_logger
 from cdt.storage import (
     ArtifactPath,
+    coerce_dataset_text,
     join_artifact_path,
     read_dataset,
     read_text_artifact,
@@ -358,5 +361,25 @@ def write_final_output_tables(
         output_path = join_artifact_path(
             final_database_root, table_name, "latest.parquet"
         )
-        written_paths[table_name] = write_table(output_path, table)
+        written_paths[table_name] = write_table(
+            output_path, normalize_snapshot_text(table)
+        )
     return written_paths
+
+
+def normalize_snapshot_text(table: pd.DataFrame) -> pd.DataFrame:
+    """Return one snapshot table with placeholder text values replaced by nulls.
+
+    Partitions written before a text column existed, or by a stage that
+    stringified a missing value, carry literal text such as ``nan``. Dashboard
+    consumers read these snapshots directly, so they are normalized on the way
+    out instead of rendering the placeholder.
+    """
+    if table.empty:
+        return table
+    normalized = table.copy()
+    for column in normalized.columns:
+        if normalized[column].dtype != object:
+            continue
+        normalized[column] = normalized[column].map(coerce_dataset_text)
+    return normalized

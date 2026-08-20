@@ -24,6 +24,7 @@ from cdt.itemizer.extract import DocumentText, ItemSection, extract_items_from_d
 from cdt.shared import get_logger
 from cdt.storage import (
     artifact_exists,
+    coerce_dataset_text,
     parse_s3_uri,
     read_table,
     write_json_artifact,
@@ -289,7 +290,7 @@ def itemize_document_record(
         DocumentText(
             accession_number=str(document["accession_number"]),
             cik=str(document["cik"]),
-            company_name=str(document.get("company_name") or ""),
+            company_name=coerce_dataset_text(document.get("company_name")) or "",
             url=str(document["url"]),
             text=text,
             date=str(document["date"]),

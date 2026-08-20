@@ -35,7 +35,13 @@ from cdt.matcher.core import (
     lender_signature,
     match_tables,
 )
-from cdt.storage import artifact_exists, read_dataset, write_partition_table
+from cdt.pipeline import normalize_snapshot_text
+from cdt.storage import (
+    artifact_exists,
+    coerce_dataset_text,
+    read_dataset,
+    write_partition_table,
+)
 
 
 class FakeModel:
@@ -174,6 +180,62 @@ def build_mention_row(
         "end_date_json": "{}",
         "amount_json": "{}",
     }
+
+
+def test_coerce_dataset_text_treats_placeholder_values_as_missing() -> None:
+    """Parquet placeholders must never survive as real text values."""
+    assert coerce_dataset_text(float("nan")) is None
+    assert coerce_dataset_text(None) is None
+    assert coerce_dataset_text("nan") is None
+    assert coerce_dataset_text("N/A") is None
+    assert coerce_dataset_text("  ") is None
+    assert (
+        coerce_dataset_text(" Appreciate Holdings, Inc. ")
+        == "Appreciate Holdings, Inc."
+    )
+    assert coerce_dataset_text("Nantucket Bank") == "Nantucket Bank"
+
+
+def test_itemize_document_record_blanks_missing_company_name() -> None:
+    """A missing document company name must not become the literal text 'nan'."""
+    document = {
+        "accession_number": "000114036126006577",
+        "cik": "1821075",
+        "company_name": float("nan"),
+        "url": "https://sec.example/full.txt",
+        "date": "2026-01-02",
+        "text": """
+ITEM INFORMATION: Other Events
+<DOCUMENT>
+<TYPE>8-K
+<TEXT>
+Item 8.01 Other Events.
+The Company issued a promissory note.
+</TEXT>
+</DOCUMENT>
+""".strip(),
+    }
+
+    sections = itemizer_core.itemize_document_record(document)
+
+    assert sections
+    assert {section.company_name for section in sections} == {""}
+
+
+def test_normalize_snapshot_text_nulls_placeholder_strings() -> None:
+    """Dashboard-facing snapshots must not carry literal placeholder text."""
+    table = pd.DataFrame(
+        [
+            {"company_name": "nan", "name": "convertible debentures", "amount": 1.5},
+            {"company_name": "Versigent PLC", "name": "None", "amount": 2.5},
+        ]
+    )
+
+    normalized = normalize_snapshot_text(table)
+
+    assert normalized["company_name"].to_list() == [None, "Versigent PLC"]
+    assert normalized["name"].to_list() == ["convertible debentures", None]
+    assert normalized["amount"].to_list() == [1.5, 2.5]
 
 
 def test_itemize_pending_documents_writes_canonical_partitions(tmp_path: Path) -> None:
