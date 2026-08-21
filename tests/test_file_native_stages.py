@@ -238,6 +238,27 @@ def test_normalize_snapshot_text_nulls_placeholder_strings() -> None:
     assert normalized["amount"].to_list() == [1.5, 2.5]
 
 
+def test_normalize_snapshot_text_keeps_non_text_values_typed() -> None:
+    """Booleans in an object column must not be published as text."""
+    # Partitions written before lenders_complete existed leave an object column
+    # holding booleans and nulls side by side.
+    table = pd.DataFrame(
+        {
+            "lenders_complete": [True, None, False],
+            "company_name": ["Acme Inc.", "nan", "Contoso Ltd."],
+        }
+    )
+
+    normalized = normalize_snapshot_text(table)
+
+    assert normalized["lenders_complete"].to_list() == [True, None, False]
+    assert normalized["company_name"].to_list() == [
+        "Acme Inc.",
+        None,
+        "Contoso Ltd.",
+    ]
+
+
 def test_itemize_pending_documents_writes_canonical_partitions(tmp_path: Path) -> None:
     """Itemization should consume document partitions and write item partitions."""
     seed_document_partition(tmp_path)

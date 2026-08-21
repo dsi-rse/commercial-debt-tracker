@@ -381,5 +381,17 @@ def normalize_snapshot_text(table: pd.DataFrame) -> pd.DataFrame:
     for column in normalized.columns:
         if normalized[column].dtype != object:
             continue
-        normalized[column] = normalized[column].map(coerce_dataset_text)
+        normalized[column] = normalized[column].map(normalize_snapshot_cell)
     return normalized
+
+
+def normalize_snapshot_cell(value: object) -> object:
+    """Null one placeholder string, leaving non-text values at their own type.
+
+    An object column can hold booleans when older partitions predate the column,
+    so only text cells are coerced. Mapping everything through the text helper
+    would publish `True` as the string `"True"`.
+    """
+    if isinstance(value, str):
+        return coerce_dataset_text(value)
+    return value
