@@ -800,6 +800,13 @@ def test_instrument_ie_postprocess_excludes_the_borrower_from_other_parties() ->
     assert [cluster["tag_ids"] for cluster in other_parties] == [["tag-o-agent"]]
 
 
+def test_lender_signature_prefers_the_named_party_over_an_alias() -> None:
+    """A defined-term alias in the cluster must not hide the party it names."""
+    payload = json.dumps([{"mentions": [{"text": "Purchasers"}, {"text": "Oaktree"}]}])
+
+    assert lender_signature(payload) == "oaktree"
+
+
 def test_lender_signature_uses_stored_lender_clusters() -> None:
     """Lender signatures come from the persisted named clusters."""
     payload = json.dumps([{"mentions": [{"text": "Acme Bank"}]}])

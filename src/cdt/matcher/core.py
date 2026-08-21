@@ -1052,7 +1052,12 @@ def parse_cluster_list(value: str) -> list[dict[str, object]]:
 
 
 def cluster_canonical_key(cluster: dict[str, object]) -> str:
-    """Return the normalized canonical key for one cluster."""
+    """Return the normalized canonical key for one cluster.
+
+    A cluster can hold a defined-term alias alongside the party it names, as in
+    `Oaktree` and `Purchasers`. The specific name is the useful key, so generic
+    party words lose to it even when the alias is the longer string.
+    """
     mentions = cluster.get("mentions", [])
     if not isinstance(mentions, list):
         return ""
@@ -1064,7 +1069,8 @@ def cluster_canonical_key(cluster: dict[str, object]) -> str:
     texts = [text for text in texts if text]
     if not texts:
         return ""
-    return max(texts, key=len)
+    specific = [text for text in texts if text not in GENERIC_LENDER_TERMS]
+    return max(specific or texts, key=len)
 
 
 def prepare_mention(row: dict[str, object]) -> PreparedMention:
