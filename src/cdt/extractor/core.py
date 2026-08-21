@@ -1141,6 +1141,17 @@ def collapse_whitespace(value: str) -> str:
     return re.sub(r"\s+", "", value)
 
 
+def normalize_span_whitespace(value: str) -> str:
+    """Collapse whitespace runs in a span promoted to a canonical text field.
+
+    Filings wrap instrument names across lines, so a verbatim span can carry a
+    newline, tab, or non-breaking space. Canonical fields are display and
+    comparison surfaces; the verbatim text stays in the `*_json` payloads, where
+    the character offsets make it meaningful as provenance.
+    """
+    return re.sub(r"\s+", " ", value).strip()
+
+
 def single_value_evidence_tag_ids(value: object) -> object:
     """Return evidence tag IDs from one single-value extractor payload."""
     if isinstance(value, dict):
@@ -1403,10 +1414,11 @@ def canonical_value(
     if not isinstance(tag_ids, list) or not tag_ids:
         return None
     values = [
-        str(tag_details[tag_id]["text"])
+        normalize_span_whitespace(str(tag_details[tag_id]["text"]))
         for tag_id in tag_ids
         if isinstance(tag_id, str) and tag_id in tag_details
     ]
+    values = [value for value in values if value]
     if not values:
         return None
     return max(values, key=len)

@@ -1136,6 +1136,41 @@ def test_instrument_ie_postprocess_drops_rate_amount() -> None:
     assert payload["tag_ids"] == ["tag-a-rate"]
 
 
+def test_instrument_ie_postprocess_normalizes_wrapped_names() -> None:
+    """A name wrapped across lines is stored collapsed, verbatim in name_json."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = (
+        "<body>The Company entered into a "
+        '<debt_instrument id="tag-i-1">revolving credit\nfacility</debt_instrument> '
+        "and issued "
+        '<debt_instrument id="tag-i-2">4.85% Remarketable\tSenior\xa0Notes '
+        "due 2032</debt_instrument>.</body>"
+    )
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [{"name": ["tag-i-1"]}, {"name": ["tag-i-2"]}]
+    )
+
+    InstrumentIEStage().postprocess(row_state)
+
+    names = [mention["name"] for mention in row_state.debt_instrument_mentions]
+    assert names == [
+        "revolving credit facility",
+        "4.85% Remarketable Senior Notes due 2032",
+    ]
+    # Provenance keeps the verbatim span, since the char offsets index into it.
+    verbatim = [
+        json.loads(str(mention["name_json"]))["mentions"][0]["text"]
+        for mention in row_state.debt_instrument_mentions
+    ]
+    assert verbatim == [
+        "revolving credit\nfacility",
+        "4.85% Remarketable\tSenior\xa0Notes due 2032",
+    ]
+
+
 def test_instrument_ie_postprocess_drops_duplicate_identical_mentions() -> None:
     """Objects that differ in no extracted property must not duplicate a mention row."""
     row_state = ExtractionRowState(
