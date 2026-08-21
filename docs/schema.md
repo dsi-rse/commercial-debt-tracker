@@ -202,13 +202,13 @@ Columns:
 - `amount`: Normalized principal or commitment amount when present.
 - `amendment_of`: `debt_instrument_mention_id` of the mention this row amends, when the extractor found that relation.
 - `split_of`: `debt_instrument_mention_id` of the mention this row splits from, when the extractor found that relation.
-- `lenders_json`: JSON array of named lender or counterparty mention clusters with evidence text. Each cluster carries `kind: "named"`; collective phrases such as `the other lenders party thereto` are dropped from this column and recorded through `lenders_complete` instead.
-- `lenders_complete`: Boolean flag that is true only when the mention names at least one lender and signals no additional undisclosed lenders. A false value with an empty `lenders_json` means the lenders were not disclosed.
-- `other_interested_parties_json`: JSON array of additional related-party clusters with evidence text. Each cluster carries a `role` of `agent`, `trustee`, `underwriter`, `guarantor`, `borrower`, or `other`.
+- `lenders_json`: JSON array of lender or counterparty mention clusters with evidence text. Collective phrases such as `the other lenders party thereto` are excluded; `lenders_known_incomplete` records that they were present.
+- `other_interested_parties_json`: JSON array of additional related-party clusters with evidence text, excluding the filer or borrower itself.
 - `name_json`: JSON payload describing the evidence tags and surface text used to construct `name`.
 - `start_date_json`: JSON payload containing normalized start-date value plus extraction evidence.
-- `end_date_json`: JSON payload containing normalized end-date value plus extraction evidence, including `derived_from_name`, which is true when the maturity came from the instrument name such as `notes due 2028` rather than a standalone date mention. Year-only maturities normalize to `YYYY-12-31`.
+- `end_date_json`: JSON payload containing normalized end-date value plus extraction evidence. The maturity may come from the instrument name, such as `notes due 2028`, in which case the evidence list can be empty; year-only maturities normalize to `YYYY-12-31`.
 - `amount_json`: JSON payload containing normalized amount value plus extraction evidence.
+- `lenders_known_incomplete`: Boolean flag that is true when the mention shows the document referred to lenders it did not name, such as `the other lenders party thereto`. A true value with an empty `lenders_json` means no lender was disclosed.
 
 Primary key: `debt_instrument_mention_id`
 
@@ -239,10 +239,10 @@ Columns:
 - `end_date`: Matcher-selected canonical end date derived from the instrument's direct mentions.
 - `amount`: Matcher-selected canonical amount derived from the instrument's direct mentions.
 - `direct_mentions_json`: JSON array of directly assigned `debt_instrument_mention_id` values for this instrument.
-- `lenders_json`: JSON aggregation of named lender clusters carried forward from the instrument's direct mentions.
-- `lenders_complete`: Boolean flag that is true only when every lender-bearing mention of the instrument named all of its lenders.
-- `other_interested_parties_json`: JSON aggregation of other related-party clusters carried forward from the instrument's direct mentions, each with its `role`.
+- `lenders_json`: JSON aggregation of lender clusters carried forward from the instrument's direct mentions.
+- `other_interested_parties_json`: JSON aggregation of other related-party clusters carried forward from the instrument's direct mentions.
 - `possibly_related_json`: JSON array of advisory mention IDs that look related but were not directly matched into the instrument.
+- `lenders_known_incomplete`: Boolean flag that is true when any direct mention of the instrument showed undisclosed lenders.
 
 Primary key: `debt_instrument_id`
 

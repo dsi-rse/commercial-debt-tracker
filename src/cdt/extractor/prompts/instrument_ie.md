@@ -18,17 +18,17 @@ For each object, extract these properties when present:
 - `end_date`
 - `amount`
 - `lenders`
-- `lenders_complete`
+- `lenders_known_incomplete`
 - `other_interested_parties`
 
 For standardized single-value properties, use these object shapes:
 - `start_date`: `{ "evidence": ["tag-..."], "normalized_date": "YYYY-MM-DD" | null }`
-- `end_date`: `{ "evidence": ["tag-..."], "normalized_date": "YYYY-MM-DD" | null, "derived_from_name": true | false }`
+- `end_date`: `{ "evidence": ["tag-..."], "normalized_date": "YYYY-MM-DD" | null }`
 - `amount`: `{ "evidence": ["tag-..."], "normalized_amount": "12345.67" | null, "currency": "USD" | null }`
 
 For party properties, return one object per coreference cluster:
 - `lenders`: `[{ "tag_ids": ["tag-..."], "kind": "named" | "collective" }]`
-- `lenders_complete`: `true` | `false`
+- `lenders_known_incomplete`: `true` | `false`
 - `other_interested_parties`: `[{ "tag_ids": ["tag-..."], "role": "agent" | "trustee" | "underwriter" | "guarantor" | "borrower" | "other" }]`
 
 ## Hard Rules
@@ -37,12 +37,11 @@ For party properties, return one object per coreference cluster:
 - `name` may contain only `debt_instrument` tag ids.
 - `start_date.evidence` may contain only `date` tag ids.
 - `end_date.evidence` may contain `date` tag ids, or the instrument's own `debt_instrument` tag id when the maturity is embedded in the name, such as `3.875% senior notes due 2028`.
-- `end_date.derived_from_name` is optional. Set it to `true` when the maturity comes from the instrument name rather than a standalone date mention.
 - `amount.evidence` may contain only `amount` tag ids.
 - `lenders` and `other_interested_parties` cluster `tag_ids` may contain only `person` or `organization` tag ids.
 - For `name`, return one list of tag ids representing a single coreference cluster.
 - Every `lenders` cluster must carry a `kind`, and every `other_interested_parties` cluster must carry a `role`.
-- `lenders_complete` must be `true` or `false`, and may be returned only when `lenders` is present.
+- `lenders_known_incomplete` is optional and must be `true` or `false`.
 - Do not use an aggregate amount that covers several instruments as the `amount` of any one of them. When the document states only a combined total for a group, such as the total principal subject to one amendment, omit `amount` on the individual instruments.
 - `amount` is the principal or commitment amount only. Interest rates, margins, spreads, fees, discounts, and per-annum percentages are never `amount`. Omit `amount` when the document states no principal or commitment amount.
 - For `amount.normalized_amount`, return only digits and at most one decimal point, or `null`.
@@ -71,8 +70,7 @@ Party rules:
 - Use `kind: "named"` for a cluster that identifies a specific lender by name, such as `JPMorgan Chase Bank, N.A.` or `EGT 11 LLC`.
 - Use `kind: "collective"` for a cluster whose surface text only describes the group without identifying anyone, such as `the Lenders`, `the other lenders party thereto`, `the holders`, `certain financial institutions`, or `the purchasers`.
 - A defined term that stands for a list of parties the document just named, such as `(collectively, the "Purchasers")` or `the Lenders listed on Schedule A`, is a coreference of those named parties rather than a `collective` cluster. Put its tag ids in the `named` clusters they refer to, or leave them out. Reserve `collective` for a group the document never enumerates.
-- Return `lenders_complete: true` when the document names every lender, which is the normal case when all `lenders` clusters are `named`.
-- Return `lenders_complete: false` when the document signals additional undisclosed lenders, which is the normal case when any `lenders` cluster is `collective` or when the text hedges with wording such as `certain lenders`, `including`, or `and others`.
+- Return `lenders_known_incomplete: true` when the document signals lenders it does not name, which is the normal case when any `lenders` cluster is `collective` or when the text hedges with wording such as `certain lenders`, `including`, or `and others`. Otherwise omit it or return `false`.
 - The filer, issuer, borrower, or obligor is never its own lender. Put it in `other_interested_parties` with `role: "borrower"` only when the document treats it as a distinct party worth recording, and otherwise omit it.
 - An administrative agent, collateral agent, or paying agent belongs in `other_interested_parties` with `role: "agent"`. Include it in `lenders` only when the document also describes it as a lender or purchaser of that instrument, for example `as a Lender and as Administrative Agent`.
 - An indenture trustee or collateral trustee belongs in `other_interested_parties` with `role: "trustee"`, never in `lenders`.
@@ -83,15 +81,15 @@ Party rules:
 - Use `role: "other"` only when the party is clearly related to the instrument but none of the other roles fit.
 
 Examples:
-- If a document describes `3.875% senior notes due 2028` and gives no separate maturity date, return that instrument's `debt_instrument` tag id as `end_date.evidence` with `normalized_date` `2028-12-31` and `derived_from_name` `true`.
+- If a document describes `3.875% senior notes due 2028` and gives no separate maturity date, return that instrument's `debt_instrument` tag id as `end_date.evidence` with `normalized_date` `2028-12-31`.
 - If a document describes `senior notes due October 1, 2028` and tags `October 1, 2028` as a date, cite the `date` tag id with `normalized_date` `2028-10-01`.
 - If a credit agreement says ABR Loans bear interest at `0.875% per annum`, do not return `0.875` as the `amount`. Omit `amount` unless the document states that loan's principal or commitment amount.
 - If a trust issues `Class A-1 Asset Backed Notes`, `Class A-2a Asset Backed Notes`, `Class A-2b Asset Backed Notes`, `Class A-3 Asset Backed Notes`, and `Class A-4 Asset Backed Notes` in one offering, return five objects, one per class, each with its own amount and maturity when stated. Do not return one object naming all five, and do not return a sixth object for `Asset Backed Notes`.
 - If a document says the company issued an initial note on March 17, 2025 for $5.5 million and a subsequent note on March 20, 2025 for $269,000, both called `Senior Subordinated Convertible Promissory Note`, return two objects.
 - If a document later refers collectively to those instruments as `Exchange Notes`, do not return a third `Exchange Notes` object.
 - If a document says prior notes were retired in full, do not return a new object just for that contextual mention unless the filing separately describes a concrete debt instrument state for it.
-- If a credit agreement says the lenders are `JPMorgan Chase Bank, N.A.` and `the other lenders party thereto`, return both clusters, `kind: "named"` for Chase and `kind: "collective"` for the other lenders, with `lenders_complete: false`.
-- If the document says the lenders are `JPMorgan Chase Bank, N.A.` and `Wells Fargo Bank, National Association` with no collective phrase, return two `named` clusters with `lenders_complete: true`.
-- If the document only says the notes were sold to `the Holders`, return one `collective` cluster with `lenders_complete: false`.
-- If a note purchase agreement says the company sold notes to `Metropolitan Life Insurance Company` and `the other purchasers named therein`, return Metropolitan Life as `named` and the other purchasers as `collective`, with `lenders_complete: false`.
+- If a credit agreement says the lenders are `JPMorgan Chase Bank, N.A.` and `the other lenders party thereto`, return both clusters, `kind: "named"` for Chase and `kind: "collective"` for the other lenders, with `lenders_known_incomplete: true`.
+- If the document says the lenders are `JPMorgan Chase Bank, N.A.` and `Wells Fargo Bank, National Association` with no collective phrase, return two `named` clusters and omit `lenders_known_incomplete`.
+- If the document only says the notes were sold to `the Holders`, return one `collective` cluster with `lenders_known_incomplete: true`.
+- If a note purchase agreement says the company sold notes to `Metropolitan Life Insurance Company` and `the other purchasers named therein`, return Metropolitan Life as `named` and the other purchasers as `collective`, with `lenders_known_incomplete: true`.
 - If an indenture names `The Bank of New York Mellon` as trustee and the notes were sold through underwriters, return no `lenders` clusters, and return the trustee with `role: "trustee"` and the underwriters with `role: "underwriter"`.

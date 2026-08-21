@@ -29,7 +29,6 @@ from cdt.matcher import (
     mention_matches_root,
 )
 from cdt.matcher.core import (
-    aggregate_lenders_complete,
     coerce_optional_text,
     company_names_by_cik,
     lender_signature,
@@ -153,7 +152,7 @@ def build_mention_row(
     start_date: str,
     amount: str,
     lenders_json: str = "[]",
-    lenders_complete: bool = False,
+    lenders_known_incomplete: bool = False,
     company_name: str | None = "Example Inc.",
 ) -> dict[str, object]:
     """Return one canonical mention row for matcher tests."""
@@ -173,7 +172,7 @@ def build_mention_row(
         "retired_of": None,
         "split_of": None,
         "lenders_json": lenders_json,
-        "lenders_complete": lenders_complete,
+        "lenders_known_incomplete": lenders_known_incomplete,
         "other_interested_parties_json": "[]",
         "name_json": "{}",
         "start_date_json": "{}",
@@ -240,18 +239,18 @@ def test_normalize_snapshot_text_nulls_placeholder_strings() -> None:
 
 def test_normalize_snapshot_text_keeps_non_text_values_typed() -> None:
     """Booleans in an object column must not be published as text."""
-    # Partitions written before lenders_complete existed leave an object column
-    # holding booleans and nulls side by side.
+    # Partitions written before lenders_known_incomplete existed leave an object
+    # column holding booleans and nulls side by side.
     table = pd.DataFrame(
         {
-            "lenders_complete": [True, None, False],
+            "lenders_known_incomplete": [True, None, False],
             "company_name": ["Acme Inc.", "nan", "Contoso Ltd."],
         }
     )
 
     normalized = normalize_snapshot_text(table)
 
-    assert normalized["lenders_complete"].to_list() == [True, None, False]
+    assert normalized["lenders_known_incomplete"].to_list() == [True, None, False]
     assert normalized["company_name"].to_list() == [
         "Acme Inc.",
         None,
@@ -415,7 +414,7 @@ def test_extract_pending_items_writes_mentions_and_audit(
                 "retired_of": None,
                 "split_of": None,
                 "lenders_json": "[]",
-                "lenders_complete": False,
+                "lenders_known_incomplete": False,
                 "other_interested_parties_json": "[]",
                 "name_json": "{}",
                 "start_date_json": "{}",
@@ -479,7 +478,7 @@ def test_extract_pending_items_drains_all_partitions(
                 "retired_of": None,
                 "split_of": None,
                 "lenders_json": "[]",
-                "lenders_complete": False,
+                "lenders_known_incomplete": True,
                 "other_interested_parties_json": "[]",
                 "name_json": "{}",
                 "start_date_json": "{}",
@@ -590,7 +589,6 @@ Together, the <debt_instrument id="tag-i-4">Exchange Notes</debt_instrument> wer
     "start_date": {"evidence": ["tag-d-1"], "normalized_date": "2025-03-17"},
     "amount": {"evidence": ["tag-a-1"], "normalized_amount": "5500000", "currency": "USD"},
     "lenders": [{"tag_ids": ["tag-o-1"], "kind": "named"}],
-    "lenders_complete": true,
     "other_interested_parties": []
   },
   {
@@ -598,7 +596,6 @@ Together, the <debt_instrument id="tag-i-4">Exchange Notes</debt_instrument> wer
     "start_date": {"evidence": ["tag-d-2"], "normalized_date": "2025-03-20"},
     "amount": {"evidence": ["tag-a-2"], "normalized_amount": "269000", "currency": "USD"},
     "lenders": [{"tag_ids": ["tag-o-1b"], "kind": "named"}],
-    "lenders_complete": true,
     "other_interested_parties": []
   }
 ]
@@ -649,7 +646,7 @@ def test_instrument_ie_validate_accepts_party_kinds_and_roles() -> None:
                     {"tag_ids": ["tag-o-named"], "kind": "named"},
                     {"tag_ids": ["tag-o-collective"], "kind": "collective"},
                 ],
-                "lenders_complete": False,
+                "lenders_known_incomplete": True,
                 "other_interested_parties": [
                     {"tag_ids": ["tag-o-agent"], "role": "agent"},
                     {"tag_ids": ["tag-o-borrower"], "role": "borrower"},
@@ -684,14 +681,16 @@ def test_instrument_ie_validate_rejects_unannotated_party_clusters() -> None:
     assert any("'role' must be one of" in failure for failure in failures)
 
 
-def test_instrument_ie_validate_rejects_lenders_complete_without_lenders() -> None:
-    """lenders_complete should require lenders and a boolean value."""
-    response = json.dumps([{"name": ["tag-i-1"], "lenders_complete": "yes"}])
+def test_instrument_ie_validate_rejects_non_boolean_lenders_known_incomplete() -> None:
+    """The lenders_known_incomplete flag must be boolean when present."""
+    response = json.dumps([{"name": ["tag-i-1"], "lenders_known_incomplete": "yes"}])
 
     failures = InstrumentIEStage().validate(party_row_state(), response)
 
-    assert any("must be true or false" in failure for failure in failures)
-    assert any("only with 'lenders'" in failure for failure in failures)
+    assert any(
+        "'lenders_known_incomplete' must be true or false" in failure
+        for failure in failures
+    )
 
 
 def test_instrument_ie_postprocess_keeps_named_lenders_and_flags_incompleteness() -> (
@@ -707,7 +706,7 @@ def test_instrument_ie_postprocess_keeps_named_lenders_and_flags_incompleteness(
                         {"tag_ids": ["tag-o-named"], "kind": "named"},
                         {"tag_ids": ["tag-o-collective"], "kind": "collective"},
                     ],
-                    "lenders_complete": False,
+                    "lenders_known_incomplete": True,
                     "other_interested_parties": [
                         {"tag_ids": ["tag-o-agent"], "role": "agent"}
                     ],
@@ -719,49 +718,51 @@ def test_instrument_ie_postprocess_keeps_named_lenders_and_flags_incompleteness(
     lenders = json.loads(str(mention["lenders_json"]))
     other_parties = json.loads(str(mention["other_interested_parties_json"]))
     assert [cluster["tag_ids"] for cluster in lenders] == [["tag-o-named"]]
-    assert [cluster["kind"] for cluster in lenders] == ["named"]
-    assert mention["lenders_complete"] is False
-    assert [cluster["role"] for cluster in other_parties] == ["agent"]
+    assert mention["lenders_known_incomplete"] is True
+    # Persisted clusters keep the plain tag_ids/mentions shape: the model's kind and
+    # role labels decide what is stored and are not themselves stored.
+    assert set(lenders[0]) == {"tag_ids", "mentions"}
+    assert [cluster["tag_ids"] for cluster in other_parties] == [["tag-o-agent"]]
+    assert set(other_parties[0]) == {"tag_ids", "mentions"}
 
 
-def test_instrument_ie_postprocess_marks_named_only_lenders_complete() -> None:
-    """A lender list with only named clusters is a complete list."""
+def test_instrument_ie_postprocess_leaves_named_only_lenders_unflagged() -> None:
+    """A lender list with only named clusters is not known to be incomplete."""
     mention = instrument_ie_mention(
         json.dumps(
             [
                 {
                     "name": ["tag-i-1"],
                     "lenders": [{"tag_ids": ["tag-o-named"], "kind": "named"}],
-                    "lenders_complete": True,
                 }
             ]
         )
     )
 
-    assert mention["lenders_complete"] is True
+    assert mention["lenders_known_incomplete"] is False
     assert len(json.loads(str(mention["lenders_json"]))) == 1
 
 
 def test_instrument_ie_postprocess_honors_declared_incompleteness() -> None:
-    """A model-declared false flag survives even when every cluster is named."""
+    """A model-declared flag survives even when every cluster is named."""
     mention = instrument_ie_mention(
         json.dumps(
             [
                 {
                     "name": ["tag-i-1"],
                     "lenders": [{"tag_ids": ["tag-o-named"], "kind": "named"}],
-                    "lenders_complete": False,
+                    "lenders_known_incomplete": True,
                 }
             ]
         )
     )
 
-    assert mention["lenders_complete"] is False
+    assert mention["lenders_known_incomplete"] is True
     assert len(json.loads(str(mention["lenders_json"]))) == 1
 
 
 def test_instrument_ie_postprocess_drops_collective_only_lenders() -> None:
-    """A collective-only lender list carries no lenders and is never complete."""
+    """A collective-only lender list carries no lenders and is flagged."""
     mention = instrument_ie_mention(
         json.dumps(
             [
@@ -770,39 +771,44 @@ def test_instrument_ie_postprocess_drops_collective_only_lenders() -> None:
                     "lenders": [
                         {"tag_ids": ["tag-o-collective"], "kind": "collective"}
                     ],
-                    "lenders_complete": True,
                 }
             ]
         )
     )
 
     assert json.loads(str(mention["lenders_json"])) == []
-    assert mention["lenders_complete"] is False
+    assert mention["lenders_known_incomplete"] is True
 
 
-def test_lender_signature_ignores_collective_clusters() -> None:
-    """Collective lender clusters should not contribute to lender signatures."""
-    payload = json.dumps(
-        [
-            {"kind": "collective", "mentions": [{"text": "the other lenders"}]},
-            {"kind": "named", "mentions": [{"text": "Acme Bank"}]},
-        ]
+def test_instrument_ie_postprocess_excludes_the_borrower_from_other_parties() -> None:
+    """The filer itself is not persisted as an interested party."""
+    mention = instrument_ie_mention(
+        json.dumps(
+            [
+                {
+                    "name": ["tag-i-1"],
+                    "other_interested_parties": [
+                        {"tag_ids": ["tag-o-borrower"], "role": "borrower"},
+                        {"tag_ids": ["tag-o-agent"], "role": "agent"},
+                    ],
+                }
+            ]
+        )
     )
+
+    other_parties = json.loads(str(mention["other_interested_parties_json"]))
+    assert [cluster["tag_ids"] for cluster in other_parties] == [["tag-o-agent"]]
+
+
+def test_lender_signature_uses_stored_lender_clusters() -> None:
+    """Lender signatures come from the persisted named clusters."""
+    payload = json.dumps([{"mentions": [{"text": "Acme Bank"}]}])
 
     assert lender_signature(payload) == "acme bank"
 
 
-def test_aggregate_lenders_complete_requires_every_lender_bearing_mention() -> None:
-    """Instrument-level completeness needs lenders and no incomplete contribution."""
-    named = '[{"kind": "named", "mentions": [{"text": "Acme Bank"}]}]'
-
-    assert aggregate_lenders_complete([(named, True), ("[]", False)]) is True
-    assert aggregate_lenders_complete([(named, True), (named, False)]) is False
-    assert aggregate_lenders_complete([("[]", False)]) is False
-
-
-def test_match_pending_mentions_carries_lender_completeness(tmp_path: Path) -> None:
-    """Matcher output should carry mention-level lender completeness forward."""
+def test_match_pending_mentions_carries_lender_incompleteness(tmp_path: Path) -> None:
+    """Matcher output should carry mention-level lender incompleteness forward."""
     mention_rows = pd.DataFrame(
         [
             build_mention_row(
@@ -815,10 +821,9 @@ def test_match_pending_mentions_carries_lender_completeness(tmp_path: Path) -> N
                 start_date="2024-01-01",
                 amount="$100 million",
                 lenders_json=(
-                    '[{"kind": "named", "mentions": [{"text": "Acme Bank"}],'
-                    ' "tag_ids": ["tag-l-1"]}]'
+                    '[{"mentions": [{"text": "Acme Bank"}], "tag_ids": ["tag-l-1"]}]'
                 ),
-                lenders_complete=True,
+                lenders_known_incomplete=True,
             )
         ]
     )
@@ -831,7 +836,7 @@ def test_match_pending_mentions_carries_lender_completeness(tmp_path: Path) -> N
     match_pending_mentions(artifact_root=tmp_path, batch_size=5)
 
     written_instruments = read_dataset(debt_instruments_root(tmp_path))
-    assert written_instruments["lenders_complete"].to_list() == [True]
+    assert written_instruments["lenders_known_incomplete"].to_list() == [True]
 
 
 def test_instrument_ie_validate_rejects_conflicting_start_dates() -> None:
@@ -940,26 +945,6 @@ def test_instrument_ie_validate_still_rejects_name_span_as_start_date_evidence()
     assert any("expected date" in failure for failure in failures)
 
 
-def test_instrument_ie_validate_rejects_non_boolean_derived_from_name() -> None:
-    """The derived_from_name flag must be boolean when present."""
-    response = json.dumps(
-        [
-            {
-                "name": ["tag-i-1"],
-                "end_date": {
-                    "evidence": ["tag-i-1"],
-                    "normalized_date": "2028-12-31",
-                    "derived_from_name": "yes",
-                },
-            }
-        ]
-    )
-
-    failures = InstrumentIEStage().validate(maturity_row_state(), response)
-
-    assert any("derived_from_name' must be true or false" in f for f in failures)
-
-
 def test_instrument_ie_postprocess_keeps_name_derived_end_date() -> None:
     """A maturity cited from the name span should survive normalization."""
     mention = maturity_mention(
@@ -970,7 +955,6 @@ def test_instrument_ie_postprocess_keeps_name_derived_end_date() -> None:
                     "end_date": {
                         "evidence": ["tag-i-1"],
                         "normalized_date": "2028-12-31",
-                        "derived_from_name": True,
                     },
                 }
             ]
@@ -980,7 +964,6 @@ def test_instrument_ie_postprocess_keeps_name_derived_end_date() -> None:
     assert mention["end_date"] == "2028-12-31"
     payload = json.loads(str(mention["end_date_json"]))
     assert payload["tag_ids"] == ["tag-i-1"]
-    assert payload["derived_from_name"] is True
 
 
 def test_instrument_ie_postprocess_backfills_end_date_from_name() -> None:
@@ -1001,8 +984,8 @@ def test_instrument_ie_postprocess_backfills_end_date_from_name() -> None:
 
     assert mention["end_date"] == "2028-12-31"
     payload = json.loads(str(mention["end_date_json"]))
+    # A maturity read from the name has no citable date tag of its own.
     assert payload["tag_ids"] == []
-    assert payload["derived_from_name"] is True
 
 
 def test_instrument_ie_postprocess_leaves_end_date_null_without_maturity() -> None:
@@ -1023,7 +1006,7 @@ on <date id="tag-d-1">March 17, 2025</date>.
 
     mention = row_state.debt_instrument_mentions[0]
     assert mention["end_date"] is None
-    assert json.loads(str(mention["end_date_json"]))["derived_from_name"] is False
+    assert json.loads(str(mention["end_date_json"]))["normalized_date"] is None
 
 
 def test_instrument_ie_postprocess_drops_end_date_that_contradicts_evidence() -> None:
@@ -1047,7 +1030,6 @@ def test_instrument_ie_postprocess_drops_end_date_that_contradicts_evidence() ->
     # The cited date tag says March 17, 2025, so the model value is rejected and the
     # name maturity fills the gap instead.
     assert mention["end_date"] == "2028-12-31"
-    assert payload["derived_from_name"] is True
 
 
 RATE_AMOUNT_XML = """
@@ -1218,7 +1200,7 @@ def test_match_pending_mentions_writes_match_datasets(tmp_path: Path) -> None:
                 name="Term Loan",
                 start_date="2024-01-01",
                 amount="$100 million",
-                lenders_json='[{"kind": "named", "mentions": [{"text": "Acme Bank"}], "tag_ids": ["tag-l-1"]}]',
+                lenders_json='[{"mentions": [{"text": "Acme Bank"}], "tag_ids": ["tag-l-1"]}]',
             )
         ]
     )
@@ -1342,7 +1324,7 @@ def test_match_pending_mentions_drains_all_shards(tmp_path: Path) -> None:
                 name="Term Loan",
                 start_date="2024-01-01",
                 amount="$100 million",
-                lenders_json='[{"kind": "named", "mentions": [{"text": "Acme Bank"}], "tag_ids": ["tag-l-1"]}]',
+                lenders_json='[{"mentions": [{"text": "Acme Bank"}], "tag_ids": ["tag-l-1"]}]',
             ),
             build_mention_row(
                 mention_id="m-2",
@@ -1353,7 +1335,7 @@ def test_match_pending_mentions_drains_all_shards(tmp_path: Path) -> None:
                 name="Revolving Credit Facility",
                 start_date="2024-01-01",
                 amount="$250 million",
-                lenders_json='[{"kind": "named", "mentions": [{"text": "Contoso Bank"}], "tag_ids": ["tag-l-2"]}]',
+                lenders_json='[{"mentions": [{"text": "Contoso Bank"}], "tag_ids": ["tag-l-2"]}]',
             ),
         ]
     )

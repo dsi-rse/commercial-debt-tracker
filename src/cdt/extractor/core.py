@@ -60,6 +60,10 @@ OTHER_PARTY_ROLES = {
     "other",
 }
 DEFAULT_OTHER_PARTY_ROLE = "other"
+BORROWER_PARTY_ROLE = "borrower"
+COLLECTIVE_LENDER_KIND = "collective"
+# The model labels every party cluster so collective lenders and the borrower can
+# be dropped here. The labels are extraction-time signals and are not persisted.
 PARTY_PROPERTY_ANNOTATIONS = {
     "lenders": ("kind", LENDER_CLUSTER_KINDS, DEFAULT_LENDER_CLUSTER_KIND),
     "other_interested_parties": (
@@ -156,12 +160,12 @@ DEBT_INSTRUMENT_MENTION_COLUMNS = [
     "retired_of",
     "split_of",
     "lenders_json",
-    "lenders_complete",
     "other_interested_parties_json",
     "name_json",
     "start_date_json",
     "end_date_json",
     "amount_json",
+    "lenders_known_incomplete",
 ]
 
 
@@ -500,7 +504,7 @@ class InstrumentIEStage:
                     )
                 )
             failures.extend(
-                validate_lenders_complete(
+                validate_lenders_known_incomplete(
                     index=index,
                     obj=obj,
                 )
@@ -539,9 +543,8 @@ class InstrumentIEStage:
                 tag_details,
                 name_text=name_text,
             )
-            lender_clusters, lenders_complete = lender_payloads_and_completeness(
-                obj,
-                tag_details,
+            lender_clusters, lenders_known_incomplete = (
+                lender_payloads_and_incompleteness(obj, tag_details)
             )
             mention_row: dict[str, object] = {
                 "item_id": row_state.item_id,
@@ -559,13 +562,9 @@ class InstrumentIEStage:
                 "retired_of": None,
                 "split_of": None,
                 "lenders_json": json.dumps(lender_clusters, sort_keys=True),
-                "lenders_complete": lenders_complete,
+                "lenders_known_incomplete": lenders_known_incomplete,
                 "other_interested_parties_json": json.dumps(
-                    party_cluster_payload_list(
-                        obj.get("other_interested_parties", []),
-                        tag_details,
-                        property_name="other_interested_parties",
-                    ),
+                    disclosed_party_payloads(obj, tag_details),
                     sort_keys=True,
                 ),
                 "name_json": json.dumps(
@@ -1191,11 +1190,6 @@ def validate_standardized_single_value_shape(
             failures.append(
                 f"Entry {index}: '{property_name}.normalized_date' must be YYYY-MM-DD or null."
             )
-        derived_from_name = value.get("derived_from_name")
-        if derived_from_name is not None and not isinstance(derived_from_name, bool):
-            failures.append(
-                f"Entry {index}: '{property_name}.derived_from_name' must be true or false."
-            )
     return failures
 
 
@@ -1296,18 +1290,13 @@ def validate_party_property(
     return failures
 
 
-def validate_lenders_complete(*, index: int, obj: dict[str, Any]) -> list[str]:
-    """Validate the optional lenders_complete flag."""
-    if "lenders_complete" not in obj:
+def validate_lenders_known_incomplete(*, index: int, obj: dict[str, Any]) -> list[str]:
+    """Validate the optional lenders_known_incomplete flag."""
+    if "lenders_known_incomplete" not in obj:
         return []
-    failures: list[str] = []
-    if not isinstance(obj["lenders_complete"], bool):
-        failures.append(f"Entry {index}: 'lenders_complete' must be true or false.")
-    if "lenders" not in obj:
-        failures.append(
-            f"Entry {index}: 'lenders_complete' may be returned only with 'lenders'."
-        )
-    return failures
+    if isinstance(obj["lenders_known_incomplete"], bool):
+        return []
+    return [f"Entry {index}: 'lenders_known_incomplete' must be true or false."]
 
 
 def validate_amount_is_not_rate(
@@ -1381,8 +1370,8 @@ def debt_instrument_mention_id_for(
         "end_date": mention_row.get("end_date"),
         "end_date_json": normalize_json_text(mention_row.get("end_date_json")),
         "item_id": item_id,
-        "lenders_complete": mention_row.get("lenders_complete"),
         "lenders_json": normalize_json_text(mention_row.get("lenders_json")),
+        "lenders_known_incomplete": mention_row.get("lenders_known_incomplete"),
         "name_json": normalize_json_text(mention_row.get("name_json")),
         "name": mention_row.get("name"),
         "other_interested_parties_json": normalize_json_text(
@@ -1623,16 +1612,10 @@ def standardized_end_date_payload(
         tag_details,
         allow_maturity_phrase=True,
     )
-    mentions = cast(list[dict[str, object]], payload["mentions"])
-    derived_from_name = payload["normalized_date"] is not None and any(
-        mention["type"] in MATURITY_EVIDENCE_TAG_TYPES for mention in mentions
-    )
     if payload["normalized_date"] is None:
         derived_date = normalized_maturity_from_text(name_text)
         if derived_date is not None:
             payload["normalized_date"] = derived_date
-            derived_from_name = True
-    payload["derived_from_name"] = derived_from_name
     return payload
 
 
@@ -1660,19 +1643,23 @@ def cluster_payload(
     }
 
 
-def party_cluster_payload_list(
+def annotated_party_clusters(
     clusters: object,
     tag_details: dict[str, dict[str, object]],
     *,
     property_name: str,
-) -> list[dict[str, object]]:
-    """Return annotated party clusters carrying their kind or role."""
+) -> list[tuple[dict[str, object], str]]:
+    """Return (cluster payload, annotation) pairs for one party property.
+
+    Each payload keeps the persisted cluster shape. The annotation is the model's
+    extraction-time label, used only to decide which clusters to persist.
+    """
     annotation_key, allowed_annotations, default_annotation = (
         PARTY_PROPERTY_ANNOTATIONS[property_name]
     )
     if not isinstance(clusters, list):
         return []
-    payloads: list[dict[str, object]] = []
+    pairs: list[tuple[dict[str, object], str]] = []
     for cluster in clusters:
         if isinstance(cluster, dict):
             tag_ids = cluster.get("tag_ids")
@@ -1684,30 +1671,40 @@ def party_cluster_payload_list(
         payload = cluster_payload(tag_ids, tag_details)
         if not payload["tag_ids"]:
             continue
-        payload[annotation_key] = (
-            annotation if annotation in allowed_annotations else default_annotation
+        resolved = (
+            str(annotation) if annotation in allowed_annotations else default_annotation
         )
-        payloads.append(payload)
-    return payloads
+        pairs.append((payload, resolved))
+    return pairs
 
 
-def lender_payloads_and_completeness(
+def lender_payloads_and_incompleteness(
     obj: dict[str, Any],
     tag_details: dict[str, dict[str, object]],
 ) -> tuple[list[dict[str, object]], bool]:
-    """Return named lender clusters plus whether the lender list is complete."""
-    clusters = party_cluster_payload_list(
+    """Return named lender clusters plus whether lenders are known to be missing."""
+    pairs = annotated_party_clusters(
         obj.get("lenders", []),
         tag_details,
         property_name="lenders",
     )
-    named = [cluster for cluster in clusters if cluster["kind"] == "named"]
-    has_collective = len(named) < len(clusters)
-    declared_complete = obj.get("lenders_complete")
-    complete = bool(named) and not has_collective
-    if complete and declared_complete is False:
-        complete = False
-    return named, complete
+    named = [payload for payload, kind in pairs if kind != COLLECTIVE_LENDER_KIND]
+    has_collective = len(named) < len(pairs)
+    declared_incomplete = obj.get("lenders_known_incomplete") is True
+    return named, has_collective or declared_incomplete
+
+
+def disclosed_party_payloads(
+    obj: dict[str, Any],
+    tag_details: dict[str, dict[str, object]],
+) -> list[dict[str, object]]:
+    """Return other-interested-party clusters, excluding the borrower itself."""
+    pairs = annotated_party_clusters(
+        obj.get("other_interested_parties", []),
+        tag_details,
+        property_name="other_interested_parties",
+    )
+    return [payload for payload, role in pairs if role != BORROWER_PARTY_ROLE]
 
 
 def relation_prompt_xml(row_state: ExtractionRowState) -> str:
