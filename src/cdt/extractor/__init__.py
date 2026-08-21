@@ -5,6 +5,7 @@ from cdt.extractor.core import (
     DEFAULT_MAX_ATTEMPTS,
     DEFAULT_MODEL,
     DEFAULT_REASONING_EFFORT,
+    ExtractionAborted,
     extract_pending_items,
     extract_tables,
     extracted_tables_path,
@@ -13,6 +14,7 @@ from cdt.extractor.core import (
 
 __all__ = [
     "DEBT_INSTRUMENT_MENTION_COLUMNS",
+    "ExtractionAborted",
     "DEFAULT_MAX_ATTEMPTS",
     "DEFAULT_MODEL",
     "DEFAULT_REASONING_EFFORT",

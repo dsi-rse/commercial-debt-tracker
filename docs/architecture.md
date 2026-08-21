@@ -35,6 +35,7 @@ CDT stores canonical state as Parquet, JSON, and JSONL artifacts under one root 
 That choice is visible throughout the code:
 
 - stage completion is inferred from partition presence
+- extract additionally gates completion on row outcomes: a partition whose rows died on provider errors stays pending, and those rows land in `failures/extract/failures.json` for `cdt extract --retry-failures`
 - partitions are rewritten deterministically
 - stage manifests are sidecar metadata, not the source of truth
 - the same pipeline can target either local paths or `s3://` URIs

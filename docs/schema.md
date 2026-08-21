@@ -279,6 +279,18 @@ The ingest stage maintains a permanent failure registry at:
 <artifact-root>/failures/ingest/failures.json
 ```
 
+The extract stage maintains a row-level failure registry at:
+
+```text
+<artifact-root>/failures/extract/failures.json
+```
+
+Each row records `item_id`, the `classification_path` it came from, its terminal
+`state`, a `failure_class` of `content` or `infrastructure`, the `run_id`, and the
+summarized error. Rows are removed once a later run extracts them successfully.
+`cdt extract --retry-failures` re-drives exactly these rows and merges the
+results into their existing mention partitions.
+
 ## Operational Semantics
 
 - canonical truth is the partition data, not the run manifest
@@ -287,5 +299,7 @@ The ingest stage maintains a permanent failure registry at:
 - `cdt-orchestrator` writes final snapshots when `FINAL_DATABASE_ROOT` is set or `--final-database-root` is passed before the mode
 - stage completion is inferred from output partition presence plus stage completion registries for zero-row outputs
 - `force=false` skips already-written partitions
+- an extract partition is recorded complete only when every relevant row reached a content-terminal state, so a partition holding rows that died on provider errors stays pending
+- a provider-side failure (HTTP 402, 408, 425, 429, 5xx, or a transport error) aborts the extract run at the first occurrence rather than iterating the rest of the corpus, and raises after the audit log, run manifest, and failure registry are written
 - local runs and deployed runs use the same layout and code paths
 - the default operating model is one active writer per environment

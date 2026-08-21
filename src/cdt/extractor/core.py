@@ -26,6 +26,7 @@ from cdt.datasets import (
     dataset_root,
     date_shard_partition_path,
     extractor_run_path,
+    failure_registry_path,
     iter_date_shard_partitions,
     load_completed_partitions,
     parse_date_shard_partition,
@@ -36,6 +37,7 @@ from cdt.datasets import (
 from cdt.shared import get_logger
 from cdt.storage import (
     artifact_exists,
+    read_json_artifact,
     read_table,
     write_json_artifact,
     write_partition_table,
@@ -58,6 +60,19 @@ INSTRUMENT_SINGLE_VALUE_PROPERTIES = {
 STANDARDIZED_SINGLE_VALUE_PROPERTIES = {"start_date", "end_date", "amount"}
 INSTRUMENT_RELATION_TYPES = {"amendment_of", "retired_of", "split_of"}
 NUMERIC_STRING_PATTERN = re.compile(r"^\d+(?:\.\d+)?$")
+INFRASTRUCTURE_FAILURE_CLASS = "infrastructure"
+CONTENT_FAILURE_CLASS = "content"
+# Provider-side conditions: the row would likely succeed once the provider does.
+INFRASTRUCTURE_STATUS_CODES = frozenset({402, 408, 425, 429, 500, 502, 503, 504, 529})
+INFRASTRUCTURE_ERROR_PATTERN = re.compile(
+    r"payment[ _]required|insufficient[ _]quota|quota exceeded|credit|billing|"
+    r"rate[ _]?limit|too many requests|service unavailable|bad gateway|"
+    r"gateway time ?out|overloaded|temporarily unavailable|internal server error|"
+    r"connection (?:error|reset|aborted|refused|closed)|timed out|timeout|"
+    r"remote (?:end closed|disconnected)|ssl",
+    re.IGNORECASE,
+)
+STATUS_CODE_ATTRIBUTES = ("status_code", "status", "http_status", "code")
 ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 MONTH_MAP = {
     "january": "01",
@@ -172,6 +187,7 @@ class ExtractionRowState:
     debt_instrument_mentions: list[dict[str, object]] = field(default_factory=list)
     ner_tagged_xml: str | None = None
     state: str | None = None
+    failure_class: str | None = None
     current_attempt: AttemptRecord = field(init=False)
 
     def __post_init__(self) -> None:
@@ -233,6 +249,7 @@ class ExtractionRowState:
             "stage_responses": self.stage_responses,
             "debt_instrument_mentions": self.debt_instrument_mentions,
             "state": self.state,
+            "failure_class": self.failure_class,
             "attempts": attempts,
         }
 
@@ -676,6 +693,67 @@ def extracted_tables_path(
     )
 
 
+def load_extract_failures(
+    artifact_root: str | Path | None = None,
+    *,
+    data_dir: Path | None = None,
+) -> dict[str, dict[str, str]]:
+    """Load recorded extract row failures keyed by item id."""
+    path = failure_registry_path(
+        "extract", artifact_root=artifact_root, data_dir=data_dir
+    )
+    if not artifact_exists(path):
+        return {}
+    payload = read_json_artifact(path)
+    if not isinstance(payload, dict):
+        return {}
+    rows = payload.get("rows", [])
+    if not isinstance(rows, list):
+        return {}
+    return {
+        str(row["item_id"]): {str(key): str(value) for key, value in row.items()}
+        for row in rows
+        if isinstance(row, dict) and row.get("item_id")
+    }
+
+
+def save_extract_failures(
+    failures: dict[str, dict[str, str]],
+    artifact_root: str | Path | None = None,
+    *,
+    data_dir: Path | None = None,
+) -> str:
+    """Persist extract row failures so they can be re-driven later."""
+    return write_json_artifact(
+        failure_registry_path(
+            "extract", artifact_root=artifact_root, data_dir=data_dir
+        ),
+        {
+            "stage": "extract",
+            "rows": [failures[item_id] for item_id in sorted(failures)],
+        },
+    )
+
+
+def merge_retried_mentions(
+    target_path: str,
+    mentions: pd.DataFrame,
+    *,
+    retried_item_ids: set[str],
+) -> pd.DataFrame:
+    """Merge re-driven mention rows into an existing partition table."""
+    existing = read_table(target_path, DEBT_INSTRUMENT_MENTION_COLUMNS).reindex(
+        columns=DEBT_INSTRUMENT_MENTION_COLUMNS
+    )
+    if existing.empty:
+        return mentions
+    kept = existing.loc[~existing["item_id"].astype(str).isin(retried_item_ids)]
+    merged = pd.concat([kept, mentions], ignore_index=True)
+    return merged.drop_duplicates(
+        subset=["debt_instrument_mention_id"], keep="last"
+    ).reindex(columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
+
+
 def extract_pending_items(
     *,
     artifact_root: str | Path | None = None,
@@ -686,8 +764,14 @@ def extract_pending_items(
     reasoning_effort: str | None = None,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     client: SupportsChatCompletion | None = None,
+    retry_failures: bool = False,
 ) -> pd.DataFrame:
-    """Extract instrument mentions for classified item partitions."""
+    """Extract instrument mentions for classified item partitions.
+
+    Rows that die on provider-side errors leave their partition pending and are
+    recorded in the extract failure registry. Pass ``retry_failures`` to re-drive
+    exactly those rows and merge the results into their existing partitions.
+    """
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
     if max_attempts <= 0:
@@ -711,8 +795,17 @@ def extract_pending_items(
         )
     )
     visited_classification_paths: set[str] = set()
+    completed_now: set[str] = set()
     empty_partitions = 0
     pending_classification_paths: list[str] = []
+    recorded_failures = load_extract_failures(resolved_root, data_dir=data_dir)
+    failed_items_by_partition: dict[str, set[str]] = {}
+    for item_id, entry in recorded_failures.items():
+        source = entry.get("classification_path")
+        if source:
+            failed_items_by_partition.setdefault(source, set()).add(item_id)
+    aborted_detail: str | None = None
+    aborted_item_id: str | None = None
 
     for classification_path in iter_date_shard_partitions(
         CLASSIFICATION_DATASET_NAME,
@@ -727,7 +820,12 @@ def extract_pending_items(
             artifact_root=resolved_root,
             data_dir=data_dir,
         )
-        if not force and artifact_exists(target_path):
+        has_recorded_failures = classification_path in failed_items_by_partition
+        if retry_failures:
+            if has_recorded_failures:
+                pending_classification_paths.append(classification_path)
+            continue
+        if not force and not has_recorded_failures and artifact_exists(target_path):
             continue
         if not force and classification_path in completed_classification_paths:
             continue
@@ -753,7 +851,15 @@ def extract_pending_items(
             mention_rows: list[dict[str, object]] = []
             partition_failures = 0
             relevant_records = relevant_items.to_dict("records")
+            if retry_failures:
+                retry_item_ids = failed_items_by_partition.get(classification_path, ())
+                relevant_records = [
+                    record
+                    for record in relevant_records
+                    if str(record.get("item_id")) in retry_item_ids
+                ]
             total_relevant_items = len(relevant_records)
+            infrastructure_failure: dict[str, str] | None = None
             for item_index, item_row in enumerate(relevant_records, start=1):
                 row_state = asyncio.run(
                     run_extraction_workflow(
@@ -769,14 +875,30 @@ def extract_pending_items(
                 )
                 if row_state.state == "SUCCESS":
                     mention_rows.extend(row_state.debt_instrument_mentions)
+                    recorded_failures.pop(row_state.item_id, None)
                 else:
-                    failed_rows.append(
-                        {
-                            "item_id": row_state.item_id,
-                            "extractor_error": summarize_failure(row_state),
-                        }
-                    )
+                    failure_entry = {
+                        "item_id": row_state.item_id,
+                        "classification_path": classification_path,
+                        "state": str(row_state.state),
+                        "failure_class": row_state.failure_class
+                        or CONTENT_FAILURE_CLASS,
+                        "run_id": run_id,
+                        "extractor_error": summarize_failure(row_state),
+                    }
+                    failed_rows.append(failure_entry)
+                    recorded_failures[row_state.item_id] = failure_entry
                     partition_failures += 1
+                    if failure_entry["failure_class"] == INFRASTRUCTURE_FAILURE_CLASS:
+                        infrastructure_failure = failure_entry
+                        LOGGER.error(
+                            "Extraction hit an infrastructure failure on %s: %s. "
+                            "Stopping the run; partition %s stays pending.",
+                            row_state.item_id,
+                            failure_entry["extractor_error"],
+                            partition_label,
+                        )
+                        break
                 if (
                     item_index == total_relevant_items
                     or item_index % EXTRACTOR_PROGRESS_LOG_INTERVAL == 0
@@ -795,6 +917,16 @@ def extract_pending_items(
             mentions = pd.DataFrame(
                 mention_rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS
             )
+            if retry_failures and not mentions.empty:
+                mentions = merge_retried_mentions(
+                    target_path,
+                    mentions,
+                    retried_item_ids={
+                        str(record.get("item_id")) for record in relevant_records
+                    },
+                )
+            if infrastructure_failure is None:
+                completed_now.add(classification_path)
             if mentions.empty:
                 empty_partitions += 1
             else:
@@ -813,6 +945,10 @@ def extract_pending_items(
                         data_dir=data_dir,
                     )
                 )
+            if infrastructure_failure is not None:
+                aborted_detail = infrastructure_failure["extractor_error"]
+                aborted_item_id = infrastructure_failure["item_id"]
+                break
             LOGGER.info(
                 "Extraction partition complete: %s progress=%s/%s classified_items=%s relevant_items=%s mentions=%s wrote_output=%s elapsed=%.1fs",
                 partition_label,
@@ -824,10 +960,10 @@ def extract_pending_items(
                 not mentions.empty,
                 perf_counter() - partition_start,
             )
+        if aborted_detail is not None:
+            break
 
-    updated_completed_paths = (
-        completed_classification_paths | visited_classification_paths
-    )
+    updated_completed_paths = completed_classification_paths | completed_now
     save_completed_partitions(
         "extract",
         updated_completed_paths,
@@ -862,8 +998,16 @@ def extract_pending_items(
             "completion_registry": completion_registry_path(
                 "extract", artifact_root=resolved_root, data_dir=data_dir
             ),
+            "failure_registry": failure_registry_path(
+                "extract", artifact_root=resolved_root, data_dir=data_dir
+            ),
+            "partitions_completed": sorted(completed_now),
+            "retry_failures": retry_failures,
+            "aborted": aborted_detail is not None,
+            "abort_detail": aborted_detail,
         },
     )
+    save_extract_failures(recorded_failures, resolved_root, data_dir=data_dir)
 
     LOGGER.info(
         "Extractor complete: successes=%s failures=%s mentions=%s run_dir=%s",
@@ -876,6 +1020,8 @@ def extract_pending_items(
         sum(len(frame) for frame in processed_frames),
         full_jsonl_path,
     )
+    if aborted_detail is not None:
+        raise ExtractionAborted(aborted_item_id or "", aborted_detail)
     if not processed_frames:
         return pd.DataFrame(columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
     return pd.concat(processed_frames, ignore_index=True).reindex(
@@ -952,6 +1098,36 @@ def extract_tables(
     }
 
 
+class ExtractionAborted(RuntimeError):
+    """Raised when a provider-side failure stops an extraction run."""
+
+    def __init__(self, item_id: str, detail: str) -> None:
+        super().__init__(
+            f"Extraction aborted on item {item_id} after an infrastructure failure: "
+            f"{detail}"
+        )
+        self.item_id = item_id
+        self.detail = detail
+
+
+def classify_extraction_error(error: BaseException) -> str:
+    """Classify one raised extraction error as infrastructure or content."""
+    for attribute in STATUS_CODE_ATTRIBUTES:
+        value = getattr(error, attribute, None)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int) and value in INFRASTRUCTURE_STATUS_CODES:
+            return INFRASTRUCTURE_FAILURE_CLASS
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
+    if isinstance(status, int) and status in INFRASTRUCTURE_STATUS_CODES:
+        return INFRASTRUCTURE_FAILURE_CLASS
+    text = f"{type(error).__name__}: {error}"
+    if INFRASTRUCTURE_ERROR_PATTERN.search(text):
+        return INFRASTRUCTURE_FAILURE_CLASS
+    return CONTENT_FAILURE_CLASS
+
+
 async def run_extraction_workflow(
     *,
     item_row: dict[str, object],
@@ -978,6 +1154,8 @@ async def run_extraction_workflow(
                 f"{type(exc).__name__}: {exc}"
             ]
             row_state.current_attempt.status = "ERROR"
+            # Prompt assembly depends on this row's own data, not the provider.
+            row_state.failure_class = CONTENT_FAILURE_CLASS
             row_state.finish("ERROR")
             return row_state
 
@@ -993,6 +1171,7 @@ async def run_extraction_workflow(
                     f"{type(exc).__name__}: {exc}"
                 ]
                 row_state.current_attempt.status = "ERROR"
+                row_state.failure_class = classify_extraction_error(exc)
                 row_state.finish("ERROR")
                 return row_state
 
@@ -1017,6 +1196,7 @@ async def run_extraction_workflow(
                 break
 
             if row_state.current_attempt.attempt_index >= max_attempts:
+                row_state.failure_class = CONTENT_FAILURE_CLASS
                 row_state.finish("FAILED")
                 return row_state
             row_state.retry(stage.build_retry_message(failures))

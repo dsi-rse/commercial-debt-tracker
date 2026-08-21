@@ -183,6 +183,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
     )
     extract_parser.add_argument("--force", action="store_true")
+    extract_parser.add_argument(
+        "--retry-failures",
+        action="store_true",
+        help=(
+            "Re-drive only the rows recorded in the extract failure registry, "
+            "merging results into their existing mention partitions."
+        ),
+    )
     extract_parser.add_argument("--model", default=DEFAULT_EXTRACTOR_MODEL)
     extract_parser.add_argument(
         "--reasoning-effort", default=DEFAULT_EXTRACTOR_REASONING_EFFORT
@@ -487,9 +495,10 @@ def run_extractor(args: argparse.Namespace) -> int:
     artifact_root = args.artifact_root or default_output_root()
     try:
         logger.info(
-            "Starting extraction: batch_size=%s force=%s input=%s output=%s model=%s reasoning_effort=%s max_attempts=%s audit=%s",
+            "Starting extraction: batch_size=%s force=%s retry_failures=%s input=%s output=%s model=%s reasoning_effort=%s max_attempts=%s audit=%s",
             args.batch_size,
             args.force,
+            args.retry_failures,
             classifications_root(artifact_root),
             mentions_root(artifact_root),
             args.model,
@@ -504,6 +513,7 @@ def run_extractor(args: argparse.Namespace) -> int:
             model=args.model,
             reasoning_effort=args.reasoning_effort,
             max_attempts=args.max_attempts,
+            retry_failures=args.retry_failures,
         )
     except Exception:
         logger.exception("Extraction failed")

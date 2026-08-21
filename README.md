@@ -68,6 +68,7 @@ make local-run
 Notes:
 
 - `cdt` is the stage-oriented CLI for local and ad hoc runs.
+- `cdt extract --retry-failures` re-drives only the rows in `failures/extract/failures.json`, which is where rows that died on provider errors are recorded.
 - `cdt-orchestrator` is the deployment-oriented entrypoint used by ECS.
 - `cdt pipeline` writes final snapshots only when `--final-database-root` is passed.
 - `cdt-orchestrator` reads `FINAL_DATABASE_ROOT` from the environment, or accepts `--final-database-root` before the mode.

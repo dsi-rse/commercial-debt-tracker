@@ -9,12 +9,14 @@ import pytest
 
 from cdt.classifier import classifications_root, classify_pending_items
 from cdt.classifier import core as classifier_core
-from cdt.datasets import shard_for_accession
-from cdt.extractor import extract_pending_items, mentions_root
+from cdt.datasets import load_completed_partitions, shard_for_accession
+from cdt.extractor import ExtractionAborted, extract_pending_items, mentions_root
 from cdt.extractor.core import (
     ExtractionRowState,
     InstrumentIEStage,
     InstrumentRelationStage,
+    classify_extraction_error,
+    load_extract_failures,
 )
 from cdt.ingest import DOCUMENT_COLUMNS
 from cdt.itemizer import core as itemizer_core
@@ -411,6 +413,178 @@ def test_extract_pending_items_drains_all_partitions(
     ]
     audit_files = list((tmp_path / "extractor-runs").glob("run_id=*/full.jsonl"))
     assert len(audit_files) == 1
+
+
+class ProviderError(Exception):  # noqa: N818
+    """Stand-in for a provider-side error carrying an HTTP status."""
+
+    def __init__(self: ProviderError, message: str, status_code: int) -> None:
+        """Store the HTTP status the provider returned."""
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def seed_classified_partition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Itemize and classify one document partition for extractor tests."""
+    seed_document_partition(tmp_path)
+    itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
+    monkeypatch.setattr(
+        classifier_core,
+        "load_training_artifacts",
+        lambda path: (FakeModel(), 0.5, {"threshold": 0.5}),
+    )
+    classify_pending_items(artifact_root=tmp_path, batch_size=5)
+
+
+def test_classify_extraction_error_separates_provider_from_content() -> None:
+    """Provider status codes and messages classify as infrastructure failures."""
+    assert (
+        classify_extraction_error(ProviderError("payment required", 402))
+        == "infrastructure"
+    )
+    assert (
+        classify_extraction_error(ProviderError("too many requests", 429))
+        == "infrastructure"
+    )
+    assert (
+        classify_extraction_error(RuntimeError("Connection reset by peer"))
+        == "infrastructure"
+    )
+    assert classify_extraction_error(ProviderError("bad request", 400)) == "content"
+    assert classify_extraction_error(ValueError("ner_tagged_xml is required")) == (
+        "content"
+    )
+
+
+def test_extract_pending_items_leaves_partition_pending_after_provider_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provider failure aborts the run and never marks the partition complete."""
+    seed_classified_partition(tmp_path, monkeypatch)
+
+    async def failing_workflow(**kwargs: object) -> ExtractionRowState:
+        item_row = kwargs["item_row"]
+        row_state = ExtractionRowState(item_row=item_row, stage_name="instrument_ie")
+        row_state.failure_class = "infrastructure"
+        row_state.current_attempt.validation_errors = [
+            "PaymentRequiredResponseError: 402 credits exhausted"
+        ]
+        row_state.finish("ERROR")
+        return row_state
+
+    monkeypatch.setattr("cdt.extractor.core.run_extraction_workflow", failing_workflow)
+
+    with pytest.raises(ExtractionAborted):
+        extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+
+    assert load_completed_partitions("extract", artifact_root=tmp_path) == set()
+    failures = load_extract_failures(tmp_path)
+    assert len(failures) == 1
+    entry = next(iter(failures.values()))
+    assert entry["failure_class"] == "infrastructure"
+    assert entry["state"] == "ERROR"
+    assert entry["classification_path"].endswith("part-0000.parquet")
+
+
+def test_extract_pending_items_completes_partition_on_content_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A row the model cannot satisfy is terminal, so the partition is complete."""
+    seed_classified_partition(tmp_path, monkeypatch)
+
+    async def content_failure_workflow(**kwargs: object) -> ExtractionRowState:
+        item_row = kwargs["item_row"]
+        row_state = ExtractionRowState(item_row=item_row, stage_name="instrument_ie")
+        row_state.failure_class = "content"
+        row_state.current_attempt.validation_errors = ["Output must be a JSON array."]
+        row_state.finish("FAILED")
+        return row_state
+
+    monkeypatch.setattr(
+        "cdt.extractor.core.run_extraction_workflow", content_failure_workflow
+    )
+
+    mentions = extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+
+    assert mentions.empty
+    assert load_completed_partitions("extract", artifact_root=tmp_path) != set()
+    assert len(load_extract_failures(tmp_path)) == 1
+
+
+def test_extract_pending_items_retries_recorded_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-drive processes only recorded rows and clears them once they succeed."""
+    seed_classified_partition(tmp_path, monkeypatch)
+    attempts: list[str] = []
+
+    async def failing_workflow(**kwargs: object) -> ExtractionRowState:
+        item_row = kwargs["item_row"]
+        attempts.append(str(item_row["item_id"]))
+        row_state = ExtractionRowState(item_row=item_row, stage_name="instrument_ie")
+        row_state.failure_class = "infrastructure"
+        row_state.current_attempt.validation_errors = ["402 credits exhausted"]
+        row_state.finish("ERROR")
+        return row_state
+
+    monkeypatch.setattr("cdt.extractor.core.run_extraction_workflow", failing_workflow)
+    with pytest.raises(ExtractionAborted):
+        extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+    failed_item_id = next(iter(load_extract_failures(tmp_path)))
+    attempts.clear()
+
+    async def succeeding_workflow(**kwargs: object) -> ExtractionRowState:
+        item_row = kwargs["item_row"]
+        attempts.append(str(item_row["item_id"]))
+        row_state = ExtractionRowState(item_row=item_row, stage_name="instrument_ie")
+        row_state.debt_instrument_mentions = [
+            {
+                "debt_instrument_mention_id": "m-retried",
+                "item_id": item_row["item_id"],
+                "accession_number": item_row["accession_number"],
+                "cik": item_row["cik"],
+                "date": item_row["date"],
+                "raw_id": "i-1",
+                "name": "Term Loan",
+                "start_date": "2024-01-01",
+                "end_date": None,
+                "amount": "$100 million",
+                "amendment_of": None,
+                "retired_of": None,
+                "split_of": None,
+                "lenders_json": "[]",
+                "other_interested_parties_json": "[]",
+                "name_json": "{}",
+                "start_date_json": "{}",
+                "end_date_json": "{}",
+                "amount_json": "{}",
+            }
+        ]
+        row_state.finish("SUCCESS")
+        return row_state
+
+    monkeypatch.setattr(
+        "cdt.extractor.core.run_extraction_workflow", succeeding_workflow
+    )
+
+    mentions = extract_pending_items(
+        artifact_root=tmp_path,
+        batch_size=5,
+        client=None,
+        retry_failures=True,
+    )
+
+    assert attempts == [failed_item_id]
+    assert mentions["debt_instrument_mention_id"].to_list() == ["m-retried"]
+    assert load_extract_failures(tmp_path) == {}
+    written = read_dataset(mentions_root(tmp_path))
+    assert written["debt_instrument_mention_id"].to_list() == ["m-retried"]
 
 
 def test_extract_pending_items_skips_empty_outputs_on_rerun(

@@ -609,6 +609,7 @@ def test_extract_cli_calls_pending_extractor(
         model: str | None = None,
         reasoning_effort: str | None = None,
         max_attempts: int,
+        retry_failures: bool = False,
     ) -> pd.DataFrame:
         del artifact_root
         calls.append(
@@ -618,6 +619,7 @@ def test_extract_cli_calls_pending_extractor(
                 "model": model,
                 "reasoning_effort": reasoning_effort,
                 "max_attempts": max_attempts,
+                "retry_failures": retry_failures,
             }
         )
         return pd.DataFrame([{"debt_instrument_mention_id": "m-1"}])
@@ -648,6 +650,7 @@ def test_extract_cli_calls_pending_extractor(
             "model": "anthropic/claude-sonnet-4",
             "reasoning_effort": "high",
             "max_attempts": 5,
+            "retry_failures": False,
         }
     ]
 
