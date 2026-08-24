@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
 from time import perf_counter
@@ -160,6 +160,7 @@ class ClusterProfile:
     normalized_end_dates: set[str]
     normalized_name_fingerprints: set[str]
     lender_signatures: set[str]
+    relation_target_ids: set[str] = field(default_factory=set)
 
     def add_member(self: ClusterProfile, mention: PreparedMention) -> None:
         """Update the cluster cache with one newly accepted member."""
@@ -175,6 +176,9 @@ class ClusterProfile:
             self.normalized_name_fingerprints.add(mention.normalized_name_fingerprint)
         if mention.lender_signature:
             self.lender_signatures.add(mention.lender_signature)
+        for target in (mention.amendment_of, mention.retired_of, mention.split_of):
+            if target:
+                self.relation_target_ids.add(target)
 
 
 @dataclass(frozen=True)
@@ -604,6 +608,8 @@ def score_candidates_for_mention(
             continue
         if mention.split_of and mention.split_of in profile.member_ids:
             continue
+        if mention.debt_instrument_mention_id in profile.relation_target_ids:
+            continue
         if profile.normalized_end_dates and not any(
             end_dates_are_compatible(mention.normalized_end_date, candidate_end_date)
             for candidate_end_date in profile.normalized_end_dates
@@ -616,24 +622,29 @@ def score_candidates_for_mention(
             for candidate_name in profile.normalized_name_fingerprints
         ):
             continue
-        if not has_match_keys:
-            if (
+        keys_match = (
+            has_match_keys
+            and mention.normalized_amount in profile.normalized_amounts
+            and mention.normalized_start_date in profile.normalized_start_dates
+        )
+        if not keys_match:
+            # Launch, pricing, and closing 8-Ks for one offering drift on
+            # amount (upsizes) and start date (pricing vs settlement), so an
+            # identifying fingerprint may attach a mention whose keys conflict.
+            if name_fingerprint_is_identifying(
                 mention.normalized_name_fingerprint
-                not in profile.normalized_name_fingerprints
+            ) and (
+                mention.normalized_name_fingerprint
+                in profile.normalized_name_fingerprints
             ):
-                continue
-            candidates.append(
-                CandidateScore(
-                    debt_instrument_id=profile.debt_instrument_id,
-                    match_score=round(strong_match_threshold, 4),
-                    support_family="name",
-                    basis="name_fingerprint",
+                candidates.append(
+                    CandidateScore(
+                        debt_instrument_id=profile.debt_instrument_id,
+                        match_score=round(strong_match_threshold, 4),
+                        support_family="name",
+                        basis="name_fingerprint",
+                    )
                 )
-            )
-            continue
-        if mention.normalized_amount not in profile.normalized_amounts:
-            continue
-        if mention.normalized_start_date not in profile.normalized_start_dates:
             continue
         lender_similarity = max(
             (

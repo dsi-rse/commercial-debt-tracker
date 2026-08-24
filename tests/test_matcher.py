@@ -233,3 +233,95 @@ def test_year_only_fingerprint_is_not_identifying() -> None:
         )
     )
     assert score(other_subsidiary, profile_from(seed)) == []
+
+
+def test_upsized_pricing_mention_attaches_by_fingerprint() -> None:
+    """A pricing 8-K that upsizes the launch amount still joins the offering."""
+    launch = prepare_mention(
+        mention_row(name="9.875% Senior Secured Notes due 2025", amount="400000000")
+    )
+    pricing = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-2",
+            name="9.875% Senior Secured Notes due 2025",
+            amount="555159000",
+        )
+    )
+    candidates = score(pricing, profile_from(launch))
+    assert len(candidates) == 1
+    assert candidates[0].basis == "name_fingerprint"
+
+
+def test_closing_mention_with_drifted_start_date_attaches_by_fingerprint() -> None:
+    """A closing 8-K dated at settlement still joins the priced offering."""
+    pricing = prepare_mention(mention_row(start_date="2024-03-05"))
+    closing = prepare_mention(
+        mention_row(debt_instrument_mention_id="mention-2", start_date="2024-03-19")
+    )
+    candidates = score(closing, profile_from(pricing))
+    assert len(candidates) == 1
+    assert candidates[0].basis == "name_fingerprint"
+
+
+def test_generic_name_upsize_stays_split() -> None:
+    """Launch names without a coupon cannot bridge conflicting amounts."""
+    launch = prepare_mention(
+        mention_row(name="Senior Guaranteed Notes due 2029", amount="800000000")
+    )
+    pricing = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-2",
+            name="Senior Guaranteed Notes due 2029",
+            amount="900000000",
+        )
+    )
+    assert score(pricing, profile_from(launch)) == []
+
+
+def test_exact_key_match_keeps_amount_start_basis() -> None:
+    """Full-evidence matches still report the amount_start basis."""
+    seed = prepare_mention(mention_row())
+    repeat = prepare_mention(mention_row(debt_instrument_mention_id="mention-2"))
+    candidates = score(repeat, profile_from(seed))
+    assert candidates[0].basis == "amount_start"
+    assert candidates[0].match_score == 1.0
+
+
+def test_relation_target_cannot_join_declaring_cluster() -> None:
+    """Old notes retired by an exchange stay outside the new notes' cluster."""
+    new_notes = prepare_mention(
+        mention_row(
+            name="6.375% Senior Notes due 2025",
+            amount="231800000",
+            retired_of="mention-old",
+        )
+    )
+    old_notes = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-old",
+            name="6.375% Senior Notes due 2025",
+            amount="38400000",
+            start_date="2010-05-11",
+        )
+    )
+    assert score(old_notes, profile_from(new_notes)) == []
+
+
+def test_declaring_mention_cannot_join_target_cluster() -> None:
+    """The new exchange notes stay outside the old notes' cluster too."""
+    old_notes = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-old",
+            name="6.375% Senior Notes due 2025",
+            amount="38400000",
+            start_date="2010-05-11",
+        )
+    )
+    new_notes = prepare_mention(
+        mention_row(
+            name="6.375% Senior Notes due 2025",
+            amount="231800000",
+            retired_of="mention-old",
+        )
+    )
+    assert score(new_notes, profile_from(old_notes)) == []
