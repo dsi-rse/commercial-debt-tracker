@@ -13,6 +13,10 @@ Do not use `amendment_of` for a new note issued in exchange for an old note if t
 Do not use `amendment_of` for debt retired with the proceeds of another debt issuance.
 Use `retired_of` when the text says the older debt ceased to exist because it was retired, repaid, cancelled, exchanged, or satisfied.
 
+## Examples
+- A commitment increase, maturity extension, amendment, or amendment and restatement filing that also describes the predecessor instrument: the mention cluster for the instrument as amended is `amendment_of` the predecessor's mention cluster. The cluster for the instrument as amended, carrying the newer terms, is always `from`; the predecessor, carrying the older terms, is always `to`.
+- A new facility that `refinances and replaces` an existing facility: the new facility is `retired_of` the replaced facility, not `amendment_of`, because the old facility ceased to exist.
+
 ## Output Rules
 1. Return a JSON array of objects with exactly the keys `from`, `to`, and `type`.
 2. The only valid `type` values are `amendment_of`, `retired_of`, and `split_of`.
