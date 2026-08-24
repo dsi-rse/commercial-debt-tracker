@@ -136,3 +136,100 @@ def test_name_rates_are_compatible_requires_rates_on_both_sides() -> None:
     assert not name_rates_are_compatible(
         "5.25% senior notes due 2028", "6.75% senior notes due 2031"
     )
+
+
+def test_keyless_mention_matches_on_identifying_fingerprint() -> None:
+    """A redemption mention without amount/start joins its instrument by name."""
+    seed = prepare_mention(mention_row())
+    redemption = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-2",
+            amount=None,
+            start_date=None,
+            end_date=None,
+        )
+    )
+    candidates = score(redemption, profile_from(seed))
+    assert len(candidates) == 1
+    assert candidates[0].match_score == 0.90
+    assert candidates[0].basis == "name_fingerprint"
+    assert candidates[0].base_match_via == "name_fingerprint"
+
+
+def test_keyless_mention_with_generic_name_stays_unmatched() -> None:
+    """Names without a rate or maturity year cannot identify an instrument."""
+    seed = prepare_mention(mention_row(name="senior secured notes"))
+    redemption = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-2",
+            name="senior secured notes",
+            amount=None,
+            start_date=None,
+            end_date=None,
+        )
+    )
+    assert score(redemption, profile_from(seed)) == []
+
+
+def test_keyless_mention_requires_exact_fingerprint_in_cluster() -> None:
+    """An identifying fingerprint only matches clusters that contain it."""
+    seed = prepare_mention(mention_row())
+    other = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-2",
+            name="6.75% senior notes due 2031",
+            amount=None,
+            start_date=None,
+            end_date=None,
+        )
+    )
+    assert score(other, profile_from(seed)) == []
+
+
+def test_keyless_mention_still_blocked_by_end_date_conflict() -> None:
+    """A rate-only name match is rejected when maturities conflict."""
+    seed = prepare_mention(
+        mention_row(name="5.25% senior secured notes", end_date="2028-06-01")
+    )
+    other = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-2",
+            name="5.25% senior secured notes",
+            amount=None,
+            start_date=None,
+            end_date="2031-06-01",
+        )
+    )
+    assert score(other, profile_from(seed)) == []
+
+
+def test_partial_key_mention_matches_despite_amount_conflict() -> None:
+    """A partial redemption amount does not block a fingerprint match."""
+    seed = prepare_mention(mention_row())
+    partial = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-2",
+            amount="400000000",
+            start_date=None,
+        )
+    )
+    candidates = score(partial, profile_from(seed))
+    assert len(candidates) == 1
+    assert candidates[0].basis == "name_fingerprint"
+
+
+def test_year_only_fingerprint_is_not_identifying() -> None:
+    """Class-plus-year names collide across subsidiary issuers of one CIK."""
+    seed = prepare_mention(
+        mention_row(name="Senior Secured Notes due 2027", end_date="2027-12-31")
+    )
+    other_subsidiary = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-2",
+            name="Senior Secured Notes due 2027",
+            amount=None,
+            start_date=None,
+            end_date="2027-12-31",
+        )
+    )
+    assert score(other_subsidiary, profile_from(seed)) == []

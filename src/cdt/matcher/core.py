@@ -184,12 +184,13 @@ class CandidateScore:
     debt_instrument_id: str
     match_score: float
     support_family: str | None
+    basis: str = "amount_start"
 
     @property
     def base_match_via(self: CandidateScore) -> str:
         """Return the explanation family without the outcome prefix."""
-        if self.support_family is None:
-            return "amount_start"
+        if self.basis != "amount_start" or self.support_family is None:
+            return self.basis
         return f"amount_start+{self.support_family}"
 
 
@@ -582,12 +583,15 @@ def score_candidates_for_mention(
     loose_match_threshold: float,
 ) -> list[CandidateScore]:
     """Return scored candidate clusters for one mention."""
-    del strong_match_threshold
     del loose_match_threshold
-    if (
-        mention.cik is None
-        or mention.normalized_amount is None
-        or mention.normalized_start_date is None
+    if mention.cik is None:
+        return []
+    has_match_keys = (
+        mention.normalized_amount is not None
+        and mention.normalized_start_date is not None
+    )
+    if not has_match_keys and not name_fingerprint_is_identifying(
+        mention.normalized_name_fingerprint
     ):
         return []
     candidates: list[CandidateScore] = []
@@ -600,10 +604,6 @@ def score_candidates_for_mention(
             continue
         if mention.split_of and mention.split_of in profile.member_ids:
             continue
-        if mention.normalized_amount not in profile.normalized_amounts:
-            continue
-        if mention.normalized_start_date not in profile.normalized_start_dates:
-            continue
         if profile.normalized_end_dates and not any(
             end_dates_are_compatible(mention.normalized_end_date, candidate_end_date)
             for candidate_end_date in profile.normalized_end_dates
@@ -615,6 +615,25 @@ def score_candidates_for_mention(
             )
             for candidate_name in profile.normalized_name_fingerprints
         ):
+            continue
+        if not has_match_keys:
+            if (
+                mention.normalized_name_fingerprint
+                not in profile.normalized_name_fingerprints
+            ):
+                continue
+            candidates.append(
+                CandidateScore(
+                    debt_instrument_id=profile.debt_instrument_id,
+                    match_score=round(strong_match_threshold, 4),
+                    support_family="name",
+                    basis="name_fingerprint",
+                )
+            )
+            continue
+        if mention.normalized_amount not in profile.normalized_amounts:
+            continue
+        if mention.normalized_start_date not in profile.normalized_start_dates:
             continue
         lender_similarity = max(
             (
@@ -683,7 +702,9 @@ def resolve_candidates(
                     edge_type="member",
                     match_score=top_candidate.match_score,
                     candidate_rank=1,
-                    match_via=render_match_via("member", top_candidate.support_family),
+                    match_via=render_match_via(
+                        "member", top_candidate.support_family, top_candidate.basis
+                    ),
                     evaluated_run_id=evaluated_run_id,
                 )
             ]
@@ -697,7 +718,9 @@ def resolve_candidates(
                         edge_type="related",
                         match_score=candidate.match_score,
                         candidate_rank=rank,
-                        match_via=render_match_via("related", candidate.support_family),
+                        match_via=render_match_via(
+                            "related", candidate.support_family, candidate.basis
+                        ),
                         evaluated_run_id=evaluated_run_id,
                     )
                 )
@@ -723,7 +746,9 @@ def resolve_candidates(
                     edge_type="ambiguous_candidate",
                     match_score=candidate.match_score,
                     candidate_rank=rank,
-                    match_via=render_match_via("ambiguous", candidate.support_family),
+                    match_via=render_match_via(
+                        "ambiguous", candidate.support_family, candidate.basis
+                    ),
                     evaluated_run_id=evaluated_run_id,
                 )
             )
@@ -754,7 +779,9 @@ def resolve_candidates(
                 edge_type="related",
                 match_score=candidate.match_score,
                 candidate_rank=rank,
-                match_via=render_match_via("related", candidate.support_family),
+                match_via=render_match_via(
+                    "related", candidate.support_family, candidate.basis
+                ),
                 evaluated_run_id=evaluated_run_id,
             )
         )
@@ -783,10 +810,12 @@ def build_edge_row(
     }
 
 
-def render_match_via(outcome: str, support_family: str | None) -> str:
+def render_match_via(
+    outcome: str, support_family: str | None, basis: str = "amount_start"
+) -> str:
     """Render one stable explanation-family label for an edge."""
-    base = f"{outcome}:amount_start"
-    if support_family is None:
+    base = f"{outcome}:{basis}"
+    if support_family is None or basis != "amount_start":
         return base
     return f"{base}+{support_family}"
 
@@ -1289,6 +1318,18 @@ def name_rate_tokens(fingerprint: str | None) -> frozenset[str]:
     if not fingerprint:
         return frozenset()
     return frozenset(NAME_RATE_PATTERN.findall(fingerprint))
+
+
+def name_fingerprint_is_identifying(fingerprint: str | None) -> bool:
+    """Return whether a name fingerprint alone can identify one instrument.
+
+    A coupon rate is required: one issuer group can announce several
+    generic "Senior Secured Notes due YYYY" through different subsidiaries,
+    so a class-plus-year name is not identifying on its own.
+    """
+    if not fingerprint:
+        return False
+    return bool(NAME_RATE_PATTERN.search(fingerprint))
 
 
 def name_rates_are_compatible(left: str | None, right: str | None) -> bool:
