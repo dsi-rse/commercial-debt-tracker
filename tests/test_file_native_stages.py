@@ -1620,3 +1620,20 @@ def test_match_tables_retired_of_keeps_separate_clusters_and_updates_parent_end_
     }
     assert instruments["m-2"]["retired_of_debt_instrument_id"] == "m-1"
     assert instruments["m-1"]["end_date"] == "2024-03-01"
+
+
+def test_retry_includes_prior_response_as_assistant_turn() -> None:
+    """Retry conversations must include the failed output the retry references."""
+    row_state = ExtractionRowState(item_row={"item_id": "item-1"}, stage_name="ner")
+    row_state.add_messages([{"role": "user", "content": "tag this filing"}])
+    row_state.add_response("<bad-xml>")
+    row_state.add_validation(["unclosed tag"])
+    row_state.retry("Your previous NER output failed validation: unclosed tag")
+    assert row_state.current_attempt.messages == [
+        {"role": "user", "content": "tag this filing"},
+        {"role": "assistant", "content": "<bad-xml>"},
+        {
+            "role": "user",
+            "content": "Your previous NER output failed validation: unclosed tag",
+        },
+    ]

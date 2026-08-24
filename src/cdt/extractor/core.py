@@ -243,6 +243,10 @@ class ExtractionRowState:
         """Prepare a retry attempt for the current stage."""
         self.all_attempts.append(self.current_attempt)
         new_messages = list(self.current_attempt.messages)
+        if self.current_attempt.response is not None:
+            new_messages.append(
+                {"role": "assistant", "content": self.current_attempt.response}
+            )
         new_messages.append({"role": "user", "content": retry_message})
         self.current_attempt = AttemptRecord(
             stage_name=self.current_attempt.stage_name,
