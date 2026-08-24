@@ -157,6 +157,7 @@ class ClusterProfile:
     member_ids: list[str]
     normalized_amounts: set[str]
     normalized_start_dates: set[str]
+    normalized_end_dates: set[str]
     normalized_name_fingerprints: set[str]
     lender_signatures: set[str]
 
@@ -168,6 +169,8 @@ class ClusterProfile:
             self.normalized_amounts.add(mention.normalized_amount)
         if mention.normalized_start_date:
             self.normalized_start_dates.add(mention.normalized_start_date)
+        if mention.normalized_end_date:
+            self.normalized_end_dates.add(mention.normalized_end_date)
         if mention.normalized_name_fingerprint:
             self.normalized_name_fingerprints.add(mention.normalized_name_fingerprint)
         if mention.lender_signature:
@@ -488,6 +491,7 @@ def build_cluster_profiles(
             member_ids=list(member_ids),
             normalized_amounts=set(),
             normalized_start_dates=set(),
+            normalized_end_dates=set(),
             normalized_name_fingerprints=set(),
             lender_signatures=set(),
         )
@@ -501,6 +505,11 @@ def build_cluster_profiles(
         )
         if normalized_start_date:
             profile.normalized_start_dates.add(normalized_start_date)
+        normalized_end_date = normalize_date(
+            coerce_optional_text(instrument_row.get("end_date"))
+        )
+        if normalized_end_date:
+            profile.normalized_end_dates.add(normalized_end_date)
         normalized_name = normalize_name_fingerprint(
             coerce_optional_text(instrument_row.get("name"))
         )
@@ -537,6 +546,7 @@ def build_cluster_profiles(
             member_ids=[],
             normalized_amounts=set(),
             normalized_start_dates=set(),
+            normalized_end_dates=set(),
             normalized_name_fingerprints=set(),
             lender_signatures=set(),
         )
@@ -558,6 +568,7 @@ def build_empty_profile(
         member_ids=[],
         normalized_amounts=set(),
         normalized_start_dates=set(),
+        normalized_end_dates=set(),
         normalized_name_fingerprints=set(),
         lender_signatures=set(),
     )
@@ -592,6 +603,18 @@ def score_candidates_for_mention(
         if mention.normalized_amount not in profile.normalized_amounts:
             continue
         if mention.normalized_start_date not in profile.normalized_start_dates:
+            continue
+        if profile.normalized_end_dates and not any(
+            end_dates_are_compatible(mention.normalized_end_date, candidate_end_date)
+            for candidate_end_date in profile.normalized_end_dates
+        ):
+            continue
+        if profile.normalized_name_fingerprints and not any(
+            name_rates_are_compatible(
+                mention.normalized_name_fingerprint, candidate_name
+            )
+            for candidate_name in profile.normalized_name_fingerprints
+        ):
             continue
         lender_similarity = max(
             (
@@ -1249,4 +1272,23 @@ def end_dates_are_compatible(left: str | None, right: str | None) -> bool:
     """Return whether two normalized end dates can still describe one instrument."""
     if left and right:
         return left == right
+    return True
+
+
+NAME_RATE_PATTERN = re.compile(r"\d+(?:\.\d+)?%")
+
+
+def name_rate_tokens(fingerprint: str | None) -> frozenset[str]:
+    """Return the coupon-rate tokens embedded in one name fingerprint."""
+    if not fingerprint:
+        return frozenset()
+    return frozenset(NAME_RATE_PATTERN.findall(fingerprint))
+
+
+def name_rates_are_compatible(left: str | None, right: str | None) -> bool:
+    """Return whether two name fingerprints can still describe one instrument."""
+    left_rates = name_rate_tokens(left)
+    right_rates = name_rate_tokens(right)
+    if left_rates and right_rates:
+        return bool(left_rates & right_rates)
     return True
