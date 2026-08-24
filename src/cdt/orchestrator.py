@@ -14,8 +14,10 @@ hour (or an EventBridge retry) cannot overlap the next tick, and ``daily``'s
 match/finalize cannot interleave with a completing poll's. A run that finds the
 lease held skips its turn (``locked``) and the next scheduled run picks it up.
 
-``historical`` (and ``daily --extractor-backend live``) keep the original fully
-synchronous pipeline that extracts live via OpenRouter.
+``historical`` follows the same shape as ``daily`` — with the default ``batch``
+backend it prepares its date range and hands extraction to the poller, whose next
+tick claims the pending partitions. ``--extractor-backend live`` (on either mode)
+keeps the original fully synchronous pipeline that extracts via OpenRouter.
 """
 
 from __future__ import annotations
@@ -66,9 +68,9 @@ def _add_stage_batch_size_arguments(subparser: argparse.ArgumentParser) -> None:
         type=positive_int,
         default=None,
         help=(
-            "rows per synchronous extract batch; applies to historical and "
-            f"'daily --extractor-backend live' only (default {DEFAULT_STAGE_BATCH_SIZE}). "
-            "The batch backend chunks by --max-requests-per-batch on poll instead."
+            "rows per synchronous extract batch; applies with --extractor-backend "
+            f"live only (default {DEFAULT_STAGE_BATCH_SIZE}). The batch backend "
+            "chunks by --max-requests-per-batch on poll instead."
         ),
     )
     subparser.add_argument(
@@ -103,8 +105,9 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("live", "batch"),
         default=os.environ.get("EXTRACTOR_BACKEND", "batch"),
         help=(
-            "daily extract backend: 'batch' (default) defers extraction to the "
-            "OpenAI batch poller; 'live' runs the synchronous OpenRouter pipeline."
+            "extract backend for daily and historical: 'batch' (default) defers "
+            "extraction to the OpenAI batch poller; 'live' runs the synchronous "
+            "OpenRouter pipeline."
         ),
     )
     subparsers = parser.add_subparsers(dest="mode", required=True)
@@ -153,8 +156,13 @@ def _pipeline_config(args: argparse.Namespace) -> PipelineConfig:
     )
 
 
-def run_daily_batch(args: argparse.Namespace) -> int:
-    """Run daily ingest/itemize/classify plus match/finalize, deferring extract."""
+def run_batch_backend(args: argparse.Namespace) -> int:
+    """Run ingest/itemize/classify plus match/finalize, deferring extract to poll.
+
+    Serves both ``daily`` and ``historical``: the pipeline config carries the
+    mode, so only the resolved date range differs. The next poll tick claims
+    whatever classification partitions this run leaves pending.
+    """
     if args.extract_batch_size is not None:
         LOGGER.warning(
             "Ignoring --extract-batch-size=%s: the batch backend defers extraction "
@@ -244,10 +252,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.mode == "poll":
         return run_poll(args)
-    if args.mode == "daily" and args.extractor_backend == "batch":
-        return run_daily_batch(args)
+    if args.extractor_backend == "batch":
+        return run_batch_backend(args)
 
-    # historical, or daily with the live backend: the original synchronous pipeline.
+    # The live backend: the original synchronous pipeline.
     result = run_pipeline(_pipeline_config(args))
     print(result.artifact_root)
     return 0

@@ -60,9 +60,11 @@ cdt-orchestrator daily   # daily schedule: ingest/itemize/classify + match/final
 cdt-orchestrator poll    # hourly schedule: advances the OpenAI batch extract job one step
 ```
 
-`daily` uses the OpenAI batch extract backend by default and defers extraction to the
-poller. Historical runs are never scheduled automatically and use the synchronous
-OpenRouter backend.
+`daily` and `historical` both use the OpenAI batch extract backend by default and
+defer extraction to the poller — a historical backfill's classified items are claimed
+by the next poll tick. Historical runs are never scheduled automatically. Pass
+`--extractor-backend live` (before the mode) for the synchronous OpenRouter pipeline
+that extracts within the run itself.
 
 ## CI/CD Flow
 
