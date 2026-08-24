@@ -325,3 +325,45 @@ def test_declaring_mention_cannot_join_target_cluster() -> None:
         )
     )
     assert score(new_notes, profile_from(old_notes)) == []
+
+
+LENDER_JSON = (
+    '[{"mentions": [{"text": "JPMorgan Chase Bank, N.A.", "tag_id": "tag-1"}],'
+    ' "tag_ids": ["tag-1"]}]'
+)
+
+
+def test_name_conflict_suppresses_lender_support() -> None:
+    """Facility components sharing lenders and totals stay separate."""
+    revolver = prepare_mention(
+        mention_row(name="Revolving Loans", lenders_json=LENDER_JSON)
+    )
+    swing = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-2",
+            name="Swing Line Loans",
+            lenders_json=LENDER_JSON,
+        )
+    )
+    candidates = score(swing, profile_from(revolver))
+    assert len(candidates) == 1
+    assert candidates[0].match_score == 0.75
+    assert candidates[0].support_family is None
+
+
+def test_lender_support_still_applies_without_name_conflict() -> None:
+    """Shared lenders vouch for membership when names do not disagree."""
+    seed = prepare_mention(
+        mention_row(name="Revolving Loans", lenders_json=LENDER_JSON)
+    )
+    unnamed = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-2",
+            name=None,
+            lenders_json=LENDER_JSON,
+        )
+    )
+    candidates = score(unnamed, profile_from(seed))
+    assert len(candidates) == 1
+    assert candidates[0].support_family == "lenders"
+    assert candidates[0].match_score == 1.0

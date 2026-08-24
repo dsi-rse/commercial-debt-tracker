@@ -661,9 +661,18 @@ def score_candidates_for_mention(
             in profile.normalized_name_fingerprints
             else 0.0
         )
+        name_conflict = bool(
+            mention.normalized_name_fingerprint is not None
+            and profile.normalized_name_fingerprints
+            and mention.normalized_name_fingerprint
+            not in profile.normalized_name_fingerprints
+        )
         support_family: str | None = None
         support_strength = 0.0
-        if lender_similarity >= DEFAULT_LENDER_SUPPORT_THRESHOLD:
+        # Distinct facilities under one credit agreement share amount, start
+        # date, and lenders, so shared lenders cannot vouch for a membership
+        # when the two sides actively disagree on the instrument name.
+        if lender_similarity >= DEFAULT_LENDER_SUPPORT_THRESHOLD and not name_conflict:
             support_family = "lenders"
             support_strength = lender_similarity
         if name_support > support_strength:
