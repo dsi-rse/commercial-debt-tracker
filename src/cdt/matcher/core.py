@@ -1270,9 +1270,15 @@ def lender_similarity_score(left: str, right: str) -> float:
 
 def end_dates_are_compatible(left: str | None, right: str | None) -> bool:
     """Return whether two normalized end dates can still describe one instrument."""
-    if left and right:
-        return left == right
-    return True
+    if not left or not right:
+        return True
+    if left == right:
+        return True
+    if left[:4] != right[:4]:
+        return False
+    # A YYYY-12-31 value may come from a year-only maturity such as "due 2030",
+    # so it is only year-resolution evidence and matches any date in that year.
+    return left.endswith("-12-31") or right.endswith("-12-31")
 
 
 NAME_RATE_PATTERN = re.compile(r"\d+(?:\.\d+)?%")

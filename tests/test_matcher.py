@@ -101,12 +101,29 @@ def test_conflicting_name_rates_block_membership_without_end_dates() -> None:
 
 
 def test_end_dates_are_compatible_handles_missing_values() -> None:
-    """Only two present-and-different end dates are incompatible."""
+    """Only two present-and-conflicting end dates are incompatible."""
     assert end_dates_are_compatible(None, None)
     assert end_dates_are_compatible("2028-06-01", None)
     assert end_dates_are_compatible(None, "2028-06-01")
     assert end_dates_are_compatible("2028-06-01", "2028-06-01")
     assert not end_dates_are_compatible("2028-06-01", "2031-06-01")
+
+
+def test_end_dates_treat_december_31_as_year_resolution() -> None:
+    """A YYYY-12-31 sentinel from 'due YYYY' matches any date in that year."""
+    assert end_dates_are_compatible("2030-12-31", "2030-04-15")
+    assert end_dates_are_compatible("2030-04-15", "2030-12-31")
+    assert not end_dates_are_compatible("2030-12-31", "2031-04-15")
+    assert not end_dates_are_compatible("2030-04-15", "2030-06-01")
+
+
+def test_year_resolution_end_date_still_matches_exact_maturity() -> None:
+    """Pricing 8-K 'due 2030' merges with the closing 8-K's exact maturity."""
+    seed = prepare_mention(mention_row(end_date="2030-12-31"))
+    closing = prepare_mention(
+        mention_row(debt_instrument_mention_id="mention-2", end_date="2030-04-15")
+    )
+    assert len(score(closing, profile_from(seed))) == 1
 
 
 def test_name_rates_are_compatible_requires_rates_on_both_sides() -> None:
