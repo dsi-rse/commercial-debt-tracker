@@ -28,6 +28,16 @@ on:
         required: true
         default: false
         type: boolean
+      extractor_backend:
+        description: >-
+          batch defers extraction to the hourly poll schedule; live extracts
+          synchronously within this task via OpenRouter
+        required: true
+        default: batch
+        type: choice
+        options:
+          - batch
+          - live
 
 jobs:
   run-historical:
@@ -81,13 +91,15 @@ jobs:
             --arg start_date "${{ inputs.start_date }}" \
             --arg end_date "${{ inputs.end_date }}" \
             --arg cik_file "${{ inputs.cik_file }}" \
+            --arg backend "${{ inputs.extractor_backend }}" \
             --argjson force "${{ inputs.force }}" \
             '{
               containerOverrides: [
                 {
                   name: "cdt-orchestrator",
                   command: (
-                    ["historical", "--cik-file", $cik_file, "--start-date", $start_date, "--end-date", $end_date]
+                    ["--extractor-backend", $backend,
+                     "historical", "--cik-file", $cik_file, "--start-date", $start_date, "--end-date", $end_date]
                     + (if $force then ["--force"] else [] end)
                   )
                 }
@@ -124,6 +136,7 @@ jobs:
             echo "- End date: \`${{ inputs.end_date }}\`"
             echo "- CIK file: \`${{ inputs.cik_file }}\`"
             echo "- Force: \`${{ inputs.force }}\`"
+            echo "- Extractor backend: \`${{ inputs.extractor_backend }}\`"
             echo "- Task ARN: \`${{ steps.run-task.outputs.task_arn }}\`"
             echo "- Log group: \`${{ steps.stack.outputs.log_group_name }}\`"
           } >> "$GITHUB_STEP_SUMMARY"

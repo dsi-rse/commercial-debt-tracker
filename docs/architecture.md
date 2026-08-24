@@ -67,12 +67,16 @@ Three execution modes exist:
   (see "Extractor Design"). It never ingests; it only moves extraction forward and,
   when a job completes, re-runs match + finalize.
 - `historical`
-  Requires explicit dates and is intended for backfills. Historical always uses the
-  synchronous `live` extract backend so a single command produces final outputs.
+  Requires explicit dates and is intended for backfills. It follows the same shape as
+  `daily`: with the default `batch` backend it prepares its date range and refreshes
+  match/final snapshots, and the poller's next tick claims the pending partitions for
+  extraction. `--extractor-backend live` runs the synchronous OpenRouter pipeline
+  instead, so a single command produces final outputs.
 
 The scheduler runs `daily` (once a day) and `poll` (hourly). Historical runs are manual
-by design so wide backfills are deliberate, observable operations. `daily
---extractor-backend live` restores the original fully synchronous single-run behavior.
+by design so wide backfills are deliberate, observable operations. Where no poll
+schedule is running (e.g. a local backfill), either run `cdt-orchestrator poll` by hand
+to drain extraction or use `--extractor-backend live`.
 
 ## Classifier Design
 

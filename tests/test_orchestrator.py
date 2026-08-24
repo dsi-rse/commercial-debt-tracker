@@ -1,9 +1,10 @@
-"""Tests for the cdt-orchestrator daily/poll entrypoints."""
+"""Tests for the cdt-orchestrator daily/historical/poll entrypoints."""
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -231,3 +232,151 @@ def test_daily_batch_quiet_without_extract_batch_size(
 
     assert seen == [orch.DEFAULT_STAGE_BATCH_SIZE]
     assert "--extract-batch-size" not in caplog.text
+
+
+def test_historical_batch_defers_extract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Historical with the batch backend prepares + finalizes; poll owns extraction."""
+    calls: list[str] = []
+    monkeypatch.setattr(
+        orch,
+        "run_prepare_stages",
+        lambda config: (calls.append(f"prepare:{config.mode}"), str(tmp_path))[1],
+    )
+    monkeypatch.setattr(
+        orch, "run_match_and_finalize", lambda **kwargs: calls.append("match")
+    )
+    monkeypatch.setattr(
+        orch,
+        "run_pipeline",
+        lambda config: pytest.fail("run_pipeline must not run for historical batch"),
+    )
+
+    assert (
+        orch.main(
+            [
+                "--artifact-root",
+                str(tmp_path),
+                "historical",
+                "--cik-file",
+                "c.txt",
+                "--start-date",
+                "2024-01-01",
+                "--end-date",
+                "2024-01-31",
+            ]
+        )
+        == 0
+    )
+    assert calls == ["prepare:historical", "match"]
+
+
+def test_historical_batch_passes_dates_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The deferred-extract path keeps historical's explicit date range."""
+    seen: list[tuple[object, object]] = []
+    monkeypatch.setattr(
+        orch,
+        "run_prepare_stages",
+        lambda config: (
+            seen.append((config.start_date, config.end_date)),
+            str(tmp_path),
+        )[1],
+    )
+    monkeypatch.setattr(orch, "run_match_and_finalize", lambda **kwargs: None)
+
+    assert (
+        orch.main(
+            [
+                "--artifact-root",
+                str(tmp_path),
+                "historical",
+                "--cik-file",
+                "c.txt",
+                "--start-date",
+                "2024-01-01",
+                "--end-date",
+                "2024-01-31",
+            ]
+        )
+        == 0
+    )
+    assert seen == [(date(2024, 1, 1), date(2024, 1, 31))]
+
+
+def test_historical_live_runs_full_pipeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Historical with the live backend keeps the original synchronous pipeline."""
+    calls: list[str] = []
+
+    class Result:
+        artifact_root = str(tmp_path)
+
+    monkeypatch.setattr(
+        orch, "run_pipeline", lambda config: (calls.append("pipeline"), Result())[1]
+    )
+    monkeypatch.setattr(
+        orch,
+        "run_prepare_stages",
+        lambda config: pytest.fail("prepare-only must not run for live backend"),
+    )
+
+    assert (
+        orch.main(
+            [
+                "--extractor-backend",
+                "live",
+                "--artifact-root",
+                str(tmp_path),
+                "historical",
+                "--cik-file",
+                "c.txt",
+                "--start-date",
+                "2024-01-01",
+                "--end-date",
+                "2024-01-31",
+            ]
+        )
+        == 0
+    )
+    assert calls == ["pipeline"]
+
+
+def test_historical_batch_skips_match_when_lease_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Historical skips match/finalize (but still prepares) when poll holds the lease."""
+    calls: list[str] = []
+    monkeypatch.setattr(
+        orch,
+        "run_prepare_stages",
+        lambda config: (calls.append("prepare"), tmp_path)[1],
+    )
+    monkeypatch.setattr(
+        orch,
+        "run_match_and_finalize",
+        lambda **kwargs: pytest.fail("match must not run while the lease is held"),
+    )
+    held = acquire_lease(tmp_path, orch.PIPELINE_WRITER_LEASE)
+    assert held is not None
+
+    assert (
+        orch.main(
+            [
+                "--artifact-root",
+                str(tmp_path),
+                "historical",
+                "--cik-file",
+                "c.txt",
+                "--start-date",
+                "2024-01-01",
+                "--end-date",
+                "2024-01-31",
+            ]
+        )
+        == 0
+    )
+    assert calls == ["prepare"]
