@@ -98,9 +98,9 @@ jobs:
                 {
                   name: "cdt-orchestrator",
                   command: (
-                    ["--extractor-backend", $backend,
-                     "historical", "--cik-file", $cik_file, "--start-date", $start_date, "--end-date", $end_date]
+                    ["--extractor-backend", $backend]
                     + (if $force then ["--force"] else [] end)
+                    + ["historical", "--cik-file", $cik_file, "--start-date", $start_date, "--end-date", $end_date]
                   )
                 }
               ]
