@@ -52,6 +52,14 @@ jobs:
     env:
       PULUMI_CONFIG_PASSPHRASE: ${{ secrets.PULUMI_CONFIG_PASSPHRASE }}
     steps:
+      # Same gate the shared pipelines apply: until prod infra (and the prod
+      # environment's role secrets) exist, a prod dispatch would die at the
+      # credential step with an empty role-to-assume — fail loudly instead.
+      - name: Guard prod dispatch on PROD_INFRA_READY
+        if: inputs.stack == 'prod' && vars.PROD_INFRA_READY != 'true'
+        run: |
+          echo "::error::stack=prod requires the PROD_INFRA_READY repository variable to be 'true' (prod infra and environment secrets are not provisioned yet)."
+          exit 1
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
         with:
