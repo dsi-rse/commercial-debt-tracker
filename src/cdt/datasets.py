@@ -281,6 +281,30 @@ def iter_date_shard_partitions(
     return filtered
 
 
+def existing_date_shard_partition_ids(
+    dataset_name: str,
+    *,
+    artifact_root: ArtifactPath | None = None,
+    data_dir: Path | None = None,
+) -> set[tuple[str, str]]:
+    """Return the ``(date, shard)`` ids of every written partition in a dataset.
+
+    One LIST of the dataset answers "does the output partition exist?" for any
+    number of source partitions. The per-partition alternative — a HeadObject on
+    each candidate target — costs one sequential round-trip per partition ever
+    written and dominates stage runtime once the dataset is large (#83).
+    """
+    return {
+        (partition["date"], partition["shard"])
+        for partition in (
+            parse_date_shard_partition(path)
+            for path in iter_date_shard_partitions(
+                dataset_name, artifact_root=artifact_root, data_dir=data_dir
+            )
+        )
+    }
+
+
 def iter_cik_shard_partitions(
     dataset_name: str,
     *,

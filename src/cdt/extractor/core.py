@@ -25,6 +25,7 @@ from cdt.datasets import (
     completion_registry_path,
     dataset_root,
     date_shard_partition_path,
+    existing_date_shard_partition_ids,
     extractor_run_path,
     iter_date_shard_partitions,
     load_completed_partitions,
@@ -37,7 +38,6 @@ from cdt.datasets import (
 )
 from cdt.shared import get_logger
 from cdt.storage import (
-    artifact_exists,
     read_table,
     write_json_artifact,
     write_partition_table,
@@ -788,18 +788,21 @@ def collect_pending_extract_items(
     )
     entries: list[tuple[dict[str, str | None], str, str]] = []
     claimed_paths: set[str] = set()
+    # One LIST of the mentions dataset answers every existence check; probing
+    # each target with artifact_exists costs one HeadObject per classification
+    # partition ever written and dominates discovery time at scale (#83).
+    existing_mention_ids = (
+        set()
+        if force
+        else existing_date_shard_partition_ids(
+            MENTIONS_DATASET_NAME, artifact_root=resolved_root, data_dir=data_dir
+        )
+    )
     for classification_path in iter_date_shard_partitions(
         CLASSIFICATION_DATASET_NAME, artifact_root=resolved_root, data_dir=data_dir
     ):
         partition = parse_date_shard_partition(classification_path)
-        target_path = date_shard_partition_path(
-            MENTIONS_DATASET_NAME,
-            partition_date=partition["date"],
-            shard=partition["shard"],
-            artifact_root=resolved_root,
-            data_dir=data_dir,
-        )
-        if not force and artifact_exists(target_path):
+        if (partition["date"], partition["shard"]) in existing_mention_ids:
             continue
         if not force and classification_path in completed:
             continue
@@ -855,20 +858,23 @@ def extract_pending_items(
     empty_partitions = 0
     pending_classification_paths: list[str] = []
 
+    # One LIST of the mentions dataset answers every existence check; probing
+    # each target with artifact_exists costs one HeadObject per classification
+    # partition ever written and dominates discovery time at scale (#83).
+    existing_mention_ids = (
+        set()
+        if force
+        else existing_date_shard_partition_ids(
+            MENTIONS_DATASET_NAME, artifact_root=resolved_root, data_dir=data_dir
+        )
+    )
     for classification_path in iter_date_shard_partitions(
         CLASSIFICATION_DATASET_NAME,
         artifact_root=resolved_root,
         data_dir=data_dir,
     ):
         partition = parse_date_shard_partition(classification_path)
-        target_path = date_shard_partition_path(
-            MENTIONS_DATASET_NAME,
-            partition_date=partition["date"],
-            shard=partition["shard"],
-            artifact_root=resolved_root,
-            data_dir=data_dir,
-        )
-        if not force and artifact_exists(target_path):
+        if (partition["date"], partition["shard"]) in existing_mention_ids:
             continue
         if not force and classification_path in completed_classification_paths:
             continue

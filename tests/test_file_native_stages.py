@@ -11,6 +11,7 @@ from cdt.classifier import classifications_root, classify_pending_items
 from cdt.classifier import core as classifier_core
 from cdt.datasets import (
     completion_registry_path,
+    existing_date_shard_partition_ids,
     load_row_failures,
     shard_for_accession,
 )
@@ -948,3 +949,28 @@ def test_extract_failures_are_recorded_and_cleared(
     extract_pending_items(artifact_root=tmp_path, batch_size=5, force=True, client=None)
 
     assert load_row_failures("extract", artifact_root=tmp_path) == {}
+
+
+def test_existing_date_shard_partition_ids_lists_written_partitions(
+    tmp_path: Path,
+) -> None:
+    """The one-LIST partition-id set matches exactly what was written (#83)."""
+    root = tmp_path / "artifacts"
+    table = pd.DataFrame({"item_id": ["a"], "text": ["x"]})
+    write_partition_table(
+        str(root / "items"),
+        partition={"date": "2026-01-02", "shard": "0007"},
+        table=table,
+    )
+    write_partition_table(
+        str(root / "items"),
+        partition={"date": "2026-03-04", "shard": "0001"},
+        table=table,
+    )
+
+    ids = existing_date_shard_partition_ids("items", artifact_root=str(root))
+
+    assert ids == {("2026-01-02", "0007"), ("2026-03-04", "0001")}
+    assert (
+        existing_date_shard_partition_ids("mentions", artifact_root=str(root)) == set()
+    )
