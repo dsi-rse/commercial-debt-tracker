@@ -17,6 +17,18 @@ import pandas as pd
 
 ArtifactPath = str | Path
 
+# One client for every S3 call in this module: construction is expensive
+# (credential resolution, endpoint discovery), and the partition scans issue
+# thousands of calls per run (#83).
+_S3_CLIENT = None
+
+
+def _s3_client():  # noqa: ANN202
+    global _S3_CLIENT  # noqa: PLW0603
+    if _S3_CLIENT is None:
+        _S3_CLIENT = boto3.client("s3")
+    return _S3_CLIENT
+
 
 def is_s3_uri(path: ArtifactPath) -> bool:
     """Return whether the provided path points to S3."""
@@ -53,7 +65,7 @@ def artifact_exists(path: ArtifactPath) -> bool:
     normalized = normalize_artifact_path(path)
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
-        client = boto3.client("s3")
+        client = _s3_client()
         try:
             client.head_object(Bucket=bucket, Key=key)
             return True
@@ -70,7 +82,7 @@ def list_artifacts(base: ArtifactPath, *, suffix: str = "") -> list[str]:
     normalized = normalize_artifact_path(base).rstrip("/")
     if is_s3_uri(normalized):
         bucket, prefix = parse_s3_uri(normalized)
-        paginator = boto3.client("s3").get_paginator("list_objects_v2")
+        paginator = _s3_client().get_paginator("list_objects_v2")
         results: list[str] = []
         for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
             contents = cast(list[dict[str, str]], page.get("Contents", []))
@@ -109,7 +121,7 @@ def read_json_artifact(path: ArtifactPath) -> dict[str, object] | list[object]:
     normalized = normalize_artifact_path(path)
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
-        body = boto3.client("s3").get_object(Bucket=bucket, Key=key)["Body"].read()
+        body = _s3_client().get_object(Bucket=bucket, Key=key)["Body"].read()
         return cast(dict[str, object] | list[object], json.loads(body.decode("utf-8")))
     return cast(
         dict[str, object] | list[object],
@@ -122,7 +134,7 @@ def read_text_artifact(path: ArtifactPath) -> str:
     normalized = normalize_artifact_path(path)
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
-        body = boto3.client("s3").get_object(Bucket=bucket, Key=key)["Body"].read()
+        body = _s3_client().get_object(Bucket=bucket, Key=key)["Body"].read()
         return body.decode("utf-8")
     return Path(normalized).read_text(encoding="utf-8")
 
@@ -150,7 +162,7 @@ def write_json_artifact_if_absent(
     normalized = normalize_artifact_path(path)
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
-        client = boto3.client("s3")
+        client = _s3_client()
         try:
             client.put_object(Bucket=bucket, Key=key, Body=body, IfNoneMatch="*")
         except client.exceptions.ClientError as error:  # type: ignore[attr-defined]
@@ -176,7 +188,7 @@ def read_json_artifact_versioned(
     normalized = normalize_artifact_path(path)
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
-        response = boto3.client("s3").get_object(Bucket=bucket, Key=key)
+        response = _s3_client().get_object(Bucket=bucket, Key=key)
         body = response["Body"].read()
         return (
             cast(dict[str, object] | list[object], json.loads(body.decode("utf-8"))),
@@ -203,7 +215,7 @@ def replace_json_artifact_if_match(
     normalized = normalize_artifact_path(path)
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
-        client = boto3.client("s3")
+        client = _s3_client()
         try:
             client.put_object(Bucket=bucket, Key=key, Body=body, IfMatch=version)
         except client.exceptions.ClientError as error:  # type: ignore[attr-defined]
@@ -227,7 +239,7 @@ def write_json_artifact(path: ArtifactPath, payload: dict[str, object]) -> str:
     normalized = normalize_artifact_path(path)
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
-        boto3.client("s3").put_object(Bucket=bucket, Key=key, Body=body)
+        _s3_client().put_object(Bucket=bucket, Key=key, Body=body)
         return normalized
     local_path = Path(normalized)
     local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -240,7 +252,7 @@ def write_text_artifact(path: ArtifactPath, body: str) -> str:
     normalized = normalize_artifact_path(path)
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
-        boto3.client("s3").put_object(Bucket=bucket, Key=key, Body=body.encode("utf-8"))
+        _s3_client().put_object(Bucket=bucket, Key=key, Body=body.encode("utf-8"))
         return normalized
     local_path = Path(normalized)
     local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -257,7 +269,7 @@ def read_table(
         return pd.DataFrame(columns=columns)
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
-        body = boto3.client("s3").get_object(Bucket=bucket, Key=key)["Body"].read()
+        body = _s3_client().get_object(Bucket=bucket, Key=key)["Body"].read()
         return pd.read_parquet(io.BytesIO(body))
     return pd.read_parquet(Path(normalized))
 
@@ -285,7 +297,7 @@ def write_table(path: ArtifactPath, table: pd.DataFrame) -> str:
         buffer = io.BytesIO()
         table.to_parquet(buffer, index=False)
         bucket, key = parse_s3_uri(normalized)
-        boto3.client("s3").put_object(Bucket=bucket, Key=key, Body=buffer.getvalue())
+        _s3_client().put_object(Bucket=bucket, Key=key, Body=buffer.getvalue())
         return normalized
 
     local_path = Path(normalized)
