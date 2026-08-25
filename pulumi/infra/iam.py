@@ -142,7 +142,13 @@ bucket_arns = sorted(
 # scraper's source bucket and CDT's output bucket are the same bucket (see #8).
 # Splitting by bucket there would grant PutObject/DeleteObject over the scraper's
 # whole archive — every form type back to 2016 — which CDT only ever reads.
-source_read_arns = [f"arn:aws:s3:::{config.bucket_name}/{config.source_prefix}/*"]
+source_read_arns = [
+    f"arn:aws:s3:::{config.bucket_name}/{config.source_prefix}/*",
+    # The default CIK file lives on the shared bucket; when output_bucket_name is
+    # a different bucket the WriteOwnArtifacts grants no longer cover it, so it
+    # gets its own read grant (see config.default_cik_key).
+    f"arn:aws:s3:::{config.bucket_name}/{config.default_cik_key}",
+]
 # Everything CDT writes lives under one of these two prefixes: canonical
 # artifacts (datasets, run manifests, completion + failure registries, extract
 # job state, locks) and the final dashboard snapshots.

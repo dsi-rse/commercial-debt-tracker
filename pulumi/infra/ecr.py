@@ -4,13 +4,7 @@ import json
 
 import pulumi_aws as aws
 
-import pulumi
-
 from . import config
-
-ecr_registry = pulumi.Output.from_input(config.caller.account_id).apply(
-    lambda account_id: f"{account_id}.dkr.ecr.{config.aws_region}.amazonaws.com"
-)
 
 # The repo name carries the image name (`-orchestrator`) so it matches what the
 # shared pipeline's sync-ecr job pushes to:
@@ -22,9 +16,9 @@ ecr_repo = aws.ecr.Repository(
     tags=config.tags(),
 )
 
-orchestrator_image = ecr_registry.apply(
-    lambda registry: f"{registry}/{config.name_prefix}-orchestrator:latest"
-)
+# Derived from the repository resource so the name has exactly one home; a rename
+# cannot leave the task definition pointing at a repo sync-ecr never pushes to.
+orchestrator_image = ecr_repo.repository_url.apply(lambda url: f"{url}:latest")
 
 ecr_lifecycle_policy = aws.ecr.LifecyclePolicy(
     "cdt-ecr-lifecycle",

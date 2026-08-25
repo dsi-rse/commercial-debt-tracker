@@ -29,8 +29,12 @@ final_database_prefix = config.get("final_database_prefix") or "database/cdt"
 # drift, the task role denies every GetObject ingest attempts.
 source_prefix = config.get("source_prefix") or "sec"
 # Bucket-relative so the bucket name stays out of the committed stack files;
-# the orchestrator wants a full s3:// URI.
-default_cik_file = f"s3://{bucket_name}/{config.require('default_cik_key')}"
+# the orchestrator wants a full s3:// URI. The key is kept separately because the
+# task role grants GetObject on it explicitly — reads on the shared bucket are
+# otherwise scoped to the scraper's source prefix, so the CIK file would become
+# unreadable the day output_bucket_name diverges from the shared bucket.
+default_cik_key = config.require("default_cik_key")
+default_cik_file = f"s3://{bucket_name}/{default_cik_key}"
 shared_dlq_name = aws.ssm.get_parameter(name=f"/idi/{stack_name}/shared/dlq_name").value
 cpu = config.get("cpu") or "1024"
 memory = config.get("memory") or "4096"
