@@ -857,6 +857,17 @@ def extract_pending_items(
     visited_classification_paths: set[str] = set()
     empty_partitions = 0
     pending_classification_paths: list[str] = []
+    # Partitions the active batch job claimed are its to finish: extracting them
+    # live too would pay for every row twice and let the job's later finalize
+    # overwrite the newer live mentions with stale results. Imported lazily —
+    # batch.py imports from this module.
+    from cdt.extractor.batch import active_job_claimed_partition_paths
+
+    claimed_by_batch_job = (
+        set()
+        if force
+        else active_job_claimed_partition_paths(resolved_root, data_dir=data_dir)
+    )
 
     # One LIST of the mentions dataset answers every existence check; probing
     # each target with artifact_exists costs one HeadObject per classification
@@ -878,8 +889,16 @@ def extract_pending_items(
             continue
         if not force and classification_path in completed_classification_paths:
             continue
+        if classification_path in claimed_by_batch_job:
+            continue
         pending_classification_paths.append(classification_path)
 
+    if claimed_by_batch_job:
+        LOGGER.info(
+            "Skipping %s classification partition(s) claimed by the active batch "
+            "extract job; a poll tick will finish them.",
+            len(claimed_by_batch_job),
+        )
     total_partitions = len(pending_classification_paths)
     for chunk_start in range(0, total_partitions, batch_size):
         chunk_paths = pending_classification_paths[

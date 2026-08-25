@@ -380,3 +380,58 @@ def test_historical_batch_skips_match_when_lease_held(
         == 0
     )
     assert calls == ["prepare"]
+
+
+def test_live_backend_skips_when_lease_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live pipeline must not interleave with a running poll tick."""
+    monkeypatch.setattr(
+        orch,
+        "run_pipeline",
+        lambda config: pytest.fail("live run must not start while the lease is held"),
+    )
+    held = acquire_lease(tmp_path, orch.PIPELINE_WRITER_LEASE)
+    assert held is not None
+
+    assert (
+        orch.main(
+            [
+                "--extractor-backend",
+                "live",
+                "--artifact-root",
+                str(tmp_path),
+                "daily",
+                "--cik-file",
+                "c.txt",
+            ]
+        )
+        == 1
+    )
+
+
+def test_live_backend_releases_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live run's lease is released even on an ordinary exit."""
+
+    class Result:
+        artifact_root = str(tmp_path)
+
+    monkeypatch.setattr(orch, "run_pipeline", lambda config: Result())
+
+    assert (
+        orch.main(
+            [
+                "--extractor-backend",
+                "live",
+                "--artifact-root",
+                str(tmp_path),
+                "daily",
+                "--cik-file",
+                "c.txt",
+            ]
+        )
+        == 0
+    )
+    assert acquire_lease(tmp_path, orch.PIPELINE_WRITER_LEASE) is not None

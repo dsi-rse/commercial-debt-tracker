@@ -607,9 +607,17 @@ def run_reset_extract_job(args: argparse.Namespace) -> int:
         )
         return 1
     try:
-        job_id = reset_active_job(artifact_root)
+        # Pin the clear to the job shown above: if a poll tick completed it and
+        # started another in between, abort instead of abandoning the new job.
+        job_id = reset_active_job(artifact_root, expected_job_id=summary.job_id)
     finally:
         release_lease(lease)
+    if job_id is None:
+        print(
+            "Not reset: the active job changed (or completed) since inspection. "
+            "Re-run to inspect the current state."
+        )
+        return 1
     print(f"Cleared the active extract job marker for {job_id}.")
     print("The next poll tick starts a fresh job from unclaimed partitions.")
     return 0

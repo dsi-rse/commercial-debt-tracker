@@ -183,23 +183,30 @@ def write_json_artifact_if_absent(
 
 def read_json_artifact_versioned(
     path: ArtifactPath,
-) -> tuple[dict[str, object] | list[object], str]:
-    """Read a JSON artifact plus an opaque version token for conditional replace."""
+) -> tuple[dict[str, object] | list[object] | None, str]:
+    """Read a JSON artifact plus an opaque version token for conditional replace.
+
+    A body that does not parse returns ``(None, version)`` rather than raising:
+    the callers are lease/lock readers, where a truncated file (a local writer
+    killed mid-write) must read as "corrupt, stealable via compare-and-swap"
+    instead of wedging every subsequent run before its self-heal logic runs.
+    """
     normalized = normalize_artifact_path(path)
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
         response = _s3_client().get_object(Bucket=bucket, Key=key)
         body = response["Body"].read()
-        return (
-            cast(dict[str, object] | list[object], json.loads(body.decode("utf-8"))),
-            str(response["ETag"]),
+        version = str(response["ETag"])
+    else:
+        body = Path(normalized).read_bytes()
+        version = hashlib.sha256(body).hexdigest()
+    try:
+        payload = cast(
+            dict[str, object] | list[object], json.loads(body.decode("utf-8"))
         )
-    body = Path(normalized).read_bytes()
-    version = hashlib.sha256(body).hexdigest()
-    return (
-        cast(dict[str, object] | list[object], json.loads(body.decode("utf-8"))),
-        version,
-    )
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None, version
+    return payload, version
 
 
 def replace_json_artifact_if_match(
