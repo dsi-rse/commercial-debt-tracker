@@ -380,3 +380,33 @@ def test_historical_batch_skips_match_when_lease_held(
         == 0
     )
     assert calls == ["prepare"]
+
+
+def test_placeholder_secret_fails_fast(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A still-placeholder API key exits immediately, before any stage runs."""
+    monkeypatch.setenv("OPENAI_API_KEY", "PLACEHOLDER-set-via-aws-ssm-put-parameter")
+    monkeypatch.setattr(
+        orch,
+        "run_prepare_stages",
+        lambda config: pytest.fail("stages must not run with a placeholder key"),
+    )
+
+    with pytest.raises(SystemExit, match="OPENAI_API_KEY"):
+        orch.main(["--artifact-root", str(tmp_path), "daily", "--cik-file", "c.txt"])
+
+
+def test_real_secret_values_pass_the_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ordinary key values do not trip the placeholder guard."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-real")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-real")
+    monkeypatch.setattr(orch, "run_prepare_stages", lambda config: str(tmp_path))
+    monkeypatch.setattr(orch, "run_match_and_finalize", lambda **kwargs: None)
+
+    assert (
+        orch.main(["--artifact-root", str(tmp_path), "daily", "--cik-file", "c.txt"])
+        == 0
+    )

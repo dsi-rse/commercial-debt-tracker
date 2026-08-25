@@ -43,6 +43,34 @@ from cdt.shared import get_logger
 LOGGER = get_logger(__name__)
 
 
+# Prefix of the value Pulumi seeds into the SSM SecureStrings that feed these env
+# vars (pulumi/infra/secrets.py). Pulumi cannot import this package, so the two
+# literals are coupled by convention, like source_prefix and DEFAULT_S3_PREFIX.
+_SECRET_PLACEHOLDER_PREFIX = "PLACEHOLDER-set-via-"  # noqa: S105 — a sentinel, not a credential
+_SECRET_ENV_VARS = ("OPENAI_API_KEY", "OPENROUTER_API_KEY")
+
+
+def reject_placeholder_secrets() -> None:
+    """Fail fast when an injected API key still holds the Pulumi placeholder.
+
+    Without this, a task launched before the one-time ``aws ssm put-parameter``
+    spends a full ingest/itemize/classify before dying on a provider 401 that
+    reads like a revoked key.
+    """
+    stale = [
+        name
+        for name in _SECRET_ENV_VARS
+        if os.environ.get(name, "").startswith(_SECRET_PLACEHOLDER_PREFIX)
+    ]
+    if stale:
+        raise SystemExit(
+            f"{', '.join(stale)} still hold the Pulumi placeholder value. Set the "
+            "real value(s) with: aws ssm put-parameter --name "
+            "/idi/<env>/cdt/secrets/<key> --type SecureString --value '<v>' "
+            "--overwrite (picked up at the next task launch, no deploy needed)."
+        )
+
+
 def default_cik_file() -> str:
     """Return the default deployed CIK file path."""
     value = os.environ.get("CDT_DEFAULT_CIK_FILE")
@@ -249,6 +277,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     configure_logging(quiet=args.quiet)
+    reject_placeholder_secrets()
 
     if args.mode == "poll":
         return run_poll(args)
