@@ -12,3 +12,6 @@ config:
   idi:ecr_image_retention_count: "5"
   idi:cron: cron(0 7 * * ? *)
   idi:schedule_enabled: "false"
+  # The poller alone drives batch extraction; enabled so manual historical runs
+  # drain without hand-fired ticks while the daily schedule stays off.
+  idi:poll_schedule_enabled: "true"
