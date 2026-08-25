@@ -1197,3 +1197,105 @@ def test_failure_registry_survives_across_jobs(tmp_path: Path) -> None:
     assert failures["item-a"]["shard"] == "0001"
     assert failures["item-b"]["shard"] == "0002"
     assert failures["item-a"]["run_id"] != failures["item-b"]["run_id"]
+
+
+def test_reasoning_effort_omitted_for_non_reasoning_models() -> None:
+    """A configured effort must not reach a model family that 400s on it."""
+    body = build_request_body(
+        [{"role": "user", "content": "x"}],
+        model="openai/gpt-4.1-mini",
+        reasoning_effort="none",
+    )
+    assert "reasoning_effort" not in body
+    assert body["temperature"] == EXTRACTOR_TEMPERATURE
+
+
+def test_corrupt_active_marker_self_heals(tmp_path: Path) -> None:
+    """A truncated active.json is cleared, not a crash-loop on every tick."""
+    marker = Path(active_job_path(str(tmp_path)))
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text('{"job_id": "2026')  # killed mid-write
+
+    assert describe_active_job(tmp_path).status == "corrupt"
+
+    result = advance_extract_job(
+        batch_client=FakeBatchClient({}), artifact_root=tmp_path
+    )
+    assert result.status == "reset"
+    # Marker is cleared; the next tick proceeds normally (idle: nothing pending).
+    assert (
+        advance_extract_job(
+            batch_client=FakeBatchClient({}), artifact_root=tmp_path
+        ).status
+        == "idle"
+    )
+
+
+def test_reset_active_job_pins_to_the_inspected_job(tmp_path: Path) -> None:
+    """A reset targeting a job that is no longer active must not clear the new one."""
+    client = FakeBatchClient({"item-multi": {"ner": MULTI_NER}})
+    job_id = _seed_active_job(tmp_path, client)
+
+    assert reset_active_job(tmp_path, expected_job_id="some-older-job") is None
+    assert read_json_artifact(active_job_path(str(tmp_path)))["job_id"] == job_id
+
+    assert reset_active_job(tmp_path, expected_job_id=job_id) == job_id
+    assert describe_active_job(tmp_path).status == "idle"
+
+
+def test_stranded_pending_rows_requeue_instead_of_finalizing(tmp_path: Path) -> None:
+    """Rows pending on an unrecorded, unadopted batch re-queue, not fail-finalize.
+
+    Models the crash between _save_state (pending markers written) and
+    _save_batches, combined with an orphan-listing gap: the row is neither
+    awaiting nor terminal and no batch is in flight.
+    """
+    client = FakeBatchClient(
+        {"item-multi": {"ner": MULTI_NER, "instrument_ie": MULTI_IE}}
+    )
+    job_id = _seed_active_job(tmp_path, client)
+    batches_path = tmp_path / "extract-batches" / f"job_id={job_id}" / "batches.json"
+    payload = json.loads(batches_path.read_text())
+    payload["batches"] = []  # the submit was never recorded...
+    batches_path.write_text(json.dumps(payload))
+    client.batches.clear()  # ...and the orphan scan cannot see it
+
+    requeued = advance_extract_job(batch_client=client, artifact_root=tmp_path)
+    # The stranded row was re-queued and re-submitted on this or the next tick,
+    # and the job must NOT have finalized with the row recorded as a failure.
+    assert requeued.status != "completed"
+    assert describe_active_job(tmp_path).status == "active"
+
+    # Let the job run to completion: results now fold normally.
+    for _ in range(4):
+        result = advance_extract_job(batch_client=client, artifact_root=tmp_path)
+        if result.status == "completed":
+            break
+    assert result.status == "completed"
+    failures = load_row_failures("extract", artifact_root=tmp_path)
+    assert failures == {}
+
+
+def test_orphan_input_download_failure_skips_adoption(tmp_path: Path) -> None:
+    """A purged orphan input file must not crash the tick before state is saved."""
+
+    class PurgedInputClient(FakeBatchClient):
+        def download_file(self, file_id: str) -> str:
+            if file_id.endswith("-in"):
+                raise RuntimeError("file purged by retention")
+            return super().download_file(file_id)
+
+    client = PurgedInputClient(
+        {"item-multi": {"ner": MULTI_NER, "instrument_ie": MULTI_IE}}
+    )
+    job_id = _seed_active_job(tmp_path, client)
+    batches_path = tmp_path / "extract-batches" / f"job_id={job_id}" / "batches.json"
+    payload = json.loads(batches_path.read_text())
+    payload["batches"] = []  # unrecorded submit: the batch is now an orphan
+    batches_path.write_text(json.dumps(payload))
+
+    # The orphan is visible to list_job_batches but its input download fails:
+    # the tick must survive, skip adoption, and requeue the stranded row.
+    result = advance_extract_job(batch_client=client, artifact_root=tmp_path)
+    assert result.status in {"waiting", "submitted"}
+    assert describe_active_job(tmp_path).status == "active"

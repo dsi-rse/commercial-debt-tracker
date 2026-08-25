@@ -28,6 +28,7 @@ overlapping ticks and the ``daily`` schedule's match/finalize cannot race it.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -43,6 +44,7 @@ from cdt.extractor.core import (
     finalize_extract_outputs,
     handle_response,
     initial_messages,
+    is_reasoning_model,
     native_model_id,
     record_stage_error,
     sampling_params,
@@ -259,8 +261,10 @@ def build_request_body(
         "messages": messages,
         **sampling_params(model),
     }
+    # Mirror sampling_params' model gate: non-reasoning models 400 on
+    # reasoning_effort, and one bad request terminates every row in the batch.
     effort = openai_reasoning_effort(reasoning_effort)
-    if effort:
+    if effort and is_reasoning_model(model):
         body["reasoning_effort"] = effort
     return body
 
@@ -381,9 +385,43 @@ def _read_active_job(root: str) -> str | None:
     path = active_job_path(root)
     if not artifact_exists(path):
         return None
-    payload = cast(dict[str, object], read_json_artifact(path))
+    try:
+        payload = cast(dict[str, object], read_json_artifact(path))
+    except json.JSONDecodeError as exc:
+        # A truncated marker would otherwise wedge every mode on startup; raise
+        # the same error the per-job self-heal paths already handle.
+        raise CorruptJobStateError(
+            f"Active-job marker {path} is unreadable: {exc}"
+        ) from exc
     job_id = payload.get("job_id")
     return str(job_id) if job_id else None
+
+
+def active_job_claimed_partition_paths(
+    artifact_root: ArtifactPath | None = None, *, data_dir: Path | None = None
+) -> set[str]:
+    """Classification partitions claimed by the active batch job, if any.
+
+    Read from the job manifest (cheap, written once at creation) so the live
+    extract path can leave in-flight work alone instead of paying for it a
+    second time. A corrupt marker or manifest reads as "nothing claimed": the
+    poll tick self-heals those, and the live path double-extracting is the
+    pre-existing behavior, not a new failure.
+    """
+    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    try:
+        job_id = _read_active_job(resolved_root)
+        if job_id is None:
+            return set()
+        manifest = cast(
+            dict[str, object], read_json_artifact(_manifest_path(resolved_root, job_id))
+        )
+    except (CorruptJobStateError, json.JSONDecodeError, FileNotFoundError):
+        return set()
+    return {
+        str(path)
+        for path in cast(list[object], manifest.get("claimed_partitions") or [])
+    }
 
 
 def _clear_active_job(root: str) -> None:
@@ -619,9 +657,22 @@ def _reconcile_orphans(root: str, job: JobState, client: SupportsBatchClient) ->
         LOGGER.warning("Adopting orphan batch %s for job %s", status.id, job.job_id)
         custom_ids: list[str] = []
         if status.input_file_id:
-            custom_ids = list(
-                _parse_jsonl_by_custom_id(client.download_file(status.input_file_id))
-            )
+            try:
+                custom_ids = list(
+                    _parse_jsonl_by_custom_id(
+                        client.download_file(status.input_file_id)
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 — a purged/failing input file
+                # must not crash-loop every tick before any state is saved; skip
+                # adoption now and retry on the next tick.
+                LOGGER.error(
+                    "Could not download orphan batch %s input file: %s; "
+                    "skipping adoption this tick.",
+                    status.id,
+                    exc,
+                )
+                continue
         for custom_id in custom_ids:
             entry = job.rows.get(custom_id)
             if (
@@ -873,7 +924,10 @@ def describe_active_job(
     so an operator can diagnose a stuck poller before deciding to reset it.
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
-    job_id = _read_active_job(resolved_root)
+    try:
+        job_id = _read_active_job(resolved_root)
+    except CorruptJobStateError as exc:
+        return ActiveJobSummary(status="corrupt", detail=str(exc))
     if job_id is None:
         return ActiveJobSummary(status="idle")
     try:
@@ -895,16 +949,36 @@ def describe_active_job(
 
 
 def reset_active_job(
-    artifact_root: ArtifactPath | None = None, *, data_dir: Path | None = None
+    artifact_root: ArtifactPath | None = None,
+    *,
+    data_dir: Path | None = None,
+    expected_job_id: str | None = None,
 ) -> str | None:
     """Clear the active-job marker; returns the abandoned job id, or None if idle.
+
+    ``expected_job_id`` pins the reset to the job the operator inspected: if a
+    poll tick completed that job and started another between the look and the
+    clear, the marker is left alone rather than silently abandoning the new
+    job's in-flight batches.
 
     The job's own directory is left on disk for inspection. Callers must hold the
     pipeline-writer lease, or a concurrent poll tick could rewrite the marker.
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
-    job_id = _read_active_job(resolved_root)
+    try:
+        job_id = _read_active_job(resolved_root)
+    except CorruptJobStateError as exc:
+        LOGGER.warning("Clearing an unreadable active-job marker: %s", exc)
+        _clear_active_job(resolved_root)
+        return "<corrupt marker>"
     if job_id is None:
+        return None
+    if expected_job_id is not None and job_id != expected_job_id:
+        LOGGER.warning(
+            "Not resetting: the active job is now %s, not the inspected %s.",
+            job_id,
+            expected_job_id,
+        )
         return None
     _clear_active_job(resolved_root)
     LOGGER.warning(
@@ -928,6 +1002,7 @@ def advance_extract_job(
     max_batch_bytes: int = DEFAULT_MAX_BATCH_BYTES,
     max_resubmissions: int = DEFAULT_MAX_RESUBMISSIONS,
     force: bool = False,
+    renew_lease: Callable[[], None] | None = None,
 ) -> ExtractTickResult:
     """Advance the extract job by one tick.
 
@@ -954,7 +1029,14 @@ def advance_extract_job(
             translated_reasoning or "<model default>",
         )
 
-    active_job_id = _read_active_job(resolved_root)
+    try:
+        active_job_id = _read_active_job(resolved_root)
+    except CorruptJobStateError as exc:
+        # Same self-heal as a corrupt job directory: clear the marker so ticks
+        # stop crash-looping. Whatever job it named keeps its state on disk.
+        LOGGER.error("Clearing the active extract job marker: %s", exc)
+        _clear_active_job(resolved_root)
+        return ExtractTickResult(status="reset")
     if active_job_id is None:
         job = _create_job(
             resolved_root,
@@ -999,6 +1081,11 @@ def advance_extract_job(
             job, batch_client, max_resubmissions=max_resubmissions
         )
 
+    # Folding can dwarf the lease TTL on a large job; extend it at the phase
+    # boundary so an over-long tick is not stolen by the next scheduled one.
+    if renew_lease is not None:
+        renew_lease()
+
     job.tick += 1
     awaiting = _awaiting_rows(job)
 
@@ -1017,6 +1104,8 @@ def advance_extract_job(
         max_requests_per_batch=max_requests_per_batch,
         max_batch_bytes=max_batch_bytes,
     )
+    if renew_lease is not None:
+        renew_lease()
     # Recompute after submitting: submitted rows are now pending and oversized
     # rows were terminated, so anything left here could not be dispatched.
     still_awaiting = _awaiting_rows(job)
@@ -1038,6 +1127,34 @@ def advance_extract_job(
     )
 
     if not job.batches and not still_awaiting:
+        # A row can be neither terminal nor awaiting: pending on a batch that was
+        # never recorded and never re-adopted (crash between _save_state and
+        # _save_batches plus an orphan-listing gap). Finalizing would record it
+        # as a failure and permanently claim its partition — silent data loss.
+        # Re-queue instead: clear pending so the next tick re-submits.
+        stranded = [
+            entry
+            for entry in job.rows.values()
+            if entry.row_state.state is None and entry.pending is not None
+        ]
+        if stranded:
+            for entry in stranded:
+                entry.pending = None
+            _save_state(resolved_root, job)
+            LOGGER.warning(
+                "Extract job %s has %s row(s) pending on batches that no longer "
+                "exist; re-queued them for the next tick instead of finalizing.",
+                job.job_id,
+                len(stranded),
+            )
+            return ExtractTickResult(
+                status="waiting",
+                job_id=job.job_id,
+                folded_rows=folded,
+                submitted_batches=submitted,
+                awaiting_rows=len(stranded),
+                terminal_rows=terminal_rows,
+            )
         _finalize_job(resolved_root, job, data_dir=data_dir)
         return ExtractTickResult(
             status="completed",

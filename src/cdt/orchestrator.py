@@ -30,7 +30,12 @@ from cdt.cli import configure_logging, parse_date, positive_int
 from cdt.datasets import resolve_artifact_root
 from cdt.extractor import DEFAULT_MAX_ATTEMPTS, OpenAIBatchClient, advance_extract_job
 from cdt.ingest import DEFAULT_BUCKET
-from cdt.lease import PIPELINE_WRITER_LEASE, acquire_lease, release_lease
+from cdt.lease import (
+    PIPELINE_WRITER_LEASE,
+    acquire_lease,
+    release_lease,
+    renew_lease,
+)
 from cdt.pipeline import (
     DEFAULT_STAGE_BATCH_SIZE,
     PipelineConfig,
@@ -198,8 +203,20 @@ def run_batch_backend(args: argparse.Namespace) -> int:
             "Use --extractor-backend live to size synchronous extract batches.",
             args.extract_batch_size,
         )
+    if args.force:
+        LOGGER.warning(
+            "--force applies to the prepare and match/finalize stages only under "
+            "the batch backend: extraction is deferred to poll, which never "
+            "forces an already-completed partition. To re-extract, run a poll "
+            "tick with --force while no job is active."
+        )
     config = _pipeline_config(args)
     artifact_root = run_prepare_stages(config)
+    LOGGER.info(
+        "Extraction deferred to the batch poller: pending items are claimed by "
+        "the next `poll` run. Ensure the poll schedule is enabled, or run "
+        "`cdt-orchestrator poll` manually — nothing else drives extraction."
+    )
     # Keep final snapshots fresh from whatever mentions already exist; the in-flight
     # batch job (advanced by ``poll``) will refresh them again when it completes.
     lease = acquire_lease(artifact_root, PIPELINE_WRITER_LEASE)
@@ -244,6 +261,9 @@ def run_poll(args: argparse.Namespace) -> int:
             "artifact_root": resolved_root,
             "max_attempts": args.max_attempts,
             "force": args.force,
+            # Extend the lease at the tick's phase boundaries so a legitimately
+            # long fold/submit is not stolen by the next hourly run.
+            "renew_lease": lambda: renew_lease(lease),
         }
         if args.max_requests_per_batch is not None:
             tick_kwargs["max_requests_per_batch"] = args.max_requests_per_batch
@@ -260,6 +280,7 @@ def run_poll(args: argparse.Namespace) -> int:
             result.terminal_rows,
         )
         if result.status == "completed":
+            renew_lease(lease)
             run_match_and_finalize(
                 artifact_root=resolved_root,
                 final_database_root=args.final_database_root,
@@ -284,8 +305,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.extractor_backend == "batch":
         return run_batch_backend(args)
 
-    # The live backend: the original synchronous pipeline.
-    result = run_pipeline(_pipeline_config(args))
+    # The live backend: the original synchronous pipeline. It rewrites the same
+    # completion registries and match/final snapshots the poll tick does, so it
+    # runs under the same writer lease rather than interleaving with one.
+    resolved_root = resolve_artifact_root(args.artifact_root)
+    lease = acquire_lease(resolved_root, PIPELINE_WRITER_LEASE)
+    if lease is None:
+        LOGGER.error(
+            "Pipeline-writer lease is held (a poll tick is running); not starting "
+            "a live run. Retry once the tick finishes."
+        )
+        return 1
+    try:
+        result = run_pipeline(_pipeline_config(args))
+    finally:
+        release_lease(lease)
     print(result.artifact_root)
     return 0
 

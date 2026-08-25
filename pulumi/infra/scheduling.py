@@ -109,7 +109,7 @@ poll_schedule = aws.scheduler.Schedule(
     description="Advances the CDT OpenAI batch extract job hourly",
     schedule_expression=config.poll_schedule_expression,
     flexible_time_window=aws.scheduler.ScheduleFlexibleTimeWindowArgs(mode="OFF"),
-    state="ENABLED" if config.schedule_enabled else "DISABLED",
+    state="ENABLED" if config.poll_schedule_enabled else "DISABLED",
     target=aws.scheduler.ScheduleTargetArgs(
         arn=ecs.cluster.arn,
         role_arn=scheduler_role.arn,

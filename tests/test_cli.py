@@ -785,13 +785,15 @@ def test_reset_extract_job_clears_under_the_lease(
         lambda root: cli.ActiveJobSummary(status="active", job_id="J"),
     )
     monkeypatch.setattr(
-        cli, "reset_active_job", lambda root: (held.append("reset"), "J")[1]
+        cli,
+        "reset_active_job",
+        lambda root, expected_job_id: (held.append(f"reset:{expected_job_id}"), "J")[1],
     )
 
     assert (
         cli.main(["reset-extract-job", "--artifact-root", str(tmp_path), "--yes"]) == 0
     )
-    assert held == ["reset"]
+    assert held == ["reset:J"]
     assert "Cleared the active extract job marker for J" in capsys.readouterr().out
 
 
@@ -813,3 +815,21 @@ def test_reset_extract_job_refuses_while_a_tick_holds_the_lease(
     assert (
         cli.main(["reset-extract-job", "--artifact-root", str(tmp_path), "--yes"]) == 1
     )
+
+
+def test_reset_extract_job_aborts_when_the_job_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A reset pinned to a job that is no longer active clears nothing."""
+    monkeypatch.setattr(
+        cli,
+        "describe_active_job",
+        lambda root: cli.ActiveJobSummary(status="active", job_id="OLD"),
+    )
+    # reset_active_job reports the mismatch by returning None.
+    monkeypatch.setattr(cli, "reset_active_job", lambda root, expected_job_id: None)
+
+    assert (
+        cli.main(["reset-extract-job", "--artifact-root", str(tmp_path), "--yes"]) == 1
+    )
+    assert "Not reset" in capsys.readouterr().out

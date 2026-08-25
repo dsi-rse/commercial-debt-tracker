@@ -141,7 +141,10 @@ Optional:
 - `cpu`, `memory`
 - `cron` (daily schedule; default `cron(0 8 * * ? *)`)
 - `poll_cron` (hourly extract poll; default `cron(30 * * * ? *)`, offset from the daily run)
-- `schedule_enabled` (gates both the daily and poll schedules)
+- `schedule_enabled` (gates the daily schedule; also the poll default)
+- `poll_schedule_enabled` (gates the hourly poll on its own — the poller is the
+  only driver of batch extraction, so it can be enabled to drain a manual
+  historical run while the daily schedule stays off)
 - `log_retention_days`
 - `ecr_image_retention_count`
 
@@ -187,7 +190,12 @@ Local note:
 - `cdt pipeline` does not read `FINAL_DATABASE_ROOT`; pass `--final-database-root` to write final snapshots from that CLI.
 - `cdt-orchestrator` reads `FINAL_DATABASE_ROOT`, and also accepts `--final-database-root` as a top-level option before `daily` or `historical`.
 
-The scheduler state is controlled by the Pulumi `idi:schedule_enabled` setting.
+The scheduler state is controlled by the Pulumi `idi:schedule_enabled` setting
+(`idi:poll_schedule_enabled` overrides it for the poll schedule alone).
+
+`--force` on a batch-backend `daily`/`historical` run applies to the prepare and
+match/finalize stages only; to force a re-extract, run a poll tick with
+`--force` while no job is active.
 
 ## Historical Backfills
 

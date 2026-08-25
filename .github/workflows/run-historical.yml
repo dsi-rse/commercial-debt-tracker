@@ -20,7 +20,11 @@ on:
         required: true
         type: string
       cik_file:
-        description: Local or s3:// path to one-CIK-per-line input file
+        description: >-
+          Local or s3:// path to one-CIK-per-line input file. The task role can
+          only read the shared bucket under sec/, processors/cdt/, database/cdt/,
+          and the committed default CIK key — paths elsewhere fail with
+          AccessDenied.
         required: true
         type: string
       force:

@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 import cdt.lease as lease_module
-from cdt.lease import acquire_lease, lease_path, release_lease
+from cdt.lease import acquire_lease, lease_path, release_lease, renew_lease
 
 
 def test_acquire_blocks_second_acquirer(tmp_path: Path) -> None:
@@ -153,3 +153,45 @@ def test_corrupt_lease_warns(
         assert acquire_lease(tmp_path, "writer") is not None
 
     assert [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_corrupt_lock_file_is_stealable(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    propagate_logger: Callable[[logging.Logger], None],
+) -> None:
+    """A truncated lock file reads as corrupt-and-stealable, not a crash."""
+    propagate_logger(lease_module.LOGGER)
+    path = Path(lease_path(tmp_path, "writer"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"holder": "old", "expires_at": "2099')  # killed mid-write
+
+    with caplog.at_level(logging.DEBUG, logger=lease_module.LOGGER.name):
+        lease = acquire_lease(tmp_path, "writer")
+
+    assert lease is not None
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_renew_lease_extends_expiry(tmp_path: Path) -> None:
+    """Renewal pushes the expiry forward while the holder still owns the lease."""
+    lease = acquire_lease(tmp_path, "writer", ttl_seconds=60)
+    assert lease is not None
+    before = lease.expires_at
+
+    assert renew_lease(lease, ttl_seconds=7200) is True
+    assert lease.expires_at > before
+
+    # A second acquirer still cannot take the (now longer-lived) lease.
+    assert acquire_lease(tmp_path, "writer") is None
+
+
+def test_renew_lease_fails_after_steal(tmp_path: Path) -> None:
+    """A holder whose lease was stolen learns it from the renewal result."""
+    original = acquire_lease(tmp_path, "writer", ttl_seconds=0)
+    assert original is not None
+    thief = acquire_lease(tmp_path, "writer")
+    assert thief is not None
+
+    assert renew_lease(original) is False
+    assert renew_lease(thief) is True

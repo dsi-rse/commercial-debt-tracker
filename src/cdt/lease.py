@@ -132,6 +132,27 @@ def acquire_lease(
     return Lease(path=path, holder=holder, expires_at=str(payload["expires_at"]))
 
 
+def renew_lease(lease: Lease, *, ttl_seconds: int = DEFAULT_LEASE_TTL_SECONDS) -> bool:
+    """Extend a held lease's expiry; False if it was stolen or storage raced.
+
+    The TTL is sized for a normal tick, but folding a large job's results can
+    outlast it; renewing at phase boundaries keeps a legitimately long holder
+    from being stolen by the next scheduled run mid-write. A False return means
+    the caller no longer holds the lease and should treat the tick as lost.
+    """
+    current, version = read_json_artifact_versioned(lease.path)
+    if not isinstance(current, dict) or current.get("holder") != lease.holder:
+        return False
+    renewed = dict(cast(dict[str, object], current))
+    renewed["expires_at"] = (
+        datetime.now(UTC) + timedelta(seconds=ttl_seconds)
+    ).isoformat()
+    if not replace_json_artifact_if_match(lease.path, renewed, version=version):
+        return False
+    lease.expires_at = str(renewed["expires_at"])
+    return True
+
+
 def release_lease(lease: Lease) -> None:
     """Mark a held lease expired so the next acquirer takes over immediately.
 

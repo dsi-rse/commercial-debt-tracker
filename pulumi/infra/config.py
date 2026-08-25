@@ -45,6 +45,15 @@ schedule_expression = config.get("cron") or "cron(0 8 * * ? *)"
 # run so the daily classify writes settle first. It shares ``schedule_enabled``.
 poll_schedule_expression = config.get("poll_cron") or "cron(30 * * * ? *)"
 schedule_enabled = (config.get("schedule_enabled") or "false").lower() == "true"
+# The poller is the only driver of batch extraction, so it can be enabled on its
+# own (e.g. to drain a manual historical run) while the daily schedule stays off.
+# Defaults to schedule_enabled so flipping one knob still enables both.
+_poll_enabled_raw = config.get("poll_schedule_enabled")
+poll_schedule_enabled = (
+    schedule_enabled
+    if _poll_enabled_raw is None
+    else _poll_enabled_raw.lower() == "true"
+)
 caller = aws.get_caller_identity()
 aws_region = pulumi.Config("aws").require("region")
 
