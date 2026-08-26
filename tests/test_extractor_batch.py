@@ -1510,3 +1510,29 @@ def test_stall_warning_fires_only_past_the_tick_threshold(
     with caplog.at_level("WARNING"):
         _warn_if_stalled(job, terminal_rows=0)
     assert any("Extract job stalled" in record.message for record in caplog.records)
+
+
+def test_collect_pending_extract_items_caps_claimed_rows(tmp_path: Path) -> None:
+    """Claiming stops at max_rows; unclaimed partitions stay pending (#92)."""
+    from cdt.extractor.core import collect_pending_extract_items
+
+    for index, (date_value, shard) in enumerate(
+        [("2024-01-02", "0001"), ("2024-01-03", "0002"), ("2024-01-04", "0003")],
+        start=1,
+    ):
+        seed_classification(
+            tmp_path,
+            [{"item_id": f"item-{index}", "text": f"text {index}"}],
+            date=date_value,
+            shard=shard,
+        )
+
+    entries, claimed = collect_pending_extract_items(artifact_root=tmp_path, max_rows=1)
+
+    assert len(entries) == 1
+    assert len(claimed) == 1
+    uncapped_entries, uncapped_claimed = collect_pending_extract_items(
+        artifact_root=tmp_path
+    )
+    assert len(uncapped_entries) == 3
+    assert len(uncapped_claimed) == 3
