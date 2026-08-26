@@ -159,7 +159,9 @@ class OpenAIBatchClient:
     def _client(self) -> object:
         from openai import OpenAI
 
-        return OpenAI(api_key=self.api_key)
+        # Explicit bounds so a hung socket cannot wedge a poll tick (#93):
+        # generous, because submit uploads batch files up to 100 MB.
+        return OpenAI(api_key=self.api_key, timeout=600.0, max_retries=2)
 
     def submit(
         self, requests: list[dict[str, object]], *, metadata: dict[str, str]

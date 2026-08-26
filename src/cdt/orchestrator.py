@@ -24,7 +24,8 @@ from __future__ import annotations
 
 import argparse
 import os
-from collections.abc import Sequence
+import threading
+from collections.abc import Callable, Sequence
 from time import monotonic, sleep
 
 from cdt.cli import configure_logging, parse_date, positive_int
@@ -55,6 +56,51 @@ LOGGER = get_logger(__name__)
 # absorbs it. A wedged holder outlasts the wait and the run fails loudly (#88).
 LEASE_WAIT_SECONDS = 15 * 60
 LEASE_POLL_SECONDS = 30
+
+# ECS has no task-level timeout: a Fargate task runs (and bills) until its
+# process exits, so a run wedged past every client timeout must reap itself
+# (#93). Deadlines are per mode — a poll tick is minutes (the 2h matches the
+# lease TTL), daily is bounded by its 24h cadence, and historical backfills
+# legitimately run long. Override with --max-runtime-hours.
+MODE_DEADLINE_HOURS: dict[str, float] = {"poll": 2, "daily": 12, "historical": 72}
+# EX_SOFTWARE: distinguishes a watchdog self-reap from an ordinary crash in
+# the task's stoppedReason; any nonzero exit trips the task-failure alarm (#85).
+WATCHDOG_EXIT_CODE = 70
+
+
+def start_runtime_watchdog(
+    mode: str,
+    max_runtime_hours: float | None = None,
+    *,
+    exit_fn: Callable[[int], None] = os._exit,
+) -> threading.Timer:
+    """Arm a daemon timer that hard-exits the process past its deadline.
+
+    ``os._exit`` deliberately skips ``finally`` blocks: every artifact write is
+    already crash-safe, and the unreleased lease is exactly the crash path the
+    TTL/steal design recovers — a clean shutdown of a wedged process is not
+    achievable anyway.
+    """
+    hours = (
+        max_runtime_hours
+        if max_runtime_hours is not None
+        else (MODE_DEADLINE_HOURS[mode])
+    )
+
+    def _expire() -> None:
+        LOGGER.error(
+            "Runtime watchdog expired: mode=%s exceeded %sh — the task is wedged; "
+            "exiting %s so ECS reaps it and the task-failure alarm fires.",
+            mode,
+            hours,
+            WATCHDOG_EXIT_CODE,
+        )
+        exit_fn(WATCHDOG_EXIT_CODE)
+
+    timer = threading.Timer(hours * 3600, _expire)
+    timer.daemon = True
+    timer.start()
+    return timer
 
 
 def acquire_lease_with_wait(artifact_root: str, name: str) -> Lease | None:
@@ -157,6 +203,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--max-runtime-hours",
+        type=float,
+        default=None,
+        help=(
+            "wall-clock deadline before the run reaps itself; defaults per "
+            f"mode: {MODE_DEADLINE_HOURS} (#93)"
+        ),
+    )
     parser.add_argument(
         "--extractor-backend",
         choices=("live", "batch"),
@@ -357,6 +412,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     configure_logging(quiet=args.quiet)
     reject_placeholder_secrets()
+    start_runtime_watchdog(args.mode, args.max_runtime_hours)
 
     if args.mode == "poll":
         return run_poll(args)

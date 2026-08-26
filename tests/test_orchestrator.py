@@ -590,3 +590,25 @@ def test_daily_batch_logs_heartbeat_literal(
         "Orchestrator run complete: mode=daily" in record.message
         for record in caplog.records
     )
+
+
+def test_runtime_watchdog_reaps_past_deadline() -> None:
+    """The watchdog hard-exits a run that outlives its deadline (#93)."""
+    exits: list[int] = []
+
+    timer = orch.start_runtime_watchdog("poll", 0.05 / 3600, exit_fn=exits.append)
+    timer.join(timeout=5)
+
+    assert exits == [orch.WATCHDOG_EXIT_CODE]
+
+
+def test_runtime_watchdog_defaults_per_mode() -> None:
+    """Without an override, the deadline comes from the mode table (#93)."""
+    exits: list[int] = []
+
+    timer = orch.start_runtime_watchdog("historical", exit_fn=exits.append)
+    try:
+        assert timer.interval == orch.MODE_DEADLINE_HOURS["historical"] * 3600
+    finally:
+        timer.cancel()
+    assert exits == []

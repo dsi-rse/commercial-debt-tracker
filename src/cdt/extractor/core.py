@@ -352,6 +352,13 @@ class StageSpec(Protocol):
         """Build retry guidance after a validation failure."""
 
 
+# Bounds every live chat call: without a client timeout, one non-responsive
+# provider socket wedges the whole synchronous run — and the ECS task hosting
+# it — indefinitely (#93). Generous because reasoning models legitimately take
+# minutes per response.
+LIVE_REQUEST_TIMEOUT_SECONDS = 600
+
+
 class OpenRouterChatClient:
     """Native OpenRouter client wrapper used by the extractor."""
 
@@ -386,6 +393,7 @@ class OpenRouterChatClient:
             api_key=self.api_key,
             x_open_router_title="commercial-debt-tracker",
             x_open_router_categories="cli-agent",
+            timeout_ms=LIVE_REQUEST_TIMEOUT_SECONDS * 1000,
         ) as client:
             response = await client.chat.send_async(**request_kwargs)
         return extract_response_text(response)
