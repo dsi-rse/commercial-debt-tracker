@@ -182,10 +182,17 @@ Normal daily processing is:
 4. when an extract job completes, that poll tick writes new `mentions` partitions and
    re-runs match + finalize
 5. outputs land under the configured artifact root in S3, and if `FINAL_DATABASE_ROOT` is
-   set, four final parquet snapshots are written: `items/latest.parquet`,
-   `debt-instruments/latest.parquet`, `debt-instrument-mentions/latest.parquet`, and
-   `mention-cluster-edges/latest.parquet`
-6. the dashboard publisher in `../commercial-debt-tracker-dashboard` can then read those parquet snapshots and publish `generated/*` JSON to R2
+   set, finalize publishes one atomic snapshot generation: the four tables are written to
+   an immutable `snapshots/snapshot=<run_id>/<table>.parquet` prefix, then a single
+   `latest.json` pointer (run id, schema version, per-table row counts and paths) is
+   replaced as the last step. Consumers should resolve the pointer, never the prefix —
+   that guarantees a consistent generation across all four tables. A publish that would
+   shrink a table below half its prior row count (or empty it) is refused unless forced.
+   Only the current and prior generations are retained.
+6. the dashboard publisher in `../commercial-debt-tracker-dashboard` can then read those
+   snapshots and publish `generated/*` JSON to R2. Until it migrates to `latest.json`,
+   the deprecated per-table `<table>/latest.parquet` objects are still refreshed after
+   the pointer; they are individually atomic but not consistent as a set.
 
 Because extraction is asynchronous, final snapshots for a given filing date can lag the
 daily run by up to a few days. The daily run still refreshes match/final outputs from

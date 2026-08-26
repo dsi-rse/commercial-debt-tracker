@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Self
 
@@ -43,12 +43,18 @@ from cdt.matcher import (
     match_pending_mentions,
     mention_cluster_edges_root,
 )
+from cdt.matcher.core import MATCHER_SCHEMA_VERSION
 from cdt.shared import get_logger
 from cdt.storage import (
     ArtifactPath,
+    artifact_exists,
+    delete_artifact,
     join_artifact_path,
+    list_artifacts,
     read_dataset,
+    read_json_artifact,
     read_text_artifact,
+    write_json_artifact,
     write_table,
 )
 
@@ -344,6 +350,7 @@ class PipelineOrchestrator:
             artifact_root=resolved_artifact_root,
             final_database_root=self.config.final_database_root,
             data_dir=self.config.data_dir,
+            force=self.config.force,
         )
         self._log_stage_complete(
             "finalize",
@@ -407,6 +414,7 @@ def run_match_and_finalize(
         artifact_root=resolved_root,
         final_database_root=final_database_root,
         data_dir=data_dir,
+        force=force,
     )
 
 
@@ -440,21 +448,137 @@ def resolve_mode_dates(
     return start_date, end_date
 
 
+# A table shrinking below this fraction of its previously published row count
+# blocks the publish (unless forced): the likeliest causes are a bug or a
+# half-built artifact root, not a legitimate mass deletion of filings.
+FINAL_SNAPSHOT_GUARD_RATIO = 0.5
+
+
+def final_pointer_path(final_database_root: ArtifactPath) -> str:
+    """Return the path of the atomic latest.json snapshot pointer."""
+    return join_artifact_path(str(final_database_root), "latest.json")
+
+
 def write_final_output_tables(
     *,
     artifact_root: ArtifactPath,
     final_database_root: ArtifactPath | None,
     data_dir: Path | None = None,
+    force: bool = False,
 ) -> dict[str, str]:
-    """Materialize final latest parquet snapshots for downstream database loads."""
+    """Publish one atomic, guarded snapshot of the final tables (#91).
+
+    The old layout wrote four independent ``<table>/latest.parquet`` objects in
+    a loop: a consumer polling mid-loop read mixed generations (mentions
+    referencing instruments that did not exist yet), a crash between writes
+    left that state published permanently, and an accidentally empty dataset
+    silently clobbered a good snapshot with zero rows.
+
+    Now every table lands under an immutable ``snapshots/snapshot=<run_id>/``
+    prefix first, and a single ``latest.json`` pointer — the only object a
+    consumer should resolve — is replaced as the last, atomic step, carrying
+    the run id, schema version, and per-table row counts. Unless ``force``,
+    the publish refuses when a previously non-empty table would become empty
+    or shrink below FINAL_SNAPSHOT_GUARD_RATIO of its prior row count.
+
+    The per-table ``<table>/latest.parquet`` objects are still refreshed after
+    the pointer so the dashboard publisher keeps working until it migrates to
+    the pointer; they retain the old non-atomic semantics and are deprecated.
+    Snapshots other than the current and prior generation are pruned.
+    """
     if final_database_root is None:
         return {}
 
+    pointer_path = final_pointer_path(final_database_root)
+    previous: dict[str, object] = {}
+    if artifact_exists(pointer_path):
+        payload = read_json_artifact(pointer_path)
+        if isinstance(payload, dict):
+            previous = payload
+
+    tables = {
+        table_name: read_dataset(dataset_root_fn(artifact_root, data_dir=data_dir))
+        for table_name, dataset_root_fn in FINAL_OUTPUT_TABLES.items()
+    }
+    _guard_against_shrinkage(tables, previous, force=force)
+
+    run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    snapshots_root = join_artifact_path(str(final_database_root), "snapshots")
+    snapshot_prefix = join_artifact_path(snapshots_root, f"snapshot={run_id}")
     written_paths: dict[str, str] = {}
-    for table_name, dataset_root_fn in FINAL_OUTPUT_TABLES.items():
-        table = read_dataset(dataset_root_fn(artifact_root, data_dir=data_dir))
-        output_path = join_artifact_path(
-            final_database_root, table_name, "latest.parquet"
+    pointer_tables: dict[str, object] = {}
+    for table_name, table in tables.items():
+        snapshot_path = join_artifact_path(snapshot_prefix, f"{table_name}.parquet")
+        written_paths[table_name] = write_table(snapshot_path, table)
+        pointer_tables[table_name] = {
+            "path": written_paths[table_name],
+            "rows": len(table),
+        }
+    write_json_artifact(
+        pointer_path,
+        {
+            "run_id": run_id,
+            "written_at": datetime.now(UTC).isoformat(),
+            "schema_version": MATCHER_SCHEMA_VERSION,
+            "tables": pointer_tables,
+        },
+    )
+
+    # Deprecated compatibility objects for consumers not yet on the pointer.
+    for table_name, table in tables.items():
+        write_table(
+            join_artifact_path(str(final_database_root), table_name, "latest.parquet"),
+            table,
         )
-        written_paths[table_name] = write_table(output_path, table)
+
+    _prune_old_snapshots(
+        snapshots_root,
+        keep_run_ids={run_id, str(previous.get("run_id", ""))},
+    )
     return written_paths
+
+
+def _guard_against_shrinkage(
+    tables: dict[str, pd.DataFrame],
+    previous: dict[str, object],
+    *,
+    force: bool,
+) -> None:
+    """Refuse to publish a snapshot that looks like data loss, unless forced."""
+    previous_tables = previous.get("tables")
+    if not isinstance(previous_tables, dict):
+        return
+    regressions: list[str] = []
+    for table_name, table in tables.items():
+        prior = previous_tables.get(table_name)
+        prior_rows = int(prior.get("rows", 0)) if isinstance(prior, dict) else 0
+        if prior_rows <= 0:
+            continue
+        if len(table) < prior_rows * FINAL_SNAPSHOT_GUARD_RATIO:
+            regressions.append(f"{table_name}: {prior_rows} -> {len(table)} rows")
+    if not regressions:
+        return
+    if force:
+        LOGGER.warning(
+            "Publishing snapshot despite row-count regressions (forced): %s",
+            "; ".join(regressions),
+        )
+        return
+    msg = (
+        "Refusing to publish a final snapshot with large row-count regressions "
+        f"({'; '.join(regressions)}). This usually means a bug or a half-built "
+        "artifact root; re-run with force=True to publish anyway."
+    )
+    raise ValueError(msg)
+
+
+def _prune_old_snapshots(snapshots_root: str, *, keep_run_ids: set[str]) -> None:
+    """Delete snapshot generations other than the current and prior one.
+
+    Two generations stay readable so a consumer that resolved the previous
+    pointer moments ago can still finish reading it.
+    """
+    keep_prefixes = tuple(f"snapshot={run_id}/" for run_id in keep_run_ids if run_id)
+    for path in list_artifacts(snapshots_root, suffix=".parquet"):
+        if not any(prefix in path for prefix in keep_prefixes):
+            delete_artifact(path)

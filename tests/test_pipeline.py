@@ -295,3 +295,91 @@ This is the extracted event text.
     assert final_edges["debt_instrument_mention_id"].to_list() == ["m-1"]
     assert final_instruments["debt_instrument_id"].to_list() == ["m-1"]
     assert final_instruments["company_name"].to_list() == ["Example Inc."]
+
+
+def _seed_final_tables(artifact_root: Path, *, rows: int = 2) -> None:
+    """Write minimal rows into every dataset finalize publishes."""
+    from cdt.pipeline import FINAL_OUTPUT_TABLES
+
+    for table_name, dataset_root_fn in FINAL_OUTPUT_TABLES.items():
+        write_partition_table(
+            dataset_root_fn(str(artifact_root)),
+            partition={"date": "2024-01-02", "shard": "0001"},
+            table=pd.DataFrame(
+                [{"id": f"{table_name}-{index}"} for index in range(rows)]
+            ),
+        )
+
+
+def test_final_snapshots_publish_atomically_with_pointer(tmp_path: Path) -> None:
+    """Finalize writes immutable snapshots and one atomic latest.json pointer (#91)."""
+    from cdt.pipeline import write_final_output_tables
+    from cdt.storage import read_json_artifact
+
+    artifact_root = tmp_path / "artifacts"
+    final_root = tmp_path / "final"
+    _seed_final_tables(artifact_root)
+
+    written = write_final_output_tables(
+        artifact_root=str(artifact_root), final_database_root=str(final_root)
+    )
+
+    pointer = read_json_artifact(str(final_root / "latest.json"))
+    assert isinstance(pointer, dict)
+    assert set(pointer["tables"]) == set(written)
+    for table_name, path in written.items():
+        assert f"snapshot={pointer['run_id']}" in path
+        assert len(read_table(path)) == 2
+        assert pointer["tables"][table_name]["rows"] == 2
+        # Deprecated compatibility object for the dashboard publisher.
+        assert (final_root / table_name / "latest.parquet").exists()
+    assert pointer["schema_version"]
+
+
+def test_final_snapshot_guard_blocks_shrinkage_unless_forced(tmp_path: Path) -> None:
+    """A snapshot that would clobber a good one with ~nothing is refused (#91)."""
+    from cdt.pipeline import write_final_output_tables
+
+    artifact_root = tmp_path / "artifacts"
+    empty_root = tmp_path / "empty-artifacts"
+    final_root = tmp_path / "final"
+    _seed_final_tables(artifact_root)
+    write_final_output_tables(
+        artifact_root=str(artifact_root), final_database_root=str(final_root)
+    )
+
+    with pytest.raises(ValueError, match="row-count regressions"):
+        write_final_output_tables(
+            artifact_root=str(empty_root), final_database_root=str(final_root)
+        )
+    # The refused publish must not have moved the pointer.
+    from cdt.storage import read_json_artifact
+
+    pointer = read_json_artifact(str(final_root / "latest.json"))
+    assert pointer["tables"]["items"]["rows"] == 2
+
+    forced = write_final_output_tables(
+        artifact_root=str(empty_root),
+        final_database_root=str(final_root),
+        force=True,
+    )
+    assert forced
+
+
+def test_old_final_snapshots_are_pruned(tmp_path: Path) -> None:
+    """Only the current and prior snapshot generations are kept (#91)."""
+    from cdt.pipeline import write_final_output_tables
+
+    artifact_root = tmp_path / "artifacts"
+    final_root = tmp_path / "final"
+    _seed_final_tables(artifact_root)
+
+    for _ in range(3):
+        write_final_output_tables(
+            artifact_root=str(artifact_root), final_database_root=str(final_root)
+        )
+
+    snapshot_dirs = {
+        path.parent.name for path in (final_root / "snapshots").glob("*/*.parquet")
+    }
+    assert len(snapshot_dirs) == 2
