@@ -974,3 +974,27 @@ def test_existing_date_shard_partition_ids_lists_written_partitions(
     assert (
         existing_date_shard_partition_ids("mentions", artifact_root=str(root)) == set()
     )
+
+
+def test_iter_date_shard_partitions_tolerates_stray_files(tmp_path: Path) -> None:
+    """A pre-migration file or orphaned tempfile must not brick the scan (#68)."""
+    from cdt.datasets import iter_date_shard_partitions
+
+    root = tmp_path / "artifacts"
+    table = pd.DataFrame({"item_id": ["a"], "text": ["x"]})
+    write_partition_table(
+        str(root / "items"),
+        partition={"date": "2026-01-02", "shard": "0007"},
+        table=table,
+    )
+    # Two stray shapes from #68's verified triggers: the old flat layout, and a
+    # tempfile left by a crash between NamedTemporaryFile and the rename.
+    (root / "items" / "items.parquet").write_bytes(b"")
+    (
+        root / "items" / "date=2026-01-02" / "shard=0007" / "tmpabc123.parquet"
+    ).write_bytes(b"")
+
+    paths = iter_date_shard_partitions("items", artifact_root=str(root))
+
+    assert len(paths) == 1
+    assert paths[0].endswith("date=2026-01-02/shard=0007/part-0000.parquet")

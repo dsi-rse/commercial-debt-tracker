@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import cast
 
 from cdt import settings
+from cdt.shared import get_logger
 from cdt.storage import (
     ArtifactPath,
     artifact_exists,
@@ -18,6 +19,8 @@ from cdt.storage import (
     read_json_artifact,
     write_json_artifact,
 )
+
+LOGGER = get_logger(__name__)
 
 ITEMIZE_CLASSIFY_EXTRACT_SHARDS = 8
 MATCH_SHARDS = 64
@@ -271,7 +274,15 @@ def iter_date_shard_partitions(
     )
     filtered: list[str] = []
     for path in paths:
-        partition = parse_date_shard_partition(path)
+        match = PARTITION_PATTERN.search(normalize_artifact_path(path))
+        if match is None:
+            # Tolerate strays instead of raising (mirrors
+            # iter_cik_shard_partitions): a pre-migration layout or a tempfile
+            # orphaned by a crash mid-write_table would otherwise brick every
+            # stage until someone deletes the file by hand (#68).
+            LOGGER.warning("Skipping non-canonical partition path: %s", path)
+            continue
+        partition = match.groupdict()
         partition_date = date.fromisoformat(partition["date"])
         if start_date is not None and partition_date < start_date:
             continue
