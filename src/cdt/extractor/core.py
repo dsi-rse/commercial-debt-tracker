@@ -158,6 +158,11 @@ class InfrastructureError(RuntimeError):
 _INFRASTRUCTURE_STATUSES = frozenset({402, 408, 429, 500, 502, 503, 504})
 
 
+def is_infrastructure_status(status: object) -> bool:
+    """Classify an HTTP status from a batch result line as infrastructure."""
+    return isinstance(status, int) and status in _INFRASTRUCTURE_STATUSES
+
+
 def is_infrastructure_error(exc: BaseException) -> bool:
     """Classify an exception from a chat call as infrastructure vs content."""
     if isinstance(exc, InfrastructureError):

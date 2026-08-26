@@ -44,6 +44,7 @@ from cdt.extractor.core import (
     finalize_extract_outputs,
     handle_response,
     initial_messages,
+    is_infrastructure_status,
     is_reasoning_model,
     native_model_id,
     record_stage_error,
@@ -793,6 +794,23 @@ def _fold_completed_batches(
             entry.pending = None
             line = results.get(custom_id)
             if line is not None:
+                response = cast(dict[str, object], line.get("response") or {})
+                if is_infrastructure_status(response.get("status_code")):
+                    # A 5xx/throttle on this request says nothing about the
+                    # filing (observed live: an OpenAI 500 permanently
+                    # terminated a row). Requeue under the same cap as
+                    # expiries instead of recording a verdict.
+                    entry.resubmissions += 1
+                    if entry.resubmissions >= max_resubmissions:
+                        record_stage_error(
+                            entry.row_state,
+                            f"Batch request infra error persisted across "
+                            f"{entry.resubmissions} rounds: "
+                            f"{response.get('status_code')} "
+                            f"{response.get('body')}",
+                        )
+                        folded += 1
+                    continue
                 entry.resubmissions = 0
                 try:
                     text = extract_batch_response_text(line)
