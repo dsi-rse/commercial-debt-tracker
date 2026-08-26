@@ -274,6 +274,11 @@ def test_classify_pending_items_skips_empty_outputs_on_rerun(
     """Empty classifier results should not write parquet and should not rerun."""
     seed_document_partition(tmp_path)
     itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
+    monkeypatch.setattr(
+        classifier_core,
+        "load_training_artifacts",
+        lambda path: (FakeModel(), 0.5, {"threshold": 0.5}),
+    )
     calls = 0
 
     def fake_classify_items(*args: object, **kwargs: object) -> pd.DataFrame:
@@ -1374,3 +1379,25 @@ def test_read_table_projects_columns_and_tolerates_missing_ones(
     tolerant = read_table(path, ["a", "missing"])
     assert list(tolerant.columns) == ["a", "missing"]
     assert tolerant["missing"].isna().all()
+
+
+def test_classifier_loads_model_once_per_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pickled model is deserialized once, not once per partition (#76)."""
+    seed_document_partitions(tmp_path)
+    itemize_pending_documents(artifact_root=tmp_path, batch_size=1)
+    loads = 0
+
+    def counting_load(path: object) -> tuple[FakeModel, float, dict[str, float]]:
+        nonlocal loads
+        del path
+        loads += 1
+        return (FakeModel(), 0.5, {"threshold": 0.5})
+
+    monkeypatch.setattr(classifier_core, "load_training_artifacts", counting_load)
+
+    classified = classify_pending_items(artifact_root=tmp_path, batch_size=1)
+
+    assert len(classified) == 2
+    assert loads == 1
