@@ -9,15 +9,19 @@ from pathlib import Path
 from typing import cast
 
 from cdt import settings
+from cdt.shared import get_logger
 from cdt.storage import (
     ArtifactPath,
     artifact_exists,
+    is_orphaned_temp_artifact,
     join_artifact_path,
     list_artifacts,
     normalize_artifact_path,
     read_json_artifact,
     write_json_artifact,
 )
+
+LOGGER = get_logger(__name__)
 
 ITEMIZE_CLASSIFY_EXTRACT_SHARDS = 8
 MATCH_SHARDS = 64
@@ -238,13 +242,23 @@ def cik_shard_partition_path(
     )
 
 
+def match_date_shard_partition(path: ArtifactPath) -> dict[str, str] | None:
+    """Match a canonical date/shard partition path, or None when non-canonical.
+
+    The single matcher behind both the strict parser and the dataset scan, so
+    the two can never drift on what counts as a canonical layout.
+    """
+    match = PARTITION_PATTERN.search(normalize_artifact_path(path))
+    return match.groupdict() if match else None
+
+
 def parse_date_shard_partition(path: ArtifactPath) -> dict[str, str]:
     """Parse a canonical date/shard partition path."""
-    normalized = normalize_artifact_path(path)
-    match = PARTITION_PATTERN.search(normalized)
-    if match is None:
+    partition = match_date_shard_partition(path)
+    if partition is None:
+        normalized = normalize_artifact_path(path)
         raise ValueError(f"Unrecognized date/shard partition path: {normalized}")
-    return match.groupdict()
+    return partition
 
 
 def parse_cik_shard_partition(path: ArtifactPath) -> dict[str, str]:
@@ -271,7 +285,22 @@ def iter_date_shard_partitions(
     )
     filtered: list[str] = []
     for path in paths:
-        partition = parse_date_shard_partition(path)
+        partition = match_date_shard_partition(path)
+        if partition is None:
+            # A tempfile orphaned by a crash mid-write_table is junk and must
+            # not brick every stage until someone deletes it by hand (#68). Any
+            # other non-canonical parquet is real data laid out wrong (e.g. a
+            # pre-migration flat file); skipping it would silently run the
+            # pipeline on nothing while ingest keeps counting its rows as
+            # already ingested, so fail loudly instead.
+            if is_orphaned_temp_artifact(path):
+                LOGGER.warning("Skipping orphaned temp partition file: %s", path)
+                continue
+            msg = (
+                f"Non-canonical parquet file in dataset {dataset_name!r}: {path}. "
+                "Re-partition or remove it before running stages."
+            )
+            raise ValueError(msg)
         partition_date = date.fromisoformat(partition["date"])
         if start_date is not None and partition_date < start_date:
             continue
@@ -322,14 +351,24 @@ def iter_cik_shard_partitions(
     ]
 
 
+def shard_label(value: str, shard_count: int) -> str:
+    """Return the canonical shard label for one key.
+
+    The single source for the shard contract — crc32, modulo, four-digit label —
+    that PARTITION_PATTERN and every partition directory name depend on. Any
+    change here strands existing partitions (#61), so change it nowhere else.
+    """
+    return f"{zlib_crc32(value) % shard_count:04d}"
+
+
 def shard_for_accession(accession_number: str) -> str:
     """Return the canonical date/shard partition for one accession."""
-    return f"{zlib_crc32(accession_number) % ITEMIZE_CLASSIFY_EXTRACT_SHARDS:04d}"
+    return shard_label(accession_number, ITEMIZE_CLASSIFY_EXTRACT_SHARDS)
 
 
 def shard_for_cik(cik: str) -> str:
     """Return the canonical cik-shard partition for one CIK."""
-    return f"{zlib_crc32(cik) % MATCH_SHARDS:04d}"
+    return shard_label(cik, MATCH_SHARDS)
 
 
 def zlib_crc32(value: str) -> int:

@@ -974,3 +974,69 @@ def test_existing_date_shard_partition_ids_lists_written_partitions(
     assert (
         existing_date_shard_partition_ids("mentions", artifact_root=str(root)) == set()
     )
+
+
+def test_iter_date_shard_partitions_skips_orphaned_tempfiles(tmp_path: Path) -> None:
+    """A tempfile left by a crash between create and rename must not brick the scan (#68)."""
+    from cdt.datasets import iter_date_shard_partitions
+
+    root = tmp_path / "artifacts"
+    table = pd.DataFrame({"item_id": ["a"], "text": ["x"]})
+    write_partition_table(
+        str(root / "items"),
+        partition={"date": "2026-01-02", "shard": "0007"},
+        table=table,
+    )
+    (
+        root / "items" / "date=2026-01-02" / "shard=0007" / "tmpabc123.parquet"
+    ).write_bytes(b"")
+
+    paths = iter_date_shard_partitions("items", artifact_root=str(root))
+
+    assert len(paths) == 1
+    assert paths[0].endswith("date=2026-01-02/shard=0007/part-0000.parquet")
+
+
+def test_iter_date_shard_partitions_raises_on_non_canonical_data(
+    tmp_path: Path,
+) -> None:
+    """Real data laid out wrong must fail loudly, not silently empty the run.
+
+    Skipping a pre-migration flat file would let every stage process nothing
+    and exit 0 while ingest keeps counting the flat file's rows as ingested —
+    those filings would be invisible to the pipeline forever.
+    """
+    from cdt.datasets import iter_date_shard_partitions
+
+    root = tmp_path / "artifacts"
+    table = pd.DataFrame({"item_id": ["a"], "text": ["x"]})
+    write_partition_table(
+        str(root / "items"),
+        partition={"date": "2026-01-02", "shard": "0007"},
+        table=table,
+    )
+    (root / "items" / "items.parquet").write_bytes(b"")
+
+    with pytest.raises(ValueError, match="Non-canonical parquet file"):
+        iter_date_shard_partitions("items", artifact_root=str(root))
+
+
+def test_read_dataset_skips_orphaned_tempfiles(tmp_path: Path) -> None:
+    """Every read path, not just the partition scan, must survive an orphan.
+
+    ingest's existing-accession scan, its per-partition merge, the matcher, and
+    pipeline finalize all read through read_dataset; a zero-byte tmp*.parquet
+    orphan previously made each of them raise ArrowInvalid.
+    """
+    root = tmp_path / "artifacts" / "items"
+    table = pd.DataFrame({"item_id": ["a"], "text": ["x"]})
+    write_partition_table(
+        str(root),
+        partition={"date": "2026-01-02", "shard": "0007"},
+        table=table,
+    )
+    (root / "date=2026-01-02" / "shard=0007" / "tmpabc123.parquet").write_bytes(b"")
+
+    read = read_dataset(str(root))
+
+    assert read["item_id"].to_list() == ["a"]

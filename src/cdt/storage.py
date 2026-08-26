@@ -18,6 +18,12 @@ import pandas as pd
 
 ArtifactPath = str | Path
 
+# Basenames NamedTemporaryFile produced before write_table stopped giving temp
+# files a .parquet suffix. A crash between create and rename orphaned them
+# inside partition directories, where every ``**/*.parquet`` reader choked on
+# the empty file (#68).
+_ORPHANED_TEMP_RE = re.compile(r"(?:^|/)tmp[^/]*\.parquet$")
+
 # One client for every S3 call in this module: construction is expensive
 # (credential resolution, endpoint discovery), and the partition scans issue
 # thousands of calls per run (#83).
@@ -100,6 +106,11 @@ def list_artifacts(base: ArtifactPath, *, suffix: str = "") -> list[str]:
     return sorted(str(path) for path in root.glob(pattern) if path.is_file())
 
 
+def is_orphaned_temp_artifact(path: ArtifactPath) -> bool:
+    """Return whether a path is a tempfile orphaned by a crash mid-write_table."""
+    return _ORPHANED_TEMP_RE.search(normalize_artifact_path(path)) is not None
+
+
 def iter_partition_paths(
     base: ArtifactPath,
     *,
@@ -107,6 +118,8 @@ def iter_partition_paths(
 ) -> Iterator[str]:
     """Yield partition file paths under a dataset, optionally filtered by key/value."""
     for path in list_artifacts(base, suffix=".parquet"):
+        if is_orphaned_temp_artifact(path):
+            continue
         if partition_filter is None:
             yield path
             continue
@@ -340,8 +353,10 @@ def write_table(path: ArtifactPath, table: pd.DataFrame) -> str:
 
     local_path = Path(normalized)
     local_path.parent.mkdir(parents=True, exist_ok=True)
+    # The temp suffix must not be .parquet: a crash between create and rename
+    # would leave a file every ``**/*.parquet`` reader picks up and dies on.
     with NamedTemporaryFile(
-        dir=local_path.parent, suffix=".parquet", delete=False
+        dir=local_path.parent, suffix=".parquet.tmp", delete=False
     ) as temp_file:
         temp_path = Path(temp_file.name)
     try:
@@ -351,6 +366,16 @@ def write_table(path: ArtifactPath, table: pd.DataFrame) -> str:
         if temp_path.exists():
             temp_path.unlink()
     return str(local_path)
+
+
+def delete_artifact(path: ArtifactPath) -> None:
+    """Delete a local or S3-backed artifact, tolerating a missing target."""
+    normalized = normalize_artifact_path(path)
+    if is_s3_uri(normalized):
+        bucket, key = parse_s3_uri(normalized)
+        _s3_client().delete_object(Bucket=bucket, Key=key)
+        return
+    Path(normalized).unlink(missing_ok=True)
 
 
 def next_batch_path(directory: Path, prefix: str) -> Path:
