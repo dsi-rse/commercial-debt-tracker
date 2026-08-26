@@ -111,6 +111,41 @@ def is_orphaned_temp_artifact(path: ArtifactPath) -> bool:
     return _ORPHANED_TEMP_RE.search(normalize_artifact_path(path)) is not None
 
 
+def list_artifacts_with_versions(
+    base: ArtifactPath, *, suffix: str = ""
+) -> dict[str, str]:
+    """Map artifact path -> opaque source version, from one LIST.
+
+    The version is the S3 ETag (size+mtime locally): it changes whenever the
+    object is rewritten, which is how completion registries detect a source
+    partition that ingest merged new rows into (#62). Captured during the same
+    pagination the plain listing uses, so it costs no extra requests.
+    """
+    normalized = normalize_artifact_path(base).rstrip("/")
+    if is_s3_uri(normalized):
+        bucket, prefix = parse_s3_uri(normalized)
+        paginator = _s3_client().get_paginator("list_objects_v2")
+        results: dict[str, str] = {}
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in cast(list[dict[str, str]], page.get("Contents", [])):
+                key = obj["Key"]
+                if suffix and not key.endswith(suffix):
+                    continue
+                results[f"s3://{bucket}/{key}"] = str(obj["ETag"])
+        return results
+    root = Path(normalized)
+    if not root.exists():
+        return {}
+    pattern = f"**/*{suffix}" if suffix else "**/*"
+    results = {}
+    for path in root.glob(pattern):
+        if not path.is_file():
+            continue
+        stat = path.stat()
+        results[str(path)] = f"{stat.st_size}-{stat.st_mtime_ns}"
+    return results
+
+
 def iter_partition_paths(
     base: ArtifactPath,
     *,

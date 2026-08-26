@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import cast
@@ -90,25 +91,96 @@ def completion_registry_path(
     )
 
 
+@dataclass
+class CompletedPartition:
+    """One source partition's completion record (registry v2).
+
+    ``fingerprint`` is the source object's version at processing time (S3 ETag;
+    size+mtime locally); None on entries migrated from the v1 path list, which
+    read as "complete as recorded, reprocess if the source ever changes".
+    ``item_ids`` (extract only) are the content-terminal rows — SUCCESS or
+    FAILED-on-validation — so re-processing a partition is row-level and never
+    re-pays rows that already have a real outcome (#49, #62).
+    """
+
+    fingerprint: str | None = None
+    item_ids: frozenset[str] = frozenset()
+
+
 def load_completed_partitions(
     stage_name: str,
     *,
     artifact_root: ArtifactPath | None = None,
     data_dir: Path | None = None,
 ) -> set[str]:
-    """Load completed source partitions for one stage."""
+    """Load completed source partition paths for one stage (v1-compatible view)."""
+    return set(
+        load_completion_registry(
+            stage_name, artifact_root=artifact_root, data_dir=data_dir
+        )
+    )
+
+
+def load_completion_registry(
+    stage_name: str,
+    *,
+    artifact_root: ArtifactPath | None = None,
+    data_dir: Path | None = None,
+) -> dict[str, CompletedPartition]:
+    """Load one stage's completion registry, migrating v1 path lists in memory."""
     path = completion_registry_path(
         stage_name, artifact_root=artifact_root, data_dir=data_dir
     )
     if not artifact_exists(path):
-        return set()
+        return {}
     payload = read_json_artifact(path)
     if not isinstance(payload, dict):
-        return set()
+        return {}
+    partitions = payload.get("partitions")
+    if isinstance(partitions, dict):
+        registry: dict[str, CompletedPartition] = {}
+        for key, entry in partitions.items():
+            if not str(key).strip() or not isinstance(entry, dict):
+                continue
+            fingerprint = entry.get("fingerprint")
+            item_ids = entry.get("item_ids", [])
+            registry[str(key)] = CompletedPartition(
+                fingerprint=str(fingerprint) if fingerprint else None,
+                item_ids=frozenset(
+                    str(item) for item in item_ids if isinstance(item_ids, list)
+                ),
+            )
+        return registry
     values = payload.get("source_partitions", [])
     if not isinstance(values, list):
-        return set()
-    return {str(value) for value in values if str(value).strip()}
+        return {}
+    return {str(value): CompletedPartition() for value in values if str(value).strip()}
+
+
+def save_completion_registry(
+    stage_name: str,
+    registry: dict[str, CompletedPartition],
+    *,
+    artifact_root: ArtifactPath | None = None,
+    data_dir: Path | None = None,
+) -> str:
+    """Persist one stage's completion registry in the v2 format."""
+    return write_json_artifact(
+        completion_registry_path(
+            stage_name, artifact_root=artifact_root, data_dir=data_dir
+        ),
+        {
+            "stage": stage_name,
+            "version": 2,
+            "partitions": {
+                path: {
+                    "fingerprint": entry.fingerprint,
+                    **({"item_ids": sorted(entry.item_ids)} if entry.item_ids else {}),
+                }
+                for path, entry in sorted(registry.items())
+            },
+        },
+    )
 
 
 def save_completed_partitions(
@@ -118,15 +190,18 @@ def save_completed_partitions(
     artifact_root: ArtifactPath | None = None,
     data_dir: Path | None = None,
 ) -> str:
-    """Persist completed source partitions for one stage."""
-    return write_json_artifact(
-        completion_registry_path(
-            stage_name, artifact_root=artifact_root, data_dir=data_dir
-        ),
-        {
-            "stage": stage_name,
-            "source_partitions": sorted(source_partitions),
-        },
+    """Persist completed partitions path-only (v1-compatible writer).
+
+    Merges into the v2 registry without fingerprints; callers migrating to
+    row-aware completion should use save_completion_registry directly.
+    """
+    registry = load_completion_registry(
+        stage_name, artifact_root=artifact_root, data_dir=data_dir
+    )
+    for path in source_partitions:
+        registry.setdefault(path, CompletedPartition())
+    return save_completion_registry(
+        stage_name, registry, artifact_root=artifact_root, data_dir=data_dir
     )
 
 

@@ -427,7 +427,7 @@ def test_job_lifecycle_completes_and_writes_mentions(tmp_path: Path) -> None:
     completed = read_json_artifact(
         completion_registry_path("extract", artifact_root=tmp_path)
     )
-    assert len(completed["source_partitions"]) == 1
+    assert len(completed["partitions"]) == 1
 
     # Active marker cleared; a subsequent tick is idle (nothing pending).
     idle = _advance(tmp_path, client)
@@ -448,7 +448,7 @@ def test_empty_job_finalizes_immediately(tmp_path: Path) -> None:
     completed = read_json_artifact(
         completion_registry_path("extract", artifact_root=tmp_path)
     )
-    assert len(completed["source_partitions"]) == 1
+    assert len(completed["partitions"]) == 1
 
 
 def test_request_error_terminates_row(tmp_path: Path) -> None:
