@@ -1536,3 +1536,28 @@ def test_collect_pending_extract_items_caps_claimed_rows(tmp_path: Path) -> None
     )
     assert len(uncapped_entries) == 3
     assert len(uncapped_claimed) == 3
+
+
+def test_live_client_sends_request_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every live chat call carries a client-side timeout (#93)."""
+    import openrouter as openrouter_module
+
+    from cdt.extractor.core import (
+        LIVE_REQUEST_TIMEOUT_SECONDS,
+        OpenRouterChatClient,
+    )
+
+    captured: dict[str, object] = {}
+
+    class FakeOpenRouter:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+            raise RuntimeError("constructed")
+
+    monkeypatch.setattr(openrouter_module, "OpenRouter", FakeOpenRouter)
+    client = OpenRouterChatClient(api_key="k")
+
+    with pytest.raises(RuntimeError, match="constructed"):
+        asyncio.run(client.complete(messages=[], model="m", reasoning_effort=""))
+
+    assert captured["timeout_ms"] == LIVE_REQUEST_TIMEOUT_SECONDS * 1000
