@@ -455,6 +455,29 @@ def test_itemize_cli_calls_pending_itemizer(monkeypatch: pytest.MonkeyPatch) -> 
     ]
 
 
+def test_stage_cli_does_not_run_while_lease_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stage subcommands refuse to run against a leased artifact root (#88).
+
+    They rewrite the same completion registries the scheduled runs do, and an
+    unserialized writer loses registry updates.
+    """
+    monkeypatch.setattr(
+        cli,
+        "itemize_pending_documents",
+        lambda **kwargs: pytest.fail("itemize must not run while the lease is held"),
+    )
+    held = acquire_lease(tmp_path, PIPELINE_WRITER_LEASE)
+    assert held is not None
+
+    status = cli.main(
+        ["itemize", "--artifact-root", str(tmp_path), "--batch-size", "5", "--quiet"]
+    )
+
+    assert status == 1
+
+
 def test_itemize_cli_passes_custom_item_numbers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -15,16 +15,15 @@ import pandas as pd
 
 from cdt import settings
 from cdt.datasets import (
+    CompletedPartition,
     completion_registry_path,
     dataset_root,
     date_shard_partition_path,
-    existing_date_shard_partition_ids,
-    iter_date_shard_partitions,
-    load_completed_partitions,
     parse_date_shard_partition,
+    pending_source_partitions,
     resolve_artifact_root,
     run_manifest_path,
-    save_completed_partitions,
+    save_completion_registry,
 )
 from cdt.itemizer.core import ITEM_COLUMNS, ITEM_DATASET_NAME
 from cdt.storage import (
@@ -186,38 +185,21 @@ def classify_pending_items(
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     processed_frames: list[pd.DataFrame] = []
     partitions_written: list[str] = []
-    completed_item_paths = (
-        set()
-        if force
-        else load_completed_partitions(
-            "classify", artifact_root=resolved_root, data_dir=data_dir
-        )
-    )
     visited_item_paths: set[str] = set()
     empty_partitions = 0
-    pending_item_paths: list[str] = []
-
-    # One LIST of the target dataset answers every existence check; probing each
-    # target with artifact_exists costs one HeadObject per source partition ever
-    # written and dominates discovery time at scale (#83).
-    existing_target_ids = (
-        set()
-        if force
-        else existing_date_shard_partition_ids(
-            CLASSIFICATION_DATASET_NAME, artifact_root=resolved_root, data_dir=data_dir
-        )
-    )
-    for item_path in iter_date_shard_partitions(
+    # Fingerprint-keyed selection: an items partition the itemizer rewrote (its
+    # source grew) is pending again and recomputed whole — classification is
+    # cheap and deterministic, so row-level diffing is not worth it here (#62).
+    pending_with_fingerprints, registry = pending_source_partitions(
+        "classify",
         ITEM_DATASET_NAME,
+        CLASSIFICATION_DATASET_NAME,
         artifact_root=resolved_root,
         data_dir=data_dir,
-    ):
-        partition = parse_date_shard_partition(item_path)
-        if (partition["date"], partition["shard"]) in existing_target_ids:
-            continue
-        if not force and item_path in completed_item_paths:
-            continue
-        pending_item_paths.append(item_path)
+        force=force,
+    )
+    pending_item_paths = [path for path, _ in pending_with_fingerprints]
+    source_fingerprints = dict(pending_with_fingerprints)
 
     total_partitions = len(pending_item_paths)
     for chunk_start in range(0, total_partitions, batch_size):
@@ -265,10 +247,13 @@ def classify_pending_items(
                 perf_counter() - partition_start,
             )
 
-    updated_completed_paths = completed_item_paths | visited_item_paths
-    save_completed_partitions(
+    for item_path in visited_item_paths:
+        registry[item_path] = CompletedPartition(
+            fingerprint=source_fingerprints.get(item_path)
+        )
+    save_completion_registry(
         "classify",
-        updated_completed_paths,
+        registry,
         artifact_root=resolved_root,
         data_dir=data_dir,
     )

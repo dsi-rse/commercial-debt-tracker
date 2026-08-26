@@ -2,14 +2,28 @@
 
 import logging
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
+
+from cdt import settings
 
 
 def pytest_sessionfinish(session, exitstatus) -> None:  # noqa: ANN001
     """Disable warnings-as-workflow errors; our upstream dependencies raise warnings."""
     if exitstatus == 5:  # noqa: PLR2004
         session.exitstatus = 0
+
+
+@pytest.fixture(autouse=True)
+def _isolated_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point the default artifact root at a per-test directory.
+
+    Commands that fall back to ``settings.DATA_DIR`` (and now take the
+    pipeline-writer lease there, #88) must never touch the developer's real
+    data directory — or a live local pipeline's lock — from a test.
+    """
+    monkeypatch.setattr(settings, "DATA_DIR", tmp_path / "default-data-dir")
 
 
 @pytest.fixture

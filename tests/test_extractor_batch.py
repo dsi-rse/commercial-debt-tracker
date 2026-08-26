@@ -193,6 +193,19 @@ class FakeBatchClient:
                             {"custom_id": custom_id, "error": {"message": spec[1]}}
                         )
                     )
+                elif isinstance(spec, tuple) and spec[0] == "status":
+                    # A per-request non-200 (e.g. a provider 500) in the output file.
+                    out_lines.append(
+                        json.dumps(
+                            {
+                                "custom_id": custom_id,
+                                "response": {
+                                    "status_code": spec[1],
+                                    "body": {"error": {"type": "server_error"}},
+                                },
+                            }
+                        )
+                    )
                 elif isinstance(spec, tuple) and spec[0] == "missing":
                     continue
                 else:
@@ -427,7 +440,7 @@ def test_job_lifecycle_completes_and_writes_mentions(tmp_path: Path) -> None:
     completed = read_json_artifact(
         completion_registry_path("extract", artifact_root=tmp_path)
     )
-    assert len(completed["source_partitions"]) == 1
+    assert len(completed["partitions"]) == 1
 
     # Active marker cleared; a subsequent tick is idle (nothing pending).
     idle = _advance(tmp_path, client)
@@ -448,7 +461,7 @@ def test_empty_job_finalizes_immediately(tmp_path: Path) -> None:
     completed = read_json_artifact(
         completion_registry_path("extract", artifact_root=tmp_path)
     )
-    assert len(completed["source_partitions"]) == 1
+    assert len(completed["partitions"]) == 1
 
 
 def test_request_error_terminates_row(tmp_path: Path) -> None:
@@ -1374,3 +1387,93 @@ def test_legacy_uncompressed_state_still_loads(tmp_path: Path) -> None:
             break
     assert result.status == "completed"
     assert not read_dataset(mentions_root(tmp_path)).empty
+
+
+def test_batch_job_pays_only_for_new_rows_after_partition_grows(
+    tmp_path: Path,
+) -> None:
+    """A grown classification partition yields a job over only the new rows (#62).
+
+    The first job's mentions survive the second job's merge, and completion is
+    recorded per row outcome rather than per partition visit (#49).
+    """
+    seed_classification(tmp_path, [{"item_id": "item-multi", "text": MULTI_TEXT}])
+    client = FakeBatchClient(
+        {
+            "item-multi": {"ner": MULTI_NER, "instrument_ie": MULTI_IE},
+            "item-nodebt": {"ner": NODEBT_NER},
+        }
+    )
+    for _ in range(4):
+        if _advance(tmp_path, client).status == "completed":
+            break
+    assert read_dataset(mentions_root(tmp_path))["name"].to_list() == ["Term Loan"]
+    first_job_rows = {cid for _, cids in client.submitted for cid in cids}
+    assert first_job_rows == {"item-multi"}
+
+    # Ingest-style growth: the same partition object gains a second relevant row.
+    seed_classification(
+        tmp_path,
+        [
+            {"item_id": "item-multi", "text": MULTI_TEXT},
+            {"item_id": "item-nodebt", "text": NODEBT_TEXT},
+        ],
+    )
+    for _ in range(4):
+        result = _advance(tmp_path, client)
+        if result.status == "completed":
+            break
+    assert result.status == "completed"
+
+    second_job_rows = {
+        cid for _, cids in client.submitted for cid in cids
+    } - first_job_rows
+    assert second_job_rows == {"item-nodebt"}
+    # The first job's mentions survived the second job's finalize.
+    assert read_dataset(mentions_root(tmp_path))["name"].to_list() == ["Term Loan"]
+
+
+def test_per_request_server_error_requeues_instead_of_terminating(
+    tmp_path: Path,
+) -> None:
+    """A 500 on one request is infrastructure, not a verdict (#49, seen live).
+
+    The scripted client returns a 500 line on the first NER round; the row must
+    requeue and succeed on the next round rather than land in the failure
+    registry.
+    """
+
+    class FlakyOnceClient(FakeBatchClient):
+        def __init__(self) -> None:
+            super().__init__(
+                {"item-multi": {"ner": MULTI_NER, "instrument_ie": MULTI_IE}}
+            )
+            self._first = True
+
+        def submit(
+            self, requests: list[dict[str, object]], *, metadata: dict[str, str]
+        ) -> str:
+            if self._first:
+                self._first = False
+                self.scripts["item-multi"] = {
+                    "ner": ("status", 500),
+                    "instrument_ie": MULTI_IE,
+                }
+                batch_id = super().submit(requests, metadata=metadata)
+                self.scripts["item-multi"] = {
+                    "ner": MULTI_NER,
+                    "instrument_ie": MULTI_IE,
+                }
+                return batch_id
+            return super().submit(requests, metadata=metadata)
+
+    client = FlakyOnceClient()
+    seed_classification(tmp_path, [{"item_id": "item-multi", "text": MULTI_TEXT}])
+
+    for _ in range(6):
+        result = _advance(tmp_path, client)
+        if result.status == "completed":
+            break
+    assert result.status == "completed"
+    assert not read_dataset(mentions_root(tmp_path)).empty
+    assert load_row_failures("extract", artifact_root=tmp_path) == {}
