@@ -77,6 +77,12 @@ DEFAULT_MAX_BATCH_BYTES = 100 * 1024 * 1024
 # A row whose batch expires without a result re-submits next tick; each round
 # costs another 24h window, so cap the rounds instead of looping forever.
 DEFAULT_MAX_RESUBMISSIONS = 3
+# Ticks are hourly, so this is ~4 days. A healthy job needs at least three
+# sequential batch rounds (one per stage) plus retries, so multi-day jobs are
+# normal — but one alive this long has probably wedged (a batch stuck
+# in_progress upstream, rows ping-ponging through resubmissions). The literal
+# "Extract job stalled" below feeds a CloudWatch metric-filter alarm (#85).
+STALL_WARNING_TICKS = 96
 # reasoning_effort values gpt-5-class models accept, quoted verbatim from the API's
 # own rejection message: "Supported values are: 'none', 'low', 'medium', 'high',
 # and 'xhigh'." Note this is NOT the union of every OpenAI model's vocabulary —
@@ -1221,6 +1227,7 @@ def advance_extract_job(
             terminal_rows=terminal_rows,
         )
 
+    _warn_if_stalled(job, terminal_rows)
     LOGGER.info(
         "Extract job %s tick=%s folded=%s submitted=%s in_flight=%s terminal=%s/%s",
         job.job_id,
@@ -1239,6 +1246,29 @@ def advance_extract_job(
         awaiting_rows=len(awaiting),
         in_flight_batches=len(job.batches),
         terminal_rows=terminal_rows,
+    )
+
+
+def _warn_if_stalled(job: JobState, terminal_rows: int) -> None:
+    """Log the stall literal once per tick when a job has lived too long.
+
+    One job runs at a time, so a wedged job head-of-line blocks every newly
+    classified filing while the poll-liveness alarm stays green (ticks keep
+    succeeding). The alarm on this literal is the "job stopped advancing"
+    signal #85 asks for; it re-fires every tick, holding the alarm in ALARM
+    until the job finishes or an operator resets it.
+    """
+    if job.tick < STALL_WARNING_TICKS:
+        return
+    LOGGER.warning(
+        "Extract job stalled: job=%s tick=%s terminal=%s/%s — still unfinished "
+        "after %s hourly ticks. Inspect with `cdt show-extract-job`; a job that "
+        "cannot finish can be cleared with `cdt reset-extract-job --yes`.",
+        job.job_id,
+        job.tick,
+        terminal_rows,
+        len(job.rows),
+        job.tick,
     )
 
 

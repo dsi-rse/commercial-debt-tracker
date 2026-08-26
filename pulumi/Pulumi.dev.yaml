@@ -15,3 +15,9 @@ config:
   # The poller alone drives batch extraction; enabled so manual historical runs
   # drain without hand-fired ticks while the daily schedule stays off.
   idi:poll_schedule_enabled: "true"
+  # Where every alarm notifies. Alerts stay off until the deploy role gains the
+  # sns/cloudwatch/events statements from dsi-rse/idi-ftm2j-shared#79 — flipping
+  # alerts_enabled before that redeploy fails with AccessDenied on CreateTopic.
+  # Once it lands, uncomment the line below; nothing else is needed.
+  idi:alert_email: tspread@uchicago.edu
+  # idi:alerts_enabled: "true"

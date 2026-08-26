@@ -147,6 +147,12 @@ Optional:
   historical run while the daily schedule stays off)
 - `log_retention_days`
 - `ecr_image_retention_count`
+- `alerts_enabled` (gates every alarm/SNS resource; requires the deploy-role
+  statements from dsi-rse/idi-ftm2j-shared#79 — enabling earlier fails the
+  deploy with AccessDenied on `sns:CreateTopic`)
+- `alert_email` (SNS subscription for every alarm; **required** when
+  `alerts_enabled` is true — the deploy fails fast rather than creating alarms
+  that notify nobody)
 
 CDT does not publish Cloudflare R2 JSON, and no longer carries R2 config: it writes
 final parquet snapshots under `final_database_prefix`, and the publisher stack in
@@ -196,6 +202,25 @@ The scheduler state is controlled by the Pulumi `idi:schedule_enabled` setting
 `--force` on a batch-backend `daily`/`historical` run applies to the prepare and
 match/finalize stages only; to force a re-extract, run a poll tick with
 `--force` while no job is active.
+
+## Monitoring and Response
+
+With `idi:alerts_enabled` on, every alarm notifies the `idi:alert_email` SNS
+subscription (topic ARN is the `alerts_topic_arn` stack output). What each
+alarm means and what to do:
+
+| Alarm | Meaning | First response |
+|---|---|---|
+| `*-poll-liveness` | No poll tick completed for 6h; extraction is stalled. | Check the poll schedule state and the latest task logs; a wedged holder shows up as repeated `locked` ticks. |
+| `*-daily-heartbeat` | No `daily` run completed for 24h. | Check the daily schedule, the task-failure alerts, and the scheduler DLQ. |
+| `*-task-failures` | An ECS task exited nonzero or failed to start (includes OOM kills, exit 137). | Read the task's log stream; OOM usually means a backfill outgrew `idi:memory`. |
+| `*-job-stall` | The active extract job has run ~4 days of ticks without finishing; it blocks all newer filings. | `cdt show-extract-job`; if genuinely wedged, `cdt reset-extract-job --yes` (abandons in-flight batches). |
+| `*-lease-theft` | A run died (or overran its TTL) still holding the writer lease. | Find the previous holder's logs; its partial work is recomputed by the next run, but check why it died. |
+| `*-dlq-depth` | The shared scheduler DLQ has messages: a RunTask invocation failed after retries. | Inspect the queue; the message may belong to another processor sharing the DLQ. |
+
+The log-literal → metric-filter couplings ("Poll tick complete",
+"Orchestrator run complete: mode=daily", "Extract job stalled", "Stole lease")
+are annotated at both ends; change them together.
 
 ## Historical Backfills
 

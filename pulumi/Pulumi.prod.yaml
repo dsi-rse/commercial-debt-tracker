@@ -16,3 +16,9 @@ config:
   idi:ecr_image_retention_count: "5"
   idi:cron: cron(0 7 * * ? *)
   idi:schedule_enabled: "false"
+  # Where every alarm notifies. Alerts stay off until the deploy role gains the
+  # sns/cloudwatch/events statements from dsi-rse/idi-ftm2j-shared#79 — flipping
+  # alerts_enabled before that redeploy fails with AccessDenied on CreateTopic.
+  # Enable alerts together with the schedules when prod goes live.
+  idi:alert_email: tspread@uchicago.edu
+  # idi:alerts_enabled: "true"

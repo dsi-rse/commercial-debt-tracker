@@ -1477,3 +1477,36 @@ def test_per_request_server_error_requeues_instead_of_terminating(
     assert result.status == "completed"
     assert not read_dataset(mentions_root(tmp_path)).empty
     assert load_row_failures("extract", artifact_root=tmp_path) == {}
+
+
+def test_stall_warning_fires_only_past_the_tick_threshold(
+    caplog: pytest.LogCaptureFixture,
+    propagate_logger: Callable[[logging.Logger], None],
+) -> None:
+    """The stall literal appears once a job outlives STALL_WARNING_TICKS (#85)."""
+    from cdt.extractor.batch import LOGGER as batch_logger
+    from cdt.extractor.batch import (
+        STALL_WARNING_TICKS,
+        JobState,
+        _warn_if_stalled,
+    )
+
+    propagate_logger(batch_logger)
+    job = JobState(
+        job_id="J",
+        model="m",
+        reasoning_effort="low",
+        max_attempts=3,
+        claimed_partitions=[],
+        rows={},
+    )
+
+    job.tick = STALL_WARNING_TICKS - 1
+    with caplog.at_level("WARNING"):
+        _warn_if_stalled(job, terminal_rows=0)
+    assert not caplog.records
+
+    job.tick = STALL_WARNING_TICKS
+    with caplog.at_level("WARNING"):
+        _warn_if_stalled(job, terminal_rows=0)
+    assert any("Extract job stalled" in record.message for record in caplog.records)
