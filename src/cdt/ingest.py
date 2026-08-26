@@ -47,8 +47,10 @@ CDT_DOCUMENT_TYPE = "COMPLETE SUBMISSION TEXT FILE"
 CDT_DOCUMENT_DESCRIPTION = "COMPLETE SUBMISSION TEXT FILE"
 DEFAULT_BATCH_SIZE = 100
 PROGRESS_DAY_INTERVAL = 30
+# {prefix...}/{date}/{form}/{cik}/{accession}/manifest.json — the CIK is
+# counted from the END so a multi-segment --s3-prefix cannot shift it (#73).
+MANIFEST_KEY_CIK_INDEX_FROM_END = -3
 MIN_MANIFEST_KEY_PARTS = 5
-MANIFEST_KEY_CIK_INDEX = 3
 DEFAULT_OUTPUT_PREFIX = "processors/cdt"
 DOCUMENT_DATASET_NAME = "documents"
 RUN_DATASET_NAME = "runs"
@@ -791,7 +793,7 @@ def _key_matches_ciks(key: str, ciks: set[str] | None) -> bool:
     parts = key.split("/")
     if len(parts) < MIN_MANIFEST_KEY_PARTS:
         return False
-    return parts[MANIFEST_KEY_CIK_INDEX] in ciks
+    return parts[MANIFEST_KEY_CIK_INDEX_FROM_END] in ciks
 
 
 def _failure_key(bucket: str, key: str) -> tuple[str, str]:

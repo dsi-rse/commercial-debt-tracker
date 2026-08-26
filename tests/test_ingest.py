@@ -673,3 +673,15 @@ def test_force_retries_registered_permanent_failures(tmp_path: Path) -> None:
 
     assert skipped == []
     assert [c.accession_number for c in retried] == ["000114036126006577"]
+
+
+def test_key_matches_ciks_with_multi_segment_prefix() -> None:
+    """The CIK segment is found from the key's end, not a fixed index (#73)."""
+    from cdt.ingest import _key_matches_ciks
+
+    single = "sec/2024-01-02/8-K/320193/000114036126006577/manifest.json"
+    multi = "edgar/8k/2024-01-02/8-K/320193/000114036126006577/manifest.json"
+
+    assert _key_matches_ciks(single, {"320193"})
+    assert _key_matches_ciks(multi, {"320193"})
+    assert not _key_matches_ciks(multi, {"999999"})
