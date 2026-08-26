@@ -90,3 +90,52 @@ def test_primary_8k_body_prefers_8k_document_block() -> None:
 """
 
     assert primary_8k_body(text).strip() == "right"
+
+
+def test_duplicate_item_information_lines_emit_one_row() -> None:
+    """SEC headers repeat ITEM INFORMATION lines; item_id is a primary key (#74)."""
+    document = DocumentText(
+        accession_number="0002",
+        cik="320193",
+        company_name="Example Inc.",
+        url="https://sec.example/full.txt",
+        date="2024-01-02",
+        text="""
+ITEM INFORMATION: Other Events
+ITEM INFORMATION: Other Events
+<DOCUMENT>
+<TYPE>8-K
+<TEXT>
+<html><body>
+<p>Item 8.01 Other Events.</p>
+<p>The company entered a material update.</p>
+</body></html>
+</TEXT>
+</DOCUMENT>
+""",
+    )
+
+    sections = extract_items_from_document(document)
+
+    assert len(sections) == 1
+    assert sections[0].item_number == "8.01"
+
+
+def test_duplicate_unmapped_item_information_lines_emit_one_row() -> None:
+    """Unmapped duplicates would collide on the same accession-'' item_id (#74)."""
+    document = DocumentText(
+        accession_number="0003",
+        cik="320193",
+        company_name="Example Inc.",
+        url="https://sec.example/full.txt",
+        date="2024-01-02",
+        text=(
+            "ITEM INFORMATION: Not A Real Item\n"
+            "ITEM INFORMATION: Not A Real Item\n"
+            "Item 8.01 Other Events"
+        ),
+    )
+
+    sections = extract_items_from_document(document)
+
+    assert len(sections) == 1

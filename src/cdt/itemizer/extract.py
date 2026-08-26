@@ -198,8 +198,17 @@ def extract_items_from_document(document: DocumentText) -> list[ItemSection]:
     lines = normalize_body_lines(primary_8k_body(document.text))
     headings = item_headings(lines)
     rows = []
+    # item_id is accession + item_number, so a header repeating an ITEM
+    # INFORMATION line (which SEC headers do produce) or two labels mapping to
+    # one number would emit duplicate primary keys and corrupt downstream joins
+    # (#74). Keep the first occurrence of each key.
+    seen_keys: set[str] = set()
     for item_information in iter_item_information_values(document.text):
         item_number = ITEM_NAME_TO_NUMBER.get(item_information)
+        key = item_number or item_information
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
         section = (
             extract_section(lines, headings, item_number)
             if item_number is not None
