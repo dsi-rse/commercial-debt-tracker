@@ -25,8 +25,16 @@ once".
 exhausted — a real content verdict), or `ERROR` (an exception: provider,
 network, preprocess). The rule everywhere becomes:
 
-> **content-terminal = {SUCCESS, FAILED}. Only content-terminal rows count
-> toward completion. ERROR rows leave their work pending.**
+> **A row counts toward completion when it reached any terminal state — and
+> infrastructure failures never produce one.** The live path aborts the run on
+> the first infra error (rows stay non-terminal, hence pending); the batch path
+> requeues under the resubmission cap (#84). Deterministic content errors
+> (`FAILED` validation, parse/preprocess `ERROR`s) stay terminal so partitions
+> still converge instead of retrying forever; the failure registry records them
+> for operators.
+
+Registry entries carry an explicit ``complete`` flag: a partition interrupted
+mid-pass keeps its terminal ``item_ids`` (never re-paid) but stays pending.
 
 ### 2. Versioned, row-aware completion registry (v2)
 

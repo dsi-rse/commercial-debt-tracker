@@ -105,6 +105,10 @@ class CompletedPartition:
 
     fingerprint: str | None = None
     item_ids: frozenset[str] = frozenset()
+    # False when some relevant rows are not yet content-terminal (an aborted or
+    # infra-interrupted pass): the partition stays pending and only the rows
+    # missing from item_ids are processed next time.
+    complete: bool = True
 
 
 def load_completed_partitions(
@@ -114,11 +118,13 @@ def load_completed_partitions(
     data_dir: Path | None = None,
 ) -> set[str]:
     """Load completed source partition paths for one stage (v1-compatible view)."""
-    return set(
-        load_completion_registry(
+    return {
+        path
+        for path, entry in load_completion_registry(
             stage_name, artifact_root=artifact_root, data_dir=data_dir
-        )
-    )
+        ).items()
+        if entry.complete
+    }
 
 
 def load_completion_registry(
@@ -149,6 +155,7 @@ def load_completion_registry(
                 item_ids=frozenset(
                     str(item) for item in item_ids if isinstance(item_ids, list)
                 ),
+                complete=bool(entry.get("complete", True)),
             )
         return registry
     values = payload.get("source_partitions", [])
@@ -176,6 +183,7 @@ def save_completion_registry(
                 path: {
                     "fingerprint": entry.fingerprint,
                     **({"item_ids": sorted(entry.item_ids)} if entry.item_ids else {}),
+                    **({} if entry.complete else {"complete": False}),
                 }
                 for path, entry in sorted(registry.items())
             },

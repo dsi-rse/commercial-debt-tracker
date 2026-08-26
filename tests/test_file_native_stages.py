@@ -1040,3 +1040,131 @@ def test_read_dataset_skips_orphaned_tempfiles(tmp_path: Path) -> None:
     read = read_dataset(str(root))
 
     assert read["item_id"].to_list() == ["a"]
+
+
+def _seed_classifications(
+    tmp_path: Path, item_ids: list[str], *, date: str = "2024-01-02"
+) -> None:
+    """Write one classifications partition with the given relevant items."""
+    from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
+
+    rows = []
+    for item_id in item_ids:
+        row: dict[str, object] = {column: None for column in CLASSIFIED_ITEM_COLUMNS}
+        row.update(
+            {
+                "item_id": item_id,
+                "accession_number": item_id.split("-")[0],
+                "cik": "320193",
+                "date": date,
+                "item": "8.01",
+                "text": f"text for {item_id}",
+                "relevance": True,
+            }
+        )
+        rows.append(row)
+    write_partition_table(
+        str(classifications_root(tmp_path)),
+        partition={"date": date, "shard": "0001"},
+        table=pd.DataFrame(rows, columns=CLASSIFIED_ITEM_COLUMNS),
+    )
+
+
+def _fake_success_workflow(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Patch the extraction workflow to succeed with one mention per row."""
+    calls: list[str] = []
+
+    async def fake_workflow(**kwargs: object) -> ExtractionRowState:
+        item_row = kwargs["item_row"]
+        calls.append(str(item_row["item_id"]))
+        row_state = ExtractionRowState(item_row=item_row, stage_name="instrument_ie")
+        row_state.debt_instrument_mentions = [
+            {"item_id": str(item_row["item_id"]), "name": "Term Loan"}
+        ]
+        row_state.finish("SUCCESS")
+        return row_state
+
+    monkeypatch.setattr("cdt.extractor.core.run_extraction_workflow", fake_workflow)
+    return calls
+
+
+def test_late_arriving_rows_extract_after_partition_grows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rows merged into an already-processed partition are picked up (#62)."""
+    _seed_classifications(tmp_path, ["a-8-01"])
+    calls = _fake_success_workflow(monkeypatch)
+
+    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+    assert calls == ["a-8-01"]
+
+    # Ingest-style in-place merge: the partition object grows a new row.
+    _seed_classifications(tmp_path, ["a-8-01", "b-8-01"])
+    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+
+    # Only the new row is paid for, and the target holds both rows' mentions.
+    assert calls == ["a-8-01", "b-8-01"]
+    written = read_dataset(mentions_root(tmp_path))
+    assert sorted(written["item_id"]) == ["a-8-01", "b-8-01"]
+
+
+def test_infrastructure_error_aborts_and_preserves_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A provider failure stops the run; terminal rows are never re-paid (#49)."""
+    from cdt.datasets import load_completion_registry
+    from cdt.extractor.core import InfrastructureError
+
+    _seed_classifications(tmp_path, ["a-8-01", "b-8-01"])
+    calls: list[str] = []
+
+    async def failing_workflow(**kwargs: object) -> ExtractionRowState:
+        item_row = kwargs["item_row"]
+        calls.append(str(item_row["item_id"]))
+        if str(item_row["item_id"]) == "b-8-01":
+            raise InfrastructureError("PaymentRequiredResponseError: 402")
+        row_state = ExtractionRowState(item_row=item_row, stage_name="instrument_ie")
+        row_state.debt_instrument_mentions = [
+            {"item_id": str(item_row["item_id"]), "name": "Term Loan"}
+        ]
+        row_state.finish("SUCCESS")
+        return row_state
+
+    monkeypatch.setattr("cdt.extractor.core.run_extraction_workflow", failing_workflow)
+    with pytest.raises(InfrastructureError):
+        extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+
+    registry = load_completion_registry("extract", artifact_root=tmp_path)
+    (entry,) = registry.values()
+    assert not entry.complete
+    assert entry.item_ids == frozenset({"a-8-01"})
+    # The finished row's mentions survived the abort.
+    assert sorted(read_dataset(mentions_root(tmp_path))["item_id"]) == ["a-8-01"]
+
+    # Recovery: a healthy run pays only for the row that never got a verdict.
+    recovery_calls = _fake_success_workflow(monkeypatch)
+    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+    assert recovery_calls == ["b-8-01"]
+    registry = load_completion_registry("extract", artifact_root=tmp_path)
+    (entry,) = registry.values()
+    assert entry.complete
+    assert sorted(read_dataset(mentions_root(tmp_path))["item_id"]) == [
+        "a-8-01",
+        "b-8-01",
+    ]
+
+
+def test_infrastructure_error_classification() -> None:
+    """Status- and name-shaped provider errors classify as infrastructure."""
+    from cdt.extractor.core import is_infrastructure_error
+
+    class PaymentRequiredResponseError(Exception):
+        pass
+
+    class WithStatus(Exception):
+        status_code = 503
+
+    assert is_infrastructure_error(PaymentRequiredResponseError())
+    assert is_infrastructure_error(WithStatus())
+    assert is_infrastructure_error(ConnectionResetError())
+    assert not is_infrastructure_error(ValueError("bad xml"))

@@ -22,6 +22,8 @@ from defusedxml import ElementTree as DefusedET
 from cdt import settings
 from cdt.classifier.core import CLASSIFICATION_DATASET_NAME, CLASSIFIED_ITEM_COLUMNS
 from cdt.datasets import (
+    PARTITION_PATTERN,
+    CompletedPartition,
     completion_registry_path,
     dataset_root,
     date_shard_partition_path,
@@ -29,15 +31,19 @@ from cdt.datasets import (
     extractor_run_path,
     iter_date_shard_partitions,
     load_completed_partitions,
+    load_completion_registry,
     load_row_failures,
     parse_date_shard_partition,
     resolve_artifact_root,
     run_manifest_path,
     save_completed_partitions,
+    save_completion_registry,
     save_row_failures,
 )
 from cdt.shared import get_logger
 from cdt.storage import (
+    artifact_exists,
+    list_artifacts_with_versions,
     read_table,
     write_json_artifact,
     write_partition_table,
@@ -138,6 +144,39 @@ DEBT_INSTRUMENT_MENTION_COLUMNS = [
     "end_date_json",
     "amount_json",
 ]
+
+
+class InfrastructureError(RuntimeError):
+    """A provider/transport failure that says nothing about the row's content.
+
+    Billing (402), throttling (429), timeouts, connection resets, and 5xx are
+    properties of the run environment, not of the filing being extracted: one
+    occurrence predicts thousands more, so the live driver aborts the run at the
+    first one instead of burning retries across the corpus and terminating rows
+    that never got a real verdict (#49).
+    """
+
+
+# HTTP statuses that indicate the provider, not the content.
+_INFRASTRUCTURE_STATUSES = frozenset({402, 408, 429, 500, 502, 503, 504})
+
+
+def is_infrastructure_error(exc: BaseException) -> bool:
+    """Classify an exception from a chat call as infrastructure vs content."""
+    if isinstance(exc, InfrastructureError):
+        return True
+    if isinstance(exc, ConnectionError | TimeoutError):
+        return True
+    for attribute in ("status_code", "status"):
+        value = getattr(exc, attribute, None)
+        if isinstance(value, int) and value in _INFRASTRUCTURE_STATUSES:
+            return True
+    # Provider SDKs name their billing/rate errors without exposing a status.
+    name = type(exc).__name__.casefold()
+    return any(
+        marker in name
+        for marker in ("paymentrequired", "ratelimit", "serviceunavailable")
+    )
 
 
 class SupportsChatCompletion(Protocol):
@@ -764,6 +803,141 @@ def extracted_tables_path(
     )
 
 
+@dataclass
+class PendingExtractPartition:
+    """One classification partition with extraction work outstanding."""
+
+    classification_path: str
+    date: str
+    shard: str
+    fingerprint: str | None
+    done_item_ids: frozenset[str]
+
+
+def pending_extract_partitions(
+    *,
+    artifact_root: str | Path | None = None,
+    data_dir: Path | None = None,
+    force: bool = False,
+    exclude_paths: set[str] | None = None,
+) -> tuple[list[PendingExtractPartition], dict[str, CompletedPartition]]:
+    """Select partitions with unextracted rows, keyed on outcomes and versions.
+
+    A partition is pending when it has no completion entry, its entry is marked
+    incomplete (an aborted pass), or its source fingerprint changed (ingest
+    merged late-arriving rows into it, #62). ``done_item_ids`` are rows that
+    already reached a terminal state and must not be re-paid (#49).
+
+    Also returns the loaded registry so the caller can update and persist it —
+    including the opportunistic stamping this function does: legacy entries
+    (v1 lists, or partitions whose mentions predate the registry) get the
+    current fingerprint so future source growth is detectable.
+    """
+    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    registry = (
+        {}
+        if force
+        else load_completion_registry(
+            "extract", artifact_root=resolved_root, data_dir=data_dir
+        )
+    )
+    fingerprints = {
+        path: version
+        for path, version in list_artifacts_with_versions(
+            dataset_root(
+                CLASSIFICATION_DATASET_NAME,
+                artifact_root=resolved_root,
+                data_dir=data_dir,
+            ),
+            suffix=".parquet",
+        ).items()
+        if PARTITION_PATTERN.search(path)
+    }
+    existing_mention_ids = (
+        set()
+        if force
+        else existing_date_shard_partition_ids(
+            MENTIONS_DATASET_NAME, artifact_root=resolved_root, data_dir=data_dir
+        )
+    )
+    pending: list[PendingExtractPartition] = []
+    for classification_path in sorted(fingerprints):
+        if exclude_paths and classification_path in exclude_paths:
+            continue
+        partition = parse_date_shard_partition(classification_path)
+        fingerprint = fingerprints[classification_path]
+        entry = registry.get(classification_path)
+        if force or entry is None:
+            if (
+                not force
+                and (partition["date"], partition["shard"]) in existing_mention_ids
+            ):
+                # Mentions predate the registry: complete as of this version.
+                registry[classification_path] = CompletedPartition(
+                    fingerprint=fingerprint
+                )
+                continue
+            pending.append(
+                PendingExtractPartition(
+                    classification_path=classification_path,
+                    date=partition["date"],
+                    shard=partition["shard"],
+                    fingerprint=fingerprint,
+                    done_item_ids=frozenset(),
+                )
+            )
+            continue
+        if entry.complete and entry.fingerprint == fingerprint:
+            continue
+        if entry.complete and entry.fingerprint is None:
+            # v1 entry: complete as recorded; stamp so future growth registers.
+            entry.fingerprint = fingerprint
+            continue
+        pending.append(
+            PendingExtractPartition(
+                classification_path=classification_path,
+                date=partition["date"],
+                shard=partition["shard"],
+                fingerprint=fingerprint,
+                done_item_ids=entry.item_ids,
+            )
+        )
+    return pending, registry
+
+
+def _merge_mentions_partition(
+    resolved_root: str,
+    *,
+    data_dir: Path | None,
+    partition: dict[str, str],
+    new_mentions: pd.DataFrame,
+    replaced_item_ids: set[str],
+) -> str:
+    """Merge newly extracted mentions into a partition, replacing per item.
+
+    Row-level re-processing means a target partition can already hold mentions
+    from earlier passes; overwriting it wholesale would drop them.
+    """
+    target_path = date_shard_partition_path(
+        MENTIONS_DATASET_NAME,
+        partition_date=partition["date"],
+        shard=partition["shard"],
+        artifact_root=resolved_root,
+        data_dir=data_dir,
+    )
+    table = new_mentions
+    if artifact_exists(target_path):
+        existing = read_table(target_path, DEBT_INSTRUMENT_MENTION_COLUMNS)
+        kept = existing.loc[~existing["item_id"].astype(str).isin(replaced_item_ids)]
+        table = pd.concat([kept, new_mentions], ignore_index=True)
+    write_partition_table(
+        mentions_root(resolved_root, data_dir=data_dir),
+        partition=partition,
+        table=table.reindex(columns=DEBT_INSTRUMENT_MENTION_COLUMNS),
+    )
+    return target_path
+
+
 def collect_pending_extract_items(
     *,
     artifact_root: str | Path | None = None,
@@ -847,16 +1021,8 @@ def extract_pending_items(
     succeeded_item_ids: set[str] = set()
     audit_records: list[str] = []
     partitions_written: list[str] = []
-    completed_classification_paths = (
-        set()
-        if force
-        else load_completed_partitions(
-            "extract", artifact_root=resolved_root, data_dir=data_dir
-        )
-    )
     visited_classification_paths: set[str] = set()
     empty_partitions = 0
-    pending_classification_paths: list[str] = []
     # Partitions the active batch job claimed are its to finish: extracting them
     # live too would pay for every row twice and let the job's later finalize
     # overwrite the newer live mentions with stale results. Imported lazily —
@@ -868,59 +1034,49 @@ def extract_pending_items(
         if force
         else active_job_claimed_partition_paths(resolved_root, data_dir=data_dir)
     )
-
-    # One LIST of the mentions dataset answers every existence check; probing
-    # each target with artifact_exists costs one HeadObject per classification
-    # partition ever written and dominates discovery time at scale (#83).
-    existing_mention_ids = (
-        set()
-        if force
-        else existing_date_shard_partition_ids(
-            MENTIONS_DATASET_NAME, artifact_root=resolved_root, data_dir=data_dir
-        )
-    )
-    for classification_path in iter_date_shard_partitions(
-        CLASSIFICATION_DATASET_NAME,
-        artifact_root=resolved_root,
-        data_dir=data_dir,
-    ):
-        partition = parse_date_shard_partition(classification_path)
-        if (partition["date"], partition["shard"]) in existing_mention_ids:
-            continue
-        if not force and classification_path in completed_classification_paths:
-            continue
-        if classification_path in claimed_by_batch_job:
-            continue
-        pending_classification_paths.append(classification_path)
-
     if claimed_by_batch_job:
         LOGGER.info(
             "Skipping %s classification partition(s) claimed by the active batch "
             "extract job; a poll tick will finish them.",
             len(claimed_by_batch_job),
         )
-    total_partitions = len(pending_classification_paths)
-    for chunk_start in range(0, total_partitions, batch_size):
-        chunk_paths = pending_classification_paths[
-            chunk_start : chunk_start + batch_size
+
+    pending_partitions, registry = pending_extract_partitions(
+        artifact_root=resolved_root,
+        data_dir=data_dir,
+        force=force,
+        exclude_paths=claimed_by_batch_job,
+    )
+    aborted: str | None = None
+    total_partitions = len(pending_partitions)
+    for partition_index, pending in enumerate(pending_partitions, start=1):
+        partition = {"date": pending.date, "shard": pending.shard}
+        partition_label = f"date={pending.date} shard={pending.shard}"
+        partition_start = perf_counter()
+        visited_classification_paths.add(pending.classification_path)
+        batch_items = read_table(
+            pending.classification_path,
+            CLASSIFIED_ITEM_COLUMNS,
+        ).reindex(columns=CLASSIFIED_ITEM_COLUMNS)
+        relevant_items = batch_items.loc[batch_items["relevance"].fillna(False)]
+        # Row-level work list: rows that already reached a terminal state in an
+        # earlier pass are never re-paid (#49); rows ingest merged in later are
+        # exactly the ones missing from done_item_ids (#62).
+        relevant_records = [
+            record
+            for record in relevant_items.to_dict("records")
+            if str(record["item_id"]) not in pending.done_item_ids
         ]
-        for partition_index, classification_path in enumerate(
-            chunk_paths, start=chunk_start + 1
-        ):
-            partition = parse_date_shard_partition(classification_path)
-            partition_label = f"date={partition['date']} shard={partition['shard']}"
-            partition_start = perf_counter()
-            visited_classification_paths.add(classification_path)
-            batch_items = read_table(
-                classification_path,
-                CLASSIFIED_ITEM_COLUMNS,
-            ).reindex(columns=CLASSIFIED_ITEM_COLUMNS)
-            relevant_items = batch_items.loc[batch_items["relevance"].fillna(False)]
-            mention_rows: list[dict[str, object]] = []
-            partition_failures = 0
-            relevant_records = relevant_items.to_dict("records")
-            total_relevant_items = len(relevant_records)
-            for item_index, item_row in enumerate(relevant_records, start=1):
+        relevant_item_ids = {
+            str(value) for value in relevant_items["item_id"].astype(str)
+        }
+        terminal_ids = set(pending.done_item_ids)
+        mention_rows: list[dict[str, object]] = []
+        replaced_item_ids: set[str] = set()
+        partition_failures = 0
+        total_relevant_items = len(relevant_records)
+        for item_index, item_row in enumerate(relevant_records, start=1):
+            try:
                 row_state = asyncio.run(
                     run_extraction_workflow(
                         item_row=item_row,
@@ -930,75 +1086,82 @@ def extract_pending_items(
                         client=client,
                     )
                 )
-                audit_records.append(
-                    json.dumps(row_state.to_audit_dict(), sort_keys=True)
-                )
-                if row_state.state == "SUCCESS":
-                    succeeded_item_ids.add(row_state.item_id)
-                    mention_rows.extend(row_state.debt_instrument_mentions)
-                else:
-                    failed_rows[row_state.item_id] = _failure_record(
-                        row_state,
-                        partition_date=partition["date"],
-                        shard=partition["shard"],
-                        run_id=run_id,
-                        backend="live",
-                    )
-                    partition_failures += 1
-                if (
-                    item_index == total_relevant_items
-                    or item_index % EXTRACTOR_PROGRESS_LOG_INTERVAL == 0
-                ):
-                    LOGGER.info(
-                        "Extractor item progress: %s partition=%s/%s items=%s/%s mentions=%s failures=%s elapsed=%.1fs",
-                        partition_label,
-                        partition_index,
-                        total_partitions,
-                        item_index,
-                        total_relevant_items,
-                        len(mention_rows),
-                        partition_failures,
-                        perf_counter() - partition_start,
-                    )
-            mentions = pd.DataFrame(
-                mention_rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS
-            )
-            if mentions.empty:
-                empty_partitions += 1
+            except InfrastructureError as exc:
+                # A provider failure predicts thousands more: stop the run now.
+                # Everything terminal so far in this partition is persisted, so
+                # the retry pays only for what never got a verdict.
+                aborted = str(exc)
+                break
+            audit_records.append(json.dumps(row_state.to_audit_dict(), sort_keys=True))
+            terminal_ids.add(row_state.item_id)
+            replaced_item_ids.add(row_state.item_id)
+            if row_state.state == "SUCCESS":
+                succeeded_item_ids.add(row_state.item_id)
+                mention_rows.extend(row_state.debt_instrument_mentions)
             else:
-                write_partition_table(
-                    mentions_root(resolved_root, data_dir=data_dir),
-                    partition={"date": partition["date"], "shard": partition["shard"]},
-                    table=mentions.reindex(columns=DEBT_INSTRUMENT_MENTION_COLUMNS),
+                failed_rows[row_state.item_id] = _failure_record(
+                    row_state,
+                    partition_date=pending.date,
+                    shard=pending.shard,
+                    run_id=run_id,
+                    backend="live",
                 )
-                processed_frames.append(mentions)
-                partitions_written.append(
-                    date_shard_partition_path(
-                        MENTIONS_DATASET_NAME,
-                        partition_date=partition["date"],
-                        shard=partition["shard"],
-                        artifact_root=resolved_root,
-                        data_dir=data_dir,
-                    )
+                partition_failures += 1
+            if (
+                item_index == total_relevant_items
+                or item_index % EXTRACTOR_PROGRESS_LOG_INTERVAL == 0
+            ):
+                LOGGER.info(
+                    "Extractor item progress: %s partition=%s/%s items=%s/%s mentions=%s failures=%s elapsed=%.1fs",
+                    partition_label,
+                    partition_index,
+                    total_partitions,
+                    item_index,
+                    total_relevant_items,
+                    len(mention_rows),
+                    partition_failures,
+                    perf_counter() - partition_start,
                 )
-            LOGGER.info(
-                "Extraction partition complete: %s progress=%s/%s classified_items=%s relevant_items=%s mentions=%s wrote_output=%s elapsed=%.1fs",
-                partition_label,
-                partition_index,
-                total_partitions,
-                len(batch_items),
-                total_relevant_items,
-                len(mentions),
-                not mentions.empty,
-                perf_counter() - partition_start,
-            )
 
-    updated_completed_paths = (
-        completed_classification_paths | visited_classification_paths
-    )
-    save_completed_partitions(
+        mentions = pd.DataFrame(mention_rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
+        if mentions.empty and not replaced_item_ids:
+            empty_partitions += 1
+        elif not mentions.empty or replaced_item_ids & pending.done_item_ids:
+            partitions_written.append(
+                _merge_mentions_partition(
+                    resolved_root,
+                    data_dir=data_dir,
+                    partition=partition,
+                    new_mentions=mentions,
+                    replaced_item_ids=replaced_item_ids,
+                )
+            )
+            if not mentions.empty:
+                processed_frames.append(mentions)
+        else:
+            empty_partitions += 1
+        registry[pending.classification_path] = CompletedPartition(
+            fingerprint=pending.fingerprint,
+            item_ids=frozenset(terminal_ids),
+            complete=relevant_item_ids <= terminal_ids,
+        )
+        LOGGER.info(
+            "Extraction partition complete: %s progress=%s/%s classified_items=%s relevant_items=%s mentions=%s wrote_output=%s elapsed=%.1fs",
+            partition_label,
+            partition_index,
+            total_partitions,
+            len(batch_items),
+            total_relevant_items,
+            len(mentions),
+            not mentions.empty,
+            perf_counter() - partition_start,
+        )
+        if aborted is not None:
+            break
+
+    save_completion_registry(
         "extract",
-        updated_completed_paths,
+        registry,
         artifact_root=resolved_root,
         data_dir=data_dir,
     )
@@ -1037,8 +1200,13 @@ def extract_pending_items(
                 "extract", artifact_root=resolved_root, data_dir=data_dir
             ),
             "failure_registry": failure_registry,
+            "aborted_on_infrastructure_error": aborted,
         },
     )
+    if aborted is not None:
+        # Persisted everything first (registry, mentions, audit, failures), so
+        # the retry resumes from exactly the rows that never got a verdict.
+        raise InfrastructureError(aborted)
 
     LOGGER.info(
         "Extractor complete: successes=%s failures=%s mentions=%s run_dir=%s "
@@ -1358,6 +1526,10 @@ async def run_extraction_workflow(
                 reasoning_effort=reasoning_effort,
             )
         except Exception as exc:  # noqa: BLE001
+            if is_infrastructure_error(exc):
+                # Not a verdict on this row: leave it non-terminal and let the
+                # driver abort the run. The row stays pending via the registry.
+                raise InfrastructureError(f"{type(exc).__name__}: {exc}") from exc
             record_stage_error(row_state, f"{type(exc).__name__}: {exc}")
             return row_state
         messages = handle_response(row_state, response, max_attempts=max_attempts)
