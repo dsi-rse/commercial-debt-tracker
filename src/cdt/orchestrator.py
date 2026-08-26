@@ -272,6 +272,14 @@ def run_batch_backend(args: argparse.Namespace) -> int:
         return 1
     finally:
         release_lease(lease)
+    # The literal below feeds the daily-heartbeat CloudWatch alarm (#85): a
+    # missing "mode=daily" completion for a day means the run crashed, wedged,
+    # or never launched. Keep it in sync with pulumi/infra/alerts.py.
+    LOGGER.info(
+        "Orchestrator run complete: mode=%s artifact_root=%s",
+        config.mode,
+        artifact_root,
+    )
     print(artifact_root)
     return 0
 
@@ -309,6 +317,8 @@ def run_poll(args: argparse.Namespace) -> int:
         if args.max_batch_bytes is not None:
             tick_kwargs["max_batch_bytes"] = args.max_batch_bytes
         result = advance_extract_job(**tick_kwargs)
+        # The literal below feeds the poll-liveness CloudWatch alarm (#85);
+        # keep it in sync with pulumi/infra/alerts.py.
         LOGGER.info(
             "Poll tick complete: status=%s job=%s folded=%s submitted=%s in_flight=%s terminal=%s",
             result.status,

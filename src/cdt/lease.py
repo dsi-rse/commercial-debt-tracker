@@ -100,6 +100,8 @@ def _log_takeover(name: str, previous: object) -> None:
         # would bury the case below under ~24 false alarms a day.
         LOGGER.debug("Acquired released lease %s (previous holder %s)", name, holder)
         return
+    # "Stole lease" feeds a CloudWatch metric-filter alarm (#85); keep the
+    # literal in sync with pulumi/infra/alerts.py.
     LOGGER.warning(
         "Stole lease %s from holder %s: it expired without being released, so that "
         "run likely died mid-tick — check for a lost run.",

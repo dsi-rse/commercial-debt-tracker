@@ -562,3 +562,31 @@ def test_poll_aborts_when_lease_stolen_mid_tick(
     )
 
     assert orch.main(["--artifact-root", str(tmp_path), "poll"]) == 1
+
+
+def test_daily_batch_logs_heartbeat_literal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    propagate_logger: Callable[[logging.Logger], None],
+) -> None:
+    """A completed daily run logs the exact literal the heartbeat alarm counts (#85)."""
+    propagate_logger(orch.LOGGER)
+    monkeypatch.setattr(orch, "configure_logging", lambda **kwargs: None)
+    monkeypatch.setattr(
+        orch, "run_prepare_stages", lambda config, **kwargs: str(tmp_path)
+    )
+    monkeypatch.setattr(orch, "run_match_and_finalize", lambda **kwargs: None)
+
+    with caplog.at_level("INFO"):
+        assert (
+            orch.main(
+                ["--artifact-root", str(tmp_path), "daily", "--cik-file", "c.txt"]
+            )
+            == 0
+        )
+
+    assert any(
+        "Orchestrator run complete: mode=daily" in record.message
+        for record in caplog.records
+    )
