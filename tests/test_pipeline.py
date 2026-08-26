@@ -324,16 +324,22 @@ def test_final_snapshots_publish_atomically_with_pointer(tmp_path: Path) -> None
         artifact_root=str(artifact_root), final_database_root=str(final_root)
     )
 
-    pointer = read_json_artifact(str(final_root / "latest.json"))
+    pointer = read_json_artifact(str(artifact_root / "final-snapshots" / "latest.json"))
     assert isinstance(pointer, dict)
     assert set(pointer["tables"]) == set(written)
     for table_name, path in written.items():
         assert f"snapshot={pointer['run_id']}" in path
         assert len(read_table(path)) == 2
         assert pointer["tables"][table_name]["rows"] == 2
-        # Deprecated compatibility object for the dashboard publisher.
+        # The parquet-only contract surface under the final database root.
         assert (final_root / table_name / "latest.parquet").exists()
     assert pointer["schema_version"]
+    # The database prefix stays parquet-only: pointer and snapshots live
+    # under the artifact root instead.
+    non_parquet = [
+        p for p in final_root.rglob("*") if p.is_file() and p.suffix != ".parquet"
+    ]
+    assert non_parquet == []
 
 
 def test_final_snapshot_guard_blocks_shrinkage_unless_forced(tmp_path: Path) -> None:
@@ -355,7 +361,7 @@ def test_final_snapshot_guard_blocks_shrinkage_unless_forced(tmp_path: Path) -> 
     # The refused publish must not have moved the pointer.
     from cdt.storage import read_json_artifact
 
-    pointer = read_json_artifact(str(final_root / "latest.json"))
+    pointer = read_json_artifact(str(artifact_root / "final-snapshots" / "latest.json"))
     assert pointer["tables"]["items"]["rows"] == 2
 
     forced = write_final_output_tables(
@@ -380,6 +386,7 @@ def test_old_final_snapshots_are_pruned(tmp_path: Path) -> None:
         )
 
     snapshot_dirs = {
-        path.parent.name for path in (final_root / "snapshots").glob("*/*.parquet")
+        path.parent.name
+        for path in (artifact_root / "final-snapshots").glob("*/*.parquet")
     }
     assert len(snapshot_dirs) == 2

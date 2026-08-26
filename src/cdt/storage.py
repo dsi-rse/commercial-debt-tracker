@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 
 import boto3
 import pandas as pd
+import pyarrow.parquet
 
 ArtifactPath = str | Path
 
@@ -385,6 +386,22 @@ def read_table(
         if isinstance(source, io.BytesIO):
             source.seek(0)
         return pd.read_parquet(source).reindex(columns=list(columns))
+
+
+def count_table_rows(path: ArtifactPath) -> int | None:
+    """Return a parquet table's row count from footer metadata; None if absent.
+
+    The footer alone carries num_rows, so locally no column data is
+    deserialized; the S3 branch still fetches the object but skips decoding.
+    """
+    normalized = normalize_artifact_path(path)
+    if not artifact_exists(normalized):
+        return None
+    if is_s3_uri(normalized):
+        bucket, key = parse_s3_uri(normalized)
+        body = _s3_client().get_object(Bucket=bucket, Key=key)["Body"].read()
+        return int(pyarrow.parquet.ParquetFile(io.BytesIO(body)).metadata.num_rows)
+    return int(pyarrow.parquet.ParquetFile(Path(normalized)).metadata.num_rows)
 
 
 def read_dataset(

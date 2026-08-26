@@ -48,6 +48,7 @@ from cdt.shared import get_logger
 from cdt.storage import (
     ArtifactPath,
     artifact_exists,
+    count_table_rows,
     delete_artifact,
     join_artifact_path,
     list_artifacts,
@@ -454,9 +455,20 @@ def resolve_mode_dates(
 FINAL_SNAPSHOT_GUARD_RATIO = 0.5
 
 
-def final_pointer_path(final_database_root: ArtifactPath) -> str:
+def final_snapshots_root(artifact_root: ArtifactPath) -> str:
+    """Return the root for consistent snapshot generations and their pointer.
+
+    Deliberately under the artifact root, not the final database root: the
+    final database prefix is a parquet-only contract surface for downstream
+    consumers, so the control metadata (``latest.json``) and the immutable
+    generation copies live with the pipeline's other artifacts instead.
+    """
+    return join_artifact_path(str(artifact_root), "final-snapshots")
+
+
+def final_pointer_path(artifact_root: ArtifactPath) -> str:
     """Return the path of the atomic latest.json snapshot pointer."""
-    return join_artifact_path(str(final_database_root), "latest.json")
+    return join_artifact_path(final_snapshots_root(artifact_root), "latest.json")
 
 
 def write_final_output_tables(
@@ -466,30 +478,31 @@ def write_final_output_tables(
     data_dir: Path | None = None,
     force: bool = False,
 ) -> dict[str, str]:
-    """Publish one atomic, guarded snapshot of the final tables (#91).
+    """Publish the final tables: guarded, with an atomic generation pointer (#91).
 
-    The old layout wrote four independent ``<table>/latest.parquet`` objects in
-    a loop: a consumer polling mid-loop read mixed generations (mentions
-    referencing instruments that did not exist yet), a crash between writes
-    left that state published permanently, and an accidentally empty dataset
-    silently clobbered a good snapshot with zero rows.
+    Writing four independent ``<table>/latest.parquet`` objects in a loop can
+    never be consistent as a set: a consumer polling mid-loop reads mixed
+    generations (mentions referencing instruments that did not exist yet), a
+    crash between writes leaves that state published permanently, and an
+    accidentally empty dataset silently clobbers a good snapshot with zero rows.
 
-    Now every table lands under an immutable ``snapshots/snapshot=<run_id>/``
-    prefix first, and a single ``latest.json`` pointer — the only object a
-    consumer should resolve — is replaced as the last, atomic step, carrying
-    the run id, schema version, and per-table row counts. Unless ``force``,
-    the publish refuses when a previously non-empty table would become empty
-    or shrink below FINAL_SNAPSHOT_GUARD_RATIO of its prior row count.
-
-    The per-table ``<table>/latest.parquet`` objects are still refreshed after
-    the pointer so the dashboard publisher keeps working until it migrates to
-    the pointer; they retain the old non-atomic semantics and are deprecated.
-    Snapshots other than the current and prior generation are pruned.
+    So every publish first lands whole under an immutable
+    ``final-snapshots/snapshot=<run_id>/`` prefix beneath the *artifact* root,
+    and a single ``latest.json`` pointer there — the object consumers wanting
+    a consistent four-table generation should resolve — is replaced as the
+    last, atomic step, carrying the run id, schema version, and per-table row
+    counts. Only then are the per-table ``<table>/latest.parquet`` objects
+    under the final database root refreshed: that prefix stays parquet-only
+    (its contract), with each object individually atomic but the set not
+    consistent mid-publish. Unless ``force``, the publish refuses when a
+    previously non-empty table would become empty or shrink below
+    FINAL_SNAPSHOT_GUARD_RATIO of its prior row count. Generations other than
+    the current and prior one are pruned.
     """
     if final_database_root is None:
         return {}
 
-    pointer_path = final_pointer_path(final_database_root)
+    pointer_path = final_pointer_path(artifact_root)
     previous: dict[str, object] = {}
     if artifact_exists(pointer_path):
         payload = read_json_artifact(pointer_path)
@@ -500,10 +513,26 @@ def write_final_output_tables(
         table_name: read_dataset(dataset_root_fn(artifact_root, data_dir=data_dir))
         for table_name, dataset_root_fn in FINAL_OUTPUT_TABLES.items()
     }
-    _guard_against_shrinkage(tables, previous, force=force)
+    # Guard against what is actually published, not the pointer: the pointer
+    # lives with the artifact root, so a half-built or freshly-pointed artifact
+    # root has no pointer — exactly the case that must not clobber a good
+    # database. Footer metadata gives the counts without decoding columns.
+    previous_counts = {
+        table_name: rows
+        for table_name in FINAL_OUTPUT_TABLES
+        if (
+            rows := count_table_rows(
+                join_artifact_path(
+                    str(final_database_root), table_name, "latest.parquet"
+                )
+            )
+        )
+        is not None
+    }
+    _guard_against_shrinkage(tables, previous_counts, force=force)
 
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-    snapshots_root = join_artifact_path(str(final_database_root), "snapshots")
+    snapshots_root = final_snapshots_root(artifact_root)
     snapshot_prefix = join_artifact_path(snapshots_root, f"snapshot={run_id}")
     written_paths: dict[str, str] = {}
     pointer_tables: dict[str, object] = {}
@@ -524,7 +553,8 @@ def write_final_output_tables(
         },
     )
 
-    # Deprecated compatibility objects for consumers not yet on the pointer.
+    # The parquet-only contract surface, refreshed after the pointer so the
+    # consistent generation is always resolvable first.
     for table_name, table in tables.items():
         write_table(
             join_artifact_path(str(final_database_root), table_name, "latest.parquet"),
@@ -540,18 +570,14 @@ def write_final_output_tables(
 
 def _guard_against_shrinkage(
     tables: dict[str, pd.DataFrame],
-    previous: dict[str, object],
+    previous_counts: dict[str, int],
     *,
     force: bool,
 ) -> None:
     """Refuse to publish a snapshot that looks like data loss, unless forced."""
-    previous_tables = previous.get("tables")
-    if not isinstance(previous_tables, dict):
-        return
     regressions: list[str] = []
     for table_name, table in tables.items():
-        prior = previous_tables.get(table_name)
-        prior_rows = int(prior.get("rows", 0)) if isinstance(prior, dict) else 0
+        prior_rows = previous_counts.get(table_name, 0)
         if prior_rows <= 0:
             continue
         if len(table) < prior_rows * FINAL_SNAPSHOT_GUARD_RATIO:
