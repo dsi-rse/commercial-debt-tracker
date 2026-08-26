@@ -41,6 +41,10 @@ poll_schedule_enabled = (
     if _poll_enabled_raw is None
     else _poll_enabled_raw.lower() == "true"
 )
+# Off by default: the alarm/SNS resources need bootstrap role statements that
+# land with dsi-rse/idi-ftm2j-shared#79 — enabling before that bootstrap
+# redeploy fails the CDT deploy with AccessDenied on sns:CreateTopic.
+alerts_enabled = (config.get("alerts_enabled") or "false").lower() == "true"
 r2_account_id = config.get("r2_account_id")
 r2_bucket_name = config.get("r2_bucket_name")
 r2_object_prefix = config.get("r2_object_prefix") or "generated"
