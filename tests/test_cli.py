@@ -162,11 +162,11 @@ def test_ingest_cli_historical_defaults_to_all_time_date_range(
     ]
 
 
-def test_ingest_cli_daily_defaults_to_yesterday(
+def test_ingest_cli_daily_defaults_to_lookback_window(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Daily ingest defaults both dates to yesterday."""
+    """Daily ingest defaults to the rolling lookback window (#90)."""
     cik_file = tmp_path / "ciks.txt"
     cik_file.write_text("320193\n", encoding="utf-8")
     calls: list[tuple[date, date]] = []
@@ -200,9 +200,13 @@ def test_ingest_cli_daily_defaults_to_yesterday(
 
     status = cli.main(["ingest", "--quiet", "daily", str(cik_file)])
 
-    yesterday = date.today().fromordinal(date.today().toordinal() - 1)
+    from cdt.pipeline import DAILY_LOOKBACK_DAYS
+
+    today = date.today()
+    yesterday = today.fromordinal(today.toordinal() - 1)
+    lookback_start = today.fromordinal(today.toordinal() - DAILY_LOOKBACK_DAYS)
     assert status == 0
-    assert calls == [(yesterday, yesterday)]
+    assert calls == [(lookback_start, yesterday)]
 
 
 def test_ingest_cli_daily_rejects_partial_date_range(tmp_path: Path) -> None:
