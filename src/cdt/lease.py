@@ -23,6 +23,7 @@ warning, and they are told apart by the exact ``_EXPIRED`` stamp a release write
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import cast
@@ -151,6 +152,35 @@ def renew_lease(lease: Lease, *, ttl_seconds: int = DEFAULT_LEASE_TTL_SECONDS) -
         return False
     lease.expires_at = str(renewed["expires_at"])
     return True
+
+
+class LeaseLostError(RuntimeError):
+    """A phase-boundary renewal found the lease no longer held.
+
+    The holder must stop writing immediately: another run owns the datasets and
+    snapshots now, and continuing would interleave two writers — the exact
+    corruption the lease exists to prevent (#89).
+    """
+
+
+def renewer(lease: Lease) -> Callable[[], None]:
+    """Return a renewal callback that raises LeaseLostError instead of a bool.
+
+    Long phases pass a renewal hook across module boundaries; a discarded
+    ``renew_lease`` return value let a run keep writing on a lease another
+    process had already stolen (#89). Raising makes losing the lease
+    impossible to ignore.
+    """
+
+    def renew() -> None:
+        if not renew_lease(lease):
+            msg = (
+                f"Lease {lease.path} is no longer held by {lease.holder}; "
+                "another run owns the pipeline outputs now."
+            )
+            raise LeaseLostError(msg)
+
+    return renew
 
 
 def release_lease(lease: Lease) -> None:

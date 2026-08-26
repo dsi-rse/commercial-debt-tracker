@@ -169,12 +169,23 @@ class PipelineOrchestrator:
         self._log_config(resolved_start, resolved_end)
         return resolved_start, resolved_end, ciks, resolved_artifact_root
 
+    def _renew(self: Self, renew: Callable[[], None] | None) -> None:
+        """Extend the caller's writer lease at a stage boundary.
+
+        Historical runs outlast the lease TTL by hours; renewing between stages
+        keeps the run from being stolen mid-write, and the hook raises
+        LeaseLostError if it already was (#89).
+        """
+        if renew is not None:
+            renew()
+
     def _ingest_itemize_classify(
         self: Self,
         resolved_start: date,
         resolved_end: date,
         ciks: set[str],
         resolved_artifact_root: str,
+        renew: Callable[[], None] | None = None,
     ) -> tuple[IngestRunResult, pd.DataFrame, pd.DataFrame]:
         """Run ingest → itemize → classify and return their results."""
         self._log_stage_start(
@@ -212,6 +223,7 @@ class PipelineOrchestrator:
             partitions=len(ingest_result.document_partitions),
             failures=ingest_result.failures,
         )
+        self._renew(renew)
 
         self._log_stage_start(
             "itemize",
@@ -225,6 +237,7 @@ class PipelineOrchestrator:
             item_numbers=self.config.item_numbers,
         )
         self._log_stage_complete("itemize", rows=len(items))
+        self._renew(renew)
 
         self._log_stage_start(
             "classify",
@@ -240,7 +253,7 @@ class PipelineOrchestrator:
         self._log_stage_complete("classify", rows=len(classified))
         return ingest_result, items, classified
 
-    def run_prepare(self: Self) -> str:
+    def run_prepare(self: Self, renew: Callable[[], None] | None = None) -> str:
         """Run only ingest → itemize → classify; return the artifact root.
 
         Used by the deployed ``daily`` orchestrator, which defers the expensive
@@ -248,17 +261,18 @@ class PipelineOrchestrator:
         """
         resolved_start, resolved_end, ciks, resolved_artifact_root = self._setup()
         self._ingest_itemize_classify(
-            resolved_start, resolved_end, ciks, resolved_artifact_root
+            resolved_start, resolved_end, ciks, resolved_artifact_root, renew
         )
         return resolved_artifact_root
 
-    def run(self: Self) -> PipelineRunResult:
+    def run(self: Self, renew: Callable[[], None] | None = None) -> PipelineRunResult:
         """Execute the full CDT pipeline."""
         resolved_start, resolved_end, ciks, resolved_artifact_root = self._setup()
         start_time = datetime.now()
         ingest_result, items, classified = self._ingest_itemize_classify(
-            resolved_start, resolved_end, ciks, resolved_artifact_root
+            resolved_start, resolved_end, ciks, resolved_artifact_root, renew
         )
+        self._renew(renew)
 
         self._log_stage_start(
             "extract",
@@ -275,6 +289,7 @@ class PipelineOrchestrator:
             max_attempts=self.config.extractor_max_attempts,
         )
         self._log_stage_complete("extract", rows=len(extracted))
+        self._renew(renew)
 
         self._log_stage_start(
             "match",
@@ -288,6 +303,7 @@ class PipelineOrchestrator:
             strong_match_threshold=self.config.strong_match_threshold,
             loose_match_threshold=self.config.loose_match_threshold,
             ambiguity_margin=self.config.ambiguity_margin,
+            renew=renew,
         )
         self._log_stage_complete(
             "match",
@@ -319,6 +335,7 @@ class PipelineOrchestrator:
                 data_dir=self.config.data_dir,
             ),
         )
+        self._renew(renew)
         self._log_stage_start(
             "finalize",
             output_root=self.config.final_database_root,
@@ -338,14 +355,18 @@ class PipelineOrchestrator:
         return result
 
 
-def run_pipeline(config: PipelineConfig) -> PipelineRunResult:
+def run_pipeline(
+    config: PipelineConfig, *, renew: Callable[[], None] | None = None
+) -> PipelineRunResult:
     """Run the full CDT pipeline for the provided config."""
-    return PipelineOrchestrator(config).run()
+    return PipelineOrchestrator(config).run(renew)
 
 
-def run_prepare_stages(config: PipelineConfig) -> str:
+def run_prepare_stages(
+    config: PipelineConfig, *, renew: Callable[[], None] | None = None
+) -> str:
     """Run ingest → itemize → classify for a config; return the artifact root."""
-    return PipelineOrchestrator(config).run_prepare()
+    return PipelineOrchestrator(config).run_prepare(renew)
 
 
 def run_match_and_finalize(
@@ -358,13 +379,16 @@ def run_match_and_finalize(
     strong_match_threshold: float = DEFAULT_MEMBERSHIP_THRESHOLD,
     loose_match_threshold: float = DEFAULT_RELATED_THRESHOLD,
     ambiguity_margin: float = DEFAULT_AMBIGUITY_MARGIN,
+    renew: Callable[[], None] | None = None,
 ) -> dict[str, str]:
     """Run match on existing mentions and rewrite final snapshots.
 
     Both stages are deterministic and idempotent, so this is safe to run
     repeatedly: the daily orchestrator calls it to keep snapshots fresh while a
     batch extract job is still in flight, and the poller calls it when a job
-    completes.
+    completes. ``renew`` extends the caller's writer lease per matched shard
+    and before the snapshot rewrite — this is the longest phase, and it must
+    not keep publishing on a lease another run has stolen (#89).
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     match_pending_mentions(
@@ -375,7 +399,10 @@ def run_match_and_finalize(
         strong_match_threshold=strong_match_threshold,
         loose_match_threshold=loose_match_threshold,
         ambiguity_margin=ambiguity_margin,
+        renew=renew,
     )
+    if renew is not None:
+        renew()
     return write_final_output_tables(
         artifact_root=resolved_root,
         final_database_root=final_database_root,

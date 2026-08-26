@@ -195,3 +195,30 @@ def test_renew_lease_fails_after_steal(tmp_path: Path) -> None:
 
     assert renew_lease(original) is False
     assert renew_lease(thief) is True
+
+
+def test_renewer_raises_after_steal(tmp_path: Path) -> None:
+    """The renewal hook must be impossible to ignore once the lease is lost (#89)."""
+    from cdt.lease import LeaseLostError, renewer
+
+    held = acquire_lease(tmp_path, "writer", ttl_seconds=0)
+    assert held is not None
+    thief = acquire_lease(tmp_path, "writer")
+    assert thief is not None
+
+    renew = renewer(held)
+    with pytest.raises(LeaseLostError, match="no longer held"):
+        renew()
+
+
+def test_renewer_extends_a_held_lease(tmp_path: Path) -> None:
+    """While still held, the hook renews silently and extends the expiry."""
+    from cdt.lease import renewer
+
+    held = acquire_lease(tmp_path, "writer")
+    assert held is not None
+    before = held.expires_at
+
+    renewer(held)()
+
+    assert held.expires_at >= before

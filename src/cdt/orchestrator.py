@@ -34,9 +34,10 @@ from cdt.ingest import DEFAULT_BUCKET
 from cdt.lease import (
     PIPELINE_WRITER_LEASE,
     Lease,
+    LeaseLostError,
     acquire_lease,
     release_lease,
-    renew_lease,
+    renewer,
 )
 from cdt.pipeline import (
     DEFAULT_STAGE_BATCH_SIZE,
@@ -246,8 +247,9 @@ def run_batch_backend(args: argparse.Namespace) -> int:
             LEASE_WAIT_SECONDS,
         )
         return 1
+    renew = renewer(lease)
     try:
-        artifact_root = run_prepare_stages(config)
+        artifact_root = run_prepare_stages(config, renew=renew)
         LOGGER.info(
             "Extraction deferred to the batch poller: pending items are claimed by "
             "the next `poll` run. Ensure the poll schedule is enabled, or run "
@@ -257,18 +259,17 @@ def run_batch_backend(args: argparse.Namespace) -> int:
         # in-flight batch job (advanced by ``poll``) will refresh them again when
         # it completes. Prepare can outlast the TTL, so renew — and if the lease
         # was stolen, the snapshots belong to another run now.
-        if not renew_lease(lease):
-            LOGGER.error(
-                "Lost the pipeline-writer lease during prepare stages; skipping "
-                "match/finalize — another run owns the snapshots now."
-            )
-            return 1
+        renew()
         run_match_and_finalize(
             artifact_root=artifact_root,
             final_database_root=args.final_database_root,
             batch_size=args.match_batch_size,
             force=args.force,
+            renew=renew,
         )
+    except LeaseLostError as exc:
+        LOGGER.error("Aborting run: %s", exc)
+        return 1
     finally:
         release_lease(lease)
     print(artifact_root)
@@ -291,6 +292,7 @@ def run_poll(args: argparse.Namespace) -> int:
         )
         print("locked")
         return 0
+    renew = renewer(lease)
     try:
         tick_kwargs: dict[str, object] = {
             "batch_client": OpenAIBatchClient(),
@@ -298,8 +300,9 @@ def run_poll(args: argparse.Namespace) -> int:
             "max_attempts": args.max_attempts,
             "force": args.force,
             # Extend the lease at the tick's phase boundaries so a legitimately
-            # long fold/submit is not stolen by the next hourly run.
-            "renew_lease": lambda: renew_lease(lease),
+            # long fold/submit is not stolen by the next hourly run; the hook
+            # raises LeaseLostError if it already was, aborting the tick (#89).
+            "renew_lease": renew,
         }
         if args.max_requests_per_batch is not None:
             tick_kwargs["max_requests_per_batch"] = args.max_requests_per_batch
@@ -316,14 +319,18 @@ def run_poll(args: argparse.Namespace) -> int:
             result.terminal_rows,
         )
         if result.status == "completed":
-            renew_lease(lease)
+            renew()
             run_match_and_finalize(
                 artifact_root=resolved_root,
                 final_database_root=args.final_database_root,
                 batch_size=args.match_batch_size,
                 force=args.force,
+                renew=renew,
             )
         print(result.status)
+    except LeaseLostError as exc:
+        LOGGER.error("Aborting poll tick: %s", exc)
+        return 1
     finally:
         release_lease(lease)
     return 0
@@ -354,7 +361,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 1
     try:
-        result = run_pipeline(_pipeline_config(args))
+        result = run_pipeline(_pipeline_config(args), renew=renewer(lease))
+    except LeaseLostError as exc:
+        LOGGER.error("Aborting live run: %s", exc)
+        return 1
     finally:
         release_lease(lease)
     print(result.artifact_root)
