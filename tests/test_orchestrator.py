@@ -99,7 +99,9 @@ def test_daily_batch_does_not_run_while_lease_held(
     monkeypatch.setattr(
         orch,
         "run_prepare_stages",
-        lambda config: pytest.fail("prepare must not run while the lease is held"),
+        lambda config, **kwargs: pytest.fail(
+            "prepare must not run while the lease is held"
+        ),
     )
     monkeypatch.setattr(
         orch,
@@ -121,8 +123,8 @@ def test_daily_batch_holds_lease_through_prepare(
     """The prepare stages run under the writer lease, serialized with poll ticks (#88)."""
     calls: list[str] = []
 
-    def fake_prepare(config: object) -> str:
-        del config
+    def fake_prepare(config: object, **kwargs: object) -> str:
+        del config, kwargs
         assert (
             acquire_lease(tmp_path, orch.PIPELINE_WRITER_LEASE) is None
         ), "prepare must run while the lease is held"
@@ -151,7 +153,10 @@ def test_daily_batch_defers_extract(
     monkeypatch.setattr(
         orch,
         "run_prepare_stages",
-        lambda config: (calls.append(f"prepare:{config.mode}"), str(tmp_path))[1],
+        lambda config, **kwargs: (
+            calls.append(f"prepare:{config.mode}"),
+            str(tmp_path),
+        )[1],
     )
     monkeypatch.setattr(
         orch, "run_match_and_finalize", lambda **kwargs: calls.append("match")
@@ -159,7 +164,9 @@ def test_daily_batch_defers_extract(
     monkeypatch.setattr(
         orch,
         "run_pipeline",
-        lambda config: pytest.fail("run_pipeline must not run for daily batch"),
+        lambda config, **kwargs: pytest.fail(
+            "run_pipeline must not run for daily batch"
+        ),
     )
 
     assert (
@@ -179,12 +186,16 @@ def test_daily_live_runs_full_pipeline(
         artifact_root = str(tmp_path)
 
     monkeypatch.setattr(
-        orch, "run_pipeline", lambda config: (calls.append("pipeline"), Result())[1]
+        orch,
+        "run_pipeline",
+        lambda config, **kwargs: (calls.append("pipeline"), Result())[1],
     )
     monkeypatch.setattr(
         orch,
         "run_prepare_stages",
-        lambda config: pytest.fail("prepare-only must not run for live backend"),
+        lambda config, **kwargs: pytest.fail(
+            "prepare-only must not run for live backend"
+        ),
     )
 
     assert (
@@ -214,7 +225,9 @@ def test_daily_batch_warns_on_extract_batch_size(
     propagate_logger(orch.LOGGER)
     # main() calls basicConfig(force=True), which would drop caplog's handler.
     monkeypatch.setattr(orch, "configure_logging", lambda **kwargs: None)
-    monkeypatch.setattr(orch, "run_prepare_stages", lambda config: str(tmp_path))
+    monkeypatch.setattr(
+        orch, "run_prepare_stages", lambda config, **kwargs: str(tmp_path)
+    )
     monkeypatch.setattr(orch, "run_match_and_finalize", lambda **kwargs: None)
 
     with caplog.at_level("WARNING"):
@@ -249,7 +262,10 @@ def test_daily_batch_quiet_without_extract_batch_size(
     monkeypatch.setattr(
         orch,
         "run_prepare_stages",
-        lambda config: (seen.append(config.extract_batch_size), str(tmp_path))[1],
+        lambda config, **kwargs: (
+            seen.append(config.extract_batch_size),
+            str(tmp_path),
+        )[1],
     )
     monkeypatch.setattr(orch, "run_match_and_finalize", lambda **kwargs: None)
 
@@ -273,7 +289,10 @@ def test_historical_batch_defers_extract(
     monkeypatch.setattr(
         orch,
         "run_prepare_stages",
-        lambda config: (calls.append(f"prepare:{config.mode}"), str(tmp_path))[1],
+        lambda config, **kwargs: (
+            calls.append(f"prepare:{config.mode}"),
+            str(tmp_path),
+        )[1],
     )
     monkeypatch.setattr(
         orch, "run_match_and_finalize", lambda **kwargs: calls.append("match")
@@ -281,7 +300,9 @@ def test_historical_batch_defers_extract(
     monkeypatch.setattr(
         orch,
         "run_pipeline",
-        lambda config: pytest.fail("run_pipeline must not run for historical batch"),
+        lambda config, **kwargs: pytest.fail(
+            "run_pipeline must not run for historical batch"
+        ),
     )
 
     assert (
@@ -311,7 +332,7 @@ def test_historical_batch_passes_dates_through(
     monkeypatch.setattr(
         orch,
         "run_prepare_stages",
-        lambda config: (
+        lambda config, **kwargs: (
             seen.append((config.start_date, config.end_date)),
             str(tmp_path),
         )[1],
@@ -347,12 +368,16 @@ def test_historical_live_runs_full_pipeline(
         artifact_root = str(tmp_path)
 
     monkeypatch.setattr(
-        orch, "run_pipeline", lambda config: (calls.append("pipeline"), Result())[1]
+        orch,
+        "run_pipeline",
+        lambda config, **kwargs: (calls.append("pipeline"), Result())[1],
     )
     monkeypatch.setattr(
         orch,
         "run_prepare_stages",
-        lambda config: pytest.fail("prepare-only must not run for live backend"),
+        lambda config, **kwargs: pytest.fail(
+            "prepare-only must not run for live backend"
+        ),
     )
 
     assert (
@@ -388,7 +413,9 @@ def test_historical_batch_does_not_run_while_lease_held(
     monkeypatch.setattr(
         orch,
         "run_prepare_stages",
-        lambda config: pytest.fail("prepare must not run while the lease is held"),
+        lambda config, **kwargs: pytest.fail(
+            "prepare must not run while the lease is held"
+        ),
     )
     monkeypatch.setattr(
         orch,
@@ -424,7 +451,9 @@ def test_placeholder_secret_fails_fast(
     monkeypatch.setattr(
         orch,
         "run_prepare_stages",
-        lambda config: pytest.fail("stages must not run with a placeholder key"),
+        lambda config, **kwargs: pytest.fail(
+            "stages must not run with a placeholder key"
+        ),
     )
 
     with pytest.raises(SystemExit, match="OPENAI_API_KEY"):
@@ -437,7 +466,9 @@ def test_real_secret_values_pass_the_guard(
     """Ordinary key values do not trip the placeholder guard."""
     monkeypatch.setenv("OPENAI_API_KEY", "sk-real")
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-real")
-    monkeypatch.setattr(orch, "run_prepare_stages", lambda config: str(tmp_path))
+    monkeypatch.setattr(
+        orch, "run_prepare_stages", lambda config, **kwargs: str(tmp_path)
+    )
     monkeypatch.setattr(orch, "run_match_and_finalize", lambda **kwargs: None)
 
     assert (
@@ -454,7 +485,9 @@ def test_live_backend_skips_when_lease_held(
     monkeypatch.setattr(
         orch,
         "run_pipeline",
-        lambda config: pytest.fail("live run must not start while the lease is held"),
+        lambda config, **kwargs: pytest.fail(
+            "live run must not start while the lease is held"
+        ),
     )
     held = acquire_lease(tmp_path, orch.PIPELINE_WRITER_LEASE)
     assert held is not None
@@ -483,7 +516,7 @@ def test_live_backend_releases_lease(
     class Result:
         artifact_root = str(tmp_path)
 
-    monkeypatch.setattr(orch, "run_pipeline", lambda config: Result())
+    monkeypatch.setattr(orch, "run_pipeline", lambda config, **kwargs: Result())
 
     assert (
         orch.main(
@@ -500,3 +533,32 @@ def test_live_backend_releases_lease(
         == 0
     )
     assert acquire_lease(tmp_path, orch.PIPELINE_WRITER_LEASE) is not None
+
+
+def test_poll_aborts_when_lease_stolen_mid_tick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tick whose lease was stolen must not run match/finalize (#89)."""
+    from cdt.lease import lease_path
+    from cdt.storage import read_json_artifact, write_json_artifact
+
+    monkeypatch.setattr(orch, "OpenAIBatchClient", lambda: object())
+
+    def fake_advance(**kwargs: object) -> ExtractTickResult:
+        del kwargs
+        # Simulate a tick that outlasted its TTL: another run steals the lease
+        # mid-flight, so the post-tick renewal must fail.
+        path = lease_path(tmp_path, orch.PIPELINE_WRITER_LEASE)
+        payload = dict(read_json_artifact(path))
+        payload["holder"] = "thief"
+        write_json_artifact(path, payload)
+        return ExtractTickResult(status="completed", job_id="J")
+
+    monkeypatch.setattr(orch, "advance_extract_job", fake_advance)
+    monkeypatch.setattr(
+        orch,
+        "run_match_and_finalize",
+        lambda **kwargs: pytest.fail("must not finalize on a stolen lease"),
+    )
+
+    assert orch.main(["--artifact-root", str(tmp_path), "poll"]) == 1

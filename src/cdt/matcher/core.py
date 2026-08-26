@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -192,8 +193,14 @@ def match_pending_mentions(
     strong_match_threshold: float = DEFAULT_MEMBERSHIP_THRESHOLD,
     loose_match_threshold: float = DEFAULT_RELATED_THRESHOLD,
     ambiguity_margin: float = DEFAULT_AMBIGUITY_MARGIN,
+    renew: Callable[[], None] | None = None,
 ) -> dict[str, pd.DataFrame]:
-    """Match canonical debt instrument mentions into canonical matcher outputs."""
+    """Match canonical debt instrument mentions into canonical matcher outputs.
+
+    ``renew`` is called before each shard is rewritten; a full match pass can
+    outlast the pipeline-writer lease TTL, and it must raise rather than let
+    this run keep rewriting shards a lease thief now owns (#89).
+    """
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
@@ -224,6 +231,8 @@ def match_pending_mentions(
         for partition_index, (cik_shard, shard_mentions) in enumerate(
             chunk_groups, start=chunk_start + 1
         ):
+            if renew is not None:
+                renew()
             partition_start = perf_counter()
             if force:
                 existing_edges = pd.DataFrame(columns=MENTION_CLUSTER_EDGE_COLUMNS)

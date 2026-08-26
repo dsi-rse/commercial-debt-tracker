@@ -1324,3 +1324,35 @@ def test_grown_document_partition_reitemizes_and_reclassifies(
         "000114036126006577",
         "000114036126009999",
     ]
+
+
+def test_match_pending_mentions_renews_lease_per_shard(tmp_path: Path) -> None:
+    """The matcher extends the writer lease before rewriting each shard (#89)."""
+    for index, (cik, date_value, shard) in enumerate(
+        [("320193", "2024-01-02", "0001"), ("789019", "2024-01-03", "0002")], start=1
+    ):
+        write_partition_table(
+            tmp_path / "mentions",
+            partition={"date": date_value, "shard": shard},
+            table=pd.DataFrame(
+                [
+                    build_mention_row(
+                        mention_id=f"m-{index}",
+                        item_id=f"item-{index}",
+                        accession_number=f"000{index}",
+                        cik=cik,
+                        date=date_value,
+                        name="Term Loan",
+                        start_date="2024-01-01",
+                        amount="$100 million",
+                    )
+                ]
+            ),
+        )
+    renewals: list[int] = []
+
+    match_pending_mentions(
+        artifact_root=tmp_path, batch_size=5, renew=lambda: renewals.append(1)
+    )
+
+    assert len(renewals) == 2

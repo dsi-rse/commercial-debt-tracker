@@ -1062,6 +1062,12 @@ def advance_extract_job(
     needing a call, then persist state. When every row is terminal, write the
     mention partitions + audit log + completion registry and clear the active-job
     marker (match/finalize is the orchestrator's responsibility).
+
+    ``renew_lease`` runs at phase boundaries and may raise (``LeaseLostError``)
+    to abort the tick when the caller's writer lease was stolen (#89). Both
+    call sites are crash-equivalent points: before the post-fold save (completed
+    batches are re-folded idempotently next tick) and after submits are
+    persisted, so an abort never loses durable state.
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     resolved_model = model or settings.EXTRACTOR_BATCH_MODEL
