@@ -13,7 +13,7 @@ Layout under ``{artifact_root}/extract-batches/``::
 
     active.json                 # {"job_id": ...}; absent when idle
     job_id=<id>/manifest.json   # static job config + claimed partitions
-    job_id=<id>/state.jsonl     # one line per item: source partition + pending
+    job_id=<id>/state.jsonl.gz  # one line per item: source partition + pending
                                 # request marker + row state
     job_id=<id>/batches.json    # in-flight batches, seen batch ids, tick counter
     job_id=<id>/ticks/tick=<n>.json  # per-tick audit counts
@@ -54,10 +54,11 @@ from cdt.storage import (
     ArtifactPath,
     artifact_exists,
     join_artifact_path,
+    read_gzip_text_artifact,
     read_json_artifact,
     read_text_artifact,
+    write_gzip_text_artifact,
     write_json_artifact,
-    write_text_artifact,
 )
 
 LOGGER = get_logger(__name__)
@@ -87,9 +88,13 @@ OPENAI_REASONING_EFFORTS = frozenset({"none", "low", "medium", "high", "xhigh"})
 OPENROUTER_TO_OPENAI_REASONING = {"minimal": "low"}
 # OpenAI batch statuses whose results we fold into row states.
 RESULT_STATUSES = frozenset({"completed", "expired"})
-# OpenAI batch statuses that terminate a batch without usable results.
-FATAL_STATUSES = frozenset({"failed", "cancelled"})
-TERMINAL_STATUSES = RESULT_STATUSES | FATAL_STATUSES
+# Batch-level failure. Rows it strands get resubmission rounds (see
+# _fold_completed_batches) because the cause can be transient — enqueued-token
+# quota, provider incident — and one failed batch can carry a 40k-row chunk.
+# ``cancelled`` is deliberately NOT here: it is an operator action meaning
+# "stop", so its rows requeue like an expiry rather than terminating (#84).
+FATAL_STATUSES = frozenset({"failed"})
+TERMINAL_STATUSES = RESULT_STATUSES | FATAL_STATUSES | {"cancelled"}
 
 
 class CorruptJobStateError(RuntimeError):
@@ -370,6 +375,11 @@ def _manifest_path(root: str, job_id: str) -> str:
 
 
 def _state_path(root: str, job_id: str) -> str:
+    return join_artifact_path(_job_dir(root, job_id), "state.jsonl.gz")
+
+
+def _legacy_state_path(root: str, job_id: str) -> str:
+    """Uncompressed state written by jobs started before #86; read-only."""
     return join_artifact_path(_job_dir(root, job_id), "state.jsonl")
 
 
@@ -502,15 +512,26 @@ def _load_job_state(root: str, job_id: str) -> JobState:
 
 
 def _read_job_state(root: str, job_id: str) -> JobState:
+    state_path = _state_path(root, job_id)
+    if not artifact_exists(state_path):
+        # A job started before #86 wrote uncompressed state; the next
+        # _save_state writes the compressed path and the legacy file goes stale.
+        legacy = _legacy_state_path(root, job_id)
+        state_path = legacy if artifact_exists(legacy) else state_path
     for path in (
         _manifest_path(root, job_id),
-        _state_path(root, job_id),
+        state_path,
         _batches_path(root, job_id),
     ):
         if not artifact_exists(path):
             raise CorruptJobStateError(f"Extract job {job_id} is missing {path}.")
     manifest = cast(dict[str, object], read_json_artifact(_manifest_path(root, job_id)))
-    rows = _load_state_jsonl(read_text_artifact(_state_path(root, job_id)))
+    state_text = (
+        read_gzip_text_artifact(state_path)
+        if state_path.endswith(".gz")
+        else read_text_artifact(state_path)
+    )
+    rows = _load_state_jsonl(state_text)
     batches_payload = cast(
         dict[str, object], read_json_artifact(_batches_path(root, job_id))
     )
@@ -541,7 +562,9 @@ def _read_job_state(root: str, job_id: str) -> JobState:
 
 
 def _save_state(root: str, job: JobState) -> None:
-    write_text_artifact(_state_path(root, job.job_id), _serialize_state_jsonl(job.rows))
+    write_gzip_text_artifact(
+        _state_path(root, job.job_id), _serialize_state_jsonl(job.rows)
+    )
 
 
 def _save_batches(root: str, job: JobState) -> None:
@@ -770,23 +793,23 @@ def _fold_completed_batches(
                         entry.row_state, text, max_attempts=job.max_attempts
                     )
                 folded += 1
-            elif status.status in FATAL_STATUSES:
-                # Whole-batch failure (usually bad input): terminate, don't loop.
-                # No per-request line for this row, so carry the batch-level
-                # errors into its audit record instead of a bare status.
-                record_stage_error(entry.row_state, _fatal_batch_error(status))
-                folded += 1
             else:
-                # Expired-and-missing: pending is cleared so the row re-submits
-                # next tick — but each round costs a 24h window, so terminate at
-                # the cap instead of blocking the job forever.
+                # No result line: the batch failed wholesale, was cancelled, or
+                # expired without reaching this row. All three requeue — pending
+                # is cleared so the row re-submits next tick — because the cause
+                # can be transient (enqueued-token quota, provider incident, an
+                # operator pausing a job). Each round costs another batch window,
+                # so terminate at the cap instead of blocking the job forever,
+                # carrying the batch-level errors into the audit record.
                 entry.resubmissions += 1
                 if entry.resubmissions >= max_resubmissions:
-                    record_stage_error(
-                        entry.row_state,
-                        f"Batch request expired {entry.resubmissions} times "
-                        "without a result.",
+                    reason = (
+                        _fatal_batch_error(status)
+                        if status.status in FATAL_STATUSES
+                        else f"Batch request {status.status} "
+                        f"{entry.resubmissions} times without a result."
                     )
+                    record_stage_error(entry.row_state, reason)
                     folded += 1
         if status.status in FATAL_STATUSES:
             LOGGER.error(
