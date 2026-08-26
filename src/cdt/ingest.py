@@ -15,15 +15,19 @@ import boto3
 import pandas as pd
 
 from cdt import settings
-from cdt.datasets import zlib_crc32
+from cdt.datasets import parse_date_shard_partition, shard_label
 from cdt.shared import FailureClassifier, FailureRegistry, get_logger
 from cdt.storage import (
+    delete_artifact,
+    iter_partition_paths,
     join_artifact_path,
     normalize_artifact_path,
     parse_s3_uri,
     read_dataset,
+    read_table,
     write_json_artifact,
     write_partition_table,
+    write_table,
 )
 
 LOGGER = get_logger(__name__)
@@ -429,12 +433,21 @@ def run_ingest_pipeline(
                 failures += 1
                 continue
             downloaded += 1
+            if config.force:
+                # The registered download failure did not reproduce; drop it so
+                # normal runs stop skipping this filing (#67).
+                failure_registry.discard(_failure_key_for_candidate(candidate))
 
         pending_rows.append(row)
         if len(pending_rows) >= config.batch_size:
             flush_pending_rows()
 
     flush_pending_rows()
+    if config.force:
+        # A forced re-ingest rewrites every accession under its crc32 shard;
+        # copies stored under a pre-#61 salted shard would survive as
+        # cross-partition duplicates without this sweep.
+        repair_document_shards(documents_dataset_root)
     failure_registry.flush()
 
     updated = read_dataset(documents_dataset_root, columns=DOCUMENT_COLUMNS)
@@ -550,6 +563,14 @@ def iter_document_candidates_for_date_range(
             failure_registry=failure_registry,
         )
         if candidate is not None:
+            if (
+                retry_registered_failures
+                and failure_registry is not None
+                and key in failure_registry
+            ):
+                # The registered manifest failure did not reproduce; drop it so
+                # normal runs stop skipping this filing (#67).
+                failure_registry.discard(key)
             candidates.append(candidate)
     return candidates
 
@@ -828,16 +849,9 @@ def _document_shard(accession_number: str) -> str:
     Python's builtin ``hash`` is salted per process, so the same accession
     landed in different shards across runs — a forced re-ingest then wrote a
     second copy into a new partition that per-partition dedup could never see
-    (#61). crc32 pins the assignment.
+    (#61). The crc32 scheme in datasets.shard_label pins the assignment.
     """
-    return f"{zlib_crc32(accession_number) % DOCUMENT_PARTITION_SHARDS:04d}"
-
-
-def _partition_for_row(row: dict[str, str]) -> dict[str, str]:
-    return {
-        "date": row["date"],
-        "shard": _document_shard(row["accession_number"]),
-    }
+    return shard_label(accession_number, DOCUMENT_PARTITION_SHARDS)
 
 
 def _partition_path(dataset_root: str, partition: dict[str, str]) -> str:
@@ -845,6 +859,79 @@ def _partition_path(dataset_root: str, partition: dict[str, str]) -> str:
     for key, value in partition.items():
         partition_root = join_artifact_path(partition_root, f"{key}={value}")
     return join_artifact_path(partition_root, "part-0000.parquet")
+
+
+def repair_document_shards(documents_dataset_root: str) -> int:
+    """Move document rows stored under a non-canonical shard to their crc32 one.
+
+    Partitions written before #61 used the salted builtin hash, so a --force
+    re-ingest rewrites an accession under its crc32 shard while the historical
+    copy survives under the old one — per-partition dedup cannot see across
+    files, and itemize would emit duplicate item_ids from both. Rows whose
+    accession already has a canonical copy (the force re-ingest just refreshed
+    it) are dropped as stale; the rest are merged into their canonical
+    partition. Canonical writes happen before the stray partitions are
+    rewritten, so a crash mid-repair leaves a re-repairable duplicate, never a
+    lost row.
+
+    Returns the number of stray rows removed from non-canonical partitions.
+    """
+    stray_frames: list[pd.DataFrame] = []
+    rewrites: list[tuple[str, pd.DataFrame]] = []
+    for path in iter_partition_paths(documents_dataset_root):
+        partition = parse_date_shard_partition(path)
+        table = read_table(path, columns=DOCUMENT_COLUMNS)
+        if table.empty:
+            continue
+        canonical_shards = table["accession_number"].astype(str).map(_document_shard)
+        stray_mask = canonical_shards != partition["shard"]
+        if not stray_mask.any():
+            continue
+        stray_frames.append(table.loc[stray_mask])
+        rewrites.append((path, table.loc[~stray_mask]))
+    if not stray_frames:
+        return 0
+
+    strays = pd.concat(stray_frames, ignore_index=True)
+    grouped = strays.assign(
+        _shard=strays["accession_number"].astype(str).map(_document_shard)
+    ).groupby(["date", "_shard"], sort=True)
+    moved_frames: list[pd.DataFrame] = []
+    for (date_value, shard), group in grouped:
+        canonical = read_table(
+            _partition_path(
+                documents_dataset_root,
+                {"date": str(date_value), "shard": str(shard)},
+            ),
+            columns=DOCUMENT_COLUMNS,
+        )
+        canonical_accessions = (
+            set(canonical["accession_number"].astype(str))
+            if "accession_number" in canonical
+            else set()
+        )
+        moved_frames.append(
+            group.loc[
+                ~group["accession_number"].astype(str).isin(canonical_accessions)
+            ].drop(columns=["_shard"])
+        )
+    moved = pd.concat(moved_frames, ignore_index=True)
+    if not moved.empty:
+        _write_document_partitions(
+            documents_dataset_root, moved.reindex(columns=DOCUMENT_COLUMNS)
+        )
+    for path, kept in rewrites:
+        if kept.empty:
+            delete_artifact(path)
+        else:
+            write_table(path, kept.reindex(columns=DOCUMENT_COLUMNS))
+    LOGGER.info(
+        "Repaired document shards: strays_removed=%s rows_moved=%s partitions_rewritten=%s",
+        len(strays),
+        len(moved),
+        len(rewrites),
+    )
+    return len(strays)
 
 
 def _existing_accessions(documents_dataset_root: str) -> set[str]:
@@ -871,11 +958,9 @@ def _write_document_partitions(
         ).groupby("shard", sort=True):
             partition = {"date": str(date_value), "shard": str(shard)}
             path = _partition_path(documents_dataset_root, partition)
-            existing = read_dataset(
-                documents_dataset_root,
-                columns=DOCUMENT_COLUMNS,
-                partition_filter=partition,
-            )
+            # The partition holds exactly one file at a known path; listing the
+            # whole dataset to find it costs a full LIST per group per flush.
+            existing = read_table(path, columns=DOCUMENT_COLUMNS)
             merged = pd.concat(
                 [
                     existing.reindex(columns=DOCUMENT_COLUMNS),
