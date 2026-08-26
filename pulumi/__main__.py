@@ -14,9 +14,8 @@ pulumi.export("schedule_arn", scheduling.schedule.arn)
 pulumi.export("poll_schedule_arn", scheduling.poll_schedule.arn)
 pulumi.export("security_group_id", networking.ecs_sg.id)
 pulumi.export("primary_subnet_id", networking.primary_subnet_id)
-pulumi.export("openrouter_secret_arn", secrets.openrouter_api_key_secret.arn)
-pulumi.export("openai_secret_arn", secrets.openai_api_key_secret.arn)
-pulumi.export("sec_user_agent_secret_arn", secrets.sec_user_agent_secret.arn)
+pulumi.export("openrouter_param_arn", secrets.openrouter_api_key_param.arn)
+pulumi.export("openai_param_arn", secrets.openai_api_key_param.arn)
 
 if alerts.alerts_topic is not None:
     pulumi.export("alerts_topic_arn", alerts.alerts_topic.arn)

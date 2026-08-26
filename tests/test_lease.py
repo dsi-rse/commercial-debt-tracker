@@ -124,10 +124,18 @@ def test_crashed_holder_still_warns(
         stolen = acquire_lease(tmp_path, "writer")
 
     assert stolen is not None
-    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    # pytest >= 9 attaches caplog's handler to the named logger as well as the
+    # root, so one emission is captured twice as the SAME record object. Dedup by
+    # record identity: double-capture collapses to one, while a genuine duplicate
+    # emission (the #32 alarm-spam class) still produces two distinct records and
+    # fails the exact-once assertion.
+    warnings = list(
+        {id(r): r for r in caplog.records if r.levelno >= logging.WARNING}.values()
+    )
     assert len(warnings) == 1
-    assert "expired without being released" in warnings[0].getMessage()
-    assert crashed.holder in warnings[0].getMessage()
+    message = warnings[0].getMessage()
+    assert "expired without being released" in message
+    assert crashed.holder in message
 
 
 def test_corrupt_lease_warns(

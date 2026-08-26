@@ -73,49 +73,38 @@ aws.iam.RolePolicy(
     ),
 )
 
+# Reading a SecureString parameter takes two permissions: ssm:GetParameters on
+# the parameter, plus kms:Decrypt to unwrap it. KMS is scoped by ViaService so the
+# role can only use the key through SSM.
 aws.iam.RolePolicy(
     "cdt-ecs-execution-secrets-policy",
     role=task_execution_role.id,
-    policy=pulumi.Output.all(
-        openrouter_secret_arn=secrets.openrouter_api_key_secret.arn,
-        openai_secret_arn=secrets.openai_api_key_secret.arn,
-        sec_user_agent_secret_arn=secrets.sec_user_agent_secret.arn,
-        r2_access_key_id_secret_arn=(
-            secrets.r2_access_key_id_secret.arn
-            if secrets.r2_access_key_id_secret is not None
-            else None
-        ),
-        r2_secret_access_key_secret_arn=(
-            secrets.r2_secret_access_key_secret.arn
-            if secrets.r2_secret_access_key_secret is not None
-            else None
-        ),
-    ).apply(
-        lambda args: json.dumps(
-            {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Action": [
-                            "secretsmanager:GetSecretValue",
-                            "secretsmanager:DescribeSecret",
-                        ],
-                        "Resource": [
-                            arn
-                            for arn in [
-                                args["openrouter_secret_arn"],
-                                args["openai_secret_arn"],
-                                args["sec_user_agent_secret_arn"],
-                                args["r2_access_key_id_secret_arn"],
-                                args["r2_secret_access_key_secret_arn"],
-                            ]
-                            if arn is not None
-                        ],
-                    }
-                ],
-            }
-        )
+    policy=pulumi.Output.json_dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "ReadSecretParams",
+                    "Effect": "Allow",
+                    "Action": ["ssm:GetParameter", "ssm:GetParameters"],
+                    "Resource": [
+                        secrets.openrouter_api_key_param.arn,
+                        secrets.openai_api_key_param.arn,
+                    ],
+                },
+                {
+                    "Sid": "DecryptViaSSM",
+                    "Effect": "Allow",
+                    "Action": ["kms:Decrypt"],
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {
+                            "kms:ViaService": f"ssm.{config.aws_region}.amazonaws.com"
+                        }
+                    },
+                },
+            ],
+        }
     ),
 )
 
@@ -153,7 +142,13 @@ bucket_arns = sorted(
 # scraper's source bucket and CDT's output bucket are the same bucket (see #8).
 # Splitting by bucket there would grant PutObject/DeleteObject over the scraper's
 # whole archive — every form type back to 2016 — which CDT only ever reads.
-source_read_arns = [f"arn:aws:s3:::{config.bucket_name}/{config.source_prefix}/*"]
+source_read_arns = [
+    f"arn:aws:s3:::{config.bucket_name}/{config.source_prefix}/*",
+    # The default CIK file lives on the shared bucket; when output_bucket_name is
+    # a different bucket the WriteOwnArtifacts grants no longer cover it, so it
+    # gets its own read grant (see config.default_cik_key).
+    f"arn:aws:s3:::{config.bucket_name}/{config.default_cik_key}",
+]
 # Everything CDT writes lives under one of these two prefixes: canonical
 # artifacts (datasets, run manifests, completion + failure registries, extract
 # job state, locks) and the final dashboard snapshots.

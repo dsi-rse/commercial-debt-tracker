@@ -45,11 +45,10 @@ snapshots, but hands the expensive LLM extract stage to OpenAI's Batch API. The 
 finalize when it completes. See [docs/architecture.md](docs/architecture.md) for the
 extract state machine.
 
-The GitHub Actions deployment path is:
-
-1. build and push the orchestrator image to GHCR
-2. run `pulumi up`
-3. sync the GHCR image into the Pulumi-managed ECR repository as both `:latest` and `:${GITHUB_SHA}`
+The GitHub Actions deployment path is the shared processor pipeline
+(`dsi-rse/idi-ftm2j-shared`): version + tag + release, build and push the
+orchestrator image to GHCR, run `pulumi up`, then sync the image into the
+Pulumi-managed ECR repository as `:latest` and `:<version>`.
 
 Full details are in [docs/deployment.md](docs/deployment.md).
 
@@ -141,9 +140,8 @@ Optional runtime configuration:
 - `EXTRACTOR_BATCH_MODEL` and `EXTRACTOR_BATCH_REASONING` (OpenAI batch backend).
   `EXTRACTOR_BATCH_MODEL` defaults to `EXTRACTOR_MODEL` with the provider prefix
   stripped, so setting `EXTRACTOR_MODEL` alone moves both backends. Reasoning effort
-  is configured in OpenRouter's vocabulary for both backends and translated for
-  OpenAI (`none` → `minimal`, `xhigh` → `high`).
+  is configured in OpenRouter's vocabulary for both backends; the vocabularies align
+  except for `minimal`, which is translated to OpenAI's `low`.
 - `EXTRACTOR_BACKEND` (`batch` default, or `live`) — also settable per run with
   `cdt-orchestrator --extractor-backend {live,batch} daily`
 
-Pulumi also provisions a `SEC_USER_AGENT` secret into the ECS task to match the shared processor deployment pattern, even though CDT itself currently reads filings from scraper-managed S3 rather than calling SEC endpoints directly.
