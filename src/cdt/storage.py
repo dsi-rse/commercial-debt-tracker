@@ -290,7 +290,12 @@ def replace_json_artifact_if_match(
 
 
 def write_json_artifact(path: ArtifactPath, payload: dict[str, object]) -> str:
-    """Persist JSON to local storage or S3."""
+    """Persist JSON atomically to local storage or S3.
+
+    S3 PUTs are atomic; the local branch writes a temp file and renames so a
+    crash mid-write can never leave a truncated registry or pointer — readers
+    see whole-old or whole-new, matching write_table's contract.
+    """
     body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
     normalized = normalize_artifact_path(path)
     if is_s3_uri(normalized):
@@ -299,7 +304,14 @@ def write_json_artifact(path: ArtifactPath, payload: dict[str, object]) -> str:
         return normalized
     local_path = Path(normalized)
     local_path.parent.mkdir(parents=True, exist_ok=True)
-    local_path.write_bytes(body)
+    with NamedTemporaryFile(dir=local_path.parent, suffix=".tmp", delete=False) as tmp:
+        temp_path = Path(tmp.name)
+    try:
+        temp_path.write_bytes(body)
+        temp_path.replace(local_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
     return str(local_path)
 
 
@@ -349,15 +361,30 @@ def read_gzip_text_artifact(path: ArtifactPath) -> str:
 def read_table(
     path: ArtifactPath, columns: Sequence[str] | None = None
 ) -> pd.DataFrame:
-    """Read a Parquet table or return an empty table when it does not exist."""
+    """Read a Parquet table (projected to ``columns``) or an empty table if absent.
+
+    ``columns`` used to shape only the empty fallback while both real branches
+    deserialized every column — so a scan that needed one key column paid for
+    the full 8-K text of the whole corpus (#69). A partition written before a
+    column existed falls back to a full read plus reindex instead of raising.
+    """
     normalized = normalize_artifact_path(path)
     if not artifact_exists(normalized):
         return pd.DataFrame(columns=columns)
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
         body = _s3_client().get_object(Bucket=bucket, Key=key)["Body"].read()
-        return pd.read_parquet(io.BytesIO(body))
-    return pd.read_parquet(Path(normalized))
+        source: io.BytesIO | Path = io.BytesIO(body)
+    else:
+        source = Path(normalized)
+    if columns is None:
+        return pd.read_parquet(source)
+    try:
+        return pd.read_parquet(source, columns=list(columns))
+    except (KeyError, ValueError):
+        if isinstance(source, io.BytesIO):
+            source.seek(0)
+        return pd.read_parquet(source).reindex(columns=list(columns))
 
 
 def read_dataset(

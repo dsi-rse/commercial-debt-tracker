@@ -34,6 +34,7 @@ from cdt.storage import (
     artifact_exists,
     read_dataset,
     read_json_artifact,
+    read_table,
     write_partition_table,
 )
 
@@ -1356,3 +1357,20 @@ def test_match_pending_mentions_renews_lease_per_shard(tmp_path: Path) -> None:
     )
 
     assert len(renewals) == 2
+
+
+def test_read_table_projects_columns_and_tolerates_missing_ones(
+    tmp_path: Path,
+) -> None:
+    """Column projection is pushed down; absent columns reindex instead of raising (#69)."""
+    from cdt.storage import write_table
+
+    path = tmp_path / "table.parquet"
+    write_table(path, pd.DataFrame({"a": [1, 2], "b": ["x", "y"]}))
+
+    projected = read_table(path, ["a"])
+    assert list(projected.columns) == ["a"]
+
+    tolerant = read_table(path, ["a", "missing"])
+    assert list(tolerant.columns) == ["a", "missing"]
+    assert tolerant["missing"].isna().all()

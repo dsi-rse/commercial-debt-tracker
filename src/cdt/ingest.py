@@ -15,7 +15,11 @@ import boto3
 import pandas as pd
 
 from cdt import settings
-from cdt.datasets import parse_date_shard_partition, shard_label
+from cdt.datasets import (
+    iter_date_shard_partitions,
+    parse_date_shard_partition,
+    shard_label,
+)
 from cdt.shared import FailureClassifier, FailureRegistry, get_logger
 from cdt.storage import (
     delete_artifact,
@@ -450,7 +454,23 @@ def run_ingest_pipeline(
         repair_document_shards(documents_dataset_root)
     failure_registry.flush()
 
-    updated = read_dataset(documents_dataset_root, columns=DOCUMENT_COLUMNS)
+    # Read back only the run's date window: partition dates equal row dates, so
+    # this is exact — reading the whole dataset here deserialized every
+    # historical 8-K body a second time per run (#69).
+    window_frames = [
+        read_table(path, DOCUMENT_COLUMNS)
+        for path in iter_date_shard_partitions(
+            DOCUMENT_DATASET_NAME,
+            artifact_root=output_root,
+            start_date=config.start_date,
+            end_date=config.end_date,
+        )
+    ]
+    updated = (
+        pd.concat(window_frames, ignore_index=True)
+        if window_frames
+        else pd.DataFrame(columns=DOCUMENT_COLUMNS)
+    )
     filtered_updated = updated.loc[
         updated["date"].between(
             config.start_date.isoformat(),
@@ -935,7 +955,9 @@ def repair_document_shards(documents_dataset_root: str) -> int:
 
 
 def _existing_accessions(documents_dataset_root: str) -> set[str]:
-    table = read_dataset(documents_dataset_root, columns=DOCUMENT_COLUMNS)
+    # Only the key column: with projection pushdown this skips deserializing
+    # every stored 8-K body just to build a set of accession numbers (#69).
+    table = read_dataset(documents_dataset_root, columns=["accession_number"])
     if table.empty or "accession_number" not in table:
         return set()
     return set(table["accession_number"].astype(str))
