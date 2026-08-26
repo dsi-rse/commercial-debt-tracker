@@ -626,3 +626,50 @@ def test_document_shard_is_stable_across_processes() -> None:
         check=True,
     ).stdout.strip()
     assert out == _document_shard("0001437749-26-027029")
+
+
+def test_force_retries_registered_permanent_failures(tmp_path: Path) -> None:
+    """--force must be able to unpoison a filing the registry marked permanent (#67)."""
+    from cdt.ingest import (
+        IngestFailureClassifier,
+        iter_document_candidates_for_date_range,
+    )
+    from cdt.shared import FailureRegistry
+
+    manifest_key = "sec/2024-01-02/8-K/320193/000114036126006577/manifest.json"
+    client = FakeS3Client(
+        {
+            ("sec-bucket", manifest_key): _manifest_bytes(
+                "320193",
+                "0001140361-26-006577",
+                "8-K",
+                "2024-01-02",
+                "COMPLETE SUBMISSION TEXT FILE",
+            )
+        }
+    )
+    registry = FailureRegistry(
+        str(tmp_path / "failures.json"), IngestFailureClassifier()
+    )
+    from cdt.ingest import IngestFailureType
+
+    registry.add(("sec-bucket", manifest_key), IngestFailureType.DOCUMENT_NOT_FOUND)
+
+    skipped = iter_document_candidates_for_date_range(
+        client,
+        "sec-bucket",
+        date(2024, 1, 2),
+        date(2024, 1, 2),
+        failure_registry=registry,
+    )
+    retried = iter_document_candidates_for_date_range(
+        client,
+        "sec-bucket",
+        date(2024, 1, 2),
+        date(2024, 1, 2),
+        failure_registry=registry,
+        retry_registered_failures=True,
+    )
+
+    assert skipped == []
+    assert [c.accession_number for c in retried] == ["000114036126006577"]

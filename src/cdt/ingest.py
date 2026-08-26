@@ -387,6 +387,11 @@ def run_ingest_pipeline(
         normalized_ciks,
         failure_registry=failure_registry,
         s3_prefix=config.s3_prefix,
+        # --force retries even permanently registered failures: a variant
+        # document label or a since-fixed scraper bug would otherwise poison a
+        # filing forever, with hand-editing failures.json as the only remedy
+        # (#67). New failures are still recorded through the registry.
+        retry_registered_failures=config.force,
     ):
         candidates_seen += 1
         if candidate.accession_number in seen_accessions:
@@ -508,8 +513,14 @@ def iter_document_candidates_for_date_range(
     *,
     failure_registry: FailureRegistry | None = None,
     s3_prefix: str = DEFAULT_S3_PREFIX,
+    retry_registered_failures: bool = False,
 ) -> list[DocumentCandidate]:
-    """Return manifest-backed document candidates for a date range."""
+    """Return manifest-backed document candidates for a date range.
+
+    ``retry_registered_failures`` re-attempts filings the failure registry marked
+    permanent; the registry is still passed through so a repeat failure is
+    re-recorded rather than lost.
+    """
     candidates: list[DocumentCandidate] = []
     for manifest_key in _iter_manifest_keys(
         s3_client,
@@ -521,7 +532,11 @@ def iter_document_candidates_for_date_range(
         s3_prefix=s3_prefix,
     ):
         key = _failure_key(bucket, manifest_key)
-        if failure_registry is not None and key in failure_registry:
+        if (
+            not retry_registered_failures
+            and failure_registry is not None
+            and key in failure_registry
+        ):
             LOGGER.info(
                 "Skipping known ingest failure: bucket=%s key=%s", bucket, manifest_key
             )
