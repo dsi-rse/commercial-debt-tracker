@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import io
 import json
@@ -265,6 +266,36 @@ def write_text_artifact(path: ArtifactPath, body: str) -> str:
     local_path.parent.mkdir(parents=True, exist_ok=True)
     local_path.write_text(body, encoding="utf-8")
     return str(local_path)
+
+
+def write_gzip_text_artifact(path: ArtifactPath, body: str) -> str:
+    """Write text gzip-compressed.
+
+    The extract job state embeds full item text and message histories, so
+    compression cuts the repeatedly rewritten object by roughly an order of
+    magnitude (#86).
+    """
+    compressed = gzip.compress(body.encode("utf-8"))
+    normalized = normalize_artifact_path(path)
+    if is_s3_uri(normalized):
+        bucket, key = parse_s3_uri(normalized)
+        _s3_client().put_object(Bucket=bucket, Key=key, Body=compressed)
+        return normalized
+    target = Path(normalized)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(compressed)
+    return normalized
+
+
+def read_gzip_text_artifact(path: ArtifactPath) -> str:
+    """Read a gzip-compressed text artifact."""
+    normalized = normalize_artifact_path(path)
+    if is_s3_uri(normalized):
+        bucket, key = parse_s3_uri(normalized)
+        body = _s3_client().get_object(Bucket=bucket, Key=key)["Body"].read()
+    else:
+        body = Path(normalized).read_bytes()
+    return gzip.decompress(body).decode("utf-8")
 
 
 def read_table(

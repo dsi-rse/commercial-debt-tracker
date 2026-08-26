@@ -513,16 +513,64 @@ def test_repeatedly_expired_row_terminates_at_cap(tmp_path: Path) -> None:
     assert "expired 3 times" in json.dumps(record["attempts"])
 
 
-def test_failed_batch_marks_rows_error(tmp_path: Path) -> None:
-    """A whole-batch failure terminates its rows rather than looping forever."""
+def test_failed_batch_retries_and_recovers(tmp_path: Path) -> None:
+    """A transient whole-batch failure requeues its rows instead of dropping them.
+
+    One failed batch can carry a 40k-row chunk, and the cause can be quota-shaped
+    (#84) — so the rows resubmit under the same cap as expiries and succeed when
+    the next round goes through.
+    """
     seed_classification(tmp_path, [{"item_id": "item-multi", "text": MULTI_TEXT}])
     client = FakeBatchClient(
-        {"item-multi": {"ner": MULTI_NER}}, forced_status={0: "failed"}
+        {"item-multi": {"ner": MULTI_NER, "instrument_ie": MULTI_IE}},
+        forced_status={0: "failed"},  # the retry (index 1) completes normally
     )
 
     assert _advance(tmp_path, client).status == "submitted"
-    assert _advance(tmp_path, client).status == "completed"
+    result = _advance(tmp_path, client)  # folds the failure, resubmits
+    assert result.status == "submitted"
+    for _ in range(4):
+        result = _advance(tmp_path, client)
+        if result.status == "completed":
+            break
+    assert result.status == "completed"
+    assert not read_dataset(mentions_root(tmp_path)).empty
+
+
+def test_persistently_failed_batch_terminates_at_cap(tmp_path: Path) -> None:
+    """Rows whose batches keep failing terminate at the resubmission cap."""
+    seed_classification(tmp_path, [{"item_id": "item-multi", "text": MULTI_TEXT}])
+    client = FakeBatchClient(
+        {"item-multi": {"ner": MULTI_NER}},
+        forced_status={0: "failed", 1: "failed", 2: "failed"},
+    )
+
+    statuses = [_advance(tmp_path, client).status for _ in range(4)]
+    assert statuses[-1] == "completed"
     assert read_dataset(mentions_root(tmp_path)).empty
+    audit = list((tmp_path / "extractor-runs").glob("run_id=*/full.jsonl"))
+    record = json.loads(audit[0].read_text(encoding="utf-8"))
+    assert record["state"] == "ERROR"
+    assert "OpenAI batch failed" in json.dumps(record["attempts"])
+
+
+def test_cancelled_batch_requeues_rows(tmp_path: Path) -> None:
+    """Cancelling a batch means "stop", not "abandon these rows" (#84)."""
+    seed_classification(tmp_path, [{"item_id": "item-multi", "text": MULTI_TEXT}])
+    client = FakeBatchClient(
+        {"item-multi": {"ner": MULTI_NER, "instrument_ie": MULTI_IE}},
+        forced_status={0: "cancelled"},
+    )
+
+    assert _advance(tmp_path, client).status == "submitted"
+    result = _advance(tmp_path, client)
+    assert result.status == "submitted"  # requeued and resubmitted, not dropped
+    for _ in range(4):
+        result = _advance(tmp_path, client)
+        if result.status == "completed":
+            break
+    assert result.status == "completed"
+    assert not read_dataset(mentions_root(tmp_path)).empty
 
 
 def test_failed_batch_records_per_request_diagnostics(tmp_path: Path) -> None:
@@ -535,6 +583,8 @@ def test_failed_batch_records_per_request_diagnostics(tmp_path: Path) -> None:
     )
 
     assert _advance(tmp_path, client).status == "submitted"
+    # A row WITH a per-request error line terminates on that concrete reason
+    # immediately; only line-less rows get resubmission rounds.
     assert _advance(tmp_path, client).status == "completed"
 
     assert "batch-0-err" in client.downloaded
@@ -547,14 +597,15 @@ def test_failed_batch_records_per_request_diagnostics(tmp_path: Path) -> None:
 def test_failed_batch_falls_back_to_batch_level_errors(tmp_path: Path) -> None:
     """With no error file, the batch-level errors land in the row's audit record."""
     seed_classification(tmp_path, [{"item_id": "item-multi", "text": MULTI_TEXT}])
+    errors = ["invalid_json_line: could not parse (input line 1)"]
     client = FakeBatchClient(
         {"item-multi": {"ner": MULTI_NER}},
-        forced_status={0: "failed"},
-        batch_errors={0: ["invalid_json_line: could not parse (input line 1)"]},
+        forced_status={0: "failed", 1: "failed", 2: "failed"},
+        batch_errors={0: errors, 1: errors, 2: errors},
     )
 
-    assert _advance(tmp_path, client).status == "submitted"
-    assert _advance(tmp_path, client).status == "completed"
+    statuses = [_advance(tmp_path, client).status for _ in range(4)]
+    assert statuses[-1] == "completed"
 
     audit = list((tmp_path / "extractor-runs").glob("run_id=*/full.jsonl"))
     record = json.loads(audit[0].read_text(encoding="utf-8"))
@@ -574,14 +625,15 @@ def test_unreadable_diagnostics_file_does_not_strand_rows(tmp_path: Path) -> Non
                 raise RuntimeError("403 while fetching error file")
             return super().download_file(file_id)
 
+    errs = {"item-multi": "context_length_exceeded"}
     client = BrokenDownloadClient(
         {"item-multi": {"ner": MULTI_NER}},
-        forced_status={0: "failed"},
-        fatal_request_errors={0: {"item-multi": "context_length_exceeded"}},
+        forced_status={0: "failed", 1: "failed", 2: "failed"},
+        fatal_request_errors={0: errs, 1: errs, 2: errs},
     )
 
-    assert _advance(tmp_path, client).status == "submitted"
-    assert _advance(tmp_path, client).status == "completed"
+    statuses = [_advance(tmp_path, client).status for _ in range(4)]
+    assert statuses[-1] == "completed"
 
     audit = list((tmp_path / "extractor-runs").glob("run_id=*/full.jsonl"))
     record = json.loads(audit[0].read_text(encoding="utf-8"))
@@ -1105,7 +1157,7 @@ def test_unparseable_state_jsonl_self_heals(tmp_path: Path) -> None:
     client = FakeBatchClient({"item-multi": {"ner": MULTI_NER}})
     job_id = _seed_active_job(tmp_path, client)
 
-    state = tmp_path / "extract-batches" / f"job_id={job_id}" / "state.jsonl"
+    state = tmp_path / "extract-batches" / f"job_id={job_id}" / "state.jsonl.gz"
     state.write_text("{not json at all\n", encoding="utf-8")
 
     assert _advance(tmp_path, client).status == "reset"
@@ -1140,7 +1192,9 @@ def test_reset_active_job_clears_marker_and_keeps_state(tmp_path: Path) -> None:
     job_id = _seed_active_job(tmp_path, client)
 
     assert reset_active_job(tmp_path) == job_id
-    assert (tmp_path / "extract-batches" / f"job_id={job_id}" / "state.jsonl").exists()
+    assert (
+        tmp_path / "extract-batches" / f"job_id={job_id}" / "state.jsonl.gz"
+    ).exists()
     assert describe_active_job(tmp_path).status == "idle"
     assert reset_active_job(tmp_path) is None
 
@@ -1299,3 +1353,24 @@ def test_orphan_input_download_failure_skips_adoption(tmp_path: Path) -> None:
     result = advance_extract_job(batch_client=client, artifact_root=tmp_path)
     assert result.status in {"waiting", "submitted"}
     assert describe_active_job(tmp_path).status == "active"
+
+
+def test_legacy_uncompressed_state_still_loads(tmp_path: Path) -> None:
+    """A job started before #86 (plain state.jsonl) keeps advancing after deploy."""
+    client = FakeBatchClient(
+        {"item-multi": {"ner": MULTI_NER, "instrument_ie": MULTI_IE}}
+    )
+    job_id = _seed_active_job(tmp_path, client)
+    job_dir = tmp_path / "extract-batches" / f"job_id={job_id}"
+    gz = job_dir / "state.jsonl.gz"
+    import gzip as _gzip
+
+    (job_dir / "state.jsonl").write_bytes(_gzip.decompress(gz.read_bytes()))
+    gz.unlink()
+
+    for _ in range(4):
+        result = advance_extract_job(batch_client=client, artifact_root=tmp_path)
+        if result.status == "completed":
+            break
+    assert result.status == "completed"
+    assert not read_dataset(mentions_root(tmp_path)).empty

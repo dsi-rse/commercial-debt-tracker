@@ -78,6 +78,20 @@ by design so wide backfills are deliberate, observable operations. Where no poll
 schedule is running (e.g. a local backfill), either run `cdt-orchestrator poll` by hand
 to drain extraction or use `--extractor-backend live`.
 
+### Known tradeoff: one active job (head-of-line blocking)
+
+The poller runs a single active job at a time, and mentions are written only
+when every row in the job is terminal. New classification partitions therefore
+queue behind the active job, and one slow row delays the whole job's output.
+This is deliberate: one job means one marker, one claimed set, and no cross-job
+partition arbitration, and at daily volume queue time is invisible (batches
+normally return in minutes to hours). The pathological case — three stages of
+repeated 24h expiries — is bounded by the resubmission cap, and a stalled job
+delays mentions rather than losing them. If wide backfills make the queueing
+real, the escape hatches are per-partition finalize (write mentions as each
+partition's rows go terminal) or multiple concurrent jobs; revisit then rather
+than paying the state-machine complexity now.
+
 ## Classifier Design
 
 The classifier is a saved local model under `data/models/classifier/tfidf-linear-svc/`. It is trained with threshold selection aimed at a high recall target, which reflects the product decision to prefer over-inclusion before extraction rather than miss potentially relevant debt disclosures.

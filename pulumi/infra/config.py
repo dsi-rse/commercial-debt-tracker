@@ -54,6 +54,10 @@ poll_schedule_enabled = (
     if _poll_enabled_raw is None
     else _poll_enabled_raw.lower() == "true"
 )
+# Off by default: the alarm/SNS resources need bootstrap role statements that
+# land with dsi-rse/idi-ftm2j-shared#79 — enabling before that bootstrap
+# redeploy fails the CDT deploy with AccessDenied on sns:CreateTopic.
+alerts_enabled = (config.get("alerts_enabled") or "false").lower() == "true"
 caller = aws.get_caller_identity()
 aws_region = pulumi.Config("aws").require("region")
 
