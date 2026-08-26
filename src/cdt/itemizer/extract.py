@@ -327,12 +327,16 @@ def leading_item_numbers(line: str) -> tuple[str, ...]:
     if any(phrase in normalized_casefold for phrase in NON_HEADING_PHRASES):
         return ()
 
+    # Every 8-K item number is X.0Y, and a number followed by '%' is a coupon
+    # rate, not a heading — '5.25% Senior Notes due 2029' as a body line (HTML
+    # table cells become their own lines) otherwise truncated the enclosing
+    # item section right at the debt text this pipeline targets (#63).
     item_match = re.match(r"^\s*Item\b(?P<rest>.*)$", normalized, re.IGNORECASE)
     if item_match:
-        return tuple(re.findall(r"\b\d\.\d\d\b", item_match.group("rest")))
+        return tuple(re.findall(r"\b\d\.0\d\b(?!\s*%)", item_match.group("rest")))
 
     bare_match = re.match(
-        r"^\s*(?P<number>\d\.\d\d)\s*(?:[.:;\-)]|\b)",
+        r"^\s*(?P<number>\d\.0\d)(?!\s*%)\s*(?:[.:;\-)]|\b)",
         normalized,
         re.IGNORECASE,
     )
