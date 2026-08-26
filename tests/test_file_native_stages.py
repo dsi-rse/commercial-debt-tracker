@@ -1042,6 +1042,42 @@ def test_read_dataset_skips_orphaned_tempfiles(tmp_path: Path) -> None:
     assert read["item_id"].to_list() == ["a"]
 
 
+def test_pending_source_partitions_skips_orphans_and_raises_on_flat_files(
+    tmp_path: Path,
+) -> None:
+    """Fingerprint work selection follows the same stray contract as the scan.
+
+    Silently dropping a mis-laid-out real file here would run the stage on
+    nothing while ingest keeps counting the file's rows as ingested.
+    """
+    from cdt.datasets import pending_source_partitions
+
+    root = tmp_path / "artifacts"
+    table = pd.DataFrame({"item_id": ["a"], "text": ["x"]})
+    write_partition_table(
+        str(root / "items"),
+        partition={"date": "2026-01-02", "shard": "0007"},
+        table=table,
+    )
+    (
+        root / "items" / "date=2026-01-02" / "shard=0007" / "tmpabc123.parquet"
+    ).write_bytes(b"")
+
+    pending, _ = pending_source_partitions(
+        "classify", "items", "classifications", artifact_root=str(root)
+    )
+
+    assert len(pending) == 1
+    assert pending[0][0].endswith("date=2026-01-02/shard=0007/part-0000.parquet")
+
+    (root / "items" / "items.parquet").write_bytes(b"")
+
+    with pytest.raises(ValueError, match="Non-canonical parquet file"):
+        pending_source_partitions(
+            "classify", "items", "classifications", artifact_root=str(root)
+        )
+
+
 def _seed_classifications(
     tmp_path: Path, item_ids: list[str], *, date: str = "2024-01-02"
 ) -> None:

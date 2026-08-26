@@ -241,16 +241,26 @@ def pending_source_partitions(
             stage_name, artifact_root=resolved_root, data_dir=data_dir
         )
     )
-    fingerprints = {
-        path: version
-        for path, version in list_artifacts_with_versions(
-            dataset_root(
-                source_dataset, artifact_root=resolved_root, data_dir=data_dir
-            ),
-            suffix=".parquet",
-        ).items()
-        if PARTITION_PATTERN.search(path)
-    }
+    # Same stray contract as iter_date_shard_partitions: an orphaned tempfile
+    # is junk to skip, but any other non-canonical parquet is real data laid
+    # out wrong — silently dropping it here would run the stage on nothing
+    # while ingest keeps counting the file's rows as ingested.
+    fingerprints: dict[str, str] = {}
+    for path, version in list_artifacts_with_versions(
+        dataset_root(source_dataset, artifact_root=resolved_root, data_dir=data_dir),
+        suffix=".parquet",
+    ).items():
+        if match_date_shard_partition(path) is not None:
+            fingerprints[path] = version
+            continue
+        if is_orphaned_temp_artifact(path):
+            LOGGER.warning("Skipping orphaned temp partition file: %s", path)
+            continue
+        msg = (
+            f"Non-canonical parquet file in dataset {source_dataset!r}: {path}. "
+            "Re-partition or remove it before running stages."
+        )
+        raise ValueError(msg)
     existing_target_ids = (
         set()
         if force
