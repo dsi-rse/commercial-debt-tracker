@@ -8,7 +8,7 @@ import asyncio
 import hashlib
 import json
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime
 from importlib import resources
 from pathlib import Path
@@ -893,7 +893,9 @@ def pending_extract_partitions(
             continue
         if entry.complete and entry.fingerprint is None:
             # v1 entry: complete as recorded; stamp so future growth registers.
-            entry.fingerprint = fingerprint
+            # Reassign rather than mutate so the change lands in the registry's
+            # dirty set and survives the compare-and-swap merge on save (#88).
+            registry[classification_path] = replace(entry, fingerprint=fingerprint)
             continue
         pending.append(
             PendingExtractPartition(

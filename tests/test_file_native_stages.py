@@ -1078,6 +1078,72 @@ def test_pending_source_partitions_skips_orphans_and_raises_on_flat_files(
         )
 
 
+def test_completion_registry_saves_merge_concurrent_updates(tmp_path: Path) -> None:
+    """Overlapping writers must not lose each other's registry entries (#88).
+
+    A lost entry silently strands a partition (or fake-completes it with empty
+    item_ids), so saves overlay only the entries a run changed onto the freshest
+    persisted state instead of overwriting the file with a stale snapshot.
+    """
+    from cdt.datasets import (
+        CompletedPartition,
+        load_completion_registry,
+        save_completion_registry,
+    )
+
+    save_completion_registry(
+        "itemize", {"P": CompletedPartition(fingerprint="f1")}, artifact_root=tmp_path
+    )
+    writer_a = load_completion_registry("itemize", artifact_root=tmp_path)
+    writer_b = load_completion_registry("itemize", artifact_root=tmp_path)
+
+    writer_b["P"] = CompletedPartition(fingerprint="f2")
+    writer_b["Q"] = CompletedPartition(fingerprint="q1")
+    save_completion_registry("itemize", writer_b, artifact_root=tmp_path)
+
+    # A loaded P at f1 but never touched it; its save must not revert B's f2.
+    writer_a["R"] = CompletedPartition(fingerprint="r1")
+    save_completion_registry("itemize", writer_a, artifact_root=tmp_path)
+
+    final = load_completion_registry("itemize", artifact_root=tmp_path)
+    assert set(final) == {"P", "Q", "R"}
+    assert final["P"].fingerprint == "f2"
+    assert final["Q"].fingerprint == "q1"
+    assert final["R"].fingerprint == "r1"
+
+
+def test_pending_source_partitions_stamps_survive_concurrent_saves(
+    tmp_path: Path,
+) -> None:
+    """Legacy-entry stamping counts as a change and survives the merge (#88)."""
+    from cdt.datasets import (
+        CompletedPartition,
+        load_completion_registry,
+        pending_source_partitions,
+        save_completion_registry,
+    )
+
+    table = pd.DataFrame({"item_id": ["a"], "text": ["x"]})
+    source_path = write_partition_table(
+        str(tmp_path / "items"),
+        partition={"date": "2026-01-02", "shard": "0007"},
+        table=table,
+    )
+    # A v1-migrated entry: complete but fingerprint-less.
+    save_completion_registry(
+        "classify", {source_path: CompletedPartition()}, artifact_root=tmp_path
+    )
+
+    pending, registry = pending_source_partitions(
+        "classify", "items", "classifications", artifact_root=str(tmp_path)
+    )
+    assert pending == []
+    save_completion_registry("classify", registry, artifact_root=tmp_path)
+
+    final = load_completion_registry("classify", artifact_root=tmp_path)
+    assert final[source_path].fingerprint is not None
+
+
 def _seed_classifications(
     tmp_path: Path, item_ids: list[str], *, date: str = "2024-01-02"
 ) -> None:

@@ -87,15 +87,19 @@ def test_poll_releases_lease_after_tick(
     assert acquire_lease(tmp_path, orch.PIPELINE_WRITER_LEASE) is not None
 
 
-def test_daily_batch_skips_match_when_lease_held(
+def test_daily_batch_does_not_run_while_lease_held(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Daily skips match/finalize (but still prepares) when a poll holds the lease."""
-    calls: list[str] = []
+    """Daily fails loudly, without preparing, when another run holds the lease.
+
+    Prepare rewrites the same completion registries a poll tick's finalize does;
+    running it unserialized loses registry updates (#88).
+    """
+    monkeypatch.setattr(orch, "LEASE_WAIT_SECONDS", 0)
     monkeypatch.setattr(
         orch,
         "run_prepare_stages",
-        lambda config: (calls.append("prepare"), tmp_path)[1],
+        lambda config: pytest.fail("prepare must not run while the lease is held"),
     )
     monkeypatch.setattr(
         orch,
@@ -107,9 +111,36 @@ def test_daily_batch_skips_match_when_lease_held(
 
     assert (
         orch.main(["--artifact-root", str(tmp_path), "daily", "--cik-file", "c.txt"])
+        == 1
+    )
+
+
+def test_daily_batch_holds_lease_through_prepare(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The prepare stages run under the writer lease, serialized with poll ticks (#88)."""
+    calls: list[str] = []
+
+    def fake_prepare(config: object) -> str:
+        del config
+        assert (
+            acquire_lease(tmp_path, orch.PIPELINE_WRITER_LEASE) is None
+        ), "prepare must run while the lease is held"
+        calls.append("prepare")
+        return str(tmp_path)
+
+    monkeypatch.setattr(orch, "run_prepare_stages", fake_prepare)
+    monkeypatch.setattr(
+        orch, "run_match_and_finalize", lambda **kwargs: calls.append("match")
+    )
+
+    assert (
+        orch.main(["--artifact-root", str(tmp_path), "daily", "--cik-file", "c.txt"])
         == 0
     )
-    assert calls == ["prepare"]
+    assert calls == ["prepare", "match"]
+    # Released on the way out, so the next scheduled run proceeds immediately.
+    assert acquire_lease(tmp_path, orch.PIPELINE_WRITER_LEASE) is not None
 
 
 def test_daily_batch_defers_extract(
@@ -345,15 +376,19 @@ def test_historical_live_runs_full_pipeline(
     assert calls == ["pipeline"]
 
 
-def test_historical_batch_skips_match_when_lease_held(
+def test_historical_batch_does_not_run_while_lease_held(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Historical skips match/finalize (but still prepares) when poll holds the lease."""
-    calls: list[str] = []
+    """Historical fails loudly, without preparing, when another run holds the lease.
+
+    Prepare rewrites the same completion registries a poll tick's finalize does;
+    running it unserialized loses registry updates (#88).
+    """
+    monkeypatch.setattr(orch, "LEASE_WAIT_SECONDS", 0)
     monkeypatch.setattr(
         orch,
         "run_prepare_stages",
-        lambda config: (calls.append("prepare"), tmp_path)[1],
+        lambda config: pytest.fail("prepare must not run while the lease is held"),
     )
     monkeypatch.setattr(
         orch,
@@ -377,9 +412,8 @@ def test_historical_batch_skips_match_when_lease_held(
                 "2024-01-31",
             ]
         )
-        == 0
+        == 1
     )
-    assert calls == ["prepare"]
 
 
 def test_placeholder_secret_fails_fast(
@@ -416,6 +450,7 @@ def test_live_backend_skips_when_lease_held(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The live pipeline must not interleave with a running poll tick."""
+    monkeypatch.setattr(orch, "LEASE_WAIT_SECONDS", 0)
     monkeypatch.setattr(
         orch,
         "run_pipeline",

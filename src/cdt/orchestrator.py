@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import os
 from collections.abc import Sequence
+from time import monotonic, sleep
 
 from cdt.cli import configure_logging, parse_date, positive_int
 from cdt.datasets import resolve_artifact_root
@@ -32,6 +33,7 @@ from cdt.extractor import DEFAULT_MAX_ATTEMPTS, OpenAIBatchClient, advance_extra
 from cdt.ingest import DEFAULT_BUCKET
 from cdt.lease import (
     PIPELINE_WRITER_LEASE,
+    Lease,
     acquire_lease,
     release_lease,
     renew_lease,
@@ -46,6 +48,27 @@ from cdt.pipeline import (
 from cdt.shared import get_logger
 
 LOGGER = get_logger(__name__)
+
+# Daily/historical runs must not silently skip a day's work because an hourly
+# poll tick briefly held the lease: a normal tick is minutes, so a bounded wait
+# absorbs it. A wedged holder outlasts the wait and the run fails loudly (#88).
+LEASE_WAIT_SECONDS = 15 * 60
+LEASE_POLL_SECONDS = 30
+
+
+def acquire_lease_with_wait(artifact_root: str, name: str) -> Lease | None:
+    """Acquire the lease, retrying up to LEASE_WAIT_SECONDS; None on timeout."""
+    deadline = monotonic() + LEASE_WAIT_SECONDS
+    while True:
+        lease = acquire_lease(artifact_root, name)
+        if lease is not None:
+            return lease
+        if monotonic() >= deadline:
+            return None
+        LOGGER.info(
+            "Pipeline-writer lease is held; retrying in %ss.", LEASE_POLL_SECONDS
+        )
+        sleep(LEASE_POLL_SECONDS)
 
 
 # Prefix of the value Pulumi seeds into the SSM SecureStrings that feed these env
@@ -211,30 +234,43 @@ def run_batch_backend(args: argparse.Namespace) -> int:
             "tick with --force while no job is active."
         )
     config = _pipeline_config(args)
-    artifact_root = run_prepare_stages(config)
-    LOGGER.info(
-        "Extraction deferred to the batch poller: pending items are claimed by "
-        "the next `poll` run. Ensure the poll schedule is enabled, or run "
-        "`cdt-orchestrator poll` manually — nothing else drives extraction."
-    )
-    # Keep final snapshots fresh from whatever mentions already exist; the in-flight
-    # batch job (advanced by ``poll``) will refresh them again when it completes.
-    lease = acquire_lease(artifact_root, PIPELINE_WRITER_LEASE)
+    # The prepare stages rewrite the same completion registries a poll tick's
+    # finalize does, so the whole run — not just match/finalize — holds the
+    # writer lease (#88).
+    resolved_root = resolve_artifact_root(args.artifact_root)
+    lease = acquire_lease_with_wait(resolved_root, PIPELINE_WRITER_LEASE)
     if lease is None:
-        LOGGER.warning(
-            "Pipeline-writer lease is held (a poll tick is running); skipping "
-            "match/finalize — the poll schedule will refresh snapshots."
+        LOGGER.error(
+            "Pipeline-writer lease still held after %ss; not running. The holder "
+            "may be wedged — check for a stuck poll tick.",
+            LEASE_WAIT_SECONDS,
         )
-    else:
-        try:
-            run_match_and_finalize(
-                artifact_root=artifact_root,
-                final_database_root=args.final_database_root,
-                batch_size=args.match_batch_size,
-                force=args.force,
+        return 1
+    try:
+        artifact_root = run_prepare_stages(config)
+        LOGGER.info(
+            "Extraction deferred to the batch poller: pending items are claimed by "
+            "the next `poll` run. Ensure the poll schedule is enabled, or run "
+            "`cdt-orchestrator poll` manually — nothing else drives extraction."
+        )
+        # Keep final snapshots fresh from whatever mentions already exist; the
+        # in-flight batch job (advanced by ``poll``) will refresh them again when
+        # it completes. Prepare can outlast the TTL, so renew — and if the lease
+        # was stolen, the snapshots belong to another run now.
+        if not renew_lease(lease):
+            LOGGER.error(
+                "Lost the pipeline-writer lease during prepare stages; skipping "
+                "match/finalize — another run owns the snapshots now."
             )
-        finally:
-            release_lease(lease)
+            return 1
+        run_match_and_finalize(
+            artifact_root=artifact_root,
+            final_database_root=args.final_database_root,
+            batch_size=args.match_batch_size,
+            force=args.force,
+        )
+    finally:
+        release_lease(lease)
     print(artifact_root)
     return 0
 
@@ -309,11 +345,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     # completion registries and match/final snapshots the poll tick does, so it
     # runs under the same writer lease rather than interleaving with one.
     resolved_root = resolve_artifact_root(args.artifact_root)
-    lease = acquire_lease(resolved_root, PIPELINE_WRITER_LEASE)
+    lease = acquire_lease_with_wait(resolved_root, PIPELINE_WRITER_LEASE)
     if lease is None:
         LOGGER.error(
-            "Pipeline-writer lease is held (a poll tick is running); not starting "
-            "a live run. Retry once the tick finishes."
+            "Pipeline-writer lease still held after %ss; not starting a live run. "
+            "The holder may be wedged — check for a stuck poll tick.",
+            LEASE_WAIT_SECONDS,
         )
         return 1
     try:
