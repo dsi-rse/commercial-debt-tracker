@@ -947,6 +947,7 @@ def collect_pending_extract_items(
     artifact_root: str | Path | None = None,
     data_dir: Path | None = None,
     force: bool = False,
+    max_rows: int | None = None,
 ) -> tuple[list[tuple[dict[str, str | None], str, str]], dict[str, dict[str, object]]]:
     """Collect relevant items awaiting extraction across pending partitions.
 
@@ -957,6 +958,12 @@ def collect_pending_extract_items(
     row-outcome-keyed completion (#49) and to detect source growth (#62). Uses
     the same selection as ``extract_pending_items`` so both backends claim the
     same work, row by row.
+
+    ``max_rows`` stops claiming partitions once the collected row count reaches
+    it (whole partitions stay the atomic claim unit, so the last claimed
+    partition may overshoot). Unclaimed partitions are simply left pending: a
+    post-backfill job holding every pending item's full text OOMs the poll
+    tick (#92), and the next job picks up the remainder.
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     pending, _registry = pending_extract_partitions(
@@ -964,7 +971,11 @@ def collect_pending_extract_items(
     )
     entries: list[tuple[dict[str, str | None], str, str]] = []
     claimed: dict[str, dict[str, object]] = {}
+    deferred_partitions = 0
     for pending_partition in pending:
+        if max_rows is not None and len(entries) >= max_rows:
+            deferred_partitions += 1
+            continue
         claimed[pending_partition.classification_path] = {
             "fingerprint": pending_partition.fingerprint,
             "prior_item_ids": sorted(pending_partition.done_item_ids),
@@ -980,6 +991,13 @@ def collect_pending_extract_items(
                 key: coerce_native(item_row.get(key)) for key in STATE_ITEM_ROW_FIELDS
             }
             entries.append((coerced, pending_partition.date, pending_partition.shard))
+    if deferred_partitions:
+        LOGGER.info(
+            "Deferred %s pending partition(s) beyond the %s-row job cap; the "
+            "next job claims them once this one completes.",
+            deferred_partitions,
+            max_rows,
+        )
     return entries, claimed
 
 

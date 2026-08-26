@@ -77,6 +77,12 @@ DEFAULT_MAX_BATCH_BYTES = 100 * 1024 * 1024
 # A row whose batch expires without a result re-submits next tick; each round
 # costs another 24h window, so cap the rounds instead of looping forever.
 DEFAULT_MAX_RESUBMISSIONS = 3
+# One job's rows (item text + per-stage message histories) live in a single
+# state blob rewritten every tick; claiming every pending partition after a
+# large backfill builds a multi-GB job that OOMs the poll task (#92). Whole
+# partitions remain the claim unit, so the last one may overshoot slightly;
+# the next job claims the remainder when this one completes.
+DEFAULT_MAX_ROWS_PER_JOB = 10_000
 # Ticks are hourly, so this is ~4 days. A healthy job needs at least three
 # sequential batch rounds (one per stage) plus retries, so multi-day jobs are
 # normal — but one alive this long has probably wedged (a batch stuck
@@ -625,10 +631,11 @@ def _create_job(
     reasoning_effort: str,
     max_attempts: int,
     force: bool,
+    max_rows: int = DEFAULT_MAX_ROWS_PER_JOB,
 ) -> JobState | None:
     """Start a new job from pending classification partitions, or None if idle."""
     entries, claimed = collect_pending_extract_items(
-        artifact_root=root, data_dir=data_dir, force=force
+        artifact_root=root, data_dir=data_dir, force=force, max_rows=max_rows
     )
     if not claimed:
         return None
@@ -1058,6 +1065,7 @@ def advance_extract_job(
     max_requests_per_batch: int = DEFAULT_MAX_REQUESTS_PER_BATCH,
     max_batch_bytes: int = DEFAULT_MAX_BATCH_BYTES,
     max_resubmissions: int = DEFAULT_MAX_RESUBMISSIONS,
+    max_rows_per_job: int = DEFAULT_MAX_ROWS_PER_JOB,
     force: bool = False,
     renew_lease: Callable[[], None] | None = None,
 ) -> ExtractTickResult:
@@ -1108,6 +1116,7 @@ def advance_extract_job(
             reasoning_effort=resolved_reasoning,
             max_attempts=max_attempts,
             force=force,
+            max_rows=max_rows_per_job,
         )
         if job is None:
             return ExtractTickResult(status="idle")

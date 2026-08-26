@@ -146,14 +146,23 @@ def classify_items(
     data_dir: Path | None = None,
     model_dir: Path | None = None,
     force: bool = False,
+    artifacts: tuple[object, float] | None = None,
 ) -> pd.DataFrame:
-    """Classify in-memory item rows using a saved binary model."""
+    """Classify in-memory item rows using a saved binary model.
+
+    ``artifacts`` is a pre-loaded ``(model, threshold)`` pair; callers looping
+    over partitions pass it so the pickle is deserialized once per run instead
+    of once per partition (#76).
+    """
     del force
     if items.empty:
         return pd.DataFrame(columns=CLASSIFIED_ITEM_COLUMNS)
 
-    resolved_model_dir = model_dir or default_model_dir(data_dir)
-    model, threshold, _ = load_training_artifacts(resolved_model_dir)
+    if artifacts is not None:
+        model, threshold = artifacts
+    else:
+        resolved_model_dir = model_dir or default_model_dir(data_dir)
+        model, threshold, _ = load_training_artifacts(resolved_model_dir)
     classified = items.copy()
     texts = [normalize_text(str(value)) for value in classified["text"].fillna("")]
     scores = score_model(model, texts)
@@ -201,6 +210,14 @@ def classify_pending_items(
     pending_item_paths = [path for path, _ in pending_with_fingerprints]
     source_fingerprints = dict(pending_with_fingerprints)
 
+    # Unpickle the model once per run: per-partition loads dominate large
+    # backfills with redundant deserialization and S3 GETs (#76).
+    artifacts: tuple[object, float] | None = None
+    if pending_item_paths:
+        resolved_model_dir = model_dir or default_model_dir(data_dir)
+        model, threshold, _ = load_training_artifacts(resolved_model_dir)
+        artifacts = (model, threshold)
+
     total_partitions = len(pending_item_paths)
     for chunk_start in range(0, total_partitions, batch_size):
         chunk_paths = pending_item_paths[chunk_start : chunk_start + batch_size]
@@ -216,6 +233,7 @@ def classify_pending_items(
                 batch_items,
                 data_dir=data_dir,
                 model_dir=model_dir,
+                artifacts=artifacts,
             )
             if classified.empty:
                 empty_partitions += 1

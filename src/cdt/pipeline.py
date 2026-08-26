@@ -67,6 +67,10 @@ FINAL_OUTPUT_TABLES: dict[str, Callable[[str | Path | None], str]] = {
 }
 
 ALL_TIME_START_DATE = date(1994, 1, 1)
+# Daily mode re-scans this many days back (ending yesterday) so late-arriving
+# or since-repaired scraper manifests are picked up instead of falling outside
+# a moved-on one-day window forever (#90).
+DAILY_LOOKBACK_DAYS = 5
 DEFAULT_STAGE_BATCH_SIZE = 100
 PIPELINE_MODES = ("daily", "historical")
 LOGGER = get_logger(__name__)
@@ -431,15 +435,24 @@ def resolve_mode_dates(
     start_date: date | None,
     end_date: date | None,
 ) -> tuple[date, date]:
-    """Resolve mode-specific dates for ingest-like commands."""
+    """Resolve mode-specific dates for ingest-like commands.
+
+    Daily defaults to a rolling lookback window ending yesterday, not a single
+    day: a manifest the scraper writes (or repairs) after CDT's morning pass
+    would otherwise never be scanned again — a permanent, unobservable gap
+    (#90). Ingest dedups by accession, so the re-scan costs only LIST/GET
+    requests, and the fingerprint registries propagate late merges downstream.
+    """
     if mode not in PIPELINE_MODES:
         msg = f"unsupported mode {mode!r}"
         raise ValueError(msg)
     if mode == "historical":
         return start_date or ALL_TIME_START_DATE, end_date or date.today()
     if start_date is None and end_date is None:
-        yesterday = date.today().fromordinal(date.today().toordinal() - 1)
-        return yesterday, yesterday
+        today = date.today()
+        yesterday = today.fromordinal(today.toordinal() - 1)
+        lookback_start = today.fromordinal(today.toordinal() - DAILY_LOOKBACK_DAYS)
+        return lookback_start, yesterday
     if start_date is None:
         msg = "--start-date is required when --end-date is provided"
         raise ValueError(msg)

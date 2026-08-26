@@ -186,6 +186,9 @@ def build_parser() -> argparse.ArgumentParser:
     poll.add_argument("--max-attempts", type=positive_int, default=DEFAULT_MAX_ATTEMPTS)
     poll.add_argument("--max-requests-per-batch", type=positive_int, default=None)
     poll.add_argument("--max-batch-bytes", type=positive_int, default=None)
+    # Caps rows claimed into one job so a post-backfill job cannot OOM the
+    # poll task; deferred partitions form the next job (#92).
+    poll.add_argument("--max-rows-per-job", type=positive_int, default=None)
     return parser
 
 
@@ -316,6 +319,8 @@ def run_poll(args: argparse.Namespace) -> int:
             tick_kwargs["max_requests_per_batch"] = args.max_requests_per_batch
         if args.max_batch_bytes is not None:
             tick_kwargs["max_batch_bytes"] = args.max_batch_bytes
+        if args.max_rows_per_job is not None:
+            tick_kwargs["max_rows_per_job"] = args.max_rows_per_job
         result = advance_extract_job(**tick_kwargs)
         # The literal below feeds the poll-liveness CloudWatch alarm (#85);
         # keep it in sync with pulumi/infra/alerts.py.

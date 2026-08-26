@@ -30,14 +30,6 @@ class FakeModel:
         return [2.0]
 
 
-def test_resolve_mode_dates_daily_defaults_to_yesterday() -> None:
-    """Daily mode defaults both dates to yesterday."""
-    start_date, end_date = resolve_mode_dates("daily", None, None)
-    yesterday = date.today().fromordinal(date.today().toordinal() - 1)
-    assert start_date == yesterday
-    assert end_date == yesterday
-
-
 def test_resolve_mode_dates_daily_requires_both_dates() -> None:
     """Daily mode rejects partial date ranges."""
     with pytest.raises(ValueError, match="--end-date is required"):
@@ -390,3 +382,14 @@ def test_old_final_snapshots_are_pruned(tmp_path: Path) -> None:
         for path in (artifact_root / "final-snapshots").glob("*/*.parquet")
     }
     assert len(snapshot_dirs) == 2
+
+
+def test_resolve_mode_dates_daily_uses_lookback_window() -> None:
+    """Daily defaults to a rolling lookback ending yesterday (#90)."""
+    from cdt.pipeline import DAILY_LOOKBACK_DAYS
+
+    start, end = resolve_mode_dates("daily", None, None)
+
+    today = date.today()
+    assert end == today.fromordinal(today.toordinal() - 1)
+    assert start == today.fromordinal(today.toordinal() - DAILY_LOOKBACK_DAYS)
