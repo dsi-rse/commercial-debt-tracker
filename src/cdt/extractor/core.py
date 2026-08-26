@@ -29,14 +29,11 @@ from cdt.datasets import (
     date_shard_partition_path,
     existing_date_shard_partition_ids,
     extractor_run_path,
-    iter_date_shard_partitions,
-    load_completed_partitions,
     load_completion_registry,
     load_row_failures,
     parse_date_shard_partition,
     resolve_artifact_root,
     run_manifest_path,
-    save_completed_partitions,
     save_completion_registry,
     save_row_failures,
 )
@@ -943,54 +940,40 @@ def collect_pending_extract_items(
     artifact_root: str | Path | None = None,
     data_dir: Path | None = None,
     force: bool = False,
-) -> tuple[list[tuple[dict[str, str | None], str, str]], set[str]]:
+) -> tuple[list[tuple[dict[str, str | None], str, str]], dict[str, dict[str, object]]]:
     """Collect relevant items awaiting extraction across pending partitions.
 
-    Returns ``(entries, claimed_paths)`` where each entry is a native-typed item
-    row plus its originating ``(date, shard)``, and ``claimed_paths`` is the set of
-    classification partitions the caller will mark completed once every item in
-    them is terminal. Mirrors the pending-partition selection in
-    ``extract_pending_items`` so the batch backend claims the same work.
+    Returns ``(entries, claimed)`` where each entry is a native-typed item row
+    plus its originating ``(date, shard)``, and ``claimed`` maps each claimed
+    classification partition to its source fingerprint and the item_ids that
+    were already terminal before this job — the state finalize needs to record
+    row-outcome-keyed completion (#49) and to detect source growth (#62). Uses
+    the same selection as ``extract_pending_items`` so both backends claim the
+    same work, row by row.
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
-    completed = (
-        set()
-        if force
-        else load_completed_partitions(
-            "extract", artifact_root=resolved_root, data_dir=data_dir
-        )
+    pending, _registry = pending_extract_partitions(
+        artifact_root=resolved_root, data_dir=data_dir, force=force
     )
     entries: list[tuple[dict[str, str | None], str, str]] = []
-    claimed_paths: set[str] = set()
-    # One LIST of the mentions dataset answers every existence check; probing
-    # each target with artifact_exists costs one HeadObject per classification
-    # partition ever written and dominates discovery time at scale (#83).
-    existing_mention_ids = (
-        set()
-        if force
-        else existing_date_shard_partition_ids(
-            MENTIONS_DATASET_NAME, artifact_root=resolved_root, data_dir=data_dir
-        )
-    )
-    for classification_path in iter_date_shard_partitions(
-        CLASSIFICATION_DATASET_NAME, artifact_root=resolved_root, data_dir=data_dir
-    ):
-        partition = parse_date_shard_partition(classification_path)
-        if (partition["date"], partition["shard"]) in existing_mention_ids:
-            continue
-        if not force and classification_path in completed:
-            continue
-        claimed_paths.add(classification_path)
-        batch_items = read_table(classification_path, CLASSIFIED_ITEM_COLUMNS).reindex(
-            columns=CLASSIFIED_ITEM_COLUMNS
-        )
+    claimed: dict[str, dict[str, object]] = {}
+    for pending_partition in pending:
+        claimed[pending_partition.classification_path] = {
+            "fingerprint": pending_partition.fingerprint,
+            "prior_item_ids": sorted(pending_partition.done_item_ids),
+        }
+        batch_items = read_table(
+            pending_partition.classification_path, CLASSIFIED_ITEM_COLUMNS
+        ).reindex(columns=CLASSIFIED_ITEM_COLUMNS)
         relevant_items = batch_items.loc[batch_items["relevance"].fillna(False)]
         for item_row in relevant_items.to_dict("records"):
+            if str(item_row["item_id"]) in pending_partition.done_item_ids:
+                continue
             coerced = {
                 key: coerce_native(item_row.get(key)) for key in STATE_ITEM_ROW_FIELDS
             }
-            entries.append((coerced, partition["date"], partition["shard"]))
-    return entries, claimed_paths
+            entries.append((coerced, pending_partition.date, pending_partition.shard))
+    return entries, claimed
 
 
 def extract_pending_items(
@@ -1232,7 +1215,7 @@ def extract_pending_items(
 def finalize_extract_outputs(
     row_entries: list[tuple[ExtractionRowState, str, str]],
     *,
-    claimed_classification_paths: set[str],
+    claimed: dict[str, dict[str, object]],
     run_id: str,
     model: str,
     reasoning_effort: str,
@@ -1243,9 +1226,11 @@ def finalize_extract_outputs(
     """Write mention partitions, audit log, and manifests for a completed job.
 
     This is the batch backend's analogue of the tail of ``extract_pending_items``.
-    Every row in ``row_entries`` must already be terminal; ``claimed_classification_
-    paths`` are marked completed as a set since a job finalizes all its partitions
-    at once. Mentions are regrouped by their originating ``(date, shard)`` partition.
+    Every row in ``row_entries`` must already be terminal. ``claimed`` carries each
+    claimed classification partition's fingerprint and prior terminal item_ids
+    (from ``collect_pending_extract_items``), so completion is recorded per row
+    outcome rather than per visit. Mentions are regrouped by their originating
+    ``(date, shard)`` partition and merged into existing targets per item.
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     mentions_by_partition: dict[tuple[str, str], list[dict[str, object]]] = {}
@@ -1271,35 +1256,60 @@ def finalize_extract_outputs(
         # lose track of which partitions the job covered.
         mentions_by_partition.setdefault((partition_date, shard), [])
 
+    terminal_by_partition: dict[tuple[str, str], set[str]] = {}
+    for row_state, partition_date, shard in row_entries:
+        if row_state.state is not None:
+            terminal_by_partition.setdefault((partition_date, shard), set()).add(
+                row_state.item_id
+            )
+
     processed_frames: list[pd.DataFrame] = []
     partitions_written: list[str] = []
     empty_partitions = 0
     for (partition_date, shard), mention_rows in sorted(mentions_by_partition.items()):
         mentions = pd.DataFrame(mention_rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
+        replaced = terminal_by_partition.get((partition_date, shard), set())
+        if mentions.empty and not replaced:
+            empty_partitions += 1
+            continue
         if mentions.empty:
             empty_partitions += 1
             continue
-        write_partition_table(
-            mentions_root(resolved_root, data_dir=data_dir),
-            partition={"date": partition_date, "shard": shard},
-            table=mentions.reindex(columns=DEBT_INSTRUMENT_MENTION_COLUMNS),
-        )
-        processed_frames.append(mentions)
         partitions_written.append(
-            date_shard_partition_path(
-                MENTIONS_DATASET_NAME,
-                partition_date=partition_date,
-                shard=shard,
-                artifact_root=resolved_root,
+            _merge_mentions_partition(
+                resolved_root,
                 data_dir=data_dir,
+                partition={"date": partition_date, "shard": shard},
+                new_mentions=mentions,
+                replaced_item_ids=replaced,
             )
         )
+        processed_frames.append(mentions)
 
-    completed = load_completed_partitions(
+    registry = load_completion_registry(
         "extract", artifact_root=resolved_root, data_dir=data_dir
-    ) | set(claimed_classification_paths)
-    save_completed_partitions(
-        "extract", completed, artifact_root=resolved_root, data_dir=data_dir
+    )
+    for classification_path, claim in claimed.items():
+        partition = parse_date_shard_partition(classification_path)
+        prior = {
+            str(item) for item in cast(list[object], claim.get("prior_item_ids") or [])
+        }
+        terminal = prior | terminal_by_partition.get(
+            (partition["date"], partition["shard"]), set()
+        )
+        relevant = read_table(classification_path, CLASSIFIED_ITEM_COLUMNS).reindex(
+            columns=CLASSIFIED_ITEM_COLUMNS
+        )
+        relevant = relevant.loc[relevant["relevance"].fillna(False)]
+        relevant_ids = {str(value) for value in relevant["item_id"].astype(str)}
+        fingerprint = claim.get("fingerprint")
+        registry[classification_path] = CompletedPartition(
+            fingerprint=str(fingerprint) if fingerprint else None,
+            item_ids=frozenset(terminal),
+            complete=relevant_ids <= terminal,
+        )
+    save_completion_registry(
+        "extract", registry, artifact_root=resolved_root, data_dir=data_dir
     )
     # Claiming the partitions above marks these rows done for good, so record the
     # ones that produced nothing before that fact is only visible in the audit log.
@@ -1328,7 +1338,7 @@ def finalize_extract_outputs(
             "model": model,
             "reasoning_effort": reasoning_effort,
             "max_attempts": max_attempts,
-            "partitions_completed": sorted(claimed_classification_paths),
+            "partitions_completed": sorted(claimed),
             "partitions_written": partitions_written,
             "empty_partitions_skipped_from_write": empty_partitions,
             "failure_count": len(failed_rows),

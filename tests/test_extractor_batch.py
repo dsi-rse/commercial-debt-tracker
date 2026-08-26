@@ -1374,3 +1374,47 @@ def test_legacy_uncompressed_state_still_loads(tmp_path: Path) -> None:
             break
     assert result.status == "completed"
     assert not read_dataset(mentions_root(tmp_path)).empty
+
+
+def test_batch_job_pays_only_for_new_rows_after_partition_grows(
+    tmp_path: Path,
+) -> None:
+    """A grown classification partition yields a job over only the new rows (#62).
+
+    The first job's mentions survive the second job's merge, and completion is
+    recorded per row outcome rather than per partition visit (#49).
+    """
+    seed_classification(tmp_path, [{"item_id": "item-multi", "text": MULTI_TEXT}])
+    client = FakeBatchClient(
+        {
+            "item-multi": {"ner": MULTI_NER, "instrument_ie": MULTI_IE},
+            "item-nodebt": {"ner": NODEBT_NER},
+        }
+    )
+    for _ in range(4):
+        if _advance(tmp_path, client).status == "completed":
+            break
+    assert read_dataset(mentions_root(tmp_path))["name"].to_list() == ["Term Loan"]
+    first_job_rows = {cid for _, cids in client.submitted for cid in cids}
+    assert first_job_rows == {"item-multi"}
+
+    # Ingest-style growth: the same partition object gains a second relevant row.
+    seed_classification(
+        tmp_path,
+        [
+            {"item_id": "item-multi", "text": MULTI_TEXT},
+            {"item_id": "item-nodebt", "text": NODEBT_TEXT},
+        ],
+    )
+    for _ in range(4):
+        result = _advance(tmp_path, client)
+        if result.status == "completed":
+            break
+    assert result.status == "completed"
+
+    second_job_rows = {
+        cid for _, cids in client.submitted for cid in cids
+    } - first_job_rows
+    assert second_job_rows == {"item-nodebt"}
+    # The first job's mentions survived the second job's finalize.
+    assert read_dataset(mentions_root(tmp_path))["name"].to_list() == ["Term Loan"]

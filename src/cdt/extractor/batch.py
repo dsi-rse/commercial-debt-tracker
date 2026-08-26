@@ -319,6 +319,11 @@ class JobState:
     max_attempts: int
     claimed_partitions: list[str]
     rows: dict[str, RowEntry]
+    # path -> {"fingerprint": ..., "prior_item_ids": [...]}, captured at claim
+    # time so finalize can record row-outcome-keyed completion (#49, #62).
+    # Empty for jobs created before the v2 registry; finalize then writes
+    # fingerprint-less entries, the same v1-style record as before.
+    claimed_state: dict[str, dict[str, object]] = field(default_factory=dict)
     batches: list[BatchRecord] = field(default_factory=list)
     all_batch_ids: list[str] = field(default_factory=list)
     tick: int = 0
@@ -551,6 +556,9 @@ def _read_job_state(root: str, job_id: str) -> JobState:
         claimed_partitions=[
             str(path) for path in cast(list[object], manifest["claimed_partitions"])
         ],
+        claimed_state=cast(
+            dict[str, dict[str, object]], manifest.get("claimed_state") or {}
+        ),
         rows=rows,
         batches=batches,
         all_batch_ids=[
@@ -612,10 +620,10 @@ def _create_job(
     force: bool,
 ) -> JobState | None:
     """Start a new job from pending classification partitions, or None if idle."""
-    entries, claimed_paths = collect_pending_extract_items(
+    entries, claimed = collect_pending_extract_items(
         artifact_root=root, data_dir=data_dir, force=force
     )
-    if not claimed_paths:
+    if not claimed:
         return None
     job_id = _new_job_id()
     rows: dict[str, RowEntry] = {}
@@ -638,7 +646,8 @@ def _create_job(
         model=model,
         reasoning_effort=reasoning_effort,
         max_attempts=max_attempts,
-        claimed_partitions=sorted(claimed_paths),
+        claimed_partitions=sorted(claimed),
+        claimed_state=claimed,
         rows=rows,
     )
     write_json_artifact(
@@ -650,6 +659,7 @@ def _create_job(
             "reasoning_effort": reasoning_effort,
             "max_attempts": max_attempts,
             "claimed_partitions": job.claimed_partitions,
+            "claimed_state": job.claimed_state,
         },
     )
     _save_state(root, job)
@@ -658,7 +668,7 @@ def _create_job(
         "Started extract job %s: items=%s partitions=%s",
         job_id,
         len(rows),
-        len(claimed_paths),
+        len(claimed),
     )
     return job
 
@@ -1220,7 +1230,13 @@ def _finalize_job(root: str, job: JobState, *, data_dir: Path | None) -> None:
     ]
     mentions = finalize_extract_outputs(
         row_entries,
-        claimed_classification_paths=set(job.claimed_partitions),
+        # Pre-v2 jobs have no claimed_state; fall back to fingerprint-less claims
+        # so their completion records match what they would have written before.
+        claimed=job.claimed_state
+        or {
+            path: {"fingerprint": None, "prior_item_ids": []}
+            for path in job.claimed_partitions
+        },
         run_id=job.job_id,
         model=job.model,
         reasoning_effort=job.reasoning_effort,
