@@ -17,6 +17,7 @@ from cdt.storage import (
     is_orphaned_temp_artifact,
     join_artifact_path,
     list_artifacts,
+    list_artifacts_with_versions,
     normalize_artifact_path,
     read_json_artifact,
     write_json_artifact,
@@ -211,6 +212,73 @@ def save_completed_partitions(
     return save_completion_registry(
         stage_name, registry, artifact_root=artifact_root, data_dir=data_dir
     )
+
+
+def pending_source_partitions(
+    stage_name: str,
+    source_dataset: str,
+    target_dataset: str,
+    *,
+    artifact_root: ArtifactPath | None = None,
+    data_dir: Path | None = None,
+    force: bool = False,
+) -> tuple[list[tuple[str, str]], dict[str, CompletedPartition]]:
+    """Select source partitions a whole-partition stage still has to process.
+
+    Returns ``([(source_path, fingerprint), ...], registry)``. A partition is
+    pending when it has no completion entry or its source fingerprint changed —
+    ingest merges late-arriving rows into partition files in place, and a
+    path-level "target exists" skip silently strands those rows forever (#62).
+    Legacy entries (v1 lists, or targets that predate the registry) are stamped
+    with the current fingerprint in the returned registry so future growth is
+    detectable; the caller persists it via save_completion_registry.
+    """
+    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    registry = (
+        {}
+        if force
+        else load_completion_registry(
+            stage_name, artifact_root=resolved_root, data_dir=data_dir
+        )
+    )
+    fingerprints = {
+        path: version
+        for path, version in list_artifacts_with_versions(
+            dataset_root(
+                source_dataset, artifact_root=resolved_root, data_dir=data_dir
+            ),
+            suffix=".parquet",
+        ).items()
+        if PARTITION_PATTERN.search(path)
+    }
+    existing_target_ids = (
+        set()
+        if force
+        else existing_date_shard_partition_ids(
+            target_dataset, artifact_root=resolved_root, data_dir=data_dir
+        )
+    )
+    pending: list[tuple[str, str]] = []
+    for source_path in sorted(fingerprints):
+        partition = parse_date_shard_partition(source_path)
+        fingerprint = fingerprints[source_path]
+        entry = registry.get(source_path)
+        if force:
+            pending.append((source_path, fingerprint))
+            continue
+        if entry is None:
+            if (partition["date"], partition["shard"]) in existing_target_ids:
+                registry[source_path] = CompletedPartition(fingerprint=fingerprint)
+                continue
+            pending.append((source_path, fingerprint))
+            continue
+        if entry.fingerprint == fingerprint:
+            continue
+        if entry.fingerprint is None:
+            entry.fingerprint = fingerprint
+            continue
+        pending.append((source_path, fingerprint))
+    return pending, registry
 
 
 def failure_registry_path(

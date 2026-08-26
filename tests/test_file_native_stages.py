@@ -1168,3 +1168,57 @@ def test_infrastructure_error_classification() -> None:
     assert is_infrastructure_error(WithStatus())
     assert is_infrastructure_error(ConnectionResetError())
     assert not is_infrastructure_error(ValueError("bad xml"))
+
+
+def test_grown_document_partition_reitemizes_and_reclassifies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Late-arriving documents merged into a partition flow downstream (#62)."""
+
+    def _doc(accession: str) -> dict[str, object]:
+        return {
+            "accession_number": accession,
+            "cik": "320193",
+            "company_name": "Example Inc.",
+            "url": "https://sec.example/full.txt",
+            "text": (
+                "\nITEM INFORMATION: Other Events\n<DOCUMENT>\n<TYPE>8-K\n<TEXT>\n"
+                "Item 8.01 Other Events.\nThis is the extracted event text.\n"
+                "</TEXT>\n</DOCUMENT>\n"
+            ),
+            "date": "2024-01-02",
+            "resource_uri": None,
+        }
+
+    def _write_documents(accessions: list[str]) -> None:
+        write_partition_table(
+            str(tmp_path / "documents"),
+            partition={"date": "2024-01-02", "shard": "0001"},
+            table=pd.DataFrame([_doc(a) for a in accessions], columns=DOCUMENT_COLUMNS),
+        )
+
+    class SizedFakeModel:
+        def decision_function(self: SizedFakeModel, texts: list[str]) -> list[float]:
+            return [2.0] * len(texts)
+
+    monkeypatch.setattr(
+        classifier_core,
+        "load_training_artifacts",
+        lambda path: (SizedFakeModel(), 0.5, {"threshold": 0.5}),
+    )
+
+    _write_documents(["000114036126006577"])
+    itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
+    classify_pending_items(artifact_root=tmp_path, batch_size=5)
+    assert len(read_dataset(classifications_root(tmp_path))) == 1
+
+    # Ingest-style merge: the same partition object grows a second filing.
+    _write_documents(["000114036126006577", "000114036126009999"])
+    itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
+    classify_pending_items(artifact_root=tmp_path, batch_size=5)
+
+    classified = read_dataset(classifications_root(tmp_path))
+    assert sorted(classified["accession_number"].astype(str).unique()) == [
+        "000114036126006577",
+        "000114036126009999",
+    ]
