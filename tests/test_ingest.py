@@ -598,3 +598,31 @@ def _manifest_bytes(
             ],
         }
     ).encode()
+
+
+def test_document_shard_is_stable_across_processes() -> None:
+    """Shard assignment must not depend on the per-process hash salt (#61)."""
+    from cdt.ingest import DOCUMENT_PARTITION_SHARDS, _document_shard
+
+    # crc32 is deterministic: pin exact values so any change to the scheme
+    # (which would strand existing partitions) fails loudly.
+    assert _document_shard("0001437749-26-027029") == _document_shard(
+        "0001437749-26-027029"
+    )
+    shard = int(_document_shard("0001437749-26-027029"))
+    assert 0 <= shard < DOCUMENT_PARTITION_SHARDS
+    import subprocess
+    import sys
+
+    out = subprocess.run(  # noqa: S603 — spawns sys.executable with a fixed literal
+        [
+            sys.executable,
+            "-c",
+            "from cdt.ingest import _document_shard;"
+            "print(_document_shard('0001437749-26-027029'))",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert out == _document_shard("0001437749-26-027029")

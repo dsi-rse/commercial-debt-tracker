@@ -15,6 +15,7 @@ import boto3
 import pandas as pd
 
 from cdt import settings
+from cdt.datasets import zlib_crc32
 from cdt.shared import FailureClassifier, FailureRegistry, get_logger
 from cdt.storage import (
     join_artifact_path,
@@ -804,12 +805,21 @@ def _run_id() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
 
 
+def _document_shard(accession_number: str) -> str:
+    """Stable document shard for one accession.
+
+    Python's builtin ``hash`` is salted per process, so the same accession
+    landed in different shards across runs — a forced re-ingest then wrote a
+    second copy into a new partition that per-partition dedup could never see
+    (#61). crc32 pins the assignment.
+    """
+    return f"{zlib_crc32(accession_number) % DOCUMENT_PARTITION_SHARDS:04d}"
+
+
 def _partition_for_row(row: dict[str, str]) -> dict[str, str]:
-    accession_number = row["accession_number"]
-    shard = f"{hash(accession_number) % DOCUMENT_PARTITION_SHARDS:04d}"
     return {
         "date": row["date"],
-        "shard": shard,
+        "shard": _document_shard(row["accession_number"]),
     }
 
 
@@ -839,7 +849,7 @@ def _write_document_partitions(
     for date_value, date_group in grouped:
         for shard, shard_group in date_group.assign(
             shard=date_group["accession_number"].map(
-                lambda value: f"{hash(str(value)) % DOCUMENT_PARTITION_SHARDS:04d}"
+                lambda value: _document_shard(str(value))
             )
         ).groupby("shard", sort=True):
             partition = {"date": str(date_value), "shard": str(shard)}
