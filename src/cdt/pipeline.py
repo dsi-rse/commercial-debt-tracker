@@ -8,6 +8,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Self
 
+import pandas as pd
+
 from cdt.classifier import classify_pending_items, default_model_dir
 from cdt.datasets import resolve_artifact_root
 from cdt.extractor import (
@@ -149,8 +151,8 @@ class PipelineOrchestrator:
             f" | {detail_text}" if detail_text else "",
         )
 
-    def run(self: Self) -> PipelineRunResult:
-        """Execute the full CDT pipeline."""
+    def _setup(self: Self) -> tuple[date, date, set[str], str]:
+        """Resolve dates, CIKs, and the artifact root and emit the run banner."""
         resolved_start, resolved_end = resolve_mode_dates(
             self.config.mode,
             self.config.start_date,
@@ -165,8 +167,16 @@ class PipelineOrchestrator:
             f"Starting pipeline | mode={self.config.mode} | cik_file={self.config.cik_file}"
         )
         self._log_config(resolved_start, resolved_end)
-        start_time = datetime.now()
+        return resolved_start, resolved_end, ciks, resolved_artifact_root
 
+    def _ingest_itemize_classify(
+        self: Self,
+        resolved_start: date,
+        resolved_end: date,
+        ciks: set[str],
+        resolved_artifact_root: str,
+    ) -> tuple[IngestRunResult, pd.DataFrame, pd.DataFrame]:
+        """Run ingest → itemize → classify and return their results."""
         self._log_stage_start(
             "ingest",
             batch_size=self.config.ingest_batch_size,
@@ -228,6 +238,27 @@ class PipelineOrchestrator:
             force=self.config.force,
         )
         self._log_stage_complete("classify", rows=len(classified))
+        return ingest_result, items, classified
+
+    def run_prepare(self: Self) -> str:
+        """Run only ingest → itemize → classify; return the artifact root.
+
+        Used by the deployed ``daily`` orchestrator, which defers the expensive
+        extract stage to the asynchronous batch poller.
+        """
+        resolved_start, resolved_end, ciks, resolved_artifact_root = self._setup()
+        self._ingest_itemize_classify(
+            resolved_start, resolved_end, ciks, resolved_artifact_root
+        )
+        return resolved_artifact_root
+
+    def run(self: Self) -> PipelineRunResult:
+        """Execute the full CDT pipeline."""
+        resolved_start, resolved_end, ciks, resolved_artifact_root = self._setup()
+        start_time = datetime.now()
+        ingest_result, items, classified = self._ingest_itemize_classify(
+            resolved_start, resolved_end, ciks, resolved_artifact_root
+        )
 
         self._log_stage_start(
             "extract",
@@ -310,6 +341,46 @@ class PipelineOrchestrator:
 def run_pipeline(config: PipelineConfig) -> PipelineRunResult:
     """Run the full CDT pipeline for the provided config."""
     return PipelineOrchestrator(config).run()
+
+
+def run_prepare_stages(config: PipelineConfig) -> str:
+    """Run ingest → itemize → classify for a config; return the artifact root."""
+    return PipelineOrchestrator(config).run_prepare()
+
+
+def run_match_and_finalize(
+    *,
+    artifact_root: ArtifactPath,
+    final_database_root: ArtifactPath | None = None,
+    data_dir: Path | None = None,
+    batch_size: int = DEFAULT_STAGE_BATCH_SIZE,
+    force: bool = False,
+    strong_match_threshold: float = DEFAULT_MEMBERSHIP_THRESHOLD,
+    loose_match_threshold: float = DEFAULT_RELATED_THRESHOLD,
+    ambiguity_margin: float = DEFAULT_AMBIGUITY_MARGIN,
+) -> dict[str, str]:
+    """Run match on existing mentions and rewrite final snapshots.
+
+    Both stages are deterministic and idempotent, so this is safe to run
+    repeatedly: the daily orchestrator calls it to keep snapshots fresh while a
+    batch extract job is still in flight, and the poller calls it when a job
+    completes.
+    """
+    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    match_pending_mentions(
+        artifact_root=resolved_root,
+        data_dir=data_dir,
+        batch_size=batch_size,
+        force=force,
+        strong_match_threshold=strong_match_threshold,
+        loose_match_threshold=loose_match_threshold,
+        ambiguity_margin=ambiguity_margin,
+    )
+    return write_final_output_tables(
+        artifact_root=resolved_root,
+        final_database_root=final_database_root,
+        data_dir=data_dir,
+    )
 
 
 def read_cik_file(path: ArtifactPath) -> set[str]:

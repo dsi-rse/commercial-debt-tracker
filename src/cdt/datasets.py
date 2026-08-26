@@ -6,6 +6,7 @@ import re
 from collections.abc import Iterable
 from datetime import date
 from pathlib import Path
+from typing import cast
 
 from cdt import settings
 from cdt.storage import (
@@ -140,6 +141,56 @@ def failure_registry_path(
     )
 
 
+def load_row_failures(
+    stage_name: str,
+    *,
+    artifact_root: ArtifactPath | None = None,
+    data_dir: Path | None = None,
+) -> dict[str, dict[str, object]]:
+    """Load one stage's row-level failure registry, keyed by row id."""
+    path = failure_registry_path(
+        stage_name, artifact_root=artifact_root, data_dir=data_dir
+    )
+    if not artifact_exists(path):
+        return {}
+    payload = read_json_artifact(path)
+    if not isinstance(payload, dict):
+        return {}
+    failures = payload.get("failures", {})
+    if not isinstance(failures, dict):
+        return {}
+    return {
+        str(key): cast(dict[str, object], value)
+        for key, value in failures.items()
+        if isinstance(value, dict)
+    }
+
+
+def save_row_failures(
+    stage_name: str,
+    failures: dict[str, dict[str, object]],
+    *,
+    artifact_root: ArtifactPath | None = None,
+    data_dir: Path | None = None,
+) -> str:
+    """Persist one stage's row-level failure registry.
+
+    Unlike the completion registry this is diagnostic, not control flow: nothing
+    reads it to decide what to process. It exists so rows that a run dropped are
+    recoverable as a work-list instead of only appearing in an audit log.
+    """
+    return write_json_artifact(
+        failure_registry_path(
+            stage_name, artifact_root=artifact_root, data_dir=data_dir
+        ),
+        {
+            "stage": stage_name,
+            "failure_count": len(failures),
+            "failures": {key: failures[key] for key in sorted(failures)},
+        },
+    )
+
+
 def extractor_run_path(
     run_id: str,
     *,
@@ -228,6 +279,30 @@ def iter_date_shard_partitions(
             continue
         filtered.append(path)
     return filtered
+
+
+def existing_date_shard_partition_ids(
+    dataset_name: str,
+    *,
+    artifact_root: ArtifactPath | None = None,
+    data_dir: Path | None = None,
+) -> set[tuple[str, str]]:
+    """Return the ``(date, shard)`` ids of every written partition in a dataset.
+
+    One LIST of the dataset answers "does the output partition exist?" for any
+    number of source partitions. The per-partition alternative — a HeadObject on
+    each candidate target — costs one sequential round-trip per partition ever
+    written and dominates stage runtime once the dataset is large (#83).
+    """
+    return {
+        (partition["date"], partition["shard"])
+        for partition in (
+            parse_date_shard_partition(path)
+            for path in iter_date_shard_partitions(
+                dataset_name, artifact_root=artifact_root, data_dir=data_dir
+            )
+        )
+    }
 
 
 def iter_cik_shard_partitions(

@@ -1,0 +1,9 @@
+# Copy to .envrc and run `direnv allow`. Requires direnv (https://direnv.net) and the
+# direnv hook in your shell rc. Secrets live in .env (gitignored); this file only sets
+# the AWS profile/region and loads .env.
+dotenv
+
+export AWS_PROFILE=${AWS_PROFILE:-idi-analysis}
+export AWS_REGION=${AWS_REGION:-us-east-2}
+export AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-$AWS_REGION}
+export AWS_SDK_LOAD_CONFIG=1

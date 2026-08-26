@@ -12,6 +12,7 @@ from cdt.datasets import (
     completion_registry_path,
     dataset_root,
     date_shard_partition_path,
+    existing_date_shard_partition_ids,
     iter_date_shard_partitions,
     load_completed_partitions,
     parse_date_shard_partition,
@@ -23,7 +24,6 @@ from cdt.ingest import DOCUMENT_COLUMNS, decode_document_bytes, default_s3_clien
 from cdt.itemizer.extract import DocumentText, ItemSection, extract_items_from_document
 from cdt.shared import get_logger
 from cdt.storage import (
-    artifact_exists,
     parse_s3_uri,
     read_table,
     write_json_artifact,
@@ -150,20 +150,23 @@ def itemize_pending_documents(
     shared_s3_client = s3_client
     pending_document_paths: list[str] = []
 
+    # One LIST of the target dataset answers every existence check; probing each
+    # target with artifact_exists costs one HeadObject per source partition ever
+    # written and dominates discovery time at scale (#83).
+    existing_target_ids = (
+        set()
+        if force
+        else existing_date_shard_partition_ids(
+            ITEM_DATASET_NAME, artifact_root=resolved_root, data_dir=data_dir
+        )
+    )
     for document_path in iter_date_shard_partitions(
         "documents",
         artifact_root=resolved_root,
         data_dir=data_dir,
     ):
         partition = parse_date_shard_partition(document_path)
-        target_path = date_shard_partition_path(
-            ITEM_DATASET_NAME,
-            partition_date=partition["date"],
-            shard=partition["shard"],
-            artifact_root=resolved_root,
-            data_dir=data_dir,
-        )
-        if not force and artifact_exists(target_path):
+        if (partition["date"], partition["shard"]) in existing_target_ids:
             continue
         if not force and document_path in completed_document_paths:
             continue

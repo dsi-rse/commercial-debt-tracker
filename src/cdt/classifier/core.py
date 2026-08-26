@@ -18,6 +18,7 @@ from cdt.datasets import (
     completion_registry_path,
     dataset_root,
     date_shard_partition_path,
+    existing_date_shard_partition_ids,
     iter_date_shard_partitions,
     load_completed_partitions,
     parse_date_shard_partition,
@@ -27,7 +28,6 @@ from cdt.datasets import (
 )
 from cdt.itemizer.core import ITEM_COLUMNS, ITEM_DATASET_NAME
 from cdt.storage import (
-    artifact_exists,
     read_table,
     write_json_artifact,
     write_partition_table,
@@ -197,20 +197,23 @@ def classify_pending_items(
     empty_partitions = 0
     pending_item_paths: list[str] = []
 
+    # One LIST of the target dataset answers every existence check; probing each
+    # target with artifact_exists costs one HeadObject per source partition ever
+    # written and dominates discovery time at scale (#83).
+    existing_target_ids = (
+        set()
+        if force
+        else existing_date_shard_partition_ids(
+            CLASSIFICATION_DATASET_NAME, artifact_root=resolved_root, data_dir=data_dir
+        )
+    )
     for item_path in iter_date_shard_partitions(
         ITEM_DATASET_NAME,
         artifact_root=resolved_root,
         data_dir=data_dir,
     ):
         partition = parse_date_shard_partition(item_path)
-        target_path = date_shard_partition_path(
-            CLASSIFICATION_DATASET_NAME,
-            partition_date=partition["date"],
-            shard=partition["shard"],
-            artifact_root=resolved_root,
-            data_dir=data_dir,
-        )
-        if not force and artifact_exists(target_path):
+        if (partition["date"], partition["shard"]) in existing_target_ids:
             continue
         if not force and item_path in completed_item_paths:
             continue

@@ -1,6 +1,6 @@
 """LLM-backed extractor stage for relevant SEC 8-K items."""
 
-# ruff: noqa: ANN101, D102, D105, D107
+# ruff: noqa: ANN101, ANN102, D102, D105, D107
 
 from __future__ import annotations
 
@@ -25,17 +25,19 @@ from cdt.datasets import (
     completion_registry_path,
     dataset_root,
     date_shard_partition_path,
+    existing_date_shard_partition_ids,
     extractor_run_path,
     iter_date_shard_partitions,
     load_completed_partitions,
+    load_row_failures,
     parse_date_shard_partition,
     resolve_artifact_root,
     run_manifest_path,
     save_completed_partitions,
+    save_row_failures,
 )
 from cdt.shared import get_logger
 from cdt.storage import (
-    artifact_exists,
     read_table,
     write_json_artifact,
     write_partition_table,
@@ -44,9 +46,15 @@ from cdt.storage import (
 
 LOGGER = get_logger(__name__)
 DEFAULT_MAX_ATTEMPTS = 3
-DEFAULT_MODEL = "openai/gpt-5.4"
+DEFAULT_MODEL = settings.DEFAULT_EXTRACTOR_MODEL
 DEFAULT_REASONING_EFFORT = "none"
 REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
+EXTRACTOR_TEMPERATURE = 0.0
+# Reasoning models take a reasoning_effort and reject temperature != 1, so both
+# backends must decide sampling params the same way or the same model produces
+# different output live versus in batch. Prefixes are matched against the native
+# id, so both "gpt-5.4" and "openai/gpt-5.4" resolve identically.
+REASONING_MODEL_PREFIXES = ("gpt-5", "o1", "o3", "o4")
 INSTRUMENT_ENTITY_TAG_TYPES = {"debt_instrument"}
 LENDER_TAG_TYPES = {"person", "organization"}
 INSTRUMENT_SINGLE_VALUE_PROPERTIES = {
@@ -236,6 +244,51 @@ class ExtractionRowState:
             "attempts": attempts,
         }
 
+    def to_state_dict(self) -> dict[str, object]:
+        """Return a JSON-serializable snapshot for resumable batch extraction.
+
+        Unlike ``to_audit_dict`` this preserves everything the resumable state
+        machine needs to continue after a process exit: the in-flight
+        ``current_attempt`` (which ``__post_init__`` rebuilds blank), the current
+        stage, ``ner_tagged_xml``, partial mentions, and a native-typed copy of
+        the item fields the stages consume.
+        """
+        return {
+            "item_row": {
+                key: coerce_native(self.item_row.get(key))
+                for key in STATE_ITEM_ROW_FIELDS
+            },
+            "all_attempts": [attempt.to_dict() for attempt in self.all_attempts],
+            "stage_responses": dict(self.stage_responses),
+            "debt_instrument_mentions": self.debt_instrument_mentions,
+            "ner_tagged_xml": self.ner_tagged_xml,
+            "state": self.state,
+            "current_attempt": self.current_attempt.to_dict(),
+        }
+
+    @classmethod
+    def from_state_dict(cls, payload: dict[str, object]) -> ExtractionRowState:
+        """Rebuild a row state previously produced by ``to_state_dict``."""
+        current_attempt = AttemptRecord(
+            **cast(dict[str, Any], payload["current_attempt"])
+        )
+        row_state = cls(
+            item_row=cast(dict[str, object], payload["item_row"]),
+            stage_name=current_attempt.stage_name,
+        )
+        row_state.all_attempts = [
+            AttemptRecord(**cast(dict[str, Any], attempt))
+            for attempt in cast(list[dict[str, object]], payload["all_attempts"])
+        ]
+        row_state.stage_responses = cast(dict[str, str], payload["stage_responses"])
+        row_state.debt_instrument_mentions = cast(
+            list[dict[str, object]], payload["debt_instrument_mentions"]
+        )
+        row_state.ner_tagged_xml = cast(str | None, payload["ner_tagged_xml"])
+        row_state.state = cast(str | None, payload["state"])
+        row_state.current_attempt = current_attempt
+        return row_state
+
 
 class StageSpec(Protocol):
     """Minimal stage interface for the local extractor workflow."""
@@ -283,7 +336,7 @@ class OpenRouterChatClient:
             "messages": messages,
             "model": model,
             "stream": False,
-            "temperature": 0.0,
+            **sampling_params(model),
         }
         if reasoning_effort:
             request_kwargs["reasoning"] = {"effort": reasoning_effort}
@@ -653,6 +706,41 @@ class InstrumentRelationStage:
 
 MENTIONS_DATASET_NAME = "mentions"
 
+# The ordered extraction stages. They are stateless singletons; the resumable
+# state machine and the synchronous workflow both drive this same list so that
+# audit semantics stay identical across the live and batch backends.
+EXTRACTOR_STAGES: list[StageSpec] = [
+    NERStage(),
+    InstrumentIEStage(),
+    InstrumentRelationStage(),
+]
+STAGE_BY_NAME: dict[str, StageSpec] = {stage.name: stage for stage in EXTRACTOR_STAGES}
+STAGE_INDEX: dict[str, int] = {
+    stage.name: index for index, stage in enumerate(EXTRACTOR_STAGES)
+}
+# Only the item fields the stages actually read are persisted in batch job state.
+STATE_ITEM_ROW_FIELDS = (
+    "item_id",
+    "text",
+    "accession_number",
+    "cik",
+    "company_name",
+    "date",
+    "item",
+)
+
+
+def coerce_native(value: object) -> str | None:
+    """Coerce one pandas/numpy scalar to a JSON-safe native string or None."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return str(value)
+
 
 def mentions_root(
     artifact_root: str | Path | None = None,
@@ -676,6 +764,61 @@ def extracted_tables_path(
     )
 
 
+def collect_pending_extract_items(
+    *,
+    artifact_root: str | Path | None = None,
+    data_dir: Path | None = None,
+    force: bool = False,
+) -> tuple[list[tuple[dict[str, str | None], str, str]], set[str]]:
+    """Collect relevant items awaiting extraction across pending partitions.
+
+    Returns ``(entries, claimed_paths)`` where each entry is a native-typed item
+    row plus its originating ``(date, shard)``, and ``claimed_paths`` is the set of
+    classification partitions the caller will mark completed once every item in
+    them is terminal. Mirrors the pending-partition selection in
+    ``extract_pending_items`` so the batch backend claims the same work.
+    """
+    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    completed = (
+        set()
+        if force
+        else load_completed_partitions(
+            "extract", artifact_root=resolved_root, data_dir=data_dir
+        )
+    )
+    entries: list[tuple[dict[str, str | None], str, str]] = []
+    claimed_paths: set[str] = set()
+    # One LIST of the mentions dataset answers every existence check; probing
+    # each target with artifact_exists costs one HeadObject per classification
+    # partition ever written and dominates discovery time at scale (#83).
+    existing_mention_ids = (
+        set()
+        if force
+        else existing_date_shard_partition_ids(
+            MENTIONS_DATASET_NAME, artifact_root=resolved_root, data_dir=data_dir
+        )
+    )
+    for classification_path in iter_date_shard_partitions(
+        CLASSIFICATION_DATASET_NAME, artifact_root=resolved_root, data_dir=data_dir
+    ):
+        partition = parse_date_shard_partition(classification_path)
+        if (partition["date"], partition["shard"]) in existing_mention_ids:
+            continue
+        if not force and classification_path in completed:
+            continue
+        claimed_paths.add(classification_path)
+        batch_items = read_table(classification_path, CLASSIFIED_ITEM_COLUMNS).reindex(
+            columns=CLASSIFIED_ITEM_COLUMNS
+        )
+        relevant_items = batch_items.loc[batch_items["relevance"].fillna(False)]
+        for item_row in relevant_items.to_dict("records"):
+            coerced = {
+                key: coerce_native(item_row.get(key)) for key in STATE_ITEM_ROW_FIELDS
+            }
+            entries.append((coerced, partition["date"], partition["shard"]))
+    return entries, claimed_paths
+
+
 def extract_pending_items(
     *,
     artifact_root: str | Path | None = None,
@@ -692,7 +835,7 @@ def extract_pending_items(
         raise ValueError(f"batch_size must be positive, got {batch_size}")
     if max_attempts <= 0:
         raise ValueError(f"max_attempts must be positive, got {max_attempts}")
-    resolved_model = model or settings.EXTRACTOR_MODEL or DEFAULT_MODEL
+    resolved_model = model or settings.EXTRACTOR_MODEL
     resolved_reasoning = normalize_reasoning_effort(reasoning_effort)
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
@@ -700,7 +843,8 @@ def extract_pending_items(
         run_id, artifact_root=resolved_root, data_dir=data_dir
     )
     processed_frames: list[pd.DataFrame] = []
-    failed_rows: list[dict[str, str]] = []
+    failed_rows: dict[str, dict[str, object]] = {}
+    succeeded_item_ids: set[str] = set()
     audit_records: list[str] = []
     partitions_written: list[str] = []
     completed_classification_paths = (
@@ -713,26 +857,48 @@ def extract_pending_items(
     visited_classification_paths: set[str] = set()
     empty_partitions = 0
     pending_classification_paths: list[str] = []
+    # Partitions the active batch job claimed are its to finish: extracting them
+    # live too would pay for every row twice and let the job's later finalize
+    # overwrite the newer live mentions with stale results. Imported lazily —
+    # batch.py imports from this module.
+    from cdt.extractor.batch import active_job_claimed_partition_paths
 
+    claimed_by_batch_job = (
+        set()
+        if force
+        else active_job_claimed_partition_paths(resolved_root, data_dir=data_dir)
+    )
+
+    # One LIST of the mentions dataset answers every existence check; probing
+    # each target with artifact_exists costs one HeadObject per classification
+    # partition ever written and dominates discovery time at scale (#83).
+    existing_mention_ids = (
+        set()
+        if force
+        else existing_date_shard_partition_ids(
+            MENTIONS_DATASET_NAME, artifact_root=resolved_root, data_dir=data_dir
+        )
+    )
     for classification_path in iter_date_shard_partitions(
         CLASSIFICATION_DATASET_NAME,
         artifact_root=resolved_root,
         data_dir=data_dir,
     ):
         partition = parse_date_shard_partition(classification_path)
-        target_path = date_shard_partition_path(
-            MENTIONS_DATASET_NAME,
-            partition_date=partition["date"],
-            shard=partition["shard"],
-            artifact_root=resolved_root,
-            data_dir=data_dir,
-        )
-        if not force and artifact_exists(target_path):
+        if (partition["date"], partition["shard"]) in existing_mention_ids:
             continue
         if not force and classification_path in completed_classification_paths:
             continue
+        if classification_path in claimed_by_batch_job:
+            continue
         pending_classification_paths.append(classification_path)
 
+    if claimed_by_batch_job:
+        LOGGER.info(
+            "Skipping %s classification partition(s) claimed by the active batch "
+            "extract job; a poll tick will finish them.",
+            len(claimed_by_batch_job),
+        )
     total_partitions = len(pending_classification_paths)
     for chunk_start in range(0, total_partitions, batch_size):
         chunk_paths = pending_classification_paths[
@@ -768,13 +934,15 @@ def extract_pending_items(
                     json.dumps(row_state.to_audit_dict(), sort_keys=True)
                 )
                 if row_state.state == "SUCCESS":
+                    succeeded_item_ids.add(row_state.item_id)
                     mention_rows.extend(row_state.debt_instrument_mentions)
                 else:
-                    failed_rows.append(
-                        {
-                            "item_id": row_state.item_id,
-                            "extractor_error": summarize_failure(row_state),
-                        }
+                    failed_rows[row_state.item_id] = _failure_record(
+                        row_state,
+                        partition_date=partition["date"],
+                        shard=partition["shard"],
+                        run_id=run_id,
+                        backend="live",
                     )
                     partition_failures += 1
                 if (
@@ -834,6 +1002,12 @@ def extract_pending_items(
         artifact_root=resolved_root,
         data_dir=data_dir,
     )
+    failure_registry, total_known_failures = _merge_row_failures(
+        failed_rows,
+        succeeded_item_ids,
+        artifact_root=resolved_root,
+        data_dir=data_dir,
+    )
 
     if audit_records:
         write_text_artifact(full_jsonl_path, "\n".join(audit_records) + "\n")
@@ -862,11 +1036,13 @@ def extract_pending_items(
             "completion_registry": completion_registry_path(
                 "extract", artifact_root=resolved_root, data_dir=data_dir
             ),
+            "failure_registry": failure_registry,
         },
     )
 
     LOGGER.info(
-        "Extractor complete: successes=%s failures=%s mentions=%s run_dir=%s",
+        "Extractor complete: successes=%s failures=%s mentions=%s run_dir=%s "
+        "failure_registry=%s (%s total)",
         sum(
             len(frame["item_id"].unique())
             for frame in processed_frames
@@ -875,6 +1051,136 @@ def extract_pending_items(
         len(failed_rows),
         sum(len(frame) for frame in processed_frames),
         full_jsonl_path,
+        failure_registry,
+        total_known_failures,
+    )
+    if not processed_frames:
+        return pd.DataFrame(columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
+    return pd.concat(processed_frames, ignore_index=True).reindex(
+        columns=DEBT_INSTRUMENT_MENTION_COLUMNS
+    )
+
+
+def finalize_extract_outputs(
+    row_entries: list[tuple[ExtractionRowState, str, str]],
+    *,
+    claimed_classification_paths: set[str],
+    run_id: str,
+    model: str,
+    reasoning_effort: str,
+    max_attempts: int,
+    artifact_root: str | Path | None = None,
+    data_dir: Path | None = None,
+) -> pd.DataFrame:
+    """Write mention partitions, audit log, and manifests for a completed job.
+
+    This is the batch backend's analogue of the tail of ``extract_pending_items``.
+    Every row in ``row_entries`` must already be terminal; ``claimed_classification_
+    paths`` are marked completed as a set since a job finalizes all its partitions
+    at once. Mentions are regrouped by their originating ``(date, shard)`` partition.
+    """
+    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    mentions_by_partition: dict[tuple[str, str], list[dict[str, object]]] = {}
+    audit_records: list[str] = []
+    failed_rows: dict[str, dict[str, object]] = {}
+    succeeded_item_ids: set[str] = set()
+    for row_state, partition_date, shard in row_entries:
+        audit_records.append(json.dumps(row_state.to_audit_dict(), sort_keys=True))
+        if row_state.state == "SUCCESS":
+            succeeded_item_ids.add(row_state.item_id)
+            mentions_by_partition.setdefault((partition_date, shard), []).extend(
+                row_state.debt_instrument_mentions
+            )
+        else:
+            failed_rows[row_state.item_id] = _failure_record(
+                row_state,
+                partition_date=partition_date,
+                shard=shard,
+                run_id=run_id,
+                backend="batch",
+            )
+        # Ensure a visited-but-empty partition still exists as a key so we do not
+        # lose track of which partitions the job covered.
+        mentions_by_partition.setdefault((partition_date, shard), [])
+
+    processed_frames: list[pd.DataFrame] = []
+    partitions_written: list[str] = []
+    empty_partitions = 0
+    for (partition_date, shard), mention_rows in sorted(mentions_by_partition.items()):
+        mentions = pd.DataFrame(mention_rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
+        if mentions.empty:
+            empty_partitions += 1
+            continue
+        write_partition_table(
+            mentions_root(resolved_root, data_dir=data_dir),
+            partition={"date": partition_date, "shard": shard},
+            table=mentions.reindex(columns=DEBT_INSTRUMENT_MENTION_COLUMNS),
+        )
+        processed_frames.append(mentions)
+        partitions_written.append(
+            date_shard_partition_path(
+                MENTIONS_DATASET_NAME,
+                partition_date=partition_date,
+                shard=shard,
+                artifact_root=resolved_root,
+                data_dir=data_dir,
+            )
+        )
+
+    completed = load_completed_partitions(
+        "extract", artifact_root=resolved_root, data_dir=data_dir
+    ) | set(claimed_classification_paths)
+    save_completed_partitions(
+        "extract", completed, artifact_root=resolved_root, data_dir=data_dir
+    )
+    # Claiming the partitions above marks these rows done for good, so record the
+    # ones that produced nothing before that fact is only visible in the audit log.
+    failure_registry, total_known_failures = _merge_row_failures(
+        failed_rows,
+        succeeded_item_ids,
+        artifact_root=resolved_root,
+        data_dir=data_dir,
+    )
+
+    full_jsonl_path = extractor_run_path(
+        run_id, artifact_root=resolved_root, data_dir=data_dir
+    )
+    write_text_artifact(
+        full_jsonl_path,
+        ("\n".join(audit_records) + "\n") if audit_records else "",
+    )
+    write_json_artifact(
+        run_manifest_path(
+            "extract", run_id, artifact_root=resolved_root, data_dir=data_dir
+        ),
+        {
+            "artifact_root": resolved_root,
+            "stage": "extract",
+            "backend": "batch",
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "max_attempts": max_attempts,
+            "partitions_completed": sorted(claimed_classification_paths),
+            "partitions_written": partitions_written,
+            "empty_partitions_skipped_from_write": empty_partitions,
+            "failure_count": len(failed_rows),
+            "audit_path": full_jsonl_path,
+            "completion_registry": completion_registry_path(
+                "extract", artifact_root=resolved_root, data_dir=data_dir
+            ),
+            "failure_registry": failure_registry,
+        },
+    )
+    LOGGER.info(
+        "Batch extractor finalize complete: rows=%s successes=%s failures=%s "
+        "mentions=%s audit=%s failure_registry=%s (%s total)",
+        len(row_entries),
+        len(row_entries) - len(failed_rows),
+        len(failed_rows),
+        sum(len(frame) for frame in processed_frames),
+        full_jsonl_path,
+        failure_registry,
+        total_known_failures,
     )
     if not processed_frames:
         return pd.DataFrame(columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
@@ -913,7 +1219,7 @@ def extract_tables(
                 columns=DEBT_INSTRUMENT_MENTION_COLUMNS
             )
         }
-    resolved_model = model or settings.EXTRACTOR_MODEL or DEFAULT_MODEL
+    resolved_model = model or settings.EXTRACTOR_MODEL
     resolved_reasoning = normalize_reasoning_effort(reasoning_effort)
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
@@ -952,6 +1258,84 @@ def extract_tables(
     }
 
 
+def record_stage_error(row_state: ExtractionRowState, message: str) -> None:
+    """Mark the current attempt as a terminal ERROR for one row."""
+    row_state.current_attempt.validation_errors = [message]
+    row_state.current_attempt.status = "ERROR"
+    row_state.finish("ERROR")
+
+
+def _begin_stage(row_state: ExtractionRowState, stage: StageSpec) -> bool:
+    """Populate the current attempt's messages via ``stage.preprocess``.
+
+    Returns True on success. On a preprocess exception the row is finished as a
+    terminal ERROR (matching the synchronous workflow) and False is returned.
+    """
+    row_state.current_attempt.stage_name = stage.name
+    row_state.current_attempt.messages = []
+    try:
+        row_state.add_messages(stage.preprocess(row_state))
+    except Exception as exc:  # noqa: BLE001
+        record_stage_error(row_state, f"{type(exc).__name__}: {exc}")
+        return False
+    return True
+
+
+def initial_messages(row_state: ExtractionRowState) -> list[dict[str, str]] | None:
+    """Prepare the first request for a fresh row.
+
+    Returns the messages for the first LLM call, or None if the row terminates
+    before any call (a preprocess failure on the first stage).
+    """
+    if not _begin_stage(row_state, EXTRACTOR_STAGES[0]):
+        return None
+    return list(row_state.current_attempt.messages)
+
+
+def handle_response(
+    row_state: ExtractionRowState,
+    response: str,
+    *,
+    max_attempts: int,
+) -> list[dict[str, str]] | None:
+    """Advance one row given the response to its outstanding request.
+
+    Applies the current stage's validate/postprocess, then either advances to the
+    next stage, schedules a retry, or terminates the row. Returns the messages for
+    the next LLM call, or None when the row has reached a terminal state.
+    """
+    stage = STAGE_BY_NAME[row_state.current_attempt.stage_name]
+    stage_index = STAGE_INDEX[stage.name]
+    row_state.add_response(response)
+    failures = stage.validate(row_state, response)
+    row_state.add_validation(failures)
+    if not failures:
+        stage.postprocess(row_state)
+        if stage.early_stop(row_state):
+            row_state.finish("SUCCESS")
+            return None
+        if stage_index == len(EXTRACTOR_STAGES) - 1:
+            row_state.finish("SUCCESS")
+            return None
+        next_stage = EXTRACTOR_STAGES[stage_index + 1]
+        if (
+            next_stage.name == "instrument_relation"
+            and len(row_state.debt_instrument_mentions) <= 1
+        ):
+            row_state.finish("SUCCESS")
+            return None
+        row_state.next_stage(next_stage.name)
+        if not _begin_stage(row_state, next_stage):
+            return None
+        return list(row_state.current_attempt.messages)
+
+    if row_state.current_attempt.attempt_index >= max_attempts:
+        row_state.finish("FAILED")
+        return None
+    row_state.retry(stage.build_retry_message(failures))
+    return list(row_state.current_attempt.messages)
+
+
 async def run_extraction_workflow(
     *,
     item_row: dict[str, object],
@@ -960,67 +1344,23 @@ async def run_extraction_workflow(
     max_attempts: int,
     client: SupportsChatCompletion | None = None,
 ) -> ExtractionRowState:
-    """Run the three-stage extraction workflow for one item row."""
+    """Run the three-stage extraction workflow for one item row (live backend)."""
     resolved_client = client or OpenRouterChatClient()
-    stages: list[StageSpec] = [
-        NERStage(),
-        InstrumentIEStage(),
-        InstrumentRelationStage(),
-    ]
-    row_state = ExtractionRowState(item_row=item_row, stage_name=stages[0].name)
-    for stage_index, stage in enumerate(stages):
-        row_state.current_attempt.stage_name = stage.name
-        row_state.current_attempt.messages = []
+    row_state = ExtractionRowState(
+        item_row=item_row, stage_name=EXTRACTOR_STAGES[0].name
+    )
+    messages = initial_messages(row_state)
+    while messages is not None:
         try:
-            row_state.add_messages(stage.preprocess(row_state))
+            response = await resolved_client.complete(
+                messages=messages,
+                model=model,
+                reasoning_effort=reasoning_effort,
+            )
         except Exception as exc:  # noqa: BLE001
-            row_state.current_attempt.validation_errors = [
-                f"{type(exc).__name__}: {exc}"
-            ]
-            row_state.current_attempt.status = "ERROR"
-            row_state.finish("ERROR")
+            record_stage_error(row_state, f"{type(exc).__name__}: {exc}")
             return row_state
-
-        while True:
-            try:
-                response = await resolved_client.complete(
-                    messages=row_state.current_attempt.messages,
-                    model=model,
-                    reasoning_effort=reasoning_effort,
-                )
-            except Exception as exc:  # noqa: BLE001
-                row_state.current_attempt.validation_errors = [
-                    f"{type(exc).__name__}: {exc}"
-                ]
-                row_state.current_attempt.status = "ERROR"
-                row_state.finish("ERROR")
-                return row_state
-
-            row_state.add_response(response)
-            failures = stage.validate(row_state, response)
-            row_state.add_validation(failures)
-            if not failures:
-                stage.postprocess(row_state)
-                if stage.early_stop(row_state):
-                    row_state.finish("SUCCESS")
-                    return row_state
-                if stage_index == len(stages) - 1:
-                    row_state.finish("SUCCESS")
-                    return row_state
-                if (
-                    stages[stage_index + 1].name == "instrument_relation"
-                    and len(row_state.debt_instrument_mentions) <= 1
-                ):
-                    row_state.finish("SUCCESS")
-                    return row_state
-                row_state.next_stage(stages[stage_index + 1].name)
-                break
-
-            if row_state.current_attempt.attempt_index >= max_attempts:
-                row_state.finish("FAILED")
-                return row_state
-            row_state.retry(stage.build_retry_message(failures))
-    row_state.finish("SUCCESS")
+        messages = handle_response(row_state, response, max_attempts=max_attempts)
     return row_state
 
 
@@ -1097,6 +1437,41 @@ def extract_response_text(response: object) -> str:
                     text_parts.append(text)
         return "".join(text_parts)
     raise RuntimeError("OpenRouter response content was not text.")
+
+
+def extract_batch_response_text(line: dict[str, object]) -> str:
+    """Extract the assistant text from one OpenAI Batch output JSONL line.
+
+    Batch results are plain JSON dicts (not SDK objects). Per-request failures
+    surface either as a top-level ``error`` or a non-200 ``response.status_code``;
+    both raise so the caller can mark the row terminal ERROR.
+    """
+    error = line.get("error")
+    if error:
+        raise RuntimeError(f"Batch request error: {error}")
+    response = cast(dict[str, object], line.get("response") or {})
+    status_code = response.get("status_code")
+    if status_code != 200:  # noqa: PLR2004
+        raise RuntimeError(
+            f"Batch request returned status {status_code}: {response.get('body')}"
+        )
+    body = cast(dict[str, object], response.get("body") or {})
+    choices = cast(list[dict[str, object]], body.get("choices") or [])
+    if not choices:
+        raise RuntimeError("Batch response did not include choices.")
+    message = cast(dict[str, object], choices[0].get("message") or {})
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                text_parts.append(part)
+            elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                text_parts.append(part["text"])
+        return "".join(text_parts)
+    raise RuntimeError("Batch response content was not text.")
 
 
 def collapse_whitespace(value: str) -> str:
@@ -1512,3 +1887,73 @@ def normalize_reasoning_effort(reasoning_effort: str | None) -> str:
             f"Unsupported reasoning effort {resolved!r}; expected one of {allowed}"
         )
     return resolved
+
+
+def _failure_record(
+    row_state: ExtractionRowState,
+    *,
+    partition_date: str,
+    shard: str,
+    run_id: str,
+    backend: str,
+) -> dict[str, object]:
+    """Build one failure-registry entry for a terminal non-SUCCESS row."""
+    return {
+        "item_id": row_state.item_id,
+        "accession_number": row_state.item_row.get("accession_number"),
+        "cik": row_state.item_row.get("cik"),
+        "date": partition_date,
+        "shard": shard,
+        "state": row_state.state,
+        "stage": row_state.current_attempt.stage_name,
+        "run_id": run_id,
+        "backend": backend,
+        "error": summarize_failure(row_state),
+    }
+
+
+def _merge_row_failures(
+    failures: dict[str, dict[str, object]],
+    succeeded_item_ids: set[str],
+    *,
+    artifact_root: str,
+    data_dir: Path | None,
+) -> tuple[str, int]:
+    """Merge this run's row outcomes into the extract failure registry.
+
+    Failures are added or refreshed; rows that succeeded this run clear any
+    earlier entry, so a re-extract that fixes a row does not leave a stale
+    failure behind. Returns the registry path and its total entry count.
+    """
+    registry = load_row_failures(
+        "extract", artifact_root=artifact_root, data_dir=data_dir
+    )
+    for item_id in succeeded_item_ids:
+        registry.pop(item_id, None)
+    registry.update(failures)
+    path = save_row_failures(
+        "extract", registry, artifact_root=artifact_root, data_dir=data_dir
+    )
+    return path, len(registry)
+
+
+def native_model_id(model: str) -> str:
+    """Strip any provider prefix so an OpenRouter slug becomes a native id."""
+    return model.split("/", 1)[1] if "/" in model else model
+
+
+def is_reasoning_model(model: str) -> bool:
+    """Return True for model families that take reasoning_effort over temperature."""
+    return native_model_id(model).lower().startswith(REASONING_MODEL_PREFIXES)
+
+
+def sampling_params(model: str) -> dict[str, object]:
+    """Return the sampling params to send with one extract call.
+
+    Shared by both backends. Reasoning models reject ``temperature != 1``, so
+    temperature is only sent to models that can honor it; for those, pinning it
+    to 0 keeps extraction as reproducible as the provider allows.
+    """
+    if is_reasoning_model(model):
+        return {}
+    return {"temperature": EXTRACTOR_TEMPERATURE}
