@@ -77,6 +77,15 @@ def add_artifact_root_argument(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Artifact root as a local path or s3:// URI. Defaults to DATA_DIR.",
     )
+
+
+def add_final_database_root_argument(parser: argparse.ArgumentParser) -> None:
+    """Add --final-database-root only where a command actually honors it.
+
+    Stage subcommands used to accept it via the shared artifact-root helper and
+    silently ignore it (#72) — misleading anyone redirecting final output for a
+    single stage run.
+    """
     parser.add_argument(
         "--final-database-root",
         default=None,
@@ -255,6 +264,7 @@ def build_parser() -> argparse.ArgumentParser:
         "pipeline", help="Run the full CDT pipeline end-to-end."
     )
     add_artifact_root_argument(pipeline_parser)
+    add_final_database_root_argument(pipeline_parser)
     pipeline_parser.add_argument("--bucket", default=DEFAULT_BUCKET)
     pipeline_parser.add_argument("--force", action="store_true")
     pipeline_parser.add_argument("--download", action="store_true")

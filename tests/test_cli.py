@@ -833,3 +833,16 @@ def test_reset_extract_job_aborts_when_the_job_changed(
         cli.main(["reset-extract-job", "--artifact-root", str(tmp_path), "--yes"]) == 1
     )
     assert "Not reset" in capsys.readouterr().out
+
+
+def test_final_database_root_only_where_honored() -> None:
+    """Stage subcommands reject --final-database-root instead of ignoring it (#72)."""
+    parser = cli.build_parser()
+
+    args = parser.parse_args(
+        ["pipeline", "--final-database-root", "/final", "daily", "c.txt"]
+    )
+    assert args.final_database_root == "/final"
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["itemize", "--final-database-root", "/final"])
