@@ -11,6 +11,7 @@ import pytest
 from cdt import cli
 from cdt.ingest import IngestRunResult
 from cdt.itemizer import POTENTIALLY_RELEVANT_ITEM_NUMBERS
+from cdt.lease import PIPELINE_WRITER_LEASE, acquire_lease
 from cdt.pipeline import PipelineRunResult
 
 ARGPARSE_USAGE_ERROR = 2
@@ -161,11 +162,11 @@ def test_ingest_cli_historical_defaults_to_all_time_date_range(
     ]
 
 
-def test_ingest_cli_daily_defaults_to_yesterday(
+def test_ingest_cli_daily_defaults_to_lookback_window(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Daily ingest defaults both dates to yesterday."""
+    """Daily ingest defaults to the rolling lookback window (#90)."""
     cik_file = tmp_path / "ciks.txt"
     cik_file.write_text("320193\n", encoding="utf-8")
     calls: list[tuple[date, date]] = []
@@ -199,9 +200,13 @@ def test_ingest_cli_daily_defaults_to_yesterday(
 
     status = cli.main(["ingest", "--quiet", "daily", str(cik_file)])
 
-    yesterday = date.today().fromordinal(date.today().toordinal() - 1)
+    from cdt.pipeline import DAILY_LOOKBACK_DAYS
+
+    today = date.today()
+    yesterday = today.fromordinal(today.toordinal() - 1)
+    lookback_start = today.fromordinal(today.toordinal() - DAILY_LOOKBACK_DAYS)
     assert status == 0
-    assert calls == [(yesterday, yesterday)]
+    assert calls == [(lookback_start, yesterday)]
 
 
 def test_ingest_cli_daily_rejects_partial_date_range(tmp_path: Path) -> None:
@@ -452,6 +457,29 @@ def test_itemize_cli_calls_pending_itemizer(monkeypatch: pytest.MonkeyPatch) -> 
             "item_numbers": POTENTIALLY_RELEVANT_ITEM_NUMBERS,
         }
     ]
+
+
+def test_stage_cli_does_not_run_while_lease_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stage subcommands refuse to run against a leased artifact root (#88).
+
+    They rewrite the same completion registries the scheduled runs do, and an
+    unserialized writer loses registry updates.
+    """
+    monkeypatch.setattr(
+        cli,
+        "itemize_pending_documents",
+        lambda **kwargs: pytest.fail("itemize must not run while the lease is held"),
+    )
+    held = acquire_lease(tmp_path, PIPELINE_WRITER_LEASE)
+    assert held is not None
+
+    status = cli.main(
+        ["itemize", "--artifact-root", str(tmp_path), "--batch-size", "5", "--quiet"]
+    )
+
+    assert status == 1
 
 
 def test_itemize_cli_passes_custom_item_numbers(
@@ -722,3 +750,126 @@ def test_parse_item_numbers_rejects_empty_list() -> None:
         assert exc.code == ARGPARSE_USAGE_ERROR
     else:
         raise AssertionError("expected argparse to reject an empty item-number list")
+
+
+def test_show_extract_job_reports_idle(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """show-extract-job reports an idle root without touching anything."""
+    assert cli.main(["show-extract-job", "--artifact-root", str(tmp_path)]) == 0
+    assert "No active extract job" in capsys.readouterr().out
+
+
+def test_show_extract_job_reports_corruption_nonzero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A corrupt job exits non-zero so an operator's check fails loudly."""
+    monkeypatch.setattr(
+        cli,
+        "describe_active_job",
+        lambda root: cli.ActiveJobSummary(
+            status="corrupt", job_id="J", detail="missing manifest.json"
+        ),
+    )
+
+    assert cli.main(["show-extract-job", "--artifact-root", str(tmp_path)]) == 1
+    out = capsys.readouterr().out
+    assert "missing manifest.json" in out
+    assert "reset-extract-job" in out
+
+
+def test_reset_extract_job_requires_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Without --yes the reset only reports what it would abandon."""
+    monkeypatch.setattr(
+        cli,
+        "describe_active_job",
+        lambda root: cli.ActiveJobSummary(
+            status="active", job_id="J", in_flight_batches=2
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "reset_active_job",
+        lambda root: pytest.fail("must not reset without --yes"),
+    )
+
+    assert cli.main(["reset-extract-job", "--artifact-root", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "2 batch(es)" in out
+    assert "--yes" in out
+
+
+def test_reset_extract_job_clears_under_the_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With --yes the reset runs, holding the pipeline-writer lease."""
+    held: list[str] = []
+    monkeypatch.setattr(
+        cli,
+        "describe_active_job",
+        lambda root: cli.ActiveJobSummary(status="active", job_id="J"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "reset_active_job",
+        lambda root, expected_job_id: (held.append(f"reset:{expected_job_id}"), "J")[1],
+    )
+
+    assert (
+        cli.main(["reset-extract-job", "--artifact-root", str(tmp_path), "--yes"]) == 0
+    )
+    assert held == ["reset:J"]
+    assert "Cleared the active extract job marker for J" in capsys.readouterr().out
+
+
+def test_reset_extract_job_refuses_while_a_tick_holds_the_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A running poll tick blocks the reset rather than racing it."""
+    monkeypatch.setattr(
+        cli,
+        "describe_active_job",
+        lambda root: cli.ActiveJobSummary(status="active", job_id="J"),
+    )
+    monkeypatch.setattr(
+        cli, "reset_active_job", lambda root: pytest.fail("must not reset while locked")
+    )
+    held = acquire_lease(tmp_path, PIPELINE_WRITER_LEASE)
+    assert held is not None
+
+    assert (
+        cli.main(["reset-extract-job", "--artifact-root", str(tmp_path), "--yes"]) == 1
+    )
+
+
+def test_reset_extract_job_aborts_when_the_job_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A reset pinned to a job that is no longer active clears nothing."""
+    monkeypatch.setattr(
+        cli,
+        "describe_active_job",
+        lambda root: cli.ActiveJobSummary(status="active", job_id="OLD"),
+    )
+    # reset_active_job reports the mismatch by returning None.
+    monkeypatch.setattr(cli, "reset_active_job", lambda root, expected_job_id: None)
+
+    assert (
+        cli.main(["reset-extract-job", "--artifact-root", str(tmp_path), "--yes"]) == 1
+    )
+    assert "Not reset" in capsys.readouterr().out
+
+
+def test_final_database_root_only_where_honored() -> None:
+    """Stage subcommands reject --final-database-root instead of ignoring it (#72)."""
+    parser = cli.build_parser()
+
+    args = parser.parse_args(
+        ["pipeline", "--final-database-root", "/final", "daily", "c.txt"]
+    )
+    assert args.final_database_root == "/final"
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["itemize", "--final-database-root", "/final"])

@@ -24,7 +24,14 @@ from cdt.extractor import DEFAULT_MODEL as DEFAULT_EXTRACTOR_MODEL
 from cdt.extractor import (
     DEFAULT_REASONING_EFFORT as DEFAULT_EXTRACTOR_REASONING_EFFORT,
 )
-from cdt.extractor import extract_pending_items, extracted_tables_path, mentions_root
+from cdt.extractor import (
+    ActiveJobSummary,
+    describe_active_job,
+    extract_pending_items,
+    extracted_tables_path,
+    mentions_root,
+    reset_active_job,
+)
 from cdt.ingest import (
     DEFAULT_AWS_PROFILE,
     DEFAULT_BUCKET,
@@ -38,6 +45,7 @@ from cdt.itemizer import (
     itemize_pending_documents,
     items_root,
 )
+from cdt.lease import PIPELINE_WRITER_LEASE, Lease, acquire_lease, release_lease
 from cdt.matcher import (
     DEFAULT_AMBIGUITY_MARGIN,
     DEFAULT_MEMBERSHIP_THRESHOLD,
@@ -69,6 +77,15 @@ def add_artifact_root_argument(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Artifact root as a local path or s3:// URI. Defaults to DATA_DIR.",
     )
+
+
+def add_final_database_root_argument(parser: argparse.ArgumentParser) -> None:
+    """Add --final-database-root only where a command actually honors it.
+
+    Stage subcommands used to accept it via the shared artifact-root helper and
+    silently ignore it (#72) — misleading anyone redirecting final output for a
+    single stage run.
+    """
     parser.add_argument(
         "--final-database-root",
         default=None,
@@ -90,6 +107,25 @@ def add_logging_arguments(parser: argparse.ArgumentParser, *, noun: str) -> None
         default=None,
         help=f"Optional path to write {noun} logs.",
     )
+
+
+def acquire_stage_lease(
+    artifact_root: str, logger: logging.Logger, noun: str
+) -> Lease | None:
+    """Take the pipeline-writer lease for one stage run, or say why not.
+
+    Stage subcommands rewrite the same completion registries and datasets the
+    scheduled orchestrator runs do; unserialized writers lose registry updates
+    and silently strand partitions (#88).
+    """
+    lease = acquire_lease(artifact_root, PIPELINE_WRITER_LEASE)
+    if lease is None:
+        logger.error(
+            "Pipeline-writer lease is held (a scheduled run or poll tick is "
+            "active); not starting %s. Retry when it finishes.",
+            noun,
+        )
+    return lease
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -193,6 +229,30 @@ def build_parser() -> argparse.ArgumentParser:
     add_logging_arguments(extract_parser, noun="extraction")
     extract_parser.set_defaults(func=run_extractor)
 
+    show_job_parser = subparsers.add_parser(
+        "show-extract-job",
+        help="Show the state of the async batch extract job (read-only).",
+    )
+    add_artifact_root_argument(show_job_parser)
+    add_logging_arguments(show_job_parser, noun="inspection")
+    show_job_parser.set_defaults(func=run_show_extract_job)
+
+    reset_job_parser = subparsers.add_parser(
+        "reset-extract-job",
+        help=(
+            "Clear the active batch extract job marker so the next poll tick "
+            "starts fresh. Abandons any batch still in flight."
+        ),
+    )
+    add_artifact_root_argument(reset_job_parser)
+    reset_job_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Required to actually clear the marker; without it, only reports.",
+    )
+    add_logging_arguments(reset_job_parser, noun="reset")
+    reset_job_parser.set_defaults(func=run_reset_extract_job)
+
     match_parser = subparsers.add_parser(
         "match", help="Group extracted instrument mentions into debt instruments."
     )
@@ -223,6 +283,7 @@ def build_parser() -> argparse.ArgumentParser:
         "pipeline", help="Run the full CDT pipeline end-to-end."
     )
     add_artifact_root_argument(pipeline_parser)
+    add_final_database_root_argument(pipeline_parser)
     pipeline_parser.add_argument("--bucket", default=DEFAULT_BUCKET)
     pipeline_parser.add_argument("--force", action="store_true")
     pipeline_parser.add_argument("--download", action="store_true")
@@ -293,6 +354,10 @@ def run_ingest(args: argparse.Namespace) -> int:
     """Run the ingest subcommand."""
     configure_logging(quiet=args.quiet, log_file=args.log_file)
     logger = logging.getLogger(__name__)
+    output_root = args.artifact_root or default_output_root()
+    lease = acquire_stage_lease(output_root, logger, "ingest")
+    if lease is None:
+        return 1
     try:
         start_date, end_date = resolve_ingest_dates(args)
         config = IngestConfig(
@@ -301,7 +366,7 @@ def run_ingest(args: argparse.Namespace) -> int:
             cik_file=Path(str(args.cik_file)),
             start_date=start_date,
             end_date=end_date,
-            output_root=args.artifact_root or default_output_root(),
+            output_root=output_root,
             force=args.force,
             batch_size=args.batch_size,
             download=args.download,
@@ -325,6 +390,8 @@ def run_ingest(args: argparse.Namespace) -> int:
     except Exception:
         logger.exception("Ingest failed")
         return 1
+    finally:
+        release_lease(lease)
     print(
         f"Indexed {result.total_rows} document rows from {result.start_date} through {result.end_date}."
     )
@@ -340,6 +407,9 @@ def run_itemize(args: argparse.Namespace) -> int:
     configure_logging(quiet=args.quiet, log_file=args.log_file)
     logger = logging.getLogger(__name__)
     artifact_root = args.artifact_root or default_output_root()
+    lease = acquire_stage_lease(artifact_root, logger, "itemization")
+    if lease is None:
+        return 1
     try:
         logger.info(
             "Starting itemization: batch_size=%s force=%s item_numbers=%s documents=%s output=%s",
@@ -358,6 +428,8 @@ def run_itemize(args: argparse.Namespace) -> int:
     except Exception:
         logger.exception("Itemization failed")
         return 1
+    finally:
+        release_lease(lease)
     print(f"Itemized {len(items)} item rows.")
     print(f"Wrote item partitions to {items_root(artifact_root)}.")
     return 0
@@ -367,6 +439,10 @@ def run_pipeline_command(args: argparse.Namespace) -> int:
     """Run the full CDT pipeline."""
     configure_logging(quiet=args.quiet, log_file=args.log_file)
     logger = logging.getLogger(__name__)
+    artifact_root = args.artifact_root or default_output_root()
+    lease = acquire_stage_lease(artifact_root, logger, "the pipeline")
+    if lease is None:
+        return 1
     try:
         start_date, end_date = resolve_mode_dates(
             args.pipeline_mode,
@@ -408,6 +484,8 @@ def run_pipeline_command(args: argparse.Namespace) -> int:
     except Exception:
         logger.exception("Pipeline failed")
         return 1
+    finally:
+        release_lease(lease)
 
     print(f"Ran pipeline from {result.start_date} through {result.end_date}.")
     print(
@@ -428,6 +506,9 @@ def run_classifier(args: argparse.Namespace) -> int:
     logger = logging.getLogger(__name__)
     artifact_root = args.artifact_root or default_output_root()
     resolved_model_dir = args.model_dir or default_model_dir()
+    lease = acquire_stage_lease(artifact_root, logger, "classification")
+    if lease is None:
+        return 1
     try:
         logger.info(
             "Starting classification: batch_size=%s force=%s input=%s output=%s model_dir=%s",
@@ -446,6 +527,8 @@ def run_classifier(args: argparse.Namespace) -> int:
     except Exception:
         logger.exception("Classification failed")
         return 1
+    finally:
+        release_lease(lease)
     print(f"Classified {len(items)} item rows.")
     print(f"Wrote classification partitions to {classifications_root(artifact_root)}.")
     return 0
@@ -485,6 +568,9 @@ def run_extractor(args: argparse.Namespace) -> int:
     configure_logging(quiet=args.quiet, log_file=args.log_file)
     logger = logging.getLogger(__name__)
     artifact_root = args.artifact_root or default_output_root()
+    lease = acquire_stage_lease(artifact_root, logger, "extraction")
+    if lease is None:
+        return 1
     try:
         logger.info(
             "Starting extraction: batch_size=%s force=%s input=%s output=%s model=%s reasoning_effort=%s max_attempts=%s audit=%s",
@@ -508,6 +594,8 @@ def run_extractor(args: argparse.Namespace) -> int:
     except Exception:
         logger.exception("Extraction failed")
         return 1
+    finally:
+        release_lease(lease)
     print(f"Extracted {len(mentions)} instrument mention rows.")
     print(f"Wrote canonical mentions to {mentions_root(artifact_root)}.")
     print(
@@ -516,11 +604,89 @@ def run_extractor(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_show_extract_job(args: argparse.Namespace) -> int:
+    """Report the active batch extract job's state."""
+    configure_logging(quiet=args.quiet, log_file=args.log_file)
+    artifact_root = args.artifact_root or default_output_root()
+    summary: ActiveJobSummary = describe_active_job(artifact_root)
+    if summary.status == "idle":
+        print("No active extract job; the next poll tick will start one.")
+        return 0
+    if summary.status == "corrupt":
+        print(f"Active job {summary.job_id} is unusable: {summary.detail}")
+        print(
+            "The next poll tick clears this automatically. To clear it now, run "
+            "`cdt reset-extract-job --yes`."
+        )
+        return 1
+    print(f"Active job {summary.job_id} (tick {summary.tick}):")
+    for label, value in (
+        ("rows", summary.total_rows),
+        ("terminal rows", summary.terminal_rows),
+        ("rows awaiting a request", summary.awaiting_rows),
+        ("batches in flight", summary.in_flight_batches),
+        ("claimed partitions", summary.claimed_partitions),
+    ):
+        print(f"  {label + ':':<26}{value}")
+    return 0
+
+
+def run_reset_extract_job(args: argparse.Namespace) -> int:
+    """Clear the active batch extract job marker under the writer lease."""
+    configure_logging(quiet=args.quiet, log_file=args.log_file)
+    logger = logging.getLogger(__name__)
+    artifact_root = args.artifact_root or default_output_root()
+    summary: ActiveJobSummary = describe_active_job(artifact_root)
+    if summary.status == "idle":
+        print("No active extract job; nothing to reset.")
+        return 0
+    if not args.yes:
+        # A corrupt job's batches.json is unreadable, so the in-flight count is
+        # unknown rather than zero.
+        abandoned = (
+            "an unknown number of batches"
+            if summary.status == "corrupt"
+            else f"{summary.in_flight_batches} batch(es)"
+        )
+        print(f"Active job {summary.job_id} ({summary.status}).")
+        print(
+            f"Would clear the marker, abandoning {abandoned} still in flight. "
+            "Re-run with --yes to proceed."
+        )
+        return 0
+    # Take the same lease a poll tick holds, so a running tick cannot rewrite the
+    # marker underneath the reset.
+    lease = acquire_lease(artifact_root, PIPELINE_WRITER_LEASE)
+    if lease is None:
+        logger.error(
+            "Pipeline-writer lease is held (a poll tick is running); not resetting."
+        )
+        return 1
+    try:
+        # Pin the clear to the job shown above: if a poll tick completed it and
+        # started another in between, abort instead of abandoning the new job.
+        job_id = reset_active_job(artifact_root, expected_job_id=summary.job_id)
+    finally:
+        release_lease(lease)
+    if job_id is None:
+        print(
+            "Not reset: the active job changed (or completed) since inspection. "
+            "Re-run to inspect the current state."
+        )
+        return 1
+    print(f"Cleared the active extract job marker for {job_id}.")
+    print("The next poll tick starts a fresh job from unclaimed partitions.")
+    return 0
+
+
 def run_matcher(args: argparse.Namespace) -> int:
     """Run the matcher subcommand."""
     configure_logging(quiet=args.quiet, log_file=args.log_file)
     logger = logging.getLogger(__name__)
     artifact_root = args.artifact_root or default_output_root()
+    lease = acquire_stage_lease(artifact_root, logger, "matching")
+    if lease is None:
+        return 1
     try:
         logger.info(
             "Starting matcher: batch_size=%s force=%s input=%s mention_cluster_edges=%s debt_instruments=%s",
@@ -541,6 +707,8 @@ def run_matcher(args: argparse.Namespace) -> int:
     except Exception:
         logger.exception("Matcher failed")
         return 1
+    finally:
+        release_lease(lease)
     print(
         f"Matched {len(tables['debt_instrument_mentions'])} mention-cluster edge rows."
     )

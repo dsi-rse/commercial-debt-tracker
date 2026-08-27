@@ -73,47 +73,38 @@ aws.iam.RolePolicy(
     ),
 )
 
+# Reading a SecureString parameter takes two permissions: ssm:GetParameters on
+# the parameter, plus kms:Decrypt to unwrap it. KMS is scoped by ViaService so the
+# role can only use the key through SSM.
 aws.iam.RolePolicy(
     "cdt-ecs-execution-secrets-policy",
     role=task_execution_role.id,
-    policy=pulumi.Output.all(
-        openrouter_secret_arn=secrets.openrouter_api_key_secret.arn,
-        sec_user_agent_secret_arn=secrets.sec_user_agent_secret.arn,
-        r2_access_key_id_secret_arn=(
-            secrets.r2_access_key_id_secret.arn
-            if secrets.r2_access_key_id_secret is not None
-            else None
-        ),
-        r2_secret_access_key_secret_arn=(
-            secrets.r2_secret_access_key_secret.arn
-            if secrets.r2_secret_access_key_secret is not None
-            else None
-        ),
-    ).apply(
-        lambda args: json.dumps(
-            {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Action": [
-                            "secretsmanager:GetSecretValue",
-                            "secretsmanager:DescribeSecret",
-                        ],
-                        "Resource": [
-                            arn
-                            for arn in [
-                                args["openrouter_secret_arn"],
-                                args["sec_user_agent_secret_arn"],
-                                args["r2_access_key_id_secret_arn"],
-                                args["r2_secret_access_key_secret_arn"],
-                            ]
-                            if arn is not None
-                        ],
-                    }
-                ],
-            }
-        )
+    policy=pulumi.Output.json_dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "ReadSecretParams",
+                    "Effect": "Allow",
+                    "Action": ["ssm:GetParameter", "ssm:GetParameters"],
+                    "Resource": [
+                        secrets.openrouter_api_key_param.arn,
+                        secrets.openai_api_key_param.arn,
+                    ],
+                },
+                {
+                    "Sid": "DecryptViaSSM",
+                    "Effect": "Allow",
+                    "Action": ["kms:Decrypt"],
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {
+                            "kms:ViaService": f"ssm.{config.aws_region}.amazonaws.com"
+                        }
+                    },
+                },
+            ],
+        }
     ),
 )
 
@@ -135,38 +126,79 @@ task_role = aws.iam.Role(
     tags=config.tags(),
 )
 
-source_bucket = aws.s3.get_bucket_output(bucket=config.bucket_name)
-output_bucket = aws.s3.get_bucket_output(bucket=config.output_bucket_name)
+# S3 bucket ARNs are deterministic, so construct them directly rather than a
+# plan-time aws.s3.get_bucket lookup, which would require read access to the
+# scraper-managed source bucket just to obtain an ARN (see issue #7). The set
+# collapses to one ARN when the source and output buckets are the same bucket,
+# which is the dev configuration.
+bucket_arns = sorted(
+    {
+        f"arn:aws:s3:::{config.bucket_name}",
+        f"arn:aws:s3:::{config.output_bucket_name}",
+    }
+)
+
+# Object permissions are scoped by prefix, not by bucket, because in dev the
+# scraper's source bucket and CDT's output bucket are the same bucket (see #8).
+# Splitting by bucket there would grant PutObject/DeleteObject over the scraper's
+# whole archive — every form type back to 2016 — which CDT only ever reads.
+source_read_arns = [
+    f"arn:aws:s3:::{config.bucket_name}/{config.source_prefix}/*",
+    # The default CIK file lives on the shared bucket; when output_bucket_name is
+    # a different bucket the WriteOwnArtifacts grants no longer cover it, so it
+    # gets its own read grant (see config.default_cik_key).
+    f"arn:aws:s3:::{config.bucket_name}/{config.default_cik_key}",
+]
+# Everything CDT writes lives under one of these two prefixes: canonical
+# artifacts (datasets, run manifests, completion + failure registries, extract
+# job state, locks) and the final dashboard snapshots.
+output_write_arns = sorted(
+    {
+        f"arn:aws:s3:::{config.output_bucket_name}/{config.artifact_prefix}/*",
+        f"arn:aws:s3:::{config.output_bucket_name}/{config.final_database_prefix}/*",
+    }
+)
 
 aws.iam.RolePolicy(
     "cdt-ecs-task-s3-policy",
     role=task_role.id,
-    policy=pulumi.Output.all(source_bucket.arn, output_bucket.arn).apply(
-        lambda arns: json.dumps(
-            {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Action": ["s3:ListBucket"],
-                        "Resource": sorted(set(arns)),
-                    },
-                    {
-                        "Effect": "Allow",
-                        "Action": [
-                            "s3:GetObject",
-                            "s3:PutObject",
-                            "s3:DeleteObject",
-                            "s3:AbortMultipartUpload",
-                            "s3:CreateMultipartUpload",
-                            "s3:UploadPart",
-                            "s3:CompleteMultipartUpload",
-                            "s3:ListMultipartUploadParts",
-                        ],
-                        "Resource": [f"{arn}/*" for arn in sorted(set(arns))],
-                    },
-                ],
-            }
-        )
+    policy=json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    # ListBucket is a bucket-level action: it cannot be scoped by
+                    # resource path, only by an s3:prefix condition. Left
+                    # unconstrained for now — tightening it means enumerating
+                    # every prefix the code lists under, and a wrong list yields
+                    # silent empty listings rather than an error (see #8).
+                    "Sid": "ListBuckets",
+                    "Effect": "Allow",
+                    "Action": ["s3:ListBucket"],
+                    "Resource": bucket_arns,
+                },
+                {
+                    "Sid": "ReadScraperSource",
+                    "Effect": "Allow",
+                    "Action": ["s3:GetObject"],
+                    "Resource": source_read_arns,
+                },
+                {
+                    "Sid": "WriteOwnArtifacts",
+                    "Effect": "Allow",
+                    "Action": [
+                        "s3:GetObject",
+                        "s3:PutObject",
+                        "s3:DeleteObject",
+                        "s3:AbortMultipartUpload",
+                        "s3:CreateMultipartUpload",
+                        "s3:UploadPart",
+                        "s3:CompleteMultipartUpload",
+                        "s3:ListMultipartUploadParts",
+                    ],
+                    "Resource": output_write_arns,
+                },
+            ],
+        }
     ),
 )

@@ -17,6 +17,7 @@ Text columns are normalized on the way into a snapshot: a cell whose whole value
   mention-cluster-edges/
   debt-instruments/
   extractor-runs/
+  extract-batches/
   runs/
   failures/
 ```
@@ -275,6 +276,38 @@ Extractor writes a per-run manifest and a matching full audit log:
 <artifact-root>/extractor-runs/run_id=<run_id>/full.jsonl
 ```
 
+### Extract batch job state
+
+The OpenAI batch extract backend keeps its resumable, file-native job state under
+`extract-batches/`. The hourly `poll` run is the only writer, apart from the
+`cdt reset-extract-job` admin command, which rewrites `active.json` under the same lease.
+
+```text
+<artifact-root>/extract-batches/
+  active.json                        # {"job_id": ...}; job_id is null when idle
+  job_id=<run_id>/manifest.json      # static job config + claimed classification partitions
+  job_id=<run_id>/state.jsonl        # one line per item: source partition + pending request
+                                     # marker + expiry resubmission counter + resumable row state
+  job_id=<run_id>/batches.json       # in-flight OpenAI batches, seen batch ids, tick counter
+  job_id=<run_id>/ticks/tick=<n>.json  # per-tick audit counts
+```
+
+The orchestrator also keeps advisory locks directly under the artifact root:
+
+```text
+locks/pipeline-writer.json           # single-writer lease: {holder, acquired_at, expires_at}
+```
+
+When a job finishes, its mentions are written to the canonical `mentions` partitions and its
+audit log to `extractor-runs/run_id=<run_id>/full.jsonl`, exactly like the synchronous
+backend. `state.jsonl` and `batches.json` are working state, not canonical outputs.
+
+A `job_id=<run_id>/` directory is never deleted, including when a job is abandoned as
+corrupt, so a wedged poller leaves its evidence behind. Only `active.json` decides which
+job a tick advances: it is set to `{"job_id": null}` on completion or reset, which
+`_read_active_job` treats the same as an absent marker (a write, not a delete, so no
+delete permission on the artifact bucket is needed).
+
 ### Failure registries
 
 The ingest stage maintains a permanent failure registry at:
@@ -282,6 +315,46 @@ The ingest stage maintains a permanent failure registry at:
 ```text
 <artifact-root>/failures/ingest/failures.json
 ```
+
+The extract stage maintains an equivalent row-level registry, written by both the `live`
+and `batch` backends:
+
+```text
+<artifact-root>/failures/extract/failures.json
+```
+
+```json
+{
+  "stage": "extract",
+  "failure_count": 1,
+  "failures": {
+    "<item_id>": {
+      "item_id": "...",
+      "accession_number": "...",
+      "cik": "...",
+      "date": "2024-01-02",
+      "shard": "0001",
+      "state": "ERROR",
+      "stage": "ner",
+      "run_id": "20260814T134326943342Z",
+      "backend": "batch",
+      "error": "..."
+    }
+  }
+}
+```
+
+This registry exists because a finished extract run marks all of its claimed
+classification partitions completed regardless of individual row outcomes, so rows that
+produced no mentions are never revisited. It is **diagnostic, not control flow**: nothing
+reads it to decide what to process, and writing it does not change which partitions are
+skipped. What it provides is a durable, queryable work-list of dropped rows — previously
+recoverable only by parsing every `extractor-runs/run_id=*/full.jsonl` audit file.
+
+Entries are keyed by `item_id` and accumulate across runs. A row that succeeds in a later
+run (typically a `--force` re-extract) has its entry removed, so the registry always
+reflects the latest known outcome per row rather than a growing history. Retrying the
+listed rows is still manual, and still partition-granular via `--force`.
 
 ## Operational Semantics
 

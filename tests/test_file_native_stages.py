@@ -10,7 +10,12 @@ import pytest
 
 from cdt.classifier import classifications_root, classify_pending_items
 from cdt.classifier import core as classifier_core
-from cdt.datasets import shard_for_accession
+from cdt.datasets import (
+    completion_registry_path,
+    existing_date_shard_partition_ids,
+    load_row_failures,
+    shard_for_accession,
+)
 from cdt.extractor import extract_pending_items, mentions_root
 from cdt.extractor.core import (
     ExtractionRowState,
@@ -39,6 +44,8 @@ from cdt.storage import (
     artifact_exists,
     coerce_dataset_text,
     read_dataset,
+    read_json_artifact,
+    read_table,
     write_partition_table,
 )
 
@@ -358,6 +365,11 @@ def test_classify_pending_items_skips_empty_outputs_on_rerun(
     """Empty classifier results should not write parquet and should not rerun."""
     seed_document_partition(tmp_path)
     itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
+    monkeypatch.setattr(
+        classifier_core,
+        "load_training_artifacts",
+        lambda path: (FakeModel(), 0.5, {"threshold": 0.5}),
+    )
     calls = 0
 
     def fake_classify_items(*args: object, **kwargs: object) -> pd.DataFrame:
@@ -1637,3 +1649,527 @@ def test_retry_includes_prior_response_as_assistant_turn() -> None:
             "content": "Your previous NER output failed validation: unclosed tag",
         },
     ]
+
+
+def test_extract_failures_are_recorded_and_cleared(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dropped row lands in the failure registry; a later success clears it."""
+    seed_document_partition(tmp_path)
+    itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
+    monkeypatch.setattr(
+        classifier_core,
+        "load_training_artifacts",
+        lambda path: (FakeModel(), 0.5, {"threshold": 0.5}),
+    )
+    classify_pending_items(artifact_root=tmp_path, batch_size=5)
+
+    async def failing_workflow(**kwargs: object) -> ExtractionRowState:
+        row_state = ExtractionRowState(
+            item_row=kwargs["item_row"], stage_name="instrument_ie"
+        )
+        row_state.add_validation(["instrument_ie did not return valid JSON"])
+        row_state.finish("ERROR")
+        return row_state
+
+    monkeypatch.setattr("cdt.extractor.core.run_extraction_workflow", failing_workflow)
+    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+
+    # The partition is registered complete even though the row produced nothing,
+    # which is exactly why the failure has to be recorded somewhere durable.
+    assert (
+        "extract"
+        in read_json_artifact(
+            completion_registry_path("extract", artifact_root=tmp_path)
+        )["stage"]
+    )
+    failures = load_row_failures("extract", artifact_root=tmp_path)
+    assert len(failures) == 1
+    entry = next(iter(failures.values()))
+    assert entry["backend"] == "live"
+    assert entry["state"] == "ERROR"
+    assert entry["error"] == "instrument_ie did not return valid JSON"
+    assert entry["date"] and entry["shard"]
+
+    async def succeeding_workflow(**kwargs: object) -> ExtractionRowState:
+        item_row = kwargs["item_row"]
+        row_state = ExtractionRowState(item_row=item_row, stage_name="instrument_ie")
+        row_state.debt_instrument_mentions = [
+            {
+                "debt_instrument_mention_id": "m-1",
+                "item_id": item_row["item_id"],
+                "accession_number": item_row["accession_number"],
+                "cik": item_row["cik"],
+                "date": item_row["date"],
+                "raw_id": "i-1",
+                "name": "Term Loan",
+                "start_date": None,
+                "end_date": None,
+                "amount": None,
+                "amendment_of": None,
+                "retired_of": None,
+                "split_of": None,
+                "lenders_json": "[]",
+                "other_interested_parties_json": "[]",
+                "name_json": "{}",
+                "start_date_json": "{}",
+                "end_date_json": "{}",
+                "amount_json": "{}",
+            }
+        ]
+        row_state.finish("SUCCESS")
+        return row_state
+
+    monkeypatch.setattr(
+        "cdt.extractor.core.run_extraction_workflow", succeeding_workflow
+    )
+    extract_pending_items(artifact_root=tmp_path, batch_size=5, force=True, client=None)
+
+    assert load_row_failures("extract", artifact_root=tmp_path) == {}
+
+
+def test_existing_date_shard_partition_ids_lists_written_partitions(
+    tmp_path: Path,
+) -> None:
+    """The one-LIST partition-id set matches exactly what was written (#83)."""
+    root = tmp_path / "artifacts"
+    table = pd.DataFrame({"item_id": ["a"], "text": ["x"]})
+    write_partition_table(
+        str(root / "items"),
+        partition={"date": "2026-01-02", "shard": "0007"},
+        table=table,
+    )
+    write_partition_table(
+        str(root / "items"),
+        partition={"date": "2026-03-04", "shard": "0001"},
+        table=table,
+    )
+
+    ids = existing_date_shard_partition_ids("items", artifact_root=str(root))
+
+    assert ids == {("2026-01-02", "0007"), ("2026-03-04", "0001")}
+    assert (
+        existing_date_shard_partition_ids("mentions", artifact_root=str(root)) == set()
+    )
+
+
+def test_iter_date_shard_partitions_skips_orphaned_tempfiles(tmp_path: Path) -> None:
+    """A tempfile left by a crash between create and rename must not brick the scan (#68)."""
+    from cdt.datasets import iter_date_shard_partitions
+
+    root = tmp_path / "artifacts"
+    table = pd.DataFrame({"item_id": ["a"], "text": ["x"]})
+    write_partition_table(
+        str(root / "items"),
+        partition={"date": "2026-01-02", "shard": "0007"},
+        table=table,
+    )
+    (
+        root / "items" / "date=2026-01-02" / "shard=0007" / "tmpabc123.parquet"
+    ).write_bytes(b"")
+
+    paths = iter_date_shard_partitions("items", artifact_root=str(root))
+
+    assert len(paths) == 1
+    assert paths[0].endswith("date=2026-01-02/shard=0007/part-0000.parquet")
+
+
+def test_iter_date_shard_partitions_raises_on_non_canonical_data(
+    tmp_path: Path,
+) -> None:
+    """Real data laid out wrong must fail loudly, not silently empty the run.
+
+    Skipping a pre-migration flat file would let every stage process nothing
+    and exit 0 while ingest keeps counting the flat file's rows as ingested —
+    those filings would be invisible to the pipeline forever.
+    """
+    from cdt.datasets import iter_date_shard_partitions
+
+    root = tmp_path / "artifacts"
+    table = pd.DataFrame({"item_id": ["a"], "text": ["x"]})
+    write_partition_table(
+        str(root / "items"),
+        partition={"date": "2026-01-02", "shard": "0007"},
+        table=table,
+    )
+    (root / "items" / "items.parquet").write_bytes(b"")
+
+    with pytest.raises(ValueError, match="Non-canonical parquet file"):
+        iter_date_shard_partitions("items", artifact_root=str(root))
+
+
+def test_read_dataset_skips_orphaned_tempfiles(tmp_path: Path) -> None:
+    """Every read path, not just the partition scan, must survive an orphan.
+
+    ingest's existing-accession scan, its per-partition merge, the matcher, and
+    pipeline finalize all read through read_dataset; a zero-byte tmp*.parquet
+    orphan previously made each of them raise ArrowInvalid.
+    """
+    root = tmp_path / "artifacts" / "items"
+    table = pd.DataFrame({"item_id": ["a"], "text": ["x"]})
+    write_partition_table(
+        str(root),
+        partition={"date": "2026-01-02", "shard": "0007"},
+        table=table,
+    )
+    (root / "date=2026-01-02" / "shard=0007" / "tmpabc123.parquet").write_bytes(b"")
+
+    read = read_dataset(str(root))
+
+    assert read["item_id"].to_list() == ["a"]
+
+
+def test_pending_source_partitions_skips_orphans_and_raises_on_flat_files(
+    tmp_path: Path,
+) -> None:
+    """Fingerprint work selection follows the same stray contract as the scan.
+
+    Silently dropping a mis-laid-out real file here would run the stage on
+    nothing while ingest keeps counting the file's rows as ingested.
+    """
+    from cdt.datasets import pending_source_partitions
+
+    root = tmp_path / "artifacts"
+    table = pd.DataFrame({"item_id": ["a"], "text": ["x"]})
+    write_partition_table(
+        str(root / "items"),
+        partition={"date": "2026-01-02", "shard": "0007"},
+        table=table,
+    )
+    (
+        root / "items" / "date=2026-01-02" / "shard=0007" / "tmpabc123.parquet"
+    ).write_bytes(b"")
+
+    pending, _ = pending_source_partitions(
+        "classify", "items", "classifications", artifact_root=str(root)
+    )
+
+    assert len(pending) == 1
+    assert pending[0][0].endswith("date=2026-01-02/shard=0007/part-0000.parquet")
+
+    (root / "items" / "items.parquet").write_bytes(b"")
+
+    with pytest.raises(ValueError, match="Non-canonical parquet file"):
+        pending_source_partitions(
+            "classify", "items", "classifications", artifact_root=str(root)
+        )
+
+
+def test_completion_registry_saves_merge_concurrent_updates(tmp_path: Path) -> None:
+    """Overlapping writers must not lose each other's registry entries (#88).
+
+    A lost entry silently strands a partition (or fake-completes it with empty
+    item_ids), so saves overlay only the entries a run changed onto the freshest
+    persisted state instead of overwriting the file with a stale snapshot.
+    """
+    from cdt.datasets import (
+        CompletedPartition,
+        load_completion_registry,
+        save_completion_registry,
+    )
+
+    save_completion_registry(
+        "itemize", {"P": CompletedPartition(fingerprint="f1")}, artifact_root=tmp_path
+    )
+    writer_a = load_completion_registry("itemize", artifact_root=tmp_path)
+    writer_b = load_completion_registry("itemize", artifact_root=tmp_path)
+
+    writer_b["P"] = CompletedPartition(fingerprint="f2")
+    writer_b["Q"] = CompletedPartition(fingerprint="q1")
+    save_completion_registry("itemize", writer_b, artifact_root=tmp_path)
+
+    # A loaded P at f1 but never touched it; its save must not revert B's f2.
+    writer_a["R"] = CompletedPartition(fingerprint="r1")
+    save_completion_registry("itemize", writer_a, artifact_root=tmp_path)
+
+    final = load_completion_registry("itemize", artifact_root=tmp_path)
+    assert set(final) == {"P", "Q", "R"}
+    assert final["P"].fingerprint == "f2"
+    assert final["Q"].fingerprint == "q1"
+    assert final["R"].fingerprint == "r1"
+
+
+def test_pending_source_partitions_stamps_survive_concurrent_saves(
+    tmp_path: Path,
+) -> None:
+    """Legacy-entry stamping counts as a change and survives the merge (#88)."""
+    from cdt.datasets import (
+        CompletedPartition,
+        load_completion_registry,
+        pending_source_partitions,
+        save_completion_registry,
+    )
+
+    table = pd.DataFrame({"item_id": ["a"], "text": ["x"]})
+    source_path = write_partition_table(
+        str(tmp_path / "items"),
+        partition={"date": "2026-01-02", "shard": "0007"},
+        table=table,
+    )
+    # A v1-migrated entry: complete but fingerprint-less.
+    save_completion_registry(
+        "classify", {source_path: CompletedPartition()}, artifact_root=tmp_path
+    )
+
+    pending, registry = pending_source_partitions(
+        "classify", "items", "classifications", artifact_root=str(tmp_path)
+    )
+    assert pending == []
+    save_completion_registry("classify", registry, artifact_root=tmp_path)
+
+    final = load_completion_registry("classify", artifact_root=tmp_path)
+    assert final[source_path].fingerprint is not None
+
+
+def _seed_classifications(
+    tmp_path: Path, item_ids: list[str], *, date: str = "2024-01-02"
+) -> None:
+    """Write one classifications partition with the given relevant items."""
+    from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
+
+    rows = []
+    for item_id in item_ids:
+        row: dict[str, object] = {column: None for column in CLASSIFIED_ITEM_COLUMNS}
+        row.update(
+            {
+                "item_id": item_id,
+                "accession_number": item_id.split("-")[0],
+                "cik": "320193",
+                "date": date,
+                "item": "8.01",
+                "text": f"text for {item_id}",
+                "relevance": True,
+            }
+        )
+        rows.append(row)
+    write_partition_table(
+        str(classifications_root(tmp_path)),
+        partition={"date": date, "shard": "0001"},
+        table=pd.DataFrame(rows, columns=CLASSIFIED_ITEM_COLUMNS),
+    )
+
+
+def _fake_success_workflow(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Patch the extraction workflow to succeed with one mention per row."""
+    calls: list[str] = []
+
+    async def fake_workflow(**kwargs: object) -> ExtractionRowState:
+        item_row = kwargs["item_row"]
+        calls.append(str(item_row["item_id"]))
+        row_state = ExtractionRowState(item_row=item_row, stage_name="instrument_ie")
+        row_state.debt_instrument_mentions = [
+            {"item_id": str(item_row["item_id"]), "name": "Term Loan"}
+        ]
+        row_state.finish("SUCCESS")
+        return row_state
+
+    monkeypatch.setattr("cdt.extractor.core.run_extraction_workflow", fake_workflow)
+    return calls
+
+
+def test_late_arriving_rows_extract_after_partition_grows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rows merged into an already-processed partition are picked up (#62)."""
+    _seed_classifications(tmp_path, ["a-8-01"])
+    calls = _fake_success_workflow(monkeypatch)
+
+    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+    assert calls == ["a-8-01"]
+
+    # Ingest-style in-place merge: the partition object grows a new row.
+    _seed_classifications(tmp_path, ["a-8-01", "b-8-01"])
+    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+
+    # Only the new row is paid for, and the target holds both rows' mentions.
+    assert calls == ["a-8-01", "b-8-01"]
+    written = read_dataset(mentions_root(tmp_path))
+    assert sorted(written["item_id"]) == ["a-8-01", "b-8-01"]
+
+
+def test_infrastructure_error_aborts_and_preserves_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A provider failure stops the run; terminal rows are never re-paid (#49)."""
+    from cdt.datasets import load_completion_registry
+    from cdt.extractor.core import InfrastructureError
+
+    _seed_classifications(tmp_path, ["a-8-01", "b-8-01"])
+    calls: list[str] = []
+
+    async def failing_workflow(**kwargs: object) -> ExtractionRowState:
+        item_row = kwargs["item_row"]
+        calls.append(str(item_row["item_id"]))
+        if str(item_row["item_id"]) == "b-8-01":
+            raise InfrastructureError("PaymentRequiredResponseError: 402")
+        row_state = ExtractionRowState(item_row=item_row, stage_name="instrument_ie")
+        row_state.debt_instrument_mentions = [
+            {"item_id": str(item_row["item_id"]), "name": "Term Loan"}
+        ]
+        row_state.finish("SUCCESS")
+        return row_state
+
+    monkeypatch.setattr("cdt.extractor.core.run_extraction_workflow", failing_workflow)
+    with pytest.raises(InfrastructureError):
+        extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+
+    registry = load_completion_registry("extract", artifact_root=tmp_path)
+    (entry,) = registry.values()
+    assert not entry.complete
+    assert entry.item_ids == frozenset({"a-8-01"})
+    # The finished row's mentions survived the abort.
+    assert sorted(read_dataset(mentions_root(tmp_path))["item_id"]) == ["a-8-01"]
+
+    # Recovery: a healthy run pays only for the row that never got a verdict.
+    recovery_calls = _fake_success_workflow(monkeypatch)
+    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+    assert recovery_calls == ["b-8-01"]
+    registry = load_completion_registry("extract", artifact_root=tmp_path)
+    (entry,) = registry.values()
+    assert entry.complete
+    assert sorted(read_dataset(mentions_root(tmp_path))["item_id"]) == [
+        "a-8-01",
+        "b-8-01",
+    ]
+
+
+def test_infrastructure_error_classification() -> None:
+    """Status- and name-shaped provider errors classify as infrastructure."""
+    from cdt.extractor.core import is_infrastructure_error
+
+    class PaymentRequiredResponseError(Exception):
+        pass
+
+    class WithStatus(Exception):
+        status_code = 503
+
+    assert is_infrastructure_error(PaymentRequiredResponseError())
+    assert is_infrastructure_error(WithStatus())
+    assert is_infrastructure_error(ConnectionResetError())
+    assert not is_infrastructure_error(ValueError("bad xml"))
+
+
+def test_grown_document_partition_reitemizes_and_reclassifies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Late-arriving documents merged into a partition flow downstream (#62)."""
+
+    def _doc(accession: str) -> dict[str, object]:
+        return {
+            "accession_number": accession,
+            "cik": "320193",
+            "company_name": "Example Inc.",
+            "url": "https://sec.example/full.txt",
+            "text": (
+                "\nITEM INFORMATION: Other Events\n<DOCUMENT>\n<TYPE>8-K\n<TEXT>\n"
+                "Item 8.01 Other Events.\nThis is the extracted event text.\n"
+                "</TEXT>\n</DOCUMENT>\n"
+            ),
+            "date": "2024-01-02",
+            "resource_uri": None,
+        }
+
+    def _write_documents(accessions: list[str]) -> None:
+        write_partition_table(
+            str(tmp_path / "documents"),
+            partition={"date": "2024-01-02", "shard": "0001"},
+            table=pd.DataFrame([_doc(a) for a in accessions], columns=DOCUMENT_COLUMNS),
+        )
+
+    class SizedFakeModel:
+        def decision_function(self: SizedFakeModel, texts: list[str]) -> list[float]:
+            return [2.0] * len(texts)
+
+    monkeypatch.setattr(
+        classifier_core,
+        "load_training_artifacts",
+        lambda path: (SizedFakeModel(), 0.5, {"threshold": 0.5}),
+    )
+
+    _write_documents(["000114036126006577"])
+    itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
+    classify_pending_items(artifact_root=tmp_path, batch_size=5)
+    assert len(read_dataset(classifications_root(tmp_path))) == 1
+
+    # Ingest-style merge: the same partition object grows a second filing.
+    _write_documents(["000114036126006577", "000114036126009999"])
+    itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
+    classify_pending_items(artifact_root=tmp_path, batch_size=5)
+
+    classified = read_dataset(classifications_root(tmp_path))
+    assert sorted(classified["accession_number"].astype(str).unique()) == [
+        "000114036126006577",
+        "000114036126009999",
+    ]
+
+
+def test_match_pending_mentions_renews_lease_per_shard(tmp_path: Path) -> None:
+    """The matcher extends the writer lease before rewriting each shard (#89)."""
+    for index, (cik, date_value, shard) in enumerate(
+        [("320193", "2024-01-02", "0001"), ("789019", "2024-01-03", "0002")], start=1
+    ):
+        write_partition_table(
+            tmp_path / "mentions",
+            partition={"date": date_value, "shard": shard},
+            table=pd.DataFrame(
+                [
+                    build_mention_row(
+                        mention_id=f"m-{index}",
+                        item_id=f"item-{index}",
+                        accession_number=f"000{index}",
+                        cik=cik,
+                        date=date_value,
+                        name="Term Loan",
+                        start_date="2024-01-01",
+                        amount="$100 million",
+                    )
+                ]
+            ),
+        )
+    renewals: list[int] = []
+
+    match_pending_mentions(
+        artifact_root=tmp_path, batch_size=5, renew=lambda: renewals.append(1)
+    )
+
+    assert len(renewals) == 2
+
+
+def test_read_table_projects_columns_and_tolerates_missing_ones(
+    tmp_path: Path,
+) -> None:
+    """Column projection is pushed down; absent columns reindex instead of raising (#69)."""
+    from cdt.storage import write_table
+
+    path = tmp_path / "table.parquet"
+    write_table(path, pd.DataFrame({"a": [1, 2], "b": ["x", "y"]}))
+
+    projected = read_table(path, ["a"])
+    assert list(projected.columns) == ["a"]
+
+    tolerant = read_table(path, ["a", "missing"])
+    assert list(tolerant.columns) == ["a", "missing"]
+    assert tolerant["missing"].isna().all()
+
+
+def test_classifier_loads_model_once_per_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pickled model is deserialized once, not once per partition (#76)."""
+    seed_document_partitions(tmp_path)
+    itemize_pending_documents(artifact_root=tmp_path, batch_size=1)
+    loads = 0
+
+    def counting_load(path: object) -> tuple[FakeModel, float, dict[str, float]]:
+        nonlocal loads
+        del path
+        loads += 1
+        return (FakeModel(), 0.5, {"threshold": 0.5})
+
+    monkeypatch.setattr(classifier_core, "load_training_artifacts", counting_load)
+
+    classified = classify_pending_items(artifact_root=tmp_path, batch_size=1)
+
+    assert len(classified) == 2
+    assert loads == 1

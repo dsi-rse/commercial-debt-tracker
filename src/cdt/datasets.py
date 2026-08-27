@@ -4,19 +4,29 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
+from typing import Self, cast
 
 from cdt import settings
+from cdt.shared import get_logger
 from cdt.storage import (
     ArtifactPath,
     artifact_exists,
+    is_orphaned_temp_artifact,
     join_artifact_path,
     list_artifacts,
+    list_artifacts_with_versions,
     normalize_artifact_path,
     read_json_artifact,
+    read_json_artifact_versioned,
+    replace_json_artifact_if_match,
     write_json_artifact,
+    write_json_artifact_if_absent,
 )
+
+LOGGER = get_logger(__name__)
 
 ITEMIZE_CLASSIFY_EXTRACT_SHARDS = 8
 MATCH_SHARDS = 64
@@ -85,25 +95,184 @@ def completion_registry_path(
     )
 
 
+@dataclass
+class CompletedPartition:
+    """One source partition's completion record (registry v2).
+
+    ``fingerprint`` is the source object's version at processing time (S3 ETag;
+    size+mtime locally); None on entries migrated from the v1 path list, which
+    read as "complete as recorded, reprocess if the source ever changes".
+    ``item_ids`` (extract only) are the content-terminal rows — SUCCESS or
+    FAILED-on-validation — so re-processing a partition is row-level and never
+    re-pays rows that already have a real outcome (#49, #62).
+    """
+
+    fingerprint: str | None = None
+    item_ids: frozenset[str] = frozenset()
+    # False when some relevant rows are not yet content-terminal (an aborted or
+    # infra-interrupted pass): the partition stays pending and only the rows
+    # missing from item_ids are processed next time.
+    complete: bool = True
+
+
+class CompletionRegistry(dict[str, CompletedPartition]):
+    """A loaded completion registry that remembers which keys the run changed.
+
+    Registries have concurrent writers with no other serialization guarantee
+    (a scheduled daily run, an hourly poll tick, and manual CLI stage runs can
+    overlap, #88), so a save must overlay only the entries this run actually
+    wrote onto the freshest persisted state — overlaying the whole loaded dict
+    would revert another writer's updates to entries this run merely read.
+    Entries must therefore be changed by assignment (``registry[key] = entry``),
+    never by mutating a loaded ``CompletedPartition`` in place.
+    """
+
+    def __init__(self: Self, *args: object, **kwargs: object) -> None:
+        """Initialize from loaded entries, which start out clean."""
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self.dirty: set[str] = set()
+
+    def __setitem__(self: Self, key: str, value: CompletedPartition) -> None:
+        """Record the entry and remember it as changed by this run."""
+        super().__setitem__(key, value)
+        self.dirty.add(key)
+
+    def setdefault(
+        self: Self, key: str, default: CompletedPartition | None = None
+    ) -> CompletedPartition:
+        """Insert-if-absent through __setitem__ so insertions count as changes."""
+        if key not in self:
+            self[key] = default if default is not None else CompletedPartition()
+        return self[key]
+
+
 def load_completed_partitions(
     stage_name: str,
     *,
     artifact_root: ArtifactPath | None = None,
     data_dir: Path | None = None,
 ) -> set[str]:
-    """Load completed source partitions for one stage."""
+    """Load completed source partition paths for one stage (v1-compatible view)."""
+    return {
+        path
+        for path, entry in load_completion_registry(
+            stage_name, artifact_root=artifact_root, data_dir=data_dir
+        ).items()
+        if entry.complete
+    }
+
+
+def load_completion_registry(
+    stage_name: str,
+    *,
+    artifact_root: ArtifactPath | None = None,
+    data_dir: Path | None = None,
+) -> CompletionRegistry:
+    """Load one stage's completion registry, migrating v1 path lists in memory."""
     path = completion_registry_path(
         stage_name, artifact_root=artifact_root, data_dir=data_dir
     )
     if not artifact_exists(path):
-        return set()
-    payload = read_json_artifact(path)
+        return CompletionRegistry()
+    return CompletionRegistry(_parse_registry_payload(read_json_artifact(path)))
+
+
+def _parse_registry_payload(payload: object) -> dict[str, CompletedPartition]:
+    """Parse a persisted registry payload (v2 or v1); junk reads as empty."""
     if not isinstance(payload, dict):
-        return set()
+        return {}
+    partitions = payload.get("partitions")
+    if isinstance(partitions, dict):
+        registry: dict[str, CompletedPartition] = {}
+        for key, entry in partitions.items():
+            if not str(key).strip() or not isinstance(entry, dict):
+                continue
+            fingerprint = entry.get("fingerprint")
+            item_ids = entry.get("item_ids", [])
+            registry[str(key)] = CompletedPartition(
+                fingerprint=str(fingerprint) if fingerprint else None,
+                item_ids=frozenset(
+                    str(item) for item in item_ids if isinstance(item_ids, list)
+                ),
+                complete=bool(entry.get("complete", True)),
+            )
+        return registry
     values = payload.get("source_partitions", [])
     if not isinstance(values, list):
-        return set()
-    return {str(value) for value in values if str(value).strip()}
+        return {}
+    return {str(value): CompletedPartition() for value in values if str(value).strip()}
+
+
+def _registry_payload(
+    stage_name: str, registry: dict[str, CompletedPartition]
+) -> dict[str, object]:
+    """Build the persisted v2 payload for one registry."""
+    return {
+        "stage": stage_name,
+        "version": 2,
+        "partitions": {
+            path: {
+                "fingerprint": entry.fingerprint,
+                **({"item_ids": sorted(entry.item_ids)} if entry.item_ids else {}),
+                **({} if entry.complete else {"complete": False}),
+            }
+            for path, entry in sorted(registry.items())
+        },
+    }
+
+
+# Losing this many consecutive compare-and-swap races means writers are churning
+# the registry far faster than any supported schedule; give up loudly.
+_REGISTRY_CAS_ATTEMPTS = 8
+
+
+def save_completion_registry(
+    stage_name: str,
+    registry: dict[str, CompletedPartition],
+    *,
+    artifact_root: ArtifactPath | None = None,
+    data_dir: Path | None = None,
+) -> str:
+    """Persist one stage's completion registry via compare-and-swap merge.
+
+    Registries have concurrent writers (daily vs poll vs manual CLI runs, #88),
+    and a blind overwrite loses every entry another writer persisted since this
+    run loaded its snapshot — including entries whose loss silently strands or
+    fake-completes partitions. Only the entries this run changed (the
+    ``CompletionRegistry.dirty`` set; every entry for a plain dict, which force
+    runs and tests pass) are overlaid on the freshest persisted state, and a
+    lost race re-reads and retries.
+    """
+    path = completion_registry_path(
+        stage_name, artifact_root=artifact_root, data_dir=data_dir
+    )
+    changed = sorted(
+        registry.dirty if isinstance(registry, CompletionRegistry) else registry
+    )
+    for _ in range(_REGISTRY_CAS_ATTEMPTS):
+        if not artifact_exists(path):
+            merged = {key: registry[key] for key in changed}
+            if write_json_artifact_if_absent(
+                path, _registry_payload(stage_name, merged)
+            ):
+                return path
+            continue
+        try:
+            payload, version = read_json_artifact_versioned(path)
+        except FileNotFoundError:
+            continue
+        merged = _parse_registry_payload(payload)
+        for key in changed:
+            merged[key] = registry[key]
+        if replace_json_artifact_if_match(
+            path, _registry_payload(stage_name, merged), version=version
+        ):
+            return path
+    msg = (
+        f"Lost {_REGISTRY_CAS_ATTEMPTS} compare-and-swap races persisting the "
+        f"{stage_name!r} completion registry at {path}"
+    )
+    raise RuntimeError(msg)
 
 
 def save_completed_partitions(
@@ -113,16 +282,98 @@ def save_completed_partitions(
     artifact_root: ArtifactPath | None = None,
     data_dir: Path | None = None,
 ) -> str:
-    """Persist completed source partitions for one stage."""
-    return write_json_artifact(
-        completion_registry_path(
-            stage_name, artifact_root=artifact_root, data_dir=data_dir
-        ),
-        {
-            "stage": stage_name,
-            "source_partitions": sorted(source_partitions),
-        },
+    """Persist completed partitions path-only (v1-compatible writer).
+
+    Merges into the v2 registry without fingerprints; callers migrating to
+    row-aware completion should use save_completion_registry directly.
+    """
+    registry = load_completion_registry(
+        stage_name, artifact_root=artifact_root, data_dir=data_dir
     )
+    for path in source_partitions:
+        registry.setdefault(path, CompletedPartition())
+    return save_completion_registry(
+        stage_name, registry, artifact_root=artifact_root, data_dir=data_dir
+    )
+
+
+def pending_source_partitions(
+    stage_name: str,
+    source_dataset: str,
+    target_dataset: str,
+    *,
+    artifact_root: ArtifactPath | None = None,
+    data_dir: Path | None = None,
+    force: bool = False,
+) -> tuple[list[tuple[str, str]], dict[str, CompletedPartition]]:
+    """Select source partitions a whole-partition stage still has to process.
+
+    Returns ``([(source_path, fingerprint), ...], registry)``. A partition is
+    pending when it has no completion entry or its source fingerprint changed —
+    ingest merges late-arriving rows into partition files in place, and a
+    path-level "target exists" skip silently strands those rows forever (#62).
+    Legacy entries (v1 lists, or targets that predate the registry) are stamped
+    with the current fingerprint in the returned registry so future growth is
+    detectable; the caller persists it via save_completion_registry.
+    """
+    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    registry = (
+        {}
+        if force
+        else load_completion_registry(
+            stage_name, artifact_root=resolved_root, data_dir=data_dir
+        )
+    )
+    # Same stray contract as iter_date_shard_partitions: an orphaned tempfile
+    # is junk to skip, but any other non-canonical parquet is real data laid
+    # out wrong — silently dropping it here would run the stage on nothing
+    # while ingest keeps counting the file's rows as ingested.
+    fingerprints: dict[str, str] = {}
+    for path, version in list_artifacts_with_versions(
+        dataset_root(source_dataset, artifact_root=resolved_root, data_dir=data_dir),
+        suffix=".parquet",
+    ).items():
+        if match_date_shard_partition(path) is not None:
+            fingerprints[path] = version
+            continue
+        if is_orphaned_temp_artifact(path):
+            LOGGER.warning("Skipping orphaned temp partition file: %s", path)
+            continue
+        msg = (
+            f"Non-canonical parquet file in dataset {source_dataset!r}: {path}. "
+            "Re-partition or remove it before running stages."
+        )
+        raise ValueError(msg)
+    existing_target_ids = (
+        set()
+        if force
+        else existing_date_shard_partition_ids(
+            target_dataset, artifact_root=resolved_root, data_dir=data_dir
+        )
+    )
+    pending: list[tuple[str, str]] = []
+    for source_path in sorted(fingerprints):
+        partition = parse_date_shard_partition(source_path)
+        fingerprint = fingerprints[source_path]
+        entry = registry.get(source_path)
+        if force:
+            pending.append((source_path, fingerprint))
+            continue
+        if entry is None:
+            if (partition["date"], partition["shard"]) in existing_target_ids:
+                registry[source_path] = CompletedPartition(fingerprint=fingerprint)
+                continue
+            pending.append((source_path, fingerprint))
+            continue
+        if entry.fingerprint == fingerprint:
+            continue
+        if entry.fingerprint is None:
+            # Reassign rather than mutate so the change lands in the registry's
+            # dirty set and survives the compare-and-swap merge on save (#88).
+            registry[source_path] = replace(entry, fingerprint=fingerprint)
+            continue
+        pending.append((source_path, fingerprint))
+    return pending, registry
 
 
 def failure_registry_path(
@@ -137,6 +388,56 @@ def failure_registry_path(
         "failures",
         stage_name,
         "failures.json",
+    )
+
+
+def load_row_failures(
+    stage_name: str,
+    *,
+    artifact_root: ArtifactPath | None = None,
+    data_dir: Path | None = None,
+) -> dict[str, dict[str, object]]:
+    """Load one stage's row-level failure registry, keyed by row id."""
+    path = failure_registry_path(
+        stage_name, artifact_root=artifact_root, data_dir=data_dir
+    )
+    if not artifact_exists(path):
+        return {}
+    payload = read_json_artifact(path)
+    if not isinstance(payload, dict):
+        return {}
+    failures = payload.get("failures", {})
+    if not isinstance(failures, dict):
+        return {}
+    return {
+        str(key): cast(dict[str, object], value)
+        for key, value in failures.items()
+        if isinstance(value, dict)
+    }
+
+
+def save_row_failures(
+    stage_name: str,
+    failures: dict[str, dict[str, object]],
+    *,
+    artifact_root: ArtifactPath | None = None,
+    data_dir: Path | None = None,
+) -> str:
+    """Persist one stage's row-level failure registry.
+
+    Unlike the completion registry this is diagnostic, not control flow: nothing
+    reads it to decide what to process. It exists so rows that a run dropped are
+    recoverable as a work-list instead of only appearing in an audit log.
+    """
+    return write_json_artifact(
+        failure_registry_path(
+            stage_name, artifact_root=artifact_root, data_dir=data_dir
+        ),
+        {
+            "stage": stage_name,
+            "failure_count": len(failures),
+            "failures": {key: failures[key] for key in sorted(failures)},
+        },
     )
 
 
@@ -187,13 +488,23 @@ def cik_shard_partition_path(
     )
 
 
+def match_date_shard_partition(path: ArtifactPath) -> dict[str, str] | None:
+    """Match a canonical date/shard partition path, or None when non-canonical.
+
+    The single matcher behind both the strict parser and the dataset scan, so
+    the two can never drift on what counts as a canonical layout.
+    """
+    match = PARTITION_PATTERN.search(normalize_artifact_path(path))
+    return match.groupdict() if match else None
+
+
 def parse_date_shard_partition(path: ArtifactPath) -> dict[str, str]:
     """Parse a canonical date/shard partition path."""
-    normalized = normalize_artifact_path(path)
-    match = PARTITION_PATTERN.search(normalized)
-    if match is None:
+    partition = match_date_shard_partition(path)
+    if partition is None:
+        normalized = normalize_artifact_path(path)
         raise ValueError(f"Unrecognized date/shard partition path: {normalized}")
-    return match.groupdict()
+    return partition
 
 
 def parse_cik_shard_partition(path: ArtifactPath) -> dict[str, str]:
@@ -220,7 +531,22 @@ def iter_date_shard_partitions(
     )
     filtered: list[str] = []
     for path in paths:
-        partition = parse_date_shard_partition(path)
+        partition = match_date_shard_partition(path)
+        if partition is None:
+            # A tempfile orphaned by a crash mid-write_table is junk and must
+            # not brick every stage until someone deletes it by hand (#68). Any
+            # other non-canonical parquet is real data laid out wrong (e.g. a
+            # pre-migration flat file); skipping it would silently run the
+            # pipeline on nothing while ingest keeps counting its rows as
+            # already ingested, so fail loudly instead.
+            if is_orphaned_temp_artifact(path):
+                LOGGER.warning("Skipping orphaned temp partition file: %s", path)
+                continue
+            msg = (
+                f"Non-canonical parquet file in dataset {dataset_name!r}: {path}. "
+                "Re-partition or remove it before running stages."
+            )
+            raise ValueError(msg)
         partition_date = date.fromisoformat(partition["date"])
         if start_date is not None and partition_date < start_date:
             continue
@@ -228,6 +554,30 @@ def iter_date_shard_partitions(
             continue
         filtered.append(path)
     return filtered
+
+
+def existing_date_shard_partition_ids(
+    dataset_name: str,
+    *,
+    artifact_root: ArtifactPath | None = None,
+    data_dir: Path | None = None,
+) -> set[tuple[str, str]]:
+    """Return the ``(date, shard)`` ids of every written partition in a dataset.
+
+    One LIST of the dataset answers "does the output partition exist?" for any
+    number of source partitions. The per-partition alternative — a HeadObject on
+    each candidate target — costs one sequential round-trip per partition ever
+    written and dominates stage runtime once the dataset is large (#83).
+    """
+    return {
+        (partition["date"], partition["shard"])
+        for partition in (
+            parse_date_shard_partition(path)
+            for path in iter_date_shard_partitions(
+                dataset_name, artifact_root=artifact_root, data_dir=data_dir
+            )
+        )
+    }
 
 
 def iter_cik_shard_partitions(
@@ -247,14 +597,24 @@ def iter_cik_shard_partitions(
     ]
 
 
+def shard_label(value: str, shard_count: int) -> str:
+    """Return the canonical shard label for one key.
+
+    The single source for the shard contract — crc32, modulo, four-digit label —
+    that PARTITION_PATTERN and every partition directory name depend on. Any
+    change here strands existing partitions (#61), so change it nowhere else.
+    """
+    return f"{zlib_crc32(value) % shard_count:04d}"
+
+
 def shard_for_accession(accession_number: str) -> str:
     """Return the canonical date/shard partition for one accession."""
-    return f"{zlib_crc32(accession_number) % ITEMIZE_CLASSIFY_EXTRACT_SHARDS:04d}"
+    return shard_label(accession_number, ITEMIZE_CLASSIFY_EXTRACT_SHARDS)
 
 
 def shard_for_cik(cik: str) -> str:
     """Return the canonical cik-shard partition for one CIK."""
-    return f"{zlib_crc32(cik) % MATCH_SHARDS:04d}"
+    return shard_label(cik, MATCH_SHARDS)
 
 
 def zlib_crc32(value: str) -> int:

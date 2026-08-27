@@ -1,99 +1,34 @@
+# PR quality gate. Thin caller of the shared composition pipeline-checks.yml
+# (lint, test, security, pulumi preview), pinned to an exact release of
+# dsi-rse/idi-ftm2j-shared. Bump the @vX.Y.Z pin to upgrade.
+#
+# No paths-ignore here: the four job names are required checks on the dev and
+# main rulesets, and a skipped required check never reports, so a docs-only PR
+# would sit unmergeable.
 name: Checks
 
 on:
   pull_request:
-    branches: [main, dev]
-    paths-ignore:
-      - "**.md"
-      - "docs/**"
+    branches:
+      - main
+      - dev
   workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
-env:
-  PROJECT_DIR: .
+permissions:
+  contents: read
+  id-token: write          # OIDC for the pulumi preview role
+  security-events: write   # CodeQL upload
 
 jobs:
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
-        with:
-          version: latest
-          python-version: "3.13"
-      - name: Install dependencies
-        run: uv sync --all-groups
-      - name: Lint
-        run: uv run ruff check .
-      - name: Format check
-        run: uv run ruff format --check .
-
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
-        with:
-          version: latest
-          python-version: "3.13"
-      - name: Install dependencies
-        run: uv sync --all-groups
-      - name: Test
-        run: uv run pytest -v
-
-  security:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      security-events: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
-        with:
-          version: latest
-          python-version: "3.13"
-      - name: Install dependencies
-        run: uv sync --all-groups
-      - name: Dependency vulnerability scan
-        run: uv run --with pip-audit pip-audit --desc
-      - name: CodeQL init
-        uses: github/codeql-action/init@v4
-        with:
-          languages: python
-      - name: CodeQL analyze
-        uses: github/codeql-action/analyze@v4
-
-  pulumi-preview:
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
-    env:
-      PULUMI_CONFIG_PASSPHRASE: ${{ secrets.PULUMI_CONFIG_PASSPHRASE }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
-        with:
-          version: latest
-          python-version: "3.13"
-      - name: Install dependencies
-        run: uv sync --group pulumi
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN_CHECKS }}
-          role-session-name: idi-github-ci
-          aws-region: ${{ secrets.AWS_REGION || 'us-east-2' }}
-      - name: Pulumi preview
-        run: |
-          cd pulumi
-          pulumi login s3://${{ secrets.PULUMI_STATE_BUCKET }}
-          if [ "${{ github.base_ref }}" = "main" ]; then
-            pulumi stack select prod 2>/dev/null || pulumi stack init prod
-          else
-            pulumi stack select dev 2>/dev/null || pulumi stack init dev
-          fi
-          uv run pulumi preview --non-interactive
+  checks:
+    uses: dsi-rse/idi-ftm2j-shared/.github/workflows/pipeline-checks.yml@v0.1.19
+    secrets: inherit
+    with:
+      app-name: cdt
+      # The importable package is plain `cdt`, not `idi_cdt` — off-convention,
+      # but it is the name --cov has to be given to measure anything.
+      cov-package: cdt

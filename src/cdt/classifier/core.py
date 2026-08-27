@@ -15,19 +15,18 @@ import pandas as pd
 
 from cdt import settings
 from cdt.datasets import (
+    CompletedPartition,
     completion_registry_path,
     dataset_root,
     date_shard_partition_path,
-    iter_date_shard_partitions,
-    load_completed_partitions,
     parse_date_shard_partition,
+    pending_source_partitions,
     resolve_artifact_root,
     run_manifest_path,
-    save_completed_partitions,
+    save_completion_registry,
 )
 from cdt.itemizer.core import ITEM_COLUMNS, ITEM_DATASET_NAME
 from cdt.storage import (
-    artifact_exists,
     read_table,
     write_json_artifact,
     write_partition_table,
@@ -147,14 +146,23 @@ def classify_items(
     data_dir: Path | None = None,
     model_dir: Path | None = None,
     force: bool = False,
+    artifacts: tuple[object, float] | None = None,
 ) -> pd.DataFrame:
-    """Classify in-memory item rows using a saved binary model."""
+    """Classify in-memory item rows using a saved binary model.
+
+    ``artifacts`` is a pre-loaded ``(model, threshold)`` pair; callers looping
+    over partitions pass it so the pickle is deserialized once per run instead
+    of once per partition (#76).
+    """
     del force
     if items.empty:
         return pd.DataFrame(columns=CLASSIFIED_ITEM_COLUMNS)
 
-    resolved_model_dir = model_dir or default_model_dir(data_dir)
-    model, threshold, _ = load_training_artifacts(resolved_model_dir)
+    if artifacts is not None:
+        model, threshold = artifacts
+    else:
+        resolved_model_dir = model_dir or default_model_dir(data_dir)
+        model, threshold, _ = load_training_artifacts(resolved_model_dir)
     classified = items.copy()
     texts = [normalize_text(str(value)) for value in classified["text"].fillna("")]
     scores = score_model(model, texts)
@@ -186,35 +194,29 @@ def classify_pending_items(
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     processed_frames: list[pd.DataFrame] = []
     partitions_written: list[str] = []
-    completed_item_paths = (
-        set()
-        if force
-        else load_completed_partitions(
-            "classify", artifact_root=resolved_root, data_dir=data_dir
-        )
-    )
     visited_item_paths: set[str] = set()
     empty_partitions = 0
-    pending_item_paths: list[str] = []
-
-    for item_path in iter_date_shard_partitions(
+    # Fingerprint-keyed selection: an items partition the itemizer rewrote (its
+    # source grew) is pending again and recomputed whole — classification is
+    # cheap and deterministic, so row-level diffing is not worth it here (#62).
+    pending_with_fingerprints, registry = pending_source_partitions(
+        "classify",
         ITEM_DATASET_NAME,
+        CLASSIFICATION_DATASET_NAME,
         artifact_root=resolved_root,
         data_dir=data_dir,
-    ):
-        partition = parse_date_shard_partition(item_path)
-        target_path = date_shard_partition_path(
-            CLASSIFICATION_DATASET_NAME,
-            partition_date=partition["date"],
-            shard=partition["shard"],
-            artifact_root=resolved_root,
-            data_dir=data_dir,
-        )
-        if not force and artifact_exists(target_path):
-            continue
-        if not force and item_path in completed_item_paths:
-            continue
-        pending_item_paths.append(item_path)
+        force=force,
+    )
+    pending_item_paths = [path for path, _ in pending_with_fingerprints]
+    source_fingerprints = dict(pending_with_fingerprints)
+
+    # Unpickle the model once per run: per-partition loads dominate large
+    # backfills with redundant deserialization and S3 GETs (#76).
+    artifacts: tuple[object, float] | None = None
+    if pending_item_paths:
+        resolved_model_dir = model_dir or default_model_dir(data_dir)
+        model, threshold, _ = load_training_artifacts(resolved_model_dir)
+        artifacts = (model, threshold)
 
     total_partitions = len(pending_item_paths)
     for chunk_start in range(0, total_partitions, batch_size):
@@ -231,6 +233,7 @@ def classify_pending_items(
                 batch_items,
                 data_dir=data_dir,
                 model_dir=model_dir,
+                artifacts=artifacts,
             )
             if classified.empty:
                 empty_partitions += 1
@@ -262,10 +265,13 @@ def classify_pending_items(
                 perf_counter() - partition_start,
             )
 
-    updated_completed_paths = completed_item_paths | visited_item_paths
-    save_completed_partitions(
+    for item_path in visited_item_paths:
+        registry[item_path] = CompletedPartition(
+            fingerprint=source_fingerprints.get(item_path)
+        )
+    save_completion_registry(
         "classify",
-        updated_completed_paths,
+        registry,
         artifact_root=resolved_root,
         data_dir=data_dir,
     )

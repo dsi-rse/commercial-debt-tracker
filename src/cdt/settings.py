@@ -28,5 +28,15 @@ DATA_DIR = resolve_path(Path(os.environ.get("DATA_DIR", str(DEFAULT_DATA_DIR))))
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get(
     "OPENROUTER_API_TOKEN"
 )
-EXTRACTOR_MODEL = os.environ.get("EXTRACTOR_MODEL", "openai/gpt-5.4")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+# Single source of truth for the extractor model id, as an OpenRouter slug. The
+# batch backend strips the provider prefix (``normalize_batch_model``), so both
+# backends stay on the same model when only this value changes.
+DEFAULT_EXTRACTOR_MODEL = "openai/gpt-5.4"
+EXTRACTOR_MODEL = os.environ.get("EXTRACTOR_MODEL") or DEFAULT_EXTRACTOR_MODEL
 EXTRACTOR_REASONING = os.environ.get("EXTRACTOR_REASONING", "none")
+# The OpenAI Batch API uses a reasoning_effort vocabulary distinct from
+# OpenRouter's, so the batch backend gets its own reasoning knob. It defaults to
+# the same model as the live backend.
+EXTRACTOR_BATCH_MODEL = os.environ.get("EXTRACTOR_BATCH_MODEL") or EXTRACTOR_MODEL
+EXTRACTOR_BATCH_REASONING = os.environ.get("EXTRACTOR_BATCH_REASONING", "none")

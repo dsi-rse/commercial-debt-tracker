@@ -66,6 +66,11 @@ ITEM_NAME_TO_NUMBER = {
     "financial statements and exhibits": "9.01",
 }
 
+# The closed set of real 8-K item numbers. A number that merely looks like one
+# ('6.00' from a rate table cell, '2.00' from a price) can never be a heading,
+# no matter how heading-shaped the line is (#63).
+VALID_ITEM_NUMBERS = frozenset(ITEM_NAME_TO_NUMBER.values())
+
 
 @dataclass(frozen=True)
 class DocumentText:
@@ -198,8 +203,17 @@ def extract_items_from_document(document: DocumentText) -> list[ItemSection]:
     lines = normalize_body_lines(primary_8k_body(document.text))
     headings = item_headings(lines)
     rows = []
+    # item_id is accession + item_number, so a header repeating an ITEM
+    # INFORMATION line (which SEC headers do produce) or two labels mapping to
+    # one number would emit duplicate primary keys and corrupt downstream joins
+    # (#74). Keep the first occurrence of each key.
+    seen_keys: set[str] = set()
     for item_information in iter_item_information_values(document.text):
         item_number = ITEM_NAME_TO_NUMBER.get(item_information)
+        key = item_number or item_information
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
         section = (
             extract_section(lines, headings, item_number)
             if item_number is not None
@@ -318,16 +332,22 @@ def leading_item_numbers(line: str) -> tuple[str, ...]:
     if any(phrase in normalized_casefold for phrase in NON_HEADING_PHRASES):
         return ()
 
+    # Only real 8-K item numbers count, and even those are rejected when they
+    # read as money or a rate: '$1.05 billion' inside a heading line, or a
+    # coupon like '5.25%' — '5.25% Senior Notes due 2029' as a body line (HTML
+    # table cells become their own lines) otherwise truncated the enclosing
+    # item section right at the debt text this pipeline targets (#63).
     item_match = re.match(r"^\s*Item\b(?P<rest>.*)$", normalized, re.IGNORECASE)
     if item_match:
-        return tuple(re.findall(r"\b\d\.\d\d\b", item_match.group("rest")))
+        numbers = re.findall(r"(?<![$€£])\b\d\.0\d\b(?!\s*%)", item_match.group("rest"))
+        return tuple(number for number in numbers if number in VALID_ITEM_NUMBERS)
 
     bare_match = re.match(
-        r"^\s*(?P<number>\d\.\d\d)\s*(?:[.:;\-)]|\b)",
+        r"^\s*(?P<number>\d\.0\d)(?!\s*%)\s*(?:[.:;\-)]|\b)",
         normalized,
         re.IGNORECASE,
     )
-    if bare_match:
+    if bare_match and bare_match.group("number") in VALID_ITEM_NUMBERS:
         return (bare_match.group("number"),)
 
     return ()

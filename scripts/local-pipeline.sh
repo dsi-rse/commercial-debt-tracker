@@ -17,9 +17,9 @@ fi
 local_mode="${LOCAL_MODE:-daily}"
 local_artifact_root="${LOCAL_ARTIFACT_ROOT:-${DATA_DIR}/commercial-debt-tracker/local}"
 local_final_database_root="${LOCAL_FINAL_DATABASE_ROOT:-${DATA_DIR}/commercial-debt-tracker/database/cdt}"
-local_bucket_name="${LOCAL_BUCKET_NAME:-idi-dev-processor-s3}"
+local_bucket_name="${LOCAL_BUCKET_NAME:-idi-dev-ftm2j-shared-processor-storage}"
 local_aws_profile="${LOCAL_AWS_PROFILE:-idi-analysis}"
-local_cik_file="${LOCAL_CIK_FILE:-${repo_root}/1000-ciks.txt}"
+local_cik_file="${LOCAL_CIK_FILE:-${repo_root}/data/ciks/1000-ciks.txt}"
 
 mode="${local_mode}"
 if [[ $# -gt 0 && ( "$1" == "daily" || "$1" == "historical" ) ]]; then

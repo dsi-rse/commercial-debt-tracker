@@ -1,7 +1,11 @@
-encryptionsalt: v1:JWVjlpZ0/a0=:v1:su9qnBOMO94oCTpZ:188uRevUp9fFa07l0qWG4GUwhpPr0Q==
-# Committed variable config for the dev stack. The processor bucket and scheduler
-# DLQ are read from SSM (/idi/dev/shared/*), so they are NOT set here; the paths
-# below are bucket-relative keys resolved against that shared bucket.
+# Committed variable config for the prod stack. The processor bucket and scheduler
+# DLQ are read from SSM (/idi/prod/shared/*), so they are NOT set here; the paths
+# below are bucket-relative keys resolved against that shared bucket. The API keys
+# are SSM SecureStrings set out-of-band, not config values.
+#
+# Deploying this stack is gated on the PROD_INFRA_READY repository variable, and
+# the schedules stay disabled (idi:schedule_enabled: "false") until a prod run has
+# been verified by hand; flip it to "true" then.
 config:
   aws:region: us-east-2
   idi:artifact_prefix: processors/cdt
@@ -12,12 +16,9 @@ config:
   idi:ecr_image_retention_count: "5"
   idi:cron: cron(0 7 * * ? *)
   idi:schedule_enabled: "false"
-  # The poller alone drives batch extraction; enabled so manual historical runs
-  # drain without hand-fired ticks while the daily schedule stays off.
-  idi:poll_schedule_enabled: "true"
   # Where every alarm notifies. Alerts stay off until the deploy role gains the
   # sns/cloudwatch/events statements from dsi-rse/idi-ftm2j-shared#79 — flipping
   # alerts_enabled before that redeploy fails with AccessDenied on CreateTopic.
-  # Once it lands, uncomment the line below; nothing else is needed.
+  # Enable alerts together with the schedules when prod goes live.
   idi:alert_email: tspread@uchicago.edu
   # idi:alerts_enabled: "true"

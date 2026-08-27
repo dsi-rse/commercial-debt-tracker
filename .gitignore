@@ -113,6 +113,8 @@ celerybeat-schedule
 
 # Environments
 .env
+# .envrc exports a machine-specific AWS profile/region; copy .envrc.example instead.
+.envrc
 .venv
 env/
 venv/
@@ -138,6 +140,10 @@ venv.bak/
 
 # data files
 *.avro
+
+# CIK universes and ad hoc CIK tables
+data/ciks/
+data/important-8K-filers.csv
 
 scripts/*
 !scripts/local-pipeline.sh

@@ -98,3 +98,41 @@ schedule = aws.scheduler.Schedule(
         ),
     ),
 )
+
+# Hourly poller that advances the OpenAI batch extract job. It reuses the same
+# scheduler role, cluster, task definition, and networking as the daily run; only
+# the container command differs. This is the "checks OpenAI ~hourly and promotes
+# each completed item to the next step" job from the design.
+poll_schedule = aws.scheduler.Schedule(
+    "cdt-poll-schedule",
+    name=f"{config.name_prefix}-poll-schedule",
+    description="Advances the CDT OpenAI batch extract job hourly",
+    schedule_expression=config.poll_schedule_expression,
+    flexible_time_window=aws.scheduler.ScheduleFlexibleTimeWindowArgs(mode="OFF"),
+    state="ENABLED" if config.poll_schedule_enabled else "DISABLED",
+    target=aws.scheduler.ScheduleTargetArgs(
+        arn=ecs.cluster.arn,
+        role_arn=scheduler_role.arn,
+        input=json.dumps(
+            {"containerOverrides": [{"name": ecs.CONTAINER_NAME, "command": ["poll"]}]}
+        ),
+        ecs_parameters=aws.scheduler.ScheduleTargetEcsParametersArgs(
+            task_definition_arn=ecs.task_definition.arn,
+            launch_type="FARGATE",
+            platform_version="LATEST",
+            propagate_tags="TASK_DEFINITION",
+            network_configuration=aws.scheduler.ScheduleTargetEcsParametersNetworkConfigurationArgs(
+                assign_public_ip=True,
+                subnets=[networking.primary_subnet_id],
+                security_groups=[networking.ecs_sg.id],
+            ),
+        ),
+        retry_policy=aws.scheduler.ScheduleTargetRetryPolicyArgs(
+            maximum_retry_attempts=2,
+            maximum_event_age_in_seconds=3600,
+        ),
+        dead_letter_config=aws.scheduler.ScheduleTargetDeadLetterConfigArgs(
+            arn=shared_dlq.arn,
+        ),
+    ),
+)

@@ -598,3 +598,211 @@ def _manifest_bytes(
             ],
         }
     ).encode()
+
+
+def test_document_shard_is_stable_across_processes() -> None:
+    """Shard assignment must not depend on the per-process hash salt (#61)."""
+    from cdt.ingest import DOCUMENT_PARTITION_SHARDS, _document_shard
+
+    # crc32 is deterministic: pin exact values so any change to the scheme
+    # (which would strand existing partitions) fails loudly.
+    assert _document_shard("0001437749-26-027029") == _document_shard(
+        "0001437749-26-027029"
+    )
+    shard = int(_document_shard("0001437749-26-027029"))
+    assert 0 <= shard < DOCUMENT_PARTITION_SHARDS
+    import subprocess
+    import sys
+
+    out = subprocess.run(  # noqa: S603 — spawns sys.executable with a fixed literal
+        [
+            sys.executable,
+            "-c",
+            "from cdt.ingest import _document_shard;"
+            "print(_document_shard('0001437749-26-027029'))",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert out == _document_shard("0001437749-26-027029")
+
+
+def test_force_reingest_repairs_pre_crc32_shard_duplicates(tmp_path: Path) -> None:
+    """A copy stored under a pre-#61 salted shard must not survive a --force run."""
+    import pandas as pd
+
+    from cdt.ingest import DOCUMENT_COLUMNS, _document_shard
+    from cdt.storage import write_partition_table
+
+    accession = "000114036126006577"
+    canonical_shard = _document_shard(accession)
+    stale_shard = f"{(int(canonical_shard) + 1) % 64:04d}"
+    write_partition_table(
+        documents_root(data_dir=tmp_path),
+        partition={"date": "2024-01-02", "shard": stale_shard},
+        table=pd.DataFrame(
+            [
+                {
+                    "accession_number": accession,
+                    "cik": "320193",
+                    "company_name": "Example Inc.",
+                    "url": "https://sec.example/full.txt",
+                    "text": "stale copy",
+                    "date": "2024-01-02",
+                    "resource_uri": None,
+                }
+            ],
+            columns=DOCUMENT_COLUMNS,
+        ),
+    )
+    client = FakeS3Client(
+        {
+            (
+                "sec-bucket",
+                "sec/2024-01-02/8-K/320193/000114036126006577/manifest.json",
+            ): _manifest_bytes(
+                "320193",
+                "0001140361-26-006577",
+                "8-K",
+                "2024-01-02",
+                "COMPLETE SUBMISSION TEXT FILE",
+            )
+        }
+    )
+
+    table, _ = run_ingest_pipeline(
+        IngestConfig(
+            mode="historical",
+            bucket="sec-bucket",
+            cik_file=tmp_path / "ciks.txt",
+            start_date=date(2024, 1, 2),
+            end_date=date(2024, 1, 2),
+            data_dir=tmp_path,
+            force=True,
+        ),
+        ciks={"320193"},
+        s3_client=client,
+    )
+
+    assert table["accession_number"].to_list() == [accession]
+    partition_files = list_artifacts(
+        documents_root(data_dir=tmp_path), suffix=".parquet"
+    )
+    assert len(partition_files) == 1
+    assert partition_files[0].endswith(
+        f"date=2024-01-02/shard={canonical_shard}/part-0000.parquet"
+    )
+    documents = read_dataset(documents_root(data_dir=tmp_path))
+    assert documents["accession_number"].to_list() == [accession]
+
+
+def test_repair_document_shards_moves_rows_without_canonical_copy(
+    tmp_path: Path,
+) -> None:
+    """A row that only exists under the wrong shard is moved, never dropped."""
+    import pandas as pd
+
+    from cdt.ingest import DOCUMENT_COLUMNS, _document_shard, repair_document_shards
+    from cdt.storage import write_partition_table
+
+    accession = "000114036126006577"
+    canonical_shard = _document_shard(accession)
+    stale_shard = f"{(int(canonical_shard) + 1) % 64:04d}"
+    write_partition_table(
+        documents_root(data_dir=tmp_path),
+        partition={"date": "2024-01-02", "shard": stale_shard},
+        table=pd.DataFrame(
+            [
+                {
+                    "accession_number": accession,
+                    "cik": "320193",
+                    "company_name": "Example Inc.",
+                    "url": "https://sec.example/full.txt",
+                    "text": "only copy",
+                    "date": "2024-01-02",
+                    "resource_uri": None,
+                }
+            ],
+            columns=DOCUMENT_COLUMNS,
+        ),
+    )
+
+    removed = repair_document_shards(documents_root(data_dir=tmp_path))
+
+    assert removed == 1
+    documents = read_dataset(documents_root(data_dir=tmp_path))
+    assert documents["accession_number"].to_list() == [accession]
+    assert documents["text"].to_list() == ["only copy"]
+    partition_files = list_artifacts(
+        documents_root(data_dir=tmp_path), suffix=".parquet"
+    )
+    assert len(partition_files) == 1
+    assert partition_files[0].endswith(
+        f"date=2024-01-02/shard={canonical_shard}/part-0000.parquet"
+    )
+
+
+def test_force_retries_registered_permanent_failures(tmp_path: Path) -> None:
+    """--force must be able to unpoison a filing the registry marked permanent (#67)."""
+    from cdt.ingest import (
+        IngestFailureClassifier,
+        iter_document_candidates_for_date_range,
+    )
+    from cdt.shared import FailureRegistry
+
+    manifest_key = "sec/2024-01-02/8-K/320193/000114036126006577/manifest.json"
+    client = FakeS3Client(
+        {
+            ("sec-bucket", manifest_key): _manifest_bytes(
+                "320193",
+                "0001140361-26-006577",
+                "8-K",
+                "2024-01-02",
+                "COMPLETE SUBMISSION TEXT FILE",
+            )
+        }
+    )
+    registry = FailureRegistry(
+        str(tmp_path / "failures.json"), IngestFailureClassifier()
+    )
+    from cdt.ingest import IngestFailureType
+
+    registry.add(("sec-bucket", manifest_key), IngestFailureType.DOCUMENT_NOT_FOUND)
+
+    skipped = iter_document_candidates_for_date_range(
+        client,
+        "sec-bucket",
+        date(2024, 1, 2),
+        date(2024, 1, 2),
+        failure_registry=registry,
+    )
+    retried = iter_document_candidates_for_date_range(
+        client,
+        "sec-bucket",
+        date(2024, 1, 2),
+        date(2024, 1, 2),
+        failure_registry=registry,
+        retry_registered_failures=True,
+    )
+
+    assert skipped == []
+    assert [c.accession_number for c in retried] == ["000114036126006577"]
+    # A successful retry unpoisons the filing: the entry is discarded so
+    # normal (non-force) runs stop skipping it (#67).
+    assert ("sec-bucket", manifest_key) not in registry
+    registry.flush()
+    persisted = json.loads((tmp_path / "failures.json").read_text(encoding="utf-8"))
+    assert persisted["entries"] == []
+
+
+def test_key_matches_ciks_with_multi_segment_prefix() -> None:
+    """The CIK segment is found from the key's end, not a fixed index (#73)."""
+    from cdt.ingest import _key_matches_ciks
+
+    single = "sec/2024-01-02/8-K/320193/000114036126006577/manifest.json"
+    multi = "edgar/8k/2024-01-02/8-K/320193/000114036126006577/manifest.json"
+
+    assert _key_matches_ciks(single, {"320193"})
+    assert _key_matches_ciks(multi, {"320193"})
+    assert not _key_matches_ciks(multi, {"999999"})

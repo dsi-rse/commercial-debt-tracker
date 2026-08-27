@@ -36,13 +36,19 @@ The deployed service is a single ECS Fargate task running `cdt-orchestrator`, wi
 - a container image built from [dockerfiles/Dockerfile.orchestrator](dockerfiles/Dockerfile.orchestrator)
 - infrastructure provisioned from [`pulumi/`](pulumi/)
 - a daily EventBridge Scheduler trigger that runs `cdt-orchestrator daily`
+- an hourly EventBridge Scheduler trigger that runs `cdt-orchestrator poll`
 - manual historical backfills via ECS task command overrides or the `run-historical` GitHub Actions workflow
 
-The GitHub Actions deployment path is:
+The deployed `daily` run does ingest → itemize → classify and refreshes match/final
+snapshots, but hands the expensive LLM extract stage to OpenAI's Batch API. The hourly
+`poll` run advances that asynchronous batch job one step at a time and re-runs match +
+finalize when it completes. See [docs/architecture.md](docs/architecture.md) for the
+extract state machine.
 
-1. build and push the orchestrator image to GHCR
-2. run `pulumi up`
-3. sync the GHCR image into the Pulumi-managed ECR repository as both `:latest` and `:${GITHUB_SHA}`
+The GitHub Actions deployment path is the shared processor pipeline
+(`dsi-rse/idi-ftm2j-shared`): version + tag + release, build and push the
+orchestrator image to GHCR, run `pulumi up`, then sync the image into the
+Pulumi-managed ECR repository as `:latest` and `:<version>`.
 
 Full details are in [docs/deployment.md](docs/deployment.md).
 
@@ -59,8 +65,8 @@ uv run pytest -v
 Main local entrypoints:
 
 ```bash
-uv run cdt pipeline --artifact-root ./data historical ./1000-ciks.txt --start-date 2024-01-01 --end-date 2024-01-31
-uv run cdt-orchestrator --artifact-root ./data/local daily --cik-file ./1000-ciks.txt
+uv run cdt pipeline --artifact-root ./data historical ./data/ciks/1000-ciks.txt --start-date 2024-01-01 --end-date 2024-01-31
+uv run cdt-orchestrator --artifact-root ./data/local daily --cik-file ./data/ciks/1000-ciks.txt
 make local-run
 ./scripts/local-pipeline.sh historical --start-date 2024-01-01 --end-date 2024-01-31
 ```
@@ -72,6 +78,8 @@ Notes:
 - `cdt pipeline` writes final snapshots only when `--final-database-root` is passed.
 - `cdt-orchestrator` reads `FINAL_DATABASE_ROOT` from the environment, or accepts `--final-database-root` before the mode.
 - `make local-run` and `./scripts/local-pipeline.sh` exercise the orchestrator with deployment-like environment variables from `.env`.
+- `cdt show-extract-job` inspects the async batch extract job; `cdt reset-extract-job --yes`
+  clears a wedged one. See [docs/architecture.md](docs/architecture.md).
 - The shared local convention is `DATA_DIR/commercial-debt-tracker/local` for canonical artifacts and `DATA_DIR/commercial-debt-tracker/database/cdt` for dashboard-consumable `latest.parquet` outputs.
 
 ## Dashboard Handoff
@@ -122,12 +130,18 @@ Deployed runs require:
 - `ARTIFACT_ROOT`
 - `BUCKET_NAME`
 - `CDT_DEFAULT_CIK_FILE`
-- `OPENROUTER_API_KEY`
+- `OPENAI_API_KEY` (used by the deployed batch extract poller)
+- `OPENROUTER_API_KEY` (used by the synchronous `live` extract backend)
 
 Optional runtime configuration:
 
 - `AWS_PROFILE` for local runs against AWS
-- `EXTRACTOR_MODEL`
-- `EXTRACTOR_REASONING`
+- `EXTRACTOR_MODEL` (default `openai/gpt-5.4`) and `EXTRACTOR_REASONING` (live OpenRouter backend)
+- `EXTRACTOR_BATCH_MODEL` and `EXTRACTOR_BATCH_REASONING` (OpenAI batch backend).
+  `EXTRACTOR_BATCH_MODEL` defaults to `EXTRACTOR_MODEL` with the provider prefix
+  stripped, so setting `EXTRACTOR_MODEL` alone moves both backends. Reasoning effort
+  is configured in OpenRouter's vocabulary for both backends; the vocabularies align
+  except for `minimal`, which is translated to OpenAI's `low`.
+- `EXTRACTOR_BACKEND` (`batch` default, or `live`) — also settable per run with
+  `cdt-orchestrator --extractor-backend {live,batch} daily`
 
-Pulumi also provisions a `SEC_USER_AGENT` secret into the ECS task to match the shared processor deployment pattern, even though CDT itself currently reads filings from scraper-managed S3 rather than calling SEC endpoints directly.
