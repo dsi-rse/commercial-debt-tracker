@@ -251,6 +251,45 @@ See [docs/deployment-dev.md](deployment-dev.md) for a complete command that logs
 - Use a smaller CIK file and narrow date range for first backfills.
 - Prefer `--force` only when intentionally recomputing existing partitions.
 
+## Prod Launch Checklist
+
+Prod stays dark until this list is walked in order. The gate variable
+(`PROD_INFRA_READY=false`), the `prod` GitHub environment, the committed
+`pulumi/Pulumi.prod.yaml`, and the loud `run-historical.yml` guard already
+exist, so nothing here is urgent before launch day — but do it in order then.
+
+1. **Shared prerequisites** (owned outside this repo): the shared stack
+   publishes `/idi/prod/shared/processor_bucket_name` and
+   `/idi/prod/shared/dlq_name`; `pulumi-bootstrap` provisions the prod OIDC
+   deploy-role pair; the `prod` GitHub environment gets `AWS_ROLE_ARN_DEPLOY`
+   and `PULUMI_CONFIG_PASSPHRASE`.
+2. **Initialize the stack**: `make infra-login`, then
+   `pulumi stack init prod` (creates the stack record and the
+   `encryptionsalt` — until this runs, any prod deploy dies at
+   `pulumi stack select prod`). Creates no AWS resources.
+3. **Set the real API keys** (SecureStrings, picked up at task launch):
+   `aws ssm put-parameter --name /idi/prod/cdt/secrets/openai_api_key ...`
+   and `.../openrouter_api_key`, per the secrets section above.
+4. **Enable alerting**: uncomment `idi:alerts_enabled: "true"` in
+   `Pulumi.prod.yaml` (requires the deploy-role statements from
+   dsi-rse/idi-ftm2j-shared#79; enabling earlier fails on
+   `sns:CreateTopic`). Verify `idi:alert_email` is the address that should
+   be paged.
+5. **Flip the gate**: `gh variable set PROD_INFRA_READY --body "true"`, then
+   deploy (a `main` release, or `make infra-up PULUMI_STACK=prod`). Confirm
+   the SNS subscription email after the deploy.
+6. **Smoke test before any schedule**: dispatch `run-historical.yml` with
+   `stack=prod`, a small CIK file, and a narrow date range. Verify document/
+   item/classification partitions appear under `processors/cdt/`, a manual
+   (or scheduled) poll tick drains the extract job, `database/cdt/` holds
+   exactly the four `latest.parquet` tables, and
+   `processors/cdt/final-snapshots/latest.json` points at a consistent
+   generation with sane row counts.
+7. **Enable schedules**: set `idi:poll_schedule_enabled: "true"` first and
+   watch a few ticks (the poller alone drains extraction), then
+   `idi:schedule_enabled: "true"` for the daily run. Confirm the poll-liveness
+   and daily-heartbeat alarms settle into OK.
+
 ## Dev First-Deploy Walkthrough
 
 For the concrete `dev` stack bootstrap flow, recommended config values, and an example manual backfill command, see [docs/deployment-dev.md](deployment-dev.md).
