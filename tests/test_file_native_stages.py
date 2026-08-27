@@ -24,6 +24,7 @@ from cdt.extractor.core import (
     is_rate_like_amount_text,
     load_prompt,
     normalized_maturity_from_text,
+    validate_amount_is_not_rate,
 )
 from cdt.ingest import DOCUMENT_COLUMNS
 from cdt.itemizer import core as itemizer_core
@@ -925,6 +926,23 @@ def test_normalized_maturity_from_text_parses_due_phrases() -> None:
     assert normalized_maturity_from_text("Series 2025-B Notes") is None
 
 
+def test_normalized_maturity_from_text_rejects_coordinated_maturities() -> None:
+    """One `due` listing two maturities identifies no single instrument (#104)."""
+    assert normalized_maturity_from_text("notes due 2028 and 2030") is None
+    assert normalized_maturity_from_text("notes due 2028, 2030") is None
+    assert normalized_maturity_from_text("notes due 2028/2030") is None
+    assert normalized_maturity_from_text("notes due October 1, 2028 and 2030") is None
+    assert (
+        normalized_maturity_from_text("notes due October 1, 2028 and October 1, 2030")
+        is None
+    )
+    # A later year that is not coordinated onto the maturity is still not one.
+    assert (
+        normalized_maturity_from_text("notes due 2028, and 2030 obligations remain")
+        == "2028-12-31"
+    )
+
+
 def test_instrument_ie_validate_accepts_name_span_as_end_date_evidence() -> None:
     """The instrument name span is valid end_date evidence when maturity is embedded."""
     response = json.dumps(
@@ -1081,6 +1099,23 @@ def test_is_rate_like_amount_text_separates_rates_from_principal() -> None:
     assert is_rate_like_amount_text(None) is False
 
 
+def test_is_rate_like_amount_text_requires_every_number_to_carry_a_rate() -> None:
+    """A percentage of a stated principal is not itself a rate (#103).
+
+    The currency symbol and the scale word are not what makes these principals;
+    `normalized_amount_from_text` reads the first number, so a span whose first
+    number carries no rate marker is stating an amount.
+    """
+    assert is_rate_like_amount_text("500,000,000 (100% of principal)") is False
+    assert (
+        is_rate_like_amount_text("500 million U.S. dollars, or 5% of assets") is False
+    )
+    assert is_rate_like_amount_text("1,500,000") is False
+    # A margin range is still every-number-rated.
+    assert is_rate_like_amount_text("0.875% to 1.875%") is True
+    assert is_rate_like_amount_text("SOFR plus 100 basis points") is True
+
+
 def test_instrument_ie_validate_rejects_rate_only_amount_evidence() -> None:
     """An amount citing only a rate should fail validation and retry."""
     response = json.dumps(
@@ -1100,6 +1135,44 @@ def test_instrument_ie_validate_rejects_rate_only_amount_evidence() -> None:
 
     assert any(
         "describes an interest rate, margin, or fee" in failure for failure in failures
+    )
+
+
+def test_instrument_ie_validate_rejects_wrapped_basis_point_evidence() -> None:
+    """Basis-point evidence is rejected, and the retry quotes readable text (#102).
+
+    The evidence span wraps across a line, as filings do. Judging whitespace-free
+    text hid the `basis point` marker from the predicate entirely, so the retry
+    never fired and the amount was silently nulled instead.
+    """
+    tag_details = {"tag-a-bps": {"type": "amount", "text": "100 basis\npoints"}}
+    failures = validate_amount_is_not_rate(
+        index=0,
+        value={"evidence": ["tag-a-bps"]},
+        tag_details=tag_details,
+    )
+
+    assert len(failures) == 1
+    assert "'100 basis points'" in failures[0]
+    assert "describes an interest rate, margin, or fee" in failures[0]
+
+
+def test_instrument_ie_validate_accepts_spelled_currency_principal() -> None:
+    """A principal whose currency and scale are words, not symbols, validates (#102)."""
+    tag_details = {
+        "tag-a-spelled": {
+            "type": "amount",
+            "text": "500 million U.S. dollars, or 5% of assets",
+        }
+    }
+
+    assert (
+        validate_amount_is_not_rate(
+            index=0,
+            value={"evidence": ["tag-a-spelled"]},
+            tag_details=tag_details,
+        )
+        == []
     )
 
 

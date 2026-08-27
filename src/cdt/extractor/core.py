@@ -95,16 +95,27 @@ MATURITY_EVIDENCE_TAG_TYPES = {"debt_instrument"}
 STANDARDIZED_SINGLE_VALUE_PROPERTIES = {"start_date", "end_date", "amount"}
 INSTRUMENT_RELATION_TYPES = {"amendment_of", "retired_of", "split_of"}
 NUMERIC_STRING_PATTERN = re.compile(r"^\d+(?:\.\d+)?$")
+# One `due` can carry a list of maturities: `due 2028 and 2030`,
+# `due October 1, 2028 and 2030`, `due October 1, 2028 and October 1, 2030`. Each
+# is two maturities, and matching only the first silently invented one (#104).
+MATURITY_COORDINATED_YEARS = (
+    r"(?:\s*(?:,|/|&|and(?:/or)?|or)\s*(?:[A-Za-z]+\s+\d{1,2},?\s+)?\d{4})*"
+)
 MATURITY_FULL_DATE_PATTERN = re.compile(
-    r"\bdue\s+(?:on\s+)?(?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2}),?\s+(?P<year>\d{4})",
+    r"\bdue\s+(?:on\s+)?(?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2}),?\s+(?P<year>\d{4})"
+    rf"(?P<more>{MATURITY_COORDINATED_YEARS})",
     re.IGNORECASE,
 )
 MATURITY_YEAR_PATTERN = re.compile(
-    r"\bdue\s+(?:in\s+)?(?P<year>\d{4})\b",
+    rf"\bdue\s+(?:in\s+)?(?P<years>\d{{4}}{MATURITY_COORDINATED_YEARS})\b",
     re.IGNORECASE,
 )
+FOUR_DIGIT_YEAR_PATTERN = re.compile(r"\d{4}")
 YEAR_ONLY_MATURITY_SUFFIX = "-12-31"
-RATE_TEXT_MARKERS = ("%", "basis point")
+# A rate marker counts only where it sits on a number, so the value the parser
+# would read is the rate itself rather than a percentage of something else (#103).
+AMOUNT_VALUE_PATTERN = re.compile(r"\d[\d,]*(?:\.\d+)?")
+RATE_SUFFIX_PATTERN = re.compile(r"\s*(?:%|basis\s+points?\b)", re.IGNORECASE)
 ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 MONTH_MAP = {
     "january": "01",
@@ -1916,8 +1927,12 @@ def validate_amount_is_not_rate(
     evidence = value.get("evidence")
     if not isinstance(evidence, list):
         return []
+    # The same normalization `canonical_value` applies, so the validator and
+    # `standardized_amount_payload` judge one text. Stripping whitespace instead
+    # hid the `basis point` marker and both amount guards from the predicate
+    # (#102), and it also made the quoted text in the retry message unreadable.
     evidence_texts = [
-        collapse_whitespace(str(tag_details[tag_id]["text"]))
+        normalize_span_whitespace(str(tag_details[tag_id]["text"]))
         for tag_id in evidence
         if isinstance(tag_id, str) and tag_id in tag_details
     ]
@@ -2092,7 +2107,14 @@ def currency_candidates_from_text(text: str | None) -> set[str]:
 
 
 def is_rate_like_amount_text(text: str | None) -> bool:
-    """Return whether one amount evidence string reads as a rate, margin, or fee."""
+    """Return whether one amount evidence string reads as a rate, margin, or fee.
+
+    Every number in the span has to carry a rate marker. A marker appearing
+    somewhere is not enough: `500,000,000 (100% of principal)` states a
+    principal and then a percentage of it, and `normalized_amount_from_text`
+    reads the first number, so treating the whole span as a rate would discard a
+    real amount (#103).
+    """
     if not text:
         return False
     lowered = text.lower()
@@ -2100,7 +2122,10 @@ def is_rate_like_amount_text(text: str | None) -> bool:
         return False
     if any(re.search(rf"\b{word}\b", lowered) for word in AMOUNT_MULTIPLIERS):
         return False
-    return any(marker in lowered for marker in RATE_TEXT_MARKERS)
+    values = list(AMOUNT_VALUE_PATTERN.finditer(text))
+    if not values:
+        return False
+    return all(RATE_SUFFIX_PATTERN.match(text, value.end()) for value in values)
 
 
 def normalized_date_from_text(text: str | None) -> str | None:
@@ -2122,22 +2147,29 @@ def normalized_date_from_text(text: str | None) -> str | None:
 
 
 def normalized_maturity_from_text(text: str | None) -> str | None:
-    """Parse one maturity phrase such as 'notes due 2028' into ISO format."""
+    """Parse one maturity phrase such as 'notes due 2028' into ISO format.
+
+    A phrase stating more than one maturity names no single instrument, so it
+    parses to None rather than to whichever maturity comes first.
+    """
     if not text:
         return None
-    full_dates = {
-        normalized
-        for normalized in (
-            iso_date_from_parts(
-                match.group("year"), match.group("month"), match.group("day")
-            )
-            for match in MATURITY_FULL_DATE_PATTERN.finditer(text)
+    full_dates: set[str] = set()
+    years: set[str] = set()
+    for match in MATURITY_FULL_DATE_PATTERN.finditer(text):
+        normalized = iso_date_from_parts(
+            match.group("year"), match.group("month"), match.group("day")
         )
-        if normalized is not None
-    }
+        if normalized is not None:
+            full_dates.add(normalized)
+        years.update(FOUR_DIGIT_YEAR_PATTERN.findall(match.group("more")))
+    for match in MATURITY_YEAR_PATTERN.finditer(text):
+        years.update(FOUR_DIGIT_YEAR_PATTERN.findall(match.group("years")))
     if full_dates:
-        return full_dates.pop() if len(full_dates) == 1 else None
-    years = {match.group("year") for match in MATURITY_YEAR_PATTERN.finditer(text)}
+        # A bare alternate year alongside a full date states a second maturity too.
+        if len(full_dates) != 1 or years - {value[:4] for value in full_dates}:
+            return None
+        return full_dates.pop()
     if len(years) != 1:
         return None
     return f"{years.pop()}{YEAR_ONLY_MATURITY_SUFFIX}"
