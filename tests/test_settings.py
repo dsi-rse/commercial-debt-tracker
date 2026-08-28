@@ -31,3 +31,18 @@ def test_settings_resolves_configured_data_dir(monkeypatch, tmp_path: Path) -> N
 
     monkeypatch.undo()
     importlib.reload(cdt.settings)
+
+
+def test_sixk_triage_model_defaults_and_overrides(monkeypatch) -> None:  # noqa: ANN001
+    """The 6-K triage model id follows the extractor's env-override pattern."""
+    monkeypatch.delenv("SIXK_TRIAGE_MODEL", raising=False)
+    monkeypatch.setattr(dotenv, "load_dotenv", lambda *args, **kwargs: None)
+    reloaded = importlib.reload(cdt.settings)
+    assert reloaded.SIXK_TRIAGE_MODEL == reloaded.DEFAULT_SIXK_TRIAGE_MODEL
+
+    monkeypatch.setenv("SIXK_TRIAGE_MODEL", "openai/gpt-5.6-terra")
+    reloaded = importlib.reload(cdt.settings)
+    assert reloaded.SIXK_TRIAGE_MODEL == "openai/gpt-5.6-terra"
+
+    monkeypatch.undo()
+    importlib.reload(cdt.settings)

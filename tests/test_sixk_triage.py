@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Self
 
 import pytest
@@ -12,6 +13,8 @@ from cdt.sixk import (
     DEFAULT_STAGE1_THRESHOLD,
     Snippet,
     build_retry_message,
+    default_model_dir,
+    load_stage1_model,
     matched_debt_keywords,
     split_into_windows,
     stage1_admit,
@@ -195,3 +198,16 @@ def test_triage_keeps_everything_when_the_provider_fails() -> None:
     verdict = asyncio.run(triage_filing(ExplodingClient(), "acc-1", _snippets(2)))
     assert verdict.kept == ["s1", "s2"]
     assert "provider down" in (verdict.error or "")
+
+
+def test_default_model_dir_sits_under_the_data_dir(tmp_path: Path) -> None:
+    """The stage-1 path derives from DATA_DIR, as the 8-K classifier's does."""
+    assert default_model_dir(tmp_path) == (
+        tmp_path / "models" / "sixk" / "stage1-tfidf-linear-svc"
+    )
+
+
+def test_load_stage1_model_reports_a_missing_artifact(tmp_path: Path) -> None:
+    """A clear error beats an opaque pickle failure."""
+    with pytest.raises(FileNotFoundError, match="no stage-1 model"):
+        load_stage1_model(tmp_path / "absent")

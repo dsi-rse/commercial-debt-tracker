@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, Self
 
+from cdt import settings
 from cdt.classifier.core import score_model
 
 if TYPE_CHECKING:
@@ -49,7 +50,8 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_STAGE1_THRESHOLD = 0.332
 
 #: Stage-2 model. Cheap is the point: it reads only what stage 1 admits.
-DEFAULT_STAGE2_MODEL = "openai/gpt-5.6-luna"
+#: Sourced from settings so it is overridable by ``SIXK_TRIAGE_MODEL``.
+DEFAULT_STAGE2_MODEL = settings.SIXK_TRIAGE_MODEL
 
 #: Attempts per filing, matching the extractor's ``DEFAULT_MAX_ATTEMPTS``.
 DEFAULT_MAX_ATTEMPTS = 3
@@ -139,11 +141,30 @@ class FilingVerdict:
     error: str | None = None
 
 
-def load_stage1_model(model_dir: Path) -> object:
+def default_model_dir(data_dir: Path | None = None) -> Path:
+    """Return the default stage-1 artifact directory.
+
+    Mirrors :func:`cdt.classifier.core.default_model_dir`: the path is derived
+    from ``DATA_DIR`` rather than configured separately, so a deployment moves
+    both classifiers by moving one variable.
+
+    Args:
+        data_dir: Root to resolve against; defaults to ``settings.DATA_DIR``.
+
+    Returns:
+        Directory expected to hold :data:`MODEL_FILENAME`.
+    """
+    return (
+        (data_dir or settings.DATA_DIR) / "models" / "sixk" / "stage1-tfidf-linear-svc"
+    )
+
+
+def load_stage1_model(model_dir: Path | None = None) -> object:
     """Load the stage-1 pipeline from a model directory.
 
     Args:
-        model_dir: Directory holding :data:`MODEL_FILENAME`.
+        model_dir: Directory holding :data:`MODEL_FILENAME`; defaults to
+            :func:`default_model_dir`.
 
     Returns:
         The fitted scikit-learn pipeline.
@@ -151,7 +172,7 @@ def load_stage1_model(model_dir: Path) -> object:
     Raises:
         FileNotFoundError: If the artifact is absent.
     """
-    path = model_dir / MODEL_FILENAME
+    path = (model_dir or default_model_dir()) / MODEL_FILENAME
     if not path.exists():
         raise FileNotFoundError(f"no stage-1 model at {path}")
     with path.open("rb") as handle:

@@ -96,6 +96,26 @@ windows stage 1 admits.
 So stage 2 returns roughly 76x its cost. The quality effect is probably worth
 more than the money: half as many junk mentions reach the database.
 
+## Configuration
+
+Following the two patterns already in the repo rather than inventing a third:
+
+| | where | default | override |
+|---|---|---|---|
+| stage-1 artifact **path** | `cdt.sixk.default_model_dir()` | `DATA_DIR/models/sixk/stage1-tfidf-linear-svc` | `DATA_DIR`, or pass `model_dir` |
+| stage-2 **model id** | `settings.SIXK_TRIAGE_MODEL` | `openai/gpt-5.6-luna` | `SIXK_TRIAGE_MODEL` env |
+
+Paths follow the 8-K classifier, which derives from `DATA_DIR` via
+`classifier.core.default_model_dir` rather than taking a settings entry, so one
+variable moves both classifiers. Model ids follow the extractor, which does keep
+them in `settings.py` with an env override. The triage id is separate from
+`EXTRACTOR_MODEL` because the two jobs want opposite trade-offs: triage reads a
+lot of text and returns a list of ids, so it is priced for volume; extraction
+returns structured records and is priced for accuracy.
+
+**The artifact is not in this repo.** Place `model.pkl` and `metadata.json` from
+`model-c400-v5` in the directory above before running the stage.
+
 ## Caveats worth carrying forward
 
 - **The labels are one annotator's.** A second annotator agreed on 90% of a

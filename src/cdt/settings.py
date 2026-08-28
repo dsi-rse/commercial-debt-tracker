@@ -40,3 +40,10 @@ EXTRACTOR_REASONING = os.environ.get("EXTRACTOR_REASONING", "none")
 # the same model as the live backend.
 EXTRACTOR_BATCH_MODEL = os.environ.get("EXTRACTOR_BATCH_MODEL") or EXTRACTOR_MODEL
 EXTRACTOR_BATCH_REASONING = os.environ.get("EXTRACTOR_BATCH_REASONING", "none")
+# Model id for the 6-K stage-2 triage, as an OpenRouter slug. Separate from the
+# extractor's because the two jobs want opposite trade-offs: triage reads a lot
+# of text and returns a list of ids, so it is priced for volume, while
+# extraction returns structured records and is priced for accuracy.
+DEFAULT_SIXK_TRIAGE_MODEL = "openai/gpt-5.6-luna"
+SIXK_TRIAGE_MODEL = os.environ.get("SIXK_TRIAGE_MODEL") or DEFAULT_SIXK_TRIAGE_MODEL
+SIXK_TRIAGE_REASONING = os.environ.get("SIXK_TRIAGE_REASONING", "none")
