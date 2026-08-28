@@ -134,6 +134,30 @@ def test_stage1_handles_no_input() -> None:
             {"keep": [1], "drop": [{"id": 2, "reason": "duplicate"}]},
             ["snippet 2 dropped as a duplicate without a covered_by id"],
         ),
+        (
+            {
+                "keep": [1],
+                "drop": [{"id": 2, "reason": "duplicate", "covered_by": 7}],
+            },
+            ["snippet 2 dropped as covered by snippet 7, which is not being kept"],
+        ),
+        (
+            {
+                "keep": [1],
+                "drop": [{"id": 2, "reason": "duplicate", "covered_by": 0}],
+            },
+            ["snippet 2 dropped as covered by snippet 0, which is not being kept"],
+        ),
+        (
+            {
+                "keep": [],
+                "drop": [
+                    {"id": 1, "reason": "no_details"},
+                    {"id": 2, "reason": "duplicate", "covered_by": 1},
+                ],
+            },
+            ["snippet 2 dropped as covered by snippet 1, which is not being kept"],
+        ),
         ("not an object", ["response was not a JSON object"]),
     ],
 )
@@ -184,6 +208,18 @@ def test_triage_retries_a_malformed_verdict() -> None:
     assert verdict.kept == ["s1", "s2"]
     assert verdict.attempts == 2
     assert "not usable" in client.calls[1][-1]["content"]
+
+
+def test_triage_retries_an_out_of_range_covered_by() -> None:
+    """A covered_by outside the id range is fed back for retry, not an IndexError."""
+    bad = {"keep": [1], "drop": [{"id": 2, "reason": "duplicate", "covered_by": 7}]}
+    good = {"keep": [1], "drop": [{"id": 2, "reason": "duplicate", "covered_by": 1}]}
+    client = FakeClient([json.dumps(bad), json.dumps(good)])
+    verdict = asyncio.run(triage_filing(client, "acc-1", _snippets(2)))
+    assert verdict.kept == ["s1"]
+    assert verdict.dropped_duplicate == [("s2", "s1")]
+    assert verdict.attempts == 2
+    assert verdict.error is None
 
 
 def test_triage_keeps_everything_when_attempts_run_out() -> None:

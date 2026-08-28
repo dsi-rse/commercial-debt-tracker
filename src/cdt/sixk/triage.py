@@ -228,6 +228,11 @@ def validate_verdict(verdict: object, expected: int) -> list[str]:
     ['no verdict for snippet 2']
     >>> validate_verdict({"keep": [1], "drop": [{"id": 1, "reason": "no_details"}]}, 1)
     ['snippet 1 appears in both keep and drop']
+    >>> validate_verdict(
+    ...     {"keep": [1], "drop": [{"id": 2, "reason": "duplicate", "covered_by": 9}]},
+    ...     2,
+    ... )
+    ['snippet 2 dropped as covered by snippet 9, which is not being kept']
     """
     if not isinstance(verdict, dict):
         return ["response was not a JSON object"]
@@ -255,6 +260,17 @@ def validate_verdict(verdict: object, expected: int) -> list[str]:
         f"snippet {entry['id']} dropped as a duplicate without a covered_by id"
         for entry in entries
         if entry.get("reason") == "duplicate" and not _is_index(entry.get("covered_by"))
+    ]
+    # covered_by must name a snippet in keep: an id outside 1..expected would
+    # crash the index resolution, and one pointing at another dropped snippet
+    # means both copies of the attributes are being discarded.
+    failures += [
+        f"snippet {entry['id']} dropped as covered by snippet "
+        f"{int(entry['covered_by'])}, which is not being kept"
+        for entry in entries
+        if entry.get("reason") == "duplicate"
+        and _is_index(entry.get("covered_by"))
+        and int(entry["covered_by"]) not in keep
     ]
     return failures
 
