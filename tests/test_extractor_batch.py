@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import shutil
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -976,6 +977,30 @@ def test_extract_batch_response_text_variants() -> None:
         extract_batch_response_text(
             {"custom_id": "x", "response": {"status_code": 400, "body": {}}}
         )
+
+
+def test_configured_default_model_is_usable_by_both_backends() -> None:
+    """The default must be an undated id, or every batch request 400s.
+
+    `normalize_batch_model` only strips the provider prefix, so a dated
+    OpenRouter alias such as `openai/gpt-5.6-terra-20260709` reaches the OpenAI
+    API as `gpt-5.6-terra-20260709` — an id it does not publish, which fails the
+    whole batch rather than one row. The live backend needs the prefix present.
+    """
+    from cdt import settings
+    from cdt.extractor.core import is_reasoning_model
+
+    default = settings.DEFAULT_EXTRACTOR_MODEL
+    assert default.startswith("openai/"), "live backend needs the OpenRouter prefix"
+    native = normalize_batch_model(default)
+    assert "/" not in native
+    assert not re.search(r"-\d{8}$", native), (
+        f"{default!r} carries a date suffix; the OpenAI API publishes this model "
+        "undated and rejects the dated id"
+    )
+    # Reasoning models take reasoning_effort rather than temperature; a default
+    # that stopped matching would silently switch sampling behaviour.
+    assert is_reasoning_model(default)
 
 
 def test_build_request_body_reasoning_and_model() -> None:

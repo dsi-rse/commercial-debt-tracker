@@ -136,10 +136,12 @@ Deployed runs require:
 Optional runtime configuration:
 
 - `AWS_PROFILE` for local runs against AWS
-- `EXTRACTOR_MODEL` (default `openai/gpt-5.4`) and `EXTRACTOR_REASONING` (live OpenRouter backend)
+- `EXTRACTOR_MODEL` (default `openai/gpt-5.6-terra`) and `EXTRACTOR_REASONING` (live OpenRouter backend)
 - `EXTRACTOR_BATCH_MODEL` and `EXTRACTOR_BATCH_REASONING` (OpenAI batch backend).
   `EXTRACTOR_BATCH_MODEL` defaults to `EXTRACTOR_MODEL` with the provider prefix
-  stripped, so setting `EXTRACTOR_MODEL` alone moves both backends. Reasoning effort
+  stripped, so setting `EXTRACTOR_MODEL` alone moves both backends. Use an undated
+  model id: OpenRouter also publishes dated aliases, and a dated id normalizes to
+  something the OpenAI API rejects. Reasoning effort
   is configured in OpenRouter's vocabulary for both backends; the vocabularies align
   except for `minimal`, which is translated to OpenAI's `low`.
 - `EXTRACTOR_BACKEND` (`batch` default, or `live`) — also settable per run with
