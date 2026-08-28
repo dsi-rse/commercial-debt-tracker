@@ -162,11 +162,14 @@ class ClusterProfile:
     normalized_name_fingerprints: set[str]
     lender_signatures: set[str]
     relation_target_ids: set[str] = field(default_factory=set)
+    member_item_ids: set[str] = field(default_factory=set)
 
     def add_member(self: ClusterProfile, mention: PreparedMention) -> None:
         """Update the cluster cache with one newly accepted member."""
         if mention.debt_instrument_mention_id not in self.member_ids:
             self.member_ids.append(mention.debt_instrument_mention_id)
+        if mention.item_id:
+            self.member_item_ids.add(mention.item_id)
         if mention.normalized_amount:
             self.normalized_amounts.add(mention.normalized_amount)
         if mention.normalized_start_date:
@@ -588,6 +591,37 @@ def build_empty_profile(
     )
 
 
+def is_same_item_sibling(
+    mention: PreparedMention,
+    profile: ClusterProfile,
+) -> bool:
+    """Return whether the mention is a sibling of a cluster member, not the same debt.
+
+    The key-conflicting fingerprint path exists because one offering is observed
+    across several filings — launch, pricing, closing — which drift on amount and
+    start date. Cleveland-Cliffs launched $800M and priced $900M of the same
+    notes on one day, so a shared start date alone cannot rule the merge out.
+
+    Inside a single item it can. The extractor is told that two different start
+    dates or two different principal amounts in one document are "strong evidence
+    there are two separate debt instruments", so two objects from one item that
+    agree on the start date and disagree on the principal are siblings by
+    construction. Longevity Health issued a $1,250,000 and a $1,100,000 `10%
+    Senior Secured Convertible Note` on one day in one item; both maturities were
+    null and both coupons `10%`, so neither of #64's gates could separate them
+    (#131). An add-on to an existing series carries the add-on's own start date,
+    so it stays mergeable.
+    """
+    return (
+        mention.item_id in profile.member_item_ids
+        and mention.normalized_start_date is not None
+        and mention.normalized_start_date in profile.normalized_start_dates
+        and mention.normalized_amount is not None
+        and bool(profile.normalized_amounts)
+        and mention.normalized_amount not in profile.normalized_amounts
+    )
+
+
 def score_candidates_for_mention(
     mention: PreparedMention,
     profiles: dict[str, ClusterProfile],
@@ -640,11 +674,13 @@ def score_candidates_for_mention(
             # Launch, pricing, and closing 8-Ks for one offering drift on
             # amount (upsizes) and start date (pricing vs settlement), so an
             # identifying fingerprint may attach a mention whose keys conflict.
-            if name_fingerprint_is_identifying(
-                mention.normalized_name_fingerprint
-            ) and (
-                mention.normalized_name_fingerprint
-                in profile.normalized_name_fingerprints
+            if (
+                name_fingerprint_is_identifying(mention.normalized_name_fingerprint)
+                and (
+                    mention.normalized_name_fingerprint
+                    in profile.normalized_name_fingerprints
+                )
+                and not is_same_item_sibling(mention, profile)
             ):
                 candidates.append(
                     CandidateScore(
@@ -916,28 +952,18 @@ def derive_parent_links(
                 and mention_to_instrument[mention.split_of] != debt_instrument_id
             ):
                 split_parents.add(mention_to_instrument[mention.split_of])
-        if (
-            len(amendment_parents) > 1
-            or len(retired_parents) > 1
-            or len(split_parents) > 1
-        ):
-            parent_links[debt_instrument_id] = {
-                "amendment_of_debt_instrument_id": None,
-                "retired_of_debt_instrument_id": None,
-                "split_of_debt_instrument_id": None,
-            }
-            continue
-        parent_types_present = sum(
-            bool(parent_set)
-            for parent_set in (amendment_parents, retired_parents, split_parents)
-        )
-        if parent_types_present > 1:
-            parent_links[debt_instrument_id] = {
-                "amendment_of_debt_instrument_id": None,
-                "retired_of_debt_instrument_id": None,
-                "split_of_debt_instrument_id": None,
-            }
-            continue
+        # Ambiguity within one relation kind is unresolvable — there is no way to
+        # choose between two amendment parents — so that kind publishes nothing.
+        # Each kind is judged on its own: the three columns are independent, and
+        # an instrument that splits from one predecessor while retiring another
+        # has a place to record both. Nulling every column whenever a second kind
+        # appeared discarded lineage that was individually unambiguous (#130).
+        if len(amendment_parents) > 1:
+            amendment_parents.clear()
+        if len(retired_parents) > 1:
+            retired_parents.clear()
+        if len(split_parents) > 1:
+            split_parents.clear()
         parent_links[debt_instrument_id] = {
             "amendment_of_debt_instrument_id": next(iter(amendment_parents), None),
             "retired_of_debt_instrument_id": next(iter(retired_parents), None),

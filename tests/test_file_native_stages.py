@@ -1889,6 +1889,242 @@ def test_match_tables_retired_of_keeps_separate_clusters_and_updates_parent_end_
     assert instruments["m-1"]["end_date"] == "2024-03-01"
 
 
+def test_match_tables_publishes_two_kinds_of_lineage_for_one_instrument() -> None:
+    """Split and retirement lineage coexist in their own columns (#130).
+
+    Pitney Bowes' incremental tranche A term loans split from the existing
+    tranche A loans and redeemed the 2027 notes with the proceeds. Nulling every
+    parent column whenever a second kind appeared discarded both links.
+    """
+    mentions = pd.DataFrame(
+        [
+            build_mention_row(
+                mention_id="m-notes",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2025-02-07",
+                name="6.875% Senior Notes due March 2027",
+                start_date="2025-02-07",
+                amount="$347 million",
+            ),
+            build_mention_row(
+                mention_id="m-tranche",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2025-02-07",
+                name="tranche A term loans",
+                start_date="2025-02-07",
+                amount="$302 million",
+            ),
+            {
+                **build_mention_row(
+                    mention_id="m-incremental",
+                    item_id="item-1",
+                    accession_number="0001",
+                    cik="320193",
+                    date="2026-06-23",
+                    name="Incremental Term Loans",
+                    start_date="2026-06-23",
+                    amount="$150 million",
+                ),
+                "split_of": "m-tranche",
+                "retired_of": "m-notes",
+            },
+        ]
+    )
+
+    tables = match_tables(mentions)
+
+    instruments = {
+        row["debt_instrument_id"]: row
+        for row in tables["debt_instrument"].to_dict("records")
+    }
+    row = instruments["m-incremental"]
+    assert row["split_of_debt_instrument_id"] == "m-tranche"
+    assert row["retired_of_debt_instrument_id"] == "m-notes"
+    assert row["amendment_of_debt_instrument_id"] is None
+
+
+def test_match_tables_drops_only_the_ambiguous_relation_kind() -> None:
+    """Two parents of one kind stay unresolvable; a different kind survives (#130)."""
+    mentions = pd.DataFrame(
+        [
+            build_mention_row(
+                mention_id="m-a",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2024-01-01",
+                name="Facility A",
+                start_date="2024-01-01",
+                amount="$100 million",
+            ),
+            build_mention_row(
+                mention_id="m-b",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2024-01-01",
+                name="Facility B",
+                start_date="2024-02-01",
+                amount="$200 million",
+            ),
+            build_mention_row(
+                mention_id="m-notes",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2024-01-01",
+                name="7.000% Senior Notes due 2030",
+                start_date="2024-03-01",
+                amount="$300 million",
+            ),
+            {
+                **build_mention_row(
+                    mention_id="m-1",
+                    item_id="item-2",
+                    accession_number="0002",
+                    cik="320193",
+                    date="2026-01-01",
+                    name="New Facility",
+                    start_date="2026-01-01",
+                    amount="$400 million",
+                ),
+                "amendment_of": "m-a",
+                "retired_of": "m-notes",
+            },
+            {
+                **build_mention_row(
+                    mention_id="m-2",
+                    item_id="item-2",
+                    accession_number="0002",
+                    cik="320193",
+                    date="2026-01-01",
+                    name="New Facility",
+                    start_date="2026-01-01",
+                    amount="$400 million",
+                ),
+                "amendment_of": "m-b",
+            },
+        ]
+    )
+
+    tables = match_tables(mentions)
+
+    member_edges = tables["debt_instrument_mentions"].query("edge_type == 'member'")
+    assignment = {
+        row["debt_instrument_mention_id"]: row["debt_instrument_id"]
+        for row in member_edges.to_dict("records")
+    }
+    # m-1 and m-2 share every key, so they cluster and bring two amendment
+    # parents with them.
+    assert assignment["m-1"] == assignment["m-2"]
+    row = {
+        r["debt_instrument_id"]: r for r in tables["debt_instrument"].to_dict("records")
+    }[assignment["m-1"]]
+    assert row["amendment_of_debt_instrument_id"] is None
+    assert row["retired_of_debt_instrument_id"] == "m-notes"
+
+
+def test_match_tables_keeps_same_day_siblings_apart() -> None:
+    """Same start date plus a conflicting principal means two instruments (#131).
+
+    Longevity Health issued a $1,250,000 and a $1,100,000 `10% Senior Secured
+    Convertible Note` on one day. Both maturities are null and both coupons are
+    `10%`, so #64's gates cannot separate them and #79's key-conflicting
+    fingerprint path merged them, publishing one principal and losing the other.
+    """
+    mentions = pd.DataFrame(
+        [
+            build_mention_row(
+                mention_id="m-initial",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2026-08-13",
+                name="10% Senior Secured Convertible Note",
+                start_date="2026-08-13",
+                amount="$1,250,000",
+            ),
+            build_mention_row(
+                mention_id="m-additional",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2026-08-13",
+                name="10% Senior Secured Convertible Note",
+                start_date="2026-08-13",
+                amount="$1,100,000",
+            ),
+        ]
+    )
+
+    tables = match_tables(mentions)
+
+    member_edges = tables["debt_instrument_mentions"].query("edge_type == 'member'")
+    assignment = {
+        row["debt_instrument_mention_id"]: row["debt_instrument_id"]
+        for row in member_edges.to_dict("records")
+    }
+    assert assignment["m-initial"] != assignment["m-additional"]
+    amounts = {
+        row["debt_instrument_id"]: row["amount"]
+        for row in tables["debt_instrument"].to_dict("records")
+    }
+    assert amounts[assignment["m-initial"]] == "$1,250,000"
+    assert amounts[assignment["m-additional"]] == "$1,100,000"
+
+
+def test_match_tables_still_attaches_an_add_on_to_its_series() -> None:
+    """An add-on on a later date keeps merging into the existing series (#131).
+
+    Encompass Health sold $100 million of additional 5.875% Senior Notes due
+    2034 into its existing $500 million series. The start dates differ, which is
+    what distinguishes a second observation of one instrument from a same-day
+    sibling, so #79's path must still fire here.
+    """
+    mentions = pd.DataFrame(
+        [
+            build_mention_row(
+                mention_id="m-series",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2026-05-29",
+                name="5.875% Senior Notes due 2034",
+                start_date="2026-05-29",
+                amount="$500 million",
+            ),
+            build_mention_row(
+                mention_id="m-addon",
+                item_id="item-2",
+                accession_number="0002",
+                cik="320193",
+                date="2026-08-13",
+                name="5.875% Senior Notes due 2034",
+                start_date="2026-08-13",
+                amount="$100 million",
+            ),
+        ]
+    )
+
+    tables = match_tables(mentions)
+
+    member_edges = tables["debt_instrument_mentions"].query("edge_type == 'member'")
+    assignment = {
+        row["debt_instrument_mention_id"]: row["debt_instrument_id"]
+        for row in member_edges.to_dict("records")
+    }
+    assert assignment["m-series"] == assignment["m-addon"]
+    via = {
+        row["debt_instrument_mention_id"]: row["match_via"]
+        for row in member_edges.to_dict("records")
+    }
+    assert via["m-addon"] == "member:name_fingerprint"
+
+
 def test_retry_includes_prior_response_as_assistant_turn() -> None:
     """Retry conversations must include the failed output the retry references."""
     row_state = ExtractionRowState(item_row={"item_id": "item-1"}, stage_name="ner")

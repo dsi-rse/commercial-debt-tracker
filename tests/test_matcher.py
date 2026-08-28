@@ -236,18 +236,71 @@ def test_year_only_fingerprint_is_not_identifying() -> None:
 
 
 def test_upsized_pricing_mention_attaches_by_fingerprint() -> None:
-    """A pricing 8-K that upsizes the launch amount still joins the offering."""
+    """A pricing 8-K that upsizes the launch amount still joins the offering.
+
+    Cleveland-Cliffs launched $800M and priced $900M of the same notes on one
+    day, so the two filings can share a start date. They are separate items,
+    which is what keeps this apart from two siblings in one document (#131).
+    """
     launch = prepare_mention(
         mention_row(name="9.875% Senior Secured Notes due 2025", amount="400000000")
     )
     pricing = prepare_mention(
         mention_row(
             debt_instrument_mention_id="mention-2",
+            item_id="item-2",
+            accession_number="0000000000-24-000002",
             name="9.875% Senior Secured Notes due 2025",
             amount="555159000",
         )
     )
     candidates = score(pricing, profile_from(launch))
+    assert len(candidates) == 1
+    assert candidates[0].basis == "name_fingerprint"
+
+
+def test_same_item_sibling_with_a_conflicting_amount_does_not_attach() -> None:
+    """Two objects from one item that differ only in principal stay apart (#131)."""
+    initial = prepare_mention(
+        mention_row(
+            name="10% Senior Secured Convertible Note",
+            amount="1250000",
+            start_date="2026-08-13",
+            end_date=None,
+        )
+    )
+    additional = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-2",
+            name="10% Senior Secured Convertible Note",
+            amount="1100000",
+            start_date="2026-08-13",
+            end_date=None,
+        )
+    )
+    assert score(additional, profile_from(initial)) == []
+
+
+def test_same_item_add_on_with_its_own_start_date_still_attaches() -> None:
+    """An add-on in the same item carries its own start date, so it merges (#131)."""
+    series = prepare_mention(
+        mention_row(
+            name="5.875% Senior Notes due 2034",
+            amount="500000000",
+            start_date="2026-05-29",
+            end_date="2034-12-31",
+        )
+    )
+    add_on = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-2",
+            name="5.875% Senior Notes due 2034",
+            amount="100000000",
+            start_date="2026-08-13",
+            end_date="2034-12-31",
+        )
+    )
+    candidates = score(add_on, profile_from(series))
     assert len(candidates) == 1
     assert candidates[0].basis == "name_fingerprint"
 
