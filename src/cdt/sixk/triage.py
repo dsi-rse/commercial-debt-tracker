@@ -54,6 +54,11 @@ DEFAULT_STAGE1_THRESHOLD = 0.332
 #: Sourced from settings so it is overridable by ``SIXK_TRIAGE_MODEL``.
 DEFAULT_STAGE2_MODEL = settings.SIXK_TRIAGE_MODEL
 
+#: Stage-2 reasoning effort, overridable by ``SIXK_TRIAGE_REASONING`` and
+#: validated against the extractor's vocabulary, so both LLM stages spell
+#: "no reasoning" the same way.
+DEFAULT_STAGE2_REASONING = settings.SIXK_TRIAGE_REASONING
+
 #: Attempts per filing, matching the extractor's ``DEFAULT_MAX_ATTEMPTS``.
 DEFAULT_MAX_ATTEMPTS = 3
 
@@ -316,6 +321,7 @@ async def triage_filing(
     snippets: Sequence[Snippet],
     *,
     model: str = DEFAULT_STAGE2_MODEL,
+    reasoning_effort: str = DEFAULT_STAGE2_REASONING,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
 ) -> FilingVerdict:
     """Ask stage 2 which of one filing's admitted snippets to keep.
@@ -329,12 +335,30 @@ async def triage_filing(
         accession_number: Filing the snippets came from.
         snippets: Stage-1 admitted snippets for that filing.
         model: Stage-2 model slug.
+        reasoning_effort: Reasoning effort passed to the client, in the
+            extractor's vocabulary.
         max_attempts: Attempts before giving up.
 
     Returns:
         The verdict. On failure every snippet is kept and ``error`` is set, so a
         stage-2 outage degrades to stage-1 behaviour rather than losing data.
+
+    Raises:
+        ValueError: If ``reasoning_effort`` is not a recognised effort. A config
+            error fails every filing identically, so it fails fast instead of
+            degrading.
     """
+    # Deferred like the module's other extractor tie-in (the duplicated
+    # protocol): the vocabulary is one frozenset, and importing it at module
+    # scope would drag the extractor's pandas stack into every sixk import.
+    from cdt.extractor.core import REASONING_EFFORTS
+
+    if reasoning_effort not in REASONING_EFFORTS:
+        allowed = ", ".join(sorted(REASONING_EFFORTS))
+        raise ValueError(
+            f"Unsupported reasoning effort {reasoning_effort!r}; "
+            f"expected one of {allowed}"
+        )
     body = "\n\n".join(
         f"--- snippet {index} ---\n{snippet.text}"
         for index, snippet in enumerate(snippets, start=1)
@@ -347,7 +371,7 @@ async def triage_filing(
     for attempt in range(1, max_attempts + 1):
         try:
             text = await client.complete(
-                messages=messages, model=model, reasoning_effort=""
+                messages=messages, model=model, reasoning_effort=reasoning_effort
             )
         except Exception as error:  # noqa: BLE001 - one filing must not stop a run
             LOGGER.warning("stage 2 call failed for %s: %r", accession_number, error)

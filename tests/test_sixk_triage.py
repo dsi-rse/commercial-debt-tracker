@@ -12,6 +12,7 @@ import pytest
 from cdt import settings
 from cdt.sixk import (
     DEFAULT_STAGE1_THRESHOLD,
+    DEFAULT_STAGE2_REASONING,
     Snippet,
     build_retry_message,
     default_model_dir,
@@ -32,13 +33,15 @@ class FakeClient:
         """Store the responses to hand back in order."""
         self.responses = list(responses)
         self.calls: list[list[dict[str, str]]] = []
+        self.efforts: list[str] = []
 
     async def complete(
         self: Self, *, messages: list[dict[str, str]], model: str, reasoning_effort: str
     ) -> str:
         """Return the next canned response."""
-        del model, reasoning_effort
+        del model
         self.calls.append(list(messages))
+        self.efforts.append(reasoning_effort)
         return self.responses.pop(0)
 
 
@@ -208,6 +211,24 @@ def test_triage_retries_a_malformed_verdict() -> None:
     assert verdict.kept == ["s1", "s2"]
     assert verdict.attempts == 2
     assert "not usable" in client.calls[1][-1]["content"]
+
+
+def test_triage_passes_the_reasoning_effort_through() -> None:
+    """The stage-2 call carries the configured effort, defaulting from settings."""
+    client = FakeClient([json.dumps({"keep": [1], "drop": []})] * 2)
+    asyncio.run(triage_filing(client, "acc-1", _snippets(1)))
+    asyncio.run(triage_filing(client, "acc-1", _snippets(1), reasoning_effort="low"))
+    assert client.efforts == [DEFAULT_STAGE2_REASONING, "low"]
+
+
+def test_triage_rejects_an_unknown_reasoning_effort() -> None:
+    """A config typo fails fast rather than failing every filing downstream."""
+    with pytest.raises(ValueError, match="Unsupported reasoning effort"):
+        asyncio.run(
+            triage_filing(
+                FakeClient([]), "acc-1", _snippets(1), reasoning_effort="lots"
+            )
+        )
 
 
 def test_triage_retries_an_out_of_range_covered_by() -> None:
