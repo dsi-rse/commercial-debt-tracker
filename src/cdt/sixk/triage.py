@@ -32,21 +32,22 @@ from __future__ import annotations
 
 import json
 import logging
-import pickle  # noqa: S403 - the stage-1 artifact is produced by this project
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, Self
 
 from cdt import settings
-from cdt.classifier.core import score_model
+from cdt.classifier.core import load_training_artifacts, score_model
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
 LOGGER = logging.getLogger(__name__)
 
-#: Stage-1 cutoff. Calibrated on a frozen 500-window probability sample; it is a
-#: property of one trained model, so retraining requires recalibrating it.
+#: Stage-1 cutoff, used only when an artifact carries no threshold of its own.
+#: Prefer :func:`load_stage1_model`, which reads it from the artifact: the
+#: threshold is a property of one fitted model, and a constant here would drift
+#: away from the model it was calibrated against.
 DEFAULT_STAGE1_THRESHOLD = 0.332
 
 #: Stage-2 model. Cheap is the point: it reads only what stage 1 admits.
@@ -159,24 +160,30 @@ def default_model_dir(data_dir: Path | None = None) -> Path:
     )
 
 
-def load_stage1_model(model_dir: Path | None = None) -> object:
-    """Load the stage-1 pipeline from a model directory.
+def load_stage1_model(model_dir: Path | None = None) -> tuple[object, float]:
+    """Load the stage-1 pipeline and the threshold calibrated with it.
+
+    Delegates to :func:`cdt.classifier.core.load_training_artifacts`, so the 6-K
+    and 8-K artifacts have the same on-disk contract. The threshold travels with
+    the model rather than living in code, because it is a property of one fitted
+    pipeline: refitting moves the score scale, and a hard-coded cutoff would
+    quietly stop meaning what it meant.
 
     Args:
-        model_dir: Directory holding :data:`MODEL_FILENAME`; defaults to
-            :func:`default_model_dir`.
+        model_dir: Directory holding ``model.pkl`` and ``metadata.json``;
+            defaults to :func:`default_model_dir`.
 
     Returns:
-        The fitted scikit-learn pipeline.
+        The fitted pipeline and its threshold.
 
     Raises:
         FileNotFoundError: If the artifact is absent.
     """
-    path = (model_dir or default_model_dir()) / MODEL_FILENAME
-    if not path.exists():
-        raise FileNotFoundError(f"no stage-1 model at {path}")
-    with path.open("rb") as handle:
-        return pickle.load(handle)  # noqa: S301 - artifact is produced in-project
+    resolved = model_dir or default_model_dir()
+    if not (resolved / MODEL_FILENAME).exists():
+        raise FileNotFoundError(f"no stage-1 model at {resolved / MODEL_FILENAME}")
+    model, threshold, _ = load_training_artifacts(resolved)
+    return model, threshold
 
 
 def stage1_admit(

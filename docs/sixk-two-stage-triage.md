@@ -103,6 +103,7 @@ Following the two patterns already in the repo rather than inventing a third:
 | | where | default | override |
 |---|---|---|---|
 | stage-1 artifact **path** | `cdt.sixk.default_model_dir()` | `DATA_DIR/models/sixk/stage1-tfidf-linear-svc` | `DATA_DIR`, or pass `model_dir` |
+| stage-1 **threshold** | the artifact's `metadata.json` | 0.332 | retrain and recalibrate |
 | stage-2 **model id** | `settings.SIXK_TRIAGE_MODEL` | `openai/gpt-5.6-luna` | `SIXK_TRIAGE_MODEL` env |
 
 Paths follow the 8-K classifier, which derives from `DATA_DIR` via
@@ -113,8 +114,22 @@ them in `settings.py` with an env override. The triage id is separate from
 lot of text and returns a list of ids, so it is priced for volume; extraction
 returns structured records and is priced for accuracy.
 
-**The artifact is not in this repo.** Place `model.pkl` and `metadata.json` from
-`model-c400-v5` in the directory above before running the stage.
+The threshold lives in the artifact rather than in code, and
+`load_stage1_model` returns it alongside the model. It is a property of one
+fitted pipeline: refitting moves the score scale, so a constant in code would
+quietly stop meaning what it was calibrated to mean.
+
+### The artifact
+
+Committed at `data/models/sixk/stage1-tfidf-linear-svc/`, the same way the 8-K
+classifier's is, and written by the same `classifier.core.save_training_artifacts`
+so both have one on-disk contract. There is no fetch step.
+
+It was **refitted in this repo under the pinned scikit-learn**, not copied from
+the research repo, which would have shipped a 1.8.0 pickle that warns on load
+here. Refitting reproduces the evaluated numbers exactly: the same 255 of 500
+windows admitted at 35.4% precision and 95.4% recall. Training used 5,727
+labelled windows (231 positive) with the 500 evaluation windows held out.
 
 ## Caveats worth carrying forward
 
@@ -123,11 +138,9 @@ returns structured records and is priced for accuracy.
   taste. Treat any single precision figure as ±10pp.
 - **Stage 2 is not deterministic.** Two identical runs at temperature 0 agreed on
   94.9% of keep/drop calls, so single-run precision carries about ±1.5pp.
-- **The threshold belongs to one model.** Retraining stage 1 requires
-  recalibrating 0.332 against a labelled sample; the score scale moves.
-- **The shipped artifact was pickled under scikit-learn 1.8.0** and this repo
-  resolves 1.9.0, which warns on unpickle. Regenerate it under the pinned version
-  before relying on it.
+- **Retraining means recalibrating.** The threshold in `metadata.json` belongs to
+  the fitted pipeline beside it; a new fit needs a new threshold measured against
+  a labelled sample, not the old number carried over.
 
 ## What is not in this change
 

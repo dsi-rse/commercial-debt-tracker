@@ -9,6 +9,7 @@ from typing import Self
 
 import pytest
 
+from cdt import settings
 from cdt.sixk import (
     DEFAULT_STAGE1_THRESHOLD,
     Snippet,
@@ -211,3 +212,16 @@ def test_load_stage1_model_reports_a_missing_artifact(tmp_path: Path) -> None:
     """A clear error beats an opaque pickle failure."""
     with pytest.raises(FileNotFoundError, match="no stage-1 model"):
         load_stage1_model(tmp_path / "absent")
+
+
+def test_shipped_artifact_loads_with_its_calibrated_threshold() -> None:
+    """The committed stage-1 artifact carries the threshold it was tuned with.
+
+    Reads the repo path directly: conftest points ``settings.DATA_DIR`` at a tmp
+    directory for every test, so ``default_model_dir()`` would not find it.
+    """
+    model, threshold = load_stage1_model(
+        default_model_dir(settings.PROJECT_ROOT / "data")
+    )
+    assert threshold == DEFAULT_STAGE1_THRESHOLD
+    assert hasattr(model, "decision_function")
