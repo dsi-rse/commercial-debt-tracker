@@ -18,6 +18,7 @@ dependencies = [
   "pycountry~=24.6",
   "pyarrow>=22.0",
   "scikit-learn~=1.5",
+  "tiktoken~=0.8",
   
   "python-dotenv~=1.2",
   
