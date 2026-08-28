@@ -37,7 +37,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, Self
 
 from cdt import settings
-from cdt.classifier.core import load_training_artifacts, score_model
+from cdt.classifier.core import (
+    SupportsDecisionFunction,
+    load_training_artifacts,
+    score_model,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -165,7 +169,9 @@ def default_model_dir(data_dir: Path | None = None) -> Path:
     )
 
 
-def load_stage1_model(model_dir: Path | None = None) -> tuple[object, float]:
+def load_stage1_model(
+    model_dir: Path | None = None,
+) -> tuple[SupportsDecisionFunction, float]:
     """Load the stage-1 pipeline and the threshold calibrated with it.
 
     Delegates to :func:`cdt.classifier.core.load_training_artifacts`, so the 6-K
@@ -192,7 +198,7 @@ def load_stage1_model(model_dir: Path | None = None) -> tuple[object, float]:
 
 
 def stage1_admit(
-    model: object,
+    model: SupportsDecisionFunction,
     snippets: Sequence[tuple[str, str]],
     *,
     threshold: float = DEFAULT_STAGE1_THRESHOLD,
@@ -209,7 +215,7 @@ def stage1_admit(
     """
     if not snippets:
         return []
-    scores = score_model(model, [text for _, text in snippets])  # type: ignore[arg-type]
+    scores = score_model(model, [text for _, text in snippets])
     return [
         Snippet(snippet_id=snippet_id, text=text, score=float(score))
         for (snippet_id, text), score in zip(snippets, scores, strict=True)
