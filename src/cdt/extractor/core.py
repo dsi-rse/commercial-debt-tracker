@@ -10,6 +10,7 @@ import json
 import re
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime
+from decimal import Decimal, InvalidOperation
 from importlib import resources
 from pathlib import Path
 from time import perf_counter
@@ -131,6 +132,19 @@ MONTH_MAP = {
     "november": "11",
     "december": "12",
 }
+QUALIFIED_DOLLAR_CODES = {
+    "A": "AUD",
+    "C": "CAD",
+    "CA": "CAD",
+    "HK": "HKD",
+    "NZ": "NZD",
+    "R": "BRL",
+    "S": "SGD",
+}
+QUALIFIED_DOLLAR_PATTERN = re.compile(
+    rf"\b({'|'.join(sorted(QUALIFIED_DOLLAR_CODES, key=len, reverse=True))})\$",
+    re.IGNORECASE,
+)
 AMOUNT_MULTIPLIERS = {
     "thousand": 1_000,
     "thousands": 1_000,
@@ -2015,22 +2029,51 @@ def normalize_json_text(value: object) -> str:
     return json.dumps(parsed, sort_keys=True, separators=(",", ":"))
 
 
-def canonical_value(
+def cluster_span_texts(
     tag_ids: object,
     tag_details: dict[str, dict[str, object]],
-) -> str | None:
-    """Return the longest textual member of one coreference cluster."""
+) -> list[str]:
+    """Return the normalized texts of one coreference cluster's spans."""
     if not isinstance(tag_ids, list) or not tag_ids:
-        return None
+        return []
     values = [
         normalize_span_whitespace(str(tag_details[tag_id]["text"]))
         for tag_id in tag_ids
         if isinstance(tag_id, str) and tag_id in tag_details
     ]
-    values = [value for value in values if value]
+    return [value for value in values if value]
+
+
+def canonical_value(
+    tag_ids: object,
+    tag_details: dict[str, dict[str, object]],
+) -> str | None:
+    """Return the longest textual member of one coreference cluster."""
+    values = cluster_span_texts(tag_ids, tag_details)
     if not values:
         return None
     return max(values, key=len)
+
+
+def canonical_amount_value(
+    tag_ids: object,
+    tag_details: dict[str, dict[str, object]],
+) -> str | None:
+    """Return the amount cluster's canonical text, preferring a parseable span.
+
+    An amount cluster often pairs the figure with the label that names it, and
+    the label is the longer span: `['$2,000,000', 'Principal Amount']` resolved
+    to `Principal Amount`, which parses to nothing, so the amount published as
+    null (#120). The rate guard reads this same text, so judging it on the span
+    the parser actually reads keeps #102/#103 pointed at the right words.
+    """
+    values = cluster_span_texts(tag_ids, tag_details)
+    if not values:
+        return None
+    parseable = [
+        value for value in values if normalized_amount_from_text(value) is not None
+    ]
+    return max(parseable or values, key=len)
 
 
 def is_valid_iso_date(value: str) -> bool:
@@ -2063,11 +2106,50 @@ def supported_currency_codes() -> set[str]:
     return _SUPPORTED_CURRENCY_CODES
 
 
-def normalize_numeric_string(value: float) -> str:
-    """Return one deterministic numeric string."""
-    if value.is_integer():
-        return str(int(value))
-    return f"{value:.12f}".rstrip("0").rstrip(".")
+def normalize_numeric_string(value: Decimal) -> str:
+    """Return one deterministic numeric string.
+
+    Decimal rather than float: `float("372246148.11")` is not that number, and
+    `f"{value:.12f}"` renders the difference as `372246148.110000014305`. That
+    string is what the model's `normalized_amount` was compared against, so
+    every amount carrying cents failed the agreement check in
+    `standardized_amount_payload` and published as null (#119).
+    """
+    quantized = value.normalize()
+    if quantized == quantized.to_integral_value():
+        quantized = quantized.to_integral_value()
+    return f"{quantized:f}"
+
+
+def decimal_from_amount_string(value: str | None) -> Decimal | None:
+    """Return one amount string as a Decimal, or None when it is not numeric."""
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip().replace(",", "")
+    if not stripped:
+        return None
+    try:
+        parsed = Decimal(stripped)
+    except (InvalidOperation, ValueError):
+        return None
+    if not parsed.is_finite():
+        return None
+    return parsed
+
+
+def amounts_agree(model_amount: object, parsed_amount: str | None) -> bool:
+    """Return whether the model's amount is the same value the parser read.
+
+    Compared numerically, so the model reporting `500000.00` against a parsed
+    `500000` counts as agreement rather than losing the amount (#119).
+    """
+    if not isinstance(model_amount, str) or parsed_amount is None:
+        return False
+    model_value = decimal_from_amount_string(model_amount)
+    parsed_value = decimal_from_amount_string(parsed_amount)
+    if model_value is None or parsed_value is None:
+        return False
+    return model_value == parsed_value
 
 
 def normalized_amount_from_text(text: str | None) -> str | None:
@@ -2078,7 +2160,9 @@ def normalized_amount_from_text(text: str | None) -> str | None:
     match = re.search(r"\d+(?:\.\d+)?", lowered)
     if not match:
         return None
-    amount = float(match.group(0))
+    amount = decimal_from_amount_string(match.group(0))
+    if amount is None:
+        return None
     for word, multiplier in AMOUNT_MULTIPLIERS.items():
         if re.search(rf"\b{word}\b", lowered):
             amount *= multiplier
@@ -2092,7 +2176,16 @@ def currency_candidates_from_text(text: str | None) -> set[str]:
         return set()
     lowered = text.lower()
     candidates: set[str] = set()
-    if "$" in text or "u.s. dollar" in lowered or "us dollar" in lowered:
+    # A qualified dollar sign is a different currency. Reading `C$300 million`
+    # as USD both mislabelled the amount and kept CAD out of the candidate set,
+    # so the model's correct currency was rejected and published as null (#121).
+    qualified = QUALIFIED_DOLLAR_PATTERN.findall(text)
+    candidates.update(QUALIFIED_DOLLAR_CODES[prefix.upper()] for prefix in qualified)
+    if (
+        text.count("$") > len(qualified)
+        or "u.s. dollar" in lowered
+        or "us dollar" in lowered
+    ):
         candidates.add("USD")
     if "€" in text or " euro" in lowered:
         candidates.add("EUR")
@@ -2191,7 +2284,7 @@ def standardized_amount_payload(
     """Return evidence payload plus validated normalized amount fields."""
     evidence_tag_ids = single_value_evidence_tag_ids(value)
     payload = cluster_payload(evidence_tag_ids, tag_details)
-    evidence_text = canonical_value(evidence_tag_ids, tag_details)
+    evidence_text = canonical_amount_value(evidence_tag_ids, tag_details)
     parsed_amount = normalized_amount_from_text(evidence_text)
     parsed_currency_candidates = currency_candidates_from_text(evidence_text)
     model_amount = value.get("normalized_amount") if isinstance(value, dict) else None
@@ -2201,10 +2294,10 @@ def standardized_amount_payload(
         parsed_amount = None
         parsed_currency_candidates = set()
 
+    # The parser's own string is published, so a model reporting the same value
+    # with different formatting keeps its amount rather than losing it (#119).
     payload["normalized_amount"] = (
-        model_amount
-        if isinstance(model_amount, str) and parsed_amount == model_amount
-        else None
+        parsed_amount if amounts_agree(model_amount, parsed_amount) else None
     )
     payload["currency"] = (
         model_currency

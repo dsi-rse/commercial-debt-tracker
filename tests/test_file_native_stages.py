@@ -21,8 +21,11 @@ from cdt.extractor.core import (
     ExtractionRowState,
     InstrumentIEStage,
     InstrumentRelationStage,
+    canonical_amount_value,
+    currency_candidates_from_text,
     is_rate_like_amount_text,
     load_prompt,
+    normalized_amount_from_text,
     normalized_maturity_from_text,
     validate_amount_is_not_rate,
 )
@@ -1219,6 +1222,185 @@ def test_instrument_ie_postprocess_drops_rate_amount() -> None:
     assert payload["currency"] is None
     # Evidence is preserved so the dropped value stays auditable.
     assert payload["tag_ids"] == ["tag-a-rate"]
+
+
+def test_normalized_amount_from_text_keeps_cents_exact() -> None:
+    """A cents value parses to itself, not to a float artifact (#119).
+
+    `float("372246148.11")` is not that number, and the old `f"{value:.12f}"`
+    rendering exposed the difference, so the string never matched what the model
+    reported and the amount published as null.
+    """
+    assert normalized_amount_from_text("$372,246,148.11") == "372246148.11"
+    assert normalized_amount_from_text("$55,637.41") == "55637.41"
+    assert normalized_amount_from_text("$5,529,722.96") == "5529722.96"
+    # Trailing zeros and scale words still collapse to one canonical form.
+    assert normalized_amount_from_text("$500,000.00") == "500000"
+    assert normalized_amount_from_text("$70.0 million") == "70000000"
+    assert normalized_amount_from_text("1.5 billion") == "1500000000"
+
+
+def test_instrument_ie_postprocess_keeps_an_amount_with_cents() -> None:
+    """A principal with cents survives the model/parser agreement gate (#119)."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = (
+        '<body>The <debt_instrument id="tag-i-1">construction loan facility'
+        "</debt_instrument> provides for "
+        '<amount id="tag-a-1">$372,246,148.11</amount>.</body>'
+    )
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "amount": {
+                    "evidence": ["tag-a-1"],
+                    # The model reports the value it read, without the float
+                    # artifact the parser used to produce.
+                    "normalized_amount": "372246148.11",
+                    "currency": "USD",
+                },
+            }
+        ]
+    )
+
+    InstrumentIEStage().postprocess(row_state)
+
+    mention = row_state.debt_instrument_mentions[0]
+    payload = json.loads(str(mention["amount_json"]))
+    assert mention["amount"] == "372246148.11"
+    assert payload["normalized_amount"] == "372246148.11"
+    assert payload["currency"] == "USD"
+
+
+def test_instrument_ie_postprocess_accepts_a_differently_formatted_amount() -> None:
+    """`500000.00` and `500000` are the same amount, so neither is lost (#119)."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = (
+        '<body>The <debt_instrument id="tag-i-1">promissory note'
+        '</debt_instrument> is for <amount id="tag-a-1">$500,000.00</amount>.</body>'
+    )
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "amount": {
+                    "evidence": ["tag-a-1"],
+                    "normalized_amount": "500000.00",
+                    "currency": "USD",
+                },
+            }
+        ]
+    )
+
+    InstrumentIEStage().postprocess(row_state)
+
+    mention = row_state.debt_instrument_mentions[0]
+    # The parser's canonical string is what gets published.
+    assert mention["amount"] == "500000"
+    # A genuinely different value is still rejected.
+    assert json.loads(str(mention["amount_json"]))["normalized_amount"] == "500000"
+
+
+def test_canonical_amount_value_prefers_the_span_that_parses() -> None:
+    """A longer label must not beat the figure it names (#120)."""
+    tag_details = {
+        "tag-a-1": {"type": "amount", "text": "$2,000,000"},
+        "tag-a-2": {"type": "amount", "text": "Principal Amount"},
+    }
+
+    assert canonical_amount_value(["tag-a-1", "tag-a-2"], tag_details) == "$2,000,000"
+    # With nothing parseable, the longest span is still the canonical text.
+    assert canonical_amount_value(["tag-a-2"], tag_details) == "Principal Amount"
+    # Among parseable spans the longest still wins, as it did before.
+    tag_details["tag-a-3"] = {"type": "amount", "text": "$2,000,000 in principal"}
+    assert (
+        canonical_amount_value(["tag-a-1", "tag-a-3"], tag_details)
+        == "$2,000,000 in principal"
+    )
+
+
+def test_instrument_ie_postprocess_keeps_an_amount_clustered_with_its_label() -> None:
+    """The figure survives being clustered with a longer label span (#120)."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = (
+        '<body>The <debt_instrument id="tag-i-1">Secured Convertible Promissory Note'
+        '</debt_instrument> has a <amount id="tag-a-label">Principal Amount</amount> '
+        'of <amount id="tag-a-figure">$2,000,000</amount>.</body>'
+    )
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "amount": {
+                    "evidence": ["tag-a-figure", "tag-a-label"],
+                    "normalized_amount": "2000000",
+                    "currency": "USD",
+                },
+            }
+        ]
+    )
+
+    InstrumentIEStage().postprocess(row_state)
+
+    mention = row_state.debt_instrument_mentions[0]
+    assert mention["amount"] == "2000000"
+    # Both spans stay in the payload as provenance.
+    payload = json.loads(str(mention["amount_json"]))
+    assert payload["tag_ids"] == ["tag-a-figure", "tag-a-label"]
+
+
+def test_currency_candidates_read_a_qualified_dollar_sign() -> None:
+    """`C$` is Canadian, not US, dollars (#121)."""
+    assert currency_candidates_from_text("C$300 million") == {"CAD"}
+    assert currency_candidates_from_text("A$50,000,000") == {"AUD"}
+    assert currency_candidates_from_text("NZ$10 million") == {"NZD"}
+    # An unqualified dollar sign keeps its USD reading.
+    assert currency_candidates_from_text("$500.0 million") == {"USD"}
+    assert currency_candidates_from_text("500 million U.S. dollars") == {"USD"}
+    # A span quoting both currencies offers both.
+    assert currency_candidates_from_text("C$300 million (US$220 million)") == {
+        "CAD",
+        "USD",
+    }
+
+
+def test_instrument_ie_postprocess_keeps_a_canadian_dollar_currency() -> None:
+    """A C$ principal publishes CAD rather than a null currency (#121)."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = (
+        '<body>The <debt_instrument id="tag-i-1">4.200% Senior Notes due 2033'
+        '</debt_instrument> total <amount id="tag-a-1">C$300 million</amount>.</body>'
+    )
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "amount": {
+                    "evidence": ["tag-a-1"],
+                    "normalized_amount": "300000000",
+                    "currency": "CAD",
+                },
+            }
+        ]
+    )
+
+    InstrumentIEStage().postprocess(row_state)
+
+    payload = json.loads(str(row_state.debt_instrument_mentions[0]["amount_json"]))
+    assert payload["normalized_amount"] == "300000000"
+    assert payload["currency"] == "CAD"
 
 
 def test_instrument_ie_postprocess_normalizes_wrapped_names() -> None:
