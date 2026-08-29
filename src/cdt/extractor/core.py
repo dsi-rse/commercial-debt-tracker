@@ -89,10 +89,14 @@ INSTRUMENT_SINGLE_VALUE_PROPERTIES = {
     # NER tags maturity phrases like "notes due 2028" inside the instrument name,
     # so end_date evidence may cite that name span instead of a standalone date.
     "end_date": {"date", "debt_instrument"},
-    "amount": {"amount"},
+    # The same holds for a principal stated inside the name, as in
+    # `$183.36 million term loan`: there is no separate `amount` span to cite,
+    # and rejecting the name span lost the amount outright (#129).
+    "amount": {"amount", "debt_instrument"},
     "name": {"debt_instrument"},
 }
 MATURITY_EVIDENCE_TAG_TYPES = {"debt_instrument"}
+NAME_EMBEDDED_AMOUNT_TAG_TYPES = {"debt_instrument"}
 STANDARDIZED_SINGLE_VALUE_PROPERTIES = {"start_date", "end_date", "amount"}
 INSTRUMENT_RELATION_TYPES = {"amendment_of", "retired_of", "split_of"}
 NUMERIC_STRING_PATTERN = re.compile(r"^\d+(?:\.\d+)?$")
@@ -117,6 +121,15 @@ YEAR_ONLY_MATURITY_SUFFIX = "-12-31"
 # would read is the rate itself rather than a percentage of something else (#103).
 AMOUNT_VALUE_PATTERN = re.compile(r"\d[\d,]*(?:\.\d+)?")
 RATE_SUFFIX_PATTERN = re.compile(r"\s*(?:%|basis\s+points?\b)", re.IGNORECASE)
+# A principal stated inside an instrument name: `$183.36 million term loan`,
+# `C$300 million notes due 2033`. The currency marker is required, so a coupon
+# rate or a maturity year in the same name cannot be read as the principal.
+NAME_EMBEDDED_AMOUNT_PATTERN = re.compile(
+    r"(?P<currency>[A-Z]{0,2}\$|€|£|¥)\s?"
+    r"(?P<value>\d[\d,]*(?:\.\d+)?)"
+    r"(?:\s+(?P<scale>thousand|million|billion|trillion))?",
+    re.IGNORECASE,
+)
 ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 MONTH_MAP = {
     "january": "01",
@@ -660,15 +673,16 @@ class InstrumentIEStage:
         seen_mention_ids: set[str] = set()
         for index, obj in mention_entries:
             raw_id = raw_id_for(index)
+            name_text = canonical_value(obj.get("name", []), tag_details)
             amount_payload = standardized_amount_payload(
                 obj.get("amount"),
                 tag_details,
+                name_text=name_text,
             )
             start_date_payload = standardized_date_payload(
                 obj.get("start_date"),
                 tag_details,
             )
-            name_text = canonical_value(obj.get("name", []), tag_details)
             end_date_payload = standardized_end_date_payload(
                 obj.get("end_date"),
                 tag_details,
@@ -2170,6 +2184,40 @@ def normalized_amount_from_text(text: str | None) -> str | None:
     return normalize_numeric_string(amount)
 
 
+def normalized_amount_from_name(text: str | None) -> str | None:
+    """Parse a principal stated inside an instrument name into a numeric string.
+
+    `$183.36 million term loan` carries its own principal, and NER tags the whole
+    phrase as one `debt_instrument`, so there is no `amount` span to cite and the
+    amount was lost (#129). A name stating more than one figure names no single
+    principal, so it parses to None rather than to whichever comes first — the
+    same rule `normalized_maturity_from_text` applies to maturities (#104).
+    """
+    if not text:
+        return None
+    values = {
+        normalized_amount_from_text(match.group(0))
+        for match in NAME_EMBEDDED_AMOUNT_PATTERN.finditer(text)
+    }
+    values.discard(None)
+    if len(values) != 1:
+        return None
+    return values.pop()
+
+
+def currency_from_name(text: str | None) -> str | None:
+    """Return the currency of a principal stated inside an instrument name."""
+    if not text:
+        return None
+    matches = list(NAME_EMBEDDED_AMOUNT_PATTERN.finditer(text))
+    if len(matches) != 1:
+        return None
+    candidates = currency_candidates_from_text(matches[0].group(0))
+    if len(candidates) != 1:
+        return None
+    return candidates.pop()
+
+
 def currency_candidates_from_text(text: str | None) -> set[str]:
     """Infer plausible ISO currency codes from one amount mention."""
     if not text:
@@ -2280,6 +2328,8 @@ def iso_date_from_parts(year: str, month_name: str, day: str) -> str | None:
 def standardized_amount_payload(
     value: object,
     tag_details: dict[str, dict[str, object]],
+    *,
+    name_text: str | None = None,
 ) -> dict[str, object]:
     """Return evidence payload plus validated normalized amount fields."""
     evidence_tag_ids = single_value_evidence_tag_ids(value)
@@ -2287,6 +2337,16 @@ def standardized_amount_payload(
     evidence_text = canonical_amount_value(evidence_tag_ids, tag_details)
     parsed_amount = normalized_amount_from_text(evidence_text)
     parsed_currency_candidates = currency_candidates_from_text(evidence_text)
+    if parsed_amount is None:
+        # A principal stated inside the name has no `amount` span to cite, so the
+        # name is the only evidence there is (#129).
+        name_amount = normalized_amount_from_name(name_text)
+        if name_amount is not None:
+            parsed_amount = name_amount
+            name_currency = currency_from_name(name_text)
+            parsed_currency_candidates = (
+                {name_currency} if name_currency else parsed_currency_candidates
+            )
     model_amount = value.get("normalized_amount") if isinstance(value, dict) else None
     model_currency = value.get("currency") if isinstance(value, dict) else None
     if is_rate_like_amount_text(evidence_text):

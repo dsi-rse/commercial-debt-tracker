@@ -37,7 +37,7 @@ For party properties, return one object per coreference cluster:
 - `name` may contain only `debt_instrument` tag ids.
 - `start_date.evidence` may contain only `date` tag ids.
 - `end_date.evidence` may contain `date` tag ids, or the instrument's own `debt_instrument` tag id when the maturity is embedded in the name, such as `3.875% senior notes due 2028`.
-- `amount.evidence` may contain only `amount` tag ids.
+- `amount.evidence` may contain `amount` tag ids, or the instrument's own `debt_instrument` tag id when the principal is stated inside the name, such as `$183.36 million term loan`.
 - `lenders` and `other_interested_parties` cluster `tag_ids` may contain only `person` or `organization` tag ids.
 - For `name`, return one list of tag ids representing a single coreference cluster.
 - Every `lenders` cluster must carry a `kind`, and every `other_interested_parties` cluster must carry a `role`.
@@ -85,6 +85,7 @@ Party rules:
 
 Examples:
 - If a document describes `3.875% senior notes due 2028` and gives no separate maturity date, return that instrument's `debt_instrument` tag id as `end_date.evidence` with `normalized_date` `2028-12-31`.
+- If a document describes a `$183.36 million term loan` and tags no separate amount, return that instrument's `debt_instrument` tag id as `amount.evidence` with `normalized_amount` `183360000` and `currency` `USD`.
 - If a document describes `senior notes due October 1, 2028` and tags `October 1, 2028` as a date, cite the `date` tag id with `normalized_date` `2028-10-01`.
 - If a credit agreement says ABR Loans bear interest at `0.875% per annum`, do not return `0.875` as the `amount`. Omit `amount` unless the document states that loan's principal or commitment amount.
 - If a company closes a `$1.2 billion` working capital facility that provides revolving loans, swing line loans up to `$25 million`, and letters of credit, return one object with `normalized_amount` `1200000000`, named by the facility's tagged span when present and otherwise by the `Revolving Loans` span. Do not return additional objects for `Swing Line Loans` or `Letters of Credit`, and never give any single mechanic the `$1.2 billion` total.

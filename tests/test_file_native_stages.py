@@ -23,8 +23,10 @@ from cdt.extractor.core import (
     InstrumentRelationStage,
     canonical_amount_value,
     currency_candidates_from_text,
+    currency_from_name,
     is_rate_like_amount_text,
     load_prompt,
+    normalized_amount_from_name,
     normalized_amount_from_text,
     normalized_maturity_from_text,
     validate_amount_is_not_rate,
@@ -1222,6 +1224,93 @@ def test_instrument_ie_postprocess_drops_rate_amount() -> None:
     assert payload["currency"] is None
     # Evidence is preserved so the dropped value stays auditable.
     assert payload["tag_ids"] == ["tag-a-rate"]
+
+
+def test_normalized_amount_from_name_reads_an_embedded_principal() -> None:
+    """A principal inside the name parses; a coupon or maturity does not (#129).
+
+    NER tags `$183.36 million term loan` as one `debt_instrument`, so there is no
+    `amount` span to cite. Requiring a currency marker is what keeps the coupon
+    rate and the maturity year from being read as the principal.
+    """
+    assert normalized_amount_from_name("$183.36 million term loan") == "183360000"
+    assert normalized_amount_from_name("C$300 million notes due 2033") == "300000000"
+    assert normalized_amount_from_name("$1,299,870.00 Promissory Note") == "1299870"
+    assert currency_from_name("C$300 million notes due 2033") == "CAD"
+    assert currency_from_name("€600.0 million 3.625% Notes due 2032") == "EUR"
+    # No currency marker means no principal is stated in the name.
+    assert normalized_amount_from_name("3.875% senior notes due 2028") is None
+    assert normalized_amount_from_name("revolving credit facility") is None
+    # A name stating two figures names no single principal, as #104 requires for
+    # maturities.
+    assert (
+        normalized_amount_from_name("$500 million and $750 million facilities") is None
+    )
+
+
+def test_instrument_ie_postprocess_recovers_a_principal_from_the_name() -> None:
+    """An uncited principal inside the name still publishes (#129)."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = (
+        '<body>The Company prepaid its <debt_instrument id="tag-i-1">$183.36 million '
+        "term loan</debt_instrument>.</body>"
+    )
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                # No `amount` span exists, so the model cites nothing.
+                "amount": {
+                    "evidence": [],
+                    "normalized_amount": "183360000",
+                    "currency": "USD",
+                },
+            }
+        ]
+    )
+
+    InstrumentIEStage().postprocess(row_state)
+
+    mention = row_state.debt_instrument_mentions[0]
+    payload = json.loads(str(mention["amount_json"]))
+    assert mention["amount"] == "183360000"
+    assert payload["currency"] == "USD"
+    # Nothing was cited, so the evidence list stays empty, as it does for a
+    # name-derived maturity.
+    assert payload["tag_ids"] == []
+
+
+def test_instrument_ie_validate_accepts_the_name_span_as_amount_evidence() -> None:
+    """Citing the instrument's own name span for a name-embedded amount is valid (#129)."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = (
+        '<body>The <debt_instrument id="tag-i-1">$183.36 million term loan'
+        "</debt_instrument> was prepaid.</body>"
+    )
+    response = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "amount": {
+                    "evidence": ["tag-i-1"],
+                    "normalized_amount": "183360000",
+                    "currency": "USD",
+                },
+            }
+        ]
+    )
+
+    assert InstrumentIEStage().validate(row_state, response) == []
+
+    row_state.stage_responses["instrument_ie"] = response
+    InstrumentIEStage().postprocess(row_state)
+    assert row_state.debt_instrument_mentions[0]["amount"] == "183360000"
 
 
 def test_normalized_amount_from_text_keeps_cents_exact() -> None:
