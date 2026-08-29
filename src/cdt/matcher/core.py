@@ -399,6 +399,7 @@ def match_tables(
         existing_edges=edge_rows,
         existing_instruments=instrument_rows,
     )
+    class_sizes = name_class_sizes(mention_index, instrument_rows)
     new_edge_rows: list[dict[str, object]] = []
 
     for mention_id in sorted(
@@ -414,6 +415,7 @@ def match_tables(
             profiles,
             strong_match_threshold=strong_match_threshold,
             loose_match_threshold=loose_match_threshold,
+            name_class_size=class_sizes.get(mention_id, 1),
         )
         chosen_cluster_id, chosen_edge_rows = resolve_candidates(
             mention,
@@ -622,12 +624,53 @@ def is_same_item_sibling(
     )
 
 
+def relaxed_keys_support_membership(
+    mention: PreparedMention,
+    profile: ClusterProfile,
+) -> bool:
+    """Return whether one agreeing key and no conflicting key joins the cluster.
+
+    Requiring amount *and* start date together was a cheap identity proxy that
+    left roughly half of all mentions unable to join anything: an announcement
+    carries an amount but no closing date, an amendment carries dates but no
+    principal. With the name already compatible, one key agreeing and none
+    disagreeing is enough evidence.
+    """
+    agrees = (
+        (
+            mention.normalized_amount is not None
+            and mention.normalized_amount in profile.normalized_amounts
+        )
+        or (
+            mention.normalized_start_date is not None
+            and mention.normalized_start_date in profile.normalized_start_dates
+        )
+        or (
+            mention.normalized_end_date is not None
+            and mention.normalized_end_date in profile.normalized_end_dates
+        )
+    )
+    if not agrees:
+        return False
+    conflicts = (
+        mention.normalized_amount is not None
+        and profile.normalized_amounts
+        and mention.normalized_amount not in profile.normalized_amounts
+    ) or (
+        mention.normalized_start_date is not None
+        and profile.normalized_start_dates
+        and mention.normalized_start_date not in profile.normalized_start_dates
+    )
+    return not conflicts
+
+
 def score_candidates_for_mention(
     mention: PreparedMention,
     profiles: dict[str, ClusterProfile],
     *,
     strong_match_threshold: float,
     loose_match_threshold: float,
+    name_class_size: int = 1,
 ) -> list[CandidateScore]:
     """Return scored candidate clusters for one mention."""
     del loose_match_threshold
@@ -637,8 +680,13 @@ def score_candidates_for_mention(
         mention.normalized_amount is not None
         and mention.normalized_start_date is not None
     )
-    if not has_match_keys and not name_fingerprint_is_identifying(
+    name_is_identifying = name_fingerprint_is_identifying(
         mention.normalized_name_fingerprint
+    )
+    if (
+        not has_match_keys
+        and not name_is_identifying
+        and name_class_size > NAME_CLASS_GATE
     ):
         return []
     candidates: list[CandidateScore] = []
@@ -670,26 +718,37 @@ def score_candidates_for_mention(
             and mention.normalized_amount in profile.normalized_amounts
             and mention.normalized_start_date in profile.normalized_start_dates
         )
+        name_compatible = any(
+            name_fingerprints_are_compatible(
+                mention.normalized_name_fingerprint, candidate_name
+            )
+            for candidate_name in profile.normalized_name_fingerprints
+        )
         if not keys_match:
-            # Launch, pricing, and closing 8-Ks for one offering drift on
-            # amount (upsizes) and start date (pricing vs settlement), so an
-            # identifying fingerprint may attach a mention whose keys conflict.
-            if (
-                name_fingerprint_is_identifying(mention.normalized_name_fingerprint)
-                and (
-                    mention.normalized_name_fingerprint
-                    in profile.normalized_name_fingerprints
-                )
-                and not is_same_item_sibling(mention, profile)
-            ):
-                candidates.append(
-                    CandidateScore(
-                        debt_instrument_id=profile.debt_instrument_id,
-                        match_score=round(strong_match_threshold, 4),
-                        support_family="name",
-                        basis="name_fingerprint",
+            # One item returns one object per instrument, so two objects from the
+            # same item whose names do not even describe the same debt are two
+            # debts. Kestra Medical's four tranches share an item, a maturity,
+            # and in two cases an amount.
+            if mention.item_id in profile.member_item_ids and not name_compatible:
+                continue
+            if name_compatible and not is_same_item_sibling(mention, profile):
+                # Launch, pricing, and closing 8-Ks for one offering drift on
+                # amount (upsizes) and start date (pricing vs settlement), so an
+                # identifying name may attach a mention whose keys conflict.
+                # Otherwise one agreeing key with none conflicting will do, but
+                # only while the name still individuates within the issuer.
+                if name_is_identifying or (
+                    name_class_size <= NAME_CLASS_GATE
+                    and relaxed_keys_support_membership(mention, profile)
+                ):
+                    candidates.append(
+                        CandidateScore(
+                            debt_instrument_id=profile.debt_instrument_id,
+                            match_score=round(strong_match_threshold, 4),
+                            support_family="name",
+                            basis="name_fingerprint",
+                        )
                     )
-                )
             continue
         lender_similarity = max(
             (
@@ -699,18 +758,11 @@ def score_candidates_for_mention(
             ),
             default=0.0,
         )
-        name_support = (
-            1.0
-            if mention.normalized_name_fingerprint
-            and mention.normalized_name_fingerprint
-            in profile.normalized_name_fingerprints
-            else 0.0
-        )
+        name_support = 1.0 if name_compatible else 0.0
         name_conflict = bool(
             mention.normalized_name_fingerprint is not None
             and profile.normalized_name_fingerprints
-            and mention.normalized_name_fingerprint
-            not in profile.normalized_name_fingerprints
+            and not name_compatible
         )
         support_family: str | None = None
         support_strength = 0.0
@@ -1305,10 +1357,15 @@ def normalize_date(value: str | None) -> str | None:
 
 
 def normalize_name_fingerprint(value: str | None) -> str | None:
-    """Normalize debt-instrument names for exact comparisons."""
+    """Normalize debt-instrument names for comparison."""
     if value is None:
         return None
     text = value.lower()
+    # Close a gap between the coupon digits and the percent sign before the
+    # trailing-zero rules below look for `%`. Filings write both `4.375%` and
+    # `4.375 %`, and the punctuation pass turns the space into a token break, so
+    # the two spellings fingerprinted differently and never matched.
+    text = re.sub(r"(\d)\s+%", r"\1%", text)
     text = re.sub(r"(\d+)\.(\d*?[1-9])0+(?=%)", r"\1.\2", text)
     text = re.sub(r"(\d+)\.0+(?=%)", r"\1", text)
     text = re.sub(r"[^a-z0-9%]+", " ", text)
@@ -1375,16 +1432,116 @@ def name_rate_tokens(fingerprint: str | None) -> frozenset[str]:
     return frozenset(NAME_RATE_PATTERN.findall(fingerprint))
 
 
+NAME_STOPWORDS = frozenset({"the", "of", "and", "its", "new", "existing", "certain"})
+NAME_CLASS_TOKEN = re.compile(r"^(?:[a-z]|[a-z]?-?\d+[a-z]?|\d+)$")
+NAME_MATURITY_YEAR_PATTERN = re.compile(r"\b(?:19|20)\d{2}\b")
+# Above this many mentions sharing one compatible name, the name is generic for
+# that issuer and the relaxed key rule is off. FHLB Dallas files 67
+# `Consolidated Obligation Bonds` with no dates and repeated round amounts, so
+# without the gate a single amount collision merges dozens of distinct bonds.
+NAME_CLASS_GATE = 2
+# The shorter of two compatible names needs this many informative tokens, so a
+# bare `note` cannot subsume every note one issuer has.
+NAME_MIN_SHARED_TOKENS = 2
+
+
+def name_fingerprint_tokens(fingerprint: str | None) -> frozenset[str]:
+    """Return the informative tokens of one name fingerprint."""
+    if not fingerprint:
+        return frozenset()
+    return frozenset(
+        token for token in fingerprint.split() if token not in NAME_STOPWORDS
+    )
+
+
+def name_fingerprints_are_compatible(left: str | None, right: str | None) -> bool:
+    """Return whether two name fingerprints can name one instrument.
+
+    Equality is too strict for the filing sequence: an announcement 8-K names
+    `senior notes due 2034` and the closing names the same debt `7.500% senior
+    notes due 2034`, so one name is the other plus the details settled since.
+    One fingerprint being a token-subset of the other captures that.
+
+    Guards, each of which cost real precision without it:
+
+    - the shorter name needs two informative tokens, so a bare `note` cannot
+      subsume every note the issuer has
+    - coupon tokens present on both sides must intersect
+    - the tokens that differ must not be *only* a class or tranche designator.
+      `Tranche A Loan` is not a shortened `Tranche B Loan`, and Kestra Medical's
+      four tranches collapse into one instrument without this.
+    """
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    left_tokens = name_fingerprint_tokens(left)
+    right_tokens = name_fingerprint_tokens(right)
+    if not left_tokens or not right_tokens:
+        return False
+    if not (left_tokens <= right_tokens or right_tokens <= left_tokens):
+        return False
+    if min(len(left_tokens), len(right_tokens)) < NAME_MIN_SHARED_TOKENS:
+        return False
+    left_rates = name_rate_tokens(left)
+    right_rates = name_rate_tokens(right)
+    if left_rates and right_rates and not (left_rates & right_rates):
+        return False
+    return any(
+        not NAME_CLASS_TOKEN.match(token) for token in left_tokens ^ right_tokens
+    )
+
+
 def name_fingerprint_is_identifying(fingerprint: str | None) -> bool:
     """Return whether a name fingerprint alone can identify one instrument.
 
-    A coupon rate is required: one issuer group can announce several
-    generic "Senior Secured Notes due YYYY" through different subsidiaries,
-    so a class-plus-year name is not identifying on its own.
+    A coupon rate does it. So does a maturity year: within one CIK,
+    `Convertible Senior Notes due 2031` picks out one debt, and requiring the
+    coupon meant an announcement 8-K that had not priced yet could never attach
+    to its own closing.
     """
     if not fingerprint:
         return False
-    return bool(NAME_RATE_PATTERN.search(fingerprint))
+    if NAME_RATE_PATTERN.search(fingerprint):
+        return True
+    return bool(NAME_MATURITY_YEAR_PATTERN.search(fingerprint))
+
+
+def name_class_sizes(
+    mention_index: dict[str, PreparedMention],
+    existing_instruments: pd.DataFrame | None = None,
+) -> dict[str, int]:
+    """Count, per mention, how many mentions of its CIK share a compatible name.
+
+    A name shared by many of one issuer's mentions is a template rather than an
+    identifier, so the relaxed key rule stands down for it.
+    """
+    by_cik: dict[str, list[str | None]] = {}
+    for mention in mention_index.values():
+        if mention.cik is None:
+            continue
+        by_cik.setdefault(mention.cik, []).append(mention.normalized_name_fingerprint)
+    if existing_instruments is not None and not existing_instruments.empty:
+        for row in existing_instruments.to_dict("records"):
+            cik = coerce_optional_text(row.get("cik"))
+            if cik is None or cik not in by_cik:
+                continue
+            by_cik[cik].append(
+                normalize_name_fingerprint(coerce_optional_text(row.get("name")))
+            )
+    sizes: dict[str, int] = {}
+    for mention_id, mention in mention_index.items():
+        if mention.cik is None:
+            sizes[mention_id] = 1
+            continue
+        fingerprint = mention.normalized_name_fingerprint
+        sizes[mention_id] = sum(
+            1
+            for other in by_cik[mention.cik]
+            if other == fingerprint
+            or name_fingerprints_are_compatible(fingerprint, other)
+        )
+    return sizes
 
 
 def name_rates_are_compatible(left: str | None, right: str | None) -> bool:

@@ -44,13 +44,18 @@ def profile_from(mention: PreparedMention) -> dict[str, object]:
     return {profile.debt_instrument_id: profile}
 
 
-def score(mention: PreparedMention, profiles: dict[str, object]) -> list[object]:
+def score(
+    mention: PreparedMention,
+    profiles: dict[str, object],
+    name_class_size: int = 1,
+) -> list[object]:
     """Score one mention with default thresholds."""
     return score_candidates_for_mention(
         mention,
         profiles,
         strong_match_threshold=0.90,
         loose_match_threshold=0.75,
+        name_class_size=name_class_size,
     )
 
 
@@ -218,21 +223,111 @@ def test_partial_key_mention_matches_despite_amount_conflict() -> None:
     assert candidates[0].basis == "name_fingerprint"
 
 
-def test_year_only_fingerprint_is_not_identifying() -> None:
-    """Class-plus-year names collide across subsidiary issuers of one CIK."""
+def test_year_only_fingerprint_identifies() -> None:
+    """A maturity year individuates within one CIK, so a keyless mention attaches.
+
+    This reverses #78's original call that a coupon was required. Measured on the
+    held-out window, requiring the coupon was the main reason an announcement
+    8-K could never reach its own closing: recall on hand-labelled merges was
+    0.38. The accepted cost is the case this test used to protect — one issuer
+    announcing two distinct generic `Senior Secured Notes due YYYY` through
+    different subsidiaries now merges them. No such case appears in the labelled
+    window, so the risk is real but unmeasured (#123).
+    """
     seed = prepare_mention(
         mention_row(name="Senior Secured Notes due 2027", end_date="2027-12-31")
     )
-    other_subsidiary = prepare_mention(
+    later = prepare_mention(
         mention_row(
             debt_instrument_mention_id="mention-2",
+            item_id="item-2",
             name="Senior Secured Notes due 2027",
             amount=None,
             start_date=None,
             end_date="2027-12-31",
         )
     )
-    assert score(other_subsidiary, profile_from(seed)) == []
+    candidates = score(later, profile_from(seed))
+    assert len(candidates) == 1
+    assert candidates[0].basis == "name_fingerprint"
+
+
+def test_announcement_name_without_the_coupon_attaches_to_its_closing() -> None:
+    """`senior notes due 2034` and `7.500% senior notes due 2034` are one debt (R3)."""
+    announcement = prepare_mention(
+        mention_row(
+            name="senior secured first lien notes due 2034",
+            amount="750000000",
+            start_date=None,
+            end_date="2034-12-31",
+        )
+    )
+    closing = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-2",
+            item_id="item-2",
+            name="7.500% senior secured first lien notes due 2034",
+            amount="750000000",
+            start_date="2026-08-21",
+            end_date="2034-09-15",
+        )
+    )
+    candidates = score(closing, profile_from(announcement))
+    assert len(candidates) == 1
+    assert candidates[0].basis == "name_fingerprint"
+
+
+def test_a_class_designator_is_not_a_shortened_name() -> None:
+    """`Tranche A Loan` must not subsume `Tranche B Loan` (R3 guard)."""
+    tranche_a = prepare_mention(
+        mention_row(
+            name="Tranche A Loan",
+            amount="75000000",
+            start_date=None,
+            end_date="2031-07-10",
+        )
+    )
+    tranche_b = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-2",
+            name="Tranche B Loan",
+            amount="25000000",
+            start_date=None,
+            end_date="2031-07-10",
+        )
+    )
+    assert score(tranche_b, profile_from(tranche_a)) == []
+
+
+def test_a_generic_issuer_name_turns_off_the_relaxed_key_rule() -> None:
+    """A name shared across the issuer is a template, not an identifier (R12 gate).
+
+    FHLB Dallas files dozens of `Consolidated Obligation Bonds` with no dates and
+    repeated round amounts, so one amount collision would otherwise merge
+    distinct bonds.
+    """
+    first = prepare_mention(
+        mention_row(
+            name="Consolidated Obligation Bonds",
+            amount="10000000",
+            start_date=None,
+            end_date=None,
+        )
+    )
+    second = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-2",
+            item_id="item-2",
+            name="Consolidated Obligation Bonds",
+            amount="10000000",
+            start_date=None,
+            end_date=None,
+        )
+    )
+    # Two mentions: inside the gate, the shared amount attaches the second one.
+    assert len(score(second, profile_from(first), name_class_size=2)) == 1
+    # The same pair inside a CIK that files many identically-named bonds: off.
+    assert score(second, profile_from(first), name_class_size=9) == []
 
 
 def test_upsized_pricing_mention_attaches_by_fingerprint() -> None:
