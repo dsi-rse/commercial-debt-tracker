@@ -131,6 +131,11 @@ NAME_EMBEDDED_AMOUNT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# An ampersand that starts no entity. The NER response has to be well-formed XML
+# while reproducing text that may carry a bare `&` (#127).
+UNESCAPED_AMPERSAND_PATTERN = re.compile(
+    r"&(?!(?:amp|lt|gt|quot|apos);|#(?:\d+|x[0-9A-Fa-f]+);)"
+)
 # Zero-padding is optional on the way in, so a model writing `2026-7-28` is read
 # as the day it means rather than dropped for its shape (#133).
 LENIENT_ISO_DATE_PATTERN = re.compile(
@@ -514,6 +519,7 @@ class NERStage:
                 "Model returned empty or non-text output. Even if no entities are present, return the input text."
             ]
 
+        response = repair_unescaped_ampersands(response)
         try:
             root = DefusedET.fromstring(response)
         except ET.ParseError as exc:
@@ -551,7 +557,7 @@ class NERStage:
         response = row_state.stage_responses.get(self.name)
         if not response:
             return
-        row_state.ner_tagged_xml = assign_tag_ids(response)
+        row_state.ner_tagged_xml = assign_tag_ids(repair_unescaped_ampersands(response))
 
     def early_stop(self, row_state: ExtractionRowState) -> bool:
         if not row_state.ner_tagged_xml:
@@ -1714,6 +1720,28 @@ def parse_tag_details(
 
     walk(root)
     return root, "".join(plain_parts), tag_details
+
+
+def repair_unescaped_ampersands(text: str) -> str:
+    """Escape ampersands the NER response left bare, so it can be parsed.
+
+    `NERStage.preprocess` wraps the item text in `<body>` without escaping it, so
+    an item containing `A&R Registration Rights Agreement` is handed to the model
+    as invalid XML. The response then has to satisfy two requirements at once:
+    reproduce the text exactly, and be well-formed XML. For text carrying a bare
+    ampersand those conflict unless the model escapes on its own initiative,
+    which the prompt never asks for.
+
+    Bare ampersands appear in 44 of 342 relevant items in one held-out window
+    across 37 issuers, and in 13% to 17% of relevant items in each of three
+    windows, so this is a standing tax rather than one filer's quirk. Repairing
+    the response rather than escaping the input keeps what the model sees
+    unchanged, so nothing about its tagging behaviour moves (#127).
+
+    Only `&` is repaired. A stray `<` or `>` never occurs in the source text, so
+    one in a response is a real malformation and should still be rejected.
+    """
+    return UNESCAPED_AMPERSAND_PATTERN.sub("&amp;", text)
 
 
 def assign_tag_ids(xml_text: str) -> str:

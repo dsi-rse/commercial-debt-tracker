@@ -21,6 +21,7 @@ from cdt.extractor.core import (
     ExtractionRowState,
     InstrumentIEStage,
     InstrumentRelationStage,
+    NERStage,
     canonical_amount_value,
     currency_candidates_from_text,
     currency_from_name,
@@ -31,6 +32,8 @@ from cdt.extractor.core import (
     normalized_amount_from_text,
     normalized_date_from_text,
     normalized_maturity_from_text,
+    parse_tag_details,
+    repair_unescaped_ampersands,
     validate_amount_is_not_rate,
 )
 from cdt.ingest import DOCUMENT_COLUMNS
@@ -1226,6 +1229,63 @@ def test_instrument_ie_postprocess_drops_rate_amount() -> None:
     assert payload["currency"] is None
     # Evidence is preserved so the dropped value stays auditable.
     assert payload["tag_ids"] == ["tag-a-rate"]
+
+
+def test_repair_unescaped_ampersands_leaves_real_entities_alone() -> None:
+    """A bare ampersand is escaped; anything already an entity is untouched (#127)."""
+    assert repair_unescaped_ampersands("A&R Agreement") == "A&amp;R Agreement"
+    assert repair_unescaped_ampersands("Smith & Wesson & Co") == (
+        "Smith &amp; Wesson &amp; Co"
+    )
+    for already_valid in (
+        "A&amp;R",
+        "a &lt; b",
+        "a &gt; b",
+        "&quot;x&quot;",
+        "&apos;x&apos;",
+        "&#8217;s",
+        "&#x2019;s",
+    ):
+        assert repair_unescaped_ampersands(already_valid) == already_valid
+
+
+def test_ner_validate_accepts_a_response_carrying_a_bare_ampersand() -> None:
+    """The exact-text and well-formed-XML requirements conflict without this (#127).
+
+    `NERStage.preprocess` wraps the item text in `<body>` unescaped, so an item
+    naming an `A&R Registration Rights Agreement` is handed to the model as
+    invalid XML. Reproducing it verbatim then yields invalid XML, and 44 of 342
+    relevant items in one held-out window carry a bare ampersand.
+    """
+    text = "The Company entered into the A&R Registration Rights Agreement."
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1", "text": text}, stage_name="ner"
+    )
+    response = (
+        "<body>The Company entered into the <agreement>A&R Registration Rights "
+        "Agreement</agreement>.</body>"
+    )
+
+    assert NERStage().validate(row_state, response) == []
+
+    row_state.stage_responses["ner"] = response
+    NERStage().postprocess(row_state)
+    _, plain_text, tag_details = parse_tag_details(str(row_state.ner_tagged_xml))
+    # The ampersand round-trips, so the text invariant still holds downstream.
+    assert plain_text == text
+    assert [d["text"] for d in tag_details.values()] == [
+        "A&R Registration Rights Agreement"
+    ]
+
+
+def test_ner_validate_still_rejects_a_stray_angle_bracket() -> None:
+    """Only `&` is repaired; a malformed tag is still a failure (#127)."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1", "text": "The Company borrowed."},
+        stage_name="ner",
+    )
+    failures = NERStage().validate(row_state, "<body>The Company <borrowed.</body>")
+    assert failures and "not valid XML" in failures[0]
 
 
 def test_normalized_date_from_text_reads_every_filing_spelling() -> None:
