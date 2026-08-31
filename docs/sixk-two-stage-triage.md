@@ -105,11 +105,15 @@ Following the two patterns already in the repo rather than inventing a third:
 | stage-1 artifact **path** | `cdt.sixk.default_model_dir()` | `DATA_DIR/models/sixk/stage1-tfidf-linear-svc` | `DATA_DIR`, or pass `model_dir` |
 | stage-1 **threshold** | the artifact's `metadata.json` | 0.332 | retrain and recalibrate |
 | stage-2 **model id** | `settings.SIXK_TRIAGE_MODEL` | `openai/gpt-5.6-luna` | `SIXK_TRIAGE_MODEL` env |
+| stage-2 **reasoning effort** | `settings.SIXK_TRIAGE_REASONING` | `none` | `SIXK_TRIAGE_REASONING` env |
 
 Paths follow the 8-K classifier, which derives from `DATA_DIR` via
 `classifier.core.default_model_dir` rather than taking a settings entry, so one
-variable moves both classifiers. Model ids follow the extractor, which does keep
-them in `settings.py` with an env override. The triage id is separate from
+variable moves both classifiers. Model ids and reasoning effort follow the
+extractor, which does keep
+them in `settings.py` with an env override. Both are read inside
+`triage_filing` rather than bound as default arguments, so an override applied
+after import is honoured. The triage id is separate from
 `EXTRACTOR_MODEL` because the two jobs want opposite trade-offs: triage reads a
 lot of text and returns a list of ids, so it is priced for volume; extraction
 returns structured records and is priced for accuracy.
