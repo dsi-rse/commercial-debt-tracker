@@ -36,6 +36,7 @@ from cdt.extractor.core import (
     normalized_amount_from_text,
     normalized_date_from_text,
     normalized_maturity_from_text,
+    oriented_lineage_pair,
     parse_tag_details,
     repair_unescaped_ampersands,
     validate_amount_is_not_rate,
@@ -1233,6 +1234,90 @@ def test_instrument_ie_postprocess_drops_rate_amount() -> None:
     assert payload["currency"] is None
     # Evidence is preserved so the dropped value stays auditable.
     assert payload["tag_ids"] == ["tag-a-rate"]
+
+
+def test_lineage_pair_is_oriented_successor_first() -> None:
+    """`amendment_of` runs from the amended instrument to the predecessor (#138).
+
+    Alclear's revolver is the confirmed case: a Credit Agreement dated as of
+    2020-03-31, amended 2026-06-23 to cut commitments from $100,000,000 and
+    extend maturity from 2026-06-28 to 2031-06-23. Every figure on the
+    `$100,000,000` object is pre-amendment, so it is the predecessor, and the
+    pointer must run the other way.
+    """
+    by_raw_id = {
+        "i-1": {"raw_id": "i-1", "start_date": "2020-03-31", "amount": "100000000"},
+        "i-2": {"raw_id": "i-2", "start_date": "2026-06-23", "amount": "50000000"},
+    }
+    # The model named the predecessor first; the pointer is flipped.
+    assert oriented_lineage_pair("i-1", "i-2", "amendment_of", by_raw_id) == (
+        "i-2",
+        "i-1",
+    )
+    # Already the right way round, so it is left alone.
+    assert oriented_lineage_pair("i-2", "i-1", "amendment_of", by_raw_id) == (
+        "i-2",
+        "i-1",
+    )
+    assert oriented_lineage_pair("i-1", "i-2", "retired_of", by_raw_id) == (
+        "i-2",
+        "i-1",
+    )
+
+
+def test_lineage_pair_is_left_alone_without_two_dates_to_compare() -> None:
+    """Nothing to orient on means nothing is changed (#138)."""
+    same = {
+        "i-1": {"raw_id": "i-1", "start_date": "2025-08-01"},
+        "i-2": {"raw_id": "i-2", "start_date": "2025-08-01"},
+    }
+    # Equal dates carry no ordering, which is exactly the state the old prompt
+    # convention produced, and why the direction went unchecked for so long.
+    assert oriented_lineage_pair("i-1", "i-2", "amendment_of", same) == ("i-1", "i-2")
+    missing = {
+        "i-1": {"raw_id": "i-1", "start_date": None},
+        "i-2": {"raw_id": "i-2", "start_date": "2026-06-23"},
+    }
+    assert oriented_lineage_pair("i-1", "i-2", "amendment_of", missing) == (
+        "i-1",
+        "i-2",
+    )
+    # `split_of` is not a before/after relation, so it is never reoriented.
+    ordered = {
+        "i-1": {"raw_id": "i-1", "start_date": "2020-03-31"},
+        "i-2": {"raw_id": "i-2", "start_date": "2026-06-23"},
+    }
+    assert oriented_lineage_pair("i-1", "i-2", "split_of", ordered) == ("i-1", "i-2")
+
+
+def test_relation_postprocess_flips_an_inverted_amendment() -> None:
+    """The published mention carries the corrected direction (#138)."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1", "text": "x"}, stage_name="instrument_relation"
+    )
+    row_state.debt_instrument_mentions = [
+        {
+            "raw_id": "i-1",
+            "debt_instrument_mention_id": "dim::pred",
+            "start_date": "2020-03-31",
+            "amendment_of": None,
+        },
+        {
+            "raw_id": "i-2",
+            "debt_instrument_mention_id": "dim::amended",
+            "start_date": "2026-06-23",
+            "amendment_of": None,
+        },
+    ]
+    row_state.stage_responses["instrument_relation"] = json.dumps(
+        [{"from": "i-1", "to": "i-2", "type": "amendment_of"}]
+    )
+
+    InstrumentRelationStage().postprocess(row_state)
+
+    by_raw = {m["raw_id"]: m for m in row_state.debt_instrument_mentions}
+    assert by_raw["i-2"]["amendment_of"] == "dim::pred"
+    assert by_raw["i-1"]["amendment_of"] is None
 
 
 def test_completion_result_captures_a_filtered_live_response() -> None:

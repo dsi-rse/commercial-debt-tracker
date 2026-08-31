@@ -41,6 +41,7 @@ from cdt.datasets import (
 from cdt.shared import get_logger
 from cdt.storage import (
     artifact_exists,
+    coerce_dataset_text,
     list_artifacts_with_versions,
     read_table,
     write_json_artifact,
@@ -805,6 +806,47 @@ class InstrumentIEStage:
         )
 
 
+LINEAGE_SUCCESSOR_FIRST_TYPES = {"amendment_of", "retired_of"}
+
+
+def oriented_lineage_pair(
+    source_id: str,
+    target_id: str,
+    relation_type: str,
+    by_raw_id: dict[str, dict[str, object]],
+) -> tuple[str, str]:
+    """Return one lineage pair oriented successor-first.
+
+    `amendment_of` and `retired_of` run from the instrument as amended or
+    retiring to the predecessor, so the source is the later of the two. When both
+    sides carry a start date and the source's is earlier, the model has named the
+    pair the wrong way round and the pointer is flipped.
+
+    Alclear's revolver is the confirmed case: a Credit Agreement dated as of
+    2020-03-31, amended 2026-06-23 to cut commitments from $100,000,000 and
+    extend maturity from 2026-06-28 to 2031-06-23. Every figure on the
+    `$100,000,000` object is pre-amendment, yet it was the object carrying
+    `amendment_of` (#138).
+
+    The dates have to disagree for this to fire. While the prompt gave the
+    predecessor and the amended instrument the same start date there was nothing
+    to orient on, which is why the direction went unchecked.
+    """
+    if relation_type not in LINEAGE_SUCCESSOR_FIRST_TYPES:
+        return source_id, target_id
+    source = by_raw_id.get(source_id)
+    target = by_raw_id.get(target_id)
+    if source is None or target is None:
+        return source_id, target_id
+    source_start = coerce_dataset_text(source.get("start_date"))
+    target_start = coerce_dataset_text(target.get("start_date"))
+    if not source_start or not target_start:
+        return source_id, target_id
+    if source_start < target_start:
+        return target_id, source_id
+    return source_id, target_id
+
+
 class InstrumentRelationStage:
     """Mention-level lineage relation stage."""
 
@@ -867,10 +909,16 @@ class InstrumentRelationStage:
             for mention in row_state.debt_instrument_mentions
         }
         for relation in data:
-            mention = by_raw_id.get(relation["from"])
+            source_id, target_id = oriented_lineage_pair(
+                str(relation["from"]),
+                str(relation["to"]),
+                str(relation["type"]),
+                by_raw_id,
+            )
+            mention = by_raw_id.get(source_id)
             if mention is None:
                 continue
-            mention[str(relation["type"])] = raw_to_global.get(relation["to"])
+            mention[str(relation["type"])] = raw_to_global.get(target_id)
 
     def early_stop(self, row_state: ExtractionRowState) -> bool:
         return False
@@ -2702,7 +2750,42 @@ def relation_prompt_xml(row_state: ExtractionRowState) -> str:
             else:
                 tag_to_raw_id[key] = f"{tag_to_raw_id[key]}||{raw_id}"
     body = render_relation_body(root, tag_to_raw_id)
-    return f"<body>{body}</body>"
+    return f"{relation_instrument_manifest(row_state)}<body>{body}</body>"
+
+
+def relation_instrument_manifest(row_state: ExtractionRowState) -> str:
+    """List each instrument id with the terms already extracted for it.
+
+    Two objects built from one name span render as the same tagged text twice,
+    once per instrument id, so `Third Amended and Restated Loan Agreement` and
+    its predecessor are indistinguishable in the body. The amount and dates that
+    tell them apart live in the `instrument_ie` output, which this stage never
+    saw, and it was being asked to decide which one carries "the newer terms"
+    from the ids alone. Every inverted lineage pair on the held-out run was a
+    same-name pair (#138).
+    """
+    lines: list[str] = []
+    for mention in row_state.debt_instrument_mentions:
+        attributes = [f'id="{escape_xml_attribute(str(mention["raw_id"]))}"']
+        for field_name in ("name", "amount", "start_date", "end_date"):
+            value = coerce_dataset_text(mention.get(field_name))
+            if value is not None:
+                attributes.append(f'{field_name}="{escape_xml_attribute(value)}"')
+        lines.append(f"  <instrument {' '.join(attributes)}/>")
+    if not lines:
+        return ""
+    joined = "\n".join(lines)
+    return f"<instruments>\n{joined}\n</instruments>\n"
+
+
+def escape_xml_attribute(value: str) -> str:
+    """Escape one string for use inside an XML attribute value."""
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
 
 
 def render_relation_body(root: ET.Element, tag_to_raw_id: dict[str, str]) -> str:
