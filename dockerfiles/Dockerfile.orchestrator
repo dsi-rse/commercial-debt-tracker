@@ -16,5 +16,13 @@ COPY data ./data
 
 RUN uv sync --locked --no-dev
 
+# tiktoken fetches its BPE table from openaipublic.blob.core.windows.net on first
+# use unless a cache directory is already populated, so the 6-K window sizing
+# would otherwise reach third-party blob storage on every container start -- and
+# fail outright wherever egress is restricted. Bake it in at build time.
+ENV TIKTOKEN_CACHE_DIR=/opt/tiktoken
+RUN mkdir -p "$TIKTOKEN_CACHE_DIR" \
+    && python -c "from cdt.sixk.windows import count_tokens; count_tokens('warm')"
+
 ENTRYPOINT ["cdt-orchestrator"]
 CMD ["--help"]
