@@ -191,7 +191,10 @@ def strip_inline_xbrl_prologue(text: str) -> str:
     return "\n".join(lines[end:])
 
 
-#: Use ``extend_debt_keywords`` or ``--extra-keyword`` to widen a single run.
+#: Document-level gate vocabulary. Pass ``keywords=`` to
+#: :func:`matched_debt_keywords` or :func:`has_debt_keyword` to widen a single
+#: run; the shipped tuple is what the 13.4% pass rate in the docs was measured
+#: against, so changing it in place invalidates that figure.
 DEBT_KEYWORDS: tuple[str, ...] = (
     "credit agreement",
     "indenture",
