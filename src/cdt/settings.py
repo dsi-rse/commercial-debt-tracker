@@ -32,7 +32,12 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 # Single source of truth for the extractor model id, as an OpenRouter slug. The
 # batch backend strips the provider prefix (``normalize_batch_model``), so both
 # backends stay on the same model when only this value changes.
-DEFAULT_EXTRACTOR_MODEL = "openai/gpt-5.4"
+#
+# Keep the id undated. OpenRouter and the OpenAI API both expose this model
+# undated, so one value serves both backends; OpenRouter's dated alias
+# (`openai/gpt-5.6-terra-20260709`) normalizes to `gpt-5.6-terra-20260709`,
+# which the OpenAI API rejects with a 400 on every request in a batch.
+DEFAULT_EXTRACTOR_MODEL = "openai/gpt-5.6-terra"
 EXTRACTOR_MODEL = os.environ.get("EXTRACTOR_MODEL") or DEFAULT_EXTRACTOR_MODEL
 EXTRACTOR_REASONING = os.environ.get("EXTRACTOR_REASONING", "none")
 # The OpenAI Batch API uses a reasoning_effort vocabulary distinct from
