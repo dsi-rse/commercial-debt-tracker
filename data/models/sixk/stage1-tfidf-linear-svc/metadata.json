@@ -1,0 +1,14 @@
+{
+  "form_type": "6-K",
+  "metrics_basis": "design-weighted on that frozen sample at threshold 0.332",
+  "model_name": "tfidf_linear_svc",
+  "precision": 0.3538,
+  "random_seed": 42,
+  "recall": 0.9537,
+  "threshold": 0.332,
+  "threshold_basis": "design-weighted 500-window probability sample (commercial-debt-tracker-models: eval-set.csv + eval-labels-v2.csv), held out of training; chosen for recall, not F1",
+  "train_csv": "commercial-debt-tracker-models:data/sixk/annotation/child-labels-all.csv",
+  "training_positives": 231,
+  "training_row_count": 5727,
+  "window_tokens": 400
+}

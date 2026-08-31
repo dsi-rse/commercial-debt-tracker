@@ -144,4 +144,8 @@ Optional runtime configuration:
   except for `minimal`, which is translated to OpenAI's `low`.
 - `EXTRACTOR_BACKEND` (`batch` default, or `live`) — also settable per run with
   `cdt-orchestrator --extractor-backend {live,batch} daily`
+- `SIXK_TRIAGE_MODEL` (default `openai/gpt-5.6-luna`) and `SIXK_TRIAGE_REASONING`
+  (default `none`) for the Form 6-K stage-2 triage. Separate from `EXTRACTOR_MODEL`
+  because triage reads a lot of text and returns a list of ids, so it is priced for
+  volume; see `docs/sixk-two-stage-triage.md`.
 
