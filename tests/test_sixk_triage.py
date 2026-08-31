@@ -377,6 +377,8 @@ def test_triage_does_not_call_the_model_for_a_filing_with_no_snippets() -> None:
     assert verdict.accession_number == "acc-1"
     assert verdict.kept == []
     assert verdict.error is None
+    # Zero, not the dataclass default of 1: no attempt was made.
+    assert verdict.attempts == 0
 
 
 def test_triage_still_rejects_a_bad_effort_for_an_empty_filing() -> None:

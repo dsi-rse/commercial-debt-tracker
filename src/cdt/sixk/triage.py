@@ -438,7 +438,7 @@ async def triage_filing(
     # user message -- a 400 from several providers, which would then be charged
     # for and routed into the transport-error path below.
     if not snippets:
-        return FilingVerdict(accession_number=accession_number)
+        return FilingVerdict(accession_number=accession_number, attempts=0)
     body = build_snippet_message(snippets, secrets.token_hex(8))
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
