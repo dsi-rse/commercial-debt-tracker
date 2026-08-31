@@ -392,10 +392,18 @@ def _leaf_spans(
 
 
 def _bounded_spans(text: str, *, max_tokens: int) -> list[tuple[int, int, int]]:
-    """Return token-bounded spans that tile the text, with their token counts.
+    r"""Return token-bounded spans that tile the text, with their token counts.
 
-    Counts include each span's trailing whitespace, so summing them never
-    understates the cost of the slice a packed window is emitted from.
+    Counts include each span's trailing whitespace, so the packing in
+    :func:`_pack_spans` accounts for every character it will emit.
+
+    Summing counts is still only an approximation of the joined slice's cost,
+    not an upper bound on it: ``o200k_base`` groups digits as ``\p{N}{1,3}``, so
+    joining two spans can *raise* the count -- ``count_tokens(", 8,72,6  ")`` is
+    8 and ``count_tokens("217")`` is 1, but the concatenation is 10, not 9.
+    :func:`_to_windows` re-measures each candidate and bisects anything over
+    budget, which is what makes ``max_tokens`` an actual guarantee. That
+    bisection branch is load-bearing rather than defensive.
     """
     if max_tokens < 1:
         raise ValueError(f"max_tokens must be positive, got {max_tokens}")
