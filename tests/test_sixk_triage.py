@@ -453,3 +453,44 @@ def test_the_system_prompt_is_sent_and_snippets_are_numbered_from_one() -> None:
         line for line in user["content"].splitlines() if line.startswith("--- snippet")
     ] == [f"--- snippet {index} [{nonce}] ---" for index in (1, 2, 3)]
     assert verdict.kept == ["s2"]
+
+
+def test_an_unrecognised_drop_reason_is_rejected_rather_than_coerced() -> None:
+    """The prompt offers two reasons, so a third means the contract was misread.
+
+    It used to fall through to `dropped_no_details`, recording a ruling the
+    model never made.
+    """
+    failures = validate_verdict(
+        {"keep": [], "drop": [{"id": 1, "reason": "totally_made_up"}]}, 1
+    )
+
+    assert failures == [
+        "snippet 1 dropped with unrecognised reason 'totally_made_up'; "
+        "expected one of duplicate, no_details"
+    ]
+
+
+def test_a_repeated_drop_id_is_rejected() -> None:
+    """A repeated id used to be recorded twice: `dropped_no_details == [s2, s2]`."""
+    drop = [{"id": 2, "reason": "no_details"}] * 2
+    failures = validate_verdict({"keep": [1], "drop": drop}, 2)
+
+    assert failures == ["snippet 2 appears more than once in drop"]
+
+
+def test_triage_retries_an_unrecognised_drop_reason() -> None:
+    """A bad reason routes into the retry loop like any other failed validation."""
+    client = FakeClient(
+        [
+            json.dumps({"keep": [1], "drop": [{"id": 2, "reason": "meh"}]}),
+            json.dumps({"keep": [1], "drop": [{"id": 2, "reason": "no_details"}]}),
+        ]
+    )
+
+    verdict = asyncio.run(triage_filing(client, "acc-1", _snippets(2)))
+
+    assert verdict.attempts == 2
+    assert verdict.kept == ["s1"]
+    assert verdict.dropped_no_details == ["s2"]
+    assert "unrecognised reason" in client.calls[1][-1]["content"]

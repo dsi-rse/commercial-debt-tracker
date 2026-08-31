@@ -74,6 +74,12 @@ DEFAULT_MAX_ATTEMPTS = 3
 #: 8-K classifier's layout so both load the same way.
 MODEL_FILENAME = "model.pkl"
 
+#: The only reasons the prompt offers for dropping a snippet. Anything else is
+#: a sign the model misread the contract, so it is rejected rather than coerced:
+#: the two are recorded separately and a duplicate ruling has to name what
+#: covers it.
+DROP_REASONS = frozenset({"duplicate", "no_details"})
+
 SYSTEM_PROMPT = """\
 You triage snippets from a single SEC Form 6-K filing for a commercial debt
 tracker. A later extraction stage will pull structured debt-instrument records
@@ -253,6 +259,11 @@ def validate_verdict(verdict: object, expected: int) -> list[str]:
     ...     2,
     ... )
     ['snippet 2 dropped as covered by snippet 9, which is not being kept']
+    >>> validate_verdict({"keep": [], "drop": [{"id": 1, "reason": "unsure"}]}, 1)
+    ["snippet 1 dropped with unrecognised reason 'unsure'; expected one of duplicate, no_details"]
+    >>> drop = [{"id": 1, "reason": "no_details"}] * 2
+    >>> validate_verdict({"keep": [], "drop": drop}, 1)
+    ['snippet 1 appears more than once in drop']
     """
     if not isinstance(verdict, dict):
         return ["response was not a JSON object"]
@@ -262,7 +273,9 @@ def validate_verdict(verdict: object, expected: int) -> list[str]:
         for entry in verdict.get("drop", [])
         if isinstance(entry, dict) and _is_index(entry.get("id"))
     ]
-    drop = {int(entry["id"]) for entry in entries}
+    dropped = [int(entry["id"]) for entry in entries]
+    drop = set(dropped)
+    allowed_reasons = ", ".join(sorted(DROP_REASONS))
     failures = [
         f"snippet {index} appears in both keep and drop"
         for index in sorted(keep & drop)
@@ -275,6 +288,16 @@ def validate_verdict(verdict: object, expected: int) -> list[str]:
     failures += [
         f"snippet {index} does not exist; ids run 1 to {expected}"
         for index in sorted((keep | drop) - set(range(1, expected + 1)))
+    ]
+    failures += [
+        f"snippet {index} appears more than once in drop"
+        for index in sorted({value for value in dropped if dropped.count(value) > 1})
+    ]
+    failures += [
+        f"snippet {entry['id']} dropped with unrecognised reason "
+        f"{entry.get('reason')!r}; expected one of {allowed_reasons}"
+        for entry in entries
+        if entry.get("reason") not in DROP_REASONS
     ]
     failures += [
         f"snippet {entry['id']} dropped as a duplicate without a covered_by id"
