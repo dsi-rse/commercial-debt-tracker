@@ -40,7 +40,7 @@ from cdt.extractor.core import (
     DEFAULT_MAX_ATTEMPTS,
     ExtractionRowState,
     collect_pending_extract_items,
-    extract_batch_response_text,
+    completion_result_from_batch_line,
     finalize_extract_outputs,
     handle_response,
     initial_messages,
@@ -828,12 +828,15 @@ def _fold_completed_batches(
                     continue
                 entry.resubmissions = 0
                 try:
-                    text = extract_batch_response_text(line)
+                    completion = completion_result_from_batch_line(line)
                 except Exception as exc:  # noqa: BLE001
                     record_stage_error(entry.row_state, str(exc))
                 else:
                     handle_response(
-                        entry.row_state, text, max_attempts=job.max_attempts
+                        entry.row_state,
+                        completion.text,
+                        max_attempts=job.max_attempts,
+                        completion=completion,
                     )
                 folded += 1
             else:

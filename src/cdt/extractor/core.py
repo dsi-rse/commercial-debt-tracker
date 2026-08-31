@@ -288,8 +288,8 @@ class SupportsChatCompletion(Protocol):
         messages: list[dict[str, str]],
         model: str,
         reasoning_effort: str,
-    ) -> str:
-        """Return one chat completion as plain text."""
+    ) -> CompletionResult:
+        """Return one chat completion with its provider metadata."""
 
 
 @dataclass
@@ -302,10 +302,32 @@ class AttemptRecord:
     response: str | None = None
     validation_errors: list[str] = field(default_factory=list)
     status: str = "incomplete"
+    # Provider metadata. Without `finish_reason` a response that the provider
+    # aborted is indistinguishable in the audit log from one the model chose to
+    # end, and those need opposite remedies: four items lost to NER in one
+    # held-out window turned out to be `content_filter` aborts rather than the
+    # length cap or the model stopping that they were twice diagnosed as (#135).
+    finish_reason: str | None = None
+    refusal: str | None = None
+    usage: dict[str, object] | None = None
+    response_id: str | None = None
+    served_model: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Convert one attempt to a JSON-serializable dictionary."""
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class CompletionResult:
+    """One model response plus the provider metadata that explains it."""
+
+    text: str
+    finish_reason: str | None = None
+    refusal: str | None = None
+    usage: dict[str, object] | None = None
+    response_id: str | None = None
+    served_model: str | None = None
 
 
 @dataclass
@@ -338,11 +360,19 @@ class ExtractionRowState:
         """Append prompt messages to the current attempt."""
         self.current_attempt.messages.extend(messages)
 
-    def add_response(self, response: str) -> None:
-        """Record the latest model response."""
+    def add_response(
+        self, response: str, completion: CompletionResult | None = None
+    ) -> None:
+        """Record the latest model response and the provider metadata for it."""
         self.current_attempt.response = response
         self.current_attempt.attempt_index += 1
         self.stage_responses[self.current_attempt.stage_name] = response
+        if completion is not None:
+            self.current_attempt.finish_reason = completion.finish_reason
+            self.current_attempt.refusal = completion.refusal
+            self.current_attempt.usage = completion.usage
+            self.current_attempt.response_id = completion.response_id
+            self.current_attempt.served_model = completion.served_model
 
     def add_validation(self, failures: list[str]) -> None:
         """Record validation output for the current attempt."""
@@ -478,7 +508,7 @@ class OpenRouterChatClient:
         messages: list[dict[str, str]],
         model: str,
         reasoning_effort: str,
-    ) -> str:
+    ) -> CompletionResult:
         """Run one OpenRouter chat completion."""
         from openrouter import OpenRouter
 
@@ -498,7 +528,7 @@ class OpenRouterChatClient:
             timeout_ms=LIVE_REQUEST_TIMEOUT_SECONDS * 1000,
         ) as client:
             response = await client.chat.send_async(**request_kwargs)
-        return extract_response_text(response)
+        return completion_result_from_response(response)
 
 
 class NERStage:
@@ -1612,6 +1642,7 @@ def handle_response(
     response: str,
     *,
     max_attempts: int,
+    completion: CompletionResult | None = None,
 ) -> list[dict[str, str]] | None:
     """Advance one row given the response to its outstanding request.
 
@@ -1621,7 +1652,7 @@ def handle_response(
     """
     stage = STAGE_BY_NAME[row_state.current_attempt.stage_name]
     stage_index = STAGE_INDEX[stage.name]
-    row_state.add_response(response)
+    row_state.add_response(response, completion)
     failures = stage.validate(row_state, response)
     row_state.add_validation(failures)
     if not failures:
@@ -1667,7 +1698,7 @@ async def run_extraction_workflow(
     messages = initial_messages(row_state)
     while messages is not None:
         try:
-            response = await resolved_client.complete(
+            completion = await resolved_client.complete(
                 messages=messages,
                 model=model,
                 reasoning_effort=reasoning_effort,
@@ -1679,7 +1710,12 @@ async def run_extraction_workflow(
                 raise InfrastructureError(f"{type(exc).__name__}: {exc}") from exc
             record_stage_error(row_state, f"{type(exc).__name__}: {exc}")
             return row_state
-        messages = handle_response(row_state, response, max_attempts=max_attempts)
+        messages = handle_response(
+            row_state,
+            completion.text,
+            max_attempts=max_attempts,
+            completion=completion,
+        )
     return row_state
 
 
@@ -1813,6 +1849,66 @@ def extract_batch_response_text(line: dict[str, object]) -> str:
                 text_parts.append(part["text"])
         return "".join(text_parts)
     raise RuntimeError("Batch response content was not text.")
+
+
+def as_plain_dict(value: object) -> dict[str, object] | None:
+    """Return one SDK model or mapping as a plain JSON-serializable dict.
+
+    Falls back to the instance attributes rather than returning None, so a
+    provider SDK that stops using pydantic models does not silently start
+    logging no usage at all.
+    """
+    if value is None:
+        return None
+    candidate: object = value
+    if not isinstance(value, dict):
+        dump = getattr(value, "model_dump", None)
+        candidate = dump() if callable(dump) else getattr(value, "__dict__", None)
+    if not isinstance(candidate, dict):
+        return None
+    return cast("dict[str, object]", json.loads(json.dumps(candidate, default=str)))
+
+
+def completion_result_from_response(response: object) -> CompletionResult:
+    """Build one completion result from an OpenRouter SDK response."""
+    choices = getattr(response, "choices", None) or []
+    choice = choices[0] if choices else None
+    message = getattr(choice, "message", None)
+    return CompletionResult(
+        text=extract_response_text(response),
+        finish_reason=getattr(choice, "finish_reason", None),
+        refusal=getattr(message, "refusal", None),
+        usage=as_plain_dict(getattr(response, "usage", None)),
+        response_id=getattr(response, "id", None),
+        served_model=getattr(response, "model", None),
+    )
+
+
+def completion_result_from_batch_line(line: dict[str, object]) -> CompletionResult:
+    """Build one completion result from an OpenAI Batch output JSONL line.
+
+    The batch route reaches OpenAI directly rather than through OpenRouter, so
+    the usage block carries token counts but no `cost`; spend has to be derived
+    from the counts. A filtered response arrives here as a normal `200` with a
+    body, so it never reaches the infrastructure-error path and today is
+    indistinguishable from ordinary bad output (#135).
+    """
+    text = extract_batch_response_text(line)
+    response = cast(dict[str, object], line.get("response") or {})
+    body = cast(dict[str, object], response.get("body") or {})
+    choices = cast(list[dict[str, object]], body.get("choices") or [])
+    choice = choices[0] if choices else {}
+    message = cast(dict[str, object], choice.get("message") or {})
+    refusal = message.get("refusal")
+    finish_reason = choice.get("finish_reason")
+    return CompletionResult(
+        text=text,
+        finish_reason=finish_reason if isinstance(finish_reason, str) else None,
+        refusal=refusal if isinstance(refusal, str) else None,
+        usage=as_plain_dict(body.get("usage")),
+        response_id=body.get("id") if isinstance(body.get("id"), str) else None,
+        served_model=body.get("model") if isinstance(body.get("model"), str) else None,
+    )
 
 
 def collapse_whitespace(value: str) -> str:

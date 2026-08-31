@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -18,11 +19,14 @@ from cdt.datasets import (
 )
 from cdt.extractor import extract_pending_items, mentions_root
 from cdt.extractor.core import (
+    CompletionResult,
     ExtractionRowState,
     InstrumentIEStage,
     InstrumentRelationStage,
     NERStage,
     canonical_amount_value,
+    completion_result_from_batch_line,
+    completion_result_from_response,
     currency_candidates_from_text,
     currency_from_name,
     dates_agree,
@@ -1229,6 +1233,102 @@ def test_instrument_ie_postprocess_drops_rate_amount() -> None:
     assert payload["currency"] is None
     # Evidence is preserved so the dropped value stays auditable.
     assert payload["tag_ids"] == ["tag-a-rate"]
+
+
+def test_completion_result_captures_a_filtered_live_response() -> None:
+    """A provider abort is recorded, not just its partial text (#135).
+
+    This is the shape observed live: `content_filter`, partial content, and a
+    zeroed unbilled usage block. Without `finish_reason` the audit log cannot
+    tell it from a model that chose to stop, and the two need opposite remedies.
+    """
+    usage = SimpleNamespace(
+        completion_tokens=0, prompt_tokens=0, total_tokens=0, cost=0.0
+    )
+    message = SimpleNamespace(content="<body>partial", refusal=None)
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(finish_reason="content_filter", message=message)],
+        usage=usage,
+        id="gen-1788206728-iWdiE2p9PV0",
+        model="openai/gpt-5.6-terra",
+    )
+
+    result = completion_result_from_response(response)
+
+    assert result.text == "<body>partial"
+    assert result.finish_reason == "content_filter"
+    assert result.response_id == "gen-1788206728-iWdiE2p9PV0"
+    assert result.served_model == "openai/gpt-5.6-terra"
+    assert result.usage == {
+        "completion_tokens": 0,
+        "prompt_tokens": 0,
+        "total_tokens": 0,
+        "cost": 0.0,
+    }
+
+
+def test_completion_result_captures_a_filtered_batch_line() -> None:
+    """The batch route carries the same fields on the same path (#135).
+
+    A filtered batch response arrives as a normal 200 with a body, so it never
+    reaches the infrastructure-error path and would otherwise be indistinguishable
+    from ordinary bad output.
+    """
+    line = {
+        "response": {
+            "status_code": 200,
+            "body": {
+                "id": "chatcmpl-abc",
+                "model": "gpt-5.4",
+                "choices": [
+                    {
+                        "finish_reason": "content_filter",
+                        "message": {"content": "<body>partial", "refusal": None},
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 0,
+                    "total_tokens": 11,
+                },
+            },
+        }
+    }
+
+    result = completion_result_from_batch_line(line)
+
+    assert result.text == "<body>partial"
+    assert result.finish_reason == "content_filter"
+    assert result.response_id == "chatcmpl-abc"
+    assert result.served_model == "gpt-5.4"
+    assert result.usage["total_tokens"] == 11
+
+
+def test_attempt_records_provider_metadata() -> None:
+    """The metadata reaches the attempt, and so `full.jsonl` (#135)."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1", "text": "x"}, stage_name="ner"
+    )
+    row_state.add_response(
+        "<body>x</body>",
+        CompletionResult(
+            text="<body>x</body>",
+            finish_reason="length",
+            usage={"total_tokens": 42},
+            response_id="gen-9",
+            served_model="openai/gpt-5.4",
+        ),
+    )
+
+    recorded = row_state.current_attempt.to_dict()
+    assert recorded["finish_reason"] == "length"
+    assert recorded["usage"] == {"total_tokens": 42}
+    assert recorded["response_id"] == "gen-9"
+    assert recorded["served_model"] == "openai/gpt-5.4"
+    # An attempt recorded without provider metadata stays null rather than absent.
+    other = ExtractionRowState(item_row={"item_id": "i", "text": "x"}, stage_name="ner")
+    other.add_response("<body>x</body>")
+    assert other.current_attempt.to_dict()["finish_reason"] is None
 
 
 def test_repair_unescaped_ampersands_leaves_real_entities_alone() -> None:

@@ -45,6 +45,7 @@ from cdt.extractor.batch import (
 from cdt.extractor.core import (
     EXTRACTOR_TEMPERATURE,
     REASONING_EFFORTS,
+    CompletionResult,
     ExtractionRowState,
     extract_batch_response_text,
     handle_response,
@@ -307,11 +308,22 @@ class ScriptedChatClient:
 
     async def complete(
         self, *, messages: list[dict[str, str]], model: str, reasoning_effort: str
-    ) -> str:
+    ) -> CompletionResult:
         del messages, model, reasoning_effort
         response = self.responses[self.index]
         self.index += 1
-        return response
+        return CompletionResult(
+            text=response,
+            finish_reason="stop",
+            usage={"completion_tokens": 7, "prompt_tokens": 11, "total_tokens": 18},
+            response_id=f"gen-{self.index}",
+            served_model=model_for_test(),
+        )
+
+
+def model_for_test() -> str:
+    """Return a stable served-model value for the fake client."""
+    return "openai/gpt-5.4"
 
 
 def _drive_resumable(
@@ -323,7 +335,24 @@ def _drive_resumable(
     while messages is not None:
         response = responses[index]
         index += 1
-        messages = handle_response(row_state, response, max_attempts=max_attempts)
+        # Mirror what `_fold_completed_batches` now passes through, so parity
+        # with the live workflow still means parity of the recorded attempt.
+        messages = handle_response(
+            row_state,
+            response,
+            max_attempts=max_attempts,
+            completion=CompletionResult(
+                text=response,
+                finish_reason="stop",
+                usage={
+                    "completion_tokens": 7,
+                    "prompt_tokens": 11,
+                    "total_tokens": 18,
+                },
+                response_id=f"gen-{index}",
+                served_model=model_for_test(),
+            ),
+        )
     return row_state
 
 
