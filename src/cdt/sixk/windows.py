@@ -481,9 +481,13 @@ def _to_windows(
                 )
             ]
         )
+        # Bind the base before extending: ``list.extend`` consumes the
+        # generator incrementally, so reading ``len(windows)`` inside it would
+        # see the earlier pieces of this same candidate already appended.
+        base = len(windows)
         windows.extend(
             TextWindow(
-                index=len(windows) + offset,
+                index=base + offset,
                 text=text[piece_start:piece_end],
                 start=piece_start,
                 end=piece_end,

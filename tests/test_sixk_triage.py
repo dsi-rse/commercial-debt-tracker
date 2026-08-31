@@ -24,6 +24,7 @@ from cdt.sixk import (
     triage_filing,
     validate_verdict,
 )
+from cdt.sixk.windows import _to_windows
 
 
 class FakeClient:
@@ -282,3 +283,24 @@ def test_shipped_artifact_loads_with_its_calibrated_threshold() -> None:
     )
     assert threshold == DEFAULT_STAGE1_THRESHOLD
     assert hasattr(model, "decision_function")
+
+
+def test_window_indices_are_contiguous_when_a_candidate_is_bisected() -> None:
+    """A candidate split into pieces numbers them consecutively, without gaps.
+
+    ``_to_windows`` bisects any candidate still over budget, which is the one
+    place more than one window comes out of a single candidate. Reading the
+    running length inside the generator handed to ``list.extend`` numbered those
+    pieces 0, 2, 4, ... and repeated indices across candidates.
+    """
+    windows = _to_windows("alpha " * 300, [(0, 1800)], max_tokens=50)
+
+    assert len(windows) > 1
+    assert [window.index for window in windows] == list(range(len(windows)))
+
+
+def test_window_indices_are_unique_across_candidates() -> None:
+    """Indices identify a window, so nothing downstream can collide on them."""
+    windows = _to_windows("alpha " * 300, [(0, 900), (900, 1800)], max_tokens=50)
+
+    assert [window.index for window in windows] == list(range(len(windows)))
