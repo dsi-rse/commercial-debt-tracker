@@ -30,7 +30,7 @@ TIKTOKEN_ENCODING_NAME = "o200k_base"
 
 #: Window size the shipped stage-1 model was trained on. Changing this
 #: invalidates the model and its calibrated threshold together.
-CHILD_WINDOW_TOKENS = 400
+WINDOW_TOKENS = 400
 
 #: Cut points tried in order when a span exceeds the token budget:
 #: paragraph, then line, then sentence. A span still too long after all
@@ -485,7 +485,7 @@ def _to_windows(
 def split_into_windows(
     text: str,
     *,
-    target_tokens: int = CHILD_WINDOW_TOKENS,
+    target_tokens: int = WINDOW_TOKENS,
 ) -> list[TextWindow]:
     """Split a text into contiguous, non-overlapping classifier windows.
 
@@ -496,7 +496,7 @@ def split_into_windows(
     Args:
         text: Document text to split.
         target_tokens: Largest allowed window size in tokens. The shipped
-            stage-1 model was fitted at :data:`CHILD_WINDOW_TOKENS`, so moving
+            stage-1 model was fitted at :data:`WINDOW_TOKENS`, so moving
             this invalidates its calibrated threshold.
 
     Returns:
@@ -516,7 +516,7 @@ def split_into_windows(
 def prepare_filing(
     text: str,
     *,
-    target_tokens: int = CHILD_WINDOW_TOKENS,
+    target_tokens: int = WINDOW_TOKENS,
     keywords: tuple[str, ...] = DEBT_KEYWORDS,
 ) -> list[TextWindow]:
     """Run steps 1-3 of the sequence: strip, gate, then window.

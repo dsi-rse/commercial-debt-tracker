@@ -26,8 +26,8 @@ from cdt.sixk.triage import (
     validate_verdict,
 )
 from cdt.sixk.windows import (
-    CHILD_WINDOW_TOKENS,
     DEBT_KEYWORDS,
+    WINDOW_TOKENS,
     TextWindow,
     count_tokens,
     has_debt_keyword,
@@ -38,7 +38,6 @@ from cdt.sixk.windows import (
 )
 
 __all__ = [
-    "CHILD_WINDOW_TOKENS",
     "DEBT_KEYWORDS",
     "DEFAULT_MAX_ATTEMPTS",
     "DEFAULT_STAGE1_THRESHOLD",
@@ -48,6 +47,7 @@ __all__ = [
     "FilingVerdict",
     "Snippet",
     "TextWindow",
+    "WINDOW_TOKENS",
     "build_retry_message",
     "build_snippet_message",
     "count_tokens",
