@@ -480,43 +480,32 @@ def _to_windows(
     return windows
 
 
-def build_windows(text: str, *, max_tokens: int) -> list[TextWindow]:
-    """Split a text into contiguous, non-overlapping windows within a budget.
-
-    Windows are cut on paragraph boundaries where possible, falling back to
-    lines, then sentences, then a character bisection, so no window exceeds
-    ``max_tokens``.
-
-    Args:
-        text: Document text to split.
-        max_tokens: Largest allowed window size in tokens.
-
-    Returns:
-        Windows in document order; empty when the text is blank.
-
-    >>> [window.text for window in build_windows("a. b. c.", max_tokens=4)]
-    ['a.', 'b.', 'c.']
-    >>> build_windows("   ", max_tokens=4)
-    []
-    """
-    spans = _bounded_spans(text, max_tokens=max_tokens)
-    groups = _pack_spans(spans, max_tokens=max_tokens)
-    candidates = [(group[0][0], group[-1][1]) for group in groups]
-    return _to_windows(text, candidates, max_tokens=max_tokens)
-
-
 def split_into_windows(
     text: str,
     *,
     target_tokens: int = CHILD_WINDOW_TOKENS,
 ) -> list[TextWindow]:
-    """Split a text into non-overlapping classifier windows.
+    """Split a text into contiguous, non-overlapping classifier windows.
+
+    Windows are cut on paragraph boundaries where possible, falling back to
+    lines, then sentences, then a character bisection, so no window exceeds
+    ``target_tokens``.
 
     Args:
         text: Document text to split.
-        target_tokens: Target window size in tokens.
+        target_tokens: Largest allowed window size in tokens. The shipped
+            stage-1 model was fitted at :data:`CHILD_WINDOW_TOKENS`, so moving
+            this invalidates its calibrated threshold.
 
     Returns:
-        Windows in document order.
+        Windows in document order; empty when the text is blank.
+
+    >>> [window.text for window in split_into_windows("a. b. c.", target_tokens=4)]
+    ['a.', 'b.', 'c.']
+    >>> split_into_windows("   ", target_tokens=4)
+    []
     """
-    return build_windows(text, max_tokens=target_tokens)
+    spans = _bounded_spans(text, max_tokens=target_tokens)
+    groups = _pack_spans(spans, max_tokens=target_tokens)
+    candidates = [(group[0][0], group[-1][1]) for group in groups]
+    return _to_windows(text, candidates, max_tokens=target_tokens)
