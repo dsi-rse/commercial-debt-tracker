@@ -43,6 +43,7 @@ from cdt.classifier.core import (
     load_training_artifacts,
     score_model,
 )
+from cdt.extractor.core import normalize_reasoning_effort
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -400,11 +401,6 @@ async def triage_filing(
             error fails every filing identically, so it fails fast instead of
             degrading.
     """
-    # Deferred like the module's other extractor tie-in (the duplicated
-    # protocol): the vocabulary is one frozenset, and importing it at module
-    # scope would drag the extractor's pandas stack into every sixk import.
-    from cdt.extractor.core import normalize_reasoning_effort
-
     # Read settings here rather than binding them as default arguments, so an
     # override applied after import is honoured. The `or` chain is what keeps
     # `normalize_reasoning_effort` reading this stage's setting: it falls back
