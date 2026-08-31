@@ -425,35 +425,6 @@ def _pack_spans(
     return groups
 
 
-def _overlap_start(
-    text: str,
-    previous_group: Sequence[tuple[int, int, int]],
-    *,
-    overlap_tokens: int,
-) -> int:
-    """Return the position where a chunk's overlap with the previous one starts.
-
-    Whole trailing spans are taken while they fit; the span that does not fit
-    contributes its tail. Table-heavy filings have paragraphs of well over a
-    thousand tokens, so without the partial tail those chunks would share no
-    context at all - or share nothing but a blank line.
-    """
-    if overlap_tokens <= 0:
-        return previous_group[-1][1]
-    start = previous_group[-1][1]
-    remaining = overlap_tokens
-    for span_start, span_end, span_tokens in reversed(previous_group):
-        if span_tokens <= remaining:
-            start = span_start
-            remaining -= span_tokens
-            continue
-        if remaining > 0:
-            tail_spans = _leaf_spans(text, span_start, span_end, max_tokens=remaining)
-            start = tail_spans[-1][0]
-        break
-    return start
-
-
 def _to_windows(
     text: str,
     candidates: Sequence[tuple[int, int]],
@@ -498,13 +469,8 @@ def _to_windows(
     return windows
 
 
-def build_windows(
-    text: str,
-    *,
-    max_tokens: int,
-    overlap_tokens: int = 0,
-) -> list[TextWindow]:
-    """Split a text into contiguous windows that respect a token budget.
+def build_windows(text: str, *, max_tokens: int) -> list[TextWindow]:
+    """Split a text into contiguous, non-overlapping windows within a budget.
 
     Windows are cut on paragraph boundaries where possible, falling back to
     lines, then sentences, then a character bisection, so no window exceeds
@@ -513,31 +479,18 @@ def build_windows(
     Args:
         text: Document text to split.
         max_tokens: Largest allowed window size in tokens.
-        overlap_tokens: Tokens of the previous window repeated at the start of
-            each window after the first.
 
     Returns:
         Windows in document order; empty when the text is blank.
 
-    Raises:
-        ValueError: If ``overlap_tokens`` leaves no room for content.
+    >>> [window.text for window in build_windows("a. b. c.", max_tokens=4)]
+    ['a.', 'b.', 'c.']
+    >>> build_windows("   ", max_tokens=4)
+    []
     """
-    body_tokens = max_tokens - overlap_tokens
-    if body_tokens < 1:
-        raise ValueError(
-            f"overlap_tokens ({overlap_tokens}) must be smaller than "
-            f"max_tokens ({max_tokens})"
-        )
-    spans = _bounded_spans(text, max_tokens=body_tokens)
-    groups = _pack_spans(spans, max_tokens=body_tokens)
-    candidates: list[tuple[int, int]] = []
-    for index, group in enumerate(groups):
-        start = (
-            _overlap_start(text, groups[index - 1], overlap_tokens=overlap_tokens)
-            if index
-            else group[0][0]
-        )
-        candidates.append((start, group[-1][1]))
+    spans = _bounded_spans(text, max_tokens=max_tokens)
+    groups = _pack_spans(spans, max_tokens=max_tokens)
+    candidates = [(group[0][0], group[-1][1]) for group in groups]
     return _to_windows(text, candidates, max_tokens=max_tokens)
 
 
