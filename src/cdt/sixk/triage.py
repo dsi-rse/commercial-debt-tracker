@@ -31,7 +31,6 @@ in avoided extraction. See ``docs/sixk-two-stage-triage.md``.
 from __future__ import annotations
 
 import json
-import logging
 import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -44,11 +43,12 @@ from cdt.classifier.core import (
     score_model,
 )
 from cdt.extractor.core import normalize_reasoning_effort
+from cdt.shared import get_logger
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-LOGGER = logging.getLogger(__name__)
+LOGGER = get_logger(__name__)
 
 #: Stage-1 cutoff, used only when an artifact carries no threshold of its own.
 #: Prefer :func:`load_stage1_model`, which reads it from the artifact: the
