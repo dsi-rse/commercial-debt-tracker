@@ -371,6 +371,12 @@ async def triage_filing(
     resolved_effort = normalize_reasoning_effort(
         reasoning_effort or settings.SIXK_TRIAGE_REASONING or DEFAULT_STAGE2_REASONING
     )
+    # Nothing to ask about. Stage 1 admits 5.8% of windows, so filings with no
+    # admitted window are the common case, and asking anyway would send an empty
+    # user message -- a 400 from several providers, which would then be charged
+    # for and routed into the transport-error path below.
+    if not snippets:
+        return FilingVerdict(accession_number=accession_number)
     body = "\n\n".join(
         f"--- snippet {index} ---\n{snippet.text}"
         for index, snippet in enumerate(snippets, start=1)

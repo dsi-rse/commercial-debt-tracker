@@ -359,3 +359,27 @@ def test_window_indices_are_unique_across_candidates() -> None:
     windows = _to_windows("alpha " * 300, [(0, 900), (900, 1800)], max_tokens=50)
 
     assert [window.index for window in windows] == list(range(len(windows)))
+
+
+def test_triage_does_not_call_the_model_for_a_filing_with_no_snippets() -> None:
+    """A filing stage 1 admitted nothing from costs nothing.
+
+    It would otherwise send an empty user message, which several providers
+    reject with a 400 that is billed and then read as a transport failure.
+    """
+    client = FakeClient([])
+
+    verdict = asyncio.run(triage_filing(client, "acc-1", []))
+
+    assert client.calls == []
+    assert verdict.accession_number == "acc-1"
+    assert verdict.kept == []
+    assert verdict.error is None
+
+
+def test_triage_still_rejects_a_bad_effort_for_an_empty_filing() -> None:
+    """Config errors fail fast: the short-circuit does not skip validation."""
+    with pytest.raises(ValueError, match="Unsupported reasoning effort"):
+        asyncio.run(
+            triage_filing(FakeClient([]), "acc-1", [], reasoning_effort="turbo")
+        )
