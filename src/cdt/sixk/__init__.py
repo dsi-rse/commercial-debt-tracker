@@ -32,6 +32,7 @@ from cdt.sixk.windows import (
     count_tokens,
     has_debt_keyword,
     matched_debt_keywords,
+    prepare_filing,
     split_into_windows,
     strip_inline_xbrl_prologue,
 )
@@ -54,6 +55,7 @@ __all__ = [
     "has_debt_keyword",
     "load_stage1_model",
     "matched_debt_keywords",
+    "prepare_filing",
     "split_into_windows",
     "stage1_admit",
     "strip_inline_xbrl_prologue",

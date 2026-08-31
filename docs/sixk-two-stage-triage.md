@@ -22,6 +22,12 @@ this is the runtime implementation.
    precision.
 5. **Stage 2: LLM over a whole filing's admitted windows at once.**
 
+Steps 1-3 are composed by `cdt.sixk.prepare_filing`, so the order is code
+rather than prose. It matters in both directions: the gate applies to the whole
+document, so applying it per window would change the 13.4% pass rate above,
+and stripping has to come first because a prologue's tag names are themselves
+made of debt vocabulary.
+
 ## Why stage 1 is deliberately imprecise
 
 At 0.332 stage 1 admits 5.8% of windows, holding 95.4% of relevant ones at 35.4%

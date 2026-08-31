@@ -20,6 +20,7 @@ from cdt.sixk import (
     default_model_dir,
     load_stage1_model,
     matched_debt_keywords,
+    prepare_filing,
     split_into_windows,
     stage1_admit,
     strip_inline_xbrl_prologue,
@@ -494,3 +495,36 @@ def test_triage_retries_an_unrecognised_drop_reason() -> None:
     assert verdict.kept == ["s1"]
     assert verdict.dropped_no_details == ["s2"]
     assert "unrecognised reason" in client.calls[1][-1]["content"]
+
+
+def test_prepare_filing_gates_on_the_whole_document_not_per_window() -> None:
+    """One mention anywhere admits every window, which is what was measured.
+
+    Gating per window instead would keep only the windows repeating the keyword,
+    silently changing the documented 13.4% pass rate.
+    """
+    text = "\n\n".join(
+        ["The Company entered into an indenture on 3 March.", *["Unrelated prose."] * 8]
+    )
+
+    windows = prepare_filing(text, target_tokens=8)
+
+    assert len(windows) > 1
+    assert sum("indenture" in window.text for window in windows) == 1
+
+
+def test_prepare_filing_strips_the_prologue_before_gating() -> None:
+    """A prologue's tag names are debt vocabulary and must not pass a filing.
+
+    Gating before stripping would admit this document on `iso4217:USD`-style
+    context facts alone, even though its prose never mentions debt.
+    """
+    pad = ["lzm-20250630", "false", "0001958217", "ifrs-full:BorrowingsMember"] * 8
+    body = "The Company declared a quarterly dividend to its shareholders today."
+
+    assert prepare_filing("\n".join([*pad, body])) == []
+
+
+def test_prepare_filing_rejects_a_filing_with_no_debt_vocabulary() -> None:
+    """The gate is what keeps stage 1 off the great majority of filings."""
+    assert prepare_filing("The board appointed a new auditor this quarter.") == []

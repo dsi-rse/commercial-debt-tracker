@@ -4,7 +4,9 @@ Ported from the ``uchicago-dsi/commercial-debt-tracker-models`` research repo,
 where the window size, the keyword gate and the inline-XBRL rule were each
 chosen against labelled data. The pieces belong together because they only make
 sense as a sequence: strip the XBRL padding, gate on debt vocabulary, then cut
-the survivor into the windows the classifier was trained on.
+the survivor into the windows the classifier was trained on. That sequence is
+:func:`prepare_filing` rather than a comment, because the granularity each step
+runs at is not recoverable from the individual functions.
 
 Windows are 400 tokens, not the 2,000 the 8-K path uses. Only 1.2% of positive
 windows proved context-dependent at that size, and the smaller crop cut
@@ -509,3 +511,40 @@ def split_into_windows(
     groups = _pack_spans(spans, max_tokens=target_tokens)
     candidates = [(group[0][0], group[-1][1]) for group in groups]
     return _to_windows(text, candidates, max_tokens=target_tokens)
+
+
+def prepare_filing(
+    text: str,
+    *,
+    target_tokens: int = CHILD_WINDOW_TOKENS,
+    keywords: tuple[str, ...] = DEBT_KEYWORDS,
+) -> list[TextWindow]:
+    """Run steps 1-3 of the sequence: strip, gate, then window.
+
+    The order is load-bearing and was previously recorded only in prose. The
+    keyword gate applies to the *whole document*, after the prologue is stripped
+    and before it is cut up. Applying it per window instead would silently change
+    the measured 13.4% pass rate -- a filing that says "indenture" once in its
+    introduction would keep only the windows repeating the word, rather than all
+    of them -- and nothing would fail while it happened. Stripping after gating
+    would likewise let a prologue's tag names, which are made of debt
+    vocabulary, pass a filing whose prose never mentions debt.
+
+    Args:
+        text: Extracted document text.
+        target_tokens: Window size; see :func:`split_into_windows`.
+        keywords: Gate vocabulary; see :data:`DEBT_KEYWORDS`.
+
+    Returns:
+        Windows for a filing that passes the gate, in document order; empty when
+        the gate rejects it or nothing is left to window.
+
+    >>> len(prepare_filing("The Company issued senior notes due 2030 today."))
+    1
+    >>> prepare_filing("The Company declared a quarterly dividend of $0.10.")
+    []
+    """
+    body = strip_inline_xbrl_prologue(text)
+    if not has_debt_keyword(body, keywords=keywords):
+        return []
+    return split_into_windows(body, target_tokens=target_tokens)
