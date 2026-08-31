@@ -46,3 +46,19 @@ def test_sixk_triage_model_defaults_and_overrides(monkeypatch) -> None:  # noqa:
 
     monkeypatch.undo()
     importlib.reload(cdt.settings)
+
+
+def test_sixk_triage_reasoning_defaults_and_overrides(monkeypatch) -> None:  # noqa: ANN001
+    """The 6-K triage reasoning effort follows the same env-override pattern."""
+    monkeypatch.delenv("SIXK_TRIAGE_REASONING", raising=False)
+    monkeypatch.setattr(dotenv, "load_dotenv", lambda *args, **kwargs: None)
+    reloaded = importlib.reload(cdt.settings)
+    assert reloaded.SIXK_TRIAGE_REASONING == reloaded.DEFAULT_SIXK_TRIAGE_REASONING
+    assert reloaded.DEFAULT_SIXK_TRIAGE_REASONING == "none"
+
+    monkeypatch.setenv("SIXK_TRIAGE_REASONING", "medium")
+    reloaded = importlib.reload(cdt.settings)
+    assert reloaded.SIXK_TRIAGE_REASONING == "medium"
+
+    monkeypatch.undo()
+    importlib.reload(cdt.settings)

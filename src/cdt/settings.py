@@ -46,4 +46,7 @@ EXTRACTOR_BATCH_REASONING = os.environ.get("EXTRACTOR_BATCH_REASONING", "none")
 # extraction returns structured records and is priced for accuracy.
 DEFAULT_SIXK_TRIAGE_MODEL = "openai/gpt-5.6-luna"
 SIXK_TRIAGE_MODEL = os.environ.get("SIXK_TRIAGE_MODEL") or DEFAULT_SIXK_TRIAGE_MODEL
-SIXK_TRIAGE_REASONING = os.environ.get("SIXK_TRIAGE_REASONING", "none")
+DEFAULT_SIXK_TRIAGE_REASONING = "none"
+SIXK_TRIAGE_REASONING = (
+    os.environ.get("SIXK_TRIAGE_REASONING") or DEFAULT_SIXK_TRIAGE_REASONING
+)

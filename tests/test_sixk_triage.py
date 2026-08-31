@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 from pathlib import Path
 from typing import Self
 
+import dotenv
 import pytest
 
 from cdt import settings
 from cdt.sixk import (
     DEFAULT_STAGE1_THRESHOLD,
-    DEFAULT_STAGE2_REASONING,
     Snippet,
     build_retry_message,
     default_model_dir,
@@ -35,14 +36,15 @@ class FakeClient:
         self.responses = list(responses)
         self.calls: list[list[dict[str, str]]] = []
         self.efforts: list[str] = []
+        self.models: list[str] = []
 
     async def complete(
         self: Self, *, messages: list[dict[str, str]], model: str, reasoning_effort: str
     ) -> str:
         """Return the next canned response."""
-        del model
         self.calls.append(list(messages))
         self.efforts.append(reasoning_effort)
+        self.models.append(model)
         return self.responses.pop(0)
 
 
@@ -214,12 +216,65 @@ def test_triage_retries_a_malformed_verdict() -> None:
     assert "not usable" in client.calls[1][-1]["content"]
 
 
-def test_triage_passes_the_reasoning_effort_through() -> None:
-    """The stage-2 call carries the configured effort, defaulting from settings."""
-    client = FakeClient([json.dumps({"keep": [1], "drop": []})] * 2)
+def test_triage_defaults_the_model_and_effort_to_the_built_in_values() -> None:
+    """With nothing configured, the call carries the documented defaults."""
+    client = FakeClient([json.dumps({"keep": [1], "drop": []})])
     asyncio.run(triage_filing(client, "acc-1", _snippets(1)))
-    asyncio.run(triage_filing(client, "acc-1", _snippets(1), reasoning_effort="low"))
-    assert client.efforts == [DEFAULT_STAGE2_REASONING, "low"]
+
+    # Spelled out rather than compared to the module's own constants, which
+    # would pass whatever those constants held.
+    assert client.models == ["openai/gpt-5.6-luna"]
+    assert client.efforts == ["none"]
+
+
+def test_triage_reads_the_configured_model_and_effort_at_call_time(monkeypatch) -> None:  # noqa: ANN001
+    """A settings override applied after import reaches the stage-2 call.
+
+    Binding these as default arguments captured them at import and silently
+    ignored every override route the repo uses.
+    """
+    monkeypatch.setattr(settings, "SIXK_TRIAGE_MODEL", "openai/patched")
+    monkeypatch.setattr(settings, "SIXK_TRIAGE_REASONING", "high")
+    client = FakeClient([json.dumps({"keep": [1], "drop": []})])
+
+    asyncio.run(triage_filing(client, "acc-1", _snippets(1)))
+
+    assert client.models == ["openai/patched"]
+    assert client.efforts == ["high"]
+
+
+def test_triage_env_override_reaches_the_stage_two_call(monkeypatch) -> None:  # noqa: ANN001
+    """The env var an operator sets is the one the client receives."""
+    monkeypatch.setenv("SIXK_TRIAGE_REASONING", "medium")
+    monkeypatch.setattr(dotenv, "load_dotenv", lambda *args, **kwargs: None)
+    importlib.reload(settings)
+    client = FakeClient([json.dumps({"keep": [1], "drop": []})])
+
+    asyncio.run(triage_filing(client, "acc-1", _snippets(1)))
+
+    assert client.efforts == ["medium"]
+
+    monkeypatch.undo()
+    importlib.reload(settings)
+
+
+def test_triage_explicit_arguments_win_over_settings(monkeypatch) -> None:  # noqa: ANN001
+    """An explicit argument overrides the configured value."""
+    monkeypatch.setattr(settings, "SIXK_TRIAGE_REASONING", "high")
+    client = FakeClient([json.dumps({"keep": [1], "drop": []})])
+
+    asyncio.run(
+        triage_filing(
+            client,
+            "acc-1",
+            _snippets(1),
+            model="openai/explicit",
+            reasoning_effort="low",
+        )
+    )
+
+    assert client.models == ["openai/explicit"]
+    assert client.efforts == ["low"]
 
 
 def test_triage_rejects_an_unknown_reasoning_effort() -> None:

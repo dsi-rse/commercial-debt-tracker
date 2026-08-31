@@ -55,13 +55,15 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_STAGE1_THRESHOLD = 0.332
 
 #: Stage-2 model. Cheap is the point: it reads only what stage 1 admits.
-#: Sourced from settings so it is overridable by ``SIXK_TRIAGE_MODEL``.
-DEFAULT_STAGE2_MODEL = settings.SIXK_TRIAGE_MODEL
+#: This is the built-in default, not the configured value: ``triage_filing``
+#: reads ``settings.SIXK_TRIAGE_MODEL`` at call time, matching how the extractor
+#: pairs ``DEFAULT_MODEL`` with a call-time ``settings.EXTRACTOR_MODEL`` read.
+DEFAULT_STAGE2_MODEL = settings.DEFAULT_SIXK_TRIAGE_MODEL
 
-#: Stage-2 reasoning effort, overridable by ``SIXK_TRIAGE_REASONING`` and
-#: validated against the extractor's vocabulary, so both LLM stages spell
-#: "no reasoning" the same way.
-DEFAULT_STAGE2_REASONING = settings.SIXK_TRIAGE_REASONING
+#: Stage-2 reasoning effort, the built-in default on the same terms. The
+#: configured value is ``SIXK_TRIAGE_REASONING``, validated against the
+#: extractor's vocabulary so both LLM stages spell "no reasoning" the same way.
+DEFAULT_STAGE2_REASONING = settings.DEFAULT_SIXK_TRIAGE_REASONING
 
 #: Attempts per filing, matching the extractor's ``DEFAULT_MAX_ATTEMPTS``.
 DEFAULT_MAX_ATTEMPTS = 3
@@ -326,8 +328,8 @@ async def triage_filing(
     accession_number: str,
     snippets: Sequence[Snippet],
     *,
-    model: str = DEFAULT_STAGE2_MODEL,
-    reasoning_effort: str = DEFAULT_STAGE2_REASONING,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
 ) -> FilingVerdict:
     """Ask stage 2 which of one filing's admitted snippets to keep.
@@ -340,9 +342,10 @@ async def triage_filing(
         client: Chat client.
         accession_number: Filing the snippets came from.
         snippets: Stage-1 admitted snippets for that filing.
-        model: Stage-2 model slug.
+        model: Stage-2 model slug; defaults to ``settings.SIXK_TRIAGE_MODEL``.
         reasoning_effort: Reasoning effort passed to the client, in the
-            extractor's vocabulary.
+            extractor's vocabulary; defaults to
+            ``settings.SIXK_TRIAGE_REASONING``.
         max_attempts: Attempts before giving up.
 
     Returns:
@@ -357,14 +360,17 @@ async def triage_filing(
     # Deferred like the module's other extractor tie-in (the duplicated
     # protocol): the vocabulary is one frozenset, and importing it at module
     # scope would drag the extractor's pandas stack into every sixk import.
-    from cdt.extractor.core import REASONING_EFFORTS
+    from cdt.extractor.core import normalize_reasoning_effort
 
-    if reasoning_effort not in REASONING_EFFORTS:
-        allowed = ", ".join(sorted(REASONING_EFFORTS))
-        raise ValueError(
-            f"Unsupported reasoning effort {reasoning_effort!r}; "
-            f"expected one of {allowed}"
-        )
+    # Read settings here rather than binding them as default arguments, so an
+    # override applied after import is honoured. The `or` chain is what keeps
+    # `normalize_reasoning_effort` reading this stage's setting: it falls back
+    # to `settings.EXTRACTOR_REASONING` on a falsy argument, which is the wrong
+    # knob for stage 2.
+    resolved_model = model or settings.SIXK_TRIAGE_MODEL
+    resolved_effort = normalize_reasoning_effort(
+        reasoning_effort or settings.SIXK_TRIAGE_REASONING or DEFAULT_STAGE2_REASONING
+    )
     body = "\n\n".join(
         f"--- snippet {index} ---\n{snippet.text}"
         for index, snippet in enumerate(snippets, start=1)
@@ -377,7 +383,9 @@ async def triage_filing(
     for attempt in range(1, max_attempts + 1):
         try:
             text = await client.complete(
-                messages=messages, model=model, reasoning_effort=reasoning_effort
+                messages=messages,
+                model=resolved_model,
+                reasoning_effort=resolved_effort,
             )
         except Exception as error:  # noqa: BLE001 - one filing must not stop a run
             LOGGER.warning("stage 2 call failed for %s: %r", accession_number, error)
