@@ -131,6 +131,24 @@ NAME_EMBEDDED_AMOUNT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# Zero-padding is optional on the way in, so a model writing `2026-7-28` is read
+# as the day it means rather than dropped for its shape (#133).
+LENIENT_ISO_DATE_PATTERN = re.compile(
+    r"^(?P<year>\d{4})-(?P<month>\d{1,2})-(?P<day>\d{1,2})$"
+)
+# Filing dates come in three further spellings. The four-digit year is required:
+# `7/28/26` needs a century guessed, and a null beats a wrong decade (#133).
+NUMERIC_DATE_PATTERN = re.compile(
+    r"(?<!\d)(?P<month>\d{1,2})/(?P<day>\d{1,2})/(?P<year>\d{4})(?!\d)"
+)
+# The comma is optional, so `July 28 2026` reads the same as `July 28, 2026`.
+MONTH_FIRST_DATE_PATTERN = re.compile(
+    r"(?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2}),?\s+(?P<year>\d{4})(?!\d)"
+)
+# `28 July 2026`, as non-US issuers write it.
+DAY_FIRST_DATE_PATTERN = re.compile(
+    r"(?<!\d)(?P<day>\d{1,2})\s+(?P<month>[A-Za-z]+),?\s+(?P<year>\d{4})(?!\d)"
+)
 MONTH_MAP = {
     "january": "01",
     "february": "02",
@@ -2270,21 +2288,56 @@ def is_rate_like_amount_text(text: str | None) -> bool:
 
 
 def normalized_date_from_text(text: str | None) -> str | None:
-    """Parse one date mention into ISO format."""
+    """Parse one date mention into ISO format.
+
+    The parser has to read every spelling a filing uses, because
+    `standardized_date_payload` keeps the model's date only when it matches what
+    the parser reads. A format the parser cannot read discards a date the model
+    got right: `M/D/YYYY` alone cost 67 start dates and 67 end dates on one
+    held-out window, all of them from tabular schedules (#133).
+
+    Two-digit years stay unparsed. `7/28/26` cannot be resolved without guessing
+    a century, and a null is better than a wrong decade.
+    """
     if not text:
         return None
     stripped = text.strip()
-    if ISO_DATE_PATTERN.fullmatch(stripped) and is_valid_iso_date(stripped):
-        return stripped
-    match = re.search(
-        r"(?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2}),\s+(?P<year>\d{4})",
-        stripped,
-    )
-    if not match:
-        return None
-    return iso_date_from_parts(
-        match.group("year"), match.group("month"), match.group("day")
-    )
+    iso = LENIENT_ISO_DATE_PATTERN.fullmatch(stripped)
+    if iso is not None:
+        candidate = iso_date_from_numeric_parts(
+            iso.group("year"), iso.group("month"), iso.group("day")
+        )
+        if candidate is not None:
+            return candidate
+    numeric = NUMERIC_DATE_PATTERN.search(stripped)
+    if numeric is not None:
+        candidate = iso_date_from_numeric_parts(
+            numeric.group("year"), numeric.group("month"), numeric.group("day")
+        )
+        if candidate is not None:
+            return candidate
+    for pattern in (MONTH_FIRST_DATE_PATTERN, DAY_FIRST_DATE_PATTERN):
+        match = pattern.search(stripped)
+        if match is None:
+            continue
+        candidate = iso_date_from_parts(
+            match.group("year"), match.group("month"), match.group("day")
+        )
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def dates_agree(model_date: object, parsed_date: str | None) -> bool:
+    """Return whether the model's date is the same day the parser read.
+
+    Compared as dates rather than as strings, so a model writing `2026-7-28`
+    against a parsed `2026-07-28` keeps its value (#133, same shape as #119).
+    """
+    if not isinstance(model_date, str) or parsed_date is None:
+        return False
+    normalized = normalized_date_from_text(model_date)
+    return normalized is not None and normalized == parsed_date
 
 
 def normalized_maturity_from_text(text: str | None) -> str | None:
@@ -2322,6 +2375,17 @@ def iso_date_from_parts(year: str, month_name: str, day: str) -> str | None:
     if month is None:
         return None
     normalized = f"{year}-{month}-{int(day):02d}"
+    return normalized if is_valid_iso_date(normalized) else None
+
+
+def iso_date_from_numeric_parts(year: str, month: str, day: str) -> str | None:
+    """Return one ISO date built from numeric month-first parts.
+
+    Month-first, as SEC filings write it. An out-of-range month is rejected
+    rather than swapped with the day: a span that means `28/07/2026` is more
+    likely a format this parser should not be guessing at than a transposition.
+    """
+    normalized = f"{year}-{int(month):02d}-{int(day):02d}"
     return normalized if is_valid_iso_date(normalized) else None
 
 
@@ -2383,10 +2447,10 @@ def standardized_date_payload(
     if parsed_date is None and allow_maturity_phrase:
         parsed_date = normalized_maturity_from_text(evidence_text)
     model_date = value.get("normalized_date") if isinstance(value, dict) else None
+    # The parser's own string is published, so a model writing the same day in a
+    # different shape keeps its value rather than losing it (#133).
     payload["normalized_date"] = (
-        model_date
-        if isinstance(model_date, str) and model_date == parsed_date
-        else None
+        parsed_date if dates_agree(model_date, parsed_date) else None
     )
     return payload
 

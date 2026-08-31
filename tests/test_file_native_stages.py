@@ -24,10 +24,12 @@ from cdt.extractor.core import (
     canonical_amount_value,
     currency_candidates_from_text,
     currency_from_name,
+    dates_agree,
     is_rate_like_amount_text,
     load_prompt,
     normalized_amount_from_name,
     normalized_amount_from_text,
+    normalized_date_from_text,
     normalized_maturity_from_text,
     validate_amount_is_not_rate,
 )
@@ -1224,6 +1226,73 @@ def test_instrument_ie_postprocess_drops_rate_amount() -> None:
     assert payload["currency"] is None
     # Evidence is preserved so the dropped value stays auditable.
     assert payload["tag_ids"] == ["tag-a-rate"]
+
+
+def test_normalized_date_from_text_reads_every_filing_spelling() -> None:
+    """A format the parser cannot read discards a date the model got right (#133).
+
+    `M/D/YYYY` alone cost 67 start dates and 67 end dates on one held-out
+    window, all from tabular schedules whose rows the model had parsed
+    correctly.
+    """
+    assert normalized_date_from_text("7/28/2026") == "2026-07-28"
+    assert normalized_date_from_text("07/28/2026") == "2026-07-28"
+    assert normalized_date_from_text("12/31/2030") == "2030-12-31"
+    # The comma is optional, and non-US issuers write the day first.
+    assert normalized_date_from_text("July 28 2026") == "2026-07-28"
+    assert normalized_date_from_text("28 July 2026") == "2026-07-28"
+    assert normalized_date_from_text("July 28, 2026") == "2026-07-28"
+    # Zero-padding is optional on the way in.
+    assert normalized_date_from_text("2026-7-8") == "2026-07-08"
+    # A two-digit year needs a century guessed, so it stays unparsed.
+    assert normalized_date_from_text("7/28/26") is None
+    # Impossible dates and non-dates stay unparsed.
+    assert normalized_date_from_text("13/28/2026") is None
+    assert normalized_date_from_text("2/30/2026") is None
+    assert normalized_date_from_text("Closing Date") is None
+    assert normalized_date_from_text("August 2056") is None
+    assert normalized_date_from_text("Section 8 2026") is None
+    assert normalized_date_from_text("6.875% Senior Notes due March 2027") is None
+
+
+def test_dates_agree_ignores_shape_but_not_value() -> None:
+    """A model writing the same day differently keeps its date (#133)."""
+    assert dates_agree("2026-7-28", "2026-07-28") is True
+    assert dates_agree("2026-07-28", "2026-07-28") is True
+    assert dates_agree("2026-07-29", "2026-07-28") is False
+    assert dates_agree("soon", "2026-07-28") is False
+    assert dates_agree(None, "2026-07-28") is False
+
+
+def test_instrument_ie_postprocess_keeps_a_slash_format_date() -> None:
+    """A tabular schedule row publishes its dates (#133)."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = (
+        '<body>Schedule A lists <debt_instrument id="tag-i-1">Consolidated '
+        'Obligation Bonds</debt_instrument> settling <date id="tag-d-1">7/28/2026'
+        '</date> and maturing <date id="tag-d-2">7/28/2028</date>.</body>'
+    )
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "start_date": {
+                    "evidence": ["tag-d-1"],
+                    "normalized_date": "2026-07-28",
+                },
+                "end_date": {"evidence": ["tag-d-2"], "normalized_date": "2028-07-28"},
+            }
+        ]
+    )
+
+    InstrumentIEStage().postprocess(row_state)
+
+    mention = row_state.debt_instrument_mentions[0]
+    assert mention["start_date"] == "2026-07-28"
+    assert mention["end_date"] == "2028-07-28"
 
 
 def test_normalized_amount_from_name_reads_an_embedded_principal() -> None:
