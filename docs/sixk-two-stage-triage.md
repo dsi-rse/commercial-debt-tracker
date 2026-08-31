@@ -66,11 +66,16 @@ five-sixths of the instrument.
 
 88 filings, scored against 500 hand-labelled windows.
 
-| | precision | recall |
-|---|---|---|
-| stage 1 alone | 35.4% | 95.4% (window) |
-| **stage 1 + stage 2** | **70.9%** | 74.6% (window) |
-| | | **100.0% (filing)** |
+Every row is the same one configuration per stage: stage 2 always sees all of a
+filing's admitted windows at once. There is no variant here where the LLM is
+shown a single window in isolation. The last two rows are one run reported at two
+granularities, not two different runs.
+
+| configuration | granularity | precision | recall |
+|---|---|---|---|
+| stage 1 alone | window | 35.4% | 95.4% |
+| **stage 1 + stage 2** | window | **70.9%** | 74.6% |
+| **stage 1 + stage 2** | filing | — | **100.0%** |
 
 Window recall falls **by design** — consolidating siblings is the job. The metric
 that matters is whether a filing still has a window an instrument can be
