@@ -10,12 +10,20 @@ import re
 from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from time import sleep
 from typing import cast
 from urllib.parse import urlparse
 
 import boto3
 import pandas as pd
 import pyarrow.parquet
+from botocore.config import Config
+from botocore.exceptions import ConnectionError as BotocoreConnectionError
+from botocore.exceptions import IncompleteReadError, ReadTimeoutError
+
+from cdt.shared import get_logger
+
+LOGGER = get_logger(__name__)
 
 ArtifactPath = str | Path
 
@@ -30,12 +38,69 @@ _ORPHANED_TEMP_RE = re.compile(r"(?:^|/)tmp[^/]*\.parquet$")
 # thousands of calls per run (#83).
 _S3_CLIENT = None
 
+# Explicit API-call retries and timeouts: nothing configured them before, so
+# every client ran botocore's legacy retry mode (2 attempts) with no bound on
+# a stalled socket. This covers the get_object call itself, NOT the streaming
+# read of a returned body -- _get_object_with_body handles that half (#112).
+S3_CLIENT_CONFIG = Config(
+    retries={"mode": "standard", "max_attempts": 5},
+    connect_timeout=10,
+    read_timeout=60,
+)
+
 
 def _s3_client():  # noqa: ANN202
     global _S3_CLIENT  # noqa: PLW0603
     if _S3_CLIENT is None:
-        _S3_CLIENT = boto3.client("s3")
+        _S3_CLIENT = boto3.client("s3", config=S3_CLIENT_CONFIG)
     return _S3_CLIENT
+
+
+# Failures a streaming body read surfaces after get_object has returned, where
+# botocore's retry logic no longer applies (#112). ClientError (NoSuchKey,
+# AccessDenied) is deliberately absent: those are permanent.
+_STREAMING_READ_ERRORS = (
+    ReadTimeoutError,
+    BotocoreConnectionError,
+    IncompleteReadError,
+)
+_GET_OBJECT_ATTEMPTS = 5
+_GET_OBJECT_BACKOFF_SECONDS = 1.0
+
+
+def _get_object_with_body(
+    s3_client: object, bucket: str, key: str
+) -> tuple[bytes, dict[str, object]]:
+    """GET an object and read the whole body, retrying streaming failures.
+
+    A mid-stream timeout cannot be resumed, so each retry re-issues get_object
+    and reads from the start; one such timeout previously killed a 2.5h itemize
+    outright (#112).
+    """
+    for attempt in range(1, _GET_OBJECT_ATTEMPTS + 1):
+        try:
+            response = s3_client.get_object(Bucket=bucket, Key=key)
+            return response["Body"].read(), response
+        except _STREAMING_READ_ERRORS as error:
+            if attempt == _GET_OBJECT_ATTEMPTS:
+                raise
+            LOGGER.warning(
+                "S3 object read failed (attempt %s/%s) for s3://%s/%s: %s",
+                attempt,
+                _GET_OBJECT_ATTEMPTS,
+                bucket,
+                key,
+                error,
+            )
+            sleep(_GET_OBJECT_BACKOFF_SECONDS * attempt)
+    msg = "unreachable: loop returns or raises"
+    raise AssertionError(msg)
+
+
+def get_object_bytes(s3_client: object, bucket: str, key: str) -> bytes:
+    """GET an S3 object body with bounded retries around the streaming read."""
+    body, _ = _get_object_with_body(s3_client, bucket, key)
+    return body
 
 
 def is_s3_uri(path: ArtifactPath) -> bool:
@@ -171,7 +236,7 @@ def read_json_artifact(path: ArtifactPath) -> dict[str, object] | list[object]:
     normalized = normalize_artifact_path(path)
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
-        body = _s3_client().get_object(Bucket=bucket, Key=key)["Body"].read()
+        body = get_object_bytes(_s3_client(), bucket, key)
         return cast(dict[str, object] | list[object], json.loads(body.decode("utf-8")))
     return cast(
         dict[str, object] | list[object],
@@ -184,7 +249,7 @@ def read_text_artifact(path: ArtifactPath) -> str:
     normalized = normalize_artifact_path(path)
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
-        body = _s3_client().get_object(Bucket=bucket, Key=key)["Body"].read()
+        body = get_object_bytes(_s3_client(), bucket, key)
         return body.decode("utf-8")
     return Path(normalized).read_text(encoding="utf-8")
 
@@ -244,8 +309,7 @@ def read_json_artifact_versioned(
     normalized = normalize_artifact_path(path)
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
-        response = _s3_client().get_object(Bucket=bucket, Key=key)
-        body = response["Body"].read()
+        body, response = _get_object_with_body(_s3_client(), bucket, key)
         version = str(response["ETag"])
     else:
         body = Path(normalized).read_bytes()
@@ -375,7 +439,7 @@ def read_gzip_text_artifact(path: ArtifactPath) -> str:
     normalized = normalize_artifact_path(path)
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
-        body = _s3_client().get_object(Bucket=bucket, Key=key)["Body"].read()
+        body = get_object_bytes(_s3_client(), bucket, key)
     else:
         body = Path(normalized).read_bytes()
     return gzip.decompress(body).decode("utf-8")
@@ -396,7 +460,7 @@ def read_table(
         return pd.DataFrame(columns=columns)
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
-        body = _s3_client().get_object(Bucket=bucket, Key=key)["Body"].read()
+        body = get_object_bytes(_s3_client(), bucket, key)
         source: io.BytesIO | Path = io.BytesIO(body)
     else:
         source = Path(normalized)
@@ -421,7 +485,7 @@ def count_table_rows(path: ArtifactPath) -> int | None:
         return None
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
-        body = _s3_client().get_object(Bucket=bucket, Key=key)["Body"].read()
+        body = get_object_bytes(_s3_client(), bucket, key)
         return int(pyarrow.parquet.ParquetFile(io.BytesIO(body)).metadata.num_rows)
     return int(pyarrow.parquet.ParquetFile(Path(normalized)).metadata.num_rows)
 

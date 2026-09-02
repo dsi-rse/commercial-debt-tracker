@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 from time import perf_counter
 
@@ -24,6 +25,7 @@ from cdt.itemizer.extract import DocumentText, ItemSection, extract_items_from_d
 from cdt.shared import get_logger
 from cdt.storage import (
     coerce_dataset_text,
+    get_object_bytes,
     parse_s3_uri,
     read_table,
     write_json_artifact,
@@ -127,6 +129,7 @@ def itemize_pending_documents(
     force: bool = False,
     s3_client: object | None = None,
     item_numbers: tuple[str, ...] | None = None,
+    renew: Callable[[], None] | None = None,
 ) -> pd.DataFrame:
     """Itemize canonical document partitions into canonical item partitions."""
     if batch_size <= 0:
@@ -209,10 +212,29 @@ def itemize_pending_documents(
                 perf_counter() - partition_start,
             )
 
-    for document_path in visited_document_paths:
-        registry[document_path] = CompletedPartition(
-            fingerprint=source_fingerprints.get(document_path)
+        # Persist completion at every batch boundary: the registry was written
+        # once at stage end, so any interruption discarded the whole run's
+        # progress -- up to 2.5h of itemize on the real corpus (#111). Repeat
+        # saves are cheap and concurrency-safe: only dirty entries are merged
+        # via compare-and-swap (#88). Renew the writer lease at the same
+        # boundary, because a stage that outlasts the lease TTL was otherwise
+        # stolen mid-run and aborted at the next stage boundary (#111).
+        for document_path in chunk_paths:
+            registry[document_path] = CompletedPartition(
+                fingerprint=source_fingerprints.get(document_path)
+            )
+        save_completion_registry(
+            "itemize",
+            registry,
+            artifact_root=resolved_root,
+            data_dir=data_dir,
         )
+        if renew is not None:
+            renew()
+
+    # Still save once at the end: pending_source_partitions may have refreshed
+    # registry entries (backfill, fingerprint adoption) even when nothing was
+    # pending, and those land in the dirty set outside any chunk (#111).
     save_completion_registry(
         "itemize",
         registry,
@@ -346,7 +368,7 @@ def _load_resource_text(
             msg = "expected an initialized S3 client for s3:// resources"
             raise ValueError(msg)
         bucket, key = parse_s3_uri(resource_uri)
-        body = s3_client.get_object(Bucket=bucket, Key=key)["Body"].read()
+        body = get_object_bytes(s3_client, bucket, key)
         return decode_document_bytes(body)
 
     path = Path(resource_uri)
