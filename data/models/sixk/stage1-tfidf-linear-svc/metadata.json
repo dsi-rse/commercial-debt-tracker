@@ -5,6 +5,7 @@
   "precision": 0.3538,
   "random_seed": 42,
   "recall": 0.9537,
+  "sklearn_version": "1.9.0",
   "threshold": 0.332,
   "threshold_basis": "design-weighted 500-window probability sample (commercial-debt-tracker-models: eval-set.csv + eval-labels-v2.csv), held out of training; chosen for recall, not F1",
   "train_csv": "commercial-debt-tracker-models:data/sixk/annotation/child-labels-all.csv",

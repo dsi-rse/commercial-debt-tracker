@@ -457,7 +457,7 @@ requires-dist = [
     { name = "pyarrow", specifier = ">=22.0" },
     { name = "pycountry", specifier = "~=24.6" },
     { name = "python-dotenv", specifier = "~=1.2" },
-    { name = "scikit-learn", specifier = "~=1.5" },
+    { name = "scikit-learn", specifier = "==1.9.*" },
     { name = "tiktoken", specifier = "~=0.8" },
 ]
 
