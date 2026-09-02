@@ -48,6 +48,7 @@ from cdt.shared import get_logger
 from cdt.storage import (
     ArtifactPath,
     artifact_exists,
+    coerce_dataset_text,
     count_table_rows,
     delete_artifact,
     join_artifact_path,
@@ -522,8 +523,12 @@ def write_final_output_tables(
         if isinstance(payload, dict):
             previous = payload
 
+    # Placeholder text is nulled once, up front, so the immutable snapshot and
+    # the parquet-only database root publish the same normalized values.
     tables = {
-        table_name: read_dataset(dataset_root_fn(artifact_root, data_dir=data_dir))
+        table_name: normalize_snapshot_text(
+            read_dataset(dataset_root_fn(artifact_root, data_dir=data_dir))
+        )
         for table_name, dataset_root_fn in FINAL_OUTPUT_TABLES.items()
     }
     # Guard against what is actually published, not the pointer: the pointer
@@ -579,6 +584,36 @@ def write_final_output_tables(
         keep_run_ids={run_id, str(previous.get("run_id", ""))},
     )
     return written_paths
+
+
+def normalize_snapshot_text(table: pd.DataFrame) -> pd.DataFrame:
+    """Return one snapshot table with placeholder text values replaced by nulls.
+
+    Partitions written before a text column existed, or by a stage that
+    stringified a missing value, carry literal text such as ``nan``. Dashboard
+    consumers read these snapshots directly, so they are normalized on the way
+    out instead of rendering the placeholder.
+    """
+    if table.empty:
+        return table
+    normalized = table.copy()
+    for column in normalized.columns:
+        if normalized[column].dtype != object:
+            continue
+        normalized[column] = normalized[column].map(normalize_snapshot_cell)
+    return normalized
+
+
+def normalize_snapshot_cell(value: object) -> object:
+    """Null one placeholder string, leaving non-text values at their own type.
+
+    An object column can hold booleans when older partitions predate the column,
+    so only text cells are coerced. Mapping everything through the text helper
+    would publish `True` as the string `"True"`.
+    """
+    if isinstance(value, str):
+        return coerce_dataset_text(value)
+    return value
 
 
 def _guard_against_shrinkage(

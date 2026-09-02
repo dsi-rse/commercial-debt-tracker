@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -17,9 +19,27 @@ from cdt.datasets import (
 )
 from cdt.extractor import extract_pending_items, mentions_root
 from cdt.extractor.core import (
+    CompletionResult,
     ExtractionRowState,
     InstrumentIEStage,
     InstrumentRelationStage,
+    NERStage,
+    canonical_amount_value,
+    completion_result_from_batch_line,
+    completion_result_from_response,
+    currency_candidates_from_text,
+    currency_from_name,
+    dates_agree,
+    is_rate_like_amount_text,
+    load_prompt,
+    normalized_amount_from_name,
+    normalized_amount_from_text,
+    normalized_date_from_text,
+    normalized_maturity_from_text,
+    oriented_lineage_pair,
+    parse_tag_details,
+    repair_unescaped_ampersands,
+    validate_amount_is_not_rate,
 )
 from cdt.ingest import DOCUMENT_COLUMNS
 from cdt.itemizer import core as itemizer_core
@@ -29,9 +49,16 @@ from cdt.matcher import (
     match_pending_mentions,
     mention_matches_root,
 )
-from cdt.matcher.core import coerce_optional_text, match_tables
+from cdt.matcher.core import (
+    coerce_optional_text,
+    company_names_by_cik,
+    lender_signature,
+    match_tables,
+)
+from cdt.pipeline import normalize_snapshot_text
 from cdt.storage import (
     artifact_exists,
+    coerce_dataset_text,
     read_dataset,
     read_json_artifact,
     read_table,
@@ -148,6 +175,8 @@ def build_mention_row(
     start_date: str,
     amount: str,
     lenders_json: str = "[]",
+    lenders_known_incomplete: bool = False,
+    company_name: str | None = "Example Inc.",
 ) -> dict[str, object]:
     """Return one canonical mention row for matcher tests."""
     return {
@@ -155,7 +184,7 @@ def build_mention_row(
         "item_id": item_id,
         "accession_number": accession_number,
         "cik": cik,
-        "company_name": "Example Inc.",
+        "company_name": company_name,
         "date": date,
         "raw_id": "i-1",
         "name": name,
@@ -166,12 +195,90 @@ def build_mention_row(
         "retired_of": None,
         "split_of": None,
         "lenders_json": lenders_json,
+        "lenders_known_incomplete": lenders_known_incomplete,
         "other_interested_parties_json": "[]",
         "name_json": "{}",
         "start_date_json": "{}",
         "end_date_json": "{}",
         "amount_json": "{}",
     }
+
+
+def test_coerce_dataset_text_treats_placeholder_values_as_missing() -> None:
+    """Parquet placeholders must never survive as real text values."""
+    assert coerce_dataset_text(float("nan")) is None
+    assert coerce_dataset_text(None) is None
+    assert coerce_dataset_text("nan") is None
+    assert coerce_dataset_text("N/A") is None
+    assert coerce_dataset_text("  ") is None
+    assert (
+        coerce_dataset_text(" Appreciate Holdings, Inc. ")
+        == "Appreciate Holdings, Inc."
+    )
+    assert coerce_dataset_text("Nantucket Bank") == "Nantucket Bank"
+
+
+def test_itemize_document_record_blanks_missing_company_name() -> None:
+    """A missing document company name must not become the literal text 'nan'."""
+    document = {
+        "accession_number": "000114036126006577",
+        "cik": "1821075",
+        "company_name": float("nan"),
+        "url": "https://sec.example/full.txt",
+        "date": "2026-01-02",
+        "text": """
+ITEM INFORMATION: Other Events
+<DOCUMENT>
+<TYPE>8-K
+<TEXT>
+Item 8.01 Other Events.
+The Company issued a promissory note.
+</TEXT>
+</DOCUMENT>
+""".strip(),
+    }
+
+    sections = itemizer_core.itemize_document_record(document)
+
+    assert sections
+    assert {section.company_name for section in sections} == {""}
+
+
+def test_normalize_snapshot_text_nulls_placeholder_strings() -> None:
+    """Dashboard-facing snapshots must not carry literal placeholder text."""
+    table = pd.DataFrame(
+        [
+            {"company_name": "nan", "name": "convertible debentures", "amount": 1.5},
+            {"company_name": "Versigent PLC", "name": "None", "amount": 2.5},
+        ]
+    )
+
+    normalized = normalize_snapshot_text(table)
+
+    assert normalized["company_name"].to_list() == [None, "Versigent PLC"]
+    assert normalized["name"].to_list() == ["convertible debentures", None]
+    assert normalized["amount"].to_list() == [1.5, 2.5]
+
+
+def test_normalize_snapshot_text_keeps_non_text_values_typed() -> None:
+    """Booleans in an object column must not be published as text."""
+    # Partitions written before lenders_known_incomplete existed leave an object
+    # column holding booleans and nulls side by side.
+    table = pd.DataFrame(
+        {
+            "lenders_known_incomplete": [True, None, False],
+            "company_name": ["Acme Inc.", "nan", "Contoso Ltd."],
+        }
+    )
+
+    normalized = normalize_snapshot_text(table)
+
+    assert normalized["lenders_known_incomplete"].to_list() == [True, None, False]
+    assert normalized["company_name"].to_list() == [
+        "Acme Inc.",
+        None,
+        "Contoso Ltd.",
+    ]
 
 
 def test_itemize_pending_documents_writes_canonical_partitions(tmp_path: Path) -> None:
@@ -335,6 +442,7 @@ def test_extract_pending_items_writes_mentions_and_audit(
                 "retired_of": None,
                 "split_of": None,
                 "lenders_json": "[]",
+                "lenders_known_incomplete": False,
                 "other_interested_parties_json": "[]",
                 "name_json": "{}",
                 "start_date_json": "{}",
@@ -398,6 +506,7 @@ def test_extract_pending_items_drains_all_partitions(
                 "retired_of": None,
                 "split_of": None,
                 "lenders_json": "[]",
+                "lenders_known_incomplete": True,
                 "other_interested_parties_json": "[]",
                 "name_json": "{}",
                 "start_date_json": "{}",
@@ -507,14 +616,14 @@ Together, the <debt_instrument id="tag-i-4">Exchange Notes</debt_instrument> wer
     "name": ["tag-i-1", "tag-i-2"],
     "start_date": {"evidence": ["tag-d-1"], "normalized_date": "2025-03-17"},
     "amount": {"evidence": ["tag-a-1"], "normalized_amount": "5500000", "currency": "USD"},
-    "lenders": [["tag-o-1"]],
+    "lenders": [{"tag_ids": ["tag-o-1"], "kind": "named"}],
     "other_interested_parties": []
   },
   {
     "name": ["tag-i-1b", "tag-i-3"],
     "start_date": {"evidence": ["tag-d-2"], "normalized_date": "2025-03-20"},
     "amount": {"evidence": ["tag-a-2"], "normalized_amount": "269000", "currency": "USD"},
-    "lenders": [["tag-o-1b"]],
+    "lenders": [{"tag_ids": ["tag-o-1b"], "kind": "named"}],
     "other_interested_parties": []
   }
 ]
@@ -523,6 +632,246 @@ Together, the <debt_instrument id="tag-i-4">Exchange Notes</debt_instrument> wer
     failures = InstrumentIEStage().validate(row_state, response)
 
     assert failures == []
+
+
+PARTY_ROLE_XML = """
+<body>
+On <date id="tag-d-1">March 17, 2025</date>, <organization id="tag-o-borrower">Example Inc.</organization>
+entered into a <debt_instrument id="tag-i-1">Term Loan</debt_instrument> with
+<organization id="tag-o-named">JPMorgan Chase Bank, N.A.</organization> and
+<organization id="tag-o-collective">the other lenders party thereto</organization>, with
+<organization id="tag-o-agent">Wells Fargo Bank, National Association</organization> as administrative agent.
+</body>
+""".strip()
+
+
+def party_row_state() -> ExtractionRowState:
+    """Return one instrument_ie row state seeded with party-role tagged XML."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = PARTY_ROLE_XML
+    return row_state
+
+
+def instrument_ie_mention(response: str) -> dict[str, object]:
+    """Run instrument_ie postprocessing on one response and return its mention."""
+    row_state = party_row_state()
+    row_state.stage_responses["instrument_ie"] = response
+    InstrumentIEStage().postprocess(row_state)
+    assert len(row_state.debt_instrument_mentions) == 1
+    return row_state.debt_instrument_mentions[0]
+
+
+def test_instrument_ie_validate_accepts_party_kinds_and_roles() -> None:
+    """Annotated lender and other-party clusters should validate."""
+    response = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "lenders": [
+                    {"tag_ids": ["tag-o-named"], "kind": "named"},
+                    {"tag_ids": ["tag-o-collective"], "kind": "collective"},
+                ],
+                "lenders_known_incomplete": True,
+                "other_interested_parties": [
+                    {"tag_ids": ["tag-o-agent"], "role": "agent"},
+                    {"tag_ids": ["tag-o-borrower"], "role": "borrower"},
+                ],
+            }
+        ]
+    )
+
+    assert InstrumentIEStage().validate(party_row_state(), response) == []
+
+
+def test_instrument_ie_validate_rejects_unannotated_party_clusters() -> None:
+    """Bare tag-id lists and unknown annotations should fail validation."""
+    response = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "lenders": [["tag-o-named"]],
+                "other_interested_parties": [
+                    {"tag_ids": ["tag-o-agent"], "role": "servicer"}
+                ],
+            }
+        ]
+    )
+
+    failures = InstrumentIEStage().validate(party_row_state(), response)
+
+    assert any(
+        "'lenders'[0] must be an object with 'tag_ids' and 'kind' keys." in failure
+        for failure in failures
+    )
+    assert any("'role' must be one of" in failure for failure in failures)
+
+
+def test_instrument_ie_validate_rejects_non_boolean_lenders_known_incomplete() -> None:
+    """The lenders_known_incomplete flag must be boolean when present."""
+    response = json.dumps([{"name": ["tag-i-1"], "lenders_known_incomplete": "yes"}])
+
+    failures = InstrumentIEStage().validate(party_row_state(), response)
+
+    assert any(
+        "'lenders_known_incomplete' must be true or false" in failure
+        for failure in failures
+    )
+
+
+def test_instrument_ie_postprocess_keeps_named_lenders_and_flags_incompleteness() -> (
+    None
+):
+    """A named lender plus a collective phrase should keep only the named lender."""
+    mention = instrument_ie_mention(
+        json.dumps(
+            [
+                {
+                    "name": ["tag-i-1"],
+                    "lenders": [
+                        {"tag_ids": ["tag-o-named"], "kind": "named"},
+                        {"tag_ids": ["tag-o-collective"], "kind": "collective"},
+                    ],
+                    "lenders_known_incomplete": True,
+                    "other_interested_parties": [
+                        {"tag_ids": ["tag-o-agent"], "role": "agent"}
+                    ],
+                }
+            ]
+        )
+    )
+
+    lenders = json.loads(str(mention["lenders_json"]))
+    other_parties = json.loads(str(mention["other_interested_parties_json"]))
+    assert [cluster["tag_ids"] for cluster in lenders] == [["tag-o-named"]]
+    assert mention["lenders_known_incomplete"] is True
+    # Persisted clusters keep the plain tag_ids/mentions shape: the model's kind and
+    # role labels decide what is stored and are not themselves stored.
+    assert set(lenders[0]) == {"tag_ids", "mentions"}
+    assert [cluster["tag_ids"] for cluster in other_parties] == [["tag-o-agent"]]
+    assert set(other_parties[0]) == {"tag_ids", "mentions"}
+
+
+def test_instrument_ie_postprocess_leaves_named_only_lenders_unflagged() -> None:
+    """A lender list with only named clusters is not known to be incomplete."""
+    mention = instrument_ie_mention(
+        json.dumps(
+            [
+                {
+                    "name": ["tag-i-1"],
+                    "lenders": [{"tag_ids": ["tag-o-named"], "kind": "named"}],
+                }
+            ]
+        )
+    )
+
+    assert mention["lenders_known_incomplete"] is False
+    assert len(json.loads(str(mention["lenders_json"]))) == 1
+
+
+def test_instrument_ie_postprocess_honors_declared_incompleteness() -> None:
+    """A model-declared flag survives even when every cluster is named."""
+    mention = instrument_ie_mention(
+        json.dumps(
+            [
+                {
+                    "name": ["tag-i-1"],
+                    "lenders": [{"tag_ids": ["tag-o-named"], "kind": "named"}],
+                    "lenders_known_incomplete": True,
+                }
+            ]
+        )
+    )
+
+    assert mention["lenders_known_incomplete"] is True
+    assert len(json.loads(str(mention["lenders_json"]))) == 1
+
+
+def test_instrument_ie_postprocess_drops_collective_only_lenders() -> None:
+    """A collective-only lender list carries no lenders and is flagged."""
+    mention = instrument_ie_mention(
+        json.dumps(
+            [
+                {
+                    "name": ["tag-i-1"],
+                    "lenders": [
+                        {"tag_ids": ["tag-o-collective"], "kind": "collective"}
+                    ],
+                }
+            ]
+        )
+    )
+
+    assert json.loads(str(mention["lenders_json"])) == []
+    assert mention["lenders_known_incomplete"] is True
+
+
+def test_instrument_ie_postprocess_excludes_the_borrower_from_other_parties() -> None:
+    """The filer itself is not persisted as an interested party."""
+    mention = instrument_ie_mention(
+        json.dumps(
+            [
+                {
+                    "name": ["tag-i-1"],
+                    "other_interested_parties": [
+                        {"tag_ids": ["tag-o-borrower"], "role": "borrower"},
+                        {"tag_ids": ["tag-o-agent"], "role": "agent"},
+                    ],
+                }
+            ]
+        )
+    )
+
+    other_parties = json.loads(str(mention["other_interested_parties_json"]))
+    assert [cluster["tag_ids"] for cluster in other_parties] == [["tag-o-agent"]]
+
+
+def test_lender_signature_prefers_the_named_party_over_an_alias() -> None:
+    """A defined-term alias in the cluster must not hide the party it names."""
+    payload = json.dumps([{"mentions": [{"text": "Purchasers"}, {"text": "Oaktree"}]}])
+
+    assert lender_signature(payload) == "oaktree"
+
+
+def test_lender_signature_uses_stored_lender_clusters() -> None:
+    """Lender signatures come from the persisted named clusters."""
+    payload = json.dumps([{"mentions": [{"text": "Acme Bank"}]}])
+
+    assert lender_signature(payload) == "acme bank"
+
+
+def test_match_pending_mentions_carries_lender_incompleteness(tmp_path: Path) -> None:
+    """Matcher output should carry mention-level lender incompleteness forward."""
+    mention_rows = pd.DataFrame(
+        [
+            build_mention_row(
+                mention_id="m-1",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2024-01-02",
+                name="Term Loan",
+                start_date="2024-01-01",
+                amount="$100 million",
+                lenders_json=(
+                    '[{"mentions": [{"text": "Acme Bank"}], "tag_ids": ["tag-l-1"]}]'
+                ),
+                lenders_known_incomplete=True,
+            )
+        ]
+    )
+    write_partition_table(
+        tmp_path / "mentions",
+        partition={"date": "2024-01-02", "shard": "0001"},
+        table=mention_rows,
+    )
+
+    match_pending_mentions(artifact_root=tmp_path, batch_size=5)
+
+    written_instruments = read_dataset(debt_instruments_root(tmp_path))
+    assert written_instruments["lenders_known_incomplete"].to_list() == [True]
 
 
 def test_instrument_ie_validate_rejects_conflicting_start_dates() -> None:
@@ -549,6 +898,978 @@ was issued on <date id="tag-d-1">March 17, 2025</date> and <date id="tag-d-2">Ma
     failures = InstrumentIEStage().validate(row_state, response)
 
     assert any("multiple distinct normalized values" in failure for failure in failures)
+
+
+MATURITY_IN_NAME_XML = """
+<body>
+On <date id="tag-d-1">March 17, 2025</date>, the Company issued
+<debt_instrument id="tag-i-1">3.875% senior notes due 2028</debt_instrument>
+in an aggregate principal amount of <amount id="tag-a-1">$500 million</amount>.
+</body>
+""".strip()
+
+
+def maturity_row_state() -> ExtractionRowState:
+    """Return one instrument_ie row state whose instrument name carries a maturity."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = MATURITY_IN_NAME_XML
+    return row_state
+
+
+def maturity_mention(response: str) -> dict[str, object]:
+    """Run instrument_ie postprocessing on one response and return its mention."""
+    row_state = maturity_row_state()
+    row_state.stage_responses["instrument_ie"] = response
+    InstrumentIEStage().postprocess(row_state)
+    assert len(row_state.debt_instrument_mentions) == 1
+    return row_state.debt_instrument_mentions[0]
+
+
+def test_normalized_maturity_from_text_parses_due_phrases() -> None:
+    """Maturity parsing should cover year-only, full-date, and ambiguous names."""
+    assert normalized_maturity_from_text("3.875% senior notes due 2028") == "2028-12-31"
+    assert (
+        normalized_maturity_from_text("senior notes due October 1, 2028")
+        == "2028-10-01"
+    )
+    assert normalized_maturity_from_text("notes due in 2030") == "2030-12-31"
+    assert normalized_maturity_from_text("notes due 2028 and notes due 2031") is None
+    assert normalized_maturity_from_text("3.875% senior notes") is None
+    assert normalized_maturity_from_text("Series 2025-B Notes") is None
+
+
+def test_normalized_maturity_from_text_rejects_coordinated_maturities() -> None:
+    """One `due` listing two maturities identifies no single instrument (#104)."""
+    assert normalized_maturity_from_text("notes due 2028 and 2030") is None
+    assert normalized_maturity_from_text("notes due 2028, 2030") is None
+    assert normalized_maturity_from_text("notes due 2028/2030") is None
+    assert normalized_maturity_from_text("notes due October 1, 2028 and 2030") is None
+    assert (
+        normalized_maturity_from_text("notes due October 1, 2028 and October 1, 2030")
+        is None
+    )
+    # A later year that is not coordinated onto the maturity is still not one.
+    assert (
+        normalized_maturity_from_text("notes due 2028, and 2030 obligations remain")
+        == "2028-12-31"
+    )
+
+
+def test_instrument_ie_validate_accepts_name_span_as_end_date_evidence() -> None:
+    """The instrument name span is valid end_date evidence when maturity is embedded."""
+    response = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "end_date": {
+                    "evidence": ["tag-i-1"],
+                    "normalized_date": "2028-12-31",
+                    "derived_from_name": True,
+                },
+            }
+        ]
+    )
+
+    assert InstrumentIEStage().validate(maturity_row_state(), response) == []
+
+
+def test_instrument_ie_validate_still_rejects_name_span_as_start_date_evidence() -> (
+    None
+):
+    """Only end_date may cite a debt_instrument tag."""
+    response = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "start_date": {
+                    "evidence": ["tag-i-1"],
+                    "normalized_date": "2028-12-31",
+                },
+            }
+        ]
+    )
+
+    failures = InstrumentIEStage().validate(maturity_row_state(), response)
+
+    assert any("expected date" in failure for failure in failures)
+
+
+def test_instrument_ie_postprocess_keeps_name_derived_end_date() -> None:
+    """A maturity cited from the name span should survive normalization."""
+    mention = maturity_mention(
+        json.dumps(
+            [
+                {
+                    "name": ["tag-i-1"],
+                    "end_date": {
+                        "evidence": ["tag-i-1"],
+                        "normalized_date": "2028-12-31",
+                    },
+                }
+            ]
+        )
+    )
+
+    assert mention["end_date"] == "2028-12-31"
+    payload = json.loads(str(mention["end_date_json"]))
+    assert payload["tag_ids"] == ["tag-i-1"]
+
+
+def test_instrument_ie_postprocess_backfills_end_date_from_name() -> None:
+    """A missing end_date should fall back to the maturity in the instrument name."""
+    mention = maturity_mention(
+        json.dumps(
+            [
+                {
+                    "name": ["tag-i-1"],
+                    "start_date": {
+                        "evidence": ["tag-d-1"],
+                        "normalized_date": "2025-03-17",
+                    },
+                }
+            ]
+        )
+    )
+
+    assert mention["end_date"] == "2028-12-31"
+    payload = json.loads(str(mention["end_date_json"]))
+    # A maturity read from the name has no citable date tag of its own.
+    assert payload["tag_ids"] == []
+
+
+def test_instrument_ie_postprocess_leaves_end_date_null_without_maturity() -> None:
+    """Names without a maturity phrase should not gain an invented end date."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = """
+<body>
+The Company issued <debt_instrument id="tag-i-1">3.875% senior notes</debt_instrument>
+on <date id="tag-d-1">March 17, 2025</date>.
+</body>
+""".strip()
+    row_state.stage_responses["instrument_ie"] = json.dumps([{"name": ["tag-i-1"]}])
+
+    InstrumentIEStage().postprocess(row_state)
+
+    mention = row_state.debt_instrument_mentions[0]
+    assert mention["end_date"] is None
+    assert json.loads(str(mention["end_date_json"]))["normalized_date"] is None
+
+
+def test_instrument_ie_postprocess_drops_end_date_that_contradicts_evidence() -> None:
+    """A normalized date that does not match its evidence text is still dropped."""
+    mention = maturity_mention(
+        json.dumps(
+            [
+                {
+                    "name": ["tag-i-1"],
+                    "end_date": {
+                        "evidence": ["tag-d-1"],
+                        "normalized_date": "2028-12-31",
+                    },
+                }
+            ]
+        )
+    )
+
+    payload = json.loads(str(mention["end_date_json"]))
+    assert payload["tag_ids"] == ["tag-d-1"]
+    # The cited date tag says March 17, 2025, so the model value is rejected and the
+    # name maturity fills the gap instead.
+    assert mention["end_date"] == "2028-12-31"
+
+
+RATE_AMOUNT_XML = """
+<body>
+<debt_instrument id="tag-i-1">ABR Loan</debt_instrument> borrowings bear interest at
+<amount id="tag-a-rate">0.875% per annum</amount> and the facility provides for
+<amount id="tag-a-principal">$500.0 million</amount> of commitments.
+</body>
+""".strip()
+
+
+def rate_amount_row_state() -> ExtractionRowState:
+    """Return one instrument_ie row state with both a rate and a principal amount."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = RATE_AMOUNT_XML
+    return row_state
+
+
+def test_is_rate_like_amount_text_separates_rates_from_principal() -> None:
+    """Rate detection should key on percentages without currency or scale words."""
+    assert is_rate_like_amount_text("0.875% per annum") is True
+    assert is_rate_like_amount_text("5.75%") is True
+    assert is_rate_like_amount_text("175 basis points") is True
+    assert is_rate_like_amount_text("$500.0 million") is False
+    assert is_rate_like_amount_text("$500,000,000 (100% of principal)") is False
+    assert is_rate_like_amount_text("100% of the outstanding 30.0 million") is False
+    assert is_rate_like_amount_text(None) is False
+
+
+def test_is_rate_like_amount_text_requires_every_number_to_carry_a_rate() -> None:
+    """A percentage of a stated principal is not itself a rate (#103).
+
+    The currency symbol and the scale word are not what makes these principals;
+    `normalized_amount_from_text` reads the first number, so a span whose first
+    number carries no rate marker is stating an amount.
+    """
+    assert is_rate_like_amount_text("500,000,000 (100% of principal)") is False
+    assert (
+        is_rate_like_amount_text("500 million U.S. dollars, or 5% of assets") is False
+    )
+    assert is_rate_like_amount_text("1,500,000") is False
+    # A margin range is still every-number-rated.
+    assert is_rate_like_amount_text("0.875% to 1.875%") is True
+    assert is_rate_like_amount_text("SOFR plus 100 basis points") is True
+
+
+def test_instrument_ie_validate_rejects_rate_only_amount_evidence() -> None:
+    """An amount citing only a rate should fail validation and retry."""
+    response = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "amount": {
+                    "evidence": ["tag-a-rate"],
+                    "normalized_amount": "0.875",
+                    "currency": None,
+                },
+            }
+        ]
+    )
+
+    failures = InstrumentIEStage().validate(rate_amount_row_state(), response)
+
+    assert any(
+        "describes an interest rate, margin, or fee" in failure for failure in failures
+    )
+
+
+def test_instrument_ie_validate_rejects_wrapped_basis_point_evidence() -> None:
+    """Basis-point evidence is rejected, and the retry quotes readable text (#102).
+
+    The evidence span wraps across a line, as filings do. Judging whitespace-free
+    text hid the `basis point` marker from the predicate entirely, so the retry
+    never fired and the amount was silently nulled instead.
+    """
+    tag_details = {"tag-a-bps": {"type": "amount", "text": "100 basis\npoints"}}
+    failures = validate_amount_is_not_rate(
+        index=0,
+        value={"evidence": ["tag-a-bps"]},
+        tag_details=tag_details,
+    )
+
+    assert len(failures) == 1
+    assert "'100 basis points'" in failures[0]
+    assert "describes an interest rate, margin, or fee" in failures[0]
+
+
+def test_instrument_ie_validate_accepts_spelled_currency_principal() -> None:
+    """A principal whose currency and scale are words, not symbols, validates (#102)."""
+    tag_details = {
+        "tag-a-spelled": {
+            "type": "amount",
+            "text": "500 million U.S. dollars, or 5% of assets",
+        }
+    }
+
+    assert (
+        validate_amount_is_not_rate(
+            index=0,
+            value={"evidence": ["tag-a-spelled"]},
+            tag_details=tag_details,
+        )
+        == []
+    )
+
+
+def test_instrument_ie_validate_accepts_principal_amount_evidence() -> None:
+    """A principal amount should still validate."""
+    response = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "amount": {
+                    "evidence": ["tag-a-principal"],
+                    "normalized_amount": "500000000",
+                    "currency": "USD",
+                },
+            }
+        ]
+    )
+
+    assert InstrumentIEStage().validate(rate_amount_row_state(), response) == []
+
+
+def test_instrument_ie_postprocess_drops_rate_amount() -> None:
+    """A rate that slips past validation should not be stored as an amount."""
+    row_state = rate_amount_row_state()
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "amount": {
+                    "evidence": ["tag-a-rate"],
+                    "normalized_amount": "0.875",
+                    "currency": "USD",
+                },
+            }
+        ]
+    )
+
+    InstrumentIEStage().postprocess(row_state)
+
+    mention = row_state.debt_instrument_mentions[0]
+    payload = json.loads(str(mention["amount_json"]))
+    assert mention["amount"] is None
+    assert payload["normalized_amount"] is None
+    assert payload["currency"] is None
+    # Evidence is preserved so the dropped value stays auditable.
+    assert payload["tag_ids"] == ["tag-a-rate"]
+
+
+def test_lineage_pair_is_oriented_successor_first() -> None:
+    """`amendment_of` runs from the amended instrument to the predecessor (#138).
+
+    Alclear's revolver is the confirmed case: a Credit Agreement dated as of
+    2020-03-31, amended 2026-06-23 to cut commitments from $100,000,000 and
+    extend maturity from 2026-06-28 to 2031-06-23. Every figure on the
+    `$100,000,000` object is pre-amendment, so it is the predecessor, and the
+    pointer must run the other way.
+    """
+    by_raw_id = {
+        "i-1": {"raw_id": "i-1", "start_date": "2020-03-31", "amount": "100000000"},
+        "i-2": {"raw_id": "i-2", "start_date": "2026-06-23", "amount": "50000000"},
+    }
+    # The model named the predecessor first; the pointer is flipped.
+    assert oriented_lineage_pair("i-1", "i-2", "amendment_of", by_raw_id) == (
+        "i-2",
+        "i-1",
+    )
+    # Already the right way round, so it is left alone.
+    assert oriented_lineage_pair("i-2", "i-1", "amendment_of", by_raw_id) == (
+        "i-2",
+        "i-1",
+    )
+    assert oriented_lineage_pair("i-1", "i-2", "retired_of", by_raw_id) == (
+        "i-2",
+        "i-1",
+    )
+
+
+def test_lineage_pair_is_left_alone_without_two_dates_to_compare() -> None:
+    """Nothing to orient on means nothing is changed (#138)."""
+    same = {
+        "i-1": {"raw_id": "i-1", "start_date": "2025-08-01"},
+        "i-2": {"raw_id": "i-2", "start_date": "2025-08-01"},
+    }
+    # Equal dates carry no ordering, which is exactly the state the old prompt
+    # convention produced, and why the direction went unchecked for so long.
+    assert oriented_lineage_pair("i-1", "i-2", "amendment_of", same) == ("i-1", "i-2")
+    missing = {
+        "i-1": {"raw_id": "i-1", "start_date": None},
+        "i-2": {"raw_id": "i-2", "start_date": "2026-06-23"},
+    }
+    assert oriented_lineage_pair("i-1", "i-2", "amendment_of", missing) == (
+        "i-1",
+        "i-2",
+    )
+    # `split_of` is not a before/after relation, so it is never reoriented.
+    ordered = {
+        "i-1": {"raw_id": "i-1", "start_date": "2020-03-31"},
+        "i-2": {"raw_id": "i-2", "start_date": "2026-06-23"},
+    }
+    assert oriented_lineage_pair("i-1", "i-2", "split_of", ordered) == ("i-1", "i-2")
+
+
+def test_relation_postprocess_flips_an_inverted_amendment() -> None:
+    """The published mention carries the corrected direction (#138)."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1", "text": "x"}, stage_name="instrument_relation"
+    )
+    row_state.debt_instrument_mentions = [
+        {
+            "raw_id": "i-1",
+            "debt_instrument_mention_id": "dim::pred",
+            "start_date": "2020-03-31",
+            "amendment_of": None,
+        },
+        {
+            "raw_id": "i-2",
+            "debt_instrument_mention_id": "dim::amended",
+            "start_date": "2026-06-23",
+            "amendment_of": None,
+        },
+    ]
+    row_state.stage_responses["instrument_relation"] = json.dumps(
+        [{"from": "i-1", "to": "i-2", "type": "amendment_of"}]
+    )
+
+    InstrumentRelationStage().postprocess(row_state)
+
+    by_raw = {m["raw_id"]: m for m in row_state.debt_instrument_mentions}
+    assert by_raw["i-2"]["amendment_of"] == "dim::pred"
+    assert by_raw["i-1"]["amendment_of"] is None
+
+
+def test_completion_result_captures_a_filtered_live_response() -> None:
+    """A provider abort is recorded, not just its partial text (#135).
+
+    This is the shape observed live: `content_filter`, partial content, and a
+    zeroed unbilled usage block. Without `finish_reason` the audit log cannot
+    tell it from a model that chose to stop, and the two need opposite remedies.
+    """
+    usage = SimpleNamespace(
+        completion_tokens=0, prompt_tokens=0, total_tokens=0, cost=0.0
+    )
+    message = SimpleNamespace(content="<body>partial", refusal=None)
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(finish_reason="content_filter", message=message)],
+        usage=usage,
+        id="gen-1788206728-iWdiE2p9PV0",
+        model="openai/gpt-5.6-terra",
+    )
+
+    result = completion_result_from_response(response)
+
+    assert result.text == "<body>partial"
+    assert result.finish_reason == "content_filter"
+    assert result.response_id == "gen-1788206728-iWdiE2p9PV0"
+    assert result.served_model == "openai/gpt-5.6-terra"
+    assert result.usage == {
+        "completion_tokens": 0,
+        "prompt_tokens": 0,
+        "total_tokens": 0,
+        "cost": 0.0,
+    }
+
+
+def test_completion_result_captures_a_filtered_batch_line() -> None:
+    """The batch route carries the same fields on the same path (#135).
+
+    A filtered batch response arrives as a normal 200 with a body, so it never
+    reaches the infrastructure-error path and would otherwise be indistinguishable
+    from ordinary bad output.
+    """
+    line = {
+        "response": {
+            "status_code": 200,
+            "body": {
+                "id": "chatcmpl-abc",
+                "model": "gpt-5.4",
+                "choices": [
+                    {
+                        "finish_reason": "content_filter",
+                        "message": {"content": "<body>partial", "refusal": None},
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 0,
+                    "total_tokens": 11,
+                },
+            },
+        }
+    }
+
+    result = completion_result_from_batch_line(line)
+
+    assert result.text == "<body>partial"
+    assert result.finish_reason == "content_filter"
+    assert result.response_id == "chatcmpl-abc"
+    assert result.served_model == "gpt-5.4"
+    assert result.usage["total_tokens"] == 11
+
+
+def test_attempt_records_provider_metadata() -> None:
+    """The metadata reaches the attempt, and so `full.jsonl` (#135)."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1", "text": "x"}, stage_name="ner"
+    )
+    row_state.add_response(
+        "<body>x</body>",
+        CompletionResult(
+            text="<body>x</body>",
+            finish_reason="length",
+            usage={"total_tokens": 42},
+            response_id="gen-9",
+            served_model="openai/gpt-5.4",
+        ),
+    )
+
+    recorded = row_state.current_attempt.to_dict()
+    assert recorded["finish_reason"] == "length"
+    assert recorded["usage"] == {"total_tokens": 42}
+    assert recorded["response_id"] == "gen-9"
+    assert recorded["served_model"] == "openai/gpt-5.4"
+    # An attempt recorded without provider metadata stays null rather than absent.
+    other = ExtractionRowState(item_row={"item_id": "i", "text": "x"}, stage_name="ner")
+    other.add_response("<body>x</body>")
+    assert other.current_attempt.to_dict()["finish_reason"] is None
+
+
+def test_repair_unescaped_ampersands_leaves_real_entities_alone() -> None:
+    """A bare ampersand is escaped; anything already an entity is untouched (#127)."""
+    assert repair_unescaped_ampersands("A&R Agreement") == "A&amp;R Agreement"
+    assert repair_unescaped_ampersands("Smith & Wesson & Co") == (
+        "Smith &amp; Wesson &amp; Co"
+    )
+    for already_valid in (
+        "A&amp;R",
+        "a &lt; b",
+        "a &gt; b",
+        "&quot;x&quot;",
+        "&apos;x&apos;",
+        "&#8217;s",
+        "&#x2019;s",
+    ):
+        assert repair_unescaped_ampersands(already_valid) == already_valid
+
+
+def test_ner_validate_accepts_a_response_carrying_a_bare_ampersand() -> None:
+    """The exact-text and well-formed-XML requirements conflict without this (#127).
+
+    `NERStage.preprocess` wraps the item text in `<body>` unescaped, so an item
+    naming an `A&R Registration Rights Agreement` is handed to the model as
+    invalid XML. Reproducing it verbatim then yields invalid XML, and 44 of 342
+    relevant items in one held-out window carry a bare ampersand.
+    """
+    text = "The Company entered into the A&R Registration Rights Agreement."
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1", "text": text}, stage_name="ner"
+    )
+    response = (
+        "<body>The Company entered into the <agreement>A&R Registration Rights "
+        "Agreement</agreement>.</body>"
+    )
+
+    assert NERStage().validate(row_state, response) == []
+
+    row_state.stage_responses["ner"] = response
+    NERStage().postprocess(row_state)
+    _, plain_text, tag_details = parse_tag_details(str(row_state.ner_tagged_xml))
+    # The ampersand round-trips, so the text invariant still holds downstream.
+    assert plain_text == text
+    assert [d["text"] for d in tag_details.values()] == [
+        "A&R Registration Rights Agreement"
+    ]
+
+
+def test_ner_validate_still_rejects_a_stray_angle_bracket() -> None:
+    """Only `&` is repaired; a malformed tag is still a failure (#127)."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1", "text": "The Company borrowed."},
+        stage_name="ner",
+    )
+    failures = NERStage().validate(row_state, "<body>The Company <borrowed.</body>")
+    assert failures and "not valid XML" in failures[0]
+
+
+def test_normalized_date_from_text_reads_every_filing_spelling() -> None:
+    """A format the parser cannot read discards a date the model got right (#133).
+
+    `M/D/YYYY` alone cost 67 start dates and 67 end dates on one held-out
+    window, all from tabular schedules whose rows the model had parsed
+    correctly.
+    """
+    assert normalized_date_from_text("7/28/2026") == "2026-07-28"
+    assert normalized_date_from_text("07/28/2026") == "2026-07-28"
+    assert normalized_date_from_text("12/31/2030") == "2030-12-31"
+    # The comma is optional, and non-US issuers write the day first.
+    assert normalized_date_from_text("July 28 2026") == "2026-07-28"
+    assert normalized_date_from_text("28 July 2026") == "2026-07-28"
+    assert normalized_date_from_text("July 28, 2026") == "2026-07-28"
+    # Zero-padding is optional on the way in.
+    assert normalized_date_from_text("2026-7-8") == "2026-07-08"
+    # A two-digit year needs a century guessed, so it stays unparsed.
+    assert normalized_date_from_text("7/28/26") is None
+    # Impossible dates and non-dates stay unparsed.
+    assert normalized_date_from_text("13/28/2026") is None
+    assert normalized_date_from_text("2/30/2026") is None
+    assert normalized_date_from_text("Closing Date") is None
+    assert normalized_date_from_text("August 2056") is None
+    assert normalized_date_from_text("Section 8 2026") is None
+    assert normalized_date_from_text("6.875% Senior Notes due March 2027") is None
+
+
+def test_dates_agree_ignores_shape_but_not_value() -> None:
+    """A model writing the same day differently keeps its date (#133)."""
+    assert dates_agree("2026-7-28", "2026-07-28") is True
+    assert dates_agree("2026-07-28", "2026-07-28") is True
+    assert dates_agree("2026-07-29", "2026-07-28") is False
+    assert dates_agree("soon", "2026-07-28") is False
+    assert dates_agree(None, "2026-07-28") is False
+
+
+def test_instrument_ie_postprocess_keeps_a_slash_format_date() -> None:
+    """A tabular schedule row publishes its dates (#133)."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = (
+        '<body>Schedule A lists <debt_instrument id="tag-i-1">Consolidated '
+        'Obligation Bonds</debt_instrument> settling <date id="tag-d-1">7/28/2026'
+        '</date> and maturing <date id="tag-d-2">7/28/2028</date>.</body>'
+    )
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "start_date": {
+                    "evidence": ["tag-d-1"],
+                    "normalized_date": "2026-07-28",
+                },
+                "end_date": {"evidence": ["tag-d-2"], "normalized_date": "2028-07-28"},
+            }
+        ]
+    )
+
+    InstrumentIEStage().postprocess(row_state)
+
+    mention = row_state.debt_instrument_mentions[0]
+    assert mention["start_date"] == "2026-07-28"
+    assert mention["end_date"] == "2028-07-28"
+
+
+def test_normalized_amount_from_name_reads_an_embedded_principal() -> None:
+    """A principal inside the name parses; a coupon or maturity does not (#129).
+
+    NER tags `$183.36 million term loan` as one `debt_instrument`, so there is no
+    `amount` span to cite. Requiring a currency marker is what keeps the coupon
+    rate and the maturity year from being read as the principal.
+    """
+    assert normalized_amount_from_name("$183.36 million term loan") == "183360000"
+    assert normalized_amount_from_name("C$300 million notes due 2033") == "300000000"
+    assert normalized_amount_from_name("$1,299,870.00 Promissory Note") == "1299870"
+    assert currency_from_name("C$300 million notes due 2033") == "CAD"
+    assert currency_from_name("€600.0 million 3.625% Notes due 2032") == "EUR"
+    # No currency marker means no principal is stated in the name.
+    assert normalized_amount_from_name("3.875% senior notes due 2028") is None
+    assert normalized_amount_from_name("revolving credit facility") is None
+    # A name stating two figures names no single principal, as #104 requires for
+    # maturities.
+    assert (
+        normalized_amount_from_name("$500 million and $750 million facilities") is None
+    )
+
+
+def test_instrument_ie_postprocess_recovers_a_principal_from_the_name() -> None:
+    """An uncited principal inside the name still publishes (#129)."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = (
+        '<body>The Company prepaid its <debt_instrument id="tag-i-1">$183.36 million '
+        "term loan</debt_instrument>.</body>"
+    )
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                # No `amount` span exists, so the model cites nothing.
+                "amount": {
+                    "evidence": [],
+                    "normalized_amount": "183360000",
+                    "currency": "USD",
+                },
+            }
+        ]
+    )
+
+    InstrumentIEStage().postprocess(row_state)
+
+    mention = row_state.debt_instrument_mentions[0]
+    payload = json.loads(str(mention["amount_json"]))
+    assert mention["amount"] == "183360000"
+    assert payload["currency"] == "USD"
+    # Nothing was cited, so the evidence list stays empty, as it does for a
+    # name-derived maturity.
+    assert payload["tag_ids"] == []
+
+
+def test_instrument_ie_validate_accepts_the_name_span_as_amount_evidence() -> None:
+    """Citing the instrument's own name span for a name-embedded amount is valid (#129)."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = (
+        '<body>The <debt_instrument id="tag-i-1">$183.36 million term loan'
+        "</debt_instrument> was prepaid.</body>"
+    )
+    response = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "amount": {
+                    "evidence": ["tag-i-1"],
+                    "normalized_amount": "183360000",
+                    "currency": "USD",
+                },
+            }
+        ]
+    )
+
+    assert InstrumentIEStage().validate(row_state, response) == []
+
+    row_state.stage_responses["instrument_ie"] = response
+    InstrumentIEStage().postprocess(row_state)
+    assert row_state.debt_instrument_mentions[0]["amount"] == "183360000"
+
+
+def test_normalized_amount_from_text_keeps_cents_exact() -> None:
+    """A cents value parses to itself, not to a float artifact (#119).
+
+    `float("372246148.11")` is not that number, and the old `f"{value:.12f}"`
+    rendering exposed the difference, so the string never matched what the model
+    reported and the amount published as null.
+    """
+    assert normalized_amount_from_text("$372,246,148.11") == "372246148.11"
+    assert normalized_amount_from_text("$55,637.41") == "55637.41"
+    assert normalized_amount_from_text("$5,529,722.96") == "5529722.96"
+    # Trailing zeros and scale words still collapse to one canonical form.
+    assert normalized_amount_from_text("$500,000.00") == "500000"
+    assert normalized_amount_from_text("$70.0 million") == "70000000"
+    assert normalized_amount_from_text("1.5 billion") == "1500000000"
+
+
+def test_instrument_ie_postprocess_keeps_an_amount_with_cents() -> None:
+    """A principal with cents survives the model/parser agreement gate (#119)."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = (
+        '<body>The <debt_instrument id="tag-i-1">construction loan facility'
+        "</debt_instrument> provides for "
+        '<amount id="tag-a-1">$372,246,148.11</amount>.</body>'
+    )
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "amount": {
+                    "evidence": ["tag-a-1"],
+                    # The model reports the value it read, without the float
+                    # artifact the parser used to produce.
+                    "normalized_amount": "372246148.11",
+                    "currency": "USD",
+                },
+            }
+        ]
+    )
+
+    InstrumentIEStage().postprocess(row_state)
+
+    mention = row_state.debt_instrument_mentions[0]
+    payload = json.loads(str(mention["amount_json"]))
+    assert mention["amount"] == "372246148.11"
+    assert payload["normalized_amount"] == "372246148.11"
+    assert payload["currency"] == "USD"
+
+
+def test_instrument_ie_postprocess_accepts_a_differently_formatted_amount() -> None:
+    """`500000.00` and `500000` are the same amount, so neither is lost (#119)."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = (
+        '<body>The <debt_instrument id="tag-i-1">promissory note'
+        '</debt_instrument> is for <amount id="tag-a-1">$500,000.00</amount>.</body>'
+    )
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "amount": {
+                    "evidence": ["tag-a-1"],
+                    "normalized_amount": "500000.00",
+                    "currency": "USD",
+                },
+            }
+        ]
+    )
+
+    InstrumentIEStage().postprocess(row_state)
+
+    mention = row_state.debt_instrument_mentions[0]
+    # The parser's canonical string is what gets published.
+    assert mention["amount"] == "500000"
+    # A genuinely different value is still rejected.
+    assert json.loads(str(mention["amount_json"]))["normalized_amount"] == "500000"
+
+
+def test_canonical_amount_value_prefers_the_span_that_parses() -> None:
+    """A longer label must not beat the figure it names (#120)."""
+    tag_details = {
+        "tag-a-1": {"type": "amount", "text": "$2,000,000"},
+        "tag-a-2": {"type": "amount", "text": "Principal Amount"},
+    }
+
+    assert canonical_amount_value(["tag-a-1", "tag-a-2"], tag_details) == "$2,000,000"
+    # With nothing parseable, the longest span is still the canonical text.
+    assert canonical_amount_value(["tag-a-2"], tag_details) == "Principal Amount"
+    # Among parseable spans the longest still wins, as it did before.
+    tag_details["tag-a-3"] = {"type": "amount", "text": "$2,000,000 in principal"}
+    assert (
+        canonical_amount_value(["tag-a-1", "tag-a-3"], tag_details)
+        == "$2,000,000 in principal"
+    )
+
+
+def test_instrument_ie_postprocess_keeps_an_amount_clustered_with_its_label() -> None:
+    """The figure survives being clustered with a longer label span (#120)."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = (
+        '<body>The <debt_instrument id="tag-i-1">Secured Convertible Promissory Note'
+        '</debt_instrument> has a <amount id="tag-a-label">Principal Amount</amount> '
+        'of <amount id="tag-a-figure">$2,000,000</amount>.</body>'
+    )
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "amount": {
+                    "evidence": ["tag-a-figure", "tag-a-label"],
+                    "normalized_amount": "2000000",
+                    "currency": "USD",
+                },
+            }
+        ]
+    )
+
+    InstrumentIEStage().postprocess(row_state)
+
+    mention = row_state.debt_instrument_mentions[0]
+    assert mention["amount"] == "2000000"
+    # Both spans stay in the payload as provenance.
+    payload = json.loads(str(mention["amount_json"]))
+    assert payload["tag_ids"] == ["tag-a-figure", "tag-a-label"]
+
+
+def test_currency_candidates_read_a_qualified_dollar_sign() -> None:
+    """`C$` is Canadian, not US, dollars (#121)."""
+    assert currency_candidates_from_text("C$300 million") == {"CAD"}
+    assert currency_candidates_from_text("A$50,000,000") == {"AUD"}
+    assert currency_candidates_from_text("NZ$10 million") == {"NZD"}
+    # An unqualified dollar sign keeps its USD reading.
+    assert currency_candidates_from_text("$500.0 million") == {"USD"}
+    assert currency_candidates_from_text("500 million U.S. dollars") == {"USD"}
+    # A span quoting both currencies offers both.
+    assert currency_candidates_from_text("C$300 million (US$220 million)") == {
+        "CAD",
+        "USD",
+    }
+
+
+def test_instrument_ie_postprocess_keeps_a_canadian_dollar_currency() -> None:
+    """A C$ principal publishes CAD rather than a null currency (#121)."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = (
+        '<body>The <debt_instrument id="tag-i-1">4.200% Senior Notes due 2033'
+        '</debt_instrument> total <amount id="tag-a-1">C$300 million</amount>.</body>'
+    )
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "amount": {
+                    "evidence": ["tag-a-1"],
+                    "normalized_amount": "300000000",
+                    "currency": "CAD",
+                },
+            }
+        ]
+    )
+
+    InstrumentIEStage().postprocess(row_state)
+
+    payload = json.loads(str(row_state.debt_instrument_mentions[0]["amount_json"]))
+    assert payload["normalized_amount"] == "300000000"
+    assert payload["currency"] == "CAD"
+
+
+def test_instrument_ie_postprocess_normalizes_wrapped_names() -> None:
+    """A name wrapped across lines is stored collapsed, verbatim in name_json."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = (
+        "<body>The Company entered into a "
+        '<debt_instrument id="tag-i-1">revolving credit\nfacility</debt_instrument> '
+        "and issued "
+        '<debt_instrument id="tag-i-2">4.85% Remarketable\tSenior\xa0Notes '
+        "due 2032</debt_instrument>.</body>"
+    )
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [{"name": ["tag-i-1"]}, {"name": ["tag-i-2"]}]
+    )
+
+    InstrumentIEStage().postprocess(row_state)
+
+    names = [mention["name"] for mention in row_state.debt_instrument_mentions]
+    assert names == [
+        "revolving credit facility",
+        "4.85% Remarketable Senior Notes due 2032",
+    ]
+    # Provenance keeps the verbatim span, since the char offsets index into it.
+    verbatim = [
+        json.loads(str(mention["name_json"]))["mentions"][0]["text"]
+        for mention in row_state.debt_instrument_mentions
+    ]
+    assert verbatim == [
+        "revolving credit\nfacility",
+        "4.85% Remarketable\tSenior\xa0Notes due 2032",
+    ]
+
+
+def test_instrument_ie_postprocess_drops_duplicate_identical_mentions() -> None:
+    """Objects that differ in no extracted property must not duplicate a mention row."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = """
+<body>
+The trust issued
+<debt_instrument id="tag-i-1">Class A-1 Notes, Class A-2 Notes, and Class A-3 Notes</debt_instrument>.
+</body>
+""".strip()
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [{"name": ["tag-i-1"]}, {"name": ["tag-i-1"]}, {"name": ["tag-i-1"]}]
+    )
+
+    InstrumentIEStage().postprocess(row_state)
+
+    mentions = row_state.debt_instrument_mentions
+    assert len(mentions) == 1
+    assert mentions[0]["raw_id"] == "i-1"
+
+
+def test_instrument_ie_prompt_requires_one_object_per_class() -> None:
+    """The IE prompt must keep telling the model to split multi-class offerings."""
+    prompt = load_prompt("instrument_ie")
+
+    assert "one object per class, tranche, or series" in prompt
+    assert "Class A-1" in prompt
 
 
 def test_instrument_relation_stage_accepts_retired_of() -> None:
@@ -608,6 +1929,98 @@ def test_match_pending_mentions_writes_match_datasets(tmp_path: Path) -> None:
     assert len(tables["debt_instrument_mentions"]) == 1
     assert written_matches["edge_type"].to_list() == ["member"]
     assert written_instruments["debt_instrument_id"].to_list() == ["m-1"]
+
+
+def test_company_names_by_cik_takes_the_newest_known_name() -> None:
+    """CIK name resolution should ignore missing values and prefer newer filings."""
+    mention_rows = pd.DataFrame(
+        [
+            build_mention_row(
+                mention_id="m-1",
+                item_id="item-1",
+                accession_number="0001",
+                cik="2078008",
+                date="2024-01-02",
+                name="Term Loan",
+                start_date="2024-01-01",
+                amount="$100 million",
+                company_name=None,
+            ),
+            build_mention_row(
+                mention_id="m-2",
+                item_id="item-2",
+                accession_number="0002",
+                cik="2078008",
+                date="2024-02-02",
+                name="Revolver",
+                start_date="2024-02-01",
+                amount="$50 million",
+                company_name="Versigent PLC",
+            ),
+            build_mention_row(
+                mention_id="m-3",
+                item_id="item-3",
+                accession_number="0003",
+                cik="320193",
+                date="2024-03-02",
+                name="Senior Notes",
+                start_date="2024-03-01",
+                amount="$1 billion",
+            ),
+        ]
+    )
+
+    assert company_names_by_cik(mention_rows) == {
+        "2078008": "Versigent PLC",
+        "320193": "Example Inc.",
+    }
+
+
+def test_match_tables_backfills_company_name_from_cik() -> None:
+    """An instrument seeded by a mention without display metadata is still named."""
+    mention_rows = pd.DataFrame(
+        [
+            build_mention_row(
+                mention_id="m-1",
+                item_id="item-1",
+                accession_number="0001",
+                cik="2078008",
+                date="2024-01-02",
+                name="6.125% senior unsecured notes due 2031",
+                start_date="2024-01-01",
+                amount="$400 million",
+                company_name=None,
+            ),
+            build_mention_row(
+                mention_id="m-2",
+                item_id="item-2",
+                accession_number="0002",
+                cik="2078008",
+                date="2024-02-02",
+                name="Revolving Credit Facility",
+                start_date="2024-02-01",
+                amount="$50 million",
+                company_name="Versigent PLC",
+            ),
+        ]
+    )
+
+    tables = match_tables(mention_rows)
+
+    instruments = tables["debt_instrument"].set_index("debt_instrument_id")
+    assert len(instruments) == 2
+    assert instruments.loc["m-1", "company_name"] == "Versigent PLC"
+    assert instruments.loc["m-2", "company_name"] == "Versigent PLC"
+
+
+def test_coerce_optional_text_treats_nan_like_text_as_missing() -> None:
+    """Literal placeholder strings must never reach a dashboard-facing column."""
+    assert coerce_optional_text("nan") is None
+    assert coerce_optional_text("NaN") is None
+    assert coerce_optional_text("None") is None
+    assert coerce_optional_text("N/A") is None
+    assert coerce_optional_text("  ") is None
+    assert coerce_optional_text("Nantucket Bank") == "Nantucket Bank"
 
 
 def test_match_pending_mentions_drains_all_shards(tmp_path: Path) -> None:
@@ -877,6 +2290,259 @@ def test_match_tables_retired_of_keeps_separate_clusters_and_updates_parent_end_
     }
     assert instruments["m-2"]["retired_of_debt_instrument_id"] == "m-1"
     assert instruments["m-1"]["end_date"] == "2024-03-01"
+
+
+def test_match_tables_publishes_two_kinds_of_lineage_for_one_instrument() -> None:
+    """Split and retirement lineage coexist in their own columns (#130).
+
+    Pitney Bowes' incremental tranche A term loans split from the existing
+    tranche A loans and redeemed the 2027 notes with the proceeds. Nulling every
+    parent column whenever a second kind appeared discarded both links.
+    """
+    mentions = pd.DataFrame(
+        [
+            build_mention_row(
+                mention_id="m-notes",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2025-02-07",
+                name="6.875% Senior Notes due March 2027",
+                start_date="2025-02-07",
+                amount="$347 million",
+            ),
+            build_mention_row(
+                mention_id="m-tranche",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2025-02-07",
+                name="tranche A term loans",
+                start_date="2025-02-07",
+                amount="$302 million",
+            ),
+            {
+                **build_mention_row(
+                    mention_id="m-incremental",
+                    item_id="item-1",
+                    accession_number="0001",
+                    cik="320193",
+                    date="2026-06-23",
+                    name="Incremental Term Loans",
+                    start_date="2026-06-23",
+                    amount="$150 million",
+                ),
+                "split_of": "m-tranche",
+                "retired_of": "m-notes",
+            },
+        ]
+    )
+
+    tables = match_tables(mentions)
+
+    instruments = {
+        row["debt_instrument_id"]: row
+        for row in tables["debt_instrument"].to_dict("records")
+    }
+    row = instruments["m-incremental"]
+    assert row["split_of_debt_instrument_id"] == "m-tranche"
+    assert row["retired_of_debt_instrument_id"] == "m-notes"
+    assert row["amendment_of_debt_instrument_id"] is None
+
+
+def test_match_tables_drops_only_the_ambiguous_relation_kind() -> None:
+    """Two parents of one kind stay unresolvable; a different kind survives (#130)."""
+    mentions = pd.DataFrame(
+        [
+            build_mention_row(
+                mention_id="m-a",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2024-01-01",
+                name="Facility A",
+                start_date="2024-01-01",
+                amount="$100 million",
+            ),
+            build_mention_row(
+                mention_id="m-b",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2024-01-01",
+                name="Facility B",
+                start_date="2024-02-01",
+                amount="$200 million",
+            ),
+            build_mention_row(
+                mention_id="m-notes",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2024-01-01",
+                name="7.000% Senior Notes due 2030",
+                start_date="2024-03-01",
+                amount="$300 million",
+            ),
+            {
+                **build_mention_row(
+                    mention_id="m-1",
+                    item_id="item-2",
+                    accession_number="0002",
+                    cik="320193",
+                    date="2026-01-01",
+                    name="New Facility",
+                    start_date="2026-01-01",
+                    amount="$400 million",
+                ),
+                "amendment_of": "m-a",
+                "retired_of": "m-notes",
+            },
+            {
+                **build_mention_row(
+                    mention_id="m-2",
+                    item_id="item-2",
+                    accession_number="0002",
+                    cik="320193",
+                    date="2026-01-01",
+                    name="New Facility",
+                    start_date="2026-01-01",
+                    amount="$400 million",
+                ),
+                "amendment_of": "m-b",
+            },
+        ]
+    )
+
+    tables = match_tables(mentions)
+
+    member_edges = tables["debt_instrument_mentions"].query("edge_type == 'member'")
+    assignment = {
+        row["debt_instrument_mention_id"]: row["debt_instrument_id"]
+        for row in member_edges.to_dict("records")
+    }
+    # m-1 and m-2 share every key, so they cluster and bring two amendment
+    # parents with them.
+    assert assignment["m-1"] == assignment["m-2"]
+    row = {
+        r["debt_instrument_id"]: r for r in tables["debt_instrument"].to_dict("records")
+    }[assignment["m-1"]]
+    assert row["amendment_of_debt_instrument_id"] is None
+    assert row["retired_of_debt_instrument_id"] == "m-notes"
+
+
+def test_match_tables_keeps_same_day_siblings_apart() -> None:
+    """Same start date plus a conflicting principal means two instruments (#131).
+
+    Longevity Health issued a $1,250,000 and a $1,100,000 `10% Senior Secured
+    Convertible Note` on one day. Both maturities are null and both coupons are
+    `10%`, so #64's gates cannot separate them and #79's key-conflicting
+    fingerprint path merged them, publishing one principal and losing the other.
+    """
+    mentions = pd.DataFrame(
+        [
+            build_mention_row(
+                mention_id="m-initial",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2026-08-13",
+                name="10% Senior Secured Convertible Note",
+                start_date="2026-08-13",
+                amount="$1,250,000",
+            ),
+            build_mention_row(
+                mention_id="m-additional",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2026-08-13",
+                name="10% Senior Secured Convertible Note",
+                start_date="2026-08-13",
+                amount="$1,100,000",
+            ),
+        ]
+    )
+
+    tables = match_tables(mentions)
+
+    member_edges = tables["debt_instrument_mentions"].query("edge_type == 'member'")
+    assignment = {
+        row["debt_instrument_mention_id"]: row["debt_instrument_id"]
+        for row in member_edges.to_dict("records")
+    }
+    assert assignment["m-initial"] != assignment["m-additional"]
+    amounts = {
+        row["debt_instrument_id"]: row["amount"]
+        for row in tables["debt_instrument"].to_dict("records")
+    }
+    assert amounts[assignment["m-initial"]] == "$1,250,000"
+    assert amounts[assignment["m-additional"]] == "$1,100,000"
+
+
+def test_match_tables_still_attaches_an_add_on_to_its_series() -> None:
+    """An add-on on a later date keeps merging into the existing series (#131).
+
+    Encompass Health sold $100 million of additional 5.875% Senior Notes due
+    2034 into its existing $500 million series. The start dates differ, which is
+    what distinguishes a second observation of one instrument from a same-day
+    sibling, so #79's path must still fire here.
+    """
+    mentions = pd.DataFrame(
+        [
+            build_mention_row(
+                mention_id="m-series",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2026-05-29",
+                name="5.875% Senior Notes due 2034",
+                start_date="2026-05-29",
+                amount="$500 million",
+            ),
+            build_mention_row(
+                mention_id="m-addon",
+                item_id="item-2",
+                accession_number="0002",
+                cik="320193",
+                date="2026-08-13",
+                name="5.875% Senior Notes due 2034",
+                start_date="2026-08-13",
+                amount="$100 million",
+            ),
+        ]
+    )
+
+    tables = match_tables(mentions)
+
+    member_edges = tables["debt_instrument_mentions"].query("edge_type == 'member'")
+    assignment = {
+        row["debt_instrument_mention_id"]: row["debt_instrument_id"]
+        for row in member_edges.to_dict("records")
+    }
+    assert assignment["m-series"] == assignment["m-addon"]
+    via = {
+        row["debt_instrument_mention_id"]: row["match_via"]
+        for row in member_edges.to_dict("records")
+    }
+    assert via["m-addon"] == "member:name_fingerprint"
+
+
+def test_retry_includes_prior_response_as_assistant_turn() -> None:
+    """Retry conversations must include the failed output the retry references."""
+    row_state = ExtractionRowState(item_row={"item_id": "item-1"}, stage_name="ner")
+    row_state.add_messages([{"role": "user", "content": "tag this filing"}])
+    row_state.add_response("<bad-xml>")
+    row_state.add_validation(["unclosed tag"])
+    row_state.retry("Your previous NER output failed validation: unclosed tag")
+    assert row_state.current_attempt.messages == [
+        {"role": "user", "content": "tag this filing"},
+        {"role": "assistant", "content": "<bad-xml>"},
+        {
+            "role": "user",
+            "content": "Your previous NER output failed validation: unclosed tag",
+        },
+    ]
 
 
 def test_extract_failures_are_recorded_and_cleared(

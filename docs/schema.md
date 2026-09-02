@@ -4,6 +4,8 @@ CDT writes canonical artifacts under one artifact root. That root can be a local
 
 The pipeline can also write optional final snapshot parquet files under a separate final database root. Those snapshots are flattened table-wide exports intended for downstream database loading and are not the canonical working state for the pipeline.
 
+Text columns are normalized on the way into a snapshot: a cell whose whole value is a placeholder such as `nan`, `none`, `null`, `<na>`, or `n/a` is written as a null. Partitions written before a column existed, or by a stage that stringified a missing value, would otherwise publish the placeholder as if it were real text.
+
 ## Root Layout
 
 ```text
@@ -201,12 +203,13 @@ Columns:
 - `amount`: Normalized principal or commitment amount when present.
 - `amendment_of`: `debt_instrument_mention_id` of the mention this row amends, when the extractor found that relation.
 - `split_of`: `debt_instrument_mention_id` of the mention this row splits from, when the extractor found that relation.
-- `lenders_json`: JSON array of lender or counterparty mention clusters with evidence text.
-- `other_interested_parties_json`: JSON array of additional related-party clusters with evidence text.
+- `lenders_json`: JSON array of lender or counterparty mention clusters with evidence text. Collective phrases such as `the other lenders party thereto` are excluded; `lenders_known_incomplete` records that they were present.
+- `other_interested_parties_json`: JSON array of additional related-party clusters with evidence text, excluding the filer or borrower itself.
 - `name_json`: JSON payload describing the evidence tags and surface text used to construct `name`.
 - `start_date_json`: JSON payload containing normalized start-date value plus extraction evidence.
-- `end_date_json`: JSON payload containing normalized end-date value plus extraction evidence.
+- `end_date_json`: JSON payload containing normalized end-date value plus extraction evidence. The maturity may come from the instrument name, such as `notes due 2028`, in which case the evidence list can be empty; year-only maturities normalize to `YYYY-12-31`.
 - `amount_json`: JSON payload containing normalized amount value plus extraction evidence.
+- `lenders_known_incomplete`: Boolean flag that is true when the mention shows the document referred to lenders it did not name, such as `the other lenders party thereto`. A true value with an empty `lenders_json` means the instrument has counterparties the document never named — the normal case for an instrument placed into the public market or sold to unnamed holders through underwriters, where the underwriters are recorded in `other_interested_parties_json` instead. A false value with an empty `lenders_json` means the document named no counterparty and signalled none, so there is nothing to disclose rather than something undisclosed.
 
 Primary key: `debt_instrument_mention_id`
 
@@ -228,7 +231,7 @@ Columns:
 
 - `debt_instrument_id`: Canonical entity identifier for one consolidated debt instrument history.
 - `cik`: Issuer CIK shared by the instrument's directly matched mentions.
-- `company_name`: Issuer display name shared by the instrument's directly matched mentions.
+- `company_name`: Issuer display name resolved from the instrument's directly matched mentions, falling back to the newest name any mention for the same CIK carries.
 - `seed_debt_instrument_mention_id`: First direct mention used as the representative seed for the instrument record.
 - `amendment_of_debt_instrument_id`: Parent instrument ID when this instrument is an amendment lineage child.
 - `split_of_debt_instrument_id`: Parent instrument ID when this instrument is a split lineage child.
@@ -240,6 +243,7 @@ Columns:
 - `lenders_json`: JSON aggregation of lender clusters carried forward from the instrument's direct mentions.
 - `other_interested_parties_json`: JSON aggregation of other related-party clusters carried forward from the instrument's direct mentions.
 - `possibly_related_json`: JSON array of advisory mention IDs that look related but were not directly matched into the instrument.
+- `lenders_known_incomplete`: Boolean flag that is true when any direct mention of the instrument showed undisclosed lenders.
 
 Primary key: `debt_instrument_id`
 

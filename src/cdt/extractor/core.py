@@ -10,6 +10,7 @@ import json
 import re
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime
+from decimal import Decimal, InvalidOperation
 from importlib import resources
 from pathlib import Path
 from time import perf_counter
@@ -40,6 +41,7 @@ from cdt.datasets import (
 from cdt.shared import get_logger
 from cdt.storage import (
     artifact_exists,
+    coerce_dataset_text,
     list_artifacts_with_versions,
     read_table,
     write_json_artifact,
@@ -60,16 +62,99 @@ EXTRACTOR_TEMPERATURE = 0.0
 REASONING_MODEL_PREFIXES = ("gpt-5", "o1", "o3", "o4")
 INSTRUMENT_ENTITY_TAG_TYPES = {"debt_instrument"}
 LENDER_TAG_TYPES = {"person", "organization"}
+LENDER_CLUSTER_KINDS = {"named", "collective"}
+DEFAULT_LENDER_CLUSTER_KIND = "named"
+OTHER_PARTY_ROLES = {
+    "agent",
+    "trustee",
+    "underwriter",
+    "guarantor",
+    "borrower",
+    "other",
+}
+DEFAULT_OTHER_PARTY_ROLE = "other"
+BORROWER_PARTY_ROLE = "borrower"
+COLLECTIVE_LENDER_KIND = "collective"
+# The model labels every party cluster so collective lenders and the borrower can
+# be dropped here. The labels are extraction-time signals and are not persisted.
+PARTY_PROPERTY_ANNOTATIONS = {
+    "lenders": ("kind", LENDER_CLUSTER_KINDS, DEFAULT_LENDER_CLUSTER_KIND),
+    "other_interested_parties": (
+        "role",
+        OTHER_PARTY_ROLES,
+        DEFAULT_OTHER_PARTY_ROLE,
+    ),
+}
 INSTRUMENT_SINGLE_VALUE_PROPERTIES = {
     "start_date": {"date"},
-    "end_date": {"date"},
-    "amount": {"amount"},
+    # NER tags maturity phrases like "notes due 2028" inside the instrument name,
+    # so end_date evidence may cite that name span instead of a standalone date.
+    "end_date": {"date", "debt_instrument"},
+    # The same holds for a principal stated inside the name, as in
+    # `$183.36 million term loan`: there is no separate `amount` span to cite,
+    # and rejecting the name span lost the amount outright (#129).
+    "amount": {"amount", "debt_instrument"},
     "name": {"debt_instrument"},
 }
+MATURITY_EVIDENCE_TAG_TYPES = {"debt_instrument"}
+NAME_EMBEDDED_AMOUNT_TAG_TYPES = {"debt_instrument"}
 STANDARDIZED_SINGLE_VALUE_PROPERTIES = {"start_date", "end_date", "amount"}
 INSTRUMENT_RELATION_TYPES = {"amendment_of", "retired_of", "split_of"}
 NUMERIC_STRING_PATTERN = re.compile(r"^\d+(?:\.\d+)?$")
+# One `due` can carry a list of maturities: `due 2028 and 2030`,
+# `due October 1, 2028 and 2030`, `due October 1, 2028 and October 1, 2030`. Each
+# is two maturities, and matching only the first silently invented one (#104).
+MATURITY_COORDINATED_YEARS = (
+    r"(?:\s*(?:,|/|&|and(?:/or)?|or)\s*(?:[A-Za-z]+\s+\d{1,2},?\s+)?\d{4})*"
+)
+MATURITY_FULL_DATE_PATTERN = re.compile(
+    r"\bdue\s+(?:on\s+)?(?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2}),?\s+(?P<year>\d{4})"
+    rf"(?P<more>{MATURITY_COORDINATED_YEARS})",
+    re.IGNORECASE,
+)
+MATURITY_YEAR_PATTERN = re.compile(
+    rf"\bdue\s+(?:in\s+)?(?P<years>\d{{4}}{MATURITY_COORDINATED_YEARS})\b",
+    re.IGNORECASE,
+)
+FOUR_DIGIT_YEAR_PATTERN = re.compile(r"\d{4}")
+YEAR_ONLY_MATURITY_SUFFIX = "-12-31"
+# A rate marker counts only where it sits on a number, so the value the parser
+# would read is the rate itself rather than a percentage of something else (#103).
+AMOUNT_VALUE_PATTERN = re.compile(r"\d[\d,]*(?:\.\d+)?")
+RATE_SUFFIX_PATTERN = re.compile(r"\s*(?:%|basis\s+points?\b)", re.IGNORECASE)
+# A principal stated inside an instrument name: `$183.36 million term loan`,
+# `C$300 million notes due 2033`. The currency marker is required, so a coupon
+# rate or a maturity year in the same name cannot be read as the principal.
+NAME_EMBEDDED_AMOUNT_PATTERN = re.compile(
+    r"(?P<currency>[A-Z]{0,2}\$|€|£|¥)\s?"
+    r"(?P<value>\d[\d,]*(?:\.\d+)?)"
+    r"(?:\s+(?P<scale>thousand|million|billion|trillion))?",
+    re.IGNORECASE,
+)
 ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# An ampersand that starts no entity. The NER response has to be well-formed XML
+# while reproducing text that may carry a bare `&` (#127).
+UNESCAPED_AMPERSAND_PATTERN = re.compile(
+    r"&(?!(?:amp|lt|gt|quot|apos);|#(?:\d+|x[0-9A-Fa-f]+);)"
+)
+# Zero-padding is optional on the way in, so a model writing `2026-7-28` is read
+# as the day it means rather than dropped for its shape (#133).
+LENIENT_ISO_DATE_PATTERN = re.compile(
+    r"^(?P<year>\d{4})-(?P<month>\d{1,2})-(?P<day>\d{1,2})$"
+)
+# Filing dates come in three further spellings. The four-digit year is required:
+# `7/28/26` needs a century guessed, and a null beats a wrong decade (#133).
+NUMERIC_DATE_PATTERN = re.compile(
+    r"(?<!\d)(?P<month>\d{1,2})/(?P<day>\d{1,2})/(?P<year>\d{4})(?!\d)"
+)
+# The comma is optional, so `July 28 2026` reads the same as `July 28, 2026`.
+MONTH_FIRST_DATE_PATTERN = re.compile(
+    r"(?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2}),?\s+(?P<year>\d{4})(?!\d)"
+)
+# `28 July 2026`, as non-US issuers write it.
+DAY_FIRST_DATE_PATTERN = re.compile(
+    r"(?<!\d)(?P<day>\d{1,2})\s+(?P<month>[A-Za-z]+),?\s+(?P<year>\d{4})(?!\d)"
+)
 MONTH_MAP = {
     "january": "01",
     "february": "02",
@@ -84,6 +169,19 @@ MONTH_MAP = {
     "november": "11",
     "december": "12",
 }
+QUALIFIED_DOLLAR_CODES = {
+    "A": "AUD",
+    "C": "CAD",
+    "CA": "CAD",
+    "HK": "HKD",
+    "NZ": "NZD",
+    "R": "BRL",
+    "S": "SGD",
+}
+QUALIFIED_DOLLAR_PATTERN = re.compile(
+    rf"\b({'|'.join(sorted(QUALIFIED_DOLLAR_CODES, key=len, reverse=True))})\$",
+    re.IGNORECASE,
+)
 AMOUNT_MULTIPLIERS = {
     "thousand": 1_000,
     "thousands": 1_000,
@@ -140,6 +238,7 @@ DEBT_INSTRUMENT_MENTION_COLUMNS = [
     "start_date_json",
     "end_date_json",
     "amount_json",
+    "lenders_known_incomplete",
 ]
 
 
@@ -190,8 +289,8 @@ class SupportsChatCompletion(Protocol):
         messages: list[dict[str, str]],
         model: str,
         reasoning_effort: str,
-    ) -> str:
-        """Return one chat completion as plain text."""
+    ) -> CompletionResult:
+        """Return one chat completion with its provider metadata."""
 
 
 @dataclass
@@ -204,10 +303,32 @@ class AttemptRecord:
     response: str | None = None
     validation_errors: list[str] = field(default_factory=list)
     status: str = "incomplete"
+    # Provider metadata. Without `finish_reason` a response that the provider
+    # aborted is indistinguishable in the audit log from one the model chose to
+    # end, and those need opposite remedies: four items lost to NER in one
+    # held-out window turned out to be `content_filter` aborts rather than the
+    # length cap or the model stopping that they were twice diagnosed as (#135).
+    finish_reason: str | None = None
+    refusal: str | None = None
+    usage: dict[str, object] | None = None
+    response_id: str | None = None
+    served_model: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Convert one attempt to a JSON-serializable dictionary."""
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class CompletionResult:
+    """One model response plus the provider metadata that explains it."""
+
+    text: str
+    finish_reason: str | None = None
+    refusal: str | None = None
+    usage: dict[str, object] | None = None
+    response_id: str | None = None
+    served_model: str | None = None
 
 
 @dataclass
@@ -240,11 +361,19 @@ class ExtractionRowState:
         """Append prompt messages to the current attempt."""
         self.current_attempt.messages.extend(messages)
 
-    def add_response(self, response: str) -> None:
-        """Record the latest model response."""
+    def add_response(
+        self, response: str, completion: CompletionResult | None = None
+    ) -> None:
+        """Record the latest model response and the provider metadata for it."""
         self.current_attempt.response = response
         self.current_attempt.attempt_index += 1
         self.stage_responses[self.current_attempt.stage_name] = response
+        if completion is not None:
+            self.current_attempt.finish_reason = completion.finish_reason
+            self.current_attempt.refusal = completion.refusal
+            self.current_attempt.usage = completion.usage
+            self.current_attempt.response_id = completion.response_id
+            self.current_attempt.served_model = completion.served_model
 
     def add_validation(self, failures: list[str]) -> None:
         """Record validation output for the current attempt."""
@@ -255,6 +384,10 @@ class ExtractionRowState:
         """Prepare a retry attempt for the current stage."""
         self.all_attempts.append(self.current_attempt)
         new_messages = list(self.current_attempt.messages)
+        if self.current_attempt.response is not None:
+            new_messages.append(
+                {"role": "assistant", "content": self.current_attempt.response}
+            )
         new_messages.append({"role": "user", "content": retry_message})
         self.current_attempt = AttemptRecord(
             stage_name=self.current_attempt.stage_name,
@@ -376,7 +509,7 @@ class OpenRouterChatClient:
         messages: list[dict[str, str]],
         model: str,
         reasoning_effort: str,
-    ) -> str:
+    ) -> CompletionResult:
         """Run one OpenRouter chat completion."""
         from openrouter import OpenRouter
 
@@ -396,7 +529,7 @@ class OpenRouterChatClient:
             timeout_ms=LIVE_REQUEST_TIMEOUT_SECONDS * 1000,
         ) as client:
             response = await client.chat.send_async(**request_kwargs)
-        return extract_response_text(response)
+        return completion_result_from_response(response)
 
 
 class NERStage:
@@ -417,6 +550,7 @@ class NERStage:
                 "Model returned empty or non-text output. Even if no entities are present, return the input text."
             ]
 
+        response = repair_unescaped_ampersands(response)
         try:
             root = DefusedET.fromstring(response)
         except ET.ParseError as exc:
@@ -454,7 +588,7 @@ class NERStage:
         response = row_state.stage_responses.get(self.name)
         if not response:
             return
-        row_state.ner_tagged_xml = assign_tag_ids(response)
+        row_state.ner_tagged_xml = assign_tag_ids(repair_unescaped_ampersands(response))
 
     def early_stop(self, row_state: ExtractionRowState) -> bool:
         if not row_state.ner_tagged_xml:
@@ -529,6 +663,14 @@ class InstrumentIEStage:
                                 tag_details=tag_details,
                             )
                         )
+                    if property_name == "amount":
+                        failures.extend(
+                            validate_amount_is_not_rate(
+                                index=index,
+                                value=obj[property_name],
+                                tag_details=tag_details,
+                            )
+                        )
                 if not isinstance(tag_ids, list):
                     failures.append(
                         f"Entry {index}: '{property_name}' evidence must be a list of tag IDs."
@@ -551,37 +693,21 @@ class InstrumentIEStage:
                         failures.append(
                             f"Entry {index}: '{property_name}' tag {tag_id} is type '{tag_info['type']}', expected {expected}."
                         )
-            for property_name in ("lenders", "other_interested_parties"):
-                if property_name not in obj:
-                    continue
-                values = obj[property_name]
-                if not isinstance(values, list):
-                    failures.append(
-                        f"Entry {index}: '{property_name}' must be a list of lists."
+            for property_name in PARTY_PROPERTY_ANNOTATIONS:
+                failures.extend(
+                    validate_party_property(
+                        index=index,
+                        property_name=property_name,
+                        obj=obj,
+                        tag_details=tag_details,
                     )
-                    continue
-                for cluster_index, cluster in enumerate(values):
-                    if not isinstance(cluster, list):
-                        failures.append(
-                            f"Entry {index}: '{property_name}'[{cluster_index}] must be a list of tag IDs."
-                        )
-                        continue
-                    if not all(isinstance(tag_id, str) for tag_id in cluster):
-                        failures.append(
-                            f"Entry {index}: '{property_name}'[{cluster_index}] must contain string tag IDs only."
-                        )
-                        continue
-                    for tag_id in cluster:
-                        tag_info = tag_details.get(tag_id)
-                        if tag_info is None:
-                            failures.append(
-                                f"Entry {index}: '{property_name}'[{cluster_index}] contains unknown tag ID {tag_id}."
-                            )
-                            continue
-                        if tag_info["type"] not in LENDER_TAG_TYPES:
-                            failures.append(
-                                f"Entry {index}: '{property_name}'[{cluster_index}] tag {tag_id} must be person or organization."
-                            )
+                )
+            failures.extend(
+                validate_lenders_known_incomplete(
+                    index=index,
+                    obj=obj,
+                )
+            )
         return failures
 
     def postprocess(self, row_state: ExtractionRowState) -> None:
@@ -599,19 +725,26 @@ class InstrumentIEStage:
             cast(list[dict[str, Any]], data), tag_details
         )
         mentions: list[dict[str, object]] = []
+        seen_mention_ids: set[str] = set()
         for index, obj in mention_entries:
             raw_id = raw_id_for(index)
+            name_text = canonical_value(obj.get("name", []), tag_details)
             amount_payload = standardized_amount_payload(
                 obj.get("amount"),
                 tag_details,
+                name_text=name_text,
             )
             start_date_payload = standardized_date_payload(
                 obj.get("start_date"),
                 tag_details,
             )
-            end_date_payload = standardized_date_payload(
+            end_date_payload = standardized_end_date_payload(
                 obj.get("end_date"),
                 tag_details,
+                name_text=name_text,
+            )
+            lender_clusters, lenders_known_incomplete = (
+                lender_payloads_and_incompleteness(obj, tag_details)
             )
             mention_row: dict[str, object] = {
                 "item_id": row_state.item_id,
@@ -621,22 +754,17 @@ class InstrumentIEStage:
                 "company_name": row_state.item_row.get("company_name"),
                 "date": row_state.item_row.get("date"),
                 "raw_id": raw_id,
-                "name": canonical_value(obj.get("name", []), tag_details),
+                "name": name_text,
                 "start_date": start_date_payload["normalized_date"],
                 "end_date": end_date_payload["normalized_date"],
                 "amount": amount_payload["normalized_amount"],
                 "amendment_of": None,
                 "retired_of": None,
                 "split_of": None,
-                "lenders_json": json.dumps(
-                    cluster_payload_list(obj.get("lenders", []), tag_details),
-                    sort_keys=True,
-                ),
+                "lenders_json": json.dumps(lender_clusters, sort_keys=True),
+                "lenders_known_incomplete": lenders_known_incomplete,
                 "other_interested_parties_json": json.dumps(
-                    cluster_payload_list(
-                        obj.get("other_interested_parties", []),
-                        tag_details,
-                    ),
+                    disclosed_party_payloads(obj, tag_details),
                     sort_keys=True,
                 ),
                 "name_json": json.dumps(
@@ -647,10 +775,17 @@ class InstrumentIEStage:
                 "end_date_json": json.dumps(end_date_payload, sort_keys=True),
                 "amount_json": json.dumps(amount_payload, sort_keys=True),
             }
-            mention_row["debt_instrument_mention_id"] = debt_instrument_mention_id_for(
+            mention_id = debt_instrument_mention_id_for(
                 row_state.item_id,
                 mention_row,
             )
+            if mention_id in seen_mention_ids:
+                # Objects that differ in no extracted property are the same mention.
+                # One name span covering several note classes produces these, and they
+                # would otherwise write duplicate primary keys.
+                continue
+            seen_mention_ids.add(mention_id)
+            mention_row["debt_instrument_mention_id"] = mention_id
             mentions.append(mention_row)
         row_state.debt_instrument_mentions = mentions
 
@@ -669,6 +804,47 @@ class InstrumentIEStage:
             "- Do not return agreements as output objects.\n"
             "- Return only valid JSON."
         )
+
+
+LINEAGE_SUCCESSOR_FIRST_TYPES = {"amendment_of", "retired_of"}
+
+
+def oriented_lineage_pair(
+    source_id: str,
+    target_id: str,
+    relation_type: str,
+    by_raw_id: dict[str, dict[str, object]],
+) -> tuple[str, str]:
+    """Return one lineage pair oriented successor-first.
+
+    `amendment_of` and `retired_of` run from the instrument as amended or
+    retiring to the predecessor, so the source is the later of the two. When both
+    sides carry a start date and the source's is earlier, the model has named the
+    pair the wrong way round and the pointer is flipped.
+
+    Alclear's revolver is the confirmed case: a Credit Agreement dated as of
+    2020-03-31, amended 2026-06-23 to cut commitments from $100,000,000 and
+    extend maturity from 2026-06-28 to 2031-06-23. Every figure on the
+    `$100,000,000` object is pre-amendment, yet it was the object carrying
+    `amendment_of` (#138).
+
+    The dates have to disagree for this to fire. While the prompt gave the
+    predecessor and the amended instrument the same start date there was nothing
+    to orient on, which is why the direction went unchecked.
+    """
+    if relation_type not in LINEAGE_SUCCESSOR_FIRST_TYPES:
+        return source_id, target_id
+    source = by_raw_id.get(source_id)
+    target = by_raw_id.get(target_id)
+    if source is None or target is None:
+        return source_id, target_id
+    source_start = coerce_dataset_text(source.get("start_date"))
+    target_start = coerce_dataset_text(target.get("start_date"))
+    if not source_start or not target_start:
+        return source_id, target_id
+    if source_start < target_start:
+        return target_id, source_id
+    return source_id, target_id
 
 
 class InstrumentRelationStage:
@@ -733,10 +909,16 @@ class InstrumentRelationStage:
             for mention in row_state.debt_instrument_mentions
         }
         for relation in data:
-            mention = by_raw_id.get(relation["from"])
+            source_id, target_id = oriented_lineage_pair(
+                str(relation["from"]),
+                str(relation["to"]),
+                str(relation["type"]),
+                by_raw_id,
+            )
+            mention = by_raw_id.get(source_id)
             if mention is None:
                 continue
-            mention[str(relation["type"])] = raw_to_global.get(relation["to"])
+            mention[str(relation["type"])] = raw_to_global.get(target_id)
 
     def early_stop(self, row_state: ExtractionRowState) -> bool:
         return False
@@ -1508,6 +1690,7 @@ def handle_response(
     response: str,
     *,
     max_attempts: int,
+    completion: CompletionResult | None = None,
 ) -> list[dict[str, str]] | None:
     """Advance one row given the response to its outstanding request.
 
@@ -1517,7 +1700,7 @@ def handle_response(
     """
     stage = STAGE_BY_NAME[row_state.current_attempt.stage_name]
     stage_index = STAGE_INDEX[stage.name]
-    row_state.add_response(response)
+    row_state.add_response(response, completion)
     failures = stage.validate(row_state, response)
     row_state.add_validation(failures)
     if not failures:
@@ -1563,7 +1746,7 @@ async def run_extraction_workflow(
     messages = initial_messages(row_state)
     while messages is not None:
         try:
-            response = await resolved_client.complete(
+            completion = await resolved_client.complete(
                 messages=messages,
                 model=model,
                 reasoning_effort=reasoning_effort,
@@ -1575,7 +1758,12 @@ async def run_extraction_workflow(
                 raise InfrastructureError(f"{type(exc).__name__}: {exc}") from exc
             record_stage_error(row_state, f"{type(exc).__name__}: {exc}")
             return row_state
-        messages = handle_response(row_state, response, max_attempts=max_attempts)
+        messages = handle_response(
+            row_state,
+            completion.text,
+            max_attempts=max_attempts,
+            completion=completion,
+        )
     return row_state
 
 
@@ -1616,6 +1804,28 @@ def parse_tag_details(
 
     walk(root)
     return root, "".join(plain_parts), tag_details
+
+
+def repair_unescaped_ampersands(text: str) -> str:
+    """Escape ampersands the NER response left bare, so it can be parsed.
+
+    `NERStage.preprocess` wraps the item text in `<body>` without escaping it, so
+    an item containing `A&R Registration Rights Agreement` is handed to the model
+    as invalid XML. The response then has to satisfy two requirements at once:
+    reproduce the text exactly, and be well-formed XML. For text carrying a bare
+    ampersand those conflict unless the model escapes on its own initiative,
+    which the prompt never asks for.
+
+    Bare ampersands appear in 44 of 342 relevant items in one held-out window
+    across 37 issuers, and in 13% to 17% of relevant items in each of three
+    windows, so this is a standing tax rather than one filer's quirk. Repairing
+    the response rather than escaping the input keeps what the model sees
+    unchanged, so nothing about its tagging behaviour moves (#127).
+
+    Only `&` is repaired. A stray `<` or `>` never occurs in the source text, so
+    one in a response is a real malformation and should still be rejected.
+    """
+    return UNESCAPED_AMPERSAND_PATTERN.sub("&amp;", text)
 
 
 def assign_tag_ids(xml_text: str) -> str:
@@ -1689,9 +1899,80 @@ def extract_batch_response_text(line: dict[str, object]) -> str:
     raise RuntimeError("Batch response content was not text.")
 
 
+def as_plain_dict(value: object) -> dict[str, object] | None:
+    """Return one SDK model or mapping as a plain JSON-serializable dict.
+
+    Falls back to the instance attributes rather than returning None, so a
+    provider SDK that stops using pydantic models does not silently start
+    logging no usage at all.
+    """
+    if value is None:
+        return None
+    candidate: object = value
+    if not isinstance(value, dict):
+        dump = getattr(value, "model_dump", None)
+        candidate = dump() if callable(dump) else getattr(value, "__dict__", None)
+    if not isinstance(candidate, dict):
+        return None
+    return cast("dict[str, object]", json.loads(json.dumps(candidate, default=str)))
+
+
+def completion_result_from_response(response: object) -> CompletionResult:
+    """Build one completion result from an OpenRouter SDK response."""
+    choices = getattr(response, "choices", None) or []
+    choice = choices[0] if choices else None
+    message = getattr(choice, "message", None)
+    return CompletionResult(
+        text=extract_response_text(response),
+        finish_reason=getattr(choice, "finish_reason", None),
+        refusal=getattr(message, "refusal", None),
+        usage=as_plain_dict(getattr(response, "usage", None)),
+        response_id=getattr(response, "id", None),
+        served_model=getattr(response, "model", None),
+    )
+
+
+def completion_result_from_batch_line(line: dict[str, object]) -> CompletionResult:
+    """Build one completion result from an OpenAI Batch output JSONL line.
+
+    The batch route reaches OpenAI directly rather than through OpenRouter, so
+    the usage block carries token counts but no `cost`; spend has to be derived
+    from the counts. A filtered response arrives here as a normal `200` with a
+    body, so it never reaches the infrastructure-error path and today is
+    indistinguishable from ordinary bad output (#135).
+    """
+    text = extract_batch_response_text(line)
+    response = cast(dict[str, object], line.get("response") or {})
+    body = cast(dict[str, object], response.get("body") or {})
+    choices = cast(list[dict[str, object]], body.get("choices") or [])
+    choice = choices[0] if choices else {}
+    message = cast(dict[str, object], choice.get("message") or {})
+    refusal = message.get("refusal")
+    finish_reason = choice.get("finish_reason")
+    return CompletionResult(
+        text=text,
+        finish_reason=finish_reason if isinstance(finish_reason, str) else None,
+        refusal=refusal if isinstance(refusal, str) else None,
+        usage=as_plain_dict(body.get("usage")),
+        response_id=body.get("id") if isinstance(body.get("id"), str) else None,
+        served_model=body.get("model") if isinstance(body.get("model"), str) else None,
+    )
+
+
 def collapse_whitespace(value: str) -> str:
     """Collapse all whitespace in a string for comparison."""
     return re.sub(r"\s+", "", value)
+
+
+def normalize_span_whitespace(value: str) -> str:
+    """Collapse whitespace runs in a span promoted to a canonical text field.
+
+    Filings wrap instrument names across lines, so a verbatim span can carry a
+    newline, tab, or non-breaking space. Canonical fields are display and
+    comparison surfaces; the verbatim text stays in the `*_json` payloads, where
+    the character offsets make it meaningful as provenance.
+    """
+    return re.sub(r"\s+", " ", value).strip()
 
 
 def single_value_evidence_tag_ids(value: object) -> object:
@@ -1762,7 +2043,10 @@ def validate_standardized_single_value_cardinality(
     evidence_texts = [
         str(tag_details[tag_id]["text"])
         for tag_id in evidence
-        if isinstance(tag_id, str) and tag_id in tag_details
+        if isinstance(tag_id, str)
+        and tag_id in tag_details
+        # Name spans carrying an embedded maturity are not comparable date mentions.
+        and tag_details[tag_id]["type"] not in MATURITY_EVIDENCE_TAG_TYPES
     ]
     if property_name == "amount":
         normalized_values = {
@@ -1783,6 +2067,103 @@ def validate_standardized_single_value_cardinality(
             f"Entry {index}: '{property_name}' contains multiple distinct normalized "
             "values. Split this into separate debt instrument objects instead of "
             "combining them."
+        )
+    ]
+
+
+def validate_party_property(
+    *,
+    index: int,
+    property_name: str,
+    obj: dict[str, Any],
+    tag_details: dict[str, dict[str, object]],
+) -> list[str]:
+    """Validate one party property against the annotated cluster shape."""
+    if property_name not in obj:
+        return []
+    value = obj[property_name]
+    annotation_key, allowed_annotations, _default = PARTY_PROPERTY_ANNOTATIONS[
+        property_name
+    ]
+    expected_annotations = ", ".join(sorted(allowed_annotations))
+    if not isinstance(value, list):
+        return [
+            f"Entry {index}: '{property_name}' must be a list of cluster objects "
+            f'shaped like {{"tag_ids": ["tag-..."], "{annotation_key}": "..."}}.'
+        ]
+    failures: list[str] = []
+    for cluster_index, cluster in enumerate(value):
+        location = f"Entry {index}: '{property_name}'[{cluster_index}]"
+        if not isinstance(cluster, dict):
+            failures.append(
+                f"{location} must be an object with 'tag_ids' and "
+                f"'{annotation_key}' keys."
+            )
+            continue
+        annotation = cluster.get(annotation_key)
+        if annotation not in allowed_annotations:
+            failures.append(
+                f"{location} '{annotation_key}' must be one of {expected_annotations}."
+            )
+        tag_ids = cluster.get("tag_ids")
+        if not isinstance(tag_ids, list):
+            failures.append(f"{location} 'tag_ids' must be a list of tag IDs.")
+            continue
+        if not all(isinstance(tag_id, str) for tag_id in tag_ids):
+            failures.append(f"{location} 'tag_ids' must contain string tag IDs only.")
+            continue
+        for tag_id in tag_ids:
+            tag_info = tag_details.get(tag_id)
+            if tag_info is None:
+                failures.append(f"{location} contains unknown tag ID {tag_id}.")
+                continue
+            if tag_info["type"] not in LENDER_TAG_TYPES:
+                failures.append(
+                    f"{location} tag {tag_id} must be person or organization."
+                )
+    return failures
+
+
+def validate_lenders_known_incomplete(*, index: int, obj: dict[str, Any]) -> list[str]:
+    """Validate the optional lenders_known_incomplete flag."""
+    if "lenders_known_incomplete" not in obj:
+        return []
+    if isinstance(obj["lenders_known_incomplete"], bool):
+        return []
+    return [f"Entry {index}: 'lenders_known_incomplete' must be true or false."]
+
+
+def validate_amount_is_not_rate(
+    *,
+    index: int,
+    value: object,
+    tag_details: dict[str, dict[str, object]],
+) -> list[str]:
+    """Reject an amount whose evidence only describes a rate, margin, or fee."""
+    if not isinstance(value, dict):
+        return []
+    evidence = value.get("evidence")
+    if not isinstance(evidence, list):
+        return []
+    # The same normalization `canonical_value` applies, so the validator and
+    # `standardized_amount_payload` judge one text. Stripping whitespace instead
+    # hid the `basis point` marker and both amount guards from the predicate
+    # (#102), and it also made the quoted text in the retry message unreadable.
+    evidence_texts = [
+        normalize_span_whitespace(str(tag_details[tag_id]["text"]))
+        for tag_id in evidence
+        if isinstance(tag_id, str) and tag_id in tag_details
+    ]
+    if not evidence_texts or not all(
+        is_rate_like_amount_text(text) for text in evidence_texts
+    ):
+        return []
+    quoted = ", ".join(f"'{text}'" for text in evidence_texts)
+    return [
+        (
+            f"Entry {index}: 'amount' evidence {quoted} describes an interest rate, "
+            "margin, or fee rather than a principal or commitment amount. Cite the "
+            "principal or commitment amount instead, or omit 'amount'."
         )
     ]
 
@@ -1828,6 +2209,7 @@ def debt_instrument_mention_id_for(
         "end_date_json": normalize_json_text(mention_row.get("end_date_json")),
         "item_id": item_id,
         "lenders_json": normalize_json_text(mention_row.get("lenders_json")),
+        "lenders_known_incomplete": mention_row.get("lenders_known_incomplete"),
         "name_json": normalize_json_text(mention_row.get("name_json")),
         "name": mention_row.get("name"),
         "other_interested_parties_json": normalize_json_text(
@@ -1851,21 +2233,51 @@ def normalize_json_text(value: object) -> str:
     return json.dumps(parsed, sort_keys=True, separators=(",", ":"))
 
 
+def cluster_span_texts(
+    tag_ids: object,
+    tag_details: dict[str, dict[str, object]],
+) -> list[str]:
+    """Return the normalized texts of one coreference cluster's spans."""
+    if not isinstance(tag_ids, list) or not tag_ids:
+        return []
+    values = [
+        normalize_span_whitespace(str(tag_details[tag_id]["text"]))
+        for tag_id in tag_ids
+        if isinstance(tag_id, str) and tag_id in tag_details
+    ]
+    return [value for value in values if value]
+
+
 def canonical_value(
     tag_ids: object,
     tag_details: dict[str, dict[str, object]],
 ) -> str | None:
     """Return the longest textual member of one coreference cluster."""
-    if not isinstance(tag_ids, list) or not tag_ids:
-        return None
-    values = [
-        str(tag_details[tag_id]["text"])
-        for tag_id in tag_ids
-        if isinstance(tag_id, str) and tag_id in tag_details
-    ]
+    values = cluster_span_texts(tag_ids, tag_details)
     if not values:
         return None
     return max(values, key=len)
+
+
+def canonical_amount_value(
+    tag_ids: object,
+    tag_details: dict[str, dict[str, object]],
+) -> str | None:
+    """Return the amount cluster's canonical text, preferring a parseable span.
+
+    An amount cluster often pairs the figure with the label that names it, and
+    the label is the longer span: `['$2,000,000', 'Principal Amount']` resolved
+    to `Principal Amount`, which parses to nothing, so the amount published as
+    null (#120). The rate guard reads this same text, so judging it on the span
+    the parser actually reads keeps #102/#103 pointed at the right words.
+    """
+    values = cluster_span_texts(tag_ids, tag_details)
+    if not values:
+        return None
+    parseable = [
+        value for value in values if normalized_amount_from_text(value) is not None
+    ]
+    return max(parseable or values, key=len)
 
 
 def is_valid_iso_date(value: str) -> bool:
@@ -1898,11 +2310,50 @@ def supported_currency_codes() -> set[str]:
     return _SUPPORTED_CURRENCY_CODES
 
 
-def normalize_numeric_string(value: float) -> str:
-    """Return one deterministic numeric string."""
-    if value.is_integer():
-        return str(int(value))
-    return f"{value:.12f}".rstrip("0").rstrip(".")
+def normalize_numeric_string(value: Decimal) -> str:
+    """Return one deterministic numeric string.
+
+    Decimal rather than float: `float("372246148.11")` is not that number, and
+    `f"{value:.12f}"` renders the difference as `372246148.110000014305`. That
+    string is what the model's `normalized_amount` was compared against, so
+    every amount carrying cents failed the agreement check in
+    `standardized_amount_payload` and published as null (#119).
+    """
+    quantized = value.normalize()
+    if quantized == quantized.to_integral_value():
+        quantized = quantized.to_integral_value()
+    return f"{quantized:f}"
+
+
+def decimal_from_amount_string(value: str | None) -> Decimal | None:
+    """Return one amount string as a Decimal, or None when it is not numeric."""
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip().replace(",", "")
+    if not stripped:
+        return None
+    try:
+        parsed = Decimal(stripped)
+    except (InvalidOperation, ValueError):
+        return None
+    if not parsed.is_finite():
+        return None
+    return parsed
+
+
+def amounts_agree(model_amount: object, parsed_amount: str | None) -> bool:
+    """Return whether the model's amount is the same value the parser read.
+
+    Compared numerically, so the model reporting `500000.00` against a parsed
+    `500000` counts as agreement rather than losing the amount (#119).
+    """
+    if not isinstance(model_amount, str) or parsed_amount is None:
+        return False
+    model_value = decimal_from_amount_string(model_amount)
+    parsed_value = decimal_from_amount_string(parsed_amount)
+    if model_value is None or parsed_value is None:
+        return False
+    return model_value == parsed_value
 
 
 def normalized_amount_from_text(text: str | None) -> str | None:
@@ -1913,12 +2364,48 @@ def normalized_amount_from_text(text: str | None) -> str | None:
     match = re.search(r"\d+(?:\.\d+)?", lowered)
     if not match:
         return None
-    amount = float(match.group(0))
+    amount = decimal_from_amount_string(match.group(0))
+    if amount is None:
+        return None
     for word, multiplier in AMOUNT_MULTIPLIERS.items():
         if re.search(rf"\b{word}\b", lowered):
             amount *= multiplier
             break
     return normalize_numeric_string(amount)
+
+
+def normalized_amount_from_name(text: str | None) -> str | None:
+    """Parse a principal stated inside an instrument name into a numeric string.
+
+    `$183.36 million term loan` carries its own principal, and NER tags the whole
+    phrase as one `debt_instrument`, so there is no `amount` span to cite and the
+    amount was lost (#129). A name stating more than one figure names no single
+    principal, so it parses to None rather than to whichever comes first — the
+    same rule `normalized_maturity_from_text` applies to maturities (#104).
+    """
+    if not text:
+        return None
+    values = {
+        normalized_amount_from_text(match.group(0))
+        for match in NAME_EMBEDDED_AMOUNT_PATTERN.finditer(text)
+    }
+    values.discard(None)
+    if len(values) != 1:
+        return None
+    return values.pop()
+
+
+def currency_from_name(text: str | None) -> str | None:
+    """Return the currency of a principal stated inside an instrument name."""
+    if not text:
+        return None
+    matches = list(NAME_EMBEDDED_AMOUNT_PATTERN.finditer(text))
+    if len(matches) != 1:
+        return None
+    candidates = currency_candidates_from_text(matches[0].group(0))
+    if len(candidates) != 1:
+        return None
+    return candidates.pop()
 
 
 def currency_candidates_from_text(text: str | None) -> set[str]:
@@ -1927,7 +2414,16 @@ def currency_candidates_from_text(text: str | None) -> set[str]:
         return set()
     lowered = text.lower()
     candidates: set[str] = set()
-    if "$" in text or "u.s. dollar" in lowered or "us dollar" in lowered:
+    # A qualified dollar sign is a different currency. Reading `C$300 million`
+    # as USD both mislabelled the amount and kept CAD out of the candidate set,
+    # so the model's correct currency was rejected and published as null (#121).
+    qualified = QUALIFIED_DOLLAR_PATTERN.findall(text)
+    candidates.update(QUALIFIED_DOLLAR_CODES[prefix.upper()] for prefix in qualified)
+    if (
+        text.count("$") > len(qualified)
+        or "u.s. dollar" in lowered
+        or "us dollar" in lowered
+    ):
         candidates.add("USD")
     if "€" in text or " euro" in lowered:
         candidates.add("EUR")
@@ -1941,43 +2437,163 @@ def currency_candidates_from_text(text: str | None) -> set[str]:
     return candidates
 
 
+def is_rate_like_amount_text(text: str | None) -> bool:
+    """Return whether one amount evidence string reads as a rate, margin, or fee.
+
+    Every number in the span has to carry a rate marker. A marker appearing
+    somewhere is not enough: `500,000,000 (100% of principal)` states a
+    principal and then a percentage of it, and `normalized_amount_from_text`
+    reads the first number, so treating the whole span as a rate would discard a
+    real amount (#103).
+    """
+    if not text:
+        return False
+    lowered = text.lower()
+    if currency_candidates_from_text(text):
+        return False
+    if any(re.search(rf"\b{word}\b", lowered) for word in AMOUNT_MULTIPLIERS):
+        return False
+    values = list(AMOUNT_VALUE_PATTERN.finditer(text))
+    if not values:
+        return False
+    return all(RATE_SUFFIX_PATTERN.match(text, value.end()) for value in values)
+
+
 def normalized_date_from_text(text: str | None) -> str | None:
-    """Parse one date mention into ISO format."""
+    """Parse one date mention into ISO format.
+
+    The parser has to read every spelling a filing uses, because
+    `standardized_date_payload` keeps the model's date only when it matches what
+    the parser reads. A format the parser cannot read discards a date the model
+    got right: `M/D/YYYY` alone cost 67 start dates and 67 end dates on one
+    held-out window, all of them from tabular schedules (#133).
+
+    Two-digit years stay unparsed. `7/28/26` cannot be resolved without guessing
+    a century, and a null is better than a wrong decade.
+    """
     if not text:
         return None
     stripped = text.strip()
-    if ISO_DATE_PATTERN.fullmatch(stripped) and is_valid_iso_date(stripped):
-        return stripped
-    match = re.search(
-        r"(?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2}),\s+(?P<year>\d{4})",
-        stripped,
-    )
-    if not match:
+    iso = LENIENT_ISO_DATE_PATTERN.fullmatch(stripped)
+    if iso is not None:
+        candidate = iso_date_from_numeric_parts(
+            iso.group("year"), iso.group("month"), iso.group("day")
+        )
+        if candidate is not None:
+            return candidate
+    numeric = NUMERIC_DATE_PATTERN.search(stripped)
+    if numeric is not None:
+        candidate = iso_date_from_numeric_parts(
+            numeric.group("year"), numeric.group("month"), numeric.group("day")
+        )
+        if candidate is not None:
+            return candidate
+    for pattern in (MONTH_FIRST_DATE_PATTERN, DAY_FIRST_DATE_PATTERN):
+        match = pattern.search(stripped)
+        if match is None:
+            continue
+        candidate = iso_date_from_parts(
+            match.group("year"), match.group("month"), match.group("day")
+        )
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def dates_agree(model_date: object, parsed_date: str | None) -> bool:
+    """Return whether the model's date is the same day the parser read.
+
+    Compared as dates rather than as strings, so a model writing `2026-7-28`
+    against a parsed `2026-07-28` keeps its value (#133, same shape as #119).
+    """
+    if not isinstance(model_date, str) or parsed_date is None:
+        return False
+    normalized = normalized_date_from_text(model_date)
+    return normalized is not None and normalized == parsed_date
+
+
+def normalized_maturity_from_text(text: str | None) -> str | None:
+    """Parse one maturity phrase such as 'notes due 2028' into ISO format.
+
+    A phrase stating more than one maturity names no single instrument, so it
+    parses to None rather than to whichever maturity comes first.
+    """
+    if not text:
         return None
-    month = MONTH_MAP.get(match.group("month").lower())
+    full_dates: set[str] = set()
+    years: set[str] = set()
+    for match in MATURITY_FULL_DATE_PATTERN.finditer(text):
+        normalized = iso_date_from_parts(
+            match.group("year"), match.group("month"), match.group("day")
+        )
+        if normalized is not None:
+            full_dates.add(normalized)
+        years.update(FOUR_DIGIT_YEAR_PATTERN.findall(match.group("more")))
+    for match in MATURITY_YEAR_PATTERN.finditer(text):
+        years.update(FOUR_DIGIT_YEAR_PATTERN.findall(match.group("years")))
+    if full_dates:
+        # A bare alternate year alongside a full date states a second maturity too.
+        if len(full_dates) != 1 or years - {value[:4] for value in full_dates}:
+            return None
+        return full_dates.pop()
+    if len(years) != 1:
+        return None
+    return f"{years.pop()}{YEAR_ONLY_MATURITY_SUFFIX}"
+
+
+def iso_date_from_parts(year: str, month_name: str, day: str) -> str | None:
+    """Return one ISO date built from year, month name, and day parts."""
+    month = MONTH_MAP.get(month_name.lower())
     if month is None:
         return None
-    normalized = f"{match.group('year')}-{month}-{int(match.group('day')):02d}"
+    normalized = f"{year}-{month}-{int(day):02d}"
+    return normalized if is_valid_iso_date(normalized) else None
+
+
+def iso_date_from_numeric_parts(year: str, month: str, day: str) -> str | None:
+    """Return one ISO date built from numeric month-first parts.
+
+    Month-first, as SEC filings write it. An out-of-range month is rejected
+    rather than swapped with the day: a span that means `28/07/2026` is more
+    likely a format this parser should not be guessing at than a transposition.
+    """
+    normalized = f"{year}-{int(month):02d}-{int(day):02d}"
     return normalized if is_valid_iso_date(normalized) else None
 
 
 def standardized_amount_payload(
     value: object,
     tag_details: dict[str, dict[str, object]],
+    *,
+    name_text: str | None = None,
 ) -> dict[str, object]:
     """Return evidence payload plus validated normalized amount fields."""
     evidence_tag_ids = single_value_evidence_tag_ids(value)
     payload = cluster_payload(evidence_tag_ids, tag_details)
-    evidence_text = canonical_value(evidence_tag_ids, tag_details)
+    evidence_text = canonical_amount_value(evidence_tag_ids, tag_details)
     parsed_amount = normalized_amount_from_text(evidence_text)
     parsed_currency_candidates = currency_candidates_from_text(evidence_text)
+    if parsed_amount is None:
+        # A principal stated inside the name has no `amount` span to cite, so the
+        # name is the only evidence there is (#129).
+        name_amount = normalized_amount_from_name(name_text)
+        if name_amount is not None:
+            parsed_amount = name_amount
+            name_currency = currency_from_name(name_text)
+            parsed_currency_candidates = (
+                {name_currency} if name_currency else parsed_currency_candidates
+            )
     model_amount = value.get("normalized_amount") if isinstance(value, dict) else None
     model_currency = value.get("currency") if isinstance(value, dict) else None
+    if is_rate_like_amount_text(evidence_text):
+        # Rates, margins, and fees are not principal amounts.
+        parsed_amount = None
+        parsed_currency_candidates = set()
 
+    # The parser's own string is published, so a model reporting the same value
+    # with different formatting keeps its amount rather than losing it (#119).
     payload["normalized_amount"] = (
-        model_amount
-        if isinstance(model_amount, str) and parsed_amount == model_amount
-        else None
+        parsed_amount if amounts_agree(model_amount, parsed_amount) else None
     )
     payload["currency"] = (
         model_currency
@@ -1992,18 +2608,41 @@ def standardized_amount_payload(
 def standardized_date_payload(
     value: object,
     tag_details: dict[str, dict[str, object]],
+    *,
+    allow_maturity_phrase: bool = False,
 ) -> dict[str, object]:
     """Return evidence payload plus validated normalized date field."""
     evidence_tag_ids = single_value_evidence_tag_ids(value)
     payload = cluster_payload(evidence_tag_ids, tag_details)
     evidence_text = canonical_value(evidence_tag_ids, tag_details)
     parsed_date = normalized_date_from_text(evidence_text)
+    if parsed_date is None and allow_maturity_phrase:
+        parsed_date = normalized_maturity_from_text(evidence_text)
     model_date = value.get("normalized_date") if isinstance(value, dict) else None
+    # The parser's own string is published, so a model writing the same day in a
+    # different shape keeps its value rather than losing it (#133).
     payload["normalized_date"] = (
-        model_date
-        if isinstance(model_date, str) and model_date == parsed_date
-        else None
+        parsed_date if dates_agree(model_date, parsed_date) else None
     )
+    return payload
+
+
+def standardized_end_date_payload(
+    value: object,
+    tag_details: dict[str, dict[str, object]],
+    *,
+    name_text: str | None,
+) -> dict[str, object]:
+    """Return the end-date payload, falling back to the maturity in the name."""
+    payload = standardized_date_payload(
+        value,
+        tag_details,
+        allow_maturity_phrase=True,
+    )
+    if payload["normalized_date"] is None:
+        derived_date = normalized_maturity_from_text(name_text)
+        if derived_date is not None:
+            payload["normalized_date"] = derived_date
     return payload
 
 
@@ -2031,14 +2670,68 @@ def cluster_payload(
     }
 
 
-def cluster_payload_list(
+def annotated_party_clusters(
     clusters: object,
     tag_details: dict[str, dict[str, object]],
-) -> list[dict[str, object]]:
-    """Return rich details for a list of clusters."""
+    *,
+    property_name: str,
+) -> list[tuple[dict[str, object], str]]:
+    """Return (cluster payload, annotation) pairs for one party property.
+
+    Each payload keeps the persisted cluster shape. The annotation is the model's
+    extraction-time label, used only to decide which clusters to persist.
+    """
+    annotation_key, allowed_annotations, default_annotation = (
+        PARTY_PROPERTY_ANNOTATIONS[property_name]
+    )
     if not isinstance(clusters, list):
         return []
-    return [cluster_payload(cluster, tag_details) for cluster in clusters]
+    pairs: list[tuple[dict[str, object], str]] = []
+    for cluster in clusters:
+        if isinstance(cluster, dict):
+            tag_ids = cluster.get("tag_ids")
+            annotation = cluster.get(annotation_key)
+        else:
+            # Tolerate the legacy bare tag-id list shape when replaying old responses.
+            tag_ids = cluster
+            annotation = None
+        payload = cluster_payload(tag_ids, tag_details)
+        if not payload["tag_ids"]:
+            continue
+        resolved = (
+            str(annotation) if annotation in allowed_annotations else default_annotation
+        )
+        pairs.append((payload, resolved))
+    return pairs
+
+
+def lender_payloads_and_incompleteness(
+    obj: dict[str, Any],
+    tag_details: dict[str, dict[str, object]],
+) -> tuple[list[dict[str, object]], bool]:
+    """Return named lender clusters plus whether lenders are known to be missing."""
+    pairs = annotated_party_clusters(
+        obj.get("lenders", []),
+        tag_details,
+        property_name="lenders",
+    )
+    named = [payload for payload, kind in pairs if kind != COLLECTIVE_LENDER_KIND]
+    has_collective = len(named) < len(pairs)
+    declared_incomplete = obj.get("lenders_known_incomplete") is True
+    return named, has_collective or declared_incomplete
+
+
+def disclosed_party_payloads(
+    obj: dict[str, Any],
+    tag_details: dict[str, dict[str, object]],
+) -> list[dict[str, object]]:
+    """Return other-interested-party clusters, excluding the borrower itself."""
+    pairs = annotated_party_clusters(
+        obj.get("other_interested_parties", []),
+        tag_details,
+        property_name="other_interested_parties",
+    )
+    return [payload for payload, role in pairs if role != BORROWER_PARTY_ROLE]
 
 
 def relation_prompt_xml(row_state: ExtractionRowState) -> str:
@@ -2057,7 +2750,42 @@ def relation_prompt_xml(row_state: ExtractionRowState) -> str:
             else:
                 tag_to_raw_id[key] = f"{tag_to_raw_id[key]}||{raw_id}"
     body = render_relation_body(root, tag_to_raw_id)
-    return f"<body>{body}</body>"
+    return f"{relation_instrument_manifest(row_state)}<body>{body}</body>"
+
+
+def relation_instrument_manifest(row_state: ExtractionRowState) -> str:
+    """List each instrument id with the terms already extracted for it.
+
+    Two objects built from one name span render as the same tagged text twice,
+    once per instrument id, so `Third Amended and Restated Loan Agreement` and
+    its predecessor are indistinguishable in the body. The amount and dates that
+    tell them apart live in the `instrument_ie` output, which this stage never
+    saw, and it was being asked to decide which one carries "the newer terms"
+    from the ids alone. Every inverted lineage pair on the held-out run was a
+    same-name pair (#138).
+    """
+    lines: list[str] = []
+    for mention in row_state.debt_instrument_mentions:
+        attributes = [f'id="{escape_xml_attribute(str(mention["raw_id"]))}"']
+        for field_name in ("name", "amount", "start_date", "end_date"):
+            value = coerce_dataset_text(mention.get(field_name))
+            if value is not None:
+                attributes.append(f'{field_name}="{escape_xml_attribute(value)}"')
+        lines.append(f"  <instrument {' '.join(attributes)}/>")
+    if not lines:
+        return ""
+    joined = "\n".join(lines)
+    return f"<instruments>\n{joined}\n</instruments>\n"
+
+
+def escape_xml_attribute(value: str) -> str:
+    """Escape one string for use inside an XML attribute value."""
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
 
 
 def render_relation_body(root: ET.Element, tag_to_raw_id: dict[str, str]) -> str:
