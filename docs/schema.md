@@ -209,7 +209,7 @@ Columns:
 - `start_date_json`: JSON payload containing normalized start-date value plus extraction evidence.
 - `end_date_json`: JSON payload containing normalized end-date value plus extraction evidence. The maturity may come from the instrument name, such as `notes due 2028`, in which case the evidence list can be empty; year-only maturities normalize to `YYYY-12-31`.
 - `amount_json`: JSON payload containing normalized amount value plus extraction evidence.
-- `lenders_known_incomplete`: Boolean flag that is true when the mention shows the document referred to lenders it did not name, such as `the other lenders party thereto`. A true value with an empty `lenders_json` means no lender was disclosed.
+- `lenders_known_incomplete`: Boolean flag that is true when the mention shows the document referred to lenders it did not name, such as `the other lenders party thereto`. A true value with an empty `lenders_json` means the instrument has counterparties the document never named — the normal case for an instrument placed into the public market or sold to unnamed holders through underwriters, where the underwriters are recorded in `other_interested_parties_json` instead. A false value with an empty `lenders_json` means the document named no counterparty and signalled none, so there is nothing to disclose rather than something undisclosed.
 
 Primary key: `debt_instrument_mention_id`
 
