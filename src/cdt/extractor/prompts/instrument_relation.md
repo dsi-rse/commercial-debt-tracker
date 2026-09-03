@@ -14,11 +14,13 @@ Use `amendment_of` only when the two mention clusters still describe the same de
 Do not use `amendment_of` for a new note issued in exchange for an old note if the old note is extinguished.
 Do not use `amendment_of` for debt retired with the proceeds of another debt issuance.
 Use `retired_of` when the text says the older debt ceased to exist because it was retired, repaid, cancelled, exchanged, or satisfied.
+Use `retired_of` also when the text says the older debt will be redeemed, repaid, or retired with the proceeds of the `from` instrument. Proceeds-financed retirement counts, whether or not the new instrument structurally replaces the old one.
 
 ## Examples
 - A commitment increase, maturity extension, amendment, or amendment and restatement filing that also describes the predecessor instrument: the mention cluster for the instrument as amended is `amendment_of` the predecessor's mention cluster. The cluster for the instrument as amended, carrying the newer terms, is always `from`; the predecessor, carrying the older terms, is always `to`.
 - Read "newer terms" off the figures the text gives, not off which id comes first. When a filing says commitments were reduced `from $100,000,000 to $50,000,000` and the maturity extended `from June 28, 2026 to June 23, 2031`, the id holding `$100,000,000` and `2026-06-28` is the predecessor and belongs in `to`; the id holding `$50,000,000` and `2031-06-23` is the instrument as amended and belongs in `from`.
 - A new facility that `refinances and replaces` an existing facility: the new facility is `retired_of` the replaced facility, not `amendment_of`, because the old facility ceased to exist.
+- New notes whose stated use of proceeds is to redeem the company's outstanding `5.25% Senior Notes due 2027`: the new notes are `retired_of` the 2027 notes, even though the new notes do not structurally replace them.
 
 ## Output Rules
 1. Return a JSON array of objects with exactly the keys `from`, `to`, and `type`.
