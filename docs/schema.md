@@ -203,7 +203,7 @@ Columns:
 - `amount`: Normalized principal or commitment amount when present.
 - `amendment_of`: `debt_instrument_mention_id` of the mention this row amends, when the extractor found that relation.
 - `split_of`: `debt_instrument_mention_id` of the mention this row splits from, when the extractor found that relation.
-- `retired_by`: `debt_instrument_mention_id` of the mention that retired this row's obligation, when the extractor found that relation. The pointer sits on the retired instrument's mention: proceeds-financed redemption counts (#142), so the target need not structurally replace this row.
+- `retired_by_json`: JSON array of `debt_instrument_mention_id`s of the mentions that retired this row's obligation, when the extractor found that relation. The pointer sits on the retired instrument's mention, and it is a list because one obligation may be retired jointly by several instruments (a dual-tranche offering funding one redemption). Proceeds-financed redemption counts (#142), so the targets need not structurally replace this row.
 - `lenders_json`: JSON array of lender or counterparty mention clusters with evidence text. Collective phrases such as `the other lenders party thereto` are excluded; `lenders_known_incomplete` records that they were present.
 - `other_interested_parties_json`: JSON array of additional related-party clusters with evidence text, excluding the filer or borrower itself.
 - `name_json`: JSON payload describing the evidence tags and surface text used to construct `name`.
@@ -236,7 +236,7 @@ Columns:
 - `seed_debt_instrument_mention_id`: First direct mention used as the representative seed for the instrument record.
 - `amendment_of_debt_instrument_id`: Parent instrument ID when this instrument is an amendment lineage child.
 - `split_of_debt_instrument_id`: Parent instrument ID when this instrument is a split lineage child.
-- `retired_by_debt_instrument_id`: ID of the instrument that retired this one, set on the retired instrument's own row. Unlike the two parent columns above, the pointer marks this row's obligation as ended, not as a lineage child.
+- `retired_by_debt_instrument_ids`: JSON array of IDs of the instruments that retired this one, set on the retired instrument's own row (null when none). Unlike the two parent columns above, the pointer marks this row's obligation as ended, not as a lineage child, and several retirers are legitimate rather than ambiguous, so all are kept.
 - `name`: Matcher-selected canonical instrument name derived from the instrument's direct mentions.
 - `start_date`: Matcher-selected canonical start date derived from the instrument's direct mentions.
 - `end_date`: Matcher-selected canonical end date derived from the instrument's direct mentions.

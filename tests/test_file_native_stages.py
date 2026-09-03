@@ -197,7 +197,7 @@ def build_mention_row(
         "end_date": None,
         "amount": amount,
         "amendment_of": None,
-        "retired_by": None,
+        "retired_by_json": "[]",
         "split_of": None,
         "lenders_json": lenders_json,
         "lenders_known_incomplete": lenders_known_incomplete,
@@ -668,7 +668,7 @@ def test_extract_pending_items_writes_mentions_and_audit(
                 "end_date": None,
                 "amount": "$100 million",
                 "amendment_of": None,
-                "retired_by": None,
+                "retired_by_json": "[]",
                 "split_of": None,
                 "lenders_json": "[]",
                 "lenders_known_incomplete": False,
@@ -732,7 +732,7 @@ def test_extract_pending_items_drains_all_partitions(
                 "end_date": None,
                 "amount": "$100 million",
                 "amendment_of": None,
-                "retired_by": None,
+                "retired_by_json": "[]",
                 "split_of": None,
                 "lenders_json": "[]",
                 "lenders_known_incomplete": True,
@@ -2127,7 +2127,7 @@ def test_instrument_relation_stage_accepts_retired_by() -> None:
     row_state.stage_responses["instrument_relation"] = response
     InstrumentRelationStage().postprocess(row_state)
 
-    assert row_state.debt_instrument_mentions[1]["retired_by"] == "m-1"
+    assert row_state.debt_instrument_mentions[1]["retired_by_json"] == '["m-1"]'
 
 
 def test_match_pending_mentions_writes_match_datasets(tmp_path: Path) -> None:
@@ -2498,7 +2498,7 @@ def test_match_tables_retired_by_keeps_separate_clusters_and_ends_the_instrument
                     lenders_json='[{"mentions": [{"text": "Acme Bank"}]}]',
                 ),
                 "end_date": "2024-03-01",
-                "retired_by": "m-1",
+                "retired_by_json": '["m-1"]',
             },
         ]
     )
@@ -2519,7 +2519,7 @@ def test_match_tables_retired_by_keeps_separate_clusters_and_ends_the_instrument
         row["debt_instrument_id"]: row
         for row in tables["debt_instrument"].to_dict("records")
     }
-    assert instruments["m-2"]["retired_by_debt_instrument_id"] == "m-1"
+    assert instruments["m-2"]["retired_by_debt_instrument_ids"] == '["m-1"]'
     # No cross-row propagation: the retirement filing's mention sits in the
     # retired instrument's own cluster, so its end date is already there.
     assert instruments["m-2"]["end_date"] == "2024-03-01"
@@ -2569,7 +2569,7 @@ def test_match_tables_publishes_two_kinds_of_lineage_for_one_instrument() -> Non
                     amount="$150 million",
                 ),
                 "split_of": "m-tranche",
-                "retired_by": "m-refi",
+                "retired_by_json": '["m-refi"]',
             },
             build_mention_row(
                 mention_id="m-refi",
@@ -2592,8 +2592,65 @@ def test_match_tables_publishes_two_kinds_of_lineage_for_one_instrument() -> Non
     }
     row = instruments["m-incremental"]
     assert row["split_of_debt_instrument_id"] == "m-tranche"
-    assert row["retired_by_debt_instrument_id"] == "m-refi"
+    assert row["retired_by_debt_instrument_ids"] == '["m-refi"]'
     assert row["amendment_of_debt_instrument_id"] is None
+
+
+def test_match_tables_keeps_every_joint_retirer() -> None:
+    """Several instruments jointly retiring one obligation all publish.
+
+    Venture Global's two new series ($1.125B due 2034 and due 2036) jointly
+    redeem the 8.125% notes due 2028. Two retirers is a legitimate state of the
+    world, not extraction ambiguity, so the retired row keeps both -- unlike the
+    single-parent amendment/split columns, which clear on ambiguity (#130).
+    """
+    mentions = pd.DataFrame(
+        [
+            {
+                **build_mention_row(
+                    mention_id="m-old",
+                    item_id="item-1",
+                    accession_number="0001",
+                    cik="320193",
+                    date="2026-06-11",
+                    name="8.125% senior secured notes due 2028",
+                    start_date="2021-06-11",
+                    amount="$1,250 million",
+                ),
+                "retired_by_json": '["m-2034", "m-2036"]',
+            },
+            build_mention_row(
+                mention_id="m-2034",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2026-06-11",
+                name="6.375% senior secured notes due 2034",
+                start_date="2026-06-11",
+                amount="$1,125 million",
+            ),
+            build_mention_row(
+                mention_id="m-2036",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2026-06-11",
+                name="6.625% senior secured notes due 2036",
+                start_date="2026-06-11",
+                amount="$1,125 million",
+            ),
+        ]
+    )
+
+    tables = match_tables(mentions)
+
+    instruments = {
+        row["debt_instrument_id"]: row
+        for row in tables["debt_instrument"].to_dict("records")
+    }
+    assert instruments["m-old"]["retired_by_debt_instrument_ids"] == (
+        '["m-2034", "m-2036"]'
+    )
 
 
 def test_match_tables_drops_only_the_ambiguous_relation_kind() -> None:
@@ -2642,7 +2699,7 @@ def test_match_tables_drops_only_the_ambiguous_relation_kind() -> None:
                     amount="$400 million",
                 ),
                 "amendment_of": "m-a",
-                "retired_by": "m-notes",
+                "retired_by_json": '["m-notes"]',
             },
             {
                 **build_mention_row(
@@ -2674,7 +2731,7 @@ def test_match_tables_drops_only_the_ambiguous_relation_kind() -> None:
         r["debt_instrument_id"]: r for r in tables["debt_instrument"].to_dict("records")
     }[assignment["m-1"]]
     assert row["amendment_of_debt_instrument_id"] is None
-    assert row["retired_by_debt_instrument_id"] == "m-notes"
+    assert row["retired_by_debt_instrument_ids"] == '["m-notes"]'
 
 
 def test_match_tables_keeps_same_day_siblings_apart() -> None:
@@ -2848,7 +2905,7 @@ def test_extract_failures_are_recorded_and_cleared(
                 "end_date": None,
                 "amount": None,
                 "amendment_of": None,
-                "retired_by": None,
+                "retired_by_json": "[]",
                 "split_of": None,
                 "lenders_json": "[]",
                 "other_interested_parties_json": "[]",

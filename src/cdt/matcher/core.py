@@ -71,7 +71,7 @@ DEBT_INSTRUMENT_COLUMNS = [
     "company_name",
     "seed_debt_instrument_mention_id",
     "amendment_of_debt_instrument_id",
-    "retired_by_debt_instrument_id",
+    "retired_by_debt_instrument_ids",
     "split_of_debt_instrument_id",
     "name",
     "start_date",
@@ -136,7 +136,7 @@ class PreparedMention:
     end_date: str | None
     amount: str | None
     amendment_of: str | None
-    retired_by: str | None
+    retired_by: tuple[str, ...]
     split_of: str | None
     lenders_json: str
     lenders_known_incomplete: bool
@@ -180,7 +180,7 @@ class ClusterProfile:
             self.normalized_name_fingerprints.add(mention.normalized_name_fingerprint)
         if mention.lender_signature:
             self.lender_signatures.add(mention.lender_signature)
-        for target in (mention.amendment_of, mention.retired_by, mention.split_of):
+        for target in (mention.amendment_of, *mention.retired_by, mention.split_of):
             if target:
                 self.relation_target_ids.add(target)
 
@@ -695,7 +695,7 @@ def score_candidates_for_mention(
             continue
         if mention.amendment_of and mention.amendment_of in profile.member_ids:
             continue
-        if mention.retired_by and mention.retired_by in profile.member_ids:
+        if any(target in profile.member_ids for target in mention.retired_by):
             continue
         if mention.split_of and mention.split_of in profile.member_ids:
             continue
@@ -976,10 +976,10 @@ def derive_parent_links(
         if existing_amendment:
             amendment_parents.add(existing_amendment)
         existing_retired = coerce_optional_text(
-            existing_row.get("retired_by_debt_instrument_id")
+            existing_row.get("retired_by_debt_instrument_ids")
         )
         if existing_retired:
-            retired_parents.add(existing_retired)
+            retired_parents.update(json.loads(existing_retired))
         existing_split = coerce_optional_text(
             existing_row.get("split_of_debt_instrument_id")
         )
@@ -994,32 +994,35 @@ def derive_parent_links(
                 and mention_to_instrument[mention.amendment_of] != debt_instrument_id
             ):
                 amendment_parents.add(mention_to_instrument[mention.amendment_of])
-            if (
-                mention.retired_by in mention_to_instrument
-                and mention_to_instrument[mention.retired_by] != debt_instrument_id
-            ):
-                retired_parents.add(mention_to_instrument[mention.retired_by])
+            for retirer in mention.retired_by:
+                if (
+                    retirer in mention_to_instrument
+                    and mention_to_instrument[retirer] != debt_instrument_id
+                ):
+                    retired_parents.add(mention_to_instrument[retirer])
             if (
                 mention.split_of in mention_to_instrument
                 and mention_to_instrument[mention.split_of] != debt_instrument_id
             ):
                 split_parents.add(mention_to_instrument[mention.split_of])
-        # Ambiguity within one relation kind is unresolvable — there is no way to
-        # choose between two amendment parents — so that kind publishes nothing.
-        # Each kind is judged on its own: the three columns are independent, and
-        # an instrument that splits from one predecessor and is later retired by
-        # a successor has a place to record both. Nulling every column whenever a
+        # Ambiguity within one parent-pointer kind is unresolvable — there is no
+        # way to choose between two amendment parents — so that kind publishes
+        # nothing. Each kind is judged on its own: the columns are independent,
+        # and an instrument that splits from one predecessor and is later
+        # retired has a place to record both. Nulling every column whenever a
         # second kind appeared discarded lineage that was individually
-        # unambiguous (#130).
+        # unambiguous (#130). Retirers are exempt: several instruments jointly
+        # retiring one obligation is a legitimate state of the world, so the
+        # column is a list and keeps them all.
         if len(amendment_parents) > 1:
             amendment_parents.clear()
-        if len(retired_parents) > 1:
-            retired_parents.clear()
         if len(split_parents) > 1:
             split_parents.clear()
         parent_links[debt_instrument_id] = {
             "amendment_of_debt_instrument_id": next(iter(amendment_parents), None),
-            "retired_by_debt_instrument_id": next(iter(retired_parents), None),
+            "retired_by_debt_instrument_ids": (
+                json.dumps(sorted(retired_parents)) if retired_parents else None
+            ),
             "split_of_debt_instrument_id": next(iter(split_parents), None),
         }
     return parent_links
@@ -1120,9 +1123,9 @@ def build_debt_instrument_rows(
                 "amendment_of_debt_instrument_id": parent_links.get(
                     debt_instrument_id, {}
                 ).get("amendment_of_debt_instrument_id"),
-                "retired_by_debt_instrument_id": parent_links.get(
+                "retired_by_debt_instrument_ids": parent_links.get(
                     debt_instrument_id, {}
-                ).get("retired_by_debt_instrument_id"),
+                ).get("retired_by_debt_instrument_ids"),
                 "split_of_debt_instrument_id": parent_links.get(
                     debt_instrument_id, {}
                 ).get("split_of_debt_instrument_id"),
@@ -1238,7 +1241,7 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
         end_date=coerce_optional_text(row.get("end_date")),
         amount=coerce_optional_text(row.get("amount")),
         amendment_of=coerce_optional_text(row.get("amendment_of")),
-        retired_by=coerce_optional_text(row.get("retired_by")),
+        retired_by=tuple(json.loads(str(row.get("retired_by_json") or "[]"))),
         split_of=coerce_optional_text(row.get("split_of")),
         lenders_json=str(row.get("lenders_json") or "[]"),
         lenders_known_incomplete=coerce_flag(row.get("lenders_known_incomplete")),

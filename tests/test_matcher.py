@@ -27,7 +27,7 @@ def mention_row(**overrides: object) -> dict[str, object]:
         "end_date": "2028-06-01",
         "amount": "500000000",
         "amendment_of": None,
-        "retired_by": None,
+        "retired_by_json": "[]",
         "split_of": None,
         "lenders_json": "[]",
         "lenders_known_incomplete": False,
@@ -442,7 +442,7 @@ def test_relation_target_cannot_join_declaring_cluster() -> None:
             name="6.375% Senior Notes due 2025",
             amount="38400000",
             start_date="2010-05-11",
-            retired_by="mention-new",
+            retired_by_json='["mention-new"]',
         )
     )
     new_notes = prepare_mention(
@@ -469,7 +469,7 @@ def test_declaring_mention_cannot_join_target_cluster() -> None:
             name="6.375% Senior Notes due 2025",
             amount="38400000",
             start_date="2010-05-11",
-            retired_by="mention-new",
+            retired_by_json='["mention-new"]',
         )
     )
     assert score(old_notes, profile_from(new_notes)) == []

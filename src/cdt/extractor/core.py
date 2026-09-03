@@ -230,7 +230,7 @@ DEBT_INSTRUMENT_MENTION_COLUMNS = [
     "end_date",
     "amount",
     "amendment_of",
-    "retired_by",
+    "retired_by_json",
     "split_of",
     "lenders_json",
     "other_interested_parties_json",
@@ -759,7 +759,7 @@ class InstrumentIEStage:
                 "end_date": end_date_payload["normalized_date"],
                 "amount": amount_payload["normalized_amount"],
                 "amendment_of": None,
-                "retired_by": None,
+                "retired_by_json": "[]",
                 "split_of": None,
                 "lenders_json": json.dumps(lender_clusters, sort_keys=True),
                 "lenders_known_incomplete": lenders_known_incomplete,
@@ -926,7 +926,17 @@ class InstrumentRelationStage:
             mention = by_raw_id.get(source_id)
             if mention is None:
                 continue
-            mention[str(relation["type"])] = raw_to_global.get(target_id)
+            target = raw_to_global.get(target_id)
+            if str(relation["type"]) == "retired_by":
+                # A list, not a scalar: one obligation may be retired jointly by
+                # several instruments (a dual-tranche offering funding one
+                # redemption), and a scalar overwrote all but the last edge.
+                retirers = json.loads(str(mention.get("retired_by_json") or "[]"))
+                if target and target not in retirers:
+                    retirers.append(target)
+                mention["retired_by_json"] = json.dumps(retirers)
+            else:
+                mention[str(relation["type"])] = target
 
     def early_stop(self, row_state: ExtractionRowState) -> bool:
         return False
