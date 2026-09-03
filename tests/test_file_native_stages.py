@@ -2907,12 +2907,15 @@ def test_match_tables_drops_only_the_ambiguous_relation_kind() -> None:
                 "retired_by_json": '["m-notes"]',
             },
             {
+                # A separate filing's mention of the same facility: same keys
+                # merge cross-item (#161 only blocks same-item pairs), and it
+                # brings a second amendment parent with it.
                 **build_mention_row(
                     mention_id="m-2",
-                    item_id="item-2",
-                    accession_number="0002",
+                    item_id="item-3",
+                    accession_number="0003",
                     cik="320193",
-                    date="2026-01-01",
+                    date="2026-01-02",
                     name="New Facility",
                     start_date="2026-01-01",
                     amount="$400 million",
@@ -4325,3 +4328,59 @@ def test_lifecycle_status_prefers_terminal_events_and_derives_matured() -> None:
     assert term_row["status_source_mention_id"] == "m-term"
     assert stale_row["status"] == "matured"
     assert stale_row["status_date"] == "2024-01-15"
+
+
+def test_canonical_maturity_prefers_stated_over_name_derived() -> None:
+    """A newer `due 2030` synthetic never outranks an older stated maturity (#162)."""
+    import json as _json
+
+    from cdt.matcher.core import build_debt_instrument_rows, prepare_mention
+
+    closing = prepare_mention(
+        build_mention_row(
+            mention_id="m-closing",
+            item_id="item-1",
+            accession_number="0001",
+            cik="320193",
+            date="2026-06-29",
+            name="6.75% PIK Notes due 2030",
+            start_date="2026-06-29",
+            amount="$350 million",
+        )
+        | {
+            "maturity_date": "2030-07-01",
+            "maturity_date_json": _json.dumps({"derived_from": "stated"}),
+        }
+    )
+    later = prepare_mention(
+        build_mention_row(
+            mention_id="m-later",
+            item_id="item-2",
+            accession_number="0002",
+            cik="320193",
+            date="2026-07-23",
+            name="6.75% PIK Notes due 2030",
+            start_date=None,
+            amount=None,
+        )
+        | {
+            "maturity_date": "2030-12-31",
+            "maturity_date_json": _json.dumps({"derived_from": "name"}),
+        }
+    )
+    rows = build_debt_instrument_rows(
+        {"inst": ["m-closing", "m-later"]},
+        {"m-closing": closing, "m-later": later},
+        {},
+    )
+    assert rows[0]["maturity_date"] == "2030-07-01"
+    assert rows[0]["maturity_source_mention_id"] == "m-closing"
+
+    # With no stated value anywhere, the name-derived one still publishes.
+    rows = build_debt_instrument_rows(
+        {"inst": ["m-later"]},
+        {"m-later": later},
+        {},
+    )
+    assert rows[0]["maturity_date"] == "2030-12-31"
+    assert rows[0]["maturity_source_mention_id"] == "m-later"

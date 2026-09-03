@@ -78,7 +78,9 @@ def test_conflicting_end_dates_block_membership() -> None:
 def test_matching_end_dates_and_name_score_full_support() -> None:
     """A repeat mention of the same instrument scores with name support."""
     seed = prepare_mention(mention_row())
-    repeat = prepare_mention(mention_row(debt_instrument_mention_id="mention-2"))
+    repeat = prepare_mention(
+        mention_row(debt_instrument_mention_id="mention-2", item_id="item-2")
+    )
     candidates = score(repeat, profile_from(seed))
     assert len(candidates) == 1
     assert candidates[0].match_score == 1.0
@@ -89,7 +91,9 @@ def test_missing_end_date_still_matches() -> None:
     """A mention without a maturity is compatible with any cluster end date."""
     seed = prepare_mention(mention_row())
     partial = prepare_mention(
-        mention_row(debt_instrument_mention_id="mention-2", maturity_date=None)
+        mention_row(
+            debt_instrument_mention_id="mention-2", item_id="item-2", maturity_date=None
+        )
     )
     candidates = score(partial, profile_from(seed))
     assert len(candidates) == 1
@@ -152,7 +156,11 @@ def test_year_resolution_end_date_still_matches_exact_maturity() -> None:
         )
     )
     closing = prepare_mention(
-        mention_row(debt_instrument_mention_id="mention-2", maturity_date="2030-04-15")
+        mention_row(
+            debt_instrument_mention_id="mention-2",
+            item_id="item-2",
+            maturity_date="2030-04-15",
+        )
     )
     assert len(score(closing, profile_from(seed))) == 1
 
@@ -175,6 +183,7 @@ def test_keyless_mention_matches_on_identifying_fingerprint() -> None:
     redemption = prepare_mention(
         mention_row(
             debt_instrument_mention_id="mention-2",
+            item_id="item-2",
             principal_amount=None,
             start_date=None,
             maturity_date=None,
@@ -240,6 +249,7 @@ def test_partial_key_mention_matches_despite_amount_conflict() -> None:
     partial = prepare_mention(
         mention_row(
             debt_instrument_mention_id="mention-2",
+            item_id="item-2",
             principal_amount="400000000",
             start_date=None,
         )
@@ -405,8 +415,15 @@ def test_same_item_sibling_with_a_conflicting_amount_does_not_attach() -> None:
     assert score(additional, profile_from(initial)) == []
 
 
-def test_same_item_add_on_with_its_own_start_date_still_attaches() -> None:
-    """An add-on in the same item carries its own start date, so it merges (#131)."""
+def test_same_item_mentions_never_merge() -> None:
+    """Same-item pairs are distinct debts however identifying the name is (#161).
+
+    One item returns one object per instrument by extractor construction.
+
+    Gray Media's $70M add-on tap merged into its $775M parent series and
+    published the series at the add-on's size. Cross-filing merges still work:
+    the same pair from different items attaches by fingerprint.
+    """
     series = prepare_mention(
         mention_row(
             name="5.875% Senior Notes due 2034",
@@ -415,7 +432,7 @@ def test_same_item_add_on_with_its_own_start_date_still_attaches() -> None:
             maturity_date="2034-12-31",
         )
     )
-    add_on = prepare_mention(
+    same_item_add_on = prepare_mention(
         mention_row(
             debt_instrument_mention_id="mention-2",
             name="5.875% Senior Notes due 2034",
@@ -424,7 +441,19 @@ def test_same_item_add_on_with_its_own_start_date_still_attaches() -> None:
             maturity_date="2034-12-31",
         )
     )
-    candidates = score(add_on, profile_from(series))
+    assert score(same_item_add_on, profile_from(series)) == []
+
+    cross_item_closing = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-3",
+            item_id="item-2",
+            name="5.875% Senior Notes due 2034",
+            principal_amount="500000000",
+            start_date="2026-06-02",
+            maturity_date="2034-12-31",
+        )
+    )
+    candidates = score(cross_item_closing, profile_from(series))
     assert len(candidates) == 1
     assert candidates[0].basis == "name_fingerprint"
 
@@ -433,7 +462,11 @@ def test_closing_mention_with_drifted_start_date_attaches_by_fingerprint() -> No
     """A closing 8-K dated at settlement still joins the priced offering."""
     pricing = prepare_mention(mention_row(start_date="2024-03-05"))
     closing = prepare_mention(
-        mention_row(debt_instrument_mention_id="mention-2", start_date="2024-03-19")
+        mention_row(
+            debt_instrument_mention_id="mention-2",
+            item_id="item-2",
+            start_date="2024-03-19",
+        )
     )
     candidates = score(closing, profile_from(pricing))
     assert len(candidates) == 1
@@ -460,7 +493,9 @@ def test_generic_name_upsize_stays_split() -> None:
 def test_exact_key_match_keeps_amount_start_basis() -> None:
     """Full-evidence matches still report the amount_start basis."""
     seed = prepare_mention(mention_row())
-    repeat = prepare_mention(mention_row(debt_instrument_mention_id="mention-2"))
+    repeat = prepare_mention(
+        mention_row(debt_instrument_mention_id="mention-2", item_id="item-2")
+    )
     candidates = score(repeat, profile_from(seed))
     assert candidates[0].basis == "amount_start"
     assert candidates[0].match_score == 1.0
@@ -520,6 +555,7 @@ def test_name_conflict_suppresses_lender_support() -> None:
     swing = prepare_mention(
         mention_row(
             debt_instrument_mention_id="mention-2",
+            item_id="item-2",
             name="Swing Line Loans",
             parties_json=LENDER_JSON,
         )
@@ -538,6 +574,7 @@ def test_lender_support_still_applies_without_name_conflict() -> None:
     unnamed = prepare_mention(
         mention_row(
             debt_instrument_mention_id="mention-2",
+            item_id="item-2",
             name=None,
             parties_json=LENDER_JSON,
         )

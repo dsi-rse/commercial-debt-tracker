@@ -162,6 +162,7 @@ class PreparedMention:
     instrument_type: str | None
     start_date: str | None
     maturity_date: str | None
+    maturity_is_name_derived: bool
     commitment_termination_date: str | None
     principal_amount: str | None
     principal_currency: str | None
@@ -779,37 +780,6 @@ def build_empty_profile(
     )
 
 
-def is_same_item_sibling(
-    mention: PreparedMention,
-    profile: ClusterProfile,
-) -> bool:
-    """Return whether the mention is a sibling of a cluster member, not the same debt.
-
-    The key-conflicting fingerprint path exists because one offering is observed
-    across several filings — launch, pricing, closing — which drift on amount and
-    start date. Cleveland-Cliffs launched $800M and priced $900M of the same
-    notes on one day, so a shared start date alone cannot rule the merge out.
-
-    Inside a single item it can. The extractor is told that two different start
-    dates or two different principal amounts in one document are "strong evidence
-    there are two separate debt instruments", so two objects from one item that
-    agree on the start date and disagree on the principal are siblings by
-    construction. Longevity Health issued a $1,250,000 and a $1,100,000 `10%
-    Senior Secured Convertible Note` on one day in one item; both maturities were
-    null and both coupons `10%`, so neither of #64's gates could separate them
-    (#131). An add-on to an existing series carries the add-on's own start date,
-    so it stays mergeable.
-    """
-    return (
-        mention.item_id in profile.member_item_ids
-        and mention.normalized_start_date is not None
-        and mention.normalized_start_date in profile.normalized_start_dates
-        and mention.normalized_amount is not None
-        and bool(profile.normalized_amounts)
-        and mention.normalized_amount not in profile.normalized_amounts
-    )
-
-
 def relaxed_keys_support_membership(
     mention: PreparedMention,
     profile: ClusterProfile,
@@ -879,6 +849,18 @@ def score_candidates_for_mention(
     for profile in profiles.values():
         if profile.cik != mention.cik:
             continue
+        if mention.item_id in profile.member_item_ids:
+            # One item returns one object per instrument — the extractor's
+            # invariant — so a same-item pair is two instruments by
+            # construction, whatever their names and keys say. The partial
+            # sibling test this replaces needed a shared start date and both
+            # amounts present, so Gray Media's $70M add-on tap, whose parent
+            # series stated no start date, slid through the identifying-name
+            # path and published the series at the add-on's size (#161). It
+            # also covers Longevity Health's same-day twin notes (#131) and
+            # Kestra's four tranches. Cross-filing launch/pricing/closing
+            # merges are different items and unaffected.
+            continue
         if mention.amendment_of and mention.amendment_of in profile.member_ids:
             continue
         if any(target in profile.member_ids for target in mention.retired_by):
@@ -911,13 +893,7 @@ def score_candidates_for_mention(
             for candidate_name in profile.normalized_name_fingerprints
         )
         if not keys_match:
-            # One item returns one object per instrument, so two objects from the
-            # same item whose names do not even describe the same debt are two
-            # debts. Kestra Medical's four tranches share an item, a maturity,
-            # and in two cases an amount.
-            if mention.item_id in profile.member_item_ids and not name_compatible:
-                continue
-            if name_compatible and not is_same_item_sibling(mention, profile):
+            if name_compatible:
                 # Launch, pricing, and closing 8-Ks for one offering drift on
                 # amount (upsizes) and start date (pricing vs settlement), so an
                 # identifying name may attach a mention whose keys conflict.
@@ -1324,13 +1300,8 @@ def build_debt_instrument_rows(
                     field_name="start_date",
                     source_column="start_date_source_mention_id",
                 ),
-                **canonical_scalar_fields(
-                    ordered_member_ids,
-                    mention_index,
-                    existing_row,
-                    field_name="maturity_date",
-                    source_column="maturity_source_mention_id",
-                    existing_keys=("maturity_date", "end_date"),
+                **canonical_maturity_fields(
+                    ordered_member_ids, mention_index, existing_row
                 ),
                 **canonical_scalar_fields(
                     ordered_member_ids,
@@ -1414,6 +1385,47 @@ def canonical_scalar_fields(
                 source_column: coerce_optional_text(existing_row.get(source_column)),
             }
     return {field_name: None, source_column: None}
+
+
+def canonical_maturity_fields(
+    ordered_member_ids: list[str],
+    mention_index: dict[str, PreparedMention],
+    existing_row: dict[str, object],
+) -> dict[str, str | None]:
+    """Return the canonical maturity, preferring stated dates over name-derived.
+
+    Every post-closing `due 2030` mention re-introduces the synthesized
+    year-end, so recency-only selection let a name-derived `2030-12-31`
+    outrank the closing 8-K's stated `2030-07-01` (#162). The newest stated
+    maturity wins; a name-derived value publishes only when no mention in the
+    cluster states one.
+    """
+    fallback: dict[str, str | None] | None = None
+    for mention_id in ordered_member_ids:
+        mention = mention_index[mention_id]
+        if mention.maturity_date is None:
+            continue
+        fields = {
+            "maturity_date": mention.maturity_date,
+            "maturity_source_mention_id": mention_id,
+        }
+        if not mention.maturity_is_name_derived:
+            return fields
+        if fallback is None:
+            fallback = fields
+    if fallback is not None:
+        return fallback
+    value = coerce_optional_text(
+        existing_row.get("maturity_date") or existing_row.get("end_date")
+    )
+    return {
+        "maturity_date": value,
+        "maturity_source_mention_id": (
+            coerce_optional_text(existing_row.get("maturity_source_mention_id"))
+            if value is not None
+            else None
+        ),
+    }
 
 
 def principal_amount_fields(
@@ -1597,6 +1609,9 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
         instrument_type=coerce_optional_text(row.get("instrument_type")),
         start_date=coerce_optional_text(row.get("start_date")),
         maturity_date=coerce_optional_text(row.get("maturity_date")),
+        maturity_is_name_derived=end_date_is_name_derived(
+            row.get("maturity_date_json")
+        ),
         commitment_termination_date=coerce_optional_text(
             row.get("commitment_termination_date")
         ),
