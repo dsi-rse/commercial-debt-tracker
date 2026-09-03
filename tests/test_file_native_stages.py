@@ -4163,3 +4163,46 @@ def test_interest_rate_validation_rejects_bad_kind_and_evidence() -> None:
     )
     failures = InstrumentIEStage().validate(row_state, response)
     assert any("'interest_rate.kind' must be one of" in failure for failure in failures)
+
+
+def test_canonical_fields_record_their_source_mention() -> None:
+    """Each canonical value points at the mention it came from (#151)."""
+    from cdt.matcher.core import build_debt_instrument_rows, prepare_mention
+
+    older = prepare_mention(
+        build_mention_row(
+            mention_id="m-old",
+            item_id="item-1",
+            accession_number="0001",
+            cik="320193",
+            date="2024-01-02",
+            name="Term Loan",
+            start_date="2024-01-01",
+            amount="$100 million",
+        )
+    )
+    newer = prepare_mention(
+        build_mention_row(
+            mention_id="m-new",
+            item_id="item-2",
+            accession_number="0002",
+            cik="320193",
+            date="2024-06-02",
+            name="Term Loan",
+            start_date=None,
+            amount=None,
+        )
+    )
+    mention_index = {"m-old": older, "m-new": newer}
+    rows = build_debt_instrument_rows(
+        {"m-old": ["m-old", "m-new"]},
+        mention_index,
+        {},
+    )
+    row = rows[0]
+    # The name comes from the newest mention; the start date and amount only
+    # exist on the older one, and their provenance says so.
+    assert row["name_source_mention_id"] == "m-new"
+    assert row["start_date"] == "2024-01-01"
+    assert row["start_date_source_mention_id"] == "m-old"
+    assert row["principal_source_mention_id"] == "m-old"

@@ -75,18 +75,26 @@ DEBT_INSTRUMENT_COLUMNS = [
     "retired_by_debt_instrument_ids",
     "split_of_debt_instrument_id",
     "name",
+    "name_source_mention_id",
     "instrument_type",
+    "instrument_type_source_mention_id",
     "start_date",
+    "start_date_source_mention_id",
     "maturity_date",
+    "maturity_source_mention_id",
     "commitment_termination_date",
+    "commitment_termination_source_mention_id",
     "principal_amount",
     "principal_currency",
     "principal_amount_kind",
+    "principal_source_mention_id",
     "outstanding_balance",
     "outstanding_balance_currency",
     "outstanding_balance_as_of",
+    "outstanding_balance_source_mention_id",
     "interest_rate_kind",
     "interest_rate_pct",
+    "interest_rate_source_mention_id",
     "parties_json",
     "lenders_known_incomplete",
 ]
@@ -1138,27 +1146,41 @@ def build_debt_instrument_rows(
                 "split_of_debt_instrument_id": parent_links.get(
                     debt_instrument_id, {}
                 ).get("split_of_debt_instrument_id"),
-                "name": first_non_null(ordered_member_ids, mention_index, "name")
-                or coerce_optional_text(existing_row.get("name")),
-                "instrument_type": first_non_null(
-                    ordered_member_ids, mention_index, "instrument_type"
-                )
-                or coerce_optional_text(existing_row.get("instrument_type")),
-                "start_date": first_non_null(
-                    ordered_member_ids, mention_index, "start_date"
-                )
-                or coerce_optional_text(existing_row.get("start_date")),
-                "maturity_date": first_non_null(
-                    ordered_member_ids, mention_index, "maturity_date"
-                )
-                or coerce_optional_text(
-                    existing_row.get("maturity_date") or existing_row.get("end_date")
+                **canonical_scalar_fields(
+                    ordered_member_ids,
+                    mention_index,
+                    existing_row,
+                    field_name="name",
+                    source_column="name_source_mention_id",
                 ),
-                "commitment_termination_date": first_non_null(
-                    ordered_member_ids, mention_index, "commitment_termination_date"
-                )
-                or coerce_optional_text(
-                    existing_row.get("commitment_termination_date")
+                **canonical_scalar_fields(
+                    ordered_member_ids,
+                    mention_index,
+                    existing_row,
+                    field_name="instrument_type",
+                    source_column="instrument_type_source_mention_id",
+                ),
+                **canonical_scalar_fields(
+                    ordered_member_ids,
+                    mention_index,
+                    existing_row,
+                    field_name="start_date",
+                    source_column="start_date_source_mention_id",
+                ),
+                **canonical_scalar_fields(
+                    ordered_member_ids,
+                    mention_index,
+                    existing_row,
+                    field_name="maturity_date",
+                    source_column="maturity_source_mention_id",
+                    existing_keys=("maturity_date", "end_date"),
+                ),
+                **canonical_scalar_fields(
+                    ordered_member_ids,
+                    mention_index,
+                    existing_row,
+                    field_name="commitment_termination_date",
+                    source_column="commitment_termination_source_mention_id",
                 ),
                 **principal_amount_fields(
                     ordered_member_ids, mention_index, existing_row
@@ -1207,6 +1229,36 @@ def first_non_null(
     return None
 
 
+def canonical_scalar_fields(
+    ordered_member_ids: list[str],
+    mention_index: dict[str, PreparedMention],
+    existing_row: dict[str, object],
+    *,
+    field_name: str,
+    source_column: str,
+    existing_keys: tuple[str, ...] | None = None,
+) -> dict[str, str | None]:
+    """Return one canonical field plus the mention it actually came from (#151).
+
+    The site attributes each canonical value to a source document; without the
+    pointer it guessed, and could stamp the value with the wrong filing. A
+    value carried forward from the existing row keeps that row's recorded
+    source.
+    """
+    for mention_id in ordered_member_ids:
+        value = getattr(mention_index[mention_id], field_name)
+        if value is not None:
+            return {field_name: value, source_column: mention_id}
+    for key in existing_keys or (field_name,):
+        value = coerce_optional_text(existing_row.get(key))
+        if value is not None:
+            return {
+                field_name: value,
+                source_column: coerce_optional_text(existing_row.get(source_column)),
+            }
+    return {field_name: None, source_column: None}
+
+
 def principal_amount_fields(
     ordered_member_ids: list[str],
     mention_index: dict[str, PreparedMention],
@@ -1225,6 +1277,7 @@ def principal_amount_fields(
                 "principal_amount": mention.principal_amount,
                 "principal_currency": mention.principal_currency,
                 "principal_amount_kind": mention.principal_amount_kind,
+                "principal_source_mention_id": mention_id,
             }
     return {
         "principal_amount": coerce_optional_text(
@@ -1235,6 +1288,9 @@ def principal_amount_fields(
         ),
         "principal_amount_kind": coerce_optional_text(
             existing_row.get("principal_amount_kind")
+        ),
+        "principal_source_mention_id": coerce_optional_text(
+            existing_row.get("principal_source_mention_id")
         ),
     }
 
@@ -1268,6 +1324,7 @@ def outstanding_balance_fields(
                     "outstanding_balance_as_of": (
                         str(as_of) if as_of is not None else mention.date
                     ),
+                    "outstanding_balance_source_mention_id": mention_id,
                 }
     return {
         "outstanding_balance": coerce_optional_text(
@@ -1278,6 +1335,9 @@ def outstanding_balance_fields(
         ),
         "outstanding_balance_as_of": coerce_optional_text(
             existing_row.get("outstanding_balance_as_of")
+        ),
+        "outstanding_balance_source_mention_id": coerce_optional_text(
+            existing_row.get("outstanding_balance_source_mention_id")
         ),
     }
 
@@ -1296,6 +1356,7 @@ def interest_rate_fields(
             return {
                 "interest_rate_kind": mention.interest_rate_kind,
                 "interest_rate_pct": mention.interest_rate_pct,
+                "interest_rate_source_mention_id": mention_id,
             }
     return {
         "interest_rate_kind": coerce_optional_text(
@@ -1303,6 +1364,9 @@ def interest_rate_fields(
         ),
         "interest_rate_pct": coerce_optional_text(
             existing_row.get("interest_rate_pct")
+        ),
+        "interest_rate_source_mention_id": coerce_optional_text(
+            existing_row.get("interest_rate_source_mention_id")
         ),
     }
 
