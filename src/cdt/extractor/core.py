@@ -232,8 +232,7 @@ DEBT_INSTRUMENT_MENTION_COLUMNS = [
     "amendment_of",
     "retired_by_json",
     "split_of",
-    "lenders_json",
-    "other_interested_parties_json",
+    "parties_json",
     "name_json",
     "start_date_json",
     "end_date_json",
@@ -746,8 +745,8 @@ class InstrumentIEStage:
                 tag_details,
                 name_text=name_text,
             )
-            lender_clusters, lenders_known_incomplete = (
-                lender_payloads_and_incompleteness(obj, tag_details)
+            party_clusters, lenders_known_incomplete = (
+                party_payloads_and_incompleteness(obj, tag_details)
             )
             mention_row: dict[str, object] = {
                 "item_id": row_state.item_id,
@@ -764,12 +763,8 @@ class InstrumentIEStage:
                 "amendment_of": None,
                 "retired_by_json": "[]",
                 "split_of": None,
-                "lenders_json": json.dumps(lender_clusters, sort_keys=True),
+                "parties_json": json.dumps(party_clusters, sort_keys=True),
                 "lenders_known_incomplete": lenders_known_incomplete,
-                "other_interested_parties_json": json.dumps(
-                    disclosed_party_payloads(obj, tag_details),
-                    sort_keys=True,
-                ),
                 "name_json": json.dumps(
                     cluster_payload(obj.get("name", []), tag_details),
                     sort_keys=True,
@@ -2284,13 +2279,10 @@ def debt_instrument_mention_id_for(
         "end_date": mention_row.get("end_date"),
         "end_date_json": normalize_json_text(mention_row.get("end_date_json")),
         "item_id": item_id,
-        "lenders_json": normalize_json_text(mention_row.get("lenders_json")),
         "lenders_known_incomplete": mention_row.get("lenders_known_incomplete"),
         "name_json": normalize_json_text(mention_row.get("name_json")),
         "name": mention_row.get("name"),
-        "other_interested_parties_json": normalize_json_text(
-            mention_row.get("other_interested_parties_json")
-        ),
+        "parties_json": normalize_json_text(mention_row.get("parties_json")),
         "start_date": mention_row.get("start_date"),
         "start_date_json": normalize_json_text(mention_row.get("start_date_json")),
     }
@@ -2817,33 +2809,59 @@ def annotated_party_clusters(
     return pairs
 
 
-def lender_payloads_and_incompleteness(
+LENDER_PARTY_ROLE = "lender"
+
+
+def party_payloads_and_incompleteness(
     obj: dict[str, Any],
     tag_details: dict[str, dict[str, object]],
 ) -> tuple[list[dict[str, object]], bool]:
-    """Return named lender clusters plus whether lenders are known to be missing."""
-    pairs = annotated_party_clusters(
+    """Return every party cluster with its role and kind, plus the lender flag.
+
+    The model already labels every cluster; the labels persist rather than only
+    steering what to drop (#150). Lender clusters carry ``role: "lender"`` and
+    the model's ``kind``; other clusters carry the model's role — including the
+    borrower, whose identity matters exactly when a subsidiary is the obligor
+    under the parent filer's 8-K — and ``kind: "named"``, since the collective
+    distinction is only elicited for lenders. ``canonical_name`` is the longest
+    span, same as instrument names.
+    """
+    parties: list[dict[str, object]] = []
+    lender_pairs = annotated_party_clusters(
         obj.get("lenders", []),
         tag_details,
         property_name="lenders",
     )
-    named = [payload for payload, kind in pairs if kind != COLLECTIVE_LENDER_KIND]
-    has_collective = len(named) < len(pairs)
-    declared_incomplete = obj.get("lenders_known_incomplete") is True
-    return named, has_collective or declared_incomplete
-
-
-def disclosed_party_payloads(
-    obj: dict[str, Any],
-    tag_details: dict[str, dict[str, object]],
-) -> list[dict[str, object]]:
-    """Return other-interested-party clusters, excluding the borrower itself."""
-    pairs = annotated_party_clusters(
+    has_collective = False
+    for payload, kind in lender_pairs:
+        has_collective = has_collective or kind == COLLECTIVE_LENDER_KIND
+        parties.append(
+            {
+                "canonical_name": canonical_value(
+                    payload_tag_ids(payload), tag_details
+                ),
+                "role": LENDER_PARTY_ROLE,
+                "kind": kind,
+                "spans": payload["spans"],
+            }
+        )
+    for payload, role in annotated_party_clusters(
         obj.get("other_interested_parties", []),
         tag_details,
         property_name="other_interested_parties",
-    )
-    return [payload for payload, role in pairs if role != BORROWER_PARTY_ROLE]
+    ):
+        parties.append(
+            {
+                "canonical_name": canonical_value(
+                    payload_tag_ids(payload), tag_details
+                ),
+                "role": role,
+                "kind": DEFAULT_LENDER_CLUSTER_KIND,
+                "spans": payload["spans"],
+            }
+        )
+    declared_incomplete = obj.get("lenders_known_incomplete") is True
+    return parties, has_collective or declared_incomplete
 
 
 def relation_prompt_xml(row_state: ExtractionRowState) -> str:

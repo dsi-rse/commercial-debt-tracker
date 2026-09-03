@@ -32,9 +32,8 @@ def mention_row(**overrides: object) -> dict[str, object]:
         "amendment_of": None,
         "retired_by_json": "[]",
         "split_of": None,
-        "lenders_json": "[]",
+        "parties_json": "[]",
         "lenders_known_incomplete": False,
-        "other_interested_parties_json": "[]",
         "end_date_json": "{}",
     }
     row.update(overrides)
@@ -511,13 +510,13 @@ LENDER_JSON = (
 def test_name_conflict_suppresses_lender_support() -> None:
     """Facility components sharing lenders and totals stay separate."""
     revolver = prepare_mention(
-        mention_row(name="Revolving Loans", lenders_json=LENDER_JSON)
+        mention_row(name="Revolving Loans", parties_json=LENDER_JSON)
     )
     swing = prepare_mention(
         mention_row(
             debt_instrument_mention_id="mention-2",
             name="Swing Line Loans",
-            lenders_json=LENDER_JSON,
+            parties_json=LENDER_JSON,
         )
     )
     candidates = score(swing, profile_from(revolver))
@@ -529,13 +528,13 @@ def test_name_conflict_suppresses_lender_support() -> None:
 def test_lender_support_still_applies_without_name_conflict() -> None:
     """Shared lenders vouch for membership when names do not disagree."""
     seed = prepare_mention(
-        mention_row(name="Revolving Loans", lenders_json=LENDER_JSON)
+        mention_row(name="Revolving Loans", parties_json=LENDER_JSON)
     )
     unnamed = prepare_mention(
         mention_row(
             debt_instrument_mention_id="mention-2",
             name=None,
-            lenders_json=LENDER_JSON,
+            parties_json=LENDER_JSON,
         )
     )
     candidates = score(unnamed, profile_from(seed))

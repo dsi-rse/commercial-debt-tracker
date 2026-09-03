@@ -78,8 +78,7 @@ DEBT_INSTRUMENT_COLUMNS = [
     "start_date",
     "end_date",
     "amount",
-    "lenders_json",
-    "other_interested_parties_json",
+    "parties_json",
     "lenders_known_incomplete",
 ]
 MENTION_CLUSTER_EDGE_DATASET_NAME = "mention-cluster-edges"
@@ -139,9 +138,8 @@ class PreparedMention:
     amendment_of: str | None
     retired_by: tuple[str, ...]
     split_of: str | None
-    lenders_json: str
+    parties_json: str
     lenders_known_incomplete: bool
-    other_interested_parties_json: str
     normalized_amount: str | None
     normalized_start_date: str | None
     normalized_end_date: str | None
@@ -535,7 +533,9 @@ def build_cluster_profiles(
         )
         if normalized_name:
             profile.normalized_name_fingerprints.add(normalized_name)
-        lenders = lender_signature(instrument_row.get("lenders_json"))
+        lenders = lender_signature(
+            instrument_row.get("parties_json") or instrument_row.get("lenders_json")
+        )
         if lenders:
             profile.lender_signatures.add(lenders)
         for member_id in member_ids:
@@ -1079,12 +1079,12 @@ def build_debt_instrument_rows(
             cik = coerce_optional_text(existing_row.get("cik"))
         if seed_mention_id is None or cik is None:
             continue
-        lenders_json = json.dumps(
+        parties_json = json.dumps(
             dedupe_party_clusters(
                 [
-                    str(existing_row.get("lenders_json") or "[]"),
+                    str(existing_row.get("parties_json") or "[]"),
                     *[
-                        mention_index[mention_id].lenders_json
+                        mention_index[mention_id].parties_json
                         for mention_id in present_member_ids
                     ],
                 ]
@@ -1096,18 +1096,6 @@ def build_debt_instrument_rows(
         ) or any(
             mention_index[mention_id].lenders_known_incomplete
             for mention_id in present_member_ids
-        )
-        other_interested_parties_json = json.dumps(
-            dedupe_party_clusters(
-                [
-                    str(existing_row.get("other_interested_parties_json") or "[]"),
-                    *[
-                        mention_index[mention_id].other_interested_parties_json
-                        for mention_id in present_member_ids
-                    ],
-                ]
-            ),
-            sort_keys=True,
         )
         rows.append(
             {
@@ -1142,9 +1130,8 @@ def build_debt_instrument_rows(
                 or coerce_optional_text(existing_row.get("end_date")),
                 "amount": first_non_null(ordered_member_ids, mention_index, "amount")
                 or coerce_optional_text(existing_row.get("amount")),
-                "lenders_json": lenders_json,
+                "parties_json": parties_json,
                 "lenders_known_incomplete": lenders_known_incomplete,
-                "other_interested_parties_json": other_interested_parties_json,
             }
         )
     return rows
@@ -1184,12 +1171,19 @@ def first_non_null(
 
 
 def dedupe_party_clusters(payloads: list[str]) -> list[dict[str, object]]:
-    """Return deduped party cluster payloads."""
+    """Return deduped party cluster payloads, keyed by role plus canonical name.
+
+    The role is part of the key so one entity appearing in two roles — an agent
+    that is also a lender — keeps both rows (#150).
+    """
     deduped: dict[str, dict[str, object]] = {}
     for payload in payloads:
         for cluster in parse_cluster_list(payload):
-            key = cluster_canonical_key(cluster)
-            if key and key not in deduped:
+            canonical = cluster_canonical_key(cluster)
+            if not canonical:
+                continue
+            key = f"{cluster.get('role', 'lender')}::{canonical}"
+            if key not in deduped:
                 deduped[key] = cluster
     return [deduped[key] for key in sorted(deduped)]
 
@@ -1248,11 +1242,8 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
         amendment_of=coerce_optional_text(row.get("amendment_of")),
         retired_by=tuple(json.loads(str(row.get("retired_by_json") or "[]"))),
         split_of=coerce_optional_text(row.get("split_of")),
-        lenders_json=str(row.get("lenders_json") or "[]"),
+        parties_json=str(row.get("parties_json") or "[]"),
         lenders_known_incomplete=coerce_flag(row.get("lenders_known_incomplete")),
-        other_interested_parties_json=str(
-            row.get("other_interested_parties_json") or "[]"
-        ),
         normalized_amount=normalize_amount(coerce_optional_text(row.get("amount"))),
         normalized_start_date=normalize_date(
             coerce_optional_text(row.get("start_date"))
@@ -1261,7 +1252,7 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
         normalized_name_fingerprint=normalize_name_fingerprint(
             coerce_optional_text(row.get("name"))
         ),
-        lender_signature=lender_signature(row.get("lenders_json")),
+        lender_signature=lender_signature(row.get("parties_json")),
     )
 
 
@@ -1379,9 +1370,16 @@ def normalize_name_fingerprint(value: str | None) -> str | None:
 
 
 def lender_keys(value: object) -> list[str]:
-    """Return normalized lender cluster keys in deterministic order."""
+    """Return normalized lender cluster keys in deterministic order.
+
+    Clusters without a ``role`` key are treated as lenders: they come from
+    payloads written before parties were unified (#150), when the lender list
+    was its own column.
+    """
     keys: list[str] = []
     for cluster in parse_cluster_list(str(value or "[]")):
+        if str(cluster.get("role", "lender")) != "lender":
+            continue
         key = cluster_canonical_key(cluster)
         if key:
             keys.append(key)

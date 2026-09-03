@@ -196,7 +196,7 @@ def build_mention_row(
     name: str,
     start_date: str,
     amount: str,
-    lenders_json: str = "[]",
+    parties_json: str = "[]",
     lenders_known_incomplete: bool = False,
     company_name: str | None = "Example Inc.",
 ) -> dict[str, object]:
@@ -216,9 +216,8 @@ def build_mention_row(
         "amendment_of": None,
         "retired_by_json": "[]",
         "split_of": None,
-        "lenders_json": lenders_json,
+        "parties_json": parties_json,
         "lenders_known_incomplete": lenders_known_incomplete,
-        "other_interested_parties_json": "[]",
         "name_json": "{}",
         "start_date_json": "{}",
         "end_date_json": "{}",
@@ -687,9 +686,8 @@ def test_extract_pending_items_writes_mentions_and_audit(
                 "amendment_of": None,
                 "retired_by_json": "[]",
                 "split_of": None,
-                "lenders_json": "[]",
+                "parties_json": "[]",
                 "lenders_known_incomplete": False,
-                "other_interested_parties_json": "[]",
                 "name_json": "{}",
                 "start_date_json": "{}",
                 "end_date_json": "{}",
@@ -751,9 +749,8 @@ def test_extract_pending_items_drains_all_partitions(
                 "amendment_of": None,
                 "retired_by_json": "[]",
                 "split_of": None,
-                "lenders_json": "[]",
+                "parties_json": "[]",
                 "lenders_known_incomplete": True,
-                "other_interested_parties_json": "[]",
                 "name_json": "{}",
                 "start_date_json": "{}",
                 "end_date_json": "{}",
@@ -967,10 +964,8 @@ def test_instrument_ie_validate_rejects_non_boolean_lenders_known_incomplete() -
     )
 
 
-def test_instrument_ie_postprocess_keeps_named_lenders_and_flags_incompleteness() -> (
-    None
-):
-    """A named lender plus a collective phrase should keep only the named lender."""
+def test_instrument_ie_postprocess_persists_every_party_with_role_and_kind() -> None:
+    """Lenders, collective phrases, and other parties all persist labelled (#150)."""
     mention = instrument_ie_mention(
         json.dumps(
             [
@@ -989,19 +984,20 @@ def test_instrument_ie_postprocess_keeps_named_lenders_and_flags_incompleteness(
         )
     )
 
-    lenders = json.loads(str(mention["lenders_json"]))
-    other_parties = json.loads(str(mention["other_interested_parties_json"]))
-    assert [[s["tag_id"] for s in cluster["spans"]] for cluster in lenders] == [
-        ["tag-o-named"]
+    parties = json.loads(str(mention["parties_json"]))
+    assert [
+        (party["role"], party["kind"], [s["tag_id"] for s in party["spans"]])
+        for party in parties
+    ] == [
+        ("lender", "named", ["tag-o-named"]),
+        ("lender", "collective", ["tag-o-collective"]),
+        ("agent", "named", ["tag-o-agent"]),
     ]
+    assert all(
+        set(party) == {"canonical_name", "role", "kind", "spans"} for party in parties
+    )
+    assert all(party["canonical_name"] for party in parties)
     assert mention["lenders_known_incomplete"] is True
-    # Persisted clusters keep the plain tag_ids/mentions shape: the model's kind and
-    # role labels decide what is stored and are not themselves stored.
-    assert set(lenders[0]) == {"spans"}
-    assert [[s["tag_id"] for s in cluster["spans"]] for cluster in other_parties] == [
-        ["tag-o-agent"]
-    ]
-    assert set(other_parties[0]) == {"spans"}
 
 
 def test_instrument_ie_postprocess_leaves_named_only_lenders_unflagged() -> None:
@@ -1018,7 +1014,7 @@ def test_instrument_ie_postprocess_leaves_named_only_lenders_unflagged() -> None
     )
 
     assert mention["lenders_known_incomplete"] is False
-    assert len(json.loads(str(mention["lenders_json"]))) == 1
+    assert len(json.loads(str(mention["parties_json"]))) == 1
 
 
 def test_instrument_ie_postprocess_honors_declared_incompleteness() -> None:
@@ -1036,11 +1032,11 @@ def test_instrument_ie_postprocess_honors_declared_incompleteness() -> None:
     )
 
     assert mention["lenders_known_incomplete"] is True
-    assert len(json.loads(str(mention["lenders_json"]))) == 1
+    assert len(json.loads(str(mention["parties_json"]))) == 1
 
 
-def test_instrument_ie_postprocess_drops_collective_only_lenders() -> None:
-    """A collective-only lender list carries no lenders and is flagged."""
+def test_instrument_ie_postprocess_keeps_collective_lenders_and_flags() -> None:
+    """A collective-only lender list persists with its surface text and flags (#150)."""
     mention = instrument_ie_mention(
         json.dumps(
             [
@@ -1054,12 +1050,19 @@ def test_instrument_ie_postprocess_drops_collective_only_lenders() -> None:
         )
     )
 
-    assert json.loads(str(mention["lenders_json"])) == []
+    parties = json.loads(str(mention["parties_json"]))
+    assert [(party["role"], party["kind"]) for party in parties] == [
+        ("lender", "collective")
+    ]
     assert mention["lenders_known_incomplete"] is True
 
 
-def test_instrument_ie_postprocess_excludes_the_borrower_from_other_parties() -> None:
-    """The filer itself is not persisted as an interested party."""
+def test_instrument_ie_postprocess_keeps_the_borrower_with_its_role() -> None:
+    """The borrower persists with role "borrower" (#150).
+
+    A subsidiary obligor under the parent filer's 8-K is exactly the identity
+    worth recording.
+    """
     mention = instrument_ie_mention(
         json.dumps(
             [
@@ -1074,9 +1077,12 @@ def test_instrument_ie_postprocess_excludes_the_borrower_from_other_parties() ->
         )
     )
 
-    other_parties = json.loads(str(mention["other_interested_parties_json"]))
-    assert [[s["tag_id"] for s in cluster["spans"]] for cluster in other_parties] == [
-        ["tag-o-agent"]
+    parties = json.loads(str(mention["parties_json"]))
+    assert [
+        (party["role"], [s["tag_id"] for s in party["spans"]]) for party in parties
+    ] == [
+        ("borrower", ["tag-o-borrower"]),
+        ("agent", ["tag-o-agent"]),
     ]
 
 
@@ -1107,7 +1113,7 @@ def test_match_pending_mentions_carries_lender_incompleteness(tmp_path: Path) ->
                 name="Term Loan",
                 start_date="2024-01-01",
                 amount="$100 million",
-                lenders_json=(
+                parties_json=(
                     '[{"mentions": [{"text": "Acme Bank"}], "tag_ids": ["tag-l-1"]}]'
                 ),
                 lenders_known_incomplete=True,
@@ -2238,7 +2244,7 @@ def test_match_pending_mentions_writes_match_datasets(tmp_path: Path) -> None:
                 name="Term Loan",
                 start_date="2024-01-01",
                 amount="$100 million",
-                lenders_json='[{"mentions": [{"text": "Acme Bank"}], "tag_ids": ["tag-l-1"]}]',
+                parties_json='[{"mentions": [{"text": "Acme Bank"}], "tag_ids": ["tag-l-1"]}]',
             )
         ]
     )
@@ -2363,7 +2369,7 @@ def test_match_pending_mentions_drains_all_shards(tmp_path: Path) -> None:
                 name="Term Loan",
                 start_date="2024-01-01",
                 amount="$100 million",
-                lenders_json='[{"mentions": [{"text": "Acme Bank"}], "tag_ids": ["tag-l-1"]}]',
+                parties_json='[{"mentions": [{"text": "Acme Bank"}], "tag_ids": ["tag-l-1"]}]',
             ),
             build_mention_row(
                 mention_id="m-2",
@@ -2374,7 +2380,7 @@ def test_match_pending_mentions_drains_all_shards(tmp_path: Path) -> None:
                 name="Revolving Credit Facility",
                 start_date="2024-01-01",
                 amount="$250 million",
-                lenders_json='[{"mentions": [{"text": "Contoso Bank"}], "tag_ids": ["tag-l-2"]}]',
+                parties_json='[{"mentions": [{"text": "Contoso Bank"}], "tag_ids": ["tag-l-2"]}]',
             ),
         ]
     )
@@ -2494,7 +2500,7 @@ def test_match_tables_supports_incremental_batches_against_existing_clusters() -
                 name="Alpha Loan",
                 start_date="2024-01-01",
                 amount="$100 million",
-                lenders_json='[{"mentions": [{"text": "Acme Bank"}]}]',
+                parties_json='[{"mentions": [{"text": "Acme Bank"}]}]',
             )
         ]
     )
@@ -2511,7 +2517,7 @@ def test_match_tables_supports_incremental_batches_against_existing_clusters() -
                 name="Alpha Loan",
                 start_date="2024-01-01",
                 amount="$100 million",
-                lenders_json='[{"mentions": [{"text": "Acme Bank"}]}]',
+                parties_json='[{"mentions": [{"text": "Acme Bank"}]}]',
             )
         ]
     )
@@ -2640,7 +2646,7 @@ def test_match_tables_does_not_emit_literal_nan_company_names() -> None:
         name="Alpha Loan",
         start_date="2024-01-01",
         amount="$100 million",
-        lenders_json='[{"mentions": [{"text": "Acme Bank"}]}]',
+        parties_json='[{"mentions": [{"text": "Acme Bank"}]}]',
     )
     mention["company_name"] = pd.NA
 
@@ -2667,7 +2673,7 @@ def test_match_tables_retired_by_keeps_separate_clusters_and_ends_the_instrument
                     name="Term Loan",
                     start_date="2024-01-01",
                     amount="$100 million",
-                    lenders_json='[{"mentions": [{"text": "Acme Bank"}]}]',
+                    parties_json='[{"mentions": [{"text": "Acme Bank"}]}]',
                 ),
                 "end_date": None,
             },
@@ -2681,7 +2687,7 @@ def test_match_tables_retired_by_keeps_separate_clusters_and_ends_the_instrument
                     name="Term Loan",
                     start_date="2024-01-01",
                     amount="$100 million",
-                    lenders_json='[{"mentions": [{"text": "Acme Bank"}]}]',
+                    parties_json='[{"mentions": [{"text": "Acme Bank"}]}]',
                 ),
                 "end_date": "2024-03-01",
                 "retired_by_json": '["m-1"]',
@@ -3103,8 +3109,7 @@ def test_extract_failures_are_recorded_and_cleared(
                 "amendment_of": None,
                 "retired_by_json": "[]",
                 "split_of": None,
-                "lenders_json": "[]",
-                "other_interested_parties_json": "[]",
+                "parties_json": "[]",
                 "name_json": "{}",
                 "start_date_json": "{}",
                 "end_date_json": "{}",
