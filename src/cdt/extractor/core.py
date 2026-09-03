@@ -125,6 +125,14 @@ AMOUNT_EVIDENCE_TAG_TYPES = {"amount", "debt_instrument"}
 # What one mention says happened to its instrument (#141). `matured` is
 # deliberately absent: filings almost never say it, and the matcher derives it
 # from maturity_date instead.
+# The four instrument categories the site facets on (#156); anything else
+# stays null rather than stretching a bucket.
+INSTRUMENT_TYPES = {
+    "term_loan",
+    "revolving_credit",
+    "credit_line",
+    "note_bond",
+}
 STATUS_EVENT_VALUES = {
     "announced",
     "entered_into",
@@ -270,6 +278,7 @@ DEBT_INSTRUMENT_MENTION_COLUMNS = [
     "date",
     "raw_id",
     "name",
+    "instrument_type",
     "start_date",
     "maturity_date",
     "commitment_termination_date",
@@ -739,6 +748,11 @@ def validate_instrument_entry(
                 failures.append(
                     f"Entry {index}: '{property_name}' tag {tag_id} is type '{tag_info['type']}', expected {expected}."
                 )
+    if "instrument_type" in obj and obj["instrument_type"] not in INSTRUMENT_TYPES:
+        allowed = ", ".join(sorted(INSTRUMENT_TYPES))
+        failures.append(
+            f"Entry {index}: 'instrument_type' must be one of {allowed}, or omitted."
+        )
     failures.extend(
         validate_amounts_property(
             index=index,
@@ -862,6 +876,11 @@ class InstrumentIEStage:
                 "date": row_state.item_row.get("date"),
                 "raw_id": raw_id,
                 "name": name_text,
+                "instrument_type": (
+                    obj["instrument_type"]
+                    if obj.get("instrument_type") in INSTRUMENT_TYPES
+                    else None
+                ),
                 "start_date": start_date_payload["normalized_date"],
                 "maturity_date": maturity_payload["normalized_date"],
                 "commitment_termination_date": commitment_termination_payload[
@@ -2640,6 +2659,7 @@ def debt_instrument_mention_id_for(
         "maturity_date_json": normalize_json_text(
             mention_row.get("maturity_date_json")
         ),
+        "instrument_type": mention_row.get("instrument_type"),
         "item_id": item_id,
         "lenders_known_incomplete": mention_row.get("lenders_known_incomplete"),
         "name_json": normalize_json_text(mention_row.get("name_json")),

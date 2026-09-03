@@ -4063,3 +4063,21 @@ def test_missing_status_event_publishes_null_status() -> None:
     mention = row_state.debt_instrument_mentions[0]
     assert mention["status"] is None
     assert mention["status_date"] is None
+
+
+def test_instrument_type_persists_and_rejects_unknown_values() -> None:
+    """instrument_type is one of four categories or absent (#156)."""
+    row_state = balance_row_state()
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [{"name": ["tag-i-1"], "instrument_type": "revolving_credit"}]
+    )
+    InstrumentIEStage().postprocess(row_state)
+    assert row_state.debt_instrument_mentions[0]["instrument_type"] == (
+        "revolving_credit"
+    )
+
+    failures = InstrumentIEStage().validate(
+        balance_row_state(),
+        json.dumps([{"name": ["tag-i-1"], "instrument_type": "surety_bond"}]),
+    )
+    assert any("'instrument_type' must be one of" in failure for failure in failures)

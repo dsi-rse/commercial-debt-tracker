@@ -14,6 +14,7 @@ Return one JSON object per distinct debt instrument mention cluster in the docum
 
 For each object, extract these properties when present:
 - `name`
+- `instrument_type`
 - `start_date`
 - `maturity_date`
 - `commitment_termination_date`
@@ -27,6 +28,14 @@ For standardized single-value properties, use these object shapes:
 - `start_date`: `{ "evidence": ["tag-..."], "normalized_date": "YYYY-MM-DD" | null }`
 - `maturity_date`: `{ "evidence": ["tag-..."], "normalized_date": "YYYY-MM-DD" | null }`
 - `commitment_termination_date`: `{ "evidence": ["tag-..."], "normalized_date": "YYYY-MM-DD" | null }`
+
+For the instrument's category, return one optional plain string:
+- `instrument_type`: `"term_loan" | "revolving_credit" | "credit_line" | "note_bond"`
+  - `term_loan`: a fixed advance repaid on a schedule or at maturity. Mortgages belong here.
+  - `revolving_credit`: a committed facility that can be drawn, repaid, and redrawn.
+  - `credit_line`: other borrowing availability that is not a committed revolver, such as an uncommitted or discretionary line, or a letter-of-credit-only facility.
+  - `note_bond`: a security — notes, bonds, debentures, convertibles.
+  Omit `instrument_type` when none of the four fits (leases, surety bonds) or the document does not say.
 
 For the instrument's state, return one optional event:
 - `status_event`: `{ "status": "announced" | "entered_into" | "amended" | "terminated" | "repaid" | "exchanged" | "defaulted", "status_date": { "evidence": ["tag-..."], "normalized_date": "YYYY-MM-DD" | null } | null }`

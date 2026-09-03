@@ -75,6 +75,7 @@ DEBT_INSTRUMENT_COLUMNS = [
     "retired_by_debt_instrument_ids",
     "split_of_debt_instrument_id",
     "name",
+    "instrument_type",
     "start_date",
     "maturity_date",
     "commitment_termination_date",
@@ -138,6 +139,7 @@ class PreparedMention:
     company_name: str | None
     date: str | None
     name: str | None
+    instrument_type: str | None
     start_date: str | None
     maturity_date: str | None
     commitment_termination_date: str | None
@@ -1134,6 +1136,10 @@ def build_debt_instrument_rows(
                 ).get("split_of_debt_instrument_id"),
                 "name": first_non_null(ordered_member_ids, mention_index, "name")
                 or coerce_optional_text(existing_row.get("name")),
+                "instrument_type": first_non_null(
+                    ordered_member_ids, mention_index, "instrument_type"
+                )
+                or coerce_optional_text(existing_row.get("instrument_type")),
                 "start_date": first_non_null(
                     ordered_member_ids, mention_index, "start_date"
                 )
@@ -1337,6 +1343,7 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
         company_name=coerce_optional_text(row.get("company_name")),
         date=coerce_optional_text(row.get("date")),
         name=coerce_optional_text(row.get("name")),
+        instrument_type=coerce_optional_text(row.get("instrument_type")),
         start_date=coerce_optional_text(row.get("start_date")),
         maturity_date=coerce_optional_text(row.get("maturity_date")),
         commitment_termination_date=coerce_optional_text(
