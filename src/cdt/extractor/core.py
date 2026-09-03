@@ -10,7 +10,7 @@ import hashlib
 import json
 import re
 from dataclasses import asdict, dataclass, field, replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from importlib import resources
 from pathlib import Path
@@ -93,7 +93,7 @@ INSTRUMENT_SINGLE_VALUE_PROPERTIES = {
     "start_date": {"date"},
     # NER tags maturity phrases like "notes due 2028" inside the instrument name,
     # so maturity evidence may cite that name span instead of a standalone date.
-    "maturity_date": {"date", "debt_instrument"},
+    "maturity_date": {"date", "debt_instrument", "duration"},
     # When the lender's obligation to lend ends — the draw/availability window
     # closes (#158). Distinct from the maturity so draw-period dates stop
     # publishing as maturities.
@@ -176,6 +176,29 @@ MATURITY_FULL_DATE_PATTERN = re.compile(
 )
 MATURITY_YEAR_PATTERN = re.compile(
     rf"\bdue\s+(?:in\s+)?(?P<years>\d{{4}}{MATURITY_COORDINATED_YEARS})\b",
+    re.IGNORECASE,
+)
+# A facility tenor such as `five-year` or `364-day` (#166). Only a duration
+# span stating exactly one tenor anchors computed-maturity arithmetic.
+TENOR_WORD_NUMBERS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "eighteen": 18,
+}
+TENOR_PATTERN = re.compile(
+    r"\b(?P<num>\d{1,3}|"
+    + "|".join(TENOR_WORD_NUMBERS)
+    + r")[-\s](?P<unit>year|month|day)s?\b",
     re.IGNORECASE,
 )
 # `due April 2033` states a month-resolution maturity (#164); it normalizes to
@@ -3220,6 +3243,88 @@ def iso_month_end_from_parts(year: str, month_name: str) -> str | None:
     return normalized if is_valid_iso_date(normalized) else None
 
 
+def tenor_from_text(text: str | None) -> tuple[int, str] | None:
+    """Parse one duration span such as `five-year` or `364-day` (#166).
+
+    A span stating more than one distinct tenor anchors nothing, mirroring how
+    coordinated maturities parse to None (#104).
+    """
+    if not text:
+        return None
+    tenors: set[tuple[int, str]] = set()
+    for match in TENOR_PATTERN.finditer(text):
+        num_text = match.group("num").lower()
+        number = (
+            TENOR_WORD_NUMBERS[num_text]
+            if num_text in TENOR_WORD_NUMBERS
+            else int(num_text)
+        )
+        tenors.add((number, match.group("unit").lower()))
+    if len(tenors) != 1:
+        return None
+    return tenors.pop()
+
+
+def date_plus_tenor(start: str, tenor: tuple[int, str]) -> str | None:
+    """Return start advanced by one tenor, clamping to month ends."""
+    try:
+        anchor = date.fromisoformat(start)
+    except ValueError:
+        return None
+    number, unit = tenor
+    if unit == "day":
+        return (anchor + timedelta(days=number)).isoformat()
+    months = number * 12 if unit == "year" else number
+    total = anchor.month - 1 + months
+    year = anchor.year + total // 12
+    month = total % 12 + 1
+    day = min(anchor.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day).isoformat()
+
+
+def computed_maturity_date(
+    tag_ids: object,
+    tag_details: dict[str, dict[str, object]],
+    model_date: object,
+) -> str | None:
+    """Return the model's maturity when it equals a cited start plus tenor (#166).
+
+    A filing that states a facility's closing date and its tenor but never the
+    maturity supports exactly one arithmetic answer. The model must cite both
+    the `date` span and the `duration` span; its normalized date publishes only
+    when some cited date plus some cited tenor lands on it, and it carries
+    ``derived_from: "computed"``.
+    """
+    if (
+        not isinstance(model_date, str)
+        or not ISO_DATE_PATTERN.fullmatch(model_date)
+        or not is_valid_iso_date(model_date)
+    ):
+        return None
+    if not isinstance(tag_ids, list):
+        return None
+    starts: set[str] = set()
+    tenors: set[tuple[int, str]] = set()
+    for tag_id in tag_ids:
+        detail = tag_details.get(tag_id) if isinstance(tag_id, str) else None
+        if detail is None:
+            continue
+        text = str(detail["text"])
+        if detail["type"] == "date":
+            parsed = normalized_date_from_text(text)
+            if parsed is not None:
+                starts.add(parsed)
+        elif detail["type"] == "duration":
+            tenor = tenor_from_text(text)
+            if tenor is not None:
+                tenors.add(tenor)
+    for start in starts:
+        for tenor in tenors:
+            if date_plus_tenor(start, tenor) == model_date:
+                return model_date
+    return None
+
+
 def iso_date_from_numeric_parts(year: str, month: str, day: str) -> str | None:
     """Return one ISO date built from numeric month-first parts.
 
@@ -3408,6 +3513,16 @@ def standardized_end_date_payload(
         tag_details,
         allow_maturity_phrase=True,
     )
+    if payload["normalized_date"] is None:
+        model_date = value.get("normalized_date") if isinstance(value, dict) else None
+        computed = computed_maturity_date(
+            single_value_evidence_tag_ids(value),
+            tag_details,
+            model_date,
+        )
+        if computed is not None:
+            payload["normalized_date"] = computed
+            payload["derived_from"] = DERIVED_FROM_COMPUTED
     if payload["normalized_date"] is None:
         derived_date = normalized_maturity_from_text(name_text)
         if derived_date is not None:

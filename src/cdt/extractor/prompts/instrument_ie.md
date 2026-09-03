@@ -5,6 +5,7 @@ You are an expert in corporate debt financing and SEC disclosure language. You w
 - `organization`
 - `debt_instrument`
 - `date`
+- `duration`
 - `amount`
 - `interest_rate`
 
@@ -84,6 +85,7 @@ For party properties, return one object per coreference cluster:
 - `maturity_date` is when the borrowed money must be repaid: the final maturity or expiration of the obligation itself. `commitment_termination_date` is when the lender's obligation to lend ends: the close of a draw period, availability period, or revolving period. They answer different questions, so never put one in the other's field.
 - When the text states one date for a facility's end, it is the `maturity_date`. When it states both an availability or draw-period end and a repayment date, return both fields. When it states only a draw-period or commitment-termination end, return `commitment_termination_date` and leave `maturity_date` absent rather than promoting it.
 - `maturity_date.evidence` may contain `date` tag ids, or the instrument's own `debt_instrument` tag id when the maturity is embedded in the name, such as `3.875% senior notes due 2028`.
+- When the document states a facility's tenor and its closing date but never the maturity — `entered into a five-year revolving credit facility` on a stated date — return `maturity_date` citing **both** the `duration` span and the closing `date` span, with `normalized_date` equal to the closing date advanced by the tenor. Like summed amounts, this is arithmetic on exactly the cited spans; never compute a maturity from a tenor the document does not state, and prefer a stated maturity date over the computation whenever one exists.
 - `commitment_termination_date.evidence` may contain only `date` tag ids.
 - Each `amounts` entry's `evidence` may contain `amount` tag ids, or the instrument's own `debt_instrument` tag id when the principal is stated inside the name, such as `$183.36 million term loan`.
 - `lenders` and `other_interested_parties` cluster `tag_ids` may contain only `person` or `organization` tag ids. Never cite a `debt_instrument`, `agreement`, `amount`, or `date` tag id in a party cluster.
@@ -162,6 +164,7 @@ Examples:
 - If a document describes a `$183.36 million term loan` and tags no separate amount, return one `amounts` entry with `kind` `principal`, the instrument's `debt_instrument` tag id as `evidence`, `normalized_amount` `183360000`, and `currency` `USD`.
 - If a document describes `senior notes due October 1, 2028` and tags `October 1, 2028` as a date, cite the `date` tag id with `normalized_date` `2028-10-01`.
 - If a delayed-draw facility's draw period ends `June 30, 2027` and its loans mature `June 30, 2031`, return `commitment_termination_date` `2027-06-30` and `maturity_date` `2031-06-30`.
+- If a company enters into a `five-year` senior secured revolving credit facility on `June 24, 2026` and the item never states the maturity, return `maturity_date` with `normalized_date` `2031-06-24`, citing the `five-year` duration span and the `June 24, 2026` date span.
 - If a filing states only a Draw Period Termination Date and defines the maturity relative to it, such as `12 months after the Draw Period Termination Date`, return the stated date as `commitment_termination_date` and omit `maturity_date`: never publish an availability end as the maturity.
 - If a credit agreement says ABR Loans bear interest at `0.875% per annum`, do not return `0.875` in `amounts`. That margin belongs nowhere: the loan's `interest_rate` is `{ "kind": "floating", "rate_pct": null }`, citing the tagged rate span. Omit `amounts` unless the document states a money amount for that loan.
 - If a document describes `3.875% senior notes due 2028` with no separate rate span, return `interest_rate` `{ "kind": "fixed", "rate_pct": "3.875" }`, citing the instrument's own tag id.

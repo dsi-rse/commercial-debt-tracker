@@ -626,3 +626,14 @@ def test_name_derived_month_end_collapses_to_month_resolution() -> None:
     assert end_dates_are_compatible("2033-04", "2033")
     assert not end_dates_are_compatible("2033-04", "2033-06-15")
     assert not end_dates_are_compatible("2033-04-30", "2033-04-15")
+
+
+def test_computed_maturity_collapses_to_month_resolution() -> None:
+    """Start-plus-tenor maturities are month-trustworthy, not day-exact (#166)."""
+    computed = mention_row(
+        maturity_date="2031-06-24",
+        maturity_date_json=json.dumps({"derived_from": "computed"}),
+    )
+    assert prepare_mention(computed).normalized_end_date == "2031-06"
+    assert end_dates_are_compatible("2031-06", "2031-06-30")
+    assert not end_dates_are_compatible("2031-06", "2031-09-30")

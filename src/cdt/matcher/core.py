@@ -162,7 +162,7 @@ class PreparedMention:
     instrument_type: str | None
     start_date: str | None
     maturity_date: str | None
-    maturity_is_name_derived: bool
+    maturity_is_derived: bool
     commitment_termination_date: str | None
     principal_amount: str | None
     principal_currency: str | None
@@ -1397,8 +1397,8 @@ def canonical_maturity_fields(
     Every post-closing `due 2030` mention re-introduces the synthesized
     year-end, so recency-only selection let a name-derived `2030-12-31`
     outrank the closing 8-K's stated `2030-07-01` (#162). The newest stated
-    maturity wins; a name-derived value publishes only when no mention in the
-    cluster states one.
+    maturity wins; a derived value — name-derived or computed (#166) —
+    publishes only when no mention in the cluster states one.
     """
     fallback: dict[str, str | None] | None = None
     for mention_id in ordered_member_ids:
@@ -1409,7 +1409,7 @@ def canonical_maturity_fields(
             "maturity_date": mention.maturity_date,
             "maturity_source_mention_id": mention_id,
         }
-        if not mention.maturity_is_name_derived:
+        if not mention.maturity_is_derived:
             return fields
         if fallback is None:
             fallback = fields
@@ -1609,9 +1609,8 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
         instrument_type=coerce_optional_text(row.get("instrument_type")),
         start_date=coerce_optional_text(row.get("start_date")),
         maturity_date=coerce_optional_text(row.get("maturity_date")),
-        maturity_is_name_derived=end_date_is_name_derived(
-            row.get("maturity_date_json")
-        ),
+        maturity_is_derived=maturity_derivation(row.get("maturity_date_json"))
+        in DERIVED_MATURITY_KINDS,
         commitment_termination_date=coerce_optional_text(
             row.get("commitment_termination_date")
         ),
@@ -1819,20 +1818,31 @@ def normalized_end_date_for_matching(row: dict[str, object]) -> str | None:
     value = normalize_date(coerce_optional_text(row.get("maturity_date")))
     if not value:
         return None
-    if not end_date_is_name_derived(row.get("maturity_date_json")):
+    derivation = maturity_derivation(row.get("maturity_date_json"))
+    if derivation not in DERIVED_MATURITY_KINDS:
         return value
-    if value.endswith("-12-31"):
+    if derivation == "name" and value.endswith("-12-31"):
         return value[:YEAR_TEXT_LENGTH]
+    # Name-embedded full dates, month-end synthetics (#164), and start-plus-
+    # tenor arithmetic (#166) are all month-trustworthy but not day-exact.
     return value[:MONTH_TEXT_LENGTH]
 
 
-def end_date_is_name_derived(payload_text: object) -> bool:
-    """Return whether one end-date payload marks its value as name-derived."""
+# Maturities the extractor derived rather than read off a stated date: from
+# the instrument's name, or computed as start plus tenor (#166).
+DERIVED_MATURITY_KINDS = frozenset({"name", "computed"})
+
+
+def maturity_derivation(payload_text: object) -> str | None:
+    """Return one maturity payload's derived_from marker."""
     try:
         payload = json.loads(str(payload_text or "{}"))
     except json.JSONDecodeError:
-        return False
-    return isinstance(payload, dict) and payload.get("derived_from") == "name"
+        return None
+    if not isinstance(payload, dict):
+        return None
+    derivation = payload.get("derived_from")
+    return str(derivation) if isinstance(derivation, str) else None
 
 
 def end_dates_are_compatible(left: str | None, right: str | None) -> bool:

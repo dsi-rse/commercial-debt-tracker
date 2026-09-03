@@ -4472,3 +4472,83 @@ def test_computed_sum_amount_accepts_only_the_exact_sum_of_cited_spans() -> None
         tag_details,
     )
     assert with_rate["normalized_amount"] is None
+
+
+TENOR_FACILITY_XML = """
+<body>
+On <date id="tag-d-close">June 24, 2026</date>, the Company entered into a
+<duration id="tag-t-1">five-year</duration>
+<debt_instrument id="tag-i-1">senior secured revolving credit facility</debt_instrument>
+of <amount id="tag-a-1">$1.0 billion</amount>.
+</body>
+""".strip()
+
+
+def test_computed_maturity_from_start_plus_tenor() -> None:
+    """A cited closing date plus a cited tenor verifies the maturity (#166)."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = TENOR_FACILITY_XML
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "start_date": {
+                    "evidence": ["tag-d-close"],
+                    "normalized_date": "2026-06-24",
+                },
+                "maturity_date": {
+                    "evidence": ["tag-t-1", "tag-d-close"],
+                    "normalized_date": "2031-06-24",
+                },
+            }
+        ]
+    )
+    InstrumentIEStage().postprocess(row_state)
+
+    mention = row_state.debt_instrument_mentions[0]
+    assert mention["maturity_date"] == "2031-06-24"
+    payload = json.loads(str(mention["maturity_date_json"]))
+    assert payload["derived_from"] == "computed"
+    assert {s["tag_id"] for s in payload["spans"]} == {"tag-t-1", "tag-d-close"}
+
+
+def test_computed_maturity_rejects_arithmetic_that_misses() -> None:
+    """A model date that is not start plus tenor stays null."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = TENOR_FACILITY_XML
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "maturity_date": {
+                    "evidence": ["tag-t-1", "tag-d-close"],
+                    "normalized_date": "2030-06-24",
+                },
+            }
+        ]
+    )
+    InstrumentIEStage().postprocess(row_state)
+    assert row_state.debt_instrument_mentions[0]["maturity_date"] is None
+
+
+def test_tenor_parsing_and_date_arithmetic() -> None:
+    """Tenor spans parse conservatively; month-end days clamp (#166)."""
+    from cdt.extractor.core import date_plus_tenor, tenor_from_text
+
+    assert tenor_from_text("five-year") == (5, "year")
+    assert tenor_from_text("364-day") == (364, "day")
+    assert tenor_from_text("18-month") == (18, "month")
+    assert tenor_from_text("three year") == (3, "year")
+    # Two distinct tenors anchor nothing.
+    assert tenor_from_text("three-year term plus two one-year extensions") is None
+    assert tenor_from_text("no tenor here") is None
+
+    assert date_plus_tenor("2026-06-24", (5, "year")) == "2031-06-24"
+    assert date_plus_tenor("2026-01-02", (364, "day")) == "2027-01-01"
+    assert date_plus_tenor("2026-08-31", (18, "month")) == "2028-02-29"
