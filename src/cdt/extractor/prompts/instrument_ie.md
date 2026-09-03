@@ -54,7 +54,7 @@ The `status` labels what this mention says happened to the instrument:
 - `entered_into`: the instrument closed, was issued, or became effective. The normal case for a new agreement or issuance.
 - `amended`: the instrument's terms were modified. In a before/after pair, the object for the instrument as amended carries `amended`; give the predecessor object no `status_event` unless the text states a separate event for it.
 - `terminated`: the agreement or facility was ended before its scheduled date, as in `On June 2, 2026, the Company terminated its $3.5 billion revolving credit facility`. Termination often co-occurs with a final repayment; when the filing's point is that the facility ended, use `terminated`.
-- `repaid`: the obligation was or will be satisfied by payment — repaid in full, redeemed, defeased. A redemption target of a use-of-proceeds financing is `repaid`.
+- `repaid`: the obligation was or will be satisfied **in full** by payment — repaid in full, redeemed in whole, defeased. A redemption target of a use-of-proceeds financing is `repaid`. A repurchase or redemption of less than all outstanding principal is not `repaid`: record the figure as a `repayment` entry in `amounts` and return no `status_event`, unless the text says the remaining obligation was also satisfied.
 - `exchanged`: the obligation was satisfied by delivering other securities or equity instead of cash.
 - `defaulted`: the filing reports a default, event of default, or acceleration of the obligation (the Item 2.04 vocabulary).
 
@@ -190,4 +190,5 @@ Examples:
 - If a filing describes a `Credit Agreement` providing an `$835,000,000` `revolving credit facility` maturing `June 18, 2031`, return one object naming both spans, with a `commitment` entry of `835000000` and `maturity_date` `2031-06-18`. Do not return one object for the agreement and another for the facility.
 - If a 2.03 item says the company's revolving credit facility provides `$300 million` of commitments and that `as of June 9, 2026, we had $270.5 million outstanding`, return one object with two `amounts` entries: `kind` `commitment` `300000000`, and `kind` `outstanding_balance` `270500000` with `as_of_date` `2026-06-09`. The balance is never the `commitment` or `principal`.
 - If a company states it will `repay $68 million in outstanding amounts under the credit facility`, that figure is a `repayment` entry on the facility's object, not its principal.
+- If a company `repurchased, in a privately negotiated transaction, $100 million aggregate principal amount` of its `10.500% senior secured first lien notes due 2029`, and the series remains outstanding, return the notes with a `repayment` entry of `100000000` and no `status_event`. A partial repurchase is a payment, not the end of the obligation.
 - If an offering closes with `net proceeds of $718.8 million` from `$750 million` of notes, the notes' object carries a `principal` entry of `750000000` and a `proceeds` entry of `718800000`.
