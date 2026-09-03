@@ -212,7 +212,7 @@ def build_mention_row(
         "name": name,
         "start_date": start_date,
         "end_date": None,
-        "amount": amount,
+        "principal_amount": amount,
         "amendment_of": None,
         "retired_by_json": "[]",
         "split_of": None,
@@ -221,7 +221,7 @@ def build_mention_row(
         "name_json": "{}",
         "start_date_json": "{}",
         "end_date_json": "{}",
-        "amount_json": "{}",
+        "amounts_json": "[]",
     }
 
 
@@ -691,7 +691,7 @@ def test_extract_pending_items_writes_mentions_and_audit(
                 "name_json": "{}",
                 "start_date_json": "{}",
                 "end_date_json": "{}",
-                "amount_json": "{}",
+                "amounts_json": "[]",
             }
         ]
         row_state.finish("SUCCESS")
@@ -754,7 +754,7 @@ def test_extract_pending_items_drains_all_partitions(
                 "name_json": "{}",
                 "start_date_json": "{}",
                 "end_date_json": "{}",
-                "amount_json": "{}",
+                "amounts_json": "[]",
             }
         ]
         row_state.finish("SUCCESS")
@@ -1485,8 +1485,8 @@ def test_instrument_ie_postprocess_drops_rate_amount() -> None:
     InstrumentIEStage().postprocess(row_state)
 
     mention = row_state.debt_instrument_mentions[0]
-    payload = json.loads(str(mention["amount_json"]))
-    assert mention["amount"] is None
+    payload = json.loads(str(mention["amounts_json"]))[0]
+    assert mention["principal_amount"] is None
     assert payload["normalized_amount"] is None
     assert payload["currency"] is None
     # Evidence is preserved so the dropped value stays auditable.
@@ -1868,8 +1868,8 @@ def test_instrument_ie_postprocess_recovers_a_principal_from_the_name() -> None:
     InstrumentIEStage().postprocess(row_state)
 
     mention = row_state.debt_instrument_mentions[0]
-    payload = json.loads(str(mention["amount_json"]))
-    assert mention["amount"] == "183360000"
+    payload = json.loads(str(mention["amounts_json"]))[0]
+    assert mention["principal_amount"] == "183360000"
     assert payload["currency"] == "USD"
     # Nothing was cited, so the evidence list stays empty, as it does for a
     # name-derived maturity.
@@ -1903,7 +1903,7 @@ def test_instrument_ie_validate_accepts_the_name_span_as_amount_evidence() -> No
 
     row_state.stage_responses["instrument_ie"] = response
     InstrumentIEStage().postprocess(row_state)
-    assert row_state.debt_instrument_mentions[0]["amount"] == "183360000"
+    assert row_state.debt_instrument_mentions[0]["principal_amount"] == "183360000"
 
 
 def test_normalized_amount_from_text_keeps_cents_exact() -> None:
@@ -1951,8 +1951,8 @@ def test_instrument_ie_postprocess_keeps_an_amount_with_cents() -> None:
     InstrumentIEStage().postprocess(row_state)
 
     mention = row_state.debt_instrument_mentions[0]
-    payload = json.loads(str(mention["amount_json"]))
-    assert mention["amount"] == "372246148.11"
+    payload = json.loads(str(mention["amounts_json"]))[0]
+    assert mention["principal_amount"] == "372246148.11"
     assert payload["normalized_amount"] == "372246148.11"
     assert payload["currency"] == "USD"
 
@@ -1984,9 +1984,9 @@ def test_instrument_ie_postprocess_accepts_a_differently_formatted_amount() -> N
 
     mention = row_state.debt_instrument_mentions[0]
     # The parser's canonical string is what gets published.
-    assert mention["amount"] == "500000"
+    assert mention["principal_amount"] == "500000"
     # A genuinely different value is still rejected.
-    assert json.loads(str(mention["amount_json"]))["normalized_amount"] == "500000"
+    assert json.loads(str(mention["amounts_json"]))[0]["normalized_amount"] == "500000"
 
 
 def test_canonical_amount_value_prefers_the_span_that_parses() -> None:
@@ -2034,9 +2034,9 @@ def test_instrument_ie_postprocess_keeps_an_amount_clustered_with_its_label() ->
     InstrumentIEStage().postprocess(row_state)
 
     mention = row_state.debt_instrument_mentions[0]
-    assert mention["amount"] == "2000000"
+    assert mention["principal_amount"] == "2000000"
     # Both spans stay in the payload as provenance.
-    payload = json.loads(str(mention["amount_json"]))
+    payload = json.loads(str(mention["amounts_json"]))[0]
     assert [s["tag_id"] for s in payload["spans"]] == ["tag-a-figure", "tag-a-label"]
 
 
@@ -2080,7 +2080,7 @@ def test_instrument_ie_postprocess_keeps_a_canadian_dollar_currency() -> None:
 
     InstrumentIEStage().postprocess(row_state)
 
-    payload = json.loads(str(row_state.debt_instrument_mentions[0]["amount_json"]))
+    payload = json.loads(str(row_state.debt_instrument_mentions[0]["amounts_json"]))[0]
     assert payload["normalized_amount"] == "300000000"
     assert payload["currency"] == "CAD"
 
@@ -2978,7 +2978,7 @@ def test_match_tables_keeps_same_day_siblings_apart() -> None:
     }
     assert assignment["m-initial"] != assignment["m-additional"]
     amounts = {
-        row["debt_instrument_id"]: row["amount"]
+        row["debt_instrument_id"]: row["principal_amount"]
         for row in tables["debt_instrument"].to_dict("records")
     }
     assert amounts[assignment["m-initial"]] == "$1,250,000"
@@ -3113,7 +3113,7 @@ def test_extract_failures_are_recorded_and_cleared(
                 "name_json": "{}",
                 "start_date_json": "{}",
                 "end_date_json": "{}",
-                "amount_json": "{}",
+                "amounts_json": "[]",
             }
         ]
         row_state.finish("SUCCESS")
@@ -3783,3 +3783,137 @@ def test_salvage_notes_round_trip_through_batch_state() -> None:
     legacy = row_state.to_state_dict()
     del legacy["salvage_notes"]
     assert ExtractionRowState.from_state_dict(legacy).salvage_notes == []
+
+
+BALANCE_ITEM_XML = """
+<body>
+The <debt_instrument id="tag-i-1">Revolving Credit Facility</debt_instrument> provides
+<amount id="tag-a-commitment">$300 million</amount> of commitments. As of
+<date id="tag-d-asof">June 9, 2026</date>, the Company had
+<amount id="tag-a-balance">$270.5 million</amount> outstanding.
+</body>
+""".strip()
+
+
+def balance_row_state() -> ExtractionRowState:
+    """Return one instrument_ie row state with a commitment and a balance."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = BALANCE_ITEM_XML
+    return row_state
+
+
+def test_amounts_are_kind_typed_and_the_balance_never_becomes_principal() -> None:
+    """A commitment and a balance publish as two entries; principal is the commitment (#140)."""
+    row_state = balance_row_state()
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "amounts": [
+                    {
+                        "kind": "commitment",
+                        "evidence": ["tag-a-commitment"],
+                        "normalized_amount": "300000000",
+                        "currency": "USD",
+                    },
+                    {
+                        "kind": "outstanding_balance",
+                        "evidence": ["tag-a-balance"],
+                        "normalized_amount": "270500000",
+                        "currency": "USD",
+                        "as_of_date": "2026-06-09",
+                    },
+                ],
+            }
+        ]
+    )
+    InstrumentIEStage().postprocess(row_state)
+
+    mention = row_state.debt_instrument_mentions[0]
+    payloads = json.loads(str(mention["amounts_json"]))
+    assert [(entry["kind"], entry["normalized_amount"]) for entry in payloads] == [
+        ("commitment", "300000000"),
+        ("outstanding_balance", "270500000"),
+    ]
+    assert payloads[1]["as_of_date"] == "2026-06-09"
+    assert mention["principal_amount"] == "300000000"
+    assert mention["principal_currency"] == "USD"
+    assert mention["principal_amount_kind"] == "commitment"
+
+
+def test_a_balance_only_mention_publishes_no_principal() -> None:
+    """A balance observation alone never becomes the headline amount (#140)."""
+    row_state = balance_row_state()
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "amounts": [
+                    {
+                        "kind": "outstanding_balance",
+                        "evidence": ["tag-a-balance"],
+                        "normalized_amount": "270500000",
+                        "currency": "USD",
+                        "as_of_date": "2026-06-09",
+                    }
+                ],
+            }
+        ]
+    )
+    InstrumentIEStage().postprocess(row_state)
+
+    mention = row_state.debt_instrument_mentions[0]
+    assert mention["principal_amount"] is None
+    assert mention["principal_amount_kind"] is None
+    payloads = json.loads(str(mention["amounts_json"]))
+    assert payloads[0]["kind"] == "outstanding_balance"
+
+
+def test_instrument_ie_validate_rejects_unknown_amount_kinds() -> None:
+    """An amounts entry must carry a known kind and a valid as_of_date (#140)."""
+    response = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "amounts": [
+                    {
+                        "kind": "headline",
+                        "evidence": ["tag-a-commitment"],
+                        "normalized_amount": "300000000",
+                        "as_of_date": "June 9, 2026",
+                    }
+                ],
+            }
+        ]
+    )
+    failures = InstrumentIEStage().validate(balance_row_state(), response)
+    assert any("'amounts[0].kind' must be one of" in failure for failure in failures)
+    assert any(
+        "'amounts[0].as_of_date' must be YYYY-MM-DD" in failure for failure in failures
+    )
+
+
+def test_legacy_single_amount_shape_still_replays() -> None:
+    """Pre-#140 batch responses with a bare `amount` keep their value."""
+    row_state = balance_row_state()
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "amount": {
+                    "evidence": ["tag-a-commitment"],
+                    "normalized_amount": "300000000",
+                    "currency": "USD",
+                },
+            }
+        ]
+    )
+    InstrumentIEStage().postprocess(row_state)
+
+    mention = row_state.debt_instrument_mentions[0]
+    assert mention["principal_amount"] == "300000000"
+    # The legacy shape carries no kind; the flat column still fills.
+    assert mention["principal_amount_kind"] is None

@@ -77,7 +77,12 @@ DEBT_INSTRUMENT_COLUMNS = [
     "name",
     "start_date",
     "end_date",
-    "amount",
+    "principal_amount",
+    "principal_currency",
+    "principal_amount_kind",
+    "outstanding_balance",
+    "outstanding_balance_currency",
+    "outstanding_balance_as_of",
     "parties_json",
     "lenders_known_incomplete",
 ]
@@ -134,7 +139,10 @@ class PreparedMention:
     name: str | None
     start_date: str | None
     end_date: str | None
-    amount: str | None
+    principal_amount: str | None
+    principal_currency: str | None
+    principal_amount_kind: str | None
+    amounts_json: str
     amendment_of: str | None
     retired_by: tuple[str, ...]
     split_of: str | None
@@ -514,7 +522,8 @@ def build_cluster_profiles(
             lender_signatures=set(),
         )
         normalized_amount = normalize_amount(
-            coerce_optional_text(instrument_row.get("amount"))
+            coerce_optional_text(instrument_row.get("principal_amount"))
+            or coerce_optional_text(instrument_row.get("amount"))
         )
         if normalized_amount:
             profile.normalized_amounts.add(normalized_amount)
@@ -1128,8 +1137,12 @@ def build_debt_instrument_rows(
                     ordered_member_ids, mention_index, "end_date"
                 )
                 or coerce_optional_text(existing_row.get("end_date")),
-                "amount": first_non_null(ordered_member_ids, mention_index, "amount")
-                or coerce_optional_text(existing_row.get("amount")),
+                **principal_amount_fields(
+                    ordered_member_ids, mention_index, existing_row
+                ),
+                **outstanding_balance_fields(
+                    ordered_member_ids, mention_index, existing_row
+                ),
                 "parties_json": parties_json,
                 "lenders_known_incomplete": lenders_known_incomplete,
             }
@@ -1168,6 +1181,81 @@ def first_non_null(
         if value is not None:
             return value
     return None
+
+
+def principal_amount_fields(
+    ordered_member_ids: list[str],
+    mention_index: dict[str, PreparedMention],
+    existing_row: dict[str, object],
+) -> dict[str, str | None]:
+    """Return the canonical principal columns from the newest carrying mention.
+
+    Currency and kind travel with the amount they describe (#140): mixing the
+    newest amount with an older mention's currency could relabel an AUD
+    facility as USD.
+    """
+    for mention_id in ordered_member_ids:
+        mention = mention_index[mention_id]
+        if mention.principal_amount is not None:
+            return {
+                "principal_amount": mention.principal_amount,
+                "principal_currency": mention.principal_currency,
+                "principal_amount_kind": mention.principal_amount_kind,
+            }
+    return {
+        "principal_amount": coerce_optional_text(
+            existing_row.get("principal_amount") or existing_row.get("amount")
+        ),
+        "principal_currency": coerce_optional_text(
+            existing_row.get("principal_currency")
+        ),
+        "principal_amount_kind": coerce_optional_text(
+            existing_row.get("principal_amount_kind")
+        ),
+    }
+
+
+def outstanding_balance_fields(
+    ordered_member_ids: list[str],
+    mention_index: dict[str, PreparedMention],
+    existing_row: dict[str, object],
+) -> dict[str, str | None]:
+    """Return the newest outstanding-balance observation.
+
+    Kept apart from principal so a balance can never double-count as the
+    headline amount (#140).
+    """
+    for mention_id in ordered_member_ids:
+        mention = mention_index[mention_id]
+        for entry in parse_cluster_list(mention.amounts_json):
+            if (
+                entry.get("kind") == "outstanding_balance"
+                and entry.get("normalized_amount") is not None
+            ):
+                as_of = entry.get("as_of_date")
+                return {
+                    "outstanding_balance": str(entry["normalized_amount"]),
+                    "outstanding_balance_currency": (
+                        str(entry["currency"])
+                        if entry.get("currency") is not None
+                        else None
+                    ),
+                    # The mention's filing date bounds an undated balance.
+                    "outstanding_balance_as_of": (
+                        str(as_of) if as_of is not None else mention.date
+                    ),
+                }
+    return {
+        "outstanding_balance": coerce_optional_text(
+            existing_row.get("outstanding_balance")
+        ),
+        "outstanding_balance_currency": coerce_optional_text(
+            existing_row.get("outstanding_balance_currency")
+        ),
+        "outstanding_balance_as_of": coerce_optional_text(
+            existing_row.get("outstanding_balance_as_of")
+        ),
+    }
 
 
 def dedupe_party_clusters(payloads: list[str]) -> list[dict[str, object]]:
@@ -1238,13 +1326,18 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
         name=coerce_optional_text(row.get("name")),
         start_date=coerce_optional_text(row.get("start_date")),
         end_date=coerce_optional_text(row.get("end_date")),
-        amount=coerce_optional_text(row.get("amount")),
+        principal_amount=coerce_optional_text(row.get("principal_amount")),
+        principal_currency=coerce_optional_text(row.get("principal_currency")),
+        principal_amount_kind=coerce_optional_text(row.get("principal_amount_kind")),
+        amounts_json=str(row.get("amounts_json") or "[]"),
         amendment_of=coerce_optional_text(row.get("amendment_of")),
         retired_by=tuple(json.loads(str(row.get("retired_by_json") or "[]"))),
         split_of=coerce_optional_text(row.get("split_of")),
         parties_json=str(row.get("parties_json") or "[]"),
         lenders_known_incomplete=coerce_flag(row.get("lenders_known_incomplete")),
-        normalized_amount=normalize_amount(coerce_optional_text(row.get("amount"))),
+        normalized_amount=normalize_amount(
+            coerce_optional_text(row.get("principal_amount"))
+        ),
         normalized_start_date=normalize_date(
             coerce_optional_text(row.get("start_date"))
         ),

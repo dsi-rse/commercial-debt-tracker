@@ -28,7 +28,7 @@ def mention_row(**overrides: object) -> dict[str, object]:
         "name": "5.25% senior notes due 2028",
         "start_date": "2024-06-01",
         "end_date": "2028-06-01",
-        "amount": "500000000",
+        "principal_amount": "500000000",
         "amendment_of": None,
         "retired_by_json": "[]",
         "split_of": None,
@@ -174,7 +174,7 @@ def test_keyless_mention_matches_on_identifying_fingerprint() -> None:
     redemption = prepare_mention(
         mention_row(
             debt_instrument_mention_id="mention-2",
-            amount=None,
+            principal_amount=None,
             start_date=None,
             end_date=None,
         )
@@ -193,7 +193,7 @@ def test_keyless_mention_with_generic_name_stays_unmatched() -> None:
         mention_row(
             debt_instrument_mention_id="mention-2",
             name="senior secured notes",
-            amount=None,
+            principal_amount=None,
             start_date=None,
             end_date=None,
         )
@@ -208,7 +208,7 @@ def test_keyless_mention_requires_exact_fingerprint_in_cluster() -> None:
         mention_row(
             debt_instrument_mention_id="mention-2",
             name="6.75% senior notes due 2031",
-            amount=None,
+            principal_amount=None,
             start_date=None,
             end_date=None,
         )
@@ -225,7 +225,7 @@ def test_keyless_mention_still_blocked_by_end_date_conflict() -> None:
         mention_row(
             debt_instrument_mention_id="mention-2",
             name="5.25% senior secured notes",
-            amount=None,
+            principal_amount=None,
             start_date=None,
             end_date="2031-06-01",
         )
@@ -239,7 +239,7 @@ def test_partial_key_mention_matches_despite_amount_conflict() -> None:
     partial = prepare_mention(
         mention_row(
             debt_instrument_mention_id="mention-2",
-            amount="400000000",
+            principal_amount="400000000",
             start_date=None,
         )
     )
@@ -267,7 +267,7 @@ def test_year_only_fingerprint_identifies() -> None:
             debt_instrument_mention_id="mention-2",
             item_id="item-2",
             name="Senior Secured Notes due 2027",
-            amount=None,
+            principal_amount=None,
             start_date=None,
             end_date="2027-12-31",
         )
@@ -282,7 +282,7 @@ def test_announcement_name_without_the_coupon_attaches_to_its_closing() -> None:
     announcement = prepare_mention(
         mention_row(
             name="senior secured first lien notes due 2034",
-            amount="750000000",
+            principal_amount="750000000",
             start_date=None,
             end_date="2034-12-31",
             end_date_json=json.dumps({"derived_from": "name"}),
@@ -293,7 +293,7 @@ def test_announcement_name_without_the_coupon_attaches_to_its_closing() -> None:
             debt_instrument_mention_id="mention-2",
             item_id="item-2",
             name="7.500% senior secured first lien notes due 2034",
-            amount="750000000",
+            principal_amount="750000000",
             start_date="2026-08-21",
             end_date="2034-09-15",
         )
@@ -308,7 +308,7 @@ def test_a_class_designator_is_not_a_shortened_name() -> None:
     tranche_a = prepare_mention(
         mention_row(
             name="Tranche A Loan",
-            amount="75000000",
+            principal_amount="75000000",
             start_date=None,
             end_date="2031-07-10",
         )
@@ -317,7 +317,7 @@ def test_a_class_designator_is_not_a_shortened_name() -> None:
         mention_row(
             debt_instrument_mention_id="mention-2",
             name="Tranche B Loan",
-            amount="25000000",
+            principal_amount="25000000",
             start_date=None,
             end_date="2031-07-10",
         )
@@ -335,7 +335,7 @@ def test_a_generic_issuer_name_turns_off_the_relaxed_key_rule() -> None:
     first = prepare_mention(
         mention_row(
             name="Consolidated Obligation Bonds",
-            amount="10000000",
+            principal_amount="10000000",
             start_date=None,
             end_date=None,
         )
@@ -345,7 +345,7 @@ def test_a_generic_issuer_name_turns_off_the_relaxed_key_rule() -> None:
             debt_instrument_mention_id="mention-2",
             item_id="item-2",
             name="Consolidated Obligation Bonds",
-            amount="10000000",
+            principal_amount="10000000",
             start_date=None,
             end_date=None,
         )
@@ -364,7 +364,9 @@ def test_upsized_pricing_mention_attaches_by_fingerprint() -> None:
     which is what keeps this apart from two siblings in one document (#131).
     """
     launch = prepare_mention(
-        mention_row(name="9.875% Senior Secured Notes due 2025", amount="400000000")
+        mention_row(
+            name="9.875% Senior Secured Notes due 2025", principal_amount="400000000"
+        )
     )
     pricing = prepare_mention(
         mention_row(
@@ -372,7 +374,7 @@ def test_upsized_pricing_mention_attaches_by_fingerprint() -> None:
             item_id="item-2",
             accession_number="0000000000-24-000002",
             name="9.875% Senior Secured Notes due 2025",
-            amount="555159000",
+            principal_amount="555159000",
         )
     )
     candidates = score(pricing, profile_from(launch))
@@ -385,7 +387,7 @@ def test_same_item_sibling_with_a_conflicting_amount_does_not_attach() -> None:
     initial = prepare_mention(
         mention_row(
             name="10% Senior Secured Convertible Note",
-            amount="1250000",
+            principal_amount="1250000",
             start_date="2026-08-13",
             end_date=None,
         )
@@ -394,7 +396,7 @@ def test_same_item_sibling_with_a_conflicting_amount_does_not_attach() -> None:
         mention_row(
             debt_instrument_mention_id="mention-2",
             name="10% Senior Secured Convertible Note",
-            amount="1100000",
+            principal_amount="1100000",
             start_date="2026-08-13",
             end_date=None,
         )
@@ -407,7 +409,7 @@ def test_same_item_add_on_with_its_own_start_date_still_attaches() -> None:
     series = prepare_mention(
         mention_row(
             name="5.875% Senior Notes due 2034",
-            amount="500000000",
+            principal_amount="500000000",
             start_date="2026-05-29",
             end_date="2034-12-31",
         )
@@ -416,7 +418,7 @@ def test_same_item_add_on_with_its_own_start_date_still_attaches() -> None:
         mention_row(
             debt_instrument_mention_id="mention-2",
             name="5.875% Senior Notes due 2034",
-            amount="100000000",
+            principal_amount="100000000",
             start_date="2026-08-13",
             end_date="2034-12-31",
         )
@@ -440,13 +442,15 @@ def test_closing_mention_with_drifted_start_date_attaches_by_fingerprint() -> No
 def test_generic_name_upsize_stays_split() -> None:
     """Launch names without a coupon cannot bridge conflicting amounts."""
     launch = prepare_mention(
-        mention_row(name="Senior Guaranteed Notes due 2029", amount="800000000")
+        mention_row(
+            name="Senior Guaranteed Notes due 2029", principal_amount="800000000"
+        )
     )
     pricing = prepare_mention(
         mention_row(
             debt_instrument_mention_id="mention-2",
             name="Senior Guaranteed Notes due 2029",
-            amount="900000000",
+            principal_amount="900000000",
         )
     )
     assert score(pricing, profile_from(launch)) == []
@@ -466,7 +470,7 @@ def test_relation_target_cannot_join_declaring_cluster() -> None:
     old_notes = prepare_mention(
         mention_row(
             name="6.375% Senior Notes due 2025",
-            amount="38400000",
+            principal_amount="38400000",
             start_date="2010-05-11",
             retired_by_json='["mention-new"]',
         )
@@ -475,7 +479,7 @@ def test_relation_target_cannot_join_declaring_cluster() -> None:
         mention_row(
             debt_instrument_mention_id="mention-new",
             name="6.375% Senior Notes due 2025",
-            amount="231800000",
+            principal_amount="231800000",
         )
     )
     assert score(new_notes, profile_from(old_notes)) == []
@@ -487,13 +491,13 @@ def test_declaring_mention_cannot_join_target_cluster() -> None:
         mention_row(
             debt_instrument_mention_id="mention-new",
             name="6.375% Senior Notes due 2025",
-            amount="231800000",
+            principal_amount="231800000",
         )
     )
     old_notes = prepare_mention(
         mention_row(
             name="6.375% Senior Notes due 2025",
-            amount="38400000",
+            principal_amount="38400000",
             start_date="2010-05-11",
             retired_by_json='["mention-new"]',
         )

@@ -95,10 +95,26 @@ INSTRUMENT_SINGLE_VALUE_PROPERTIES = {
     "end_date": {"date", "debt_instrument"},
     # The same holds for a principal stated inside the name, as in
     # `$183.36 million term loan`: there is no separate `amount` span to cite,
-    # and rejecting the name span lost the amount outright (#129).
+    # and rejecting the name span lost the amount outright (#129). The bare
+    # `amount` property is the pre-#140 shape, still accepted so stored batch
+    # responses replay; the prompt now teaches `amounts`.
     "amount": {"amount", "debt_instrument"},
     "name": {"debt_instrument"},
 }
+# One mention can state several money facts about one instrument — a $2.5B
+# commitment and a $270.5M outstanding balance — so amounts are a kind-typed
+# list (#140). The matcher keys only on commitment/principal; the other kinds
+# are observations.
+AMOUNT_KINDS = {
+    "commitment",
+    "principal",
+    "outstanding_balance",
+    "draw",
+    "repayment",
+    "proceeds",
+}
+PRINCIPAL_AMOUNT_KINDS = ("commitment", "principal")
+AMOUNT_EVIDENCE_TAG_TYPES = {"amount", "debt_instrument"}
 MATURITY_EVIDENCE_TAG_TYPES = {"debt_instrument"}
 NAME_EMBEDDED_AMOUNT_TAG_TYPES = {"debt_instrument"}
 STANDARDIZED_SINGLE_VALUE_PROPERTIES = {"start_date", "end_date", "amount"}
@@ -231,7 +247,9 @@ DEBT_INSTRUMENT_MENTION_COLUMNS = [
     "name",
     "start_date",
     "end_date",
-    "amount",
+    "principal_amount",
+    "principal_currency",
+    "principal_amount_kind",
     "amendment_of",
     "retired_by_json",
     "split_of",
@@ -239,7 +257,7 @@ DEBT_INSTRUMENT_MENTION_COLUMNS = [
     "name_json",
     "start_date_json",
     "end_date_json",
-    "amount_json",
+    "amounts_json",
     "lenders_known_incomplete",
 ]
 
@@ -691,6 +709,13 @@ def validate_instrument_entry(
                 failures.append(
                     f"Entry {index}: '{property_name}' tag {tag_id} is type '{tag_info['type']}', expected {expected}."
                 )
+    failures.extend(
+        validate_amounts_property(
+            index=index,
+            obj=obj,
+            tag_details=tag_details,
+        )
+    )
     for property_name in PARTY_PROPERTY_ANNOTATIONS:
         failures.extend(
             validate_party_property(
@@ -760,11 +785,12 @@ class InstrumentIEStage:
         for index, obj in mention_entries:
             raw_id = raw_id_for(index)
             name_text = canonical_value(obj.get("name", []), tag_details)
-            amount_payload = standardized_amount_payload(
-                obj.get("amount"),
+            amount_payloads = standardized_amounts_payloads(
+                obj,
                 tag_details,
                 name_text=name_text,
             )
+            principal = select_principal_amount(amount_payloads)
             start_date_payload = standardized_date_payload(
                 obj.get("start_date"),
                 tag_details,
@@ -788,7 +814,9 @@ class InstrumentIEStage:
                 "name": name_text,
                 "start_date": start_date_payload["normalized_date"],
                 "end_date": end_date_payload["normalized_date"],
-                "amount": amount_payload["normalized_amount"],
+                "principal_amount": principal.get("normalized_amount"),
+                "principal_currency": principal.get("currency"),
+                "principal_amount_kind": principal.get("kind"),
                 "amendment_of": None,
                 "retired_by_json": "[]",
                 "split_of": None,
@@ -800,7 +828,7 @@ class InstrumentIEStage:
                 ),
                 "start_date_json": json.dumps(start_date_payload, sort_keys=True),
                 "end_date_json": json.dumps(end_date_payload, sort_keys=True),
-                "amount_json": json.dumps(amount_payload, sort_keys=True),
+                "amounts_json": json.dumps(amount_payloads, sort_keys=True),
             }
             mention_id = debt_instrument_mention_id_for(
                 row_state.item_id,
@@ -2312,6 +2340,7 @@ def validate_amount_is_not_rate(
     index: int,
     value: object,
     tag_details: dict[str, dict[str, object]],
+    property_label: str = "amount",
 ) -> list[str]:
     """Reject an amount whose evidence only describes a rate, margin, or fee."""
     if not isinstance(value, dict):
@@ -2335,11 +2364,95 @@ def validate_amount_is_not_rate(
     quoted = ", ".join(f"'{text}'" for text in evidence_texts)
     return [
         (
-            f"Entry {index}: 'amount' evidence {quoted} describes an interest rate, "
-            "margin, or fee rather than a principal or commitment amount. Cite the "
-            "principal or commitment amount instead, or omit 'amount'."
+            f"Entry {index}: '{property_label}' evidence {quoted} describes an interest rate, "
+            "margin, or fee rather than a money amount. Cite the money amount "
+            f"instead, or omit '{property_label}'."
         )
     ]
+
+
+def validate_amounts_property(
+    *,
+    index: int,
+    obj: dict[str, Any],
+    tag_details: dict[str, dict[str, object]],
+) -> list[str]:
+    """Validate the kind-typed amounts list on one instrument entry (#140)."""
+    if "amounts" not in obj:
+        return []
+    entries = obj["amounts"]
+    if not isinstance(entries, list):
+        return [f"Entry {index}: 'amounts' must be a list of objects."]
+    failures: list[str] = []
+    for position, entry in enumerate(entries):
+        label = f"amounts[{position}]"
+        if not isinstance(entry, dict):
+            failures.append(f"Entry {index}: '{label}' must be an object.")
+            continue
+        kind = entry.get("kind")
+        if kind not in AMOUNT_KINDS:
+            allowed = ", ".join(sorted(AMOUNT_KINDS))
+            failures.append(f"Entry {index}: '{label}.kind' must be one of {allowed}.")
+        evidence = entry.get("evidence")
+        if not isinstance(evidence, list):
+            failures.append(
+                f"Entry {index}: '{label}.evidence' must be a list of tag IDs."
+            )
+            continue
+        for tag_id in evidence:
+            if not isinstance(tag_id, str):
+                failures.append(
+                    f"Entry {index}: '{label}.evidence' must contain string tag IDs only."
+                )
+                continue
+            tag_info = tag_details.get(tag_id)
+            if tag_info is None:
+                failures.append(
+                    f"Entry {index}: '{label}' contains unknown tag ID {tag_id}."
+                )
+            elif tag_info["type"] not in AMOUNT_EVIDENCE_TAG_TYPES:
+                expected = ", ".join(sorted(AMOUNT_EVIDENCE_TAG_TYPES))
+                failures.append(
+                    f"Entry {index}: '{label}' tag {tag_id} is type "
+                    f"'{tag_info['type']}', expected {expected}."
+                )
+        normalized_amount = entry.get("normalized_amount")
+        if normalized_amount is not None and (
+            not isinstance(normalized_amount, str)
+            or not NUMERIC_STRING_PATTERN.fullmatch(normalized_amount)
+        ):
+            failures.append(
+                f"Entry {index}: '{label}.normalized_amount' must be a numeric "
+                "string or null."
+            )
+        currency = entry.get("currency")
+        if currency is not None and (
+            not isinstance(currency, str)
+            or len(currency) != CURRENCY_CODE_LENGTH
+            or currency != currency.upper()
+        ):
+            failures.append(
+                f"Entry {index}: '{label}.currency' must be an uppercase "
+                "3-letter code or null."
+            )
+        as_of = entry.get("as_of_date")
+        if as_of is not None and (
+            not isinstance(as_of, str)
+            or not ISO_DATE_PATTERN.fullmatch(as_of)
+            or not is_valid_iso_date(as_of)
+        ):
+            failures.append(
+                f"Entry {index}: '{label}.as_of_date' must be YYYY-MM-DD or null."
+            )
+        failures.extend(
+            validate_amount_is_not_rate(
+                index=index,
+                value=entry,
+                tag_details=tag_details,
+                property_label=label,
+            )
+        )
+    return failures
 
 
 def iter_instrument_entries(
@@ -2377,8 +2490,7 @@ def debt_instrument_mention_id_for(
 ) -> str:
     """Return a stable persisted debt-instrument-mention ID."""
     payload = {
-        "amount": mention_row.get("amount"),
-        "amount_json": normalize_json_text(mention_row.get("amount_json")),
+        "amounts_json": normalize_json_text(mention_row.get("amounts_json")),
         "end_date": mention_row.get("end_date"),
         "end_date_json": normalize_json_text(mention_row.get("end_date_json")),
         "item_id": item_id,
@@ -2386,6 +2498,7 @@ def debt_instrument_mention_id_for(
         "name_json": normalize_json_text(mention_row.get("name_json")),
         "name": mention_row.get("name"),
         "parties_json": normalize_json_text(mention_row.get("parties_json")),
+        "principal_amount": mention_row.get("principal_amount"),
         "start_date": mention_row.get("start_date"),
         "start_date_json": normalize_json_text(mention_row.get("start_date_json")),
     }
@@ -2781,6 +2894,83 @@ def standardized_amount_payload(
     return payload
 
 
+def standardized_amounts_payloads(
+    obj: dict[str, Any],
+    tag_details: dict[str, dict[str, object]],
+    *,
+    name_text: str | None,
+) -> list[dict[str, object]]:
+    """Return the kind-typed amount payloads for one instrument entry (#140).
+
+    Reads the ``amounts`` list, falling back to the pre-#140 single ``amount``
+    shape (kind unknown → null) so stored batch responses replay. When neither
+    yields a value but the instrument's name embeds a principal, one
+    name-derived principal entry is synthesized, preserving #129.
+    """
+    payloads: list[dict[str, object]] = []
+    entries = obj.get("amounts")
+    if isinstance(entries, list):
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            payload = standardized_amount_payload(
+                entry,
+                tag_details,
+                name_text=name_text,
+            )
+            kind = entry.get("kind")
+            payload["kind"] = kind if kind in AMOUNT_KINDS else None
+            as_of = entry.get("as_of_date")
+            payload["as_of_date"] = (
+                as_of
+                if isinstance(as_of, str)
+                and ISO_DATE_PATTERN.fullmatch(as_of)
+                and is_valid_iso_date(as_of)
+                else None
+            )
+            payloads.append(payload)
+    elif "amount" in obj:
+        payload = standardized_amount_payload(
+            obj.get("amount"),
+            tag_details,
+            name_text=name_text,
+        )
+        payload["kind"] = None
+        payload["as_of_date"] = None
+        payloads.append(payload)
+    if not any(payload.get("normalized_amount") for payload in payloads):
+        synthesized = standardized_amount_payload(
+            None,
+            tag_details,
+            name_text=name_text,
+        )
+        if synthesized.get("normalized_amount") is not None:
+            synthesized["kind"] = "principal"
+            synthesized["as_of_date"] = None
+            payloads.append(synthesized)
+    return payloads
+
+
+def select_principal_amount(payloads: list[dict[str, object]]) -> dict[str, object]:
+    """Return the payload that supplies the flat principal columns.
+
+    Commitment and principal are the identity-bearing kinds the matcher keys
+    on (#140); a kind-less payload is the legacy single-amount shape, whose
+    value carried the same meaning. Balances, draws, repayments, and proceeds
+    never become the headline amount.
+    """
+    for payload in payloads:
+        if (
+            payload.get("normalized_amount") is not None
+            and payload.get("kind") in PRINCIPAL_AMOUNT_KINDS
+        ):
+            return payload
+    for payload in payloads:
+        if payload.get("normalized_amount") is not None and payload.get("kind") is None:
+            return payload
+    return {}
+
+
 def standardized_date_payload(
     value: object,
     tag_details: dict[str, dict[str, object]],
@@ -3000,10 +3190,18 @@ def relation_instrument_manifest(row_state: ExtractionRowState) -> str:
     lines: list[str] = []
     for mention in row_state.debt_instrument_mentions:
         attributes = [f'id="{escape_xml_attribute(str(mention["raw_id"]))}"']
-        for field_name in ("name", "amount", "start_date", "end_date"):
+        # The manifest keeps the attribute name `amount`: the relation prompt
+        # speaks in the filing's own vocabulary, not the storage schema's.
+        manifest_fields = (
+            ("name", "name"),
+            ("amount", "principal_amount"),
+            ("start_date", "start_date"),
+            ("end_date", "end_date"),
+        )
+        for attribute_name, field_name in manifest_fields:
             value = coerce_dataset_text(mention.get(field_name))
             if value is not None:
-                attributes.append(f'{field_name}="{escape_xml_attribute(value)}"')
+                attributes.append(f'{attribute_name}="{escape_xml_attribute(value)}"')
         lines.append(f"  <instrument {' '.join(attributes)}/>")
     if not lines:
         return ""
