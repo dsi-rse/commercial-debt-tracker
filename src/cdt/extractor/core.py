@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
 import hashlib
 import json
 import re
@@ -162,13 +163,26 @@ NUMERIC_STRING_PATTERN = re.compile(r"^\d+(?:\.\d+)?$")
 MATURITY_COORDINATED_YEARS = (
     r"(?:\s*(?:,|/|&|and(?:/or)?|or)\s*(?:[A-Za-z]+\s+\d{1,2},?\s+)?\d{4})*"
 )
+# Like MATURITY_COORDINATED_YEARS, but each further year may carry a bare month
+# with no day, so `due October 1, 2028 and April 2030` and `due April 2033 and
+# June 2035` both read as two maturities (#164).
+MATURITY_MONTH_YEAR_COORDINATION = (
+    r"(?:\s*(?:,|/|&|and(?:/or)?|or)\s*(?:[A-Za-z]+\s+(?:\d{1,2},?\s+)?)?\d{4})*"
+)
 MATURITY_FULL_DATE_PATTERN = re.compile(
     r"\bdue\s+(?:on\s+)?(?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2}),?\s+(?P<year>\d{4})"
-    rf"(?P<more>{MATURITY_COORDINATED_YEARS})",
+    rf"(?P<more>{MATURITY_MONTH_YEAR_COORDINATION})",
     re.IGNORECASE,
 )
 MATURITY_YEAR_PATTERN = re.compile(
     rf"\bdue\s+(?:in\s+)?(?P<years>\d{{4}}{MATURITY_COORDINATED_YEARS})\b",
+    re.IGNORECASE,
+)
+# `due April 2033` states a month-resolution maturity (#164); it normalizes to
+# the month's last day.
+MATURITY_MONTH_YEAR_PATTERN = re.compile(
+    r"\bdue\s+(?:in\s+)?(?P<month>[A-Za-z]+),?\s+(?P<year>\d{4})"
+    rf"(?P<more>{MATURITY_MONTH_YEAR_COORDINATION})",
     re.IGNORECASE,
 )
 FOUR_DIGIT_YEAR_PATTERN = re.compile(r"\d{4}")
@@ -3110,6 +3124,7 @@ def normalized_maturity_from_text(text: str | None) -> str | None:
     if not text:
         return None
     full_dates: set[str] = set()
+    month_dates: set[str] = set()
     years: set[str] = set()
     for match in MATURITY_FULL_DATE_PATTERN.finditer(text):
         normalized = iso_date_from_parts(
@@ -3118,13 +3133,29 @@ def normalized_maturity_from_text(text: str | None) -> str | None:
         if normalized is not None:
             full_dates.add(normalized)
         years.update(FOUR_DIGIT_YEAR_PATTERN.findall(match.group("more")))
+    for match in MATURITY_MONTH_YEAR_PATTERN.finditer(text):
+        normalized = iso_month_end_from_parts(match.group("year"), match.group("month"))
+        if normalized is not None:
+            month_dates.add(normalized)
+            years.update(FOUR_DIGIT_YEAR_PATTERN.findall(match.group("more")))
     for match in MATURITY_YEAR_PATTERN.finditer(text):
         years.update(FOUR_DIGIT_YEAR_PATTERN.findall(match.group("years")))
     if full_dates:
-        # A bare alternate year alongside a full date states a second maturity too.
+        # A bare alternate year alongside a full date states a second maturity
+        # too, and so does a month-year phrase for a different month (#164).
         if len(full_dates) != 1 or years - {value[:4] for value in full_dates}:
             return None
-        return full_dates.pop()
+        full_date = full_dates.pop()
+        if any(value[:7] != full_date[:7] for value in month_dates):
+            return None
+        return full_date
+    if month_dates:
+        if len(month_dates) != 1:
+            return None
+        month_date = month_dates.pop()
+        if years - {month_date[:4]}:
+            return None
+        return month_date
     if len(years) != 1:
         return None
     return f"{years.pop()}{YEAR_ONLY_MATURITY_SUFFIX}"
@@ -3136,6 +3167,21 @@ def iso_date_from_parts(year: str, month_name: str, day: str) -> str | None:
     if month is None:
         return None
     normalized = f"{year}-{month}-{int(day):02d}"
+    return normalized if is_valid_iso_date(normalized) else None
+
+
+def iso_month_end_from_parts(year: str, month_name: str) -> str | None:
+    """Return the last day of one month-year maturity such as `due April 2033`.
+
+    Month resolution is strictly better than the year-end synthetic the same
+    name would produce without the month (#164); the matcher compares
+    name-derived values at their true resolution either way.
+    """
+    month = MONTH_MAP.get(month_name.lower())
+    if month is None:
+        return None
+    last_day = calendar.monthrange(int(year), int(month))[1]
+    normalized = f"{year}-{month}-{last_day:02d}"
     return normalized if is_valid_iso_date(normalized) else None
 
 

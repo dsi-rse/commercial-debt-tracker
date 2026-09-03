@@ -1799,6 +1799,7 @@ def lender_similarity_score(left: str, right: str) -> float:
 
 
 YEAR_TEXT_LENGTH = 4
+MONTH_TEXT_LENGTH = 7
 
 
 def normalized_end_date_for_matching(row: dict[str, object]) -> str | None:
@@ -1809,16 +1810,20 @@ def normalized_end_date_for_matching(row: dict[str, object]) -> str | None:
     Comparing that synthesized day would either invent precision or force every
     genuine December 31 maturity to be treated loosely — which is what happened
     while the provenance flag was missing (#128). Name-derived year-end values
-    collapse to the bare year here; stated dates keep their day.
+    collapse to the bare year here; other name-derived values — the month-end
+    synthesized from "due April 2033" (#164), or a full date embedded in the
+    name — collapse to their month, so a stated mid-month maturity does not
+    falsely conflict with the name's synthetic day. Stated dates keep their
+    day.
     """
     value = normalize_date(coerce_optional_text(row.get("maturity_date")))
     if not value:
         return None
-    if value.endswith("-12-31") and end_date_is_name_derived(
-        row.get("maturity_date_json")
-    ):
-        return value[:4]
-    return value
+    if not end_date_is_name_derived(row.get("maturity_date_json")):
+        return value
+    if value.endswith("-12-31"):
+        return value[:YEAR_TEXT_LENGTH]
+    return value[:MONTH_TEXT_LENGTH]
 
 
 def end_date_is_name_derived(payload_text: object) -> bool:
@@ -1834,8 +1839,9 @@ def end_dates_are_compatible(left: str | None, right: str | None) -> bool:
     """Return whether two normalized end dates can still describe one instrument.
 
     A bare four-digit year is a year-resolution value from a name-derived
-    maturity (#128); it matches any date in that year. Full dates — including a
-    genuine December 31 — must agree exactly.
+    maturity (#128) and matches any date in that year; a seven-character
+    ``YYYY-MM`` is month-resolution (#164) and matches any date in that month.
+    Full stated dates — including a genuine December 31 — must agree exactly.
     """
     if not left or not right:
         return True
@@ -1843,7 +1849,10 @@ def end_dates_are_compatible(left: str | None, right: str | None) -> bool:
         return True
     if left[:YEAR_TEXT_LENGTH] != right[:YEAR_TEXT_LENGTH]:
         return False
-    return len(left) == YEAR_TEXT_LENGTH or len(right) == YEAR_TEXT_LENGTH
+    if len(left) == YEAR_TEXT_LENGTH or len(right) == YEAR_TEXT_LENGTH:
+        return True
+    shorter, longer = sorted((left, right), key=len)
+    return len(shorter) == MONTH_TEXT_LENGTH and longer[:MONTH_TEXT_LENGTH] == shorter
 
 
 NAME_RATE_PATTERN = re.compile(r"\d+(?:\.\d+)?%")

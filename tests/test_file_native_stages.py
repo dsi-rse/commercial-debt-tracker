@@ -4384,3 +4384,21 @@ def test_canonical_maturity_prefers_stated_over_name_derived() -> None:
     )
     assert rows[0]["maturity_date"] == "2030-12-31"
     assert rows[0]["maturity_source_mention_id"] == "m-later"
+
+
+def test_normalized_maturity_from_text_parses_month_year_phrases() -> None:
+    """`due April 2033` normalizes to the month's last day (#164)."""
+    assert normalized_maturity_from_text("notes due April 2033") == "2033-04-30"
+    assert normalized_maturity_from_text("notes due in February 2028") == "2028-02-29"
+    assert normalized_maturity_from_text("due September 2031") == "2031-09-30"
+    # A full date still wins its own precision, and coordinated month-years
+    # are two maturities.
+    assert normalized_maturity_from_text("due April 7, 2033") == "2033-04-07"
+    assert normalized_maturity_from_text("due April 2033 and June 2035") is None
+    assert normalized_maturity_from_text("due April 2033 and 2035") is None
+    assert normalized_maturity_from_text("due October 1, 2028 and April 2030") is None
+    # A month-year restating the full date's own month is not a second maturity.
+    assert (
+        normalized_maturity_from_text("due April 7, 2033, i.e. due April 2033")
+        == "2033-04-07"
+    )

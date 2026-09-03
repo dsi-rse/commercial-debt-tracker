@@ -609,3 +609,20 @@ def test_published_retirers_are_sorted_not_set_order() -> None:
     )
 
     assert links["m-old"]["retired_by_debt_instrument_ids"] == json.dumps(retirers)
+
+
+def test_name_derived_month_end_collapses_to_month_resolution() -> None:
+    """`due April 2033` in a name matches any stated date in that month (#164)."""
+    derived = mention_row(
+        maturity_date="2033-04-30",
+        maturity_date_json=json.dumps({"derived_from": "name"}),
+    )
+    stated = mention_row(maturity_date="2033-04-30")
+    assert prepare_mention(derived).normalized_end_date == "2033-04"
+    assert prepare_mention(stated).normalized_end_date == "2033-04-30"
+
+    assert end_dates_are_compatible("2033-04", "2033-04-15")
+    assert end_dates_are_compatible("2033-04-15", "2033-04")
+    assert end_dates_are_compatible("2033-04", "2033")
+    assert not end_dates_are_compatible("2033-04", "2033-06-15")
+    assert not end_dates_are_compatible("2033-04-30", "2033-04-15")
