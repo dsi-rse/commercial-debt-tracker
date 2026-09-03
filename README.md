@@ -37,7 +37,7 @@ The deployed service is a single ECS Fargate task running `cdt-orchestrator`, wi
 - infrastructure provisioned from [`pulumi/`](pulumi/)
 - a daily EventBridge Scheduler trigger that runs `cdt-orchestrator daily`
 - an hourly EventBridge Scheduler trigger that runs `cdt-orchestrator poll`
-- manual historical backfills via ECS task command overrides or the `run-historical` GitHub Actions workflow
+- manual historical backfills via `scripts/run-historical.sh` (admin-run ECS task command overrides; see [docs/deployment.md](docs/deployment.md))
 
 The deployed `daily` run does ingest → itemize → classify and refreshes match/final
 snapshots, but hands the expensive LLM extract stage to OpenAI's Batch API. The hourly

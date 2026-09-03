@@ -182,6 +182,9 @@ Because `idi:schedule_enabled` should be `false` for the first deploy, nothing r
 
 ## Run a Historical Backfill Manually
 
+`./scripts/run-historical.sh` wraps everything below -- prefer it for real runs.
+The raw pattern is kept here to show what the script does.
+
 Use the deployed ECS task definition with a container command override. From the repository's `pulumi/` directory, log into the Pulumi backend, select the stack, and capture the relevant Pulumi outputs:
 
 ```bash
