@@ -4081,3 +4081,85 @@ def test_instrument_type_persists_and_rejects_unknown_values() -> None:
         json.dumps([{"name": ["tag-i-1"], "instrument_type": "surety_bond"}]),
     )
     assert any("'instrument_type' must be one of" in failure for failure in failures)
+
+
+RATE_TAGGED_XML = """
+<body>
+The <debt_instrument id="tag-i-1">3.875% senior notes due 2028</debt_instrument> were
+issued, and revolver borrowings bear interest at
+<interest_rate id="tag-r-1">SOFR plus 0.875% per annum</interest_rate>.
+</body>
+""".strip()
+
+
+def test_interest_rate_is_parser_verified_from_name_or_evidence() -> None:
+    """rate_pct publishes only when a cited or name-embedded rate matches (#157)."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = RATE_TAGGED_XML
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "interest_rate": {
+                    "kind": "fixed",
+                    "rate_pct": "3.875",
+                    "evidence": ["tag-i-1"],
+                },
+            }
+        ]
+    )
+    InstrumentIEStage().postprocess(row_state)
+
+    mention = row_state.debt_instrument_mentions[0]
+    assert mention["interest_rate_kind"] == "fixed"
+    assert mention["interest_rate_pct"] == "3.875"
+    payload = json.loads(str(mention["interest_rate_json"]))
+    assert payload["derived_from"] == "name"
+
+
+def test_interest_rate_mismatch_publishes_null_rate() -> None:
+    """A model rate contradicted by every cited span keeps kind but no number."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = RATE_TAGGED_XML
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "interest_rate": {
+                    "kind": "floating",
+                    "rate_pct": "5.5",
+                    "evidence": ["tag-r-1"],
+                },
+            }
+        ]
+    )
+    InstrumentIEStage().postprocess(row_state)
+
+    mention = row_state.debt_instrument_mentions[0]
+    assert mention["interest_rate_kind"] == "floating"
+    assert mention["interest_rate_pct"] is None
+
+
+def test_interest_rate_validation_rejects_bad_kind_and_evidence() -> None:
+    """Kind must be fixed or floating; evidence must be rate or own-name tags."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = RATE_TAGGED_XML
+    response = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "interest_rate": {"kind": "variable", "evidence": ["tag-r-1"]},
+            }
+        ]
+    )
+    failures = InstrumentIEStage().validate(row_state, response)
+    assert any("'interest_rate.kind' must be one of" in failure for failure in failures)

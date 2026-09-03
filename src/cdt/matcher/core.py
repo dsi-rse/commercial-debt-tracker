@@ -85,6 +85,8 @@ DEBT_INSTRUMENT_COLUMNS = [
     "outstanding_balance",
     "outstanding_balance_currency",
     "outstanding_balance_as_of",
+    "interest_rate_kind",
+    "interest_rate_pct",
     "parties_json",
     "lenders_known_incomplete",
 ]
@@ -147,6 +149,8 @@ class PreparedMention:
     principal_currency: str | None
     principal_amount_kind: str | None
     amounts_json: str
+    interest_rate_kind: str | None
+    interest_rate_pct: str | None
     status: str | None
     status_date: str | None
     amendment_of: str | None
@@ -1162,6 +1166,7 @@ def build_debt_instrument_rows(
                 **outstanding_balance_fields(
                     ordered_member_ids, mention_index, existing_row
                 ),
+                **interest_rate_fields(ordered_member_ids, mention_index, existing_row),
                 "parties_json": parties_json,
                 "lenders_known_incomplete": lenders_known_incomplete,
             }
@@ -1277,6 +1282,31 @@ def outstanding_balance_fields(
     }
 
 
+def interest_rate_fields(
+    ordered_member_ids: list[str],
+    mention_index: dict[str, PreparedMention],
+    existing_row: dict[str, object],
+) -> dict[str, str | None]:
+    """Return the canonical interest rate from the newest carrying mention (#157)."""
+    for mention_id in ordered_member_ids:
+        mention = mention_index[mention_id]
+        if mention.interest_rate_kind is not None or (
+            mention.interest_rate_pct is not None
+        ):
+            return {
+                "interest_rate_kind": mention.interest_rate_kind,
+                "interest_rate_pct": mention.interest_rate_pct,
+            }
+    return {
+        "interest_rate_kind": coerce_optional_text(
+            existing_row.get("interest_rate_kind")
+        ),
+        "interest_rate_pct": coerce_optional_text(
+            existing_row.get("interest_rate_pct")
+        ),
+    }
+
+
 def dedupe_party_clusters(payloads: list[str]) -> list[dict[str, object]]:
     """Return deduped party cluster payloads, keyed by role plus canonical name.
 
@@ -1353,6 +1383,8 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
         principal_currency=coerce_optional_text(row.get("principal_currency")),
         principal_amount_kind=coerce_optional_text(row.get("principal_amount_kind")),
         amounts_json=str(row.get("amounts_json") or "[]"),
+        interest_rate_kind=coerce_optional_text(row.get("interest_rate_kind")),
+        interest_rate_pct=coerce_optional_text(row.get("interest_rate_pct")),
         status=coerce_optional_text(row.get("status")),
         status_date=coerce_optional_text(row.get("status_date")),
         amendment_of=coerce_optional_text(row.get("amendment_of")),

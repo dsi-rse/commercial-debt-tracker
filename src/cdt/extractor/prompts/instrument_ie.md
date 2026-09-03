@@ -6,6 +6,7 @@ You are an expert in corporate debt financing and SEC disclosure language. You w
 - `debt_instrument`
 - `date`
 - `amount`
+- `interest_rate`
 
 Each tagged span has a unique `id` attribute. Use only those tagged spans and return structured JSON.
 
@@ -19,6 +20,7 @@ For each object, extract these properties when present:
 - `maturity_date`
 - `commitment_termination_date`
 - `amounts`
+- `interest_rate`
 - `status_event`
 - `lenders`
 - `lenders_known_incomplete`
@@ -36,6 +38,13 @@ For the instrument's category, return one optional plain string:
   - `credit_line`: other borrowing availability that is not a committed revolver, such as an uncommitted or discretionary line, or a letter-of-credit-only facility.
   - `note_bond`: a security — notes, bonds, debentures, convertibles.
   Omit `instrument_type` when none of the four fits (leases, surety bonds) or the document does not say.
+
+For the instrument's interest rate, return one optional object:
+- `interest_rate`: `{ "kind": "fixed" | "floating", "rate_pct": "3.875" | null, "evidence": ["tag-..."] }`
+  - `kind` is `fixed` when the instrument bears a stated rate, and `floating` when interest is set off a benchmark plus a margin.
+  - `rate_pct` is the stated fixed or all-in rate as a numeric string of digits and at most one decimal point, without the percent sign. Leave it `null` for a floating rate: benchmarks and margins are not recorded.
+  - `evidence` may contain `interest_rate` tag ids, or the instrument's own `debt_instrument` tag id when the coupon is embedded in the name, such as `3.875% senior notes due 2028`.
+  Omit `interest_rate` when the document states nothing about the instrument's interest.
 
 For the instrument's state, return one optional event:
 - `status_event`: `{ "status": "announced" | "entered_into" | "amended" | "terminated" | "repaid" | "exchanged" | "defaulted", "status_date": { "evidence": ["tag-..."], "normalized_date": "YYYY-MM-DD" | null } | null }`
@@ -144,7 +153,8 @@ Examples:
 - If a document describes `senior notes due October 1, 2028` and tags `October 1, 2028` as a date, cite the `date` tag id with `normalized_date` `2028-10-01`.
 - If a delayed-draw facility's draw period ends `June 30, 2027` and its loans mature `June 30, 2031`, return `commitment_termination_date` `2027-06-30` and `maturity_date` `2031-06-30`.
 - If a filing states only a Draw Period Termination Date and defines the maturity relative to it, such as `12 months after the Draw Period Termination Date`, return the stated date as `commitment_termination_date` and omit `maturity_date`: never publish an availability end as the maturity.
-- If a credit agreement says ABR Loans bear interest at `0.875% per annum`, do not return `0.875` in `amounts`. Omit `amounts` unless the document states a money amount for that loan.
+- If a credit agreement says ABR Loans bear interest at `0.875% per annum`, do not return `0.875` in `amounts`. That margin belongs nowhere: the loan's `interest_rate` is `{ "kind": "floating", "rate_pct": null }`, citing the tagged rate span. Omit `amounts` unless the document states a money amount for that loan.
+- If a document describes `3.875% senior notes due 2028` with no separate rate span, return `interest_rate` `{ "kind": "fixed", "rate_pct": "3.875" }`, citing the instrument's own tag id.
 - If a company closes a `$1.2 billion` working capital facility that provides revolving loans, swing line loans up to `$25 million`, and letters of credit, return one object with one `commitment` entry of `1200000000`, named by the facility's tagged span when present and otherwise by the `Revolving Loans` span. Do not return additional objects for `Swing Line Loans` or `Letters of Credit`, and never give any single mechanic the `$1.2 billion` total.
 - If a credit agreement provides a `$750 million` term facility and a `$750 million` revolving facility, return two objects, each with its own `commitment` entry of `750000000`. Do not return a third object for the agreement's `$1.5 billion` combined total.
 - If a company enters into a commitment increase and maturity extension agreement for its revolving credit agreement dated as of August 1, 2025, raising commitments to `$1.75 billion` and extending the maturity from August 1, 2030 to August 1, 2031, return exactly two objects for that facility: the facility as amended, with a `commitment` entry of `1750000000`, `start_date` `2025-08-01`, and `maturity_date` `2031-08-01`, and the predecessor, with `start_date` `2025-08-01`, `maturity_date` `2030-08-01`, and no `amounts` because the prior commitment is not stated.

@@ -125,6 +125,9 @@ AMOUNT_EVIDENCE_TAG_TYPES = {"amount", "debt_instrument"}
 # What one mention says happened to its instrument (#141). `matured` is
 # deliberately absent: filings almost never say it, and the matcher derives it
 # from maturity_date instead.
+INTEREST_RATE_KINDS = {"fixed", "floating"}
+INTEREST_RATE_EVIDENCE_TAG_TYPES = {"interest_rate", "debt_instrument"}
+RATE_PCT_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 # The four instrument categories the site facets on (#156); anything else
 # stays null rather than stretching a bucket.
 INSTRUMENT_TYPES = {
@@ -287,6 +290,8 @@ DEBT_INSTRUMENT_MENTION_COLUMNS = [
     "principal_amount_kind",
     "status",
     "status_date",
+    "interest_rate_kind",
+    "interest_rate_pct",
     "amendment_of",
     "retired_by_json",
     "split_of",
@@ -297,6 +302,7 @@ DEBT_INSTRUMENT_MENTION_COLUMNS = [
     "commitment_termination_date_json",
     "amounts_json",
     "status_json",
+    "interest_rate_json",
     "lenders_known_incomplete",
 ]
 
@@ -639,6 +645,7 @@ class NERStage:
             "date",
             "duration",
             "amount",
+            "interest_rate",
         }
         for element in root.iter():
             if element.tag not in allowed_tags:
@@ -767,6 +774,13 @@ def validate_instrument_entry(
             tag_details=tag_details,
         )
     )
+    failures.extend(
+        validate_interest_rate(
+            index=index,
+            obj=obj,
+            tag_details=tag_details,
+        )
+    )
     for property_name in PARTY_PROPERTY_ANNOTATIONS:
         failures.extend(
             validate_party_property(
@@ -864,6 +878,11 @@ class InstrumentIEStage:
             status_payload = standardized_status_payload(
                 obj.get("status_event"), tag_details
             )
+            interest_rate_payload = standardized_interest_rate_payload(
+                obj.get("interest_rate"),
+                tag_details,
+                name_text=name_text,
+            )
             party_clusters, lenders_known_incomplete = (
                 party_payloads_and_incompleteness(obj, tag_details)
             )
@@ -889,6 +908,8 @@ class InstrumentIEStage:
                 "principal_amount": principal.get("normalized_amount"),
                 "principal_currency": principal.get("currency"),
                 "principal_amount_kind": principal.get("kind"),
+                "interest_rate_kind": interest_rate_payload["kind"],
+                "interest_rate_pct": interest_rate_payload["rate_pct"],
                 "status": status_payload["status"],
                 "status_date": (
                     cast(dict[str, object], status_payload["status_date"]).get(
@@ -913,6 +934,7 @@ class InstrumentIEStage:
                 ),
                 "amounts_json": json.dumps(amount_payloads, sort_keys=True),
                 "status_json": json.dumps(status_payload, sort_keys=True),
+                "interest_rate_json": json.dumps(interest_rate_payload, sort_keys=True),
             }
             mention_id = debt_instrument_mention_id_for(
                 row_state.item_id,
@@ -2600,6 +2622,118 @@ def validate_status_event(
     return failures
 
 
+def validate_interest_rate(
+    *,
+    index: int,
+    obj: dict[str, Any],
+    tag_details: dict[str, dict[str, object]],
+) -> list[str]:
+    """Validate the optional interest_rate on one instrument entry (#157)."""
+    if "interest_rate" not in obj:
+        return []
+    value = obj["interest_rate"]
+    if not isinstance(value, dict):
+        return [f"Entry {index}: 'interest_rate' must be an object."]
+    failures: list[str] = []
+    kind = value.get("kind")
+    if kind not in INTEREST_RATE_KINDS:
+        allowed = ", ".join(sorted(INTEREST_RATE_KINDS))
+        failures.append(
+            f"Entry {index}: 'interest_rate.kind' must be one of {allowed}."
+        )
+    rate_pct = value.get("rate_pct")
+    if rate_pct is not None and (
+        not isinstance(rate_pct, str) or not NUMERIC_STRING_PATTERN.fullmatch(rate_pct)
+    ):
+        failures.append(
+            f"Entry {index}: 'interest_rate.rate_pct' must be a numeric string or null."
+        )
+    evidence = value.get("evidence")
+    if not isinstance(evidence, list):
+        failures.append(
+            f"Entry {index}: 'interest_rate.evidence' must be a list of tag IDs."
+        )
+        return failures
+    for tag_id in evidence:
+        if not isinstance(tag_id, str):
+            failures.append(
+                f"Entry {index}: 'interest_rate.evidence' must contain string tag IDs only."
+            )
+            continue
+        tag_info = tag_details.get(tag_id)
+        if tag_info is None:
+            failures.append(
+                f"Entry {index}: 'interest_rate' contains unknown tag ID {tag_id}."
+            )
+        elif tag_info["type"] not in INTEREST_RATE_EVIDENCE_TAG_TYPES:
+            expected = ", ".join(sorted(INTEREST_RATE_EVIDENCE_TAG_TYPES))
+            failures.append(
+                f"Entry {index}: 'interest_rate' tag {tag_id} is type "
+                f"'{tag_info['type']}', expected {expected}."
+            )
+    return failures
+
+
+def standardized_interest_rate_payload(
+    value: object,
+    tag_details: dict[str, dict[str, object]],
+    *,
+    name_text: str | None,
+) -> dict[str, object]:
+    """Return the persisted interest-rate payload for one entry (#157).
+
+    The model's ``rate_pct`` publishes only when a rate token in the cited
+    evidence — or, failing that, in the instrument's name — parses to the same
+    number, mirroring how amounts and dates are parser-verified.
+    """
+    if not isinstance(value, dict):
+        return {"kind": None, "rate_pct": None, "spans": [], "derived_from": None}
+    evidence_tag_ids = single_value_evidence_tag_ids(value)
+    payload = cluster_payload(evidence_tag_ids, tag_details)
+    kind = value.get("kind")
+    payload["kind"] = kind if kind in INTEREST_RATE_KINDS else None
+    tag_ids = evidence_tag_ids if isinstance(evidence_tag_ids, list) else []
+    stated_rates = {
+        rate
+        for tag_id in tag_ids
+        if isinstance(tag_id, str)
+        and tag_details.get(tag_id, {}).get("type") == "interest_rate"
+        for rate in RATE_PCT_PATTERN.findall(str(tag_details[tag_id]["text"]))
+    }
+    # A rate read off the instrument's own name span is name-derived, exactly
+    # like a maturity embedded in `notes due 2028`.
+    name_rates = {
+        rate
+        for tag_id in tag_ids
+        if isinstance(tag_id, str)
+        and tag_details.get(tag_id, {}).get("type") == "debt_instrument"
+        for rate in RATE_PCT_PATTERN.findall(str(tag_details[tag_id]["text"]))
+    }
+    if not stated_rates and not name_rates and name_text:
+        name_rates = set(RATE_PCT_PATTERN.findall(name_text))
+    evidence_rates = stated_rates or name_rates
+    derived_from = (
+        DERIVED_FROM_STATED
+        if stated_rates
+        else DERIVED_FROM_NAME
+        if name_rates
+        else None
+    )
+    model_rate = value.get("rate_pct")
+    verified_rate = None
+    if isinstance(model_rate, str) and NUMERIC_STRING_PATTERN.fullmatch(model_rate):
+        for candidate in evidence_rates:
+            try:
+                if Decimal(candidate) == Decimal(model_rate):
+                    verified_rate = model_rate
+                    break
+            except InvalidOperation:
+                continue
+    payload["rate_pct"] = verified_rate
+    payload["derived_from"] = derived_from if verified_rate is not None else None
+    return payload
+
+
 def standardized_status_payload(
     value: object,
     tag_details: dict[str, dict[str, object]],
@@ -2660,6 +2794,9 @@ def debt_instrument_mention_id_for(
             mention_row.get("maturity_date_json")
         ),
         "instrument_type": mention_row.get("instrument_type"),
+        "interest_rate_json": normalize_json_text(
+            mention_row.get("interest_rate_json")
+        ),
         "item_id": item_id,
         "lenders_known_incomplete": mention_row.get("lenders_known_incomplete"),
         "name_json": normalize_json_text(mention_row.get("name_json")),
