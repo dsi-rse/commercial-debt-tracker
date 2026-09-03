@@ -247,6 +247,7 @@ class PipelineOrchestrator:
             batch_size=self.config.itemize_batch_size,
             force=self.config.force,
             item_numbers=self.config.item_numbers,
+            renew=renew,
         )
         self._log_stage_complete("itemize", rows=len(items))
         self._renew(renew)
@@ -261,6 +262,7 @@ class PipelineOrchestrator:
             model_dir=self.config.classifier_model_dir,
             batch_size=self.config.classify_batch_size,
             force=self.config.force,
+            renew=renew,
         )
         self._log_stage_complete("classify", rows=len(classified))
         return ingest_result, items, classified

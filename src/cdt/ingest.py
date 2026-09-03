@@ -22,7 +22,9 @@ from cdt.datasets import (
 )
 from cdt.shared import FailureClassifier, FailureRegistry, get_logger
 from cdt.storage import (
+    S3_CLIENT_CONFIG,
     delete_artifact,
+    get_object_bytes,
     iter_partition_paths,
     join_artifact_path,
     normalize_artifact_path,
@@ -644,7 +646,7 @@ def default_s3_client(profile_name: str = DEFAULT_AWS_PROFILE) -> S3Client:
     session = (
         boto3.Session(profile_name=profile_name) if profile_name else boto3.Session()
     )
-    return cast(S3Client, session.client("s3"))
+    return cast(S3Client, session.client("s3", config=S3_CLIENT_CONFIG))
 
 
 def s3_uri(bucket: str, key: str) -> str:
@@ -734,7 +736,7 @@ def _is_cdt_document(document: ScrapedDocument) -> bool:
 
 def _download_candidate(s3_client: S3Client, candidate: DocumentCandidate) -> str:
     bucket, key = parse_s3_uri(candidate.resource_uri)
-    body = s3_client.get_object(Bucket=bucket, Key=key)["Body"].read()
+    body = get_object_bytes(s3_client, bucket, key)
     return decode_document_bytes(body)
 
 
@@ -757,7 +759,7 @@ def decode_document_bytes(body: bytes) -> str:
 
 
 def _read_json_object(s3_client: S3Client, bucket: str, key: str) -> dict[str, object]:
-    body = s3_client.get_object(Bucket=bucket, Key=key)["Body"].read()
+    body = get_object_bytes(s3_client, bucket, key)
     return cast(dict[str, object], json.loads(body.decode("utf-8")))
 
 
