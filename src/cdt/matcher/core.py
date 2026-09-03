@@ -74,6 +74,16 @@ DEBT_INSTRUMENT_COLUMNS = [
     "amendment_of_debt_instrument_id",
     "retired_by_debt_instrument_ids",
     "split_of_debt_instrument_id",
+    "superseded_by_debt_instrument_id",
+    "lineage_family_id",
+    "is_lineage_head",
+    "status",
+    "status_date",
+    "status_source_mention_id",
+    "first_seen_filing_date",
+    "last_seen_filing_date",
+    "mention_count",
+    "document_count",
     "name",
     "name_source_mention_id",
     "instrument_type",
@@ -488,6 +498,11 @@ def match_tables(
         existing_instruments=instrument_rows,
         company_names=company_names or company_names_by_cik(debt_instrument_mentions),
     )
+    apply_lifecycle_rollup(
+        debt_instrument_rows,
+        member_groups=normalized_members,
+        mention_index=mention_index,
+    )
     return {
         "debt_instrument_mentions": combined_edges.reindex(
             columns=MENTION_CLUSTER_EDGE_COLUMNS
@@ -496,6 +511,148 @@ def match_tables(
             debt_instrument_rows, columns=DEBT_INSTRUMENT_COLUMNS
         ),
     }
+
+
+TERMINAL_STATUS_EVENTS = {"terminated", "repaid", "exchanged", "defaulted"}
+
+
+def apply_lifecycle_rollup(
+    rows: list[dict[str, object]],
+    *,
+    member_groups: dict[str, list[str]],
+    mention_index: dict[str, PreparedMention],
+) -> None:
+    """Fill lineage-head, derived status, and observation columns in place (#155).
+
+    The browse index needs one row per live obligation: `superseded_by` marks a
+    state that a later amendment replaced, `lineage_family_id` groups every
+    state of one obligation history, and `status` answers "is this borrowing
+    still alive as far as the filings say". The maturity comparison uses the
+    newest filing date in this run's mentions as its reference so a rerun over
+    the same inputs reproduces the same rows exactly.
+    """
+    rows_by_id = {str(row["debt_instrument_id"]): row for row in rows}
+    superseded_by: dict[str, set[str]] = {}
+    for row in rows:
+        parent = coerce_optional_text(row.get("amendment_of_debt_instrument_id"))
+        if parent and parent in rows_by_id:
+            superseded_by.setdefault(parent, set()).add(str(row["debt_instrument_id"]))
+
+    # Lineage families: connected components over every lineage pointer kind.
+    neighbors: dict[str, set[str]] = {
+        str(row["debt_instrument_id"]): set() for row in rows
+    }
+    for row in rows:
+        row_id = str(row["debt_instrument_id"])
+        targets = [
+            coerce_optional_text(row.get("amendment_of_debt_instrument_id")),
+            coerce_optional_text(row.get("split_of_debt_instrument_id")),
+        ]
+        retired = coerce_optional_text(row.get("retired_by_debt_instrument_ids"))
+        if retired:
+            targets.extend(json.loads(retired))
+        for target in targets:
+            if target and target in neighbors:
+                neighbors[row_id].add(target)
+                neighbors[target].add(row_id)
+    family_by_id: dict[str, str] = {}
+    for start in sorted(neighbors):
+        if start in family_by_id:
+            continue
+        component = {start}
+        frontier = [start]
+        while frontier:
+            node = frontier.pop()
+            for neighbor in neighbors[node]:
+                if neighbor not in component:
+                    component.add(neighbor)
+                    frontier.append(neighbor)
+        family_id = min(component)
+        for member in component:
+            family_by_id[member] = family_id
+
+    reference_date = max(
+        (mention.date for mention in mention_index.values() if mention.date),
+        default=None,
+    )
+    for row in rows:
+        row_id = str(row["debt_instrument_id"])
+        children = superseded_by.get(row_id, set())
+        # Like the parent pointers, an ambiguous inverse publishes nothing.
+        row["superseded_by_debt_instrument_id"] = (
+            next(iter(children)) if len(children) == 1 else None
+        )
+        row["lineage_family_id"] = family_by_id.get(row_id, row_id)
+        row["is_lineage_head"] = not children
+        member_ids = [
+            member_id
+            for member_id in member_groups.get(row_id, [])
+            if member_id in mention_index
+        ]
+        dates = sorted(
+            mention_index[member_id].date
+            for member_id in member_ids
+            if mention_index[member_id].date
+        )
+        row["first_seen_filing_date"] = dates[0] if dates else None
+        row["last_seen_filing_date"] = dates[-1] if dates else None
+        row["mention_count"] = len(member_ids)
+        row["document_count"] = len(
+            {
+                mention_index[member_id].accession_number
+                for member_id in member_ids
+                if mention_index[member_id].accession_number
+            }
+        )
+        status, status_date, status_source = derive_instrument_status(
+            row,
+            member_ids,
+            mention_index,
+            reference_date=reference_date,
+        )
+        row["status"] = status
+        row["status_date"] = status_date
+        row["status_source_mention_id"] = status_source
+
+
+def derive_instrument_status(
+    row: dict[str, object],
+    member_ids: list[str],
+    mention_index: dict[str, PreparedMention],
+    *,
+    reference_date: str | None,
+) -> tuple[str, str | None, str | None]:
+    """Return (status, status_date, source_mention_id) for one instrument.
+
+    The newest extracted event wins when it is terminal or `announced`;
+    `entered_into` and `amended` say the instrument existed, not how it ended,
+    so they fall through to the derived legs: superseded by an amendment
+    child, matured against the run's newest filing date, else active.
+    """
+    ordered = sorted(
+        member_ids,
+        key=lambda member_id: mention_recency_key(mention_index[member_id]),
+        reverse=True,
+    )
+    for member_id in ordered:
+        mention = mention_index[member_id]
+        if mention.status is None:
+            continue
+        if mention.status in TERMINAL_STATUS_EVENTS:
+            return mention.status, mention.status_date or mention.date, member_id
+        if mention.status == "announced":
+            return "announced", mention.status_date or mention.date, member_id
+        break
+    if row.get("superseded_by_debt_instrument_id"):
+        return "superseded", None, None
+    if coerce_optional_text(row.get("retired_by_debt_instrument_ids")):
+        # A retired_by pointer without a mention-level event still means the
+        # obligation ended; the lineage said so.
+        return "repaid", None, None
+    maturity = coerce_optional_text(row.get("maturity_date"))
+    if maturity and reference_date and maturity < reference_date:
+        return "matured", maturity, None
+    return "active", None, None
 
 
 def build_cluster_profiles(

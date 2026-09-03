@@ -4206,3 +4206,122 @@ def test_canonical_fields_record_their_source_mention() -> None:
     assert row["start_date"] == "2024-01-01"
     assert row["start_date_source_mention_id"] == "m-old"
     assert row["principal_source_mention_id"] == "m-old"
+
+
+def test_lifecycle_rollup_marks_heads_families_and_status() -> None:
+    """Amendment chains get superseded/head markers, families, and status (#155)."""
+    from cdt.matcher.core import apply_lifecycle_rollup, prepare_mention
+
+    predecessor = prepare_mention(
+        build_mention_row(
+            mention_id="m-old",
+            item_id="item-1",
+            accession_number="0001",
+            cik="320193",
+            date="2024-01-02",
+            name="Revolver (original)",
+            start_date="2020-01-01",
+            amount="$100 million",
+        )
+    )
+    amended = prepare_mention(
+        build_mention_row(
+            mention_id="m-new",
+            item_id="item-1",
+            accession_number="0001",
+            cik="320193",
+            date="2024-01-02",
+            name="Revolver (as amended)",
+            start_date="2020-01-01",
+            amount="$150 million",
+        )
+    )
+    rows = [
+        {
+            "debt_instrument_id": "inst-old",
+            "amendment_of_debt_instrument_id": None,
+            "split_of_debt_instrument_id": None,
+            "retired_by_debt_instrument_ids": None,
+            "maturity_date": "2026-06-28",
+        },
+        {
+            "debt_instrument_id": "inst-new",
+            "amendment_of_debt_instrument_id": "inst-old",
+            "split_of_debt_instrument_id": None,
+            "retired_by_debt_instrument_ids": None,
+            "maturity_date": "2031-06-23",
+        },
+    ]
+    apply_lifecycle_rollup(
+        rows,
+        member_groups={"inst-old": ["m-old"], "inst-new": ["m-new"]},
+        mention_index={"m-old": predecessor, "m-new": amended},
+    )
+    old_row, new_row = rows
+    assert old_row["superseded_by_debt_instrument_id"] == "inst-new"
+    assert old_row["is_lineage_head"] is False
+    assert old_row["status"] == "superseded"
+    assert new_row["is_lineage_head"] is True
+    assert new_row["status"] == "active"
+    assert old_row["lineage_family_id"] == new_row["lineage_family_id"]
+    assert new_row["first_seen_filing_date"] == "2024-01-02"
+    assert new_row["mention_count"] == 1
+    assert new_row["document_count"] == 1
+
+
+def test_lifecycle_status_prefers_terminal_events_and_derives_matured() -> None:
+    """A terminated event wins; a past maturity derives matured (#155)."""
+    from cdt.matcher.core import apply_lifecycle_rollup, prepare_mention
+
+    terminated = prepare_mention(
+        build_mention_row(
+            mention_id="m-term",
+            item_id="item-1",
+            accession_number="0001",
+            cik="320193",
+            date="2026-06-03",
+            name="Old Facility",
+            start_date="2023-10-11",
+            amount=None,
+        )
+        | {"status": "terminated", "status_date": "2026-06-02"}
+    )
+    stale = prepare_mention(
+        build_mention_row(
+            mention_id="m-stale",
+            item_id="item-2",
+            accession_number="0002",
+            cik="320193",
+            date="2026-06-03",
+            name="4.875% Senior Notes due 2024",
+            start_date="2017-12-19",
+            amount=None,
+        )
+    )
+    rows = [
+        {
+            "debt_instrument_id": "inst-term",
+            "amendment_of_debt_instrument_id": None,
+            "split_of_debt_instrument_id": None,
+            "retired_by_debt_instrument_ids": None,
+            "maturity_date": None,
+        },
+        {
+            "debt_instrument_id": "inst-stale",
+            "amendment_of_debt_instrument_id": None,
+            "split_of_debt_instrument_id": None,
+            "retired_by_debt_instrument_ids": None,
+            "maturity_date": "2024-01-15",
+        },
+    ]
+    apply_lifecycle_rollup(
+        rows,
+        member_groups={"inst-term": ["m-term"], "inst-stale": ["m-stale"]},
+        mention_index={"m-term": terminated, "m-stale": stale},
+    )
+    term_row, stale_row = rows
+    assert term_row["status"] == "terminated"
+    assert term_row["status_date"] == "2026-06-02"
+    assert term_row["status_source_mention_id"] == "m-term"
+    assert stale_row["status"] == "matured"
+    assert stale_row["status_date"] == "2024-01-15"
