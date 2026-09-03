@@ -35,6 +35,7 @@ def mention_row(**overrides: object) -> dict[str, object]:
         "lenders_json": "[]",
         "lenders_known_incomplete": False,
         "other_interested_parties_json": "[]",
+        "end_date_json": "{}",
     }
     row.update(overrides)
     return row
@@ -117,17 +118,39 @@ def test_end_dates_are_compatible_handles_missing_values() -> None:
     assert not end_dates_are_compatible("2028-06-01", "2031-06-01")
 
 
-def test_end_dates_treat_december_31_as_year_resolution() -> None:
-    """A YYYY-12-31 sentinel from 'due YYYY' matches any date in that year."""
-    assert end_dates_are_compatible("2030-12-31", "2030-04-15")
-    assert end_dates_are_compatible("2030-04-15", "2030-12-31")
-    assert not end_dates_are_compatible("2030-12-31", "2031-04-15")
+def test_end_dates_treat_only_name_derived_values_as_year_resolution() -> None:
+    """A bare year from 'due YYYY' matches any date in that year (#128).
+
+    A stated December 31 maturity is a real day and must agree exactly — the
+    loose treatment applies only to the year-resolution marker produced by
+    `normalized_end_date_for_matching` for name-derived values.
+    """
+    assert end_dates_are_compatible("2030", "2030-04-15")
+    assert end_dates_are_compatible("2030-04-15", "2030")
+    assert end_dates_are_compatible("2030", "2030-12-31")
+    assert not end_dates_are_compatible("2030", "2031-04-15")
+    assert not end_dates_are_compatible("2030-12-31", "2030-04-15")
     assert not end_dates_are_compatible("2030-04-15", "2030-06-01")
+
+
+def test_normalized_end_date_for_matching_collapses_name_derived_year_ends() -> None:
+    """Only a name-derived YYYY-12-31 collapses to its year (#128)."""
+    derived = mention_row(
+        end_date="2030-12-31", end_date_json=json.dumps({"derived_from": "name"})
+    )
+    stated = mention_row(end_date="2030-12-31")
+    assert prepare_mention(derived).normalized_end_date == "2030"
+    assert prepare_mention(stated).normalized_end_date == "2030-12-31"
 
 
 def test_year_resolution_end_date_still_matches_exact_maturity() -> None:
     """Pricing 8-K 'due 2030' merges with the closing 8-K's exact maturity."""
-    seed = prepare_mention(mention_row(end_date="2030-12-31"))
+    seed = prepare_mention(
+        mention_row(
+            end_date="2030-12-31",
+            end_date_json=json.dumps({"derived_from": "name"}),
+        )
+    )
     closing = prepare_mention(
         mention_row(debt_instrument_mention_id="mention-2", end_date="2030-04-15")
     )
@@ -263,6 +286,7 @@ def test_announcement_name_without_the_coupon_attaches_to_its_closing() -> None:
             amount="750000000",
             start_date=None,
             end_date="2034-12-31",
+            end_date_json=json.dumps({"derived_from": "name"}),
         )
     )
     closing = prepare_mention(

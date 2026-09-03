@@ -1212,13 +1212,15 @@ def cluster_canonical_key(cluster: dict[str, object]) -> str:
     `Oaktree` and `Purchasers`. The specific name is the useful key, so generic
     party words lose to it even when the alias is the longer string.
     """
-    mentions = cluster.get("mentions", [])
-    if not isinstance(mentions, list):
+    # Current payloads carry `spans`; partitions written before the evidence
+    # shape change (#128) carry `mentions`. Both list {text, offsets} dicts.
+    spans = cluster.get("spans", cluster.get("mentions", []))
+    if not isinstance(spans, list):
         return ""
     texts = [
-        normalize_party_text(str(mention.get("text", "")))
-        for mention in mentions
-        if isinstance(mention, dict) and mention.get("text")
+        normalize_party_text(str(span.get("text", "")))
+        for span in spans
+        if isinstance(span, dict) and span.get("text")
     ]
     texts = [text for text in texts if text]
     if not texts:
@@ -1255,7 +1257,7 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
         normalized_start_date=normalize_date(
             coerce_optional_text(row.get("start_date"))
         ),
-        normalized_end_date=normalize_date(coerce_optional_text(row.get("end_date"))),
+        normalized_end_date=normalized_end_date_for_matching(row),
         normalized_name_fingerprint=normalize_name_fingerprint(
             coerce_optional_text(row.get("name"))
         ),
@@ -1412,17 +1414,50 @@ def lender_similarity_score(left: str, right: str) -> float:
     return round(SequenceMatcher(a=left, b=right).ratio(), 4)
 
 
+YEAR_TEXT_LENGTH = 4
+
+
+def normalized_end_date_for_matching(row: dict[str, object]) -> str | None:
+    """Return the end date the matcher compares, at its true resolution.
+
+    A year-only maturity such as "due 2030" is synthesized to ``2030-12-31`` on
+    the way into the dataset, and its payload says ``derived_from: "name"``.
+    Comparing that synthesized day would either invent precision or force every
+    genuine December 31 maturity to be treated loosely — which is what happened
+    while the provenance flag was missing (#128). Name-derived year-end values
+    collapse to the bare year here; stated dates keep their day.
+    """
+    value = normalize_date(coerce_optional_text(row.get("end_date")))
+    if not value:
+        return None
+    if value.endswith("-12-31") and end_date_is_name_derived(row.get("end_date_json")):
+        return value[:4]
+    return value
+
+
+def end_date_is_name_derived(payload_text: object) -> bool:
+    """Return whether one end-date payload marks its value as name-derived."""
+    try:
+        payload = json.loads(str(payload_text or "{}"))
+    except json.JSONDecodeError:
+        return False
+    return isinstance(payload, dict) and payload.get("derived_from") == "name"
+
+
 def end_dates_are_compatible(left: str | None, right: str | None) -> bool:
-    """Return whether two normalized end dates can still describe one instrument."""
+    """Return whether two normalized end dates can still describe one instrument.
+
+    A bare four-digit year is a year-resolution value from a name-derived
+    maturity (#128); it matches any date in that year. Full dates — including a
+    genuine December 31 — must agree exactly.
+    """
     if not left or not right:
         return True
     if left == right:
         return True
-    if left[:4] != right[:4]:
+    if left[:YEAR_TEXT_LENGTH] != right[:YEAR_TEXT_LENGTH]:
         return False
-    # A YYYY-12-31 value may come from a year-only maturity such as "due 2030",
-    # so it is only year-resolution evidence and matches any date in that year.
-    return left.endswith("-12-31") or right.endswith("-12-31")
+    return len(left) == YEAR_TEXT_LENGTH or len(right) == YEAR_TEXT_LENGTH
 
 
 NAME_RATE_PATTERN = re.compile(r"\d+(?:\.\d+)?%")

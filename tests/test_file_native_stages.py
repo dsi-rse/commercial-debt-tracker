@@ -991,13 +991,17 @@ def test_instrument_ie_postprocess_keeps_named_lenders_and_flags_incompleteness(
 
     lenders = json.loads(str(mention["lenders_json"]))
     other_parties = json.loads(str(mention["other_interested_parties_json"]))
-    assert [cluster["tag_ids"] for cluster in lenders] == [["tag-o-named"]]
+    assert [[s["tag_id"] for s in cluster["spans"]] for cluster in lenders] == [
+        ["tag-o-named"]
+    ]
     assert mention["lenders_known_incomplete"] is True
     # Persisted clusters keep the plain tag_ids/mentions shape: the model's kind and
     # role labels decide what is stored and are not themselves stored.
-    assert set(lenders[0]) == {"tag_ids", "mentions"}
-    assert [cluster["tag_ids"] for cluster in other_parties] == [["tag-o-agent"]]
-    assert set(other_parties[0]) == {"tag_ids", "mentions"}
+    assert set(lenders[0]) == {"spans"}
+    assert [[s["tag_id"] for s in cluster["spans"]] for cluster in other_parties] == [
+        ["tag-o-agent"]
+    ]
+    assert set(other_parties[0]) == {"spans"}
 
 
 def test_instrument_ie_postprocess_leaves_named_only_lenders_unflagged() -> None:
@@ -1071,7 +1075,9 @@ def test_instrument_ie_postprocess_excludes_the_borrower_from_other_parties() ->
     )
 
     other_parties = json.loads(str(mention["other_interested_parties_json"]))
-    assert [cluster["tag_ids"] for cluster in other_parties] == [["tag-o-agent"]]
+    assert [[s["tag_id"] for s in cluster["spans"]] for cluster in other_parties] == [
+        ["tag-o-agent"]
+    ]
 
 
 def test_lender_signature_prefers_the_named_party_over_an_alias() -> None:
@@ -1213,7 +1219,6 @@ def test_instrument_ie_validate_accepts_name_span_as_end_date_evidence() -> None
                 "end_date": {
                     "evidence": ["tag-i-1"],
                     "normalized_date": "2028-12-31",
-                    "derived_from_name": True,
                 },
             }
         ]
@@ -1261,7 +1266,7 @@ def test_instrument_ie_postprocess_keeps_name_derived_end_date() -> None:
 
     assert mention["end_date"] == "2028-12-31"
     payload = json.loads(str(mention["end_date_json"]))
-    assert payload["tag_ids"] == ["tag-i-1"]
+    assert [s["tag_id"] for s in payload["spans"]] == ["tag-i-1"]
 
 
 def test_instrument_ie_postprocess_backfills_end_date_from_name() -> None:
@@ -1283,7 +1288,7 @@ def test_instrument_ie_postprocess_backfills_end_date_from_name() -> None:
     assert mention["end_date"] == "2028-12-31"
     payload = json.loads(str(mention["end_date_json"]))
     # A maturity read from the name has no citable date tag of its own.
-    assert payload["tag_ids"] == []
+    assert payload["spans"] == []
 
 
 def test_instrument_ie_postprocess_leaves_end_date_null_without_maturity() -> None:
@@ -1324,7 +1329,7 @@ def test_instrument_ie_postprocess_drops_end_date_that_contradicts_evidence() ->
     )
 
     payload = json.loads(str(mention["end_date_json"]))
-    assert payload["tag_ids"] == ["tag-d-1"]
+    assert [s["tag_id"] for s in payload["spans"]] == ["tag-d-1"]
     # The cited date tag says March 17, 2025, so the model value is rejected and the
     # name maturity fills the gap instead.
     assert mention["end_date"] == "2028-12-31"
@@ -1479,7 +1484,7 @@ def test_instrument_ie_postprocess_drops_rate_amount() -> None:
     assert payload["normalized_amount"] is None
     assert payload["currency"] is None
     # Evidence is preserved so the dropped value stays auditable.
-    assert payload["tag_ids"] == ["tag-a-rate"]
+    assert [s["tag_id"] for s in payload["spans"]] == ["tag-a-rate"]
 
 
 def test_lineage_pair_is_oriented_by_relation_type() -> None:
@@ -1862,7 +1867,7 @@ def test_instrument_ie_postprocess_recovers_a_principal_from_the_name() -> None:
     assert payload["currency"] == "USD"
     # Nothing was cited, so the evidence list stays empty, as it does for a
     # name-derived maturity.
-    assert payload["tag_ids"] == []
+    assert payload["spans"] == []
 
 
 def test_instrument_ie_validate_accepts_the_name_span_as_amount_evidence() -> None:
@@ -2026,7 +2031,7 @@ def test_instrument_ie_postprocess_keeps_an_amount_clustered_with_its_label() ->
     assert mention["amount"] == "2000000"
     # Both spans stay in the payload as provenance.
     payload = json.loads(str(mention["amount_json"]))
-    assert payload["tag_ids"] == ["tag-a-figure", "tag-a-label"]
+    assert [s["tag_id"] for s in payload["spans"]] == ["tag-a-figure", "tag-a-label"]
 
 
 def test_currency_candidates_read_a_qualified_dollar_sign() -> None:
@@ -2100,7 +2105,7 @@ def test_instrument_ie_postprocess_normalizes_wrapped_names() -> None:
     ]
     # Provenance keeps the verbatim span, since the char offsets index into it.
     verbatim = [
-        json.loads(str(mention["name_json"]))["mentions"][0]["text"]
+        json.loads(str(mention["name_json"]))["spans"][0]["text"]
         for mention in row_state.debt_instrument_mentions
     ]
     assert verbatim == [
@@ -3621,3 +3626,67 @@ def test_realign_tag_details_handles_model_deleted_whitespace() -> None:
     start = realigned["tag-1"]["char_start"]
     end = realigned["tag-1"]["char_end"]
     assert original[start:end] == "Senior Notes due 2028"
+
+
+def test_standardized_payloads_record_where_their_values_came_from() -> None:
+    """Payloads carry derived_from so consumers know a value's provenance (#128)."""
+    from cdt.extractor.core import (
+        standardized_amount_payload,
+        standardized_date_payload,
+        standardized_end_date_payload,
+    )
+
+    tag_details = {
+        "tag-d-1": {
+            "type": "date",
+            "text": "June 1, 2028",
+            "char_start": 0,
+            "char_end": 12,
+        },
+        "tag-i-1": {
+            "type": "debt_instrument",
+            "text": "3.875% senior notes due 2028",
+            "char_start": 20,
+            "char_end": 48,
+        },
+        "tag-a-1": {
+            "type": "amount",
+            "text": "$500,000,000",
+            "char_start": 60,
+            "char_end": 72,
+        },
+    }
+    stated_date = standardized_date_payload(
+        {"evidence": ["tag-d-1"], "normalized_date": "2028-06-01"},
+        tag_details,
+    )
+    assert stated_date["normalized_date"] == "2028-06-01"
+    assert stated_date["derived_from"] == "stated"
+
+    name_maturity = standardized_end_date_payload(
+        {"evidence": ["tag-i-1"], "normalized_date": "2028-12-31"},
+        tag_details,
+        name_text="3.875% senior notes due 2028",
+    )
+    assert name_maturity["normalized_date"] == "2028-12-31"
+    assert name_maturity["derived_from"] == "name"
+
+    fallback_maturity = standardized_end_date_payload(
+        None,
+        tag_details,
+        name_text="3.875% senior notes due 2028",
+    )
+    assert fallback_maturity["normalized_date"] == "2028-12-31"
+    assert fallback_maturity["derived_from"] == "name"
+    assert fallback_maturity["spans"] == []
+
+    stated_amount = standardized_amount_payload(
+        {"evidence": ["tag-a-1"], "normalized_amount": "500000000"},
+        tag_details,
+    )
+    assert stated_amount["normalized_amount"] == "500000000"
+    assert stated_amount["derived_from"] == "stated"
+
+    absent = standardized_date_payload(None, tag_details)
+    assert absent["normalized_date"] is None
+    assert absent["derived_from"] is None

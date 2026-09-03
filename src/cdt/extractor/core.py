@@ -2649,12 +2649,14 @@ def standardized_amount_payload(
     evidence_text = canonical_amount_value(evidence_tag_ids, tag_details)
     parsed_amount = normalized_amount_from_text(evidence_text)
     parsed_currency_candidates = currency_candidates_from_text(evidence_text)
+    derived_from = DERIVED_FROM_STATED if parsed_amount is not None else None
     if parsed_amount is None:
         # A principal stated inside the name has no `amount` span to cite, so the
         # name is the only evidence there is (#129).
         name_amount = normalized_amount_from_name(name_text)
         if name_amount is not None:
             parsed_amount = name_amount
+            derived_from = DERIVED_FROM_NAME
             name_currency = currency_from_name(name_text)
             parsed_currency_candidates = (
                 {name_currency} if name_currency else parsed_currency_candidates
@@ -2678,6 +2680,9 @@ def standardized_amount_payload(
         and model_currency in parsed_currency_candidates
         else None
     )
+    payload["derived_from"] = (
+        derived_from if payload["normalized_amount"] is not None else None
+    )
     return payload
 
 
@@ -2692,13 +2697,20 @@ def standardized_date_payload(
     payload = cluster_payload(evidence_tag_ids, tag_details)
     evidence_text = canonical_value(evidence_tag_ids, tag_details)
     parsed_date = normalized_date_from_text(evidence_text)
+    derived_from = DERIVED_FROM_STATED if parsed_date is not None else None
     if parsed_date is None and allow_maturity_phrase:
+        # A maturity phrase lives inside the instrument's own name span, so a
+        # value parsed this way is name-derived even though evidence is cited.
         parsed_date = normalized_maturity_from_text(evidence_text)
+        derived_from = DERIVED_FROM_NAME if parsed_date is not None else None
     model_date = value.get("normalized_date") if isinstance(value, dict) else None
     # The parser's own string is published, so a model writing the same day in a
     # different shape keeps its value rather than losing it (#133).
     payload["normalized_date"] = (
         parsed_date if dates_agree(model_date, parsed_date) else None
+    )
+    payload["derived_from"] = (
+        derived_from if payload["normalized_date"] is not None else None
     )
     return payload
 
@@ -2719,31 +2731,55 @@ def standardized_end_date_payload(
         derived_date = normalized_maturity_from_text(name_text)
         if derived_date is not None:
             payload["normalized_date"] = derived_date
+            payload["derived_from"] = DERIVED_FROM_NAME
     return payload
+
+
+# Where a normalized value came from: cited evidence spans, the instrument's own
+# name, or nowhere (no value). Downstream consumers key on this — the matcher
+# treats a name-synthesized YYYY-12-31 maturity as year-resolution only (#128),
+# and the dashboard can explain a value whose evidence list is empty.
+DERIVED_FROM_STATED = "stated"
+DERIVED_FROM_NAME = "name"
 
 
 def cluster_payload(
     tag_ids: object,
     tag_details: dict[str, dict[str, object]],
 ) -> dict[str, object]:
-    """Return rich details for one cluster."""
+    """Return the evidence spans for one cluster.
+
+    ``char_start``/``char_end`` index the item's own ``text`` exactly (#154).
+    ``tag_id`` is retained for the relation stage's tag-to-mention mapping and
+    for audit debugging; downstream consumers need only the offsets and text.
+    """
     if not isinstance(tag_ids, list):
-        return {"tag_ids": [], "mentions": []}
-    mentions = [
+        return {"spans": []}
+    spans = [
         {
             "tag_id": tag_id,
-            "type": tag_details[tag_id]["type"],
-            "text": tag_details[tag_id]["text"],
             "char_start": tag_details[tag_id]["char_start"],
             "char_end": tag_details[tag_id]["char_end"],
+            "text": tag_details[tag_id]["text"],
         }
         for tag_id in tag_ids
         if isinstance(tag_id, str) and tag_id in tag_details
     ]
-    return {
-        "tag_ids": [mention["tag_id"] for mention in mentions],
-        "mentions": mentions,
-    }
+    return {"spans": spans}
+
+
+def payload_tag_ids(payload: object) -> list[str]:
+    """Return the tag ids recorded in one evidence payload."""
+    if not isinstance(payload, dict):
+        return []
+    spans = payload.get("spans")
+    if not isinstance(spans, list):
+        return []
+    return [
+        str(span["tag_id"])
+        for span in spans
+        if isinstance(span, dict) and span.get("tag_id")
+    ]
 
 
 def annotated_party_clusters(
@@ -2772,7 +2808,7 @@ def annotated_party_clusters(
             tag_ids = cluster
             annotation = None
         payload = cluster_payload(tag_ids, tag_details)
-        if not payload["tag_ids"]:
+        if not payload["spans"]:
             continue
         resolved = (
             str(annotation) if annotation in allowed_annotations else default_annotation
@@ -2818,7 +2854,7 @@ def relation_prompt_xml(row_state: ExtractionRowState) -> str:
     tag_to_raw_id: dict[str, str] = {}
     for mention in row_state.debt_instrument_mentions:
         payload = json.loads(str(mention["name_json"]))
-        for tag_id in payload.get("tag_ids", []):
+        for tag_id in payload_tag_ids(payload):
             key = str(tag_id)
             raw_id = str(mention["raw_id"])
             if key not in tag_to_raw_id:
