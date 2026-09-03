@@ -16,6 +16,7 @@ import pandas as pd
 from cdt.datasets import (
     cik_shard_partition_path,
     dataset_root,
+    normalize_cik,
     resolve_artifact_root,
     run_manifest_path,
     shard_for_cik,
@@ -505,7 +506,7 @@ def build_cluster_profiles(
         )
         profile = ClusterProfile(
             debt_instrument_id=debt_instrument_id,
-            cik=coerce_optional_text(instrument_row.get("cik")) or "",
+            cik=coerce_optional_cik(instrument_row.get("cik")) or "",
             seed_mention_id=seed_mention_id,
             member_ids=list(member_ids),
             normalized_amounts=set(),
@@ -1155,7 +1156,7 @@ def company_names_by_cik(mention_rows: pd.DataFrame) -> dict[str, str]:
         return {}
     newest: dict[str, tuple[tuple[str, str], str]] = {}
     for row in mention_rows.to_dict("records"):
-        cik = coerce_optional_text(row.get("cik"))
+        cik = coerce_optional_cik(row.get("cik"))
         company_name = coerce_optional_text(row.get("company_name"))
         if cik is None or company_name is None:
             continue
@@ -1233,7 +1234,9 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
         item_id=str(row["item_id"]),
         raw_id=str(row["raw_id"]),
         accession_number=coerce_optional_text(row.get("accession_number")),
-        cik=coerce_optional_text(row.get("cik")),
+        # Normalized so mentions written before CIKs were zero-padded (#153)
+        # still group with rows written after.
+        cik=coerce_optional_cik(row.get("cik")),
         company_name=coerce_optional_text(row.get("company_name")),
         date=coerce_optional_text(row.get("date")),
         name=coerce_optional_text(row.get("name")),
@@ -1295,6 +1298,12 @@ def coerce_flag(value: object) -> bool:
 def coerce_optional_text(value: object) -> str | None:
     """Return one trimmed string or None, treating placeholder text as missing."""
     return coerce_dataset_text(value)
+
+
+def coerce_optional_cik(value: object) -> str | None:
+    """Return one canonical zero-padded CIK or None (#153)."""
+    text = coerce_dataset_text(value)
+    return normalize_cik(text) if text is not None else None
 
 
 def normalize_amount(value: str | None) -> str | None:

@@ -19,7 +19,9 @@ from cdt.datasets import (
     existing_date_shard_partition_ids,
     load_completed_partitions,
     load_row_failures,
+    normalize_cik,
     shard_for_accession,
+    shard_for_cik,
 )
 from cdt.extractor import extract_pending_items, mentions_root
 from cdt.extractor.core import (
@@ -85,6 +87,20 @@ def test_shard_for_accession_uses_eight_date_shards() -> None:
     """Date-partitioned stages should only use shards 0000 through 0007."""
     shards = {shard_for_accession(str(index)) for index in range(200)}
     assert shards == {f"{index:04d}" for index in range(8)}
+
+
+def test_normalize_cik_zero_pads_digits_and_leaves_junk_visible() -> None:
+    """CIKs publish as SEC's canonical 10-digit form (#153)."""
+    assert normalize_cik("320193") == "0000320193"
+    assert normalize_cik("0000320193") == "0000320193"
+    assert normalize_cik(320193) == "0000320193"
+    assert normalize_cik(" not-a-cik ") == "not-a-cik"
+
+
+def test_shard_for_cik_is_stable_across_padding() -> None:
+    """Pre-#153 partitions hashed unpadded CIKs; padding must not re-shard."""
+    assert shard_for_cik("0000320193") == shard_for_cik("320193")
+    assert shard_for_cik("0") == shard_for_cik("0000000000")
 
 
 def seed_document_partition(tmp_path: Path) -> str:
@@ -2275,9 +2291,10 @@ def test_company_names_by_cik_takes_the_newest_known_name() -> None:
         ]
     )
 
+    # Keys are canonical zero-padded CIKs (#153).
     assert company_names_by_cik(mention_rows) == {
-        "2078008": "Versigent PLC",
-        "320193": "Example Inc.",
+        "0002078008": "Versigent PLC",
+        "0000320193": "Example Inc.",
     }
 
 
