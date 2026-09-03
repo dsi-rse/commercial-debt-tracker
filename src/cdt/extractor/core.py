@@ -2944,6 +2944,41 @@ def decimal_from_amount_string(value: str | None) -> Decimal | None:
     return parsed
 
 
+def computed_sum_amount(
+    tag_ids: object,
+    tag_details: dict[str, dict[str, object]],
+    model_amount: object,
+) -> str | None:
+    """Return the model's amount when it equals the sum of the cited spans (#165).
+
+    An increase-by amendment states a prior total and an increment but often
+    never the result; the sum is deterministic arithmetic anchored to the cited
+    evidence, and it is the only arithmetic accepted. Requires at least two
+    parseable spans, and refuses when any single span already equals the
+    model's value — that is agreement, not computation — or when any cited
+    span reads as a rate.
+    """
+    if not isinstance(model_amount, str):
+        return None
+    model_value = decimal_from_amount_string(model_amount)
+    if model_value is None:
+        return None
+    texts = cluster_span_texts(tag_ids, tag_details)
+    if any(is_rate_like_amount_text(text) for text in texts):
+        return None
+    parsed = [normalized_amount_from_text(text) for text in texts]
+    values = [
+        decimal_from_amount_string(value) for value in parsed if value is not None
+    ]
+    if len(values) < MINIMUM_COMPUTED_SUM_SPANS or None in values:
+        return None
+    if any(value == model_value for value in values):
+        return None
+    if sum(values) != model_value:
+        return None
+    return normalized_amount_from_text(model_amount) or model_amount
+
+
 def amounts_agree(model_amount: object, parsed_amount: str | None) -> bool:
     """Return whether the model's amount is the same value the parser read.
 
@@ -3232,6 +3267,16 @@ def standardized_amount_payload(
     payload["normalized_amount"] = (
         parsed_amount if amounts_agree(model_amount, parsed_amount) else None
     )
+    if payload["normalized_amount"] is None:
+        computed = computed_sum_amount(evidence_tag_ids, tag_details, model_amount)
+        if computed is not None:
+            payload["normalized_amount"] = computed
+            derived_from = DERIVED_FROM_COMPUTED
+            parsed_currency_candidates = {
+                currency
+                for text in cluster_span_texts(evidence_tag_ids, tag_details)
+                for currency in currency_candidates_from_text(text)
+            }
     payload["currency"] = (
         model_currency
         if isinstance(model_currency, str)
@@ -3377,6 +3422,9 @@ def standardized_end_date_payload(
 # and the dashboard can explain a value whose evidence list is empty.
 DERIVED_FROM_STATED = "stated"
 DERIVED_FROM_NAME = "name"
+DERIVED_FROM_COMPUTED = "computed"
+# A sum needs at least two addends; one parsed span is agreement, not arithmetic.
+MINIMUM_COMPUTED_SUM_SPANS = 2
 
 
 def cluster_payload(

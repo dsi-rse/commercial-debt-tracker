@@ -4402,3 +4402,73 @@ def test_normalized_maturity_from_text_parses_month_year_phrases() -> None:
         normalized_maturity_from_text("due April 7, 2033, i.e. due April 2033")
         == "2033-04-07"
     )
+
+
+def test_computed_sum_amount_accepts_only_the_exact_sum_of_cited_spans() -> None:
+    """An increase-by amendment's unstated total publishes as computed (#165)."""
+    from cdt.extractor.core import standardized_amount_payload
+
+    tag_details = {
+        "tag-a-before": {
+            "type": "amount",
+            "text": "$200 million",
+            "char_start": 10,
+            "char_end": 22,
+        },
+        "tag-a-increment": {
+            "type": "amount",
+            "text": "$50 million",
+            "char_start": 40,
+            "char_end": 51,
+        },
+        "tag-a-rate": {
+            "type": "amount",
+            "text": "0.50%",
+            "char_start": 60,
+            "char_end": 65,
+        },
+    }
+    computed = standardized_amount_payload(
+        {
+            "evidence": ["tag-a-before", "tag-a-increment"],
+            "normalized_amount": "250000000",
+            "currency": "USD",
+        },
+        tag_details,
+    )
+    assert computed["normalized_amount"] == "250000000"
+    assert computed["derived_from"] == "computed"
+    assert computed["currency"] == "USD"
+
+    # A value that is not the exact sum stays null.
+    wrong = standardized_amount_payload(
+        {
+            "evidence": ["tag-a-before", "tag-a-increment"],
+            "normalized_amount": "300000000",
+        },
+        tag_details,
+    )
+    assert wrong["normalized_amount"] is None
+    assert wrong["derived_from"] is None
+
+    # A single-span citation is agreement, never computation.
+    single = standardized_amount_payload(
+        {
+            "evidence": ["tag-a-before"],
+            "normalized_amount": "200000000",
+            "currency": "USD",
+        },
+        tag_details,
+    )
+    assert single["normalized_amount"] == "200000000"
+    assert single["derived_from"] == "stated"
+
+    # A rate-like span in the citation disables the computed path.
+    with_rate = standardized_amount_payload(
+        {
+            "evidence": ["tag-a-before", "tag-a-rate"],
+            "normalized_amount": "200000000.5",
+        },
+        tag_details,
+    )
+    assert with_rate["normalized_amount"] is None
