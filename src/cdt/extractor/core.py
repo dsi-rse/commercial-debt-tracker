@@ -720,7 +720,10 @@ class InstrumentIEStage:
             data = json.loads(response)
         except json.JSONDecodeError:
             return
-        _, _, tag_details = parse_tag_details(row_state.ner_tagged_xml)
+        _, roundtrip_text, tag_details = parse_tag_details(row_state.ner_tagged_xml)
+        # Published evidence offsets index the item's own text, not the model's
+        # whitespace-drifted echo of it (#154).
+        tag_details = realign_tag_details(tag_details, roundtrip_text, row_state.text)
         mention_entries = iter_instrument_entries(
             cast(list[dict[str, Any]], data), tag_details
         )
@@ -1822,6 +1825,61 @@ def parse_tag_details(
 
     walk(root)
     return root, "".join(plain_parts), tag_details
+
+
+def realign_tag_details(
+    tag_details: dict[str, dict[str, object]],
+    roundtrip_text: str,
+    original_text: str,
+) -> dict[str, dict[str, object]]:
+    """Rewrite tag offsets from the NER round-trip text onto the original text.
+
+    Evidence `char_start`/`char_end` must index the item's own `text` exactly —
+    that is the published contract span highlighting rests on (#154). The NER
+    stage only validates whitespace-collapsed equality, so the model may add or
+    drop whitespace anywhere; the non-whitespace characters are identical in
+    order, and each span is snapped to the original text along that alignment.
+
+    Returns the input unchanged when the texts already match, and unchanged
+    when they cannot be aligned (which collapse-equality validation rules out;
+    tolerated here rather than raised so one pathological row degrades to the
+    old offsets instead of failing the item).
+    """
+    if roundtrip_text == original_text or not tag_details:
+        return tag_details
+    nonws_map: dict[int, int] = {}
+    target_index = 0
+    target_length = len(original_text)
+    for source_index, char in enumerate(roundtrip_text):
+        if char.isspace():
+            continue
+        while target_index < target_length and original_text[target_index].isspace():
+            target_index += 1
+        if target_index >= target_length or original_text[target_index] != char:
+            return tag_details
+        nonws_map[source_index] = target_index
+        target_index += 1
+    realigned: dict[str, dict[str, object]] = {}
+    for tag_id, detail in tag_details.items():
+        start = cast(int, detail["char_start"])
+        end = cast(int, detail["char_end"])
+        while start < end and roundtrip_text[start].isspace():
+            start += 1
+        last = end - 1
+        while last >= start and roundtrip_text[last].isspace():
+            last -= 1
+        if last < start or start not in nonws_map or last not in nonws_map:
+            realigned[tag_id] = detail
+            continue
+        new_start = nonws_map[start]
+        new_end = nonws_map[last] + 1
+        realigned[tag_id] = {
+            **detail,
+            "char_start": new_start,
+            "char_end": new_end,
+            "text": original_text[new_start:new_end],
+        }
+    return realigned
 
 
 def repair_unescaped_ampersands(text: str) -> str:

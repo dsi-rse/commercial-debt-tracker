@@ -3561,3 +3561,63 @@ def test_classifier_loads_model_once_per_run(
 
     assert len(classified) == 2
     assert loads == 1
+
+
+def test_realign_tag_details_maps_offsets_onto_the_original_text() -> None:
+    """Evidence offsets index the item's own text, not the model's echo (#154)."""
+    from cdt.extractor.core import realign_tag_details
+
+    original = "The  $5,000,000\tTerm Loan closed."
+    roundtrip = "The $5,000,000 Term Loan closed."
+    tag_details = {
+        "tag-1": {
+            "type": "amount",
+            "text": "$5,000,000",
+            "char_start": roundtrip.index("$5,000,000"),
+            "char_end": roundtrip.index("$5,000,000") + len("$5,000,000"),
+        },
+        "tag-2": {
+            "type": "debt_instrument",
+            "text": "Term Loan",
+            "char_start": roundtrip.index("Term Loan"),
+            "char_end": roundtrip.index("Term Loan") + len("Term Loan"),
+        },
+    }
+    realigned = realign_tag_details(tag_details, roundtrip, original)
+    for tag_id in tag_details:
+        start = realigned[tag_id]["char_start"]
+        end = realigned[tag_id]["char_end"]
+        assert original[start:end] == realigned[tag_id]["text"]
+    assert realigned["tag-1"]["text"] == "$5,000,000"
+    assert realigned["tag-2"]["text"] == "Term Loan"
+
+
+def test_realign_tag_details_is_identity_when_texts_match() -> None:
+    """The common exact-echo case pays no alignment cost."""
+    from cdt.extractor.core import realign_tag_details
+
+    text = "A $10 note."
+    details = {
+        "tag-1": {"type": "amount", "text": "$10", "char_start": 2, "char_end": 5}
+    }
+    assert realign_tag_details(details, text, text) is details
+
+
+def test_realign_tag_details_handles_model_deleted_whitespace() -> None:
+    """collapse-equality permits dropped whitespace; spans still land right."""
+    from cdt.extractor.core import realign_tag_details
+
+    original = "Senior Notes due 2028\nwere issued."
+    roundtrip = "Senior Notes due 2028 were issued."
+    details = {
+        "tag-1": {
+            "type": "debt_instrument",
+            "text": "Senior Notes due 2028",
+            "char_start": 0,
+            "char_end": len("Senior Notes due 2028"),
+        }
+    }
+    realigned = realign_tag_details(details, roundtrip, original)
+    start = realigned["tag-1"]["char_start"]
+    end = realigned["tag-1"]["char_end"]
+    assert original[start:end] == "Senior Notes due 2028"
