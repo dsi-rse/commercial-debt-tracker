@@ -81,8 +81,6 @@ an exact release tag; upgrading the pipeline means bumping that one `@vX.Y.Z` pi
   On pushes to `dev` and `main`: version → build/push image to GHCR →
   `pulumi up` → sync the image to ECR. A `main` push also commits the patch
   version bump, cuts a tag and GitHub Release, and merges `main` back into `dev`.
-- `.github/workflows/run-historical.yml`
-  CDT-specific: starts an ECS task for a manual historical backfill.
 
 Points worth knowing about the shared flow:
 
@@ -233,16 +231,27 @@ are annotated at both ends; change them together.
 
 ## Historical Backfills
 
-There are two supported historical paths:
+Historical runs are manual and admin-driven by design. The GitHub deploy role
+cannot call `ecs:RunTask`, and granting it in the shared bootstrap policy was
+judged not worth it for the handful of runs historical will ever see (#108) --
+a `run-historical.yml` workflow existed but never worked and has been removed.
 
-1. GitHub Actions
-   Use `.github/workflows/run-historical.yml` and provide `stack`, `start_date`, `end_date`, `cik_file`, and optional `force`.
-2. Manual AWS CLI
-   Run `aws ecs run-task` with a container override command beginning with `historical`.
+Use the launcher script with admin credentials:
 
-The GitHub workflow uses Pulumi outputs to resolve the cluster, task definition, subnet, and security group before launching the task.
-For manual AWS CLI runs, export `PULUMI_CONFIG_PASSPHRASE` before reading Pulumi outputs; the passphrase is stored in the Core Facility Bitwarden.
-See [docs/deployment-dev.md](deployment-dev.md) for a complete command that logs into the S3 Pulumi backend, selects the stack, and starts an ECS historical task.
+```bash
+export PULUMI_CONFIG_PASSPHRASE='<from the Core Facility Bitwarden>'
+./scripts/run-historical.sh --stack dev \
+  --start-date 2024-01-01 --end-date 2024-01-31 \
+  --cik-file s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/inputs/ciks/beta-1k.txt
+```
+
+It resolves the cluster, task definition, subnet, and security group from
+Pulumi stack outputs, builds the same container overrides the workflow did
+(`--force` and `--extractor-backend batch|live` are optional flags), echoes a
+one-line launch record (parameters plus caller ARN) for your shell history,
+and prints the task ARN and a log-tail command. See
+[docs/deployment-dev.md](deployment-dev.md) for the underlying `aws ecs
+run-task` pattern the script wraps.
 
 ## Operational Guidance
 
@@ -254,9 +263,9 @@ See [docs/deployment-dev.md](deployment-dev.md) for a complete command that logs
 ## Prod Launch Checklist
 
 Prod stays dark until this list is walked in order. The gate variable
-(`PROD_INFRA_READY=false`), the `prod` GitHub environment, the committed
-`pulumi/Pulumi.prod.yaml`, and the loud `run-historical.yml` guard already
-exist, so nothing here is urgent before launch day — but do it in order then.
+(`PROD_INFRA_READY=false`), the `prod` GitHub environment, and the committed
+`pulumi/Pulumi.prod.yaml` already exist, so nothing here is urgent before
+launch day — but do it in order then.
 
 1. **Shared prerequisites** (owned outside this repo): the shared stack
    publishes `/idi/prod/shared/processor_bucket_name` and
@@ -278,8 +287,9 @@ exist, so nothing here is urgent before launch day — but do it in order then.
 5. **Flip the gate**: `gh variable set PROD_INFRA_READY --body "true"`, then
    deploy (a `main` release, or `make infra-up PULUMI_STACK=prod`). Confirm
    the SNS subscription email after the deploy.
-6. **Smoke test before any schedule**: dispatch `run-historical.yml` with
-   `stack=prod`, a small CIK file, and a narrow date range. Verify document/
+6. **Smoke test before any schedule**: run
+   `./scripts/run-historical.sh --stack prod ...` with a small CIK file and a
+   narrow date range (admin credentials; see Historical Backfills). Verify document/
    item/classification partitions appear under `processors/cdt/`, a manual
    (or scheduled) poll tick drains the extract job, `database/cdt/` holds
    exactly the four `latest.parquet` tables, and
