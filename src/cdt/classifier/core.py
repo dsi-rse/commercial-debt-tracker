@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import pickle
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from time import perf_counter
 from typing import Protocol, Self, runtime_checkable
@@ -188,6 +188,7 @@ def classify_pending_items(
     model_dir: Path | None = None,
     batch_size: int = 100,
     force: bool = False,
+    renew: Callable[[], None] | None = None,
 ) -> pd.DataFrame:
     """Classify item partitions and persist canonical classification partitions."""
     if batch_size <= 0:
@@ -268,10 +269,29 @@ def classify_pending_items(
                 perf_counter() - partition_start,
             )
 
-    for item_path in visited_item_paths:
-        registry[item_path] = CompletedPartition(
-            fingerprint=source_fingerprints.get(item_path)
+        # Persist completion at every batch boundary: the registry was written
+        # once at stage end, so any interruption discarded the whole run's
+        # progress (#111). Repeat saves are cheap and concurrency-safe: only
+        # dirty entries are merged via compare-and-swap (#88). Renew the writer
+        # lease at the same boundary, because a stage that outlasts the lease
+        # TTL was otherwise stolen mid-run and aborted at the next stage
+        # boundary (#111).
+        for item_path in chunk_paths:
+            registry[item_path] = CompletedPartition(
+                fingerprint=source_fingerprints.get(item_path)
+            )
+        save_completion_registry(
+            "classify",
+            registry,
+            artifact_root=resolved_root,
+            data_dir=data_dir,
         )
+        if renew is not None:
+            renew()
+
+    # Still save once at the end: pending_source_partitions may have refreshed
+    # registry entries (backfill, fingerprint adoption) even when nothing was
+    # pending, and those land in the dirty set outside any chunk (#111).
     save_completion_registry(
         "classify",
         registry,

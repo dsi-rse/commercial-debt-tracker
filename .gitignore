@@ -147,3 +147,4 @@ data/important-8K-filers.csv
 
 scripts/*
 !scripts/local-pipeline.sh
+!scripts/run-historical.sh

@@ -9,12 +9,15 @@ from types import SimpleNamespace
 
 import pandas as pd
 import pytest
+from botocore.exceptions import ClientError, ReadTimeoutError
 
+from cdt import storage as cdt_storage
 from cdt.classifier import classifications_root, classify_pending_items
 from cdt.classifier import core as classifier_core
 from cdt.datasets import (
     completion_registry_path,
     existing_date_shard_partition_ids,
+    load_completed_partitions,
     load_row_failures,
     shard_for_accession,
 )
@@ -60,6 +63,7 @@ from cdt.pipeline import normalize_snapshot_text
 from cdt.storage import (
     artifact_exists,
     coerce_dataset_text,
+    get_object_bytes,
     read_dataset,
     read_json_artifact,
     read_table,
@@ -461,6 +465,175 @@ def test_load_training_artifacts_warns_without_recorded_version(
 
     assert threshold == 0.5
     assert any("sklearn_version" in record.getMessage() for record in caplog.records)
+
+
+def test_itemize_pending_documents_persists_progress_per_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash mid-stage must lose at most one batch, not the whole run (#111)."""
+    seed_document_partitions(tmp_path)
+    calls = 0
+    real_itemize_documents = itemizer_core.itemize_documents
+
+    def failing_itemize_documents(*args: object, **kwargs: object) -> pd.DataFrame:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            msg = "Read timed out"
+            raise TimeoutError(msg)
+        return real_itemize_documents(*args, **kwargs)
+
+    monkeypatch.setattr(itemizer_core, "itemize_documents", failing_itemize_documents)
+
+    with pytest.raises(TimeoutError):
+        itemize_pending_documents(artifact_root=tmp_path, batch_size=1)
+
+    assert len(load_completed_partitions("itemize", artifact_root=tmp_path)) == 1
+
+    monkeypatch.setattr(itemizer_core, "itemize_documents", real_itemize_documents)
+    resumed = itemize_pending_documents(artifact_root=tmp_path, batch_size=1)
+
+    assert len(resumed) == 1
+    assert len(load_completed_partitions("itemize", artifact_root=tmp_path)) == 2
+
+
+def test_classify_pending_items_persists_progress_per_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash mid-stage must lose at most one batch, not the whole run (#111)."""
+    seed_document_partitions(tmp_path)
+    itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
+    monkeypatch.setattr(
+        classifier_core,
+        "load_training_artifacts",
+        lambda path: (FakeModel(), 0.5, {"threshold": 0.5}),
+    )
+    calls = 0
+    real_classify_items = classifier_core.classify_items
+
+    def failing_classify_items(*args: object, **kwargs: object) -> pd.DataFrame:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            msg = "Read timed out"
+            raise TimeoutError(msg)
+        return real_classify_items(*args, **kwargs)
+
+    monkeypatch.setattr(classifier_core, "classify_items", failing_classify_items)
+
+    with pytest.raises(TimeoutError):
+        classify_pending_items(artifact_root=tmp_path, batch_size=1)
+
+    assert len(load_completed_partitions("classify", artifact_root=tmp_path)) == 1
+
+
+def test_stage_batch_boundaries_renew_the_writer_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Renew the lease once per batch, or a long stage is stolen mid-run (#111)."""
+    seed_document_partitions(tmp_path)
+    renewals: list[str] = []
+
+    itemize_pending_documents(
+        artifact_root=tmp_path,
+        batch_size=1,
+        renew=lambda: renewals.append("itemize"),
+    )
+
+    assert renewals.count("itemize") == 2
+
+    monkeypatch.setattr(
+        classifier_core,
+        "load_training_artifacts",
+        lambda path: (FakeModel(), 0.5, {"threshold": 0.5}),
+    )
+    classify_pending_items(
+        artifact_root=tmp_path,
+        batch_size=2,
+        renew=lambda: renewals.append("classify"),
+    )
+
+    assert renewals.count("classify") == 1
+
+
+class _TimingOutBody:
+    """Body whose streaming read dies mid-stream."""
+
+    def read(self: _TimingOutBody) -> bytes:
+        raise ReadTimeoutError(endpoint_url="https://s3.test")
+
+
+class _FlakyS3Client:
+    """get_object succeeds; the body read times out a set number of times."""
+
+    def __init__(self: _FlakyS3Client, payload: bytes, read_failures: int) -> None:
+        self.payload = payload
+        self.read_failures = read_failures
+        self.get_object_calls = 0
+
+    def get_object(self: _FlakyS3Client, Bucket: str, Key: str) -> dict[str, object]:  # noqa: N803
+        del Bucket, Key
+        self.get_object_calls += 1
+        if self.read_failures > 0:
+            self.read_failures -= 1
+            return {"Body": _TimingOutBody()}
+        return {"Body": SimpleNamespace(read=lambda: self.payload)}
+
+
+def test_get_object_bytes_retries_streaming_read_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mid-stream timeout must re-issue the GET, not kill the caller (#112).
+
+    botocore's retry logic covers the get_object call, not the streaming body
+    read; one such timeout previously ended a 2.5h itemize at partition
+    13,121 of 18,113.
+    """
+    monkeypatch.setattr(cdt_storage, "sleep", lambda seconds: None)
+    client = _FlakyS3Client(b"payload", read_failures=2)
+
+    assert get_object_bytes(client, "bucket", "key") == b"payload"
+    assert client.get_object_calls == 3
+
+
+def test_get_object_bytes_gives_up_after_bounded_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A persistent stream failure must surface, not retry forever (#112)."""
+    monkeypatch.setattr(cdt_storage, "sleep", lambda seconds: None)
+    client = _FlakyS3Client(b"payload", read_failures=99)
+
+    with pytest.raises(ReadTimeoutError):
+        get_object_bytes(client, "bucket", "key")
+
+    assert client.get_object_calls == cdt_storage._GET_OBJECT_ATTEMPTS
+
+
+def test_get_object_bytes_does_not_retry_client_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Permanent errors (NoSuchKey, AccessDenied) must propagate immediately (#112)."""
+    monkeypatch.setattr(cdt_storage, "sleep", lambda seconds: None)
+    calls = 0
+
+    class _MissingKeyClient:
+        def get_object(
+            self: _MissingKeyClient, Bucket: str, Key: str
+        ) -> dict[str, object]:  # noqa: N803
+            nonlocal calls
+            del Bucket, Key
+            calls += 1
+            raise ClientError(
+                {"Error": {"Code": "NoSuchKey", "Message": "missing"}}, "GetObject"
+            )
+
+    with pytest.raises(ClientError):
+        get_object_bytes(_MissingKeyClient(), "bucket", "key")
+
+    assert calls == 1
 
 
 def test_extract_pending_items_writes_mentions_and_audit(
