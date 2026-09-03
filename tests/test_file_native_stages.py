@@ -3983,3 +3983,83 @@ def test_legacy_end_date_property_replays_into_maturity_date() -> None:
     InstrumentIEStage().postprocess(row_state)
 
     assert row_state.debt_instrument_mentions[0]["maturity_date"] == "2031-06-30"
+
+
+TERMINATION_ITEM_XML = """
+<body>
+On <date id="tag-d-term">June 2, 2026</date>, the Company terminated its
+<debt_instrument id="tag-i-1">$3.5 billion five-year revolving credit facility</debt_instrument>,
+dated as of <date id="tag-d-dated">October 11, 2023</date>.
+</body>
+""".strip()
+
+
+def test_status_event_records_a_standalone_termination() -> None:
+    """A 1.02 termination is recordable without a successor object (#141)."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = TERMINATION_ITEM_XML
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "start_date": {
+                    "evidence": ["tag-d-dated"],
+                    "normalized_date": "2023-10-11",
+                },
+                "status_event": {
+                    "status": "terminated",
+                    "status_date": {
+                        "evidence": ["tag-d-term"],
+                        "normalized_date": "2026-06-02",
+                    },
+                },
+            }
+        ]
+    )
+    InstrumentIEStage().postprocess(row_state)
+
+    mention = row_state.debt_instrument_mentions[0]
+    assert mention["status"] == "terminated"
+    assert mention["status_date"] == "2026-06-02"
+    payload = json.loads(str(mention["status_json"]))
+    assert payload["status"] == "terminated"
+    assert [s["tag_id"] for s in payload["status_date"]["spans"]] == ["tag-d-term"]
+
+
+def test_status_event_validation_rejects_unknown_statuses() -> None:
+    """Only the seven agreed statuses validate; matured is derived, not extracted."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = TERMINATION_ITEM_XML
+    response = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "status_event": {"status": "matured"},
+            }
+        ]
+    )
+    failures = InstrumentIEStage().validate(row_state, response)
+    assert any(
+        "'status_event.status' must be one of" in failure for failure in failures
+    )
+
+
+def test_missing_status_event_publishes_null_status() -> None:
+    """A mention that states no event carries no status."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = TERMINATION_ITEM_XML
+    row_state.stage_responses["instrument_ie"] = json.dumps([{"name": ["tag-i-1"]}])
+    InstrumentIEStage().postprocess(row_state)
+
+    mention = row_state.debt_instrument_mentions[0]
+    assert mention["status"] is None
+    assert mention["status_date"] is None

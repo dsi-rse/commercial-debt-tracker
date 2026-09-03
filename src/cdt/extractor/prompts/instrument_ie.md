@@ -18,6 +18,7 @@ For each object, extract these properties when present:
 - `maturity_date`
 - `commitment_termination_date`
 - `amounts`
+- `status_event`
 - `lenders`
 - `lenders_known_incomplete`
 - `other_interested_parties`
@@ -26,6 +27,20 @@ For standardized single-value properties, use these object shapes:
 - `start_date`: `{ "evidence": ["tag-..."], "normalized_date": "YYYY-MM-DD" | null }`
 - `maturity_date`: `{ "evidence": ["tag-..."], "normalized_date": "YYYY-MM-DD" | null }`
 - `commitment_termination_date`: `{ "evidence": ["tag-..."], "normalized_date": "YYYY-MM-DD" | null }`
+
+For the instrument's state, return one optional event:
+- `status_event`: `{ "status": "announced" | "entered_into" | "amended" | "terminated" | "repaid" | "exchanged" | "defaulted", "status_date": { "evidence": ["tag-..."], "normalized_date": "YYYY-MM-DD" | null } | null }`
+
+The `status` labels what this mention says happened to the instrument:
+- `announced`: the instrument is disclosed before it exists — a priced or launched offering, a signed commitment letter, `expected to close on or about July 6`. An `announced` instrument gets no `start_date`; it has not started.
+- `entered_into`: the instrument closed, was issued, or became effective. The normal case for a new agreement or issuance.
+- `amended`: the instrument's terms were modified. In a before/after pair, the object for the instrument as amended carries `amended`; give the predecessor object no `status_event` unless the text states a separate event for it.
+- `terminated`: the agreement or facility was ended before its scheduled date, as in `On June 2, 2026, the Company terminated its $3.5 billion revolving credit facility`. Termination often co-occurs with a final repayment; when the filing's point is that the facility ended, use `terminated`.
+- `repaid`: the obligation was or will be satisfied by payment — repaid in full, redeemed, defeased. A redemption target of a use-of-proceeds financing is `repaid`.
+- `exchanged`: the obligation was satisfied by delivering other securities or equity instead of cash.
+- `defaulted`: the filing reports a default, event of default, or acceleration of the obligation (the Item 2.04 vocabulary).
+
+`status_date` is the date the event happened or takes effect, when the text states one: the termination date, the redemption date, the closing date. Cite `date` tag ids. Omit `status_event` entirely when the mention states no event — a facility merely described in passing has no status.
 
 For money, return one `amounts` list per object, one entry per money fact the document states about that instrument:
 - `amounts`: `[{ "kind": "commitment" | "principal" | "outstanding_balance" | "draw" | "repayment" | "proceeds", "evidence": ["tag-..."], "normalized_amount": "12345.67" | null, "currency": "USD" | null, "as_of_date": "YYYY-MM-DD" | null }]`
@@ -47,7 +62,7 @@ For party properties, return one object per coreference cluster:
 - Return one JSON object per concrete debt instrument described as its own obligation in the document.
 - Do not return agreements as objects.
 - `name` may contain only `debt_instrument` tag ids.
-- `start_date.evidence` may contain only `date` tag ids. The `debt_instrument` allowance below is specific to `maturity_date` and `amounts`, because a maturity or a principal can be stated inside a name while an issuance date never is. When the document states no date you can cite, omit `start_date` rather than citing the instrument's name.
+- `start_date.evidence` may contain only `date` tag ids. The `debt_instrument` allowance below is specific to `maturity_date` and `amounts`, because a maturity or a principal can be stated inside a name while an issuance date never is. When the document states no date you can cite, omit `start_date` rather than citing the instrument's name. An instrument whose `status_event` is `announced` has not yet come into existence and never gets a `start_date`.
 - `maturity_date` is when the borrowed money must be repaid: the final maturity or expiration of the obligation itself. `commitment_termination_date` is when the lender's obligation to lend ends: the close of a draw period, availability period, or revolving period. They answer different questions, so never put one in the other's field.
 - When the text states one date for a facility's end, it is the `maturity_date`. When it states both an availability or draw-period end and a repayment date, return both fields. When it states only a draw-period or commitment-termination end, return `commitment_termination_date` and leave `maturity_date` absent rather than promoting it.
 - `maturity_date.evidence` may contain `date` tag ids, or the instrument's own `debt_instrument` tag id when the maturity is embedded in the name, such as `3.875% senior notes due 2028`.
@@ -133,6 +148,9 @@ Examples:
 - If a document says prior notes were retired in full, do not return a new object just for that contextual mention unless the filing separately describes a concrete debt instrument state for it.
 - If a company issues new senior notes and states that the proceeds will be used to redeem its outstanding `5.25% Senior Notes due 2027`, return an object for the 2027 notes as well. The redemption target is named with concrete terms, and its redemption is a state this schema records.
 - If a company issues new senior notes and states that the proceeds will be used to `repay existing indebtedness` or to `repay outstanding borrowings under its revolving credit facility`, stating no rate, maturity, or amount for what is repaid, do not return an object for the repaid debt.
+- If a 1.02 item says `on June 2, 2026, the Company terminated its $3.5 billion five-year revolving credit facility dated as of October 11, 2023`, return that facility with `status_event` `terminated`, `status_date` `2026-06-02`, and `start_date` `2023-10-11`. The termination is recordable even though no successor instrument appears in the item.
+- If a company issues new notes whose proceeds will redeem its `5.25% Senior Notes due 2027`, the 2027 notes' object carries `status_event` `repaid`, with the stated redemption date as `status_date` when the text gives one. The new notes carry `entered_into`, or `announced` if the offering has not yet closed.
+- If a company prices an offering `expected to close on or about July 6, 2026`, return the notes with `status_event` `announced` and no `start_date`. The expected closing date is not a `start_date` until the filing says the closing happened.
 - If a company states that offering proceeds were used to repay in full its outstanding senior convertible notes (the `February Notes`) sold pursuant to a securities purchase agreement dated as of February 12, 2026, return an object for the February Notes with `start_date` `2026-02-12`: the notes themselves are repaid, and the dated agreement identifies them even though no rate, maturity, or amount is stated.
 - If a company states that proceeds were used to `repay outstanding borrowings under the Credit Agreement, dated as of March 1, 2024`, do not return a retirement object for the Credit Agreement: paying down borrowings leaves the facility in place.
 - If a credit agreement says the lenders are `JPMorgan Chase Bank, N.A.` and `the other lenders party thereto`, return both clusters, `kind: "named"` for Chase and `kind: "collective"` for the other lenders, with `lenders_known_incomplete: true`.

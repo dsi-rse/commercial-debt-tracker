@@ -145,6 +145,8 @@ class PreparedMention:
     principal_currency: str | None
     principal_amount_kind: str | None
     amounts_json: str
+    status: str | None
+    status_date: str | None
     amendment_of: str | None
     retired_by: tuple[str, ...]
     split_of: str | None
@@ -1344,6 +1346,8 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
         principal_currency=coerce_optional_text(row.get("principal_currency")),
         principal_amount_kind=coerce_optional_text(row.get("principal_amount_kind")),
         amounts_json=str(row.get("amounts_json") or "[]"),
+        status=coerce_optional_text(row.get("status")),
+        status_date=coerce_optional_text(row.get("status_date")),
         amendment_of=coerce_optional_text(row.get("amendment_of")),
         retired_by=tuple(json.loads(str(row.get("retired_by_json") or "[]"))),
         split_of=coerce_optional_text(row.get("split_of")),

@@ -122,6 +122,18 @@ AMOUNT_KINDS = {
 }
 PRINCIPAL_AMOUNT_KINDS = ("commitment", "principal")
 AMOUNT_EVIDENCE_TAG_TYPES = {"amount", "debt_instrument"}
+# What one mention says happened to its instrument (#141). `matured` is
+# deliberately absent: filings almost never say it, and the matcher derives it
+# from maturity_date instead.
+STATUS_EVENT_VALUES = {
+    "announced",
+    "entered_into",
+    "amended",
+    "terminated",
+    "repaid",
+    "exchanged",
+    "defaulted",
+}
 MATURITY_EVIDENCE_TAG_TYPES = {"debt_instrument"}
 NAME_EMBEDDED_AMOUNT_TAG_TYPES = {"debt_instrument"}
 STANDARDIZED_SINGLE_VALUE_PROPERTIES = {
@@ -264,6 +276,8 @@ DEBT_INSTRUMENT_MENTION_COLUMNS = [
     "principal_amount",
     "principal_currency",
     "principal_amount_kind",
+    "status",
+    "status_date",
     "amendment_of",
     "retired_by_json",
     "split_of",
@@ -273,6 +287,7 @@ DEBT_INSTRUMENT_MENTION_COLUMNS = [
     "maturity_date_json",
     "commitment_termination_date_json",
     "amounts_json",
+    "status_json",
     "lenders_known_incomplete",
 ]
 
@@ -731,6 +746,13 @@ def validate_instrument_entry(
             tag_details=tag_details,
         )
     )
+    failures.extend(
+        validate_status_event(
+            index=index,
+            obj=obj,
+            tag_details=tag_details,
+        )
+    )
     for property_name in PARTY_PROPERTY_ANNOTATIONS:
         failures.extend(
             validate_party_property(
@@ -825,6 +847,9 @@ class InstrumentIEStage:
                 obj.get("commitment_termination_date"),
                 tag_details,
             )
+            status_payload = standardized_status_payload(
+                obj.get("status_event"), tag_details
+            )
             party_clusters, lenders_known_incomplete = (
                 party_payloads_and_incompleteness(obj, tag_details)
             )
@@ -845,6 +870,14 @@ class InstrumentIEStage:
                 "principal_amount": principal.get("normalized_amount"),
                 "principal_currency": principal.get("currency"),
                 "principal_amount_kind": principal.get("kind"),
+                "status": status_payload["status"],
+                "status_date": (
+                    cast(dict[str, object], status_payload["status_date"]).get(
+                        "normalized_date"
+                    )
+                    if isinstance(status_payload["status_date"], dict)
+                    else None
+                ),
                 "amendment_of": None,
                 "retired_by_json": "[]",
                 "split_of": None,
@@ -860,6 +893,7 @@ class InstrumentIEStage:
                     commitment_termination_payload, sort_keys=True
                 ),
                 "amounts_json": json.dumps(amount_payloads, sort_keys=True),
+                "status_json": json.dumps(status_payload, sort_keys=True),
             }
             mention_id = debt_instrument_mention_id_for(
                 row_state.item_id,
@@ -2486,6 +2520,82 @@ def validate_amounts_property(
     return failures
 
 
+def validate_status_event(
+    *,
+    index: int,
+    obj: dict[str, Any],
+    tag_details: dict[str, dict[str, object]],
+) -> list[str]:
+    """Validate the optional status_event on one instrument entry (#141)."""
+    if "status_event" not in obj:
+        return []
+    event = obj["status_event"]
+    if not isinstance(event, dict):
+        return [f"Entry {index}: 'status_event' must be an object."]
+    failures: list[str] = []
+    status = event.get("status")
+    if status not in STATUS_EVENT_VALUES:
+        allowed = ", ".join(sorted(STATUS_EVENT_VALUES))
+        failures.append(
+            f"Entry {index}: 'status_event.status' must be one of {allowed}."
+        )
+    status_date = event.get("status_date")
+    if status_date is None:
+        return failures
+    if not isinstance(status_date, dict):
+        failures.append(
+            f"Entry {index}: 'status_event.status_date' must be an object or null."
+        )
+        return failures
+    evidence = status_date.get("evidence")
+    if not isinstance(evidence, list):
+        failures.append(
+            f"Entry {index}: 'status_event.status_date.evidence' must be a list of tag IDs."
+        )
+        return failures
+    for tag_id in evidence:
+        if not isinstance(tag_id, str):
+            failures.append(
+                f"Entry {index}: 'status_event.status_date.evidence' must contain string tag IDs only."
+            )
+            continue
+        tag_info = tag_details.get(tag_id)
+        if tag_info is None:
+            failures.append(
+                f"Entry {index}: 'status_event.status_date' contains unknown tag ID {tag_id}."
+            )
+        elif tag_info["type"] != "date":
+            failures.append(
+                f"Entry {index}: 'status_event.status_date' tag {tag_id} is type "
+                f"'{tag_info['type']}', expected date."
+            )
+    normalized_date = status_date.get("normalized_date")
+    if normalized_date is not None and (
+        not isinstance(normalized_date, str)
+        or not ISO_DATE_PATTERN.fullmatch(normalized_date)
+        or not is_valid_iso_date(normalized_date)
+    ):
+        failures.append(
+            f"Entry {index}: 'status_event.status_date.normalized_date' must be YYYY-MM-DD or null."
+        )
+    return failures
+
+
+def standardized_status_payload(
+    value: object,
+    tag_details: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    """Return the persisted status payload for one instrument entry (#141)."""
+    if not isinstance(value, dict):
+        return {"status": None, "status_date": None}
+    status = value.get("status")
+    date_payload = standardized_date_payload(value.get("status_date"), tag_details)
+    return {
+        "status": status if status in STATUS_EVENT_VALUES else None,
+        "status_date": date_payload,
+    }
+
+
 def iter_instrument_entries(
     data: list[dict[str, Any]],
     tag_details: dict[str, dict[str, object]],
@@ -2536,6 +2646,7 @@ def debt_instrument_mention_id_for(
         "name": mention_row.get("name"),
         "parties_json": normalize_json_text(mention_row.get("parties_json")),
         "principal_amount": mention_row.get("principal_amount"),
+        "status_json": normalize_json_text(mention_row.get("status_json")),
         "start_date": mention_row.get("start_date"),
         "start_date_json": normalize_json_text(mention_row.get("start_date_json")),
     }
