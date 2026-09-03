@@ -197,7 +197,7 @@ def build_mention_row(
         "end_date": None,
         "amount": amount,
         "amendment_of": None,
-        "retired_of": None,
+        "retired_by_json": "[]",
         "split_of": None,
         "lenders_json": lenders_json,
         "lenders_known_incomplete": lenders_known_incomplete,
@@ -668,7 +668,7 @@ def test_extract_pending_items_writes_mentions_and_audit(
                 "end_date": None,
                 "amount": "$100 million",
                 "amendment_of": None,
-                "retired_of": None,
+                "retired_by_json": "[]",
                 "split_of": None,
                 "lenders_json": "[]",
                 "lenders_known_incomplete": False,
@@ -732,7 +732,7 @@ def test_extract_pending_items_drains_all_partitions(
                 "end_date": None,
                 "amount": "$100 million",
                 "amendment_of": None,
-                "retired_of": None,
+                "retired_by_json": "[]",
                 "split_of": None,
                 "lenders_json": "[]",
                 "lenders_known_incomplete": True,
@@ -1488,9 +1488,11 @@ def test_lineage_pair_is_oriented_successor_first() -> None:
         "i-2",
         "i-1",
     )
-    assert oriented_lineage_pair("i-1", "i-2", "retired_of", by_raw_id) == (
-        "i-2",
+    # `retired_by` runs the other way: the retired obligation is the earlier
+    # side, so a pair the model named retirer-first is flipped.
+    assert oriented_lineage_pair("i-2", "i-1", "retired_by", by_raw_id) == (
         "i-1",
+        "i-2",
     )
 
 
@@ -2101,8 +2103,8 @@ def test_instrument_ie_prompt_requires_one_object_per_class() -> None:
     assert "Class A-1" in prompt
 
 
-def test_instrument_relation_stage_accepts_retired_of() -> None:
-    """Relation validation and postprocessing should support retired_of."""
+def test_instrument_relation_stage_accepts_retired_by() -> None:
+    """Relation validation and postprocessing should support retired_by."""
     row_state = ExtractionRowState(
         item_row={"item_id": "item-1"},
         stage_name="instrument_relation",
@@ -2117,7 +2119,7 @@ def test_instrument_relation_stage_accepts_retired_of() -> None:
             "raw_id": "i-2",
         },
     ]
-    response = '[{"from": "i-2", "to": "i-1", "type": "retired_of"}]'
+    response = '[{"from": "i-2", "to": "i-1", "type": "retired_by"}]'
 
     failures = InstrumentRelationStage().validate(row_state, response)
     assert failures == []
@@ -2125,7 +2127,7 @@ def test_instrument_relation_stage_accepts_retired_of() -> None:
     row_state.stage_responses["instrument_relation"] = response
     InstrumentRelationStage().postprocess(row_state)
 
-    assert row_state.debt_instrument_mentions[1]["retired_of"] == "m-1"
+    assert row_state.debt_instrument_mentions[1]["retired_by_json"] == '["m-1"]'
 
 
 def test_match_pending_mentions_writes_match_datasets(tmp_path: Path) -> None:
@@ -2463,10 +2465,10 @@ def test_match_tables_does_not_emit_literal_nan_company_names() -> None:
     assert tables["debt_instrument"]["company_name"].to_list() == [None]
 
 
-def test_match_tables_retired_of_keeps_separate_clusters_and_updates_parent_end_date() -> (
+def test_match_tables_retired_by_keeps_separate_clusters_and_ends_the_instrument() -> (
     None
 ):
-    """Retirement lineage should not collapse into one cluster and should end-date the parent."""
+    """The retired instrument keeps its own cluster, end date, and retirer pointer."""
     mentions = pd.DataFrame(
         [
             {
@@ -2496,7 +2498,7 @@ def test_match_tables_retired_of_keeps_separate_clusters_and_updates_parent_end_
                     lenders_json='[{"mentions": [{"text": "Acme Bank"}]}]',
                 ),
                 "end_date": "2024-03-01",
-                "retired_of": "m-1",
+                "retired_by_json": '["m-1"]',
             },
         ]
     )
@@ -2517,16 +2519,21 @@ def test_match_tables_retired_of_keeps_separate_clusters_and_updates_parent_end_
         row["debt_instrument_id"]: row
         for row in tables["debt_instrument"].to_dict("records")
     }
-    assert instruments["m-2"]["retired_of_debt_instrument_id"] == "m-1"
-    assert instruments["m-1"]["end_date"] == "2024-03-01"
+    assert instruments["m-2"]["retired_by_debt_instrument_ids"] == '["m-1"]'
+    # No cross-row propagation: the retirement filing's mention sits in the
+    # retired instrument's own cluster, so its end date is already there.
+    assert instruments["m-2"]["end_date"] == "2024-03-01"
+    assert instruments["m-1"]["end_date"] is None
 
 
 def test_match_tables_publishes_two_kinds_of_lineage_for_one_instrument() -> None:
     """Split and retirement lineage coexist in their own columns (#130).
 
     Pitney Bowes' incremental tranche A term loans split from the existing
-    tranche A loans and redeemed the 2027 notes with the proceeds. Nulling every
-    parent column whenever a second kind appeared discarded both links.
+    tranche A loans and redeemed the 2027 notes with the proceeds; a later
+    refinancing then repaid the incremental loans. The incremental loans' row
+    carries both a split parent and a retirer; nulling every parent column
+    whenever a second kind appeared discarded both links.
     """
     mentions = pd.DataFrame(
         [
@@ -2562,8 +2569,18 @@ def test_match_tables_publishes_two_kinds_of_lineage_for_one_instrument() -> Non
                     amount="$150 million",
                 ),
                 "split_of": "m-tranche",
-                "retired_of": "m-notes",
+                "retired_by_json": '["m-refi"]',
             },
+            build_mention_row(
+                mention_id="m-refi",
+                item_id="item-2",
+                accession_number="0002",
+                cik="320193",
+                date="2027-03-01",
+                name="Refinancing Term Loans",
+                start_date="2027-03-01",
+                amount="$150 million",
+            ),
         ]
     )
 
@@ -2575,8 +2592,65 @@ def test_match_tables_publishes_two_kinds_of_lineage_for_one_instrument() -> Non
     }
     row = instruments["m-incremental"]
     assert row["split_of_debt_instrument_id"] == "m-tranche"
-    assert row["retired_of_debt_instrument_id"] == "m-notes"
+    assert row["retired_by_debt_instrument_ids"] == '["m-refi"]'
     assert row["amendment_of_debt_instrument_id"] is None
+
+
+def test_match_tables_keeps_every_joint_retirer() -> None:
+    """Several instruments jointly retiring one obligation all publish.
+
+    Venture Global's two new series ($1.125B due 2034 and due 2036) jointly
+    redeem the 8.125% notes due 2028. Two retirers is a legitimate state of the
+    world, not extraction ambiguity, so the retired row keeps both -- unlike the
+    single-parent amendment/split columns, which clear on ambiguity (#130).
+    """
+    mentions = pd.DataFrame(
+        [
+            {
+                **build_mention_row(
+                    mention_id="m-old",
+                    item_id="item-1",
+                    accession_number="0001",
+                    cik="320193",
+                    date="2026-06-11",
+                    name="8.125% senior secured notes due 2028",
+                    start_date="2021-06-11",
+                    amount="$1,250 million",
+                ),
+                "retired_by_json": '["m-2034", "m-2036"]',
+            },
+            build_mention_row(
+                mention_id="m-2034",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2026-06-11",
+                name="6.375% senior secured notes due 2034",
+                start_date="2026-06-11",
+                amount="$1,125 million",
+            ),
+            build_mention_row(
+                mention_id="m-2036",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2026-06-11",
+                name="6.625% senior secured notes due 2036",
+                start_date="2026-06-11",
+                amount="$1,125 million",
+            ),
+        ]
+    )
+
+    tables = match_tables(mentions)
+
+    instruments = {
+        row["debt_instrument_id"]: row
+        for row in tables["debt_instrument"].to_dict("records")
+    }
+    assert instruments["m-old"]["retired_by_debt_instrument_ids"] == (
+        '["m-2034", "m-2036"]'
+    )
 
 
 def test_match_tables_drops_only_the_ambiguous_relation_kind() -> None:
@@ -2625,7 +2699,7 @@ def test_match_tables_drops_only_the_ambiguous_relation_kind() -> None:
                     amount="$400 million",
                 ),
                 "amendment_of": "m-a",
-                "retired_of": "m-notes",
+                "retired_by_json": '["m-notes"]',
             },
             {
                 **build_mention_row(
@@ -2657,7 +2731,7 @@ def test_match_tables_drops_only_the_ambiguous_relation_kind() -> None:
         r["debt_instrument_id"]: r for r in tables["debt_instrument"].to_dict("records")
     }[assignment["m-1"]]
     assert row["amendment_of_debt_instrument_id"] is None
-    assert row["retired_of_debt_instrument_id"] == "m-notes"
+    assert row["retired_by_debt_instrument_ids"] == '["m-notes"]'
 
 
 def test_match_tables_keeps_same_day_siblings_apart() -> None:
@@ -2831,7 +2905,7 @@ def test_extract_failures_are_recorded_and_cleared(
                 "end_date": None,
                 "amount": None,
                 "amendment_of": None,
-                "retired_of": None,
+                "retired_by_json": "[]",
                 "split_of": None,
                 "lenders_json": "[]",
                 "other_interested_parties_json": "[]",
