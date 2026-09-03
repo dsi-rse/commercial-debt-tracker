@@ -27,7 +27,7 @@ def mention_row(**overrides: object) -> dict[str, object]:
         "end_date": "2028-06-01",
         "amount": "500000000",
         "amendment_of": None,
-        "retired_of": None,
+        "retired_by": None,
         "split_of": None,
         "lenders_json": "[]",
         "lenders_known_incomplete": False,
@@ -436,43 +436,43 @@ def test_exact_key_match_keeps_amount_start_basis() -> None:
 
 
 def test_relation_target_cannot_join_declaring_cluster() -> None:
-    """Old notes retired by an exchange stay outside the new notes' cluster."""
-    new_notes = prepare_mention(
-        mention_row(
-            name="6.375% Senior Notes due 2025",
-            amount="231800000",
-            retired_of="mention-old",
-        )
-    )
+    """The new exchange notes stay outside the retired old notes' cluster."""
     old_notes = prepare_mention(
         mention_row(
-            debt_instrument_mention_id="mention-old",
             name="6.375% Senior Notes due 2025",
             amount="38400000",
             start_date="2010-05-11",
-        )
-    )
-    assert score(old_notes, profile_from(new_notes)) == []
-
-
-def test_declaring_mention_cannot_join_target_cluster() -> None:
-    """The new exchange notes stay outside the old notes' cluster too."""
-    old_notes = prepare_mention(
-        mention_row(
-            debt_instrument_mention_id="mention-old",
-            name="6.375% Senior Notes due 2025",
-            amount="38400000",
-            start_date="2010-05-11",
+            retired_by="mention-new",
         )
     )
     new_notes = prepare_mention(
         mention_row(
+            debt_instrument_mention_id="mention-new",
             name="6.375% Senior Notes due 2025",
             amount="231800000",
-            retired_of="mention-old",
         )
     )
     assert score(new_notes, profile_from(old_notes)) == []
+
+
+def test_declaring_mention_cannot_join_target_cluster() -> None:
+    """The retired old notes stay outside the new notes' cluster too."""
+    new_notes = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-new",
+            name="6.375% Senior Notes due 2025",
+            amount="231800000",
+        )
+    )
+    old_notes = prepare_mention(
+        mention_row(
+            name="6.375% Senior Notes due 2025",
+            amount="38400000",
+            start_date="2010-05-11",
+            retired_by="mention-new",
+        )
+    )
+    assert score(old_notes, profile_from(new_notes)) == []
 
 
 LENDER_JSON = (

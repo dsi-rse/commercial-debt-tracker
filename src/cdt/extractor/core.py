@@ -99,7 +99,7 @@ INSTRUMENT_SINGLE_VALUE_PROPERTIES = {
 MATURITY_EVIDENCE_TAG_TYPES = {"debt_instrument"}
 NAME_EMBEDDED_AMOUNT_TAG_TYPES = {"debt_instrument"}
 STANDARDIZED_SINGLE_VALUE_PROPERTIES = {"start_date", "end_date", "amount"}
-INSTRUMENT_RELATION_TYPES = {"amendment_of", "retired_of", "split_of"}
+INSTRUMENT_RELATION_TYPES = {"amendment_of", "retired_by", "split_of"}
 NUMERIC_STRING_PATTERN = re.compile(r"^\d+(?:\.\d+)?$")
 # One `due` can carry a list of maturities: `due 2028 and 2030`,
 # `due October 1, 2028 and 2030`, `due October 1, 2028 and October 1, 2030`. Each
@@ -230,7 +230,7 @@ DEBT_INSTRUMENT_MENTION_COLUMNS = [
     "end_date",
     "amount",
     "amendment_of",
-    "retired_of",
+    "retired_by",
     "split_of",
     "lenders_json",
     "other_interested_parties_json",
@@ -759,7 +759,7 @@ class InstrumentIEStage:
                 "end_date": end_date_payload["normalized_date"],
                 "amount": amount_payload["normalized_amount"],
                 "amendment_of": None,
-                "retired_of": None,
+                "retired_by": None,
                 "split_of": None,
                 "lenders_json": json.dumps(lender_clusters, sort_keys=True),
                 "lenders_known_incomplete": lenders_known_incomplete,
@@ -806,7 +806,8 @@ class InstrumentIEStage:
         )
 
 
-LINEAGE_SUCCESSOR_FIRST_TYPES = {"amendment_of", "retired_of"}
+LINEAGE_SUCCESSOR_FIRST_TYPES = {"amendment_of"}
+LINEAGE_PREDECESSOR_FIRST_TYPES = {"retired_by"}
 
 
 def oriented_lineage_pair(
@@ -815,12 +816,14 @@ def oriented_lineage_pair(
     relation_type: str,
     by_raw_id: dict[str, dict[str, object]],
 ) -> tuple[str, str]:
-    """Return one lineage pair oriented successor-first.
+    """Return one lineage pair oriented the way its type reads.
 
-    `amendment_of` and `retired_of` run from the instrument as amended or
-    retiring to the predecessor, so the source is the later of the two. When both
-    sides carry a start date and the source's is earlier, the model has named the
-    pair the wrong way round and the pointer is flipped.
+    `amendment_of` runs from the instrument as amended to the predecessor, so
+    the source is the later of the two; `retired_by` runs from the retired
+    obligation to the instrument that retired it, so the source is the earlier.
+    When both sides carry a start date and the source sits on the wrong side of
+    that order, the model has named the pair the wrong way round and the
+    pointer is flipped.
 
     Alclear's revolver is the confirmed case: a Credit Agreement dated as of
     2020-03-31, amended 2026-06-23 to cut commitments from $100,000,000 and
@@ -832,7 +835,10 @@ def oriented_lineage_pair(
     predecessor and the amended instrument the same start date there was nothing
     to orient on, which is why the direction went unchecked.
     """
-    if relation_type not in LINEAGE_SUCCESSOR_FIRST_TYPES:
+    if (
+        relation_type not in LINEAGE_SUCCESSOR_FIRST_TYPES
+        and relation_type not in LINEAGE_PREDECESSOR_FIRST_TYPES
+    ):
         return source_id, target_id
     source = by_raw_id.get(source_id)
     target = by_raw_id.get(target_id)
@@ -842,7 +848,9 @@ def oriented_lineage_pair(
     target_start = coerce_dataset_text(target.get("start_date"))
     if not source_start or not target_start:
         return source_id, target_id
-    if source_start < target_start:
+    if relation_type in LINEAGE_SUCCESSOR_FIRST_TYPES and source_start < target_start:
+        return target_id, source_id
+    if relation_type in LINEAGE_PREDECESSOR_FIRST_TYPES and source_start > target_start:
         return target_id, source_id
     return source_id, target_id
 
@@ -885,7 +893,7 @@ class InstrumentRelationStage:
                 continue
             if rel_type not in INSTRUMENT_RELATION_TYPES:
                 failures.append(
-                    f"Invalid relation type: {rel_type}. Must be amendment_of, retired_of, or split_of."
+                    f"Invalid relation type: {rel_type}. Must be amendment_of, retired_by, or split_of."
                 )
             if rel_from not in instrument_ids or rel_to not in instrument_ids:
                 failures.append(
@@ -930,7 +938,7 @@ class InstrumentRelationStage:
             "Retry requirements:\n"
             "- Return a JSON array.\n"
             "- Each relation must have from, to, and type.\n"
-            "- Use only amendment_of, retired_of, or split_of.\n"
+            "- Use only amendment_of, retired_by, or split_of.\n"
             "- Use only instrument IDs from the input."
         )
 
