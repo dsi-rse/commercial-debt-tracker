@@ -1,7 +1,7 @@
 ## Background
 You will be given an `<instruments>` list followed by HTML that contains only `debt_instrument` tags. Each tag has an `instrument-id` attribute such as `i-1`, `i-2`, and so on. Each `instrument-id` refers to one already-extracted debt instrument mention cluster.
 
-The `<instruments>` list gives the terms already extracted for each id: its `name`, and its `amount`, `start_date`, and `end_date` where those were found. Use it to tell ids apart. Two ids often point at the same tagged text, because two objects were built from one name span, and then the list is the only thing that distinguishes them. An id whose `start_date` is later, or whose `amount` and `end_date` match the post-change figures in the text, is the newer state.
+The `<instruments>` list gives the terms already extracted for each id: its `name`, and its `amount`, `start_date`, and `maturity_date` where those were found. Use it to tell ids apart. Two ids often point at the same tagged text, because two objects were built from one name span, and then the list is the only thing that distinguishes them. An id whose `start_date` is later, or whose `amount` and `maturity_date` match the post-change figures in the text, is the newer state.
 
 Your task is to identify lineage relationships between these mention clusters only.
 

@@ -211,7 +211,7 @@ def build_mention_row(
         "raw_id": "i-1",
         "name": name,
         "start_date": start_date,
-        "end_date": None,
+        "maturity_date": None,
         "principal_amount": amount,
         "amendment_of": None,
         "retired_by_json": "[]",
@@ -220,7 +220,7 @@ def build_mention_row(
         "lenders_known_incomplete": lenders_known_incomplete,
         "name_json": "{}",
         "start_date_json": "{}",
-        "end_date_json": "{}",
+        "maturity_date_json": "{}",
         "amounts_json": "[]",
     }
 
@@ -681,7 +681,7 @@ def test_extract_pending_items_writes_mentions_and_audit(
                 "raw_id": "i-1",
                 "name": "Term Loan",
                 "start_date": "2024-01-01",
-                "end_date": None,
+                "maturity_date": None,
                 "amount": "$100 million",
                 "amendment_of": None,
                 "retired_by_json": "[]",
@@ -690,7 +690,7 @@ def test_extract_pending_items_writes_mentions_and_audit(
                 "lenders_known_incomplete": False,
                 "name_json": "{}",
                 "start_date_json": "{}",
-                "end_date_json": "{}",
+                "maturity_date_json": "{}",
                 "amounts_json": "[]",
             }
         ]
@@ -744,7 +744,7 @@ def test_extract_pending_items_drains_all_partitions(
                 "raw_id": "i-1",
                 "name": "Term Loan",
                 "start_date": "2024-01-01",
-                "end_date": None,
+                "maturity_date": None,
                 "amount": "$100 million",
                 "amendment_of": None,
                 "retired_by_json": "[]",
@@ -753,7 +753,7 @@ def test_extract_pending_items_drains_all_partitions(
                 "lenders_known_incomplete": True,
                 "name_json": "{}",
                 "start_date_json": "{}",
-                "end_date_json": "{}",
+                "maturity_date_json": "{}",
                 "amounts_json": "[]",
             }
         ]
@@ -1222,7 +1222,7 @@ def test_instrument_ie_validate_accepts_name_span_as_end_date_evidence() -> None
         [
             {
                 "name": ["tag-i-1"],
-                "end_date": {
+                "maturity_date": {
                     "evidence": ["tag-i-1"],
                     "normalized_date": "2028-12-31",
                 },
@@ -1261,7 +1261,7 @@ def test_instrument_ie_postprocess_keeps_name_derived_end_date() -> None:
             [
                 {
                     "name": ["tag-i-1"],
-                    "end_date": {
+                    "maturity_date": {
                         "evidence": ["tag-i-1"],
                         "normalized_date": "2028-12-31",
                     },
@@ -1270,8 +1270,8 @@ def test_instrument_ie_postprocess_keeps_name_derived_end_date() -> None:
         )
     )
 
-    assert mention["end_date"] == "2028-12-31"
-    payload = json.loads(str(mention["end_date_json"]))
+    assert mention["maturity_date"] == "2028-12-31"
+    payload = json.loads(str(mention["maturity_date_json"]))
     assert [s["tag_id"] for s in payload["spans"]] == ["tag-i-1"]
 
 
@@ -1291,8 +1291,8 @@ def test_instrument_ie_postprocess_backfills_end_date_from_name() -> None:
         )
     )
 
-    assert mention["end_date"] == "2028-12-31"
-    payload = json.loads(str(mention["end_date_json"]))
+    assert mention["maturity_date"] == "2028-12-31"
+    payload = json.loads(str(mention["maturity_date_json"]))
     # A maturity read from the name has no citable date tag of its own.
     assert payload["spans"] == []
 
@@ -1314,8 +1314,8 @@ on <date id="tag-d-1">March 17, 2025</date>.
     InstrumentIEStage().postprocess(row_state)
 
     mention = row_state.debt_instrument_mentions[0]
-    assert mention["end_date"] is None
-    assert json.loads(str(mention["end_date_json"]))["normalized_date"] is None
+    assert mention["maturity_date"] is None
+    assert json.loads(str(mention["maturity_date_json"]))["normalized_date"] is None
 
 
 def test_instrument_ie_postprocess_drops_end_date_that_contradicts_evidence() -> None:
@@ -1325,7 +1325,7 @@ def test_instrument_ie_postprocess_drops_end_date_that_contradicts_evidence() ->
             [
                 {
                     "name": ["tag-i-1"],
-                    "end_date": {
+                    "maturity_date": {
                         "evidence": ["tag-d-1"],
                         "normalized_date": "2028-12-31",
                     },
@@ -1334,11 +1334,11 @@ def test_instrument_ie_postprocess_drops_end_date_that_contradicts_evidence() ->
         )
     )
 
-    payload = json.loads(str(mention["end_date_json"]))
+    payload = json.loads(str(mention["maturity_date_json"]))
     assert [s["tag_id"] for s in payload["spans"]] == ["tag-d-1"]
     # The cited date tag says March 17, 2025, so the model value is rejected and the
     # name maturity fills the gap instead.
-    assert mention["end_date"] == "2028-12-31"
+    assert mention["maturity_date"] == "2028-12-31"
 
 
 RATE_AMOUNT_XML = """
@@ -1807,7 +1807,10 @@ def test_instrument_ie_postprocess_keeps_a_slash_format_date() -> None:
                     "evidence": ["tag-d-1"],
                     "normalized_date": "2026-07-28",
                 },
-                "end_date": {"evidence": ["tag-d-2"], "normalized_date": "2028-07-28"},
+                "maturity_date": {
+                    "evidence": ["tag-d-2"],
+                    "normalized_date": "2028-07-28",
+                },
             }
         ]
     )
@@ -1816,7 +1819,7 @@ def test_instrument_ie_postprocess_keeps_a_slash_format_date() -> None:
 
     mention = row_state.debt_instrument_mentions[0]
     assert mention["start_date"] == "2026-07-28"
-    assert mention["end_date"] == "2028-07-28"
+    assert mention["maturity_date"] == "2028-07-28"
 
 
 def test_normalized_amount_from_name_reads_an_embedded_principal() -> None:
@@ -2675,7 +2678,7 @@ def test_match_tables_retired_by_keeps_separate_clusters_and_ends_the_instrument
                     amount="$100 million",
                     parties_json='[{"mentions": [{"text": "Acme Bank"}]}]',
                 ),
-                "end_date": None,
+                "maturity_date": None,
             },
             {
                 **build_mention_row(
@@ -2689,7 +2692,7 @@ def test_match_tables_retired_by_keeps_separate_clusters_and_ends_the_instrument
                     amount="$100 million",
                     parties_json='[{"mentions": [{"text": "Acme Bank"}]}]',
                 ),
-                "end_date": "2024-03-01",
+                "maturity_date": "2024-03-01",
                 "retired_by_json": '["m-1"]',
             },
         ]
@@ -2714,8 +2717,8 @@ def test_match_tables_retired_by_keeps_separate_clusters_and_ends_the_instrument
     assert instruments["m-2"]["retired_by_debt_instrument_ids"] == '["m-1"]'
     # No cross-row propagation: the retirement filing's mention sits in the
     # retired instrument's own cluster, so its end date is already there.
-    assert instruments["m-2"]["end_date"] == "2024-03-01"
-    assert instruments["m-1"]["end_date"] is None
+    assert instruments["m-2"]["maturity_date"] == "2024-03-01"
+    assert instruments["m-1"]["maturity_date"] is None
 
 
 def test_match_tables_publishes_two_kinds_of_lineage_for_one_instrument() -> None:
@@ -3104,7 +3107,7 @@ def test_extract_failures_are_recorded_and_cleared(
                 "raw_id": "i-1",
                 "name": "Term Loan",
                 "start_date": None,
-                "end_date": None,
+                "maturity_date": None,
                 "amount": None,
                 "amendment_of": None,
                 "retired_by_json": "[]",
@@ -3112,7 +3115,7 @@ def test_extract_failures_are_recorded_and_cleared(
                 "parties_json": "[]",
                 "name_json": "{}",
                 "start_date_json": "{}",
-                "end_date_json": "{}",
+                "maturity_date_json": "{}",
                 "amounts_json": "[]",
             }
         ]
@@ -3917,3 +3920,66 @@ def test_legacy_single_amount_shape_still_replays() -> None:
     assert mention["principal_amount"] == "300000000"
     # The legacy shape carries no kind; the flat column still fills.
     assert mention["principal_amount_kind"] is None
+
+
+DRAW_PERIOD_XML = """
+<body>
+The <debt_instrument id="tag-i-1">Delayed Draw Term Loan</debt_instrument> draw period
+ends on <date id="tag-d-draw">June 30, 2027</date> and the loans mature on
+<date id="tag-d-maturity">June 30, 2031</date>.
+</body>
+""".strip()
+
+
+def test_commitment_termination_date_is_its_own_field() -> None:
+    """Draw-period ends publish separately from the maturity (#158)."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = DRAW_PERIOD_XML
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "maturity_date": {
+                    "evidence": ["tag-d-maturity"],
+                    "normalized_date": "2031-06-30",
+                },
+                "commitment_termination_date": {
+                    "evidence": ["tag-d-draw"],
+                    "normalized_date": "2027-06-30",
+                },
+            }
+        ]
+    )
+    InstrumentIEStage().postprocess(row_state)
+
+    mention = row_state.debt_instrument_mentions[0]
+    assert mention["maturity_date"] == "2031-06-30"
+    assert mention["commitment_termination_date"] == "2027-06-30"
+    payload = json.loads(str(mention["commitment_termination_date_json"]))
+    assert payload["derived_from"] == "stated"
+
+
+def test_legacy_end_date_property_replays_into_maturity_date() -> None:
+    """Pre-#158 batch responses using `end_date` keep their maturity."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = DRAW_PERIOD_XML
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "end_date": {
+                    "evidence": ["tag-d-maturity"],
+                    "normalized_date": "2031-06-30",
+                },
+            }
+        ]
+    )
+    InstrumentIEStage().postprocess(row_state)
+
+    assert row_state.debt_instrument_mentions[0]["maturity_date"] == "2031-06-30"

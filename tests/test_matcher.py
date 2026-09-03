@@ -27,14 +27,14 @@ def mention_row(**overrides: object) -> dict[str, object]:
         "date": "2024-06-01",
         "name": "5.25% senior notes due 2028",
         "start_date": "2024-06-01",
-        "end_date": "2028-06-01",
+        "maturity_date": "2028-06-01",
         "principal_amount": "500000000",
         "amendment_of": None,
         "retired_by_json": "[]",
         "split_of": None,
         "parties_json": "[]",
         "lenders_known_incomplete": False,
-        "end_date_json": "{}",
+        "maturity_date_json": "{}",
     }
     row.update(overrides)
     return row
@@ -69,7 +69,7 @@ def test_conflicting_end_dates_block_membership() -> None:
         mention_row(
             debt_instrument_mention_id="mention-2",
             name="6.75% senior notes due 2031",
-            end_date="2031-06-01",
+            maturity_date="2031-06-01",
         )
     )
     assert score(other, profile_from(seed)) == []
@@ -89,7 +89,7 @@ def test_missing_end_date_still_matches() -> None:
     """A mention without a maturity is compatible with any cluster end date."""
     seed = prepare_mention(mention_row())
     partial = prepare_mention(
-        mention_row(debt_instrument_mention_id="mention-2", end_date=None)
+        mention_row(debt_instrument_mention_id="mention-2", maturity_date=None)
     )
     candidates = score(partial, profile_from(seed))
     assert len(candidates) == 1
@@ -97,12 +97,12 @@ def test_missing_end_date_still_matches() -> None:
 
 def test_conflicting_name_rates_block_membership_without_end_dates() -> None:
     """Distinct coupon rates keep tranches apart even when maturities are absent."""
-    seed = prepare_mention(mention_row(end_date=None))
+    seed = prepare_mention(mention_row(maturity_date=None))
     other = prepare_mention(
         mention_row(
             debt_instrument_mention_id="mention-2",
             name="6.75% senior notes due 2031",
-            end_date=None,
+            maturity_date=None,
         )
     )
     assert score(other, profile_from(seed)) == []
@@ -135,9 +135,10 @@ def test_end_dates_treat_only_name_derived_values_as_year_resolution() -> None:
 def test_normalized_end_date_for_matching_collapses_name_derived_year_ends() -> None:
     """Only a name-derived YYYY-12-31 collapses to its year (#128)."""
     derived = mention_row(
-        end_date="2030-12-31", end_date_json=json.dumps({"derived_from": "name"})
+        maturity_date="2030-12-31",
+        maturity_date_json=json.dumps({"derived_from": "name"}),
     )
-    stated = mention_row(end_date="2030-12-31")
+    stated = mention_row(maturity_date="2030-12-31")
     assert prepare_mention(derived).normalized_end_date == "2030"
     assert prepare_mention(stated).normalized_end_date == "2030-12-31"
 
@@ -146,12 +147,12 @@ def test_year_resolution_end_date_still_matches_exact_maturity() -> None:
     """Pricing 8-K 'due 2030' merges with the closing 8-K's exact maturity."""
     seed = prepare_mention(
         mention_row(
-            end_date="2030-12-31",
-            end_date_json=json.dumps({"derived_from": "name"}),
+            maturity_date="2030-12-31",
+            maturity_date_json=json.dumps({"derived_from": "name"}),
         )
     )
     closing = prepare_mention(
-        mention_row(debt_instrument_mention_id="mention-2", end_date="2030-04-15")
+        mention_row(debt_instrument_mention_id="mention-2", maturity_date="2030-04-15")
     )
     assert len(score(closing, profile_from(seed))) == 1
 
@@ -176,7 +177,7 @@ def test_keyless_mention_matches_on_identifying_fingerprint() -> None:
             debt_instrument_mention_id="mention-2",
             principal_amount=None,
             start_date=None,
-            end_date=None,
+            maturity_date=None,
         )
     )
     candidates = score(redemption, profile_from(seed))
@@ -195,7 +196,7 @@ def test_keyless_mention_with_generic_name_stays_unmatched() -> None:
             name="senior secured notes",
             principal_amount=None,
             start_date=None,
-            end_date=None,
+            maturity_date=None,
         )
     )
     assert score(redemption, profile_from(seed)) == []
@@ -210,7 +211,7 @@ def test_keyless_mention_requires_exact_fingerprint_in_cluster() -> None:
             name="6.75% senior notes due 2031",
             principal_amount=None,
             start_date=None,
-            end_date=None,
+            maturity_date=None,
         )
     )
     assert score(other, profile_from(seed)) == []
@@ -219,7 +220,7 @@ def test_keyless_mention_requires_exact_fingerprint_in_cluster() -> None:
 def test_keyless_mention_still_blocked_by_end_date_conflict() -> None:
     """A rate-only name match is rejected when maturities conflict."""
     seed = prepare_mention(
-        mention_row(name="5.25% senior secured notes", end_date="2028-06-01")
+        mention_row(name="5.25% senior secured notes", maturity_date="2028-06-01")
     )
     other = prepare_mention(
         mention_row(
@@ -227,7 +228,7 @@ def test_keyless_mention_still_blocked_by_end_date_conflict() -> None:
             name="5.25% senior secured notes",
             principal_amount=None,
             start_date=None,
-            end_date="2031-06-01",
+            maturity_date="2031-06-01",
         )
     )
     assert score(other, profile_from(seed)) == []
@@ -260,7 +261,7 @@ def test_year_only_fingerprint_identifies() -> None:
     window, so the risk is real but unmeasured (#123).
     """
     seed = prepare_mention(
-        mention_row(name="Senior Secured Notes due 2027", end_date="2027-12-31")
+        mention_row(name="Senior Secured Notes due 2027", maturity_date="2027-12-31")
     )
     later = prepare_mention(
         mention_row(
@@ -269,7 +270,7 @@ def test_year_only_fingerprint_identifies() -> None:
             name="Senior Secured Notes due 2027",
             principal_amount=None,
             start_date=None,
-            end_date="2027-12-31",
+            maturity_date="2027-12-31",
         )
     )
     candidates = score(later, profile_from(seed))
@@ -284,8 +285,8 @@ def test_announcement_name_without_the_coupon_attaches_to_its_closing() -> None:
             name="senior secured first lien notes due 2034",
             principal_amount="750000000",
             start_date=None,
-            end_date="2034-12-31",
-            end_date_json=json.dumps({"derived_from": "name"}),
+            maturity_date="2034-12-31",
+            maturity_date_json=json.dumps({"derived_from": "name"}),
         )
     )
     closing = prepare_mention(
@@ -295,7 +296,7 @@ def test_announcement_name_without_the_coupon_attaches_to_its_closing() -> None:
             name="7.500% senior secured first lien notes due 2034",
             principal_amount="750000000",
             start_date="2026-08-21",
-            end_date="2034-09-15",
+            maturity_date="2034-09-15",
         )
     )
     candidates = score(closing, profile_from(announcement))
@@ -310,7 +311,7 @@ def test_a_class_designator_is_not_a_shortened_name() -> None:
             name="Tranche A Loan",
             principal_amount="75000000",
             start_date=None,
-            end_date="2031-07-10",
+            maturity_date="2031-07-10",
         )
     )
     tranche_b = prepare_mention(
@@ -319,7 +320,7 @@ def test_a_class_designator_is_not_a_shortened_name() -> None:
             name="Tranche B Loan",
             principal_amount="25000000",
             start_date=None,
-            end_date="2031-07-10",
+            maturity_date="2031-07-10",
         )
     )
     assert score(tranche_b, profile_from(tranche_a)) == []
@@ -337,7 +338,7 @@ def test_a_generic_issuer_name_turns_off_the_relaxed_key_rule() -> None:
             name="Consolidated Obligation Bonds",
             principal_amount="10000000",
             start_date=None,
-            end_date=None,
+            maturity_date=None,
         )
     )
     second = prepare_mention(
@@ -347,7 +348,7 @@ def test_a_generic_issuer_name_turns_off_the_relaxed_key_rule() -> None:
             name="Consolidated Obligation Bonds",
             principal_amount="10000000",
             start_date=None,
-            end_date=None,
+            maturity_date=None,
         )
     )
     # Two mentions: inside the gate, the shared amount attaches the second one.
@@ -389,7 +390,7 @@ def test_same_item_sibling_with_a_conflicting_amount_does_not_attach() -> None:
             name="10% Senior Secured Convertible Note",
             principal_amount="1250000",
             start_date="2026-08-13",
-            end_date=None,
+            maturity_date=None,
         )
     )
     additional = prepare_mention(
@@ -398,7 +399,7 @@ def test_same_item_sibling_with_a_conflicting_amount_does_not_attach() -> None:
             name="10% Senior Secured Convertible Note",
             principal_amount="1100000",
             start_date="2026-08-13",
-            end_date=None,
+            maturity_date=None,
         )
     )
     assert score(additional, profile_from(initial)) == []
@@ -411,7 +412,7 @@ def test_same_item_add_on_with_its_own_start_date_still_attaches() -> None:
             name="5.875% Senior Notes due 2034",
             principal_amount="500000000",
             start_date="2026-05-29",
-            end_date="2034-12-31",
+            maturity_date="2034-12-31",
         )
     )
     add_on = prepare_mention(
@@ -420,7 +421,7 @@ def test_same_item_add_on_with_its_own_start_date_still_attaches() -> None:
             name="5.875% Senior Notes due 2034",
             principal_amount="100000000",
             start_date="2026-08-13",
-            end_date="2034-12-31",
+            maturity_date="2034-12-31",
         )
     )
     candidates = score(add_on, profile_from(series))

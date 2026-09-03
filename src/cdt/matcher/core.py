@@ -76,7 +76,8 @@ DEBT_INSTRUMENT_COLUMNS = [
     "split_of_debt_instrument_id",
     "name",
     "start_date",
-    "end_date",
+    "maturity_date",
+    "commitment_termination_date",
     "principal_amount",
     "principal_currency",
     "principal_amount_kind",
@@ -138,7 +139,8 @@ class PreparedMention:
     date: str | None
     name: str | None
     start_date: str | None
-    end_date: str | None
+    maturity_date: str | None
+    commitment_termination_date: str | None
     principal_amount: str | None
     principal_currency: str | None
     principal_amount_kind: str | None
@@ -533,7 +535,8 @@ def build_cluster_profiles(
         if normalized_start_date:
             profile.normalized_start_dates.add(normalized_start_date)
         normalized_end_date = normalize_date(
-            coerce_optional_text(instrument_row.get("end_date"))
+            coerce_optional_text(instrument_row.get("maturity_date"))
+            or coerce_optional_text(instrument_row.get("end_date"))
         )
         if normalized_end_date:
             profile.normalized_end_dates.add(normalized_end_date)
@@ -1133,10 +1136,18 @@ def build_debt_instrument_rows(
                     ordered_member_ids, mention_index, "start_date"
                 )
                 or coerce_optional_text(existing_row.get("start_date")),
-                "end_date": first_non_null(
-                    ordered_member_ids, mention_index, "end_date"
+                "maturity_date": first_non_null(
+                    ordered_member_ids, mention_index, "maturity_date"
                 )
-                or coerce_optional_text(existing_row.get("end_date")),
+                or coerce_optional_text(
+                    existing_row.get("maturity_date") or existing_row.get("end_date")
+                ),
+                "commitment_termination_date": first_non_null(
+                    ordered_member_ids, mention_index, "commitment_termination_date"
+                )
+                or coerce_optional_text(
+                    existing_row.get("commitment_termination_date")
+                ),
                 **principal_amount_fields(
                     ordered_member_ids, mention_index, existing_row
                 ),
@@ -1325,7 +1336,10 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
         date=coerce_optional_text(row.get("date")),
         name=coerce_optional_text(row.get("name")),
         start_date=coerce_optional_text(row.get("start_date")),
-        end_date=coerce_optional_text(row.get("end_date")),
+        maturity_date=coerce_optional_text(row.get("maturity_date")),
+        commitment_termination_date=coerce_optional_text(
+            row.get("commitment_termination_date")
+        ),
         principal_amount=coerce_optional_text(row.get("principal_amount")),
         principal_currency=coerce_optional_text(row.get("principal_currency")),
         principal_amount_kind=coerce_optional_text(row.get("principal_amount_kind")),
@@ -1518,10 +1532,12 @@ def normalized_end_date_for_matching(row: dict[str, object]) -> str | None:
     while the provenance flag was missing (#128). Name-derived year-end values
     collapse to the bare year here; stated dates keep their day.
     """
-    value = normalize_date(coerce_optional_text(row.get("end_date")))
+    value = normalize_date(coerce_optional_text(row.get("maturity_date")))
     if not value:
         return None
-    if value.endswith("-12-31") and end_date_is_name_derived(row.get("end_date_json")):
+    if value.endswith("-12-31") and end_date_is_name_derived(
+        row.get("maturity_date_json")
+    ):
         return value[:4]
     return value
 

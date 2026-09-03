@@ -91,7 +91,14 @@ PARTY_PROPERTY_ANNOTATIONS = {
 INSTRUMENT_SINGLE_VALUE_PROPERTIES = {
     "start_date": {"date"},
     # NER tags maturity phrases like "notes due 2028" inside the instrument name,
-    # so end_date evidence may cite that name span instead of a standalone date.
+    # so maturity evidence may cite that name span instead of a standalone date.
+    "maturity_date": {"date", "debt_instrument"},
+    # When the lender's obligation to lend ends — the draw/availability window
+    # closes (#158). Distinct from the maturity so draw-period dates stop
+    # publishing as maturities.
+    "commitment_termination_date": {"date"},
+    # Pre-#158 name for maturity_date, still accepted so stored batch
+    # responses replay.
     "end_date": {"date", "debt_instrument"},
     # The same holds for a principal stated inside the name, as in
     # `$183.36 million term loan`: there is no separate `amount` span to cite,
@@ -117,7 +124,13 @@ PRINCIPAL_AMOUNT_KINDS = ("commitment", "principal")
 AMOUNT_EVIDENCE_TAG_TYPES = {"amount", "debt_instrument"}
 MATURITY_EVIDENCE_TAG_TYPES = {"debt_instrument"}
 NAME_EMBEDDED_AMOUNT_TAG_TYPES = {"debt_instrument"}
-STANDARDIZED_SINGLE_VALUE_PROPERTIES = {"start_date", "end_date", "amount"}
+STANDARDIZED_SINGLE_VALUE_PROPERTIES = {
+    "start_date",
+    "maturity_date",
+    "commitment_termination_date",
+    "end_date",
+    "amount",
+}
 INSTRUMENT_RELATION_TYPES = {"amendment_of", "retired_by", "split_of"}
 NUMERIC_STRING_PATTERN = re.compile(r"^\d+(?:\.\d+)?$")
 # One `due` can carry a list of maturities: `due 2028 and 2030`,
@@ -246,7 +259,8 @@ DEBT_INSTRUMENT_MENTION_COLUMNS = [
     "raw_id",
     "name",
     "start_date",
-    "end_date",
+    "maturity_date",
+    "commitment_termination_date",
     "principal_amount",
     "principal_currency",
     "principal_amount_kind",
@@ -256,7 +270,8 @@ DEBT_INSTRUMENT_MENTION_COLUMNS = [
     "parties_json",
     "name_json",
     "start_date_json",
-    "end_date_json",
+    "maturity_date_json",
+    "commitment_termination_date_json",
     "amounts_json",
     "lenders_known_incomplete",
 ]
@@ -795,10 +810,20 @@ class InstrumentIEStage:
                 obj.get("start_date"),
                 tag_details,
             )
-            end_date_payload = standardized_end_date_payload(
-                obj.get("end_date"),
+            maturity_value = (
+                obj.get("maturity_date")
+                if "maturity_date" in obj
+                # Pre-#158 responses replay with their old property name.
+                else obj.get("end_date")
+            )
+            maturity_payload = standardized_end_date_payload(
+                maturity_value,
                 tag_details,
                 name_text=name_text,
+            )
+            commitment_termination_payload = standardized_date_payload(
+                obj.get("commitment_termination_date"),
+                tag_details,
             )
             party_clusters, lenders_known_incomplete = (
                 party_payloads_and_incompleteness(obj, tag_details)
@@ -813,7 +838,10 @@ class InstrumentIEStage:
                 "raw_id": raw_id,
                 "name": name_text,
                 "start_date": start_date_payload["normalized_date"],
-                "end_date": end_date_payload["normalized_date"],
+                "maturity_date": maturity_payload["normalized_date"],
+                "commitment_termination_date": commitment_termination_payload[
+                    "normalized_date"
+                ],
                 "principal_amount": principal.get("normalized_amount"),
                 "principal_currency": principal.get("currency"),
                 "principal_amount_kind": principal.get("kind"),
@@ -827,7 +855,10 @@ class InstrumentIEStage:
                     sort_keys=True,
                 ),
                 "start_date_json": json.dumps(start_date_payload, sort_keys=True),
-                "end_date_json": json.dumps(end_date_payload, sort_keys=True),
+                "maturity_date_json": json.dumps(maturity_payload, sort_keys=True),
+                "commitment_termination_date_json": json.dumps(
+                    commitment_termination_payload, sort_keys=True
+                ),
                 "amounts_json": json.dumps(amount_payloads, sort_keys=True),
             }
             mention_id = debt_instrument_mention_id_for(
@@ -2491,8 +2522,14 @@ def debt_instrument_mention_id_for(
     """Return a stable persisted debt-instrument-mention ID."""
     payload = {
         "amounts_json": normalize_json_text(mention_row.get("amounts_json")),
-        "end_date": mention_row.get("end_date"),
-        "end_date_json": normalize_json_text(mention_row.get("end_date_json")),
+        "commitment_termination_date": mention_row.get("commitment_termination_date"),
+        "commitment_termination_date_json": normalize_json_text(
+            mention_row.get("commitment_termination_date_json")
+        ),
+        "maturity_date": mention_row.get("maturity_date"),
+        "maturity_date_json": normalize_json_text(
+            mention_row.get("maturity_date_json")
+        ),
         "item_id": item_id,
         "lenders_known_incomplete": mention_row.get("lenders_known_incomplete"),
         "name_json": normalize_json_text(mention_row.get("name_json")),
@@ -3196,7 +3233,7 @@ def relation_instrument_manifest(row_state: ExtractionRowState) -> str:
             ("name", "name"),
             ("amount", "principal_amount"),
             ("start_date", "start_date"),
-            ("end_date", "end_date"),
+            ("maturity_date", "maturity_date"),
         )
         for attribute_name, field_name in manifest_fields:
             value = coerce_dataset_text(mention.get(field_name))

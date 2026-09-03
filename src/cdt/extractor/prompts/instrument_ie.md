@@ -15,7 +15,8 @@ Return one JSON object per distinct debt instrument mention cluster in the docum
 For each object, extract these properties when present:
 - `name`
 - `start_date`
-- `end_date`
+- `maturity_date`
+- `commitment_termination_date`
 - `amounts`
 - `lenders`
 - `lenders_known_incomplete`
@@ -23,7 +24,8 @@ For each object, extract these properties when present:
 
 For standardized single-value properties, use these object shapes:
 - `start_date`: `{ "evidence": ["tag-..."], "normalized_date": "YYYY-MM-DD" | null }`
-- `end_date`: `{ "evidence": ["tag-..."], "normalized_date": "YYYY-MM-DD" | null }`
+- `maturity_date`: `{ "evidence": ["tag-..."], "normalized_date": "YYYY-MM-DD" | null }`
+- `commitment_termination_date`: `{ "evidence": ["tag-..."], "normalized_date": "YYYY-MM-DD" | null }`
 
 For money, return one `amounts` list per object, one entry per money fact the document states about that instrument:
 - `amounts`: `[{ "kind": "commitment" | "principal" | "outstanding_balance" | "draw" | "repayment" | "proceeds", "evidence": ["tag-..."], "normalized_amount": "12345.67" | null, "currency": "USD" | null, "as_of_date": "YYYY-MM-DD" | null }]`
@@ -45,8 +47,11 @@ For party properties, return one object per coreference cluster:
 - Return one JSON object per concrete debt instrument described as its own obligation in the document.
 - Do not return agreements as objects.
 - `name` may contain only `debt_instrument` tag ids.
-- `start_date.evidence` may contain only `date` tag ids. The `debt_instrument` allowance below is specific to `end_date` and `amounts`, because a maturity or a principal can be stated inside a name while an issuance date never is. When the document states no date you can cite, omit `start_date` rather than citing the instrument's name.
-- `end_date.evidence` may contain `date` tag ids, or the instrument's own `debt_instrument` tag id when the maturity is embedded in the name, such as `3.875% senior notes due 2028`.
+- `start_date.evidence` may contain only `date` tag ids. The `debt_instrument` allowance below is specific to `maturity_date` and `amounts`, because a maturity or a principal can be stated inside a name while an issuance date never is. When the document states no date you can cite, omit `start_date` rather than citing the instrument's name.
+- `maturity_date` is when the borrowed money must be repaid: the final maturity or expiration of the obligation itself. `commitment_termination_date` is when the lender's obligation to lend ends: the close of a draw period, availability period, or revolving period. They answer different questions, so never put one in the other's field.
+- When the text states one date for a facility's end, it is the `maturity_date`. When it states both an availability or draw-period end and a repayment date, return both fields. When it states only a draw-period or commitment-termination end, return `commitment_termination_date` and leave `maturity_date` absent rather than promoting it.
+- `maturity_date.evidence` may contain `date` tag ids, or the instrument's own `debt_instrument` tag id when the maturity is embedded in the name, such as `3.875% senior notes due 2028`.
+- `commitment_termination_date.evidence` may contain only `date` tag ids.
 - Each `amounts` entry's `evidence` may contain `amount` tag ids, or the instrument's own `debt_instrument` tag id when the principal is stated inside the name, such as `$183.36 million term loan`.
 - `lenders` and `other_interested_parties` cluster `tag_ids` may contain only `person` or `organization` tag ids. Never cite a `debt_instrument`, `agreement`, `amount`, or `date` tag id in a party cluster.
 - For `name`, return one list of tag ids representing a single coreference cluster.
@@ -58,8 +63,8 @@ For party properties, return one object per coreference cluster:
 - For each entry's `normalized_amount`, return only digits and at most one decimal point, or `null`.
 - For each entry's `currency`, return one 3-letter ISO 4217 currency code or `null`.
 - For each entry's `as_of_date`, return `YYYY-MM-DD` when the document states the date the figure is measured at, and `null` otherwise. Only balances normally carry one.
-- For `start_date.normalized_date` and `end_date.normalized_date`, return `YYYY-MM-DD` or `null`.
-- When a maturity gives only a year, such as `due 2028`, return `2028-12-31` as `end_date.normalized_date`.
+- For `start_date.normalized_date`, `maturity_date.normalized_date`, and `commitment_termination_date.normalized_date`, return `YYYY-MM-DD` or `null`.
+- When a maturity gives only a year, such as `due 2028`, return `2028-12-31` as `maturity_date.normalized_date`.
 - `start_date` is the date the instrument came into existence: the closing, issuance, or effective date the document states for it. When the filing opens with `On <date>, the Company entered into`, `issued`, or `closed`, that is the `start_date` unless the text gives the instrument its own different date. The `dated as of` date of an indenture, purchase agreement, or amendment is not the instrument's start date unless the text says the instrument itself carries that date.
 - Never guess a maturity that the document does not state, and never reuse the start date as the end date.
 - If a property is absent, omit it.
@@ -90,7 +95,7 @@ Selection rules:
 - Split by class only when the document gives each class its own identity, such as its own tagged name, amount, or maturity. When several classes appear only inside one combined tagged span and the document states nothing specific to any single class, return one object for that span rather than repeating the same object several times.
 - A credit agreement that establishes genuinely distinct facilities, such as a term loan facility and a revolving credit facility, is multiple debt instruments. Return one object per facility, each with its own commitment amount when stated, and never assign one facility's commitment, or the agreement's combined total, to another facility.
 - A single facility's borrowing mechanics are not separate debt instruments. Swing line loans, letters of credit, LC loans, and similar sub-limits available under a revolving or working capital facility are ways to draw that facility. Return one object for the facility rather than one object per mechanic, unless the document describes a mechanic as its own facility with its own commitment. When only the mechanics are tagged as `debt_instrument` spans, still return exactly one object: name it with the primary mechanic's span, such as the revolving or working capital loans, and give it the facility's total commitment.
-- Any property evidence may be shared across multiple returned objects when the text says the property applies to all of them, including `name`, `start_date`, `end_date`, `amounts`, `lenders`, and `other_interested_parties`.
+- Any property evidence may be shared across multiple returned objects when the text says the property applies to all of them, including `name`, `start_date`, `maturity_date`, `amounts`, `lenders`, and `other_interested_parties`.
 
 Party rules:
 - Use `kind: "named"` for a cluster that identifies a specific lender by name, such as `JPMorgan Chase Bank, N.A.` or `EGT 11 LLC`.
@@ -110,14 +115,16 @@ Party rules:
 - Use `role: "other"` only when the party is clearly related to the instrument but none of the other roles fit.
 
 Examples:
-- If a document describes `3.875% senior notes due 2028` and gives no separate maturity date, return that instrument's `debt_instrument` tag id as `end_date.evidence` with `normalized_date` `2028-12-31`.
+- If a document describes `3.875% senior notes due 2028` and gives no separate maturity date, return that instrument's `debt_instrument` tag id as `maturity_date.evidence` with `normalized_date` `2028-12-31`.
 - If a document describes a `$183.36 million term loan` and tags no separate amount, return one `amounts` entry with `kind` `principal`, the instrument's `debt_instrument` tag id as `evidence`, `normalized_amount` `183360000`, and `currency` `USD`.
 - If a document describes `senior notes due October 1, 2028` and tags `October 1, 2028` as a date, cite the `date` tag id with `normalized_date` `2028-10-01`.
+- If a delayed-draw facility's draw period ends `June 30, 2027` and its loans mature `June 30, 2031`, return `commitment_termination_date` `2027-06-30` and `maturity_date` `2031-06-30`.
+- If a filing states only a Draw Period Termination Date and defines the maturity relative to it, such as `12 months after the Draw Period Termination Date`, return the stated date as `commitment_termination_date` and omit `maturity_date`: never publish an availability end as the maturity.
 - If a credit agreement says ABR Loans bear interest at `0.875% per annum`, do not return `0.875` in `amounts`. Omit `amounts` unless the document states a money amount for that loan.
 - If a company closes a `$1.2 billion` working capital facility that provides revolving loans, swing line loans up to `$25 million`, and letters of credit, return one object with one `commitment` entry of `1200000000`, named by the facility's tagged span when present and otherwise by the `Revolving Loans` span. Do not return additional objects for `Swing Line Loans` or `Letters of Credit`, and never give any single mechanic the `$1.2 billion` total.
 - If a credit agreement provides a `$750 million` term facility and a `$750 million` revolving facility, return two objects, each with its own `commitment` entry of `750000000`. Do not return a third object for the agreement's `$1.5 billion` combined total.
-- If a company enters into a commitment increase and maturity extension agreement for its revolving credit agreement dated as of August 1, 2025, raising commitments to `$1.75 billion` and extending the maturity from August 1, 2030 to August 1, 2031, return exactly two objects for that facility: the facility as amended, with a `commitment` entry of `1750000000`, `start_date` `2025-08-01`, and `end_date` `2031-08-01`, and the predecessor, with `start_date` `2025-08-01`, `end_date` `2030-08-01`, and no `amounts` because the prior commitment is not stated.
-- If an amendment `reduced the lender commitments from $100,000,000 to $50,000,000` and `extended the maturity date from June 28, 2026 to June 23, 2031`, return two objects for that facility: the predecessor with a `commitment` entry of `100000000` and `end_date` `2026-06-28`, and the instrument as amended with a `commitment` entry of `50000000` and `end_date` `2031-06-23`. Both before figures are stated, so both belong to the predecessor.
+- If a company enters into a commitment increase and maturity extension agreement for its revolving credit agreement dated as of August 1, 2025, raising commitments to `$1.75 billion` and extending the maturity from August 1, 2030 to August 1, 2031, return exactly two objects for that facility: the facility as amended, with a `commitment` entry of `1750000000`, `start_date` `2025-08-01`, and `maturity_date` `2031-08-01`, and the predecessor, with `start_date` `2025-08-01`, `maturity_date` `2030-08-01`, and no `amounts` because the prior commitment is not stated.
+- If an amendment `reduced the lender commitments from $100,000,000 to $50,000,000` and `extended the maturity date from June 28, 2026 to June 23, 2031`, return two objects for that facility: the predecessor with a `commitment` entry of `100000000` and `maturity_date` `2026-06-28`, and the instrument as amended with a `commitment` entry of `50000000` and `maturity_date` `2031-06-23`. Both before figures are stated, so both belong to the predecessor.
 - If an amendment only resets a financial covenant, reprices a margin, or adds a guarantor, and states no prior commitment or maturity, return one object for the facility. There is no second state to record. Never give the predecessor the increased total, and never return extra partial variants of the same facility.
 - If a new credit facility `refinances and replaces` the company's existing revolving credit facility dated as of May 29, 2019, return the new facility and a second object for the replaced facility with `start_date` `2019-05-29`.
 - If a trust issues `Class A-1 Asset Backed Notes`, `Class A-2a Asset Backed Notes`, `Class A-2b Asset Backed Notes`, `Class A-3 Asset Backed Notes`, and `Class A-4 Asset Backed Notes` in one offering, return five objects, one per class, each with its own amount and maturity when stated. Do not return one object naming all five, and do not return a sixth object for `Asset Backed Notes`.
@@ -136,7 +143,7 @@ Examples:
 - If a new credit agreement `refinances in full and extends the maturities of the Borrowers' existing term loan and revolving credit facilities`, return the new term facility, the new revolving facility, and two predecessor objects — one for the existing term loan facility and one for the existing revolving facility. Do not return a single predecessor named `term loan and revolving credit facilities`.
 - If a filing describes a settlement in which one note is exchanged for a `10% Senior Secured Convertible Note` of `$1,250,000` (the `Initial Note`) and a warrant for a second of `$1,100,000` (the `Additional Note`), return two objects, each with its defined-term span in the same `name` cluster as its descriptive span. Do not return separate objects for `Initial Note` and `Additional Note`.
 - If a filing says the notes are `working capital loans and time extension funding loans` totalling `$6.9 million`, consisting of `$2.9 million`, `$2.2 million`, and `$1.8 million` held by three parties, return three objects, one per note, each naming both phrases in one `name` cluster and carrying its own `principal` entry. Do not return six, and do not give any note the `$6.9 million` total.
-- If a filing describes a `Credit Agreement` providing an `$835,000,000` `revolving credit facility` maturing `June 18, 2031`, return one object naming both spans, with a `commitment` entry of `835000000` and `end_date` `2031-06-18`. Do not return one object for the agreement and another for the facility.
+- If a filing describes a `Credit Agreement` providing an `$835,000,000` `revolving credit facility` maturing `June 18, 2031`, return one object naming both spans, with a `commitment` entry of `835000000` and `maturity_date` `2031-06-18`. Do not return one object for the agreement and another for the facility.
 - If a 2.03 item says the company's revolving credit facility provides `$300 million` of commitments and that `as of June 9, 2026, we had $270.5 million outstanding`, return one object with two `amounts` entries: `kind` `commitment` `300000000`, and `kind` `outstanding_balance` `270500000` with `as_of_date` `2026-06-09`. The balance is never the `commitment` or `principal`.
 - If a company states it will `repay $68 million in outstanding amounts under the credit facility`, that figure is a `repayment` entry on the facility's object, not its principal.
 - If an offering closes with `net proceeds of $718.8 million` from `$750 million` of notes, the notes' object carries a `principal` entry of `750000000` and a `proceeds` entry of `718800000`.
