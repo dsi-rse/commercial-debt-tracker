@@ -3695,3 +3695,91 @@ def test_standardized_payloads_record_where_their_values_came_from() -> None:
     absent = standardized_date_payload(None, tag_details)
     assert absent["normalized_date"] is None
     assert absent["derived_from"] is None
+
+
+def test_terminal_ie_failure_salvages_the_valid_entries() -> None:
+    """One invalid entry no longer drops the whole item (#152)."""
+    from cdt.extractor.core import handle_response
+
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = PARTY_ROLE_XML
+    response = json.dumps(
+        [
+            {"name": ["tag-i-1"], "start_date": {"evidence": ["tag-d-1"]}},
+            {"name": ["tag-o-named"]},
+        ]
+    )
+    # attempt_index reaches max_attempts on this response, forcing terminal
+    # handling of the validation failure from the second entry's bad name tag.
+    result = handle_response(row_state, response, max_attempts=1)
+
+    assert result is None
+    assert row_state.state == "PARTIAL"
+    assert len(row_state.debt_instrument_mentions) == 1
+    assert row_state.debt_instrument_mentions[0]["name"] == "Term Loan"
+    assert row_state.salvage_notes
+    assert "dropped 1" in row_state.salvage_notes[0]
+
+
+def test_terminal_relation_failure_publishes_mentions_without_lineage() -> None:
+    """A relation-stage failure keeps the already-validated mentions (#152)."""
+    from cdt.extractor.core import handle_response
+
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = PARTY_ROLE_XML
+    ie_response = json.dumps(
+        [
+            {"name": ["tag-i-1"]},
+            {"name": ["tag-i-1"], "start_date": {"evidence": ["tag-d-1"]}},
+        ]
+    )
+    next_messages = handle_response(row_state, ie_response, max_attempts=3)
+    assert next_messages is not None
+    assert row_state.current_attempt.stage_name == "instrument_relation"
+    assert len(row_state.debt_instrument_mentions) == 2
+
+    result = handle_response(row_state, "not json at all", max_attempts=1)
+
+    assert result is None
+    assert row_state.state == "PARTIAL"
+    assert len(row_state.debt_instrument_mentions) == 2
+    assert any("without lineage" in note for note in row_state.salvage_notes)
+
+
+def test_terminal_ie_failure_with_nothing_valid_still_fails() -> None:
+    """Salvage never invents output: no valid entry means FAILED as before."""
+    from cdt.extractor.core import handle_response
+
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = PARTY_ROLE_XML
+    response = json.dumps([{"name": ["tag-unknown"]}])
+
+    result = handle_response(row_state, response, max_attempts=1)
+
+    assert result is None
+    assert row_state.state == "FAILED"
+    assert row_state.debt_instrument_mentions == []
+
+
+def test_salvage_notes_round_trip_through_batch_state() -> None:
+    """PARTIAL provenance survives the resumable batch state (#152)."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.salvage_notes.append("instrument_ie dropped 1 entry")
+    restored = ExtractionRowState.from_state_dict(row_state.to_state_dict())
+    assert restored.salvage_notes == ["instrument_ie dropped 1 entry"]
+    # State written before salvage existed lacks the key entirely.
+    legacy = row_state.to_state_dict()
+    del legacy["salvage_notes"]
+    assert ExtractionRowState.from_state_dict(legacy).salvage_notes == []

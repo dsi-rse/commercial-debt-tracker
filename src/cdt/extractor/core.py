@@ -51,6 +51,9 @@ from cdt.storage import (
 
 LOGGER = get_logger(__name__)
 DEFAULT_MAX_ATTEMPTS = 3
+# PARTIAL rows publish their mentions like SUCCESS but also keep a failure
+# registry entry recording what salvage dropped (#152).
+PUBLISHABLE_ROW_STATES = frozenset({"SUCCESS", "PARTIAL"})
 DEFAULT_MODEL = settings.DEFAULT_EXTRACTOR_MODEL
 DEFAULT_REASONING_EFFORT = "none"
 REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
@@ -341,6 +344,7 @@ class ExtractionRowState:
     debt_instrument_mentions: list[dict[str, object]] = field(default_factory=list)
     ner_tagged_xml: str | None = None
     state: str | None = None
+    salvage_notes: list[str] = field(default_factory=list)
     current_attempt: AttemptRecord = field(init=False)
 
     def __post_init__(self) -> None:
@@ -395,8 +399,15 @@ class ExtractionRowState:
         )
 
     def finish(self, state: str) -> None:
-        """Finish processing for this row."""
+        """Finish processing for this row.
+
+        A row that reached the end only because a terminal failure was salvaged
+        (#152) finishes PARTIAL rather than SUCCESS: its mentions publish, but
+        the failure registry keeps a record of what was lost.
+        """
         self.all_attempts.append(self.current_attempt)
+        if state == "SUCCESS" and self.salvage_notes:
+            state = "PARTIAL"
         self.state = state
 
     def next_stage(self, stage_name: str) -> None:
@@ -414,6 +425,7 @@ class ExtractionRowState:
             "stage_responses": self.stage_responses,
             "debt_instrument_mentions": self.debt_instrument_mentions,
             "state": self.state,
+            "salvage_notes": self.salvage_notes,
             "attempts": attempts,
         }
 
@@ -436,6 +448,7 @@ class ExtractionRowState:
             "debt_instrument_mentions": self.debt_instrument_mentions,
             "ner_tagged_xml": self.ner_tagged_xml,
             "state": self.state,
+            "salvage_notes": self.salvage_notes,
             "current_attempt": self.current_attempt.to_dict(),
         }
 
@@ -459,6 +472,8 @@ class ExtractionRowState:
         )
         row_state.ner_tagged_xml = cast(str | None, payload["ner_tagged_xml"])
         row_state.state = cast(str | None, payload["state"])
+        # Absent in job state written before salvage existed (#152).
+        row_state.salvage_notes = cast(list[str], payload.get("salvage_notes", []))
         row_state.current_attempt = current_attempt
         return row_state
 
@@ -609,6 +624,91 @@ class NERStage:
         )
 
 
+def validate_instrument_entry(
+    index: int,
+    obj: object,
+    tag_details: dict[str, dict[str, object]],
+) -> list[str]:
+    """Validate one instrument entry on its own.
+
+    Factored out of ``InstrumentIEStage.validate`` so terminal salvage (#152)
+    can keep the individually-valid entries of a response whose other entries
+    failed.
+    """
+    if not isinstance(obj, dict):
+        return [f"Entry {index} is not a JSON object."]
+    failures: list[str] = []
+    for (
+        property_name,
+        expected_types,
+    ) in INSTRUMENT_SINGLE_VALUE_PROPERTIES.items():
+        if property_name not in obj:
+            continue
+        tag_ids = single_value_evidence_tag_ids(obj[property_name])
+        if property_name in STANDARDIZED_SINGLE_VALUE_PROPERTIES:
+            failures.extend(
+                validate_standardized_single_value_shape(
+                    index=index,
+                    property_name=property_name,
+                    value=obj[property_name],
+                )
+            )
+            failures.extend(
+                validate_standardized_single_value_cardinality(
+                    index=index,
+                    property_name=property_name,
+                    value=obj[property_name],
+                    tag_details=tag_details,
+                )
+            )
+            if property_name == "amount":
+                failures.extend(
+                    validate_amount_is_not_rate(
+                        index=index,
+                        value=obj[property_name],
+                        tag_details=tag_details,
+                    )
+                )
+        if not isinstance(tag_ids, list):
+            failures.append(
+                f"Entry {index}: '{property_name}' evidence must be a list of tag IDs."
+            )
+            continue
+        if not all(isinstance(tag_id, str) for tag_id in tag_ids):
+            failures.append(
+                f"Entry {index}: '{property_name}' evidence must contain string tag IDs only."
+            )
+            continue
+        for tag_id in tag_ids:
+            tag_info = tag_details.get(tag_id)
+            if tag_info is None:
+                failures.append(
+                    f"Entry {index}: '{property_name}' contains unknown tag ID {tag_id}."
+                )
+                continue
+            if tag_info["type"] not in expected_types:
+                expected = ", ".join(sorted(expected_types))
+                failures.append(
+                    f"Entry {index}: '{property_name}' tag {tag_id} is type '{tag_info['type']}', expected {expected}."
+                )
+    for property_name in PARTY_PROPERTY_ANNOTATIONS:
+        failures.extend(
+            validate_party_property(
+                index=index,
+                property_name=property_name,
+                obj=obj,
+                tag_details=tag_details,
+            )
+        )
+    failures.extend(
+        validate_lenders_known_incomplete(
+            index=index,
+            obj=obj,
+        )
+    )
+    return failures
+
+
 class InstrumentIEStage:
     """Instrument-mention extraction stage."""
 
@@ -635,78 +735,7 @@ class InstrumentIEStage:
         _, _, tag_details = parse_tag_details(row_state.ner_tagged_xml)
         failures: list[str] = []
         for index, obj in enumerate(data):
-            if not isinstance(obj, dict):
-                failures.append(f"Entry {index} is not a JSON object.")
-                continue
-            for (
-                property_name,
-                expected_types,
-            ) in INSTRUMENT_SINGLE_VALUE_PROPERTIES.items():
-                if property_name not in obj:
-                    continue
-                tag_ids = single_value_evidence_tag_ids(obj[property_name])
-                if property_name in STANDARDIZED_SINGLE_VALUE_PROPERTIES:
-                    failures.extend(
-                        validate_standardized_single_value_shape(
-                            index=index,
-                            property_name=property_name,
-                            value=obj[property_name],
-                        )
-                    )
-                    if property_name in STANDARDIZED_SINGLE_VALUE_PROPERTIES:
-                        failures.extend(
-                            validate_standardized_single_value_cardinality(
-                                index=index,
-                                property_name=property_name,
-                                value=obj[property_name],
-                                tag_details=tag_details,
-                            )
-                        )
-                    if property_name == "amount":
-                        failures.extend(
-                            validate_amount_is_not_rate(
-                                index=index,
-                                value=obj[property_name],
-                                tag_details=tag_details,
-                            )
-                        )
-                if not isinstance(tag_ids, list):
-                    failures.append(
-                        f"Entry {index}: '{property_name}' evidence must be a list of tag IDs."
-                    )
-                    continue
-                if not all(isinstance(tag_id, str) for tag_id in tag_ids):
-                    failures.append(
-                        f"Entry {index}: '{property_name}' evidence must contain string tag IDs only."
-                    )
-                    continue
-                for tag_id in tag_ids:
-                    tag_info = tag_details.get(tag_id)
-                    if tag_info is None:
-                        failures.append(
-                            f"Entry {index}: '{property_name}' contains unknown tag ID {tag_id}."
-                        )
-                        continue
-                    if tag_info["type"] not in expected_types:
-                        expected = ", ".join(sorted(expected_types))
-                        failures.append(
-                            f"Entry {index}: '{property_name}' tag {tag_id} is type '{tag_info['type']}', expected {expected}."
-                        )
-            for property_name in PARTY_PROPERTY_ANNOTATIONS:
-                failures.extend(
-                    validate_party_property(
-                        index=index,
-                        property_name=property_name,
-                        obj=obj,
-                        tag_details=tag_details,
-                    )
-                )
-            failures.extend(
-                validate_lenders_known_incomplete(
-                    index=index,
-                    obj=obj,
-                )
-            )
+            failures.extend(validate_instrument_entry(index, obj, tag_details))
         return failures
 
     def postprocess(self, row_state: ExtractionRowState) -> None:
@@ -1309,9 +1338,10 @@ def extract_pending_items(
             audit_records.append(json.dumps(row_state.to_audit_dict(), sort_keys=True))
             terminal_ids.add(row_state.item_id)
             replaced_item_ids.add(row_state.item_id)
+            if row_state.state in PUBLISHABLE_ROW_STATES:
+                mention_rows.extend(row_state.debt_instrument_mentions)
             if row_state.state == "SUCCESS":
                 succeeded_item_ids.add(row_state.item_id)
-                mention_rows.extend(row_state.debt_instrument_mentions)
             else:
                 failed_rows[row_state.item_id] = _failure_record(
                     row_state,
@@ -1470,11 +1500,12 @@ def finalize_extract_outputs(
     succeeded_item_ids: set[str] = set()
     for row_state, partition_date, shard in row_entries:
         audit_records.append(json.dumps(row_state.to_audit_dict(), sort_keys=True))
-        if row_state.state == "SUCCESS":
-            succeeded_item_ids.add(row_state.item_id)
+        if row_state.state in PUBLISHABLE_ROW_STATES:
             mentions_by_partition.setdefault((partition_date, shard), []).extend(
                 row_state.debt_instrument_mentions
             )
+        if row_state.state == "SUCCESS":
+            succeeded_item_ids.add(row_state.item_id)
         else:
             failed_rows[row_state.item_id] = _failure_record(
                 row_state,
@@ -1648,7 +1679,7 @@ def extract_tables(
             )
         )
         audit_records.append(json.dumps(row_state.to_audit_dict(), sort_keys=True))
-        if row_state.state == "SUCCESS":
+        if row_state.state in PUBLISHABLE_ROW_STATES:
             rows.extend(row_state.debt_instrument_mentions)
         else:
             LOGGER.warning(
@@ -1721,29 +1752,101 @@ def handle_response(
     row_state.add_validation(failures)
     if not failures:
         stage.postprocess(row_state)
-        if stage.early_stop(row_state):
-            row_state.finish("SUCCESS")
-            return None
-        if stage_index == len(EXTRACTOR_STAGES) - 1:
-            row_state.finish("SUCCESS")
-            return None
-        next_stage = EXTRACTOR_STAGES[stage_index + 1]
-        if (
-            next_stage.name == "instrument_relation"
-            and len(row_state.debt_instrument_mentions) <= 1
-        ):
-            row_state.finish("SUCCESS")
-            return None
-        row_state.next_stage(next_stage.name)
-        if not _begin_stage(row_state, next_stage):
-            return None
-        return list(row_state.current_attempt.messages)
+        return _advance_after_stage(row_state, stage, stage_index)
 
     if row_state.current_attempt.attempt_index >= max_attempts:
-        row_state.finish("FAILED")
-        return None
+        return _salvage_or_fail(row_state, stage, stage_index, max_attempts)
     row_state.retry(stage.build_retry_message(failures))
     return list(row_state.current_attempt.messages)
+
+
+def _advance_after_stage(
+    row_state: ExtractionRowState,
+    stage: StageSpec,
+    stage_index: int,
+) -> list[dict[str, str]] | None:
+    """Move one row past a completed stage: finish it or start the next stage."""
+    if stage.early_stop(row_state):
+        row_state.finish("SUCCESS")
+        return None
+    if stage_index == len(EXTRACTOR_STAGES) - 1:
+        row_state.finish("SUCCESS")
+        return None
+    next_stage = EXTRACTOR_STAGES[stage_index + 1]
+    if (
+        next_stage.name == "instrument_relation"
+        and len(row_state.debt_instrument_mentions) <= 1
+    ):
+        row_state.finish("SUCCESS")
+        return None
+    row_state.next_stage(next_stage.name)
+    if not _begin_stage(row_state, next_stage):
+        return None
+    return list(row_state.current_attempt.messages)
+
+
+def _salvage_or_fail(
+    row_state: ExtractionRowState,
+    stage: StageSpec,
+    stage_index: int,
+    max_attempts: int,
+) -> list[dict[str, str]] | None:
+    """Keep what the row's final failed attempt still supports (#152).
+
+    A whole-item drop used to be the only terminal outcome, so one invalid
+    entry cost every valid one, and a relation-stage failure discarded mentions
+    that had already passed `instrument_ie` validation. Both salvages finish the
+    row PARTIAL: mentions publish, and the failure registry records the loss.
+    NER has nothing to salvage — without tags no downstream stage can run.
+    """
+    if stage.name == InstrumentIEStage.name:
+        dropped = salvage_instrument_ie_entries(row_state)
+        if dropped is not None:
+            row_state.salvage_notes.append(
+                f"instrument_ie kept the valid entries and dropped {dropped} "
+                f"invalid ones after {max_attempts} failed attempts"
+            )
+            stage.postprocess(row_state)
+            return _advance_after_stage(row_state, stage, stage_index)
+    if (
+        stage.name == InstrumentRelationStage.name
+        and row_state.debt_instrument_mentions
+    ):
+        row_state.salvage_notes.append(
+            f"instrument_relation failed after {max_attempts} attempts; "
+            "mentions published without lineage relations"
+        )
+        row_state.finish("PARTIAL")
+        return None
+    row_state.finish("FAILED")
+    return None
+
+
+def salvage_instrument_ie_entries(row_state: ExtractionRowState) -> int | None:
+    """Filter the final instrument_ie response down to its valid entries.
+
+    Returns the number of dropped entries, or None when nothing is salvageable
+    (unparseable JSON, a non-list response, or no individually valid entry).
+    On success the stored stage response is replaced with the surviving
+    entries, so postprocess and the audit log see exactly what was kept.
+    """
+    if not row_state.ner_tagged_xml:
+        return None
+    response = row_state.stage_responses.get(InstrumentIEStage.name)
+    if not response:
+        return None
+    try:
+        data = json.loads(response)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, list):
+        return None
+    _, _, tag_details = parse_tag_details(row_state.ner_tagged_xml)
+    kept = [obj for obj in data if not validate_instrument_entry(0, obj, tag_details)]
+    if not kept:
+        return None
+    row_state.stage_responses[InstrumentIEStage.name] = json.dumps(kept)
+    return len(data) - len(kept)
 
 
 async def run_extraction_workflow(
