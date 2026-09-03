@@ -114,8 +114,11 @@ def train_classifier_model(
     fitted_model = clone_model(model)
     fitted_model.fit(texts, labels)
 
+    import sklearn
+
     metadata = {
         "model_name": MODEL_NAME,
+        "sklearn_version": sklearn.__version__,
         "train_csv": str(train_csv),
         "training_row_count": int(len(texts)),
         "target_recall": float(target_recall),
@@ -324,16 +327,48 @@ def classify_pending_items(
     )
 
 
+def _minor_version(version: str) -> tuple[str, ...]:
+    """Return the major.minor prefix sklearn keeps pickles compatible within."""
+    return tuple(version.split(".")[:2])
+
+
 def load_training_artifacts(
     model_dir: Path,
 ) -> tuple[SupportsDecisionFunction, float, dict[str, object]]:
-    """Load a fitted model and metadata from disk."""
+    """Load a fitted model and metadata from disk.
+
+    Refuses a pickle trained under a different scikit-learn minor: the model is
+    the relevance gate deciding which items reach the LLM, its threshold is
+    calibrated against the training version's scoring behaviour, and sklearn
+    only warns on mismatch -- a drift of a few percent in relevance would look
+    like normal fluctuation in corpus size (#109).
+    """
     model_path = model_dir / MODEL_FILENAME
     metadata_path = model_dir / METADATA_FILENAME
-    with model_path.open("rb") as file_obj:
-        model = pickle.load(file_obj)  # noqa: S301
     with metadata_path.open(encoding="utf-8") as file_obj:
         metadata = json.load(file_obj)
+
+    import sklearn
+
+    recorded_version = metadata.get("sklearn_version")
+    if recorded_version is None:
+        LOGGER.warning(
+            "Model metadata at %s records no sklearn_version; cannot verify "
+            "the pickle matches the running scikit-learn %s (#109)",
+            metadata_path,
+            sklearn.__version__,
+        )
+    elif _minor_version(str(recorded_version)) != _minor_version(sklearn.__version__):
+        msg = (
+            f"Model at {model_path} was trained under scikit-learn "
+            f"{recorded_version} but the runtime has {sklearn.__version__}. "
+            "Retrain the model under the running version (cdt classify train) "
+            "or pin scikit-learn back to the training minor (#109)."
+        )
+        raise RuntimeError(msg)
+
+    with model_path.open("rb") as file_obj:
+        model = pickle.load(file_obj)  # noqa: S301
     return model, float(metadata["threshold"]), metadata
 
 

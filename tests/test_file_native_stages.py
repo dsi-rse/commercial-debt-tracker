@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -409,6 +410,61 @@ def test_classify_pending_items_skips_empty_outputs_on_rerun(
     assert not artifact_exists(
         classifications_root(tmp_path) + "/date=2024-01-02/shard=0001/part-0000.parquet"
     )
+
+
+def test_load_training_artifacts_rejects_sklearn_minor_mismatch(
+    tmp_path: Path,
+) -> None:
+    """A pickle trained under a different sklearn minor must fail loudly (#109).
+
+    The classifier is the relevance gate; sklearn itself only warns, and a
+    silent scoring drift looks like normal fluctuation in corpus size.
+    """
+    classifier_core.save_training_artifacts(
+        model_dir=tmp_path,
+        model=FakeModel(),
+        metadata={"threshold": 0.5, "sklearn_version": "0.24.2"},
+    )
+
+    with pytest.raises(RuntimeError, match="0.24.2"):
+        classifier_core.load_training_artifacts(tmp_path)
+
+
+def test_load_training_artifacts_accepts_matching_sklearn_minor(
+    tmp_path: Path,
+) -> None:
+    """Same major.minor loads fine, including across patch releases (#109)."""
+    import sklearn
+
+    patch_variant = ".".join([*sklearn.__version__.split(".")[:2], "999"])
+    classifier_core.save_training_artifacts(
+        model_dir=tmp_path,
+        model=FakeModel(),
+        metadata={"threshold": 0.5, "sklearn_version": patch_variant},
+    )
+
+    _, threshold, metadata = classifier_core.load_training_artifacts(tmp_path)
+
+    assert threshold == 0.5
+    assert metadata["sklearn_version"] == patch_variant
+
+
+def test_load_training_artifacts_warns_without_recorded_version(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Pre-provenance metadata still loads, but the gap is logged (#109)."""
+    classifier_core.save_training_artifacts(
+        model_dir=tmp_path,
+        model=FakeModel(),
+        metadata={"threshold": 0.5},
+    )
+
+    with caplog.at_level(logging.WARNING, logger="cdt.classifier.core"):
+        _, threshold, _ = classifier_core.load_training_artifacts(tmp_path)
+
+    assert threshold == 0.5
+    assert any("sklearn_version" in record.getMessage() for record in caplog.records)
 
 
 def test_itemize_pending_documents_persists_progress_per_batch(
