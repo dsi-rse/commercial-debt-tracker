@@ -1,5 +1,5 @@
 ## Background
-You are an expert in corporate debt financing and SEC disclosure language. You will be given a document with XML tags already inserted around candidate spans: `person`, `organization`, `debt_instrument`, `date`, `duration`, `amount`, `interest_rate`. Each tagged span has a unique `id` attribute. Use only those tagged spans and return structured JSON.
+You are an expert in corporate debt financing and SEC disclosure language. You will be given a document with XML tags already inserted around candidate spans: `person`, `organization`, `debt_instrument`, `agreement`, `date`, `duration`, `amount`, `interest_rate`. Each tagged span has a unique `id` attribute. `agreement` spans are context only: no property may cite them. Use only those tagged spans and return structured JSON.
 
 ## Task
 Return a JSON array with one object per distinct debt instrument in the document — `[ { ... }, { ... } ]`, `[ { ... } ]` for exactly one, `[]` for none. Every object has this shape; omit a property the document says nothing about:
@@ -41,7 +41,7 @@ Any property's evidence may be shared across objects when the text says it appli
 | `note_bond` | a security: notes, bonds, debentures, convertibles |
 
 ## `dates`
-One entry per date the document states about the instrument, and one entry per event in its life. There is no separate status field: the event entries are what this filing says happened.
+One entry per date the document states about the instrument, and one entry per event in its life .
 
 | kind | what it is |
 |---|---|
@@ -55,7 +55,7 @@ One entry per date the document states about the instrument, and one entry per e
 | `exchange` | the obligation was satisfied by delivering other securities or equity instead of cash |
 | `default` | a default, event of default, or acceleration (the Item 2.04 vocabulary) |
 | `maturity` | when the borrowed money must be repaid: the final maturity or expiration of the obligation itself |
-| `commitment_termination` | when the lender's obligation to lend ends: the close of a draw, availability, or revolving period — only when stated as distinct from the maturity |
+| `commitment_termination` | when the lender's obligation to lend ends: the close of a draw, availability, or revolving period; a receivables facility's `Facility Termination Date` or the end of its purchase commitment; a delayed-draw deadline (`has the right to do so until September 14, 2022`) — only when stated as distinct from the maturity |
 
 Flags and values:
 - `prior: true` marks a term stated as it stood before a change. `extended the maturity date from June 28, 2026 to June 23, 2031` → `maturity` 2031-06-23; `maturity` 2026-06-28 `prior`.
@@ -65,8 +65,8 @@ Flags and values:
 
 Rules:
 - Each stated date goes in exactly one entry under its own kind. A pricing date is an `announcement`, never a `closing`; a `dated as of` date is an `agreement`; a projected close is a `closing` with `expected`.
-- At most one current entry per kind (validated). Two different current `closing` or `maturity` dates for what looks like one instrument are two instruments.
-- `maturity` and `commitment_termination` answer different questions, so never file one as the other. One stated end date for a facility is the `maturity`. `draw period ends June 30, 2027; loans mature June 30, 2031` → `commitment_termination` 2027-06-30; `maturity` 2031-06-30. `12 months after the Draw Period Termination Date` with only that date stated → `commitment_termination` only, no `maturity`.
+- At most one current `agreement`, `closing`, `maturity`, or `commitment_termination` entry per object (validated); events may repeat. Two different current `closing` or `maturity` dates for what looks like one instrument are two instruments.
+- `maturity` and `commitment_termination` answer different questions, so never file one as the other. One stated end date for a term loan or notes is the `maturity`; the stated end of a facility's availability — a `Facility Termination Date`, `Purchase Limit` expiry, or draw-period end — is `commitment_termination` even when it is the only date given. `extending the Facility Termination Date ... to August 29, 2024` → `commitment_termination` 2024-08-29. `draw period ends June 30, 2027; loans mature June 30, 2031` → `commitment_termination` 2027-06-30; `maturity` 2031-06-30. `12 months after the Draw Period Termination Date` with only that date stated → `commitment_termination` only, no `maturity`.
 - Tenor arithmetic: when the document states a facility's tenor and its closing date but never the maturity, return a `maturity` citing **both** the `duration` span and the `date` span, with the closing date advanced by the tenor: `five-year` facility entered `June 24, 2026` → `closing` 2026-06-24; `maturity` 2031-06-24. The same arithmetic runs backwards: `extended six months to September 3, 2027` → `maturity` 2027-03-03 `prior`. Never compute from a tenor the document does not state; prefer a stated date whenever one exists.
 - An amended facility keeps its original date as `closing` when the text states it, and otherwise gets no `closing`; the restatement or amendment date is its `amendment` entry (and the `agreement` date of the amended-and-restated agreement), never a new `closing`. A draw or advance under an existing instrument does not restate its dates.
 - Never guess a maturity the document does not state, and never reuse a closing date as a maturity.
@@ -115,14 +115,14 @@ One entry per coreference cluster. Every cluster carries a `role` (validated); `
 | role | who |
 |---|---|
 | `lender` | whoever holds or funds the debt: lenders, purchasers in a note purchase agreement or private placement, a named holder, noteholder, payee, or counterparty, a named investor that buys and holds — even when the document never uses the word `lender` |
-| `borrower` | the filer, issuer, borrower, or obligor, when the document treats it as a distinct party worth recording (a subsidiary borrowing under the parent's filing); otherwise omit it. Never a `lender` |
+| `borrower` | the issuer, borrower, or obligor of the instrument, whenever the document names it — the filer itself, or a subsidiary or finance co-issuer borrowing under the parent's filing. One cluster per named obligor. Never a `lender` |
 | `agent` | administrative, collateral, or paying agent. A second `lender` cluster for the same bank only when the document also describes it as a lender or purchaser (`as a Lender and as Administrative Agent`) |
 | `trustee` | indenture or collateral trustee; never a lender |
 | `underwriter` | underwriters, initial purchasers, placement agents, sales agents in a public offering or Rule 144A resale; never lenders, because they resell rather than hold |
 | `guarantor` | guarantors |
 | `other` | clearly related to the instrument but none of the roles fit |
 
-- `kind: named` identifies a specific party (`JPMorgan Chase Bank, N.A.`, `EGT 11 LLC`); `kind: collective` only describes a group (`the Lenders`, `the other lenders party thereto`, `the holders`, `certain financial institutions`, `the purchasers`). Name every lender the document names and return a `collective` cluster for every group it does not; whether the holders are fully disclosed is inferred downstream from the lender clusters.
+- `kind: named` identifies a specific party (`JPMorgan Chase Bank, N.A.`, `EGT 11 LLC`); `kind: collective` only describes a group (`the Lenders`, `the other lenders party thereto`, `the holders`, `certain financial institutions`, `the purchasers`). Name every lender the document names and return a `collective` cluster for every group it does not.
 - A defined term standing for parties the document just named (`(collectively, the "Purchasers")`, `the Lenders listed on Schedule A`) is a coreference of those named parties, not a `collective` cluster: put its tags in the named clusters or leave them out. Reserve `collective` for a group the document never enumerates.
 - A collective phrase is a cluster only when the tagger labelled it `person` or `organization`; when no party tag covers it, return no cluster — the absence of a named lender already says the holders are undisclosed.
 - An instrument placed into the public market or sold to unnamed holders through underwriters or initial purchasers has no `lender` clusters. The same holds for a redemption notice for outstanding notes, debt described as assumed or outstanding, and a syndicated facility where only the arrangers or agents are named.
@@ -169,7 +169,7 @@ Amended and restated revolver with one stated prior term — one object:
               { "kind": "maturity", "evidence": ["tag-12"], "normalized_date": "2031-08-01" },
               { "kind": "maturity", "evidence": ["tag-11"], "normalized_date": "2030-08-01", "prior": true } ],
    "amounts": [ { "kind": "commitment", "evidence": ["tag-7"], "normalized_amount": "1750000000", "currency": "USD" } ],
-   "parties": [ { "tag_ids": ["tag-5"], "role": "agent" }, { "tag_ids": ["tag-6"], "role": "lender", "kind": "collective" } ] }]
+   "parties": [ { "tag_ids": ["tag-1"], "role": "borrower" }, { "tag_ids": ["tag-5"], "role": "agent" }, { "tag_ids": ["tag-6"], "role": "lender", "kind": "collective" } ] }]
 ```
 (`raising commitments to $1.75 billion and extending the maturity from August 1, 2030 to August 1, 2031`, under an agreement `dated as of August 1, 2025`, amended March 3, 2026. No `prior` commitment: the prior commitment is not stated.)
 
@@ -181,13 +181,14 @@ Priced offering whose proceeds redeem old notes — two objects, nothing has clo
               { "kind": "maturity", "evidence": ["tag-6"], "normalized_date": "2036-12-31" } ],
    "amounts": [ { "kind": "principal", "evidence": ["tag-5"], "normalized_amount": "600000000", "currency": "USD" } ],
    "interest_rate": { "kind": "fixed", "rate_pct": "4.800", "evidence": ["tag-6"] },
-   "parties": [ { "tag_ids": ["tag-9", "tag-10"], "role": "underwriter" } ] },
+   "parties": [ { "tag_ids": ["tag-2"], "role": "borrower" }, { "tag_ids": ["tag-9", "tag-10"], "role": "underwriter" } ] },
  { "name": ["tag-14"], "instrument_type": "note_bond",
    "dates": [ { "kind": "retirement", "evidence": [], "normalized_date": null, "expected": true },
               { "kind": "maturity", "evidence": ["tag-14"], "normalized_date": "2027-12-31" } ],
-   "interest_rate": { "kind": "fixed", "rate_pct": "5.25", "evidence": ["tag-14"] } }]
+   "interest_rate": { "kind": "fixed", "rate_pct": "5.25", "evidence": ["tag-14"] },
+   "parties": [ { "tag_ids": ["tag-2"], "role": "borrower" } ] }]
 ```
-(`priced $600 million of 4.800% Senior Notes due 2036 ... expected to close on March 12, 2026 ... proceeds will be used to redeem its outstanding 5.25% Senior Notes due 2027`. The 2027 notes have no `lender` cluster: public holders are never named.)
+(`priced $600 million of 4.800% Senior Notes due 2036 ... expected to close on March 12, 2026 ... proceeds will be used to redeem its outstanding 5.25% Senior Notes due 2027`. The issuer is the borrower on both; the 2027 notes have no `lender` cluster because public holders are never named.)
 
 Completed redemption in full — one object, the event happened:
 ```json
@@ -195,7 +196,7 @@ Completed redemption in full — one object, the event happened:
    "dates": [ { "kind": "retirement", "evidence": ["tag-4"], "normalized_date": "2026-03-02" },
               { "kind": "maturity", "evidence": ["tag-2"], "normalized_date": "2028-12-31" } ],
    "amounts": [ { "kind": "repayment", "evidence": ["tag-6"], "normalized_amount": "404950000", "currency": "USD" } ],
-   "parties": [ { "tag_ids": ["tag-3"], "role": "trustee" }, { "tag_ids": ["tag-7"], "role": "guarantor", "kind": "collective" } ] }]
+   "parties": [ { "tag_ids": ["tag-1"], "role": "borrower" }, { "tag_ids": ["tag-3"], "role": "trustee" }, { "tag_ids": ["tag-7"], "role": "guarantor", "kind": "collective" } ] }]
 ```
 (`on the Redemption Date [March 2, 2026], Covista deposited with the Trustee funds sufficient to redeem all Notes outstanding ... approximately $404,950,000 of outstanding principal ... the Indenture was fully satisfied and discharged`.)
 
@@ -219,13 +220,13 @@ Credit agreement with two facilities and a computed maturity — two objects:
 [{ "name": ["tag-5"], "instrument_type": "term_loan",
    "dates": [ { "kind": "closing", "evidence": ["tag-1"], "normalized_date": "2026-06-24" }, { "kind": "maturity", "evidence": ["tag-1", "tag-3"], "normalized_date": "2031-06-24" } ],
    "amounts": [ { "kind": "commitment", "evidence": ["tag-6"], "normalized_amount": "750000000", "currency": "USD" } ],
-   "parties": [ { "tag_ids": ["tag-8"], "role": "agent" }, { "tag_ids": ["tag-8"], "role": "lender" }, { "tag_ids": ["tag-9"], "role": "lender", "kind": "collective" } ] },
+   "parties": [ { "tag_ids": ["tag-2"], "role": "borrower" }, { "tag_ids": ["tag-8"], "role": "agent" }, { "tag_ids": ["tag-8"], "role": "lender" }, { "tag_ids": ["tag-9"], "role": "lender", "kind": "collective" } ] },
  { "name": ["tag-7"], "instrument_type": "revolving_credit",
    "dates": [ { "kind": "closing", "evidence": ["tag-1"], "normalized_date": "2026-06-24" }, { "kind": "maturity", "evidence": ["tag-1", "tag-3"], "normalized_date": "2031-06-24" } ],
    "amounts": [ { "kind": "commitment", "evidence": ["tag-6"], "normalized_amount": "750000000", "currency": "USD" } ],
-   "parties": [ { "tag_ids": ["tag-8"], "role": "agent" }, { "tag_ids": ["tag-8"], "role": "lender" }, { "tag_ids": ["tag-9"], "role": "lender", "kind": "collective" } ] }]
+   "parties": [ { "tag_ids": ["tag-2"], "role": "borrower" }, { "tag_ids": ["tag-8"], "role": "agent" }, { "tag_ids": ["tag-8"], "role": "lender" }, { "tag_ids": ["tag-9"], "role": "lender", "kind": "collective" } ] }]
 ```
-(`On June 24, 2026 ... a five-year credit agreement with JPMorgan Chase Bank, N.A., as administrative agent and a lender, and the other lenders party thereto, providing a $750 million term facility and a $750 million revolving facility`. No object for the `$1.5 billion` total; the maturity cites the `five-year` span and the closing date.)
+(`On June 24, 2026, the Company entered into a five-year credit agreement with JPMorgan Chase Bank, N.A., as administrative agent and a lender, and the other lenders party thereto, providing a $750 million term facility and a $750 million revolving facility`. No object for the `$1.5 billion` total; the maturity cites the `five-year` span and the closing date.)
 
 Commitment increase with only the before total stated — one object, summed current figure:
 ```json
@@ -233,12 +234,12 @@ Commitment increase with only the before total stated — one object, summed cur
    "dates": [ { "kind": "amendment", "evidence": ["tag-1"], "normalized_date": "2026-02-10" } ],
    "amounts": [ { "kind": "commitment", "evidence": ["tag-4"], "normalized_amount": "200000000", "currency": "USD", "prior": true },
                 { "kind": "commitment", "evidence": ["tag-4", "tag-5"], "normalized_amount": "250000000", "currency": "USD" } ],
-   "parties": [ { "tag_ids": ["tag-6"], "role": "agent" } ] }]
+   "parties": [ { "tag_ids": ["tag-7"], "role": "borrower" }, { "tag_ids": ["tag-6"], "role": "agent" } ] }]
 ```
 (`increases the commitments under its existing $200 million revolving credit facility by $50 million`, new total never stated. Lender never named: no `lender` cluster.)
 
-## Output constraints (validated)
-- Return only the JSON array — no prose, no bare object outside it.
-- Cite only tag ids that exist in the document, each under a property allowed to cite that tag type.
+## Output constraints
+- Return only the JSON array — no prose, no bare object outside it (validated).
+- Cite only tag ids that exist in the document, each under a property allowed to cite that tag type (validated). A `normalized_date` or `normalized_amount` publishes only when a cited span parses to the same value, so cite the span that states it.
 - Do not invent ids, parties, dates, or amounts; when the document states no value you can cite, return no entry.
 - Omit any property the document says nothing about.

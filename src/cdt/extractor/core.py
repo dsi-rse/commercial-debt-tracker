@@ -1153,7 +1153,7 @@ class InstrumentIEStage:
             "Retry requirements:\n"
             "- Return a JSON array with one object per concrete debt instrument described as its own obligation: `[ { ... } ]` even for a single instrument, `[]` for none.\n"
             "- Ignore collective labels or contextual references that should not become standalone debt instruments.\n"
-            "- If one object would have multiple distinct start dates or amounts, split it into separate debt instrument objects.\n"
+            "- One object has one current closing date and one current commitment or principal; a term stated before a change is a `prior: true` entry, and two unrelated values are two objects.\n"
             "- Shared evidence tags may appear in more than one object when the text supports that.\n"
             "- Do not return agreements as output objects.\n"
             "- Return only valid JSON."
