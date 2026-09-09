@@ -17,6 +17,7 @@ from cdt.classifier import (
     default_model_dir,
     train_classifier_model,
 )
+from cdt.datasets import dataset_root
 from cdt.extractor import (
     DEFAULT_MAX_ATTEMPTS as DEFAULT_EXTRACTOR_MAX_ATTEMPTS,
 )
@@ -32,6 +33,7 @@ from cdt.extractor import (
     mentions_root,
     reset_active_job,
 )
+from cdt.extractor.core import CLASSIFICATION_SOURCES
 from cdt.ingest import (
     DEFAULT_AWS_PROFILE,
     DEFAULT_BUCKET,
@@ -765,10 +767,14 @@ def run_extractor(args: argparse.Namespace) -> int:
         return 1
     try:
         logger.info(
-            "Starting extraction: batch_size=%s force=%s input=%s output=%s model=%s reasoning_effort=%s max_attempts=%s audit=%s",
+            "Starting extraction: batch_size=%s force=%s inputs=%s output=%s model=%s reasoning_effort=%s max_attempts=%s audit=%s",
             args.batch_size,
             args.force,
-            classifications_root(artifact_root),
+            # Both genres' sources; extraction claims from either.
+            ",".join(
+                dataset_root(source, artifact_root=artifact_root)
+                for source in CLASSIFICATION_SOURCES
+            ),
             mentions_root(artifact_root),
             args.model,
             args.reasoning_effort,
