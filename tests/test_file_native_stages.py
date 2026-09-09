@@ -856,18 +856,74 @@ Together, the <debt_instrument id="tag-i-4">Exchange Notes</debt_instrument> wer
     response = """
 [
   {
-    "name": ["tag-i-1", "tag-i-2"],
-    "start_date": {"evidence": ["tag-d-1"], "normalized_date": "2025-03-17"},
-    "amount": {"evidence": ["tag-a-1"], "normalized_amount": "5500000", "currency": "USD"},
-    "lenders": [{"tag_ids": ["tag-o-1"], "kind": "named"}],
-    "other_interested_parties": []
+    "name": [
+      "tag-i-1",
+      "tag-i-2"
+    ],
+    "dates": [
+      {
+        "kind": "closing",
+        "evidence": [
+          "tag-d-1"
+        ],
+        "normalized_date": "2025-03-17"
+      }
+    ],
+    "amounts": [
+      {
+        "evidence": [
+          "tag-a-1"
+        ],
+        "normalized_amount": "5500000",
+        "currency": "USD",
+        "kind": "principal",
+        "as_of_date": null
+      }
+    ],
+    "parties": [
+      {
+        "tag_ids": [
+          "tag-o-1"
+        ],
+        "role": "lender",
+        "kind": "named"
+      }
+    ]
   },
   {
-    "name": ["tag-i-1b", "tag-i-3"],
-    "start_date": {"evidence": ["tag-d-2"], "normalized_date": "2025-03-20"},
-    "amount": {"evidence": ["tag-a-2"], "normalized_amount": "269000", "currency": "USD"},
-    "lenders": [{"tag_ids": ["tag-o-1b"], "kind": "named"}],
-    "other_interested_parties": []
+    "name": [
+      "tag-i-1b",
+      "tag-i-3"
+    ],
+    "dates": [
+      {
+        "kind": "closing",
+        "evidence": [
+          "tag-d-2"
+        ],
+        "normalized_date": "2025-03-20"
+      }
+    ],
+    "amounts": [
+      {
+        "evidence": [
+          "tag-a-2"
+        ],
+        "normalized_amount": "269000",
+        "currency": "USD",
+        "kind": "principal",
+        "as_of_date": null
+      }
+    ],
+    "parties": [
+      {
+        "tag_ids": [
+          "tag-o-1b"
+        ],
+        "role": "lender",
+        "kind": "named"
+      }
+    ]
   }
 ]
 """.strip()
@@ -913,12 +969,13 @@ def test_instrument_ie_validate_accepts_party_kinds_and_roles() -> None:
         [
             {
                 "name": ["tag-i-1"],
-                "lenders": [
-                    {"tag_ids": ["tag-o-named"], "kind": "named"},
-                    {"tag_ids": ["tag-o-collective"], "kind": "collective"},
-                ],
-                "lenders_known_incomplete": True,
-                "other_interested_parties": [
+                "parties": [
+                    {"tag_ids": ["tag-o-named"], "role": "lender", "kind": "named"},
+                    {
+                        "tag_ids": ["tag-o-collective"],
+                        "role": "lender",
+                        "kind": "collective",
+                    },
                     {"tag_ids": ["tag-o-agent"], "role": "agent"},
                     {"tag_ids": ["tag-o-borrower"], "role": "borrower"},
                 ],
@@ -946,8 +1003,7 @@ def test_instrument_ie_validate_rejects_unannotated_party_clusters() -> None:
     failures = InstrumentIEStage().validate(party_row_state(), response)
 
     assert any(
-        "'lenders'[0] must be an object with 'tag_ids' and 'kind' keys." in failure
-        for failure in failures
+        "'lenders' is not a property of this schema" in failure for failure in failures
     )
     assert any("'role' must be one of" in failure for failure in failures)
 
@@ -1147,8 +1203,19 @@ was issued on <date id="tag-d-1">March 17, 2025</date> and <date id="tag-d-2">Ma
     response = """
 [
   {
-    "name": ["tag-i-1"],
-    "start_date": {"evidence": ["tag-d-1", "tag-d-2"], "normalized_date": "2025-03-17"}
+    "name": [
+      "tag-i-1"
+    ],
+    "dates": [
+      {
+        "kind": "closing",
+        "evidence": [
+          "tag-d-1",
+          "tag-d-2"
+        ],
+        "normalized_date": "2025-03-17"
+      }
+    ]
   }
 ]
 """.strip()
@@ -1222,10 +1289,13 @@ def test_instrument_ie_validate_accepts_name_span_as_end_date_evidence() -> None
         [
             {
                 "name": ["tag-i-1"],
-                "maturity_date": {
-                    "evidence": ["tag-i-1"],
-                    "normalized_date": "2028-12-31",
-                },
+                "dates": [
+                    {
+                        "kind": "maturity",
+                        "evidence": ["tag-i-1"],
+                        "normalized_date": "2028-12-31",
+                    }
+                ],
             }
         ]
     )
@@ -1241,10 +1311,13 @@ def test_instrument_ie_validate_still_rejects_name_span_as_start_date_evidence()
         [
             {
                 "name": ["tag-i-1"],
-                "start_date": {
-                    "evidence": ["tag-i-1"],
-                    "normalized_date": "2028-12-31",
-                },
+                "dates": [
+                    {
+                        "kind": "closing",
+                        "evidence": ["tag-i-1"],
+                        "normalized_date": "2028-12-31",
+                    }
+                ],
             }
         ]
     )
@@ -1454,11 +1527,14 @@ def test_instrument_ie_validate_accepts_principal_amount_evidence() -> None:
         [
             {
                 "name": ["tag-i-1"],
-                "amount": {
-                    "evidence": ["tag-a-principal"],
-                    "normalized_amount": "500000000",
-                    "currency": "USD",
-                },
+                "amounts": [
+                    {
+                        "kind": "principal",
+                        "evidence": ["tag-a-principal"],
+                        "normalized_amount": "500000000",
+                        "currency": "USD",
+                    }
+                ],
             }
         ]
     )
@@ -1893,11 +1969,14 @@ def test_instrument_ie_validate_accepts_the_name_span_as_amount_evidence() -> No
         [
             {
                 "name": ["tag-i-1"],
-                "amount": {
-                    "evidence": ["tag-i-1"],
-                    "normalized_amount": "183360000",
-                    "currency": "USD",
-                },
+                "amounts": [
+                    {
+                        "kind": "principal",
+                        "evidence": ["tag-i-1"],
+                        "normalized_amount": "183360000",
+                        "currency": "USD",
+                    }
+                ],
             }
         ]
     )
@@ -3714,7 +3793,16 @@ def test_terminal_ie_failure_salvages_the_valid_entries() -> None:
     row_state.ner_tagged_xml = PARTY_ROLE_XML
     response = json.dumps(
         [
-            {"name": ["tag-i-1"], "start_date": {"evidence": ["tag-d-1"]}},
+            {
+                "name": ["tag-i-1"],
+                "dates": [
+                    {
+                        "kind": "closing",
+                        "evidence": ["tag-d-1"],
+                        "normalized_date": None,
+                    }
+                ],
+            },
             {"name": ["tag-o-named"]},
         ]
     )
@@ -3742,7 +3830,16 @@ def test_terminal_relation_failure_publishes_mentions_without_lineage() -> None:
     ie_response = json.dumps(
         [
             {"name": ["tag-i-1"]},
-            {"name": ["tag-i-1"], "start_date": {"evidence": ["tag-d-1"]}},
+            {
+                "name": ["tag-i-1"],
+                "dates": [
+                    {
+                        "kind": "closing",
+                        "evidence": ["tag-d-1"],
+                        "normalized_date": None,
+                    }
+                ],
+            },
         ]
     )
     next_messages = handle_response(row_state, ie_response, max_attempts=3)
@@ -5218,3 +5315,230 @@ def test_post_filing_closing_is_expected_and_agreement_supplies_start() -> None:
         and status["status_date"]["normalized_date"] == "2015-02-27"
     )
     assert normalized_date_from_text("March 5 , 2026") == "2026-03-05"
+
+
+def _semantic_tags() -> dict[str, dict[str, object]]:
+    return {
+        "tag-1": {
+            "text": "5% Senior Notes due 2031",
+            "type": "debt_instrument",
+            "char_start": 0,
+            "char_end": 24,
+        },
+        "tag-2": {
+            "text": "March 5, 2026",
+            "type": "date",
+            "char_start": 30,
+            "char_end": 43,
+        },
+        "tag-3": {
+            "text": "$100 million",
+            "type": "amount",
+            "char_start": 50,
+            "char_end": 62,
+        },
+    }
+
+
+def test_semantic_validators_reject_misplaced_flags_and_kinds() -> None:
+    """Stage 2: `expected` only on events, `prior` only on terms, kinds fit the type, repayments pair."""
+    from cdt.extractor.core import (
+        validate_cross_field_semantics,
+        validate_dates_property,
+    )
+
+    tags = _semantic_tags()
+    expected_maturity = validate_dates_property(
+        index=0,
+        obj={
+            "dates": [
+                {
+                    "kind": "maturity",
+                    "evidence": ["tag-2"],
+                    "normalized_date": "2026-03-05",
+                    "expected": True,
+                }
+            ]
+        },
+        tag_details=tags,
+    )
+    assert any("cannot be `expected`" in f for f in expected_maturity)
+    prior_event = validate_dates_property(
+        index=0,
+        obj={
+            "dates": [
+                {
+                    "kind": "retirement",
+                    "evidence": ["tag-2"],
+                    "normalized_date": "2026-03-05",
+                    "prior": True,
+                }
+            ]
+        },
+        tag_details=tags,
+    )
+    assert any("cannot be `prior`" in f for f in prior_event)
+    ok = validate_dates_property(
+        index=0,
+        obj={
+            "dates": [
+                {
+                    "kind": "closing",
+                    "evidence": ["tag-2"],
+                    "normalized_date": "2026-03-05",
+                    "expected": True,
+                },
+                {
+                    "kind": "maturity",
+                    "evidence": ["tag-1"],
+                    "normalized_date": "2031-12-31",
+                    "prior": True,
+                },
+            ]
+        },
+        tag_details=tags,
+    )
+    assert ok == []
+    prior_balance = validate_cross_field_semantics(
+        index=0,
+        obj={
+            "amounts": [
+                {
+                    "kind": "outstanding_balance",
+                    "evidence": ["tag-3"],
+                    "normalized_amount": "100000000",
+                    "prior": True,
+                }
+            ]
+        },
+    )
+    assert any("cannot be `prior`" in f for f in prior_balance)
+    unpaired_date = validate_cross_field_semantics(
+        index=0,
+        obj={
+            "dates": [{"kind": "repayment", "evidence": [], "normalized_date": None}],
+            "amounts": [],
+        },
+    )
+    assert any("needs the repaid figure" in f for f in unpaired_date)
+    unpaired_amount = validate_cross_field_semantics(
+        index=0,
+        obj={
+            "dates": [
+                {
+                    "kind": "closing",
+                    "evidence": ["tag-2"],
+                    "normalized_date": "2026-03-05",
+                }
+            ],
+            "amounts": [
+                {
+                    "kind": "repayment",
+                    "evidence": ["tag-3"],
+                    "normalized_amount": "100000000",
+                }
+            ],
+        },
+    )
+    assert any("is an event" in f for f in unpaired_amount)
+    paired = validate_cross_field_semantics(
+        index=0,
+        obj={
+            "dates": [{"kind": "repayment", "evidence": [], "normalized_date": None}],
+            "amounts": [
+                {
+                    "kind": "repayment",
+                    "evidence": ["tag-3"],
+                    "normalized_amount": "100000000",
+                }
+            ],
+        },
+    )
+    assert paired == []
+    mismatch = validate_cross_field_semantics(
+        index=0,
+        obj={
+            "instrument_type": "note_bond",
+            "amounts": [
+                {
+                    "kind": "commitment",
+                    "evidence": ["tag-3"],
+                    "normalized_amount": "100000000",
+                }
+            ],
+        },
+    )
+    assert any("does not fit instrument_type" in f for f in mismatch)
+    assert (
+        validate_cross_field_semantics(
+            index=0,
+            obj={
+                "instrument_type": "revolving_credit",
+                "amounts": [
+                    {
+                        "kind": "commitment",
+                        "evidence": ["tag-3"],
+                        "normalized_amount": "100000000",
+                    }
+                ],
+            },
+        )
+        == []
+    )
+
+
+def test_live_validation_rejects_legacy_properties_but_replay_accepts_them() -> None:
+    """A fresh response reverting to status_event/lenders fails; stored responses still post-process."""
+    from cdt.extractor.core import validate_no_legacy_properties
+
+    legacy = {
+        "name": ["tag-1"],
+        "status_event": {"status": "repaid"},
+        "lenders": [],
+        "start_date": {"evidence": [], "normalized_date": None},
+    }
+    failures = validate_no_legacy_properties(0, legacy)
+    assert len(failures) == 3 and all(
+        "is not a property of this schema" in f for f in failures
+    )
+    assert (
+        validate_no_legacy_properties(
+            0, {"name": ["tag-1"], "dates": [], "parties": []}
+        )
+        == []
+    )
+
+
+def test_relation_manifest_marks_expected_retirement() -> None:
+    """The relation stage sees a planned retirement it cannot read off the body tags."""
+    from cdt.extractor.core import ExtractionRowState, relation_instrument_manifest
+
+    state = ExtractionRowState(
+        item_row={"item_id": "item-1"}, stage_name="instrument_relation"
+    )
+    state.debt_instrument_mentions = [
+        {
+            "raw_id": "i-1",
+            "name": "New Notes",
+            "principal_amount": "600000000",
+            "start_date": None,
+            "maturity_date": "2036-12-31",
+            "status": "announced",
+            "dates_json": json.dumps([{"kind": "closing", "expected": True}]),
+        },
+        {
+            "raw_id": "i-2",
+            "name": "5.25% Senior Notes due 2027",
+            "principal_amount": None,
+            "start_date": None,
+            "maturity_date": "2027-12-31",
+            "status": None,
+            "dates_json": json.dumps(
+                [{"kind": "retirement", "expected": True, "normalized_date": None}]
+            ),
+        },
+    ]
+    manifest = relation_instrument_manifest(state)
+    assert 'id="i-2"' in manifest and 'expected_retirement="true"' in manifest
+    assert manifest.count('expected_retirement="true"') == 1
+    assert 'status="announced"' in manifest

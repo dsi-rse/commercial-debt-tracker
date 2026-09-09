@@ -238,6 +238,19 @@ Commitment increase with only the before total stated — one object, summed cur
 ```
 (`increases the commitments under its existing $200 million revolving credit facility by $50 million`, new total never stated. Lender never named: no `lender` cluster.)
 
+Receivables facility amendment — availability end is `commitment_termination`, not `maturity`:
+```json
+[{ "name": ["tag-4", "tag-9"], "instrument_type": "credit_line",
+   "dates": [ { "kind": "agreement", "evidence": ["tag-2"], "normalized_date": "2013-01-10" },
+              { "kind": "amendment", "evidence": ["tag-1"], "normalized_date": "2023-08-30" },
+              { "kind": "commitment_termination", "evidence": ["tag-11"], "normalized_date": "2024-08-29" } ],
+   "amounts": [ { "kind": "commitment", "evidence": ["tag-7"], "normalized_amount": "600000000", "currency": "USD" },
+                { "kind": "commitment", "evidence": ["tag-6"], "normalized_amount": "800000000", "currency": "USD", "prior": true },
+                { "kind": "outstanding_balance", "evidence": ["tag-8"], "normalized_amount": "600000000", "currency": "USD", "as_of_date": "2023-08-30" } ],
+   "parties": [ { "tag_ids": ["tag-3"], "role": "borrower" }, { "tag_ids": ["tag-5"], "role": "agent" }, { "tag_ids": ["tag-10"], "role": "lender", "kind": "collective" } ] }]
+```
+(`On August 30, 2023, Targa Receivables LLC (the "SPV") entered into a Fourteenth Amendment to the Receivables Purchase Agreement dated as of January 10, 2013 ... reducing the Purchase Limit from $800 million to $600 million and extending the Facility Termination Date of the Facility to August 29, 2024 ... $600 million outstanding`. The SPV is the borrower; the committed purchasers are collective lenders; the facility's end of availability is `commitment_termination`, and no `maturity` is stated.)
+
 ## Output constraints
 - Return only the JSON array — no prose, no bare object outside it (validated).
 - Cite only tag ids that exist in the document, each under a property allowed to cite that tag type (validated). A `normalized_date` or `normalized_amount` publishes only when a cited span parses to the same value, so cite the span that states it.

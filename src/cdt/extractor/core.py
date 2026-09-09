@@ -938,6 +938,88 @@ def validate_instrument_entry(
             obj=obj,
         )
     )
+    failures.extend(validate_cross_field_semantics(index=index, obj=obj))
+    return failures
+
+
+# Which amount kinds fit which instrument types: a facility has a commitment, a
+# security has a principal. Balances, draws, repayments and proceeds fit any.
+FACILITY_INSTRUMENT_TYPES = {"revolving_credit", "credit_line"}
+AMOUNT_KIND_TYPE_CONFLICTS = {
+    ("commitment", "note_bond"),
+    ("principal", "revolving_credit"),
+    ("principal", "credit_line"),
+}
+
+
+# Properties of the pre-facts schema. Stored responses replay through
+# postprocess with their old semantics; a live response that uses them is a
+# model reverting to a shape the current prompt no longer describes.
+LEGACY_INSTRUMENT_PROPERTIES = {
+    "status_event": "events are `dates` entries (kinds closing, amendment, retirement, ...)",
+    "lenders": "parties are one `parties` list with role lender",
+    "other_interested_parties": "parties are one `parties` list with a role per cluster",
+    "lenders_known_incomplete": "derived from the lender clusters; do not return it",
+    "start_date": "a `dates` entry of kind closing (or agreement)",
+    "maturity_date": "a `dates` entry of kind maturity",
+    "end_date": "a `dates` entry of kind maturity",
+    "commitment_termination_date": "a `dates` entry of kind commitment_termination",
+    "amount": "an `amounts` entry with a kind",
+}
+
+
+def validate_no_legacy_properties(index: int, obj: object) -> list[str]:
+    """Reject pre-facts-schema properties on a freshly generated response."""
+    if not isinstance(obj, dict):
+        return []
+    return [
+        f"Entry {index}: '{name}' is not a property of this schema; use {replacement}."
+        for name, replacement in LEGACY_INSTRUMENT_PROPERTIES.items()
+        if name in obj
+    ]
+
+
+def validate_cross_field_semantics(*, index: int, obj: dict[str, Any]) -> list[str]:
+    """Reject shapes the schema forbids but no single-field check can see.
+
+    Each of these is a rule the prompt states; before this check the model's
+    violation was accepted and silently rewritten downstream.
+    """
+    failures: list[str] = []
+    dates = obj.get("dates") if isinstance(obj.get("dates"), list) else []
+    amounts = obj.get("amounts") if isinstance(obj.get("amounts"), list) else []
+    date_kinds = {entry.get("kind") for entry in dates if isinstance(entry, dict)}
+    amount_kinds = {entry.get("kind") for entry in amounts if isinstance(entry, dict)}
+    for entry in amounts:
+        if (
+            isinstance(entry, dict)
+            and entry.get("prior") is True
+            and entry.get("kind") not in PRINCIPAL_AMOUNT_KINDS
+        ):
+            failures.append(
+                f"Entry {index}: 'amounts' entry of kind '{entry.get('kind')}' cannot "
+                "be `prior`. Only a commitment or principal has a before-the-change "
+                "figure; a balance, draw, repayment or proceeds is dated, not prior."
+            )
+    if "repayment" in date_kinds and "repayment" not in amount_kinds:
+        failures.append(
+            f"Entry {index}: a `repayment` date entry needs the repaid figure as a "
+            "`repayment` entry in 'amounts' when the document states one; if it states "
+            "no figure, the payment is a `retirement` (in full) or nothing."
+        )
+    if "repayment" in amount_kinds and "repayment" not in date_kinds and dates:
+        failures.append(
+            f"Entry {index}: a `repayment` amount is an event; add a `repayment` entry to "
+            "'dates' (with `evidence` [] and `normalized_date` null when no date is stated)."
+        )
+    instrument_type = obj.get("instrument_type")
+    for kind in sorted(k for k in amount_kinds if isinstance(k, str)):
+        if (kind, instrument_type) in AMOUNT_KIND_TYPE_CONFLICTS:
+            failures.append(
+                f"Entry {index}: 'amounts' kind '{kind}' does not fit instrument_type "
+                f"'{instrument_type}'. A facility's size is a `commitment`; a security's "
+                "face amount is a `principal`. Fix the kind or the type."
+            )
     return failures
 
 
@@ -1014,6 +1096,7 @@ class InstrumentIEStage:
         failures: list[str] = []
         for index, obj in enumerate(data):
             failures.extend(validate_instrument_entry(index, obj, tag_details))
+            failures.extend(validate_no_legacy_properties(index, obj))
         return failures
 
     def postprocess(self, row_state: ExtractionRowState) -> None:
@@ -2721,6 +2804,23 @@ def validate_dates_property(
             current_kinds[kind] = current_kinds.get(kind, 0) + 1
         if not isinstance(entry.get("expected", False), bool):
             failures.append(f"Entry {index}: '{label}.expected' must be true or false.")
+        elif (
+            entry.get("expected") is True
+            and kind is not None
+            and kind not in EVENT_DATE_KINDS
+        ):
+            failures.append(
+                f"Entry {index}: '{label}' of kind '{kind}' cannot be `expected`. Only "
+                "events (announcement, closing, amendment, repayment, retirement, "
+                "termination, exchange, default) are planned or completed; a term such "
+                "as a maturity is simply stated."
+            )
+        if prior is True and kind is not None and kind in EVENT_DATE_KINDS:
+            failures.append(
+                f"Entry {index}: '{label}' of kind '{kind}' cannot be `prior`. `prior` marks "
+                "a term (maturity, commitment_termination, agreement) as it stood before "
+                "a change; an event either happened or is `expected`."
+            )
         evidence = entry.get("evidence")
         if not isinstance(evidence, list):
             failures.append(
@@ -4306,11 +4406,26 @@ def relation_instrument_manifest(row_state: ExtractionRowState) -> str:
             ("amount", "principal_amount"),
             ("start_date", "start_date"),
             ("maturity_date", "maturity_date"),
+            ("status", "status"),
         )
         for attribute_name, field_name in manifest_fields:
             value = coerce_dataset_text(mention.get(field_name))
             if value is not None:
                 attributes.append(f'{attribute_name}="{escape_xml_attribute(value)}"')
+        # A planned retirement is invisible in the body's tags; without it the
+        # relation stage cannot tell a use-of-proceeds target from a note
+        # merely mentioned, and it is exactly the `retired_by` case.
+        try:
+            facts = json.loads(str(mention.get("dates_json") or "[]"))
+        except json.JSONDecodeError:
+            facts = []
+        if any(
+            isinstance(fact, dict)
+            and fact.get("kind") in TERMINAL_DATE_KINDS
+            and fact.get("expected") is True
+            for fact in facts
+        ):
+            attributes.append('expected_retirement="true"')
         lines.append(f"  <instrument {' '.join(attributes)}/>")
     if not lines:
         return ""
