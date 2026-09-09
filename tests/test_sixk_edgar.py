@@ -64,6 +64,20 @@ DAY_ONE_INDEX = (
     )
 )
 DAY_TWO_INDEX = INDEX_BANNER + VALE_ROW
+# The daily index as EDGAR actually serves it: a four-line preamble, the header
+# split across two lines, compact dates, and rows dated before the index day.
+DAILY_INDEX_TEXT = """Description:           Daily Index of EDGAR Dissemination Feed by Form Type
+Last Data Received:    Sep 8, 2026
+Comments:              webmaster@sec.gov
+Anonymous FTP:         ftp://ftp.sec.gov/edgar/
+
+Form Type   Company Name                                                  CIK
+      Date Filed  File Name
+---------------------------------------------------------------------------------------
+6-K              AIR Global PLC                                                2097725     20260908    edgar/data/2097725/0001193125-26-384297.txt
+6-K              LATE FILER PLC                                                2097726     20260904    edgar/data/2097726/0001193125-26-384298.txt
+8-K              SOME DOMESTIC CO                                              320193      20260908    edgar/data/320193/0000320193-26-000002.txt
+"""
 BARCLAYS_ACCESSION = "0001654954-26-004070"
 VALE_ACCESSION = "0001292814-26-002379"
 EXPECTED_SIXK_ROWS = 2
@@ -145,6 +159,19 @@ def test_parse_form_index_selects_requested_forms_from_unaligned_columns() -> No
     assert [row.cik for row in rows] == ["312069", "1292814"]
     assert [row.company_name for row in rows] == ["BARCLAYS PLC", "Vale S.A."]
     assert [row.filing_date for row in rows] == ["2026-04-29", "2026-04-30"]
+
+
+def test_parse_form_index_reads_the_daily_indexs_compact_dates() -> None:
+    """EDGAR spells the date two ways, and the daily one has no dashes.
+
+    A regex accepting only the quarterly spelling matches nothing at all in a
+    daily index — every 6-K row dropped, no error raised.
+    """
+    rows = parse_form_index(DAILY_INDEX_TEXT)
+
+    assert [row.filing_date for row in rows] == ["2026-09-08", "2026-09-04"]
+    assert [row.cik for row in rows] == ["2097725", "2097726"]
+    assert [row.company_name for row in rows] == ["AIR Global PLC", "LATE FILER PLC"]
 
 
 def test_parse_form_index_does_not_confuse_an_amendment_for_its_base_form() -> None:
@@ -449,6 +476,39 @@ def test_acquire_rejects_inlining_bodies_into_the_partitions(tmp_path: Path) -> 
         acquire_sixk_documents(_config(tmp_path, download=True))
 
 
+def test_source_keeps_a_filing_the_daily_feed_reports_late(
+    tmp_path: Path,
+) -> None:
+    """A daily index lists filings dated earlier; those must not be dropped.
+
+    The run for the earlier date has already happened and its own index did not
+    list the filing yet, so a date filter here would lose it permanently — the
+    shape of #90. It is written to the partition for its own filing date.
+    """
+    late_url = submission_url("2097726", "0001193125-26-384298")
+    transport = FakeTransport(
+        {
+            daily_index_url(date(2026, 9, 8)): [(200, DAILY_INDEX_TEXT.encode())],
+            submission_url("2097725", "0001193125-26-384297"): [(200, b"on time")],
+            late_url: [(200, b"late")],
+        }
+    )
+
+    table, _ = acquire_sixk_documents(
+        _config(tmp_path, start_date=date(2026, 9, 8), end_date=date(2026, 9, 8)),
+        fetcher=_fetcher(transport),
+    )
+
+    assert late_url in transport.calls
+    late_row = table.loc[table["accession_number"] == "000119312526384298"].iloc[0]
+    assert late_row["date"] == "2026-09-04"
+    assert late_row["resource_uri"] == mirror_path(
+        str(tmp_path),
+        filing_date="2026-09-04",
+        accession_number="0001193125-26-384298",
+    )
+
+
 def test_source_yields_a_filing_listed_in_two_indexes_once(
     tmp_path: Path,
 ) -> None:
@@ -456,7 +516,7 @@ def test_source_yields_a_filing_listed_in_two_indexes_once(
     responses = _index_and_submissions()
     responses[daily_index_url(date(2026, 4, 30))] = [(200, DAY_ONE_INDEX.encode())]
     source = EdgarDocumentSource(
-        config=_config(tmp_path, end_date=date(2026, 4, 30)),
+        config=_config(tmp_path),
         fetcher=_fetcher(FakeTransport(responses)),
     )
 

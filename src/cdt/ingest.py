@@ -579,29 +579,35 @@ def run_ingest_pipeline(
         repair_document_shards(documents_dataset_root)
     failure_registry.flush()
 
-    # Read back only the run's date window: partition dates equal row dates, so
-    # this is exact — reading the whole dataset here deserialized every
-    # historical 8-K body a second time per run (#69).
-    window_frames = [
-        read_table(path, DOCUMENT_COLUMNS)
-        for path in iter_date_shard_partitions(
-            config.dataset_name,
-            artifact_root=output_root,
-            start_date=config.start_date,
-            end_date=config.end_date,
+    # Read back the run's date window plus whatever it wrote outside it, rather
+    # than the whole dataset — that deserialized every historical 8-K body a
+    # second time per run (#69). The union matters because a source can
+    # legitimately write outside the window: an EDGAR daily index is a
+    # dissemination feed and lists filings dated earlier, each written to its
+    # own filing-date partition. Reading only the window would report fewer rows
+    # than the run wrote. For the scraper path the union is a no-op, because its
+    # candidates come from per-filing-date prefixes.
+    #
+    # No row-level date filter: _write_document_partitions groups on the date
+    # column, so every row in date=D/shard=S has date D, and the partition
+    # selection is already exact.
+    read_paths = sorted(
+        set(
+            iter_date_shard_partitions(
+                config.dataset_name,
+                artifact_root=output_root,
+                start_date=config.start_date,
+                end_date=config.end_date,
+            )
         )
-    ]
-    updated = (
-        pd.concat(window_frames, ignore_index=True)
+        | document_partitions_written
+    )
+    window_frames = [read_table(path, DOCUMENT_COLUMNS) for path in read_paths]
+    filtered_updated = (
+        pd.concat(window_frames, ignore_index=True).reset_index(drop=True)
         if window_frames
         else pd.DataFrame(columns=DOCUMENT_COLUMNS)
     )
-    filtered_updated = updated.loc[
-        updated["date"].between(
-            config.start_date.isoformat(),
-            config.end_date.isoformat(),
-        )
-    ].reset_index(drop=True)
     write_json_artifact(
         run_manifest,
         {

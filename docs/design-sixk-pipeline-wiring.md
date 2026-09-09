@@ -244,10 +244,28 @@ promotes it to `src/cdt/sixk/edgar.py` and points it at
 right-anchored `FILING_RE` (the columns are not aligned):
 
 - daily runs → `https://www.sec.gov/Archives/edgar/daily-index/{yyyy}/QTR{n}/form.{yyyymmdd}.idx`
-- backfills → `https://www.sec.gov/Archives/edgar/full-index/{yyyy}/QTR{n}/form.idx` (or the `.zip`)
+  (verified: 800 KB, 147 6-K rows on 2026-09-08)
+- backfills → `https://www.sec.gov/Archives/edgar/full-index/{yyyy}/QTR{n}/form.idx`
+  (verified: 55 MB for one quarter — big enough that it is fetched out of band
+  and passed in as `--index-file` rather than downloaded per run)
 
-Volume for sizing: 7,640 `6-K`+`6-K/A` rows in 2026 QTR2, i.e. ~120 per business
-day across all filers.
+Two things the live indexes taught, neither visible from the harness (which only
+ever read a quarterly index from disk):
+
+- **The two flavours spell the date differently.** The quarterly index writes
+  `2026-04-29`; the daily index writes `20260908`. The harness's regex accepts
+  only the first, so against a daily index it matches nothing at all — 147 of
+  147 rows dropped, no error.
+- **A daily index is a dissemination feed, not a filing-date bucket.** The
+  2026-09-08 index lists filings dated 2026-09-04. So the daily path must not
+  filter rows by the run's date range: the run for the 4th has already happened
+  and its own index did not list them yet, which is #90's failure mode. Each row
+  is written to the partition for its own filing date, and the run's read-back
+  is the union of its date window and the partitions it wrote, so the summary
+  count matches what landed.
+
+Volume for sizing: 7,640 `6-K`+`6-K/A` rows in 2026 QTR2, i.e. ~120-150 per
+business day across all filers.
 
 **Body.** `https://www.sec.gov/Archives/edgar/data/{cik}/{accession_nodashes}/{accession}.txt`
 — the complete submission, the same object the scraper would have stored.
