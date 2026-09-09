@@ -34,6 +34,7 @@ import pandas as pd
 from cdt import settings
 from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
 from cdt.datasets import (
+    SIXK_SNIPPET_DATASET_NAME,
     CompletedPartition,
     completion_registry_path,
     dataset_root,
@@ -62,7 +63,6 @@ from cdt.storage import read_table, write_json_artifact, write_partition_table
 LOGGER = get_logger(__name__)
 
 STAGE_NAME = "sixk"
-SIXK_SNIPPET_DATASET_NAME = "sixk-snippets"
 #: How many filings' stage-2 calls are in flight at once. One call per filing,
 #: so this bounds provider concurrency for the whole stage.
 DEFAULT_CONCURRENCY = 4

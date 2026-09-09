@@ -415,6 +415,27 @@ window is a scoring set for the generalization eval
 (`commercial-debt-tracker-models/genwindow_eval/PLAN.md`) and iterating against
 it burns it.
 
+### Phase-4 checkpoint result (2026-09-09)
+
+Ran end to end on real filings from 2026-09-08: EDGAR → mirror → windows →
+stage 1 → stage 2 → `sixk-snippets` → extract → `mentions` → match →
+`debt-instruments`. Extraction was scoped to two partitions to keep spend to
+pennies.
+
+- Ecopetrol's bondholders'-meeting filing produced 2 mentions from one window,
+  which the matcher consolidated into one instrument. The whole path works with
+  no genre-specific code below the triage stage.
+- Canaan's kept window (an earnings release) extracted to nothing, terminating
+  SUCCESS. Correct: a stage-1/stage-2 false positive costs one extraction and
+  produces no rows, which is the trade the imprecise stage 1 is chosen for.
+
+Two quality observations, neither in this phase's scope. The Ecopetrol
+instrument came out named `bond issuances made in 2010 and 2013` with no
+amount, from a filing that announces a *meeting* of bondholders rather than an
+issuance — and the same instrument was emitted twice from one window. Both are
+`dev`'s extractor prompts, which `pre-beta-schema-update` reworks; they are not
+6-K-specific.
+
 ## Decisions taken
 
 1. **CIK universe: the deployed `CDT_DEFAULT_CIK_FILE`, with a `--sixk-cik-file`
