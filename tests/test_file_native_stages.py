@@ -2150,7 +2150,7 @@ def test_instrument_ie_prompt_requires_one_object_per_class() -> None:
     """The IE prompt must keep telling the model to split multi-class offerings."""
     prompt = load_prompt("instrument_ie")
 
-    assert "one object per class, tranche, or series" in prompt
+    assert "Each class, tranche, or series of an offering" in prompt
     assert "Class A-1" in prompt
 
 

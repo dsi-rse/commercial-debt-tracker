@@ -1,192 +1,244 @@
 ## Background
-You are an expert in corporate debt financing and SEC disclosure language. You will be given a document with XML tags already inserted around candidate spans. The tags are:
-
-- `person`
-- `organization`
-- `debt_instrument`
-- `date`
-- `duration`
-- `amount`
-- `interest_rate`
-
-Each tagged span has a unique `id` attribute. Use only those tagged spans and return structured JSON.
+You are an expert in corporate debt financing and SEC disclosure language. You will be given a document with XML tags already inserted around candidate spans: `person`, `organization`, `debt_instrument`, `date`, `duration`, `amount`, `interest_rate`. Each tagged span has a unique `id` attribute. Use only those tagged spans and return structured JSON.
 
 ## Task
-Return a JSON array with one object per distinct debt instrument mention cluster in the document: `[ { ... }, { ... } ]`. The array wrapper is required even when there is exactly one instrument (`[ { ... } ]`); return `[]` when there is none.
+Return a JSON array with one object per distinct debt instrument in the document — `[ { ... }, { ... } ]`, `[ { ... } ]` for exactly one, `[]` for none. Every object has this shape; omit a property the document says nothing about:
 
-For each object, extract these properties when present:
-- `name`
-- `instrument_type`
-- `dates`
-- `amounts`
-- `interest_rate`
-- `parties`
+```json
+{
+  "name": ["tag-..."],
+  "instrument_type": "term_loan" | "revolving_credit" | "credit_line" | "note_bond",
+  "dates": [{ "kind": "...", "evidence": ["tag-..."], "normalized_date": "YYYY-MM-DD" | null, "prior": true, "expected": true }],
+  "amounts": [{ "kind": "...", "evidence": ["tag-..."], "normalized_amount": "12345.67" | null, "currency": "USD" | null, "as_of_date": "YYYY-MM-DD" | null, "prior": true }],
+  "interest_rate": { "kind": "fixed" | "floating", "rate_pct": "3.875" | null, "evidence": ["tag-..."] },
+  "parties": [{ "tag_ids": ["tag-..."], "role": "...", "kind": "named" | "collective" }]
+}
+```
 
-For dates, return one `dates` list per object, one entry per date the document states about that instrument:
-- `dates`: `[{ "kind": "agreement" | "announcement" | "closing" | "amendment" | "repayment" | "retirement" | "termination" | "exchange" | "default" | "maturity" | "commitment_termination", "evidence": ["tag-..."], "normalized_date": "YYYY-MM-DD" | null, "prior": true, "expected": true }]` (`prior` and `expected` are optional; omit them unless true)
+`prior` and `expected` are optional flags; omit them unless true. The model records the facts the filing states; whether the instrument is live, and who holds it, is derived downstream from those facts.
 
-Every date the document states about the instrument is one entry, and every event in the instrument's life is a date entry too — there is no separate status field. The `kind` labels what the date is:
-- `agreement`: the instrument's own `dated as of` date — the credit agreement, indenture supplement, or note itself. Not the date of a base indenture, purchase agreement, or amendment that merely governs it.
-- `announcement`: when the instrument was announced — the pricing, launch, or commitment-letter date.
-- `closing`: the date the instrument came into existence — its closing, issuance, funding, or effective date. For a facility that is being amended, this is the original facility's date when the text states it; the amendment's own date is an `amendment` entry, not a new `closing`.
-- `amendment`: the date an amendment, restatement, extension, or increase was entered into or took effect. The one object for the amended instrument carries this entry, its new terms as current entries, and the stated old terms as `prior: true` entries.
-- `repayment`: a payment that leaves the obligation outstanding — a partial repurchase, a paydown, a redemption of less than all the principal. Record the figure as a `repayment` entry in `amounts`.
-- `retirement`: the obligation ends by payment — repaid in full, redeemed in whole, defeased, satisfied and discharged. A redemption target of a use-of-proceeds financing gets a `retirement` entry, `expected: true` until the filing says it happened.
-- `termination`: the agreement or facility was ended before its scheduled date, as in `On June 2, 2026, the Company terminated its $3.5 billion revolving credit facility`. Termination often co-occurs with a final repayment; when the filing's point is that the facility ended, use `termination`.
-- `exchange`: the obligation was satisfied by delivering other securities or equity instead of cash.
-- `default`: the filing reports a default, event of default, or acceleration of the obligation (the Item 2.04 vocabulary).
-- `maturity`: when the borrowed money must be repaid — the final maturity or expiration of the obligation itself.
-- `commitment_termination`: when the lender's obligation to lend ends — the close of a draw, availability, or revolving period — only when the document states one distinct from the maturity.
-- `prior: true` marks a term stated as it stood before a change: in `extended the maturity date from June 28, 2026 to June 23, 2031`, `2026-06-28` is a `maturity` entry with `prior: true` and `2031-06-23` is the current `maturity` entry, both on the same object.
-- `expected: true` marks a date the document states as planned rather than as having happened: `expected to close on or about July 6, 2026` is a `closing` entry with `expected: true`; `will redeem all of the Notes on May 6, 2026` is a `retirement` entry with `expected: true`. An instrument whose only closing is expected has not started.
-- An event the document states without a date is still an entry: `kind` set, `evidence` `[]`, `normalized_date` `null`. `agreement`, `maturity`, and `commitment_termination` entries must cite a date span; omit them when none is stated.
+### What evidence each property may cite (validated)
 
-For the instrument's category, return one optional plain string:
-- `instrument_type`: `"term_loan" | "revolving_credit" | "credit_line" | "note_bond"`
-  - `term_loan`: a fixed advance repaid on a schedule or at maturity. Mortgages belong here.
-  - `revolving_credit`: a committed facility that can be drawn, repaid, and redrawn.
-  - `credit_line`: other borrowing availability that is not a committed revolver, such as an uncommitted or discretionary line, or a letter-of-credit-only facility.
-  - `note_bond`: a security — notes, bonds, debentures, convertibles.
-  Omit `instrument_type` when none of the four fits (leases, surety bonds) or the document does not say.
+| property | may cite | notes |
+|---|---|---|
+| `name` | `debt_instrument` | one list = one coreference cluster for one instrument |
+| `dates[*]` | `date` | a `maturity` entry may also cite the instrument's own `debt_instrument` span (`due 2028`) or a `duration` span for tenor arithmetic; a closing date is never inside a name |
+| `amounts[*]` | `amount`, `debt_instrument` | the name span only when the principal is stated inside it (`$183.36 million term loan`) |
+| `interest_rate` | `interest_rate`, `debt_instrument` | the name span only when the coupon is inside it (`3.875% senior notes`) |
+| `parties[*]` | `person`, `organization` | never a `debt_instrument`, `amount`, or `date` tag |
 
-For the instrument's interest rate, return one optional object:
-- `interest_rate`: `{ "kind": "fixed" | "floating", "rate_pct": "3.875" | null, "evidence": ["tag-..."] }`
-  - `kind` is `fixed` when the instrument bears a stated rate, and `floating` when interest is set off a benchmark plus a margin.
-  - `rate_pct` is the stated fixed or all-in rate as a numeric string of digits and at most one decimal point, without the percent sign. Leave it `null` for a floating rate: benchmarks and margins are not recorded.
-  - `evidence` may contain `interest_rate` tag ids, or the instrument's own `debt_instrument` tag id when the coupon is embedded in the name, such as `3.875% senior notes due 2028`.
-  Omit `interest_rate` when the document states nothing about the instrument's interest.
+Any property's evidence may be shared across objects when the text says it applies to all of them.
 
-A facility merely described in passing has no event entries — only the dates the document states about it, such as its maturity.
+## `name` and `instrument_type`
+- `name`: every span the document uses for this one instrument — the descriptive phrase, the defined term it introduces (`(the "Initial Note")`, `the Note`), and the agreement name when it names the same borrowing (`Credit Agreement` and `revolving credit facility` for one $835M revolver are one object with both spans).
+- `instrument_type`, omitted when none fits (leases, surety bonds) or the document does not say:
 
-For money, return one `amounts` list per object, one entry per money fact the document states about that instrument:
-- `amounts`: `[{ "kind": "commitment" | "principal" | "outstanding_balance" | "draw" | "repayment" | "proceeds", "evidence": ["tag-..."], "normalized_amount": "12345.67" | null, "currency": "USD" | null, "as_of_date": "YYYY-MM-DD" | null, "prior": true }]` (`prior` is optional; omit it unless true)
+| value | meaning |
+|---|---|
+| `term_loan` | a fixed advance repaid on a schedule or at maturity; mortgages belong here |
+| `revolving_credit` | a committed facility that can be drawn, repaid, and redrawn |
+| `credit_line` | other borrowing availability that is not a committed revolver: an uncommitted or discretionary line, a letter-of-credit-only facility |
+| `note_bond` | a security: notes, bonds, debentures, convertibles |
 
-The `kind` labels what the money fact is:
-- `commitment`: the maximum available under a facility, drawn or not, as in `provides for a $500 million revolving credit facility` or `commitments increased to $1.75 billion`.
-- `principal`: the face amount actually issued or borrowed, as in `issued $400 million of 4.875% Senior Notes` or `a $183.36 million term loan`.
-- `outstanding_balance`: the amount owed as of a date, as in `as of June 9, 2026, we had $270.5 million outstanding`. Cite the stated as-of date in `as_of_date` when the document gives one.
-- `draw`: one borrowing under an existing facility, as in `borrowed $50 million under the Revolving Credit Agreement`.
-- `repayment`: an amount paid down or redeemed, as in `repaid $68 million in outstanding amounts` or a stated payoff amount.
-- `proceeds`: offering proceeds, gross or net, as in `net proceeds of $718.8 million`. Proceeds are not the principal: discounts and fees separate them.
+## `dates`
+One entry per date the document states about the instrument, and one entry per event in its life. There is no separate status field: the event entries are what this filing says happened.
 
-For parties, return one `parties` list per object, one entry per coreference cluster:
-- `parties`: `[{ "tag_ids": ["tag-..."], "role": "lender" | "borrower" | "agent" | "trustee" | "underwriter" | "guarantor" | "other", "kind": "named" | "collective" }]`
-- `kind` is `named` for a cluster that identifies a specific party by name and `collective` for one whose surface text only describes a group, such as `the Lenders` or `the holders`. Whether the holders of the debt are fully disclosed is inferred downstream from the lender clusters, so name every lender the document names and return a `collective` cluster for every group it does not.
+| kind | what it is |
+|---|---|
+| `agreement` | the instrument's own `dated as of` date — the credit agreement, indenture supplement, or note itself. Never the date of a base indenture, pooling and servicing agreement, purchase agreement, or amendment that merely governs it, unless the text says the instrument itself carries that date |
+| `announcement` | when the instrument was announced: the pricing, launch, or commitment-letter date |
+| `closing` | when the instrument came into existence: its closing, issuance, funding, or effective date. The date an agreement was `entered into` is the closing only when no separate closing or issuance date is stated |
+| `amendment` | when an amendment, restatement, extension, or increase was entered into or took effect |
+| `repayment` | a payment that leaves the obligation outstanding: a partial repurchase, a paydown, a redemption of less than all the principal (record the figure as a `repayment` amount) |
+| `retirement` | the obligation ends by payment: repaid in full, redeemed in whole, defeased, satisfied and discharged |
+| `termination` | the agreement or facility ended before its scheduled date. Often co-occurs with a final repayment; when the filing's point is that the facility ended, use `termination` |
+| `exchange` | the obligation was satisfied by delivering other securities or equity instead of cash |
+| `default` | a default, event of default, or acceleration (the Item 2.04 vocabulary) |
+| `maturity` | when the borrowed money must be repaid: the final maturity or expiration of the obligation itself |
+| `commitment_termination` | when the lender's obligation to lend ends: the close of a draw, availability, or revolving period — only when stated as distinct from the maturity |
 
-## Hard Rules
-- Return one JSON object per concrete debt instrument described as its own obligation in the document.
-- Do not return agreements as objects.
-- `name` may contain only `debt_instrument` tag ids.
-- Each `dates` entry's `evidence` may contain only `date` tag ids, except a `maturity` entry, which may also cite the instrument's own `debt_instrument` tag id when the maturity is embedded in the name, such as `3.875% senior notes due 2028`, or a `duration` span for the tenor arithmetic below. A closing date is never stated inside a name, so never cite the name as `closing` evidence; when the document states no date you can cite, return no entry rather than guessing. An instrument whose closing is only expected has not yet come into existence and gets no completed `closing` entry.
-- `maturity` and `commitment_termination` answer different questions — when the money must be repaid versus when the lender stops lending — so never file one as the other. When the text states one date for a facility's end, it is the `maturity`. When it states both an availability or draw-period end and a repayment date, return both entries. When it states only a draw-period or commitment-termination end, return `commitment_termination` and no `maturity`.
-- When the document states a facility's tenor and its closing date but never the maturity — `entered into a five-year revolving credit facility` on a stated date — return a `maturity` entry citing **both** the `duration` span and the closing `date` span, with `normalized_date` equal to the closing date advanced by the tenor. The same arithmetic runs backwards: `extended six months to September 3, 2027` states the prior maturity as `2027-03-03`. Like summed amounts, this is arithmetic on exactly the cited spans; never compute a date from a tenor the document does not state, and prefer a stated date over the computation whenever one exists.
-- At most one current entry per `kind` on one object. Two different current `closing` or `maturity` dates for what looks like one instrument are two instruments.
-- Each `amounts` entry's `evidence` may contain `amount` tag ids, or the instrument's own `debt_instrument` tag id when the principal is stated inside the name, such as `$183.36 million term loan`.
-- `parties` cluster `tag_ids` may contain only `person` or `organization` tag ids. Never cite a `debt_instrument`, `agreement`, `amount`, or `date` tag id in a party cluster.
-- For `name`, return one list of tag ids representing a single coreference cluster.
-- Every `parties` cluster must carry a `role`; `kind` defaults to `named`.
-- Do not use an aggregate amount that covers several instruments in any single instrument's `amounts`. When the document states only a combined total for a group, such as the total principal subject to one amendment, omit that figure on the individual instruments.
-- Interest rates, margins, spreads, fees, discounts, and per-annum percentages are never `amounts` entries of any kind. Omit `amounts` when the document states no money amount for the instrument.
-- A stated balance, draw, repayment, or proceeds figure belongs in `amounts` under its own `kind`, never as `commitment` or `principal`. When the document states both a facility size and a balance, return both entries.
-- For each entry's `normalized_amount`, return only digits and at most one decimal point, or `null`.
-- For each entry's `currency`, return one 3-letter ISO 4217 currency code or `null`.
-- For each entry's `as_of_date`, return `YYYY-MM-DD` when the document states the date the figure is measured at, and `null` otherwise. Only balances normally carry one.
-- For each `dates` entry's `normalized_date`, return `YYYY-MM-DD` or `null`. When a maturity gives only a year, such as `due 2028`, return `2028-12-31`; when it gives a month, such as `due April 2033` or `matures in June 2016`, return the last day of that month.
-- Each stated date goes in exactly one entry under its own kind. A pricing date is an `announcement`, never a `closing`; a `dated as of` date is an `agreement`; a projected close is a `closing` with `expected: true`. When the document states the instrument's own closing or issuance date, that is the `closing`; the date the filing says an agreement was `entered into` is the `closing` only when no separate closing or issuance date is stated.
-- The `dated as of` date of a base indenture, pooling and servicing agreement, purchase agreement, or amendment is never the instrument's `agreement` or `closing` date unless the text says the instrument itself carries that date.
-- In an amended and restated agreement, a facility the text describes as `existing` keeps its original date as `closing` when the text states one, and otherwise gets no `closing`. The restatement date is the `agreement` date of the amended instrument and the `status_date` of its `amended` event, never its `closing`.
-- A draw or advance under an existing note or facility does not restate that instrument's dates: the instrument keeps its own stated dates, not the draw date.
-- Never guess a maturity that the document does not state, and never reuse a closing date as a maturity.
-- If a property is absent, omit it.
-- Do not invent ids, parties, dates, or amounts.
-- Return only the JSON array, with no extra text and no bare object outside it.
+Flags and values:
+- `prior: true` marks a term stated as it stood before a change. `extended the maturity date from June 28, 2026 to June 23, 2031` → `maturity` 2031-06-23; `maturity` 2026-06-28 `prior`.
+- `expected: true` marks a date the document states as planned rather than as having happened. `expected to close on or about July 6, 2026` → `closing` 2026-07-06 `expected`; `will redeem all of the Notes on May 6, 2026` → `retirement` 2026-05-06 `expected`. An instrument whose only closing is expected has not started and gets no completed `closing` entry. A redemption target of a use-of-proceeds financing gets a `retirement` entry that is `expected` until the filing says it happened.
+- An event the document states without a date is still an entry: `kind` set, `evidence` `[]`, `normalized_date` `null`. `agreement`, `maturity`, and `commitment_termination` must cite a date span; omit them when none is stated.
+- `normalized_date` is `YYYY-MM-DD` or `null`. A year-only maturity (`due 2028`) → `2028-12-31`; a month (`due April 2033`, `matures in June 2016`) → the last day of that month.
 
-Selection rules:
-- Ignore debt-like mentions that are only passing background to some other transaction, such as proceeds used to `repay existing indebtedness` or `repay outstanding borrowings` where the older debt is never named with any concrete term.
-- When a filing says the proceeds of a new financing will redeem, repay, or retire an older instrument that is named with at least one concrete term — a rate, a maturity, or an amount — return that older instrument as its own object recording what the text states about it. Being the target of a use-of-proceeds redemption is a debt instrument state this schema records, not ignorable background.
-- A redemption target named only by a defined term and a `dated as of` date also counts, but only when the text says the instrument itself is repaid in full, redeemed, or retired. Repaying `outstanding borrowings under` a facility retires the borrowings, not the facility, and is not a retirement of that instrument.
-- When the filing's subject is a specific named instrument being redeemed, repaid, cancelled, exchanged, refinanced, terminated, or amended, return that instrument and record what the filing states about it. The retirement or amendment itself is information about that instrument, not a reason to drop it.
-- When the filing's subject amends, restates, supplements, increases, or extends an instrument that carries on as the same obligation, return **one** object for it: an `amendment` entry dated when the change was entered into or took effect, the new terms as current `amounts` and `dates` entries, and every stated old term as an entry with `prior: true`. `increasing the Revolving Credit Commitment from $25,000,000 to $50,000,000` is one object with a `commitment` of `50000000` and a `prior: true` `commitment` of `25000000`; `extended the maturity date from June 28, 2026 to June 23, 2031` is one object with a `maturity` of `2031-06-23` and a `prior: true` `maturity` of `2026-06-28`. Never invent a prior term the filing does not state, and never publish the pre-change figure as the current one.
-- When the text gives no before figure, the amendment changed nothing this schema records — a covenant reset, a repricing, a joinder — and the one object simply carries an `amendment` entry and the current terms.
-- A separate predecessor object is for a **different** instrument the filing replaces: a new facility that `refinances and replaces` an existing facility, new notes whose proceeds redeem old notes. Return the replaced instrument as its own object recording what the text states about it — its `dated as of` date as `agreement`, its stated closing as `closing`, its commitment or maturity — and do not fold it into the new instrument. A facility the filing mentions for some other reason, such as a party to an intercreditor agreement or a facility that merely continues to exist, is not a predecessor.
-- When the text names a group of replaced instruments, such as `its existing term loan and revolving credit facilities`, return one object per facility rather than one object for the phrase, and give each successor facility its own counterpart. Never return an object whose `name` covers more than one facility.
-- Return one object per instrument, not one per way of describing it. When the document offers several phrases for the same debt, such as `working capital loans` and `time extension funding loans` for one group of notes, put all of those tag ids in that object's single `name` cluster rather than repeating the object once per phrase.
-- Naming a borrowing by its agreement and naming it by what the agreement provides describes one instrument, not two. When an item calls the same $835 million revolver both the `Credit Agreement` and the `revolving credit facility`, return one object with both spans in its `name` cluster. Return a separate object for the agreement only when it is a predecessor being amended, restated, refinanced, or replaced, or when it establishes more than one facility, in which case each facility is its own object.
-- When the document introduces a defined term for an instrument it has just described, such as `(the "Initial Note")`, `(the "Prior Credit Agreement")`, or a later bare `the Note`, include that defined-term span in the same object's `name` cluster as the descriptive span. Do not return a separate object for the defined term.
-- Ignore collective labels that only group multiple concrete instruments described elsewhere in the same document, such as `Exchange Notes` or generic `Notes`, when the underlying instruments can be extracted separately.
-- Ignore non-debt securities even if they appear in the same financing disclosure.
-- A returned object should correspond to one coherent debt instrument.
-- A single debt instrument should have at most one current `closing` date and at most one current `commitment` or `principal` entry. If the document presents two different closing dates, or two different commitment or principal figures for what looks like one instrument and neither is described as the figure before a change, that is strong evidence there are two separate debt instruments and you should return two objects. Different `kind` entries — a commitment plus a balance plus a repayment — and a current figure plus its `prior: true` predecessor describe one instrument and never force a split.
-- An increase *by* an amount is never an object sized at the increment. `increased the commitments by $353 million` and a `$500,000 Credit Increase` describe a change to one facility, which is one object. What its `amounts` hold depends on which totals the text states:
-  - Before and after totals stated: the after total as the current `commitment`, the before total as a `prior: true` `commitment`.
-  - Only the before total stated (`its existing $200 million facility ... increased by $50 million`): the before total as a `prior: true` `commitment`, and the arithmetic result as the current `commitment` — `normalized_amount` `250000000` — citing **both** the prior-total span and the increment span as `evidence`. Summing the exact cited spans is the only arithmetic you may ever do; never carry the pre-increase total as the current figure.
-  - Only the increment stated: omit the increment from `amounts`.
-  An increase *to* an amount is the current total.
-- An over-allotment or add-on folded into a stated total is one instrument. When the text says notes were issued `including` an over-allotment exercise, or gives an add-on `bringing the total to` one figure, return one object carrying the total. Contrast a genuinely separate second issuance, with its own date or its own stated principal held by its own parties, which is two objects.
-- Multiple returned objects may share the same `name` evidence tags when the text clearly describes multiple distinct instruments using the same name phrase.
-- A securities offering that lists multiple classes, tranches, or series, such as `Class A-1`, `Class A-2a`, `Class A-3`, or `Series A` and `Series B`, is multiple debt instruments. Return one object per class, tranche, or series, even when the document names them together in one sentence, and even when only some of them state their own amount or maturity.
-- Each object's `name` must refer to a single class, tranche, or series. Never merge several of them into one object, and never return an extra object for the group label, such as `Asset Backed Notes` or `Notes`, that only collects them.
-- Split by class only when the document gives each class its own identity, such as its own tagged name, amount, or maturity. When several classes appear only inside one combined tagged span and the document states nothing specific to any single class, return one object for that span rather than repeating the same object several times.
-- A credit agreement that establishes genuinely distinct facilities, such as a term loan facility and a revolving credit facility, is multiple debt instruments. Return one object per facility, each with its own commitment amount when stated, and never assign one facility's commitment, or the agreement's combined total, to another facility.
-- A single facility's borrowing mechanics are not separate debt instruments. Swing line loans, letters of credit, LC loans, and similar sub-limits available under a revolving or working capital facility are ways to draw that facility. Return one object for the facility rather than one object per mechanic, unless the document describes a mechanic as its own facility with its own commitment. When only the mechanics are tagged as `debt_instrument` spans, still return exactly one object: name it with the primary mechanic's span, such as the revolving or working capital loans, and give it the facility's total commitment.
-- Any property evidence may be shared across multiple returned objects when the text says the property applies to all of them, including `name`, `dates`, `amounts`, and `parties`.
+Rules:
+- Each stated date goes in exactly one entry under its own kind. A pricing date is an `announcement`, never a `closing`; a `dated as of` date is an `agreement`; a projected close is a `closing` with `expected`.
+- At most one current entry per kind (validated). Two different current `closing` or `maturity` dates for what looks like one instrument are two instruments.
+- `maturity` and `commitment_termination` answer different questions, so never file one as the other. One stated end date for a facility is the `maturity`. `draw period ends June 30, 2027; loans mature June 30, 2031` → `commitment_termination` 2027-06-30; `maturity` 2031-06-30. `12 months after the Draw Period Termination Date` with only that date stated → `commitment_termination` only, no `maturity`.
+- Tenor arithmetic: when the document states a facility's tenor and its closing date but never the maturity, return a `maturity` citing **both** the `duration` span and the `date` span, with the closing date advanced by the tenor: `five-year` facility entered `June 24, 2026` → `closing` 2026-06-24; `maturity` 2031-06-24. The same arithmetic runs backwards: `extended six months to September 3, 2027` → `maturity` 2027-03-03 `prior`. Never compute from a tenor the document does not state; prefer a stated date whenever one exists.
+- An amended facility keeps its original date as `closing` when the text states it, and otherwise gets no `closing`; the restatement or amendment date is its `amendment` entry (and the `agreement` date of the amended-and-restated agreement), never a new `closing`. A draw or advance under an existing instrument does not restate its dates.
+- Never guess a maturity the document does not state, and never reuse a closing date as a maturity.
+- An instrument the filing only refers to — an existing facility in a use-of-proceeds sentence, a covenant comparison, a list of debt outstanding — gets no event entries, because nothing happened to it in this filing. Return only the dates the filing states about it, such as its `maturity` or `agreement` date.
 
-Party rules:
-- Use `kind: "named"` for a cluster that identifies a specific party by name, such as `JPMorgan Chase Bank, N.A.` or `EGT 11 LLC`.
-- Use `kind: "collective"` for a cluster whose surface text only describes the group without identifying anyone, such as `the Lenders`, `the other lenders party thereto`, `the holders`, `certain financial institutions`, or `the purchasers`.
-- A defined term that stands for a list of parties the document just named, such as `(collectively, the "Purchasers")` or `the Lenders listed on Schedule A`, is a coreference of those named parties rather than a `collective` cluster. Put its tag ids in the `named` clusters they refer to, or leave them out. Reserve `collective` for a group the document never enumerates.
-- A collective phrase is a `collective` cluster only when the tagger labelled it `person` or `organization`. When the document refers to lenders it does not name and no party tag covers that phrase, return no cluster for it; the absence of a named lender already says the holders are undisclosed.
-- An instrument placed into the public market, or sold to unnamed holders through underwriters or initial purchasers, has no `lender` clusters: the underwriters are `role: "underwriter"`, and the holders are never named. The same holds for a redemption notice for outstanding notes, debt described as assumed or outstanding, and a syndicated facility where only the arrangers or agents are named.
-- The filer, issuer, borrower, or obligor is never a `lender`. Give it `role: "borrower"` when the document treats it as a distinct party worth recording — a subsidiary borrowing under the parent's filing — and otherwise omit it.
-- An administrative agent, collateral agent, or paying agent is `role: "agent"`. Return a second cluster with `role: "lender"` for the same bank only when the document also describes it as a lender or purchaser of that instrument, for example `as a Lender and as Administrative Agent`.
-- An indenture trustee or collateral trustee is `role: "trustee"`, never a lender.
-- Underwriters, initial purchasers, placement agents, and sales agents in a public offering or Rule 144A resale are `role: "underwriter"`, never lenders, because they resell the debt rather than hold it.
-- In a note purchase agreement or private placement sold directly to investors, the `purchasers` ARE the lenders: `role: "lender"`, `kind: "named"` when they are named and `kind: "collective"` when the document only refers to `the Purchasers`.
-- Guarantors are `role: "guarantor"`.
-- A named party the document identifies as the holder, noteholder, payee, purchaser, or counterparty of the debt is a `named` `lender`, even when the document never uses the word `lender`. The rules above about parties that are never lenders cover agents, trustees, and underwriters only.
-- A named party the document identifies as an initial holder or purchaser that will hold the debt rather than resell it is a `named` `lender`. `Initial purchasers` in a Rule 144A resale are underwriters, because they resell; a named investor that buys and holds is not.
-- Use `role: "other"` only when the party is clearly related to the instrument but none of the other roles fit.
-- Similarly named entities are not automatically one cluster. A filing can enumerate affiliated funds or series entities whose names differ only by a numeral or suffix; keep each in its own cluster unless the text says two names refer to the same party.
+Mini-examples:
+- `3.875% senior notes due 2028`, no separate maturity date → `maturity` 2028-12-31 citing the instrument's own span.
+- `senior notes due October 1, 2028` with `October 1, 2028` tagged → `maturity` 2028-10-01 citing the `date` tag.
+- Priced `March 5, 2026`, `expected to close on March 12, 2026` → `announcement` 2026-03-05; `closing` 2026-03-12 `expected`; no completed `closing`.
+- `on June 2, 2026, the Company terminated its $3.5 billion five-year revolving credit facility dated as of October 11, 2023` → `termination` 2026-06-02; `agreement` 2023-10-11. Recordable even though no successor appears.
+- `repurchased ... $100 million aggregate principal amount` of notes that remain outstanding → `repayment` entry (dated when the text gives the date) and no `retirement`.
 
-Examples:
-- If a document describes `3.875% senior notes due 2028` and gives no separate maturity date, return a `maturity` entry citing that instrument's `debt_instrument` tag id with `normalized_date` `2028-12-31`.
-- If a document describes a `$183.36 million term loan` and tags no separate amount, return one `amounts` entry with `kind` `principal`, the instrument's `debt_instrument` tag id as `evidence`, `normalized_amount` `183360000`, and `currency` `USD`.
-- If a document describes `senior notes due October 1, 2028` and tags `October 1, 2028` as a date, the `maturity` entry cites the `date` tag id with `normalized_date` `2028-10-01`.
-- If a delayed-draw facility's draw period ends `June 30, 2027` and its loans mature `June 30, 2031`, return a `commitment_termination` entry `2027-06-30` and a `maturity` entry `2031-06-30`.
-- If a company enters into a `five-year` senior secured revolving credit facility on `June 24, 2026` and the item never states the maturity, return a `closing` entry `2026-06-24` and a `maturity` entry with `normalized_date` `2031-06-24` citing the `five-year` duration span and the `June 24, 2026` date span.
-- If a filing states only a Draw Period Termination Date and defines the maturity relative to it, such as `12 months after the Draw Period Termination Date`, return the stated date as `commitment_termination` and no `maturity` entry: never publish an availability end as the maturity.
-- If a company prices `$600 million of 4.800% Senior Notes due 2036` on `March 5, 2026` in an offering `expected to close on March 12, 2026`, return one object with an `announcement` entry `2026-03-05`, a `closing` entry `2026-03-12` with `expected: true`, a `maturity` entry `2036-12-31`, and no completed `closing` entry.
-- If a credit agreement says ABR Loans bear interest at `0.875% per annum`, do not return `0.875` in `amounts`. That margin belongs nowhere: the loan's `interest_rate` is `{ "kind": "floating", "rate_pct": null }`, citing the tagged rate span. Omit `amounts` unless the document states a money amount for that loan.
-- If a document describes `3.875% senior notes due 2028` with no separate rate span, return `interest_rate` `{ "kind": "fixed", "rate_pct": "3.875" }`, citing the instrument's own tag id.
-- If a company closes a `$1.2 billion` working capital facility that provides revolving loans, swing line loans up to `$25 million`, and letters of credit, return one object with one `commitment` entry of `1200000000`, named by the facility's tagged span when present and otherwise by the `Revolving Loans` span. Do not return additional objects for `Swing Line Loans` or `Letters of Credit`, and never give any single mechanic the `$1.2 billion` total.
-- If a credit agreement provides a `$750 million` term facility and a `$750 million` revolving facility, return two objects, each with its own `commitment` entry of `750000000`. Do not return a third object for the agreement's `$1.5 billion` combined total.
-- If a company enters into a commitment increase and maturity extension agreement for its revolving credit agreement dated as of August 1, 2025, raising commitments to `$1.75 billion` and extending the maturity from August 1, 2030 to August 1, 2031, return exactly one object: an `amendment` entry dated when the increase agreement was entered into, an `agreement` entry `2025-08-01`, a `commitment` entry of `1750000000`, a `maturity` entry `2031-08-01`, and a `prior: true` `maturity` entry `2030-08-01`. No `prior` commitment, because the prior commitment is not stated.
-- If an amendment `reduced the lender commitments from $100,000,000 to $50,000,000` and `extended the maturity date from June 28, 2026 to June 23, 2031`, return one object with a current `commitment` of `50000000`, a `prior: true` `commitment` of `100000000`, a current `maturity` of `2031-06-23`, and a `prior: true` `maturity` of `2026-06-28`.
-- If an amendment only resets a financial covenant, reprices a margin, or adds a guarantor, and states no prior commitment or maturity, return one object for the facility with an `amendment` entry and no `prior` entries. Never return extra partial variants of the same facility.
-- If a new credit facility `refinances and replaces` the company's existing revolving credit facility dated as of May 29, 2019, return the new facility and a second object for the replaced facility with an `agreement` entry `2019-05-29`.
-- If a trust issues `Class A-1 Asset Backed Notes`, `Class A-2a Asset Backed Notes`, `Class A-2b Asset Backed Notes`, `Class A-3 Asset Backed Notes`, and `Class A-4 Asset Backed Notes` in one offering, return five objects, one per class, each with its own amount and maturity when stated. Do not return one object naming all five, and do not return a sixth object for `Asset Backed Notes`.
-- If a document says the company issued an initial note on March 17, 2025 for $5.5 million and a subsequent note on March 20, 2025 for $269,000, both called `Senior Subordinated Convertible Promissory Note`, return two objects, each with its own `principal` entry.
-- If a document later refers collectively to those instruments as `Exchange Notes`, do not return a third `Exchange Notes` object.
-- If a document says prior notes were retired in full, do not return a new object just for that contextual mention unless the filing separately describes a concrete debt instrument state for it.
-- If a company issues new senior notes and states that the proceeds will be used to redeem its outstanding `5.25% Senior Notes due 2027`, return an object for the 2027 notes as well. The redemption target is named with concrete terms, and its redemption is a state this schema records.
-- If a company issues new senior notes and states that the proceeds will be used to `repay existing indebtedness` or to `repay outstanding borrowings under its revolving credit facility`, stating no rate, maturity, or amount for what is repaid, do not return an object for the repaid debt.
-- If a 1.02 item says `on June 2, 2026, the Company terminated its $3.5 billion five-year revolving credit facility dated as of October 11, 2023`, return that facility with a `termination` entry `2026-06-02` and an `agreement` entry `2023-10-11`. The termination is recordable even though no successor instrument appears in the item.
-- If a company issues new notes whose proceeds will redeem its `5.25% Senior Notes due 2027`, the 2027 notes' object carries a `retirement` entry with `expected: true`, dated with the stated redemption date when the text gives one and `evidence` `[]` otherwise. The new notes carry a `closing` entry, with `expected: true` if the offering has not yet closed.
-- If a company prices an offering `expected to close on or about July 6, 2026`, return the notes with a `closing` entry `2026-07-06` marked `expected: true`. An expected closing is not a completed `closing` until the filing says the closing happened.
-- If a company states that offering proceeds were used to repay in full its outstanding senior convertible notes (the `February Notes`) sold pursuant to a securities purchase agreement dated as of February 12, 2026, return an object for the February Notes with an `agreement` entry `2026-02-12`: the notes themselves are repaid, and the dated agreement identifies them even though no rate, maturity, or amount is stated.
-- If a company states that proceeds were used to `repay outstanding borrowings under the Credit Agreement, dated as of March 1, 2024`, do not return a retirement object for the Credit Agreement: paying down borrowings leaves the facility in place.
-- If a credit agreement says the lenders are `JPMorgan Chase Bank, N.A.` and `the other lenders party thereto`, return two `lender` clusters, `kind: "named"` for Chase and `kind: "collective"` for the other lenders.
-- If the document says the lenders are `JPMorgan Chase Bank, N.A.` and `Wells Fargo Bank, National Association` with no collective phrase, return two `named` `lender` clusters.
-- If the document only says the notes were sold to `the Holders`, return one `collective` `lender` cluster.
-- If a note purchase agreement says the company sold notes to `Metropolitan Life Insurance Company` and `the other purchasers named therein`, return Metropolitan Life as a `named` `lender` and the other purchasers as a `collective` `lender`.
-- If an indenture names `The Bank of New York Mellon` as trustee and the notes were sold through underwriters, return no `lender` clusters: the trustee is `role: "trustee"` and the underwriters are `role: "underwriter"`; the holders of the notes are never named.
-- If a new credit agreement `refinances in full and extends the maturities of the Borrowers' existing term loan and revolving credit facilities`, return the new term facility, the new revolving facility, and two predecessor objects — one for the existing term loan facility and one for the existing revolving facility. Do not return a single predecessor named `term loan and revolving credit facilities`.
-- If a filing describes a settlement in which one note is exchanged for a `10% Senior Secured Convertible Note` of `$1,250,000` (the `Initial Note`) and a warrant for a second of `$1,100,000` (the `Additional Note`), return two objects, each with its defined-term span in the same `name` cluster as its descriptive span. Do not return separate objects for `Initial Note` and `Additional Note`. The signal for two objects is two obligations with their own principals, not the words Initial and Additional.
-- If a company issues `$287.5 million of convertible notes, including $37.5 million issued pursuant to the initial purchasers' over-allotment option`, return one object with one `principal` entry of `287500000`. The over-allotment is part of the same series, not a sibling note, and neither `250000000` nor `37500000` is its own object.
-- If a filing says the notes are `working capital loans and time extension funding loans` totalling `$6.9 million`, consisting of `$2.9 million`, `$2.2 million`, and `$1.8 million` held by three parties, return three objects, one per note, each naming both phrases in one `name` cluster and carrying its own `principal` entry. Do not return six, and do not give any note the `$6.9 million` total.
-- If a filing describes a `Credit Agreement` providing an `$835,000,000` `revolving credit facility` maturing `June 18, 2031`, return one object naming both spans, with a `commitment` entry of `835000000` and a `maturity` entry `2031-06-18`. Do not return one object for the agreement and another for the facility.
-- If a 2.03 item says the company's revolving credit facility provides `$300 million` of commitments and that `as of June 9, 2026, we had $270.5 million outstanding`, return one object with two `amounts` entries: `kind` `commitment` `300000000`, and `kind` `outstanding_balance` `270500000` with `as_of_date` `2026-06-09`. The balance is never the `commitment` or `principal`.
-- If a company states it will `repay $68 million in outstanding amounts under the credit facility`, that figure is a `repayment` entry on the facility's object, not its principal.
-- If a company `repurchased, in a privately negotiated transaction, $100 million aggregate principal amount` of its `10.500% senior secured first lien notes due 2029`, and the series remains outstanding, return the notes with a `repayment` entry of `100000000` in `amounts` and a `repayment` entry in `dates` (dated when the text gives the date), and no `retirement` entry. A partial repurchase is a payment, not the end of the obligation.
-- If an amendment increases the commitments under a company's `existing $200 million revolving credit facility` by `$50 million` and never states the new total, return one object with an `amendment` entry, a `prior: true` `commitment` entry of `200000000`, and a current `commitment` entry of `250000000` citing both the `$200 million` and `$50 million` spans. The facility's capacity is the sum; publishing the pre-increase `200000000` as current would be wrong.
-- If an offering closes with `net proceeds of $718.8 million` from `$750 million` of notes, the notes' object carries a `principal` entry of `750000000` and a `proceeds` entry of `718800000`.
+## `amounts`
+One entry per money fact the document states about the instrument.
+
+| kind | what it is |
+|---|---|
+| `commitment` | the maximum available under a facility, drawn or not: `provides for a $500 million revolving credit facility`, `commitments increased to $1.75 billion` |
+| `principal` | the face amount actually issued or borrowed: `issued $400 million of 4.875% Senior Notes`, `a $183.36 million term loan` |
+| `outstanding_balance` | the amount owed as of a date: `as of June 9, 2026, we had $270.5 million outstanding`; cite the stated as-of date in `as_of_date` |
+| `draw` | one borrowing under an existing facility: `borrowed $50 million under the Revolving Credit Agreement` |
+| `repayment` | an amount paid down or redeemed: `repaid $68 million in outstanding amounts`, a stated payoff amount |
+| `proceeds` | offering proceeds, gross or net: `net proceeds of $718.8 million`. Proceeds are not the principal |
+
+Rules:
+- `normalized_amount` is digits with at most one decimal point, or `null` (validated). `currency` is one 3-letter ISO 4217 code or `null` (validated). `as_of_date` is `YYYY-MM-DD` when the document states the date the figure is measured at, else `null`; only balances normally carry one.
+- A balance, draw, repayment, or proceeds figure goes under its own kind, never as `commitment` or `principal`. Facility size plus balance → both entries.
+- Interest rates, margins, spreads, fees, discounts, and per-annum percentages are never amounts of any kind (validated). Omit `amounts` when the document states no money amount for the instrument.
+- Never put an aggregate that covers several instruments on any one of them: a combined total for a group, or an agreement's total across facilities, is omitted from the individual instruments.
+- `prior: true` marks a figure stated as it stood before a change; the current figure is the new one. `reduced the lender commitments from $100,000,000 to $50,000,000` → `commitment` 50000000; `commitment` 100000000 `prior`.
+- An increase *by* an amount is never an object sized at the increment. `increased the commitments by $353 million`, `$500,000 Credit Increase` describe a change to one facility. Before and after totals stated → after as current `commitment`, before as `prior`. Only the before total stated (`its existing $200 million facility ... increased by $50 million`) → `prior` `commitment` 200000000 and a current `commitment` 250000000 citing **both** spans; summing the exact cited spans is the only arithmetic allowed, and the pre-increase total is never the current figure. Only the increment stated → omit it. An increase *to* an amount is the current total.
+
+Mini-examples:
+- `$183.36 million term loan`, no separate amount tag → `principal` 183360000 USD citing the instrument's own span.
+- `$750 million` of notes closing with `net proceeds of $718.8 million` → `principal` 750000000; `proceeds` 718800000.
+- Revolver providing `$300 million` of commitments, `as of June 9, 2026, we had $270.5 million outstanding` → `commitment` 300000000; `outstanding_balance` 270500000 `as_of_date` 2026-06-09.
+- `will repay $68 million in outstanding amounts under the credit facility` → `repayment` 68000000 on the facility, not its principal.
+- ABR Loans bear interest at `0.875% per annum` → not an amount; the loan's `interest_rate` is floating with `rate_pct` null.
+
+## `interest_rate`
+One optional object. `kind` is `fixed` when the instrument bears a stated rate and `floating` when interest is set off a benchmark plus a margin. `rate_pct` is the stated fixed or all-in rate as a numeric string without the percent sign, `null` for a floating rate: benchmarks and margins are not recorded. Omit when the document states nothing about the instrument's interest. `3.875% senior notes due 2028` with no separate rate span → `{ "kind": "fixed", "rate_pct": "3.875" }` citing the instrument's own span.
+
+## `parties`
+One entry per coreference cluster. Every cluster carries a `role` (validated); `kind` defaults to `named`.
+
+| role | who |
+|---|---|
+| `lender` | whoever holds or funds the debt: lenders, purchasers in a note purchase agreement or private placement, a named holder, noteholder, payee, or counterparty, a named investor that buys and holds — even when the document never uses the word `lender` |
+| `borrower` | the filer, issuer, borrower, or obligor, when the document treats it as a distinct party worth recording (a subsidiary borrowing under the parent's filing); otherwise omit it. Never a `lender` |
+| `agent` | administrative, collateral, or paying agent. A second `lender` cluster for the same bank only when the document also describes it as a lender or purchaser (`as a Lender and as Administrative Agent`) |
+| `trustee` | indenture or collateral trustee; never a lender |
+| `underwriter` | underwriters, initial purchasers, placement agents, sales agents in a public offering or Rule 144A resale; never lenders, because they resell rather than hold |
+| `guarantor` | guarantors |
+| `other` | clearly related to the instrument but none of the roles fit |
+
+- `kind: named` identifies a specific party (`JPMorgan Chase Bank, N.A.`, `EGT 11 LLC`); `kind: collective` only describes a group (`the Lenders`, `the other lenders party thereto`, `the holders`, `certain financial institutions`, `the purchasers`). Name every lender the document names and return a `collective` cluster for every group it does not; whether the holders are fully disclosed is inferred downstream from the lender clusters.
+- A defined term standing for parties the document just named (`(collectively, the "Purchasers")`, `the Lenders listed on Schedule A`) is a coreference of those named parties, not a `collective` cluster: put its tags in the named clusters or leave them out. Reserve `collective` for a group the document never enumerates.
+- A collective phrase is a cluster only when the tagger labelled it `person` or `organization`; when no party tag covers it, return no cluster — the absence of a named lender already says the holders are undisclosed.
+- An instrument placed into the public market or sold to unnamed holders through underwriters or initial purchasers has no `lender` clusters. The same holds for a redemption notice for outstanding notes, debt described as assumed or outstanding, and a syndicated facility where only the arrangers or agents are named.
+- Similarly named entities are not automatically one cluster: affiliated funds or series entities differing by a numeral or suffix stay separate unless the text says two names refer to one party.
+
+Mini-examples:
+- lenders `JPMorgan Chase Bank, N.A.` and `the other lenders party thereto` → `lender` named (Chase); `lender` collective.
+- lenders `JPMorgan Chase Bank, N.A.` and `Wells Fargo Bank, National Association`, no collective phrase → two `lender` named clusters.
+- notes sold to `the Holders` → one `lender` collective cluster.
+- note purchase agreement with `Metropolitan Life Insurance Company` and `the other purchasers named therein` → `lender` named; `lender` collective.
+- `The Bank of New York Mellon` as trustee, notes sold through underwriters → `trustee`; `underwriter`; no `lender` clusters.
+
+## What counts as one instrument
+One object per concrete debt instrument described as its own obligation. Agreements are not objects; a returned object is one coherent obligation.
+
+Merge into one object:
+- Several phrases for the same debt (`working capital loans` and `time extension funding loans` for one group of notes; `Credit Agreement` and `revolving credit facility` for one revolver; a defined term and the phrase it defines) → one object, all spans in its `name`.
+- Borrowing mechanics of one facility — swing line loans, letters of credit, LC loans, sub-limits — are ways to draw it, not instruments, unless described as their own facility with their own commitment. When only the mechanics are tagged, return exactly one object named by the primary mechanic's span (the revolving or working capital loans) with the facility's total commitment. A `$1.2 billion` working capital facility with swing line loans up to `$25 million` → one object, `commitment` 1200000000.
+- An over-allotment or add-on folded into a stated total: `$287.5 million of convertible notes, including $37.5 million issued pursuant to the ... over-allotment option` → one object, `principal` 287500000. A genuinely separate second issuance, with its own date or its own principal held by its own parties, is two.
+- Different `kind` entries (a commitment plus a balance plus a repayment) and a current figure plus its `prior` predecessor describe one instrument and never force a split.
+
+Split into several objects:
+- Each class, tranche, or series of an offering (`Class A-1`, `Class A-2a`, `Series A` and `Series B`) is its own object, even when named together in one sentence and even when only some state their own amount or maturity. Never merge them, and never add an object for the group label (`Asset Backed Notes`, `Notes`, `Exchange Notes`) that only collects them. Split by class only when the document gives each class its own identity — its own tagged name, amount, or maturity; several classes inside one combined span with nothing class-specific → one object for that span.
+- Each genuinely distinct facility under one credit agreement (a `$750 million` term facility and a `$750 million` revolving facility) is its own object with its own commitment; never assign one facility's commitment, or the agreement's combined total, to another. No third object for the agreement's `$1.5 billion`.
+- Two different current closing dates, or two different commitment or principal figures neither of which is described as the figure before a change, are two instruments (a $5.5 million note issued March 17 and a $269,000 note issued March 20, both called `Senior Subordinated Convertible Promissory Note` → two objects). Objects may share `name` spans when the text describes distinct instruments with one phrase. The signal is two obligations with their own principals, not labels like Initial and Additional: one note of `$1,250,000` (the `Initial Note`) and one of `$1,100,000` (the `Additional Note`) → two objects, each with its defined term in its own `name`.
+
+Amendment of the same instrument versus replacement by a different one:
+- When the filing amends, restates, supplements, increases, or extends an instrument that carries on as the same obligation, return **one** object: an `amendment` entry, the new terms as current entries, every stated old term as a `prior` entry. Never invent a prior term the filing does not state, and never publish the pre-change figure as current. When the text gives no before figure — a covenant reset, a repricing, a joinder — the one object simply carries `amendment` and the current terms; never return partial variants of the same facility.
+- A separate predecessor object is for a **different** instrument the filing replaces: a facility that `refinances and replaces` an existing facility, new notes whose proceeds redeem old notes. Return the replaced instrument as its own object with what the text states about it (`agreement`, `closing`, commitment, maturity) and do not fold it into the new instrument. `refinances in full ... the Borrowers' existing term loan and revolving credit facilities` → the new term facility, the new revolving facility, and one predecessor object per replaced facility, never one named for the group. A facility mentioned for some other reason — a party to an intercreditor agreement, a facility that merely continues to exist — is not a predecessor.
+
+Include and ignore:
+- When the filing's subject is a specific named instrument being redeemed, repaid, cancelled, exchanged, refinanced, terminated, or amended, return it and record what the filing states; the event is information about the instrument, not a reason to drop it.
+- A use-of-proceeds target named with at least one concrete term (a rate, a maturity, an amount) is its own object with a `retirement` entry `expected` until the filing says it happened: `proceeds will be used to redeem its outstanding 5.25% Senior Notes due 2027` → an object for the 2027 notes. A target named only by a defined term and a `dated as of` date also counts when the text says the instrument itself is repaid in full, redeemed, or retired (`repay in full ... the February Notes sold pursuant to a securities purchase agreement dated as of February 12, 2026` → object with `agreement` 2026-02-12).
+- Ignore debt mentioned only as background with no concrete term: `repay existing indebtedness`, `repay outstanding borrowings under its revolving credit facility` → no object. Repaying `outstanding borrowings under` a facility retires the borrowings, not the facility: `repay outstanding borrowings under the Credit Agreement, dated as of March 1, 2024` → no retirement object.
+- A contextual mention that prior notes were retired in full is not an object unless the filing separately describes a concrete state for them. Ignore non-debt securities even inside a financing disclosure.
+
+## Worked examples
+
+Amended and restated revolver with one stated prior term — one object:
+```json
+[{ "name": ["tag-3", "tag-9"], "instrument_type": "revolving_credit",
+   "dates": [ { "kind": "agreement", "evidence": ["tag-4"], "normalized_date": "2025-08-01" },
+              { "kind": "amendment", "evidence": ["tag-2"], "normalized_date": "2026-03-03" },
+              { "kind": "maturity", "evidence": ["tag-12"], "normalized_date": "2031-08-01" },
+              { "kind": "maturity", "evidence": ["tag-11"], "normalized_date": "2030-08-01", "prior": true } ],
+   "amounts": [ { "kind": "commitment", "evidence": ["tag-7"], "normalized_amount": "1750000000", "currency": "USD" } ],
+   "parties": [ { "tag_ids": ["tag-5"], "role": "agent" }, { "tag_ids": ["tag-6"], "role": "lender", "kind": "collective" } ] }]
+```
+(`raising commitments to $1.75 billion and extending the maturity from August 1, 2030 to August 1, 2031`, under an agreement `dated as of August 1, 2025`, amended March 3, 2026. No `prior` commitment: the prior commitment is not stated.)
+
+Priced offering whose proceeds redeem old notes — two objects, nothing has closed yet:
+```json
+[{ "name": ["tag-6"], "instrument_type": "note_bond",
+   "dates": [ { "kind": "announcement", "evidence": ["tag-1"], "normalized_date": "2026-03-05" },
+              { "kind": "closing", "evidence": ["tag-8"], "normalized_date": "2026-03-12", "expected": true },
+              { "kind": "maturity", "evidence": ["tag-6"], "normalized_date": "2036-12-31" } ],
+   "amounts": [ { "kind": "principal", "evidence": ["tag-5"], "normalized_amount": "600000000", "currency": "USD" } ],
+   "interest_rate": { "kind": "fixed", "rate_pct": "4.800", "evidence": ["tag-6"] },
+   "parties": [ { "tag_ids": ["tag-9", "tag-10"], "role": "underwriter" } ] },
+ { "name": ["tag-14"], "instrument_type": "note_bond",
+   "dates": [ { "kind": "retirement", "evidence": [], "normalized_date": null, "expected": true },
+              { "kind": "maturity", "evidence": ["tag-14"], "normalized_date": "2027-12-31" } ],
+   "interest_rate": { "kind": "fixed", "rate_pct": "5.25", "evidence": ["tag-14"] } }]
+```
+(`priced $600 million of 4.800% Senior Notes due 2036 ... expected to close on March 12, 2026 ... proceeds will be used to redeem its outstanding 5.25% Senior Notes due 2027`. The 2027 notes have no `lender` cluster: public holders are never named.)
+
+Completed redemption in full — one object, the event happened:
+```json
+[{ "name": ["tag-2"], "instrument_type": "note_bond",
+   "dates": [ { "kind": "retirement", "evidence": ["tag-4"], "normalized_date": "2026-03-02" },
+              { "kind": "maturity", "evidence": ["tag-2"], "normalized_date": "2028-12-31" } ],
+   "amounts": [ { "kind": "repayment", "evidence": ["tag-6"], "normalized_amount": "404950000", "currency": "USD" } ],
+   "parties": [ { "tag_ids": ["tag-3"], "role": "trustee" }, { "tag_ids": ["tag-7"], "role": "guarantor", "kind": "collective" } ] }]
+```
+(`on the Redemption Date [March 2, 2026], Covista deposited with the Trustee funds sufficient to redeem all Notes outstanding ... approximately $404,950,000 of outstanding principal ... the Indenture was fully satisfied and discharged`.)
+
+Multi-tranche securitization — one object per class, none for the group:
+```json
+[{ "name": ["tag-11"], "instrument_type": "note_bond",
+   "dates": [ { "kind": "closing", "evidence": ["tag-2"], "normalized_date": "2026-03-03" }, { "kind": "maturity", "evidence": ["tag-20"], "normalized_date": "2056-03-31" } ],
+   "amounts": [ { "kind": "principal", "evidence": ["tag-10"], "normalized_amount": "1527000000", "currency": "USD" } ],
+   "interest_rate": { "kind": "fixed", "rate_pct": "5.597", "evidence": ["tag-12"] },
+   "parties": [ { "tag_ids": ["tag-4"], "role": "borrower" }, { "tag_ids": ["tag-15"], "role": "underwriter", "kind": "collective" } ] },
+ { "name": ["tag-13"], "instrument_type": "note_bond",
+   "dates": [ { "kind": "closing", "evidence": ["tag-2"], "normalized_date": "2026-03-03" }, { "kind": "maturity", "evidence": ["tag-20"], "normalized_date": "2056-03-31" } ],
+   "amounts": [ { "kind": "principal", "evidence": ["tag-14"], "normalized_amount": "130000000", "currency": "USD" } ],
+   "interest_rate": { "kind": "fixed", "rate_pct": "5.890", "evidence": ["tag-16"] },
+   "parties": [ { "tag_ids": ["tag-4"], "role": "borrower" }, { "tag_ids": ["tag-15"], "role": "underwriter", "kind": "collective" } ] }]
+```
+(`$1,527.0 million ... Class A-2 Notes` at 5.597% and `$130.0 million ... Class B Notes` at 5.890%, issued March 3, 2026; `legal final maturity date of the Notes is in March 2056`. Shared spans are cited on both; no object for `the Notes`.)
+
+Credit agreement with two facilities and a computed maturity — two objects:
+```json
+[{ "name": ["tag-5"], "instrument_type": "term_loan",
+   "dates": [ { "kind": "closing", "evidence": ["tag-1"], "normalized_date": "2026-06-24" }, { "kind": "maturity", "evidence": ["tag-1", "tag-3"], "normalized_date": "2031-06-24" } ],
+   "amounts": [ { "kind": "commitment", "evidence": ["tag-6"], "normalized_amount": "750000000", "currency": "USD" } ],
+   "parties": [ { "tag_ids": ["tag-8"], "role": "agent" }, { "tag_ids": ["tag-8"], "role": "lender" }, { "tag_ids": ["tag-9"], "role": "lender", "kind": "collective" } ] },
+ { "name": ["tag-7"], "instrument_type": "revolving_credit",
+   "dates": [ { "kind": "closing", "evidence": ["tag-1"], "normalized_date": "2026-06-24" }, { "kind": "maturity", "evidence": ["tag-1", "tag-3"], "normalized_date": "2031-06-24" } ],
+   "amounts": [ { "kind": "commitment", "evidence": ["tag-6"], "normalized_amount": "750000000", "currency": "USD" } ],
+   "parties": [ { "tag_ids": ["tag-8"], "role": "agent" }, { "tag_ids": ["tag-8"], "role": "lender" }, { "tag_ids": ["tag-9"], "role": "lender", "kind": "collective" } ] }]
+```
+(`On June 24, 2026 ... a five-year credit agreement with JPMorgan Chase Bank, N.A., as administrative agent and a lender, and the other lenders party thereto, providing a $750 million term facility and a $750 million revolving facility`. No object for the `$1.5 billion` total; the maturity cites the `five-year` span and the closing date.)
+
+Commitment increase with only the before total stated — one object, summed current figure:
+```json
+[{ "name": ["tag-2", "tag-3"], "instrument_type": "revolving_credit",
+   "dates": [ { "kind": "amendment", "evidence": ["tag-1"], "normalized_date": "2026-02-10" } ],
+   "amounts": [ { "kind": "commitment", "evidence": ["tag-4"], "normalized_amount": "200000000", "currency": "USD", "prior": true },
+                { "kind": "commitment", "evidence": ["tag-4", "tag-5"], "normalized_amount": "250000000", "currency": "USD" } ],
+   "parties": [ { "tag_ids": ["tag-6"], "role": "agent" } ] }]
+```
+(`increases the commitments under its existing $200 million revolving credit facility by $50 million`, new total never stated. Lender never named: no `lender` cluster.)
+
+## Output constraints (validated)
+- Return only the JSON array — no prose, no bare object outside it.
+- Cite only tag ids that exist in the document, each under a property allowed to cite that tag type.
+- Do not invent ids, parties, dates, or amounts; when the document states no value you can cite, return no entry.
+- Omit any property the document says nothing about.
