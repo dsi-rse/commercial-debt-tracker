@@ -73,14 +73,18 @@ HTTP_SERVER_ERROR = 500
 # the two is worth retrying.
 UNDECLARED_TOOL_MARKER = "Undeclared Automated Tool"
 # form.idx columns are not aligned, so anchor from the right, where CIK, date
-# and path all have unambiguous shapes.
+# and path all have unambiguous shapes. The date is matched in both spellings
+# EDGAR uses: the quarterly full-index writes 2026-04-29 and the daily index
+# writes 20260908, and a regex accepting only the first silently matches nothing
+# in a daily index — 147 of 147 6-K rows dropped, with no error.
 FILING_RE = re.compile(
     r"^(?P<form>\S+(?:\s\S+)*?)\s{2,}"
     r"(?P<company_name>.+?)\s{2,}"
     r"(?P<cik>\d+)\s+"
-    r"(?P<filing_date>\d{4}-\d{2}-\d{2})\s+"
+    r"(?P<filing_date>\d{4}-\d{2}-\d{2}|\d{8})\s+"
     r"(?P<file_name>\S+)\s*$"
 )
+COMPACT_DATE_LENGTH = 8
 MIRROR_DATASET_NAME = "raw-documents"
 MIRROR_GENRE = "sixk"
 MONTHS_PER_QUARTER = 3
@@ -286,12 +290,19 @@ def parse_form_index(
 ) -> list[IndexRow]:
     """Return the index rows whose form is one of ``form_types``.
 
-    >>> rows = parse_form_index(
-    ...     "6-K         Barclays PLC        312069      2026-04-29  "
-    ...     "edgar/data/312069/0001654954-26-004070.txt"
-    ... )
-    >>> rows[0].accession_number, rows[0].cik
-    ('0001654954-26-004070', '312069')
+    Filing dates are normalized to ISO, whichever spelling the index used.
+
+        >>> rows = parse_form_index(
+        ...     "6-K         Barclays PLC        312069      2026-04-29  "
+        ...     "edgar/data/312069/0001654954-26-004070.txt"
+        ... )
+        >>> rows[0].accession_number, rows[0].cik
+        ('0001654954-26-004070', '312069')
+        >>> parse_form_index(
+        ...     "6-K         AIR Global PLC      2097725     20260908    "
+        ...     "edgar/data/2097725/0001193125-26-384297.txt"
+        ... )[0].filing_date
+        '2026-09-08'
     """
     wanted = set(form_types)
     # form.idx rows start with the form type, so this skips the banner and the
@@ -311,12 +322,19 @@ def parse_form_index(
                 form=fields["form"],
                 company_name=fields["company_name"].strip(),
                 cik=fields["cik"],
-                filing_date=fields["filing_date"],
+                filing_date=_iso_filing_date(fields["filing_date"]),
                 file_name=fields["file_name"],
                 accession_number=Path(fields["file_name"]).stem,
             )
         )
     return rows
+
+
+def _iso_filing_date(value: str) -> str:
+    """Return one index date as ISO, accepting the compact daily spelling."""
+    if len(value) == COMPACT_DATE_LENGTH and value.isdigit():
+        return f"{value[:4]}-{value[4:6]}-{value[6:]}"
+    return value
 
 
 def read_index_file(path: Path) -> str:
@@ -450,14 +468,28 @@ class EdgarDocumentSource:
         )
 
     def _index_rows(self: Self) -> Iterator[IndexRow]:
-        """Yield matching index rows for the configured date range."""
+        """Yield matching index rows from the indexes this run reads.
+
+        The date range filters a *supplied* index, which covers a whole quarter,
+        and deliberately does not filter the daily ones. A daily index is that
+        day's dissemination feed, and it lists filings dated earlier — a filing
+        dated the 4th shows up in the 8th's feed. Dropping those would lose them
+        for good: the run for the 4th already happened, and its own index did
+        not list them yet (the shape of #90). Each row is written to the
+        partition for its own filing date, so a late one lands where it belongs
+        rather than where it was found.
+        """
         wanted_ciks = (
             None if self.ciks is None else {str(cik).lstrip("0") for cik in self.ciks}
         )
+        filter_dates = self.index_file is not None
         for raw in self._raw_indexes():
             for row in parse_form_index(raw, form_types=self.config.form_types):
-                filing_date = date.fromisoformat(row.filing_date)
-                if not (self.config.start_date <= filing_date <= self.config.end_date):
+                if filter_dates and not (
+                    self.config.start_date
+                    <= date.fromisoformat(row.filing_date)
+                    <= self.config.end_date
+                ):
                     continue
                 if wanted_ciks is not None and row.cik.lstrip("0") not in wanted_ciks:
                     continue
