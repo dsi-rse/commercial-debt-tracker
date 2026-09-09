@@ -103,7 +103,7 @@ def itemize_documents(
         return pd.DataFrame(columns=ITEM_COLUMNS)
 
     selected_item_numbers = normalize_item_numbers(item_numbers)
-    resolved_s3_client = _ensure_s3_client(s3_client, documents.to_dict("records"))
+    resolved_s3_client = ensure_s3_client(s3_client, documents.to_dict("records"))
     rows: list[dict[str, object]] = []
     saved_item_counts: Counter[str] = Counter()
     irrelevant_count = 0
@@ -187,7 +187,7 @@ def itemize_pending_documents(
                 columns=DOCUMENT_COLUMNS
             )
             total_documents += len(documents)
-            shared_s3_client = _ensure_s3_client(
+            shared_s3_client = ensure_s3_client(
                 shared_s3_client,
                 documents.to_dict("records"),
             )
@@ -306,7 +306,7 @@ def itemize_document_record(
     item_numbers: tuple[str, ...] | None = None,
 ) -> list[ItemSection]:
     """Extract item sections from one document record."""
-    text = _document_text_for_record(
+    text = document_text_for_record(
         document,
         data_dir=data_dir,
         s3_client=s3_client,
@@ -352,12 +352,19 @@ def item_row(section: ItemSection) -> dict[str, object]:
     }
 
 
-def _document_text_for_record(
+def document_text_for_record(
     document: dict[str, object],
     *,
-    data_dir: Path | None,
-    s3_client: object | None,
+    data_dir: Path | None = None,
+    s3_client: object | None = None,
 ) -> str:
+    """Return one document row's text, from the row or from its resource.
+
+    Public because both genres resolve a documents-dataset row the same way: a
+    row carries either inline text (``download=True`` ingest) or a
+    ``resource_uri`` pointing at the stored submission — the scraper's copy for
+    8-K, CDT's own mirror for 6-K.
+    """
     text = document.get("text")
     if isinstance(text, str) and text.strip():
         return text
@@ -391,10 +398,15 @@ def _load_resource_text(
     return decode_document_bytes(path.read_bytes())
 
 
-def _ensure_s3_client(
+def ensure_s3_client(
     s3_client: object | None,
     documents: list[dict[str, object]],
 ) -> object | None:
+    """Return a client only if some row's resource actually lives on S3.
+
+    Public for the same reason as ``document_text_for_record``: a local run
+    with mirrored bodies must not need AWS to resolve them.
+    """
     if s3_client is not None:
         return s3_client
     for document in documents:

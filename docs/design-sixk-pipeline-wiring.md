@@ -370,6 +370,43 @@ following their fake-client pattern:
    `item`-column change it implies.
 6. **Docs.**
 
+### Phase-3 checkpoint result (2026-09-09)
+
+One fresh day, 2026-09-08, all 146 6-K/6-K/A filings EDGAR listed for it — not
+the generalization eval's window, which is a scoring set.
+
+| measure | this day | `docs/sixk-two-stage-triage.md` |
+|---|---|---|
+| filings passing the debt-vocabulary gate | 13.7% (20/146) | 13.4% |
+| windows stage 1 admitted | 129 of 876 gated | — |
+| snippets stage 2 pruned | 61% (79 of 129) | 47.5% |
+| filings degraded to stage-1 output | 0 | — |
+
+The gate reproduces. Stage 2 pruned harder than measured, on 13 filings, so
+read that as a wide interval rather than a shift.
+
+**One filing-level recall miss, worth carrying into the eval.** Stage 2 dropped
+all 17 admitted windows of Gilat Satellite Networks' filing as `no_details`.
+The first of them opens `EXHIBIT 99.2 Unofficial Translation from Hebrew TRUST
+DEED FOR NOTES (SERIES 1) Made and entered into on August 30, 2026` — a real
+note issuance, and no window survived to extract it from. That is exactly the
+metric the triage doc calls the one that matters, where it reports 53 of 53;
+the doc also says that bound "is bounded, not proven", and this is a
+counterexample on the first unseen day. Two other filings lost their only
+admitted window each, both plausible stage-1 false positives.
+
+Three caveats before this is treated as a rate: one day, one annotator (me,
+by eye), and stage 2 is non-deterministic at ~95% run-to-run agreement. It is
+a finding for the generalization eval to size, not a wiring defect — the
+wiring's part worked, in that persisting dropped windows with their reasons is
+what made the miss findable at all.
+
+A related quality note, not a miss: several *kept* windows are cover-page
+boilerplate ("FORM 6-K REPORT OF FOREIGN PRIVATE ISSUER..."). The header
+leakage `prose_documents` preserves for fidelity is plausibly what admits them.
+The measured numbers were taken with the same leakage, so changing it is an
+eval-scoped decision too.
+
 Checkpoint after 4: run the whole 6-K path locally over a **fresh** small
 sample and eyeball the mentions, with `--sixk-cik-file` pointed at that sample's
 CIKs — the deployed list contains no 6-K filers, so the default produces nothing

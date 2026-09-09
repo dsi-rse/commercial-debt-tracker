@@ -55,6 +55,16 @@ DEFAULT_SIXK_TRIAGE_REASONING = "none"
 SIXK_TRIAGE_REASONING = (
     os.environ.get("SIXK_TRIAGE_REASONING") or DEFAULT_SIXK_TRIAGE_REASONING
 )
+# Which API the stage-2 triage call goes to: "openrouter" (the default, matching
+# the live extractor) or "openai". Stage 2 is priced for volume and the shared
+# OpenRouter account has hit its credit limit before — and OpenRouter reserves
+# an estimated maximum cost per in-flight request, so it fails first under
+# exactly this stage's shape. This makes that a setting change, not a blocked
+# run.
+DEFAULT_SIXK_TRIAGE_PROVIDER = "openrouter"
+SIXK_TRIAGE_PROVIDER = (
+    os.environ.get("SIXK_TRIAGE_PROVIDER") or DEFAULT_SIXK_TRIAGE_PROVIDER
+)
 # SEC fair-access policy requires a declared contact in the User-Agent of every
 # EDGAR request: "Sample Company Name AdminContact@example.com". Requests
 # without one are answered with a 403 and an "Undeclared Automated Tool" page
