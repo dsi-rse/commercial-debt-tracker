@@ -9,8 +9,15 @@ from io import BytesIO
 from pathlib import Path
 from typing import Self
 
+import pandas as pd
+
+from cdt.datasets import parse_date_shard_partition
 from cdt.ingest import (
+    DOCUMENT_COLUMNS,
+    SIXK_DOCUMENT_DATASET_NAME,
     IngestConfig,
+    _document_shard,
+    _partition_path,
     acquire_documents,
     acquire_documents_for_date_range,
     default_failure_file,
@@ -19,7 +26,7 @@ from cdt.ingest import (
     normalize_accession_number,
     run_ingest_pipeline,
 )
-from cdt.storage import list_artifacts, read_dataset, read_table
+from cdt.storage import list_artifacts, read_dataset, read_table, write_table
 
 EXPECTED_PARTITION_FILES = 3
 
@@ -839,3 +846,247 @@ def test_filing_from_manifest_pads_the_cik() -> None:
         }
     )
     assert already_padded.cik == "0000707605"
+
+
+def test_ingest_routes_configured_form_types_to_their_own_dataset(
+    tmp_path: Path,
+) -> None:
+    """A 6-K run reads 6-K prefixes and writes the 6-K documents dataset."""
+    client = FakeS3Client(
+        {
+            (
+                "sec-bucket",
+                "sec/2024-01-02/6-K/320193/000000000024000001/manifest.json",
+            ): _manifest_bytes(
+                "320193",
+                "0000000000-24-000001",
+                "6-K",
+                "2024-01-02",
+                "COMPLETE SUBMISSION TEXT FILE",
+                s3_key="s3://sec-bucket/sec/2024-01-02/6-K/320193/000000000024000001/full.txt",
+            ),
+            (
+                "sec-bucket",
+                "sec/2024-01-03/6-K_A/320193/000000000024000002/manifest.json",
+            ): _manifest_bytes(
+                "320193",
+                "0000000000-24-000002",
+                "6-K/A",
+                "2024-01-03",
+                "COMPLETE SUBMISSION TEXT FILE",
+                s3_key="s3://sec-bucket/sec/2024-01-03/6-K_A/320193/000000000024000002/full.txt",
+            ),
+            (
+                "sec-bucket",
+                "sec/2024-01-04/8-K/320193/000000000024000003/manifest.json",
+            ): _manifest_bytes(
+                "320193",
+                "0000000000-24-000003",
+                "8-K",
+                "2024-01-04",
+                "COMPLETE SUBMISSION TEXT FILE",
+                s3_key="s3://sec-bucket/sec/2024-01-04/8-K/320193/000000000024000003/full.txt",
+            ),
+        }
+    )
+
+    table, result = run_ingest_pipeline(
+        IngestConfig(
+            mode="historical",
+            bucket="sec-bucket",
+            cik_file=Path(),
+            start_date=date(2024, 1, 2),
+            end_date=date(2024, 1, 4),
+            data_dir=tmp_path,
+            output_root=str(tmp_path),
+            form_types=("6-K", "6-K/A"),
+            dataset_name=SIXK_DOCUMENT_DATASET_NAME,
+        ),
+        ciks={"320193"},
+        s3_client=client,
+    )
+
+    # The 8-K manifest sits in the same bucket and date range and is not read:
+    # form types select S3 prefixes, so a non-requested form costs no LIST hit.
+    assert table["accession_number"].to_list() == [
+        "000000000024000001",
+        "000000000024000002",
+    ]
+    assert table["form_type"].to_list() == ["6-K", "6-K/A"]
+    assert table["source"].to_list() == ["s3-manifest", "s3-manifest"]
+    assert result.form_types == ("6-K", "6-K/A")
+    assert result.dataset_name == SIXK_DOCUMENT_DATASET_NAME
+    assert result.documents_root.endswith(SIXK_DOCUMENT_DATASET_NAME)
+    assert (
+        "sec-bucket",
+        "sec/2024-01-04/8-K/320193/000000000024000003/manifest.json",
+    ) not in client.manifest_reads
+
+    sixk_root = documents_root(str(tmp_path), dataset_name=SIXK_DOCUMENT_DATASET_NAME)
+    assert len(list_artifacts(sixk_root, suffix=".parquet")) == 2
+    assert list_artifacts(documents_root(str(tmp_path)), suffix=".parquet") == []
+
+
+def test_ingesting_six_k_leaves_the_eight_k_partitions_byte_identical(
+    tmp_path: Path,
+) -> None:
+    """The genres share no partition, so a 6-K run cannot make 8-K work pending.
+
+    Every downstream stage selects work by source-partition fingerprint (#62).
+    Merging 6-K rows into the 8-K partitions would change those fingerprints and
+    make the whole 8-K corpus pending again, so this asserts the stronger
+    property the split dataset buys: the bytes do not move.
+    """
+    client = FakeS3Client(
+        {
+            (
+                "sec-bucket",
+                "sec/2024-01-02/8-K/320193/000000000024000001/manifest.json",
+            ): _manifest_bytes(
+                "320193",
+                "0000000000-24-000001",
+                "8-K",
+                "2024-01-02",
+                "COMPLETE SUBMISSION TEXT FILE",
+                s3_key="s3://sec-bucket/sec/2024-01-02/8-K/320193/000000000024000001/full.txt",
+            ),
+            (
+                "sec-bucket",
+                "sec/2024-01-02/6-K/789019/000000000024000002/manifest.json",
+            ): _manifest_bytes(
+                "789019",
+                "0000000000-24-000002",
+                "6-K",
+                "2024-01-02",
+                "COMPLETE SUBMISSION TEXT FILE",
+                s3_key="s3://sec-bucket/sec/2024-01-02/6-K/789019/000000000024000002/full.txt",
+            ),
+        }
+    )
+    common = {
+        "mode": "historical",
+        "bucket": "sec-bucket",
+        "cik_file": Path(),
+        "start_date": date(2024, 1, 2),
+        "end_date": date(2024, 1, 2),
+        "data_dir": tmp_path,
+        "output_root": str(tmp_path),
+    }
+
+    run_ingest_pipeline(
+        IngestConfig(**common),
+        ciks={"320193"},
+        s3_client=client,
+    )
+    eightk_paths = list_artifacts(documents_root(str(tmp_path)), suffix=".parquet")
+    before = {path: Path(path).read_bytes() for path in eightk_paths}
+    assert before
+
+    run_ingest_pipeline(
+        IngestConfig(
+            **common,
+            form_types=("6-K",),
+            dataset_name=SIXK_DOCUMENT_DATASET_NAME,
+        ),
+        ciks={"789019"},
+        s3_client=client,
+    )
+
+    after = {
+        path: Path(path).read_bytes()
+        for path in list_artifacts(documents_root(str(tmp_path)), suffix=".parquet")
+    }
+    assert after == before
+    sixk = read_dataset(
+        documents_root(str(tmp_path), dataset_name=SIXK_DOCUMENT_DATASET_NAME),
+        columns=DOCUMENT_COLUMNS,
+    )
+    assert sixk["accession_number"].to_list() == ["000000000024000002"]
+
+
+def test_partitions_written_before_the_provenance_columns_stay_readable(
+    tmp_path: Path,
+) -> None:
+    """A partition predating form_type/source reads back with them as null.
+
+    The two columns are provenance, not keys, so the migration is a read-time
+    reindex rather than a rewrite: an 8-K partition written by an earlier
+    release must still load, and a null form_type is an 8-K.
+    """
+    legacy_columns = [
+        column for column in DOCUMENT_COLUMNS if column not in {"form_type", "source"}
+    ]
+    legacy_path = _partition_path(
+        documents_root(str(tmp_path)),
+        {"date": "2023-01-02", "shard": _document_shard("000000000023000001")},
+    )
+    write_table(
+        legacy_path,
+        pd.DataFrame(
+            [
+                {
+                    "accession_number": "000000000023000001",
+                    "cik": "320193",
+                    "company_name": "Example Inc.",
+                    "url": "https://sec.example/legacy.txt",
+                    "text": "",
+                    "date": "2023-01-02",
+                    "resource_uri": "s3://sec-bucket/legacy.txt",
+                }
+            ],
+            columns=legacy_columns,
+        ),
+    )
+
+    client = FakeS3Client(
+        {
+            (
+                "sec-bucket",
+                "sec/2024-01-02/8-K/320193/000000000024000001/manifest.json",
+            ): _manifest_bytes(
+                "320193",
+                "0000000000-24-000001",
+                "8-K",
+                "2024-01-02",
+                "COMPLETE SUBMISSION TEXT FILE",
+                s3_key="s3://sec-bucket/sec/2024-01-02/8-K/320193/000000000024000001/full.txt",
+            ),
+        }
+    )
+    run_ingest_pipeline(
+        IngestConfig(
+            mode="historical",
+            bucket="sec-bucket",
+            cik_file=Path(),
+            start_date=date(2024, 1, 2),
+            end_date=date(2024, 1, 2),
+            data_dir=tmp_path,
+            output_root=str(tmp_path),
+        ),
+        ciks={"320193"},
+        s3_client=client,
+    )
+
+    documents = read_dataset(
+        documents_root(str(tmp_path)), columns=DOCUMENT_COLUMNS
+    ).set_index("accession_number")
+    assert documents.loc["000000000023000001", "form_type"] is None or pd.isna(
+        documents.loc["000000000023000001", "form_type"]
+    )
+    assert documents.loc["000000000024000001", "form_type"] == "8-K"
+    assert documents.loc["000000000024000001", "source"] == "s3-manifest"
+
+
+def test_sixk_document_partitions_are_canonical_date_shard_partitions() -> None:
+    """The 6-K dataset takes part in the ordinary partition contract.
+
+    Every stage locates work by joining a dataset root and then reading each
+    path's date and shard; the dataset segment itself is matched but never
+    consumed. So this pins what the new dataset actually needs — that its
+    partitions parse — rather than anything about its name.
+    """
+    partition = parse_date_shard_partition(
+        f"/artifacts/{SIXK_DOCUMENT_DATASET_NAME}/date=2024-01-02/shard=0001/part-0000.parquet"
+    )
+    assert partition["date"] == "2024-01-02"
+    assert partition["shard"] == "0001"
