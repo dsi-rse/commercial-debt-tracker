@@ -50,7 +50,21 @@ ITEM_METADATA_COLUMNS = [
     "end_line",
     "section_char_count",
 ]
-ITEM_COLUMNS = ["item_id", "item", *DOCUMENT_COLUMNS, *ITEM_METADATA_COLUMNS]
+# The document columns an item row copies. Pinned here rather than spread from
+# ingest.DOCUMENT_COLUMNS: items, classifications, mentions and the published
+# items snapshot all derive their schema from this list, so a column added to
+# the documents dataset would otherwise reshape four datasets and the
+# dashboard's contract as a side effect of an ingest change.
+ITEM_DOCUMENT_COLUMNS = [
+    "accession_number",
+    "cik",
+    "company_name",
+    "url",
+    "text",
+    "date",
+    "resource_uri",
+]
+ITEM_COLUMNS = ["item_id", "item", *ITEM_DOCUMENT_COLUMNS, *ITEM_METADATA_COLUMNS]
 ITEM_INTEGER_COLUMNS = [
     "start_line",
     "end_line",
