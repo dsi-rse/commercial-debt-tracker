@@ -123,6 +123,36 @@ AMOUNT_KINDS = {
     "proceeds",
 }
 PRINCIPAL_AMOUNT_KINDS = ("commitment", "principal")
+# Kind-typed date facts (stage 1 of the dates overhaul). The old single-value
+# `start_date` / `maturity_date` / `commitment_termination_date` slots made the
+# model arbitrate between competing dates; a list of facts records each stated
+# date once and lets the post-processor choose the published columns.
+DATE_KINDS = {
+    "agreement",  # the instrument's own `dated as of` date
+    "announcement",  # pricing, launch, or commitment-letter date
+    "expected_closing",  # `expected to close on or about`
+    "closing",  # closing, issuance, funding, or effective date: the start
+    "maturity",  # when the borrowed money must be repaid
+    "commitment_termination",  # when the lender's obligation to lend ends
+}
+DATE_KIND_EVIDENCE_TAG_TYPES = {
+    "maturity": {"date", "debt_instrument", "duration"},
+}
+DEFAULT_DATE_EVIDENCE_TAG_TYPES = {"date"}
+# Published flat columns and the fact kind each one reads.
+DATE_COLUMN_KINDS = {
+    "start_date": "closing",
+    "maturity_date": "maturity",
+    "commitment_termination_date": "commitment_termination",
+}
+# Pre-dates[] responses replay through the same path with their kind implied.
+LEGACY_DATE_PROPERTY_KINDS = {
+    "start_date": "closing",
+    "maturity_date": "maturity",
+    "end_date": "maturity",
+    "commitment_termination_date": "commitment_termination",
+}
+DATE_PRECISIONS = ("day", "month", "year")
 AMOUNT_EVIDENCE_TAG_TYPES = {"amount", "debt_instrument"}
 # What one mention says happened to its instrument (#141). `matured` is
 # deliberately absent: filings almost never say it, and the matcher derives it
@@ -349,6 +379,7 @@ DEBT_INSTRUMENT_MENTION_COLUMNS = [
     "amounts_json",
     "status_json",
     "interest_rate_json",
+    "dates_json",
     "lenders_known_incomplete",
 ]
 
@@ -814,6 +845,13 @@ def validate_instrument_entry(
         )
     )
     failures.extend(
+        validate_dates_property(
+            index=index,
+            obj=obj,
+            tag_details=tag_details,
+        )
+    )
+    failures.extend(
         validate_status_event(
             index=index,
             obj=obj,
@@ -904,24 +942,15 @@ class InstrumentIEStage:
                 name_text=name_text,
             )
             principal = select_principal_amount(amount_payloads)
-            start_date_payload = standardized_date_payload(
-                obj.get("start_date"),
-                tag_details,
-            )
-            maturity_value = (
-                obj.get("maturity_date")
-                if "maturity_date" in obj
-                # Pre-#158 responses replay with their old property name.
-                else obj.get("end_date")
-            )
-            maturity_payload = standardized_end_date_payload(
-                maturity_value,
+            date_payloads = standardized_dates_payloads(
+                obj,
                 tag_details,
                 name_text=name_text,
             )
-            commitment_termination_payload = standardized_date_payload(
-                obj.get("commitment_termination_date"),
-                tag_details,
+            start_date_payload = select_date_payload(date_payloads, "closing")
+            maturity_payload = select_date_payload(date_payloads, "maturity")
+            commitment_termination_payload = select_date_payload(
+                date_payloads, "commitment_termination"
             )
             status_payload = standardized_status_payload(
                 obj.get("status_event"), tag_details
@@ -983,6 +1012,7 @@ class InstrumentIEStage:
                 "amounts_json": json.dumps(amount_payloads, sort_keys=True),
                 "status_json": json.dumps(status_payload, sort_keys=True),
                 "interest_rate_json": json.dumps(interest_rate_payload, sort_keys=True),
+                "dates_json": json.dumps(date_payloads, sort_keys=True),
             }
             mention_id = debt_instrument_mention_id_for(
                 row_state.item_id,
@@ -2539,6 +2569,95 @@ def validate_amount_is_not_rate(
     ]
 
 
+def validate_dates_property(
+    *,
+    index: int,
+    obj: dict[str, Any],
+    tag_details: dict[str, dict[str, object]],
+) -> list[str]:
+    """Validate the kind-typed dates list on one instrument entry.
+
+    Every entry needs a known kind and date-typed evidence (a maturity may also
+    cite the instrument's name span or a duration span, as before). At most one
+    non-prior entry per kind: two current maturities describe two instruments,
+    exactly as two principals do.
+    """
+    if "dates" not in obj:
+        return []
+    entries = obj["dates"]
+    if not isinstance(entries, list):
+        return [f"Entry {index}: 'dates' must be a list of objects."]
+    failures: list[str] = []
+    current_kinds: dict[str, int] = {}
+    for position, entry in enumerate(entries):
+        label = f"dates[{position}]"
+        if not isinstance(entry, dict):
+            failures.append(f"Entry {index}: '{label}' must be an object.")
+            continue
+        kind = entry.get("kind")
+        if kind not in DATE_KINDS:
+            allowed = ", ".join(sorted(DATE_KINDS))
+            failures.append(f"Entry {index}: '{label}.kind' must be one of {allowed}.")
+            kind = None
+        prior = entry.get("prior", False)
+        if not isinstance(prior, bool):
+            failures.append(f"Entry {index}: '{label}.prior' must be true or false.")
+        elif kind is not None and not prior:
+            current_kinds[kind] = current_kinds.get(kind, 0) + 1
+        evidence = entry.get("evidence")
+        if not isinstance(evidence, list):
+            failures.append(
+                f"Entry {index}: '{label}.evidence' must be a list of tag IDs."
+            )
+            continue
+        expected_types = DATE_KIND_EVIDENCE_TAG_TYPES.get(
+            kind or "", DEFAULT_DATE_EVIDENCE_TAG_TYPES
+        )
+        for tag_id in evidence:
+            if not isinstance(tag_id, str):
+                failures.append(
+                    f"Entry {index}: '{label}.evidence' must contain string tag IDs only."
+                )
+                continue
+            tag_info = tag_details.get(tag_id)
+            if tag_info is None:
+                failures.append(
+                    f"Entry {index}: '{label}' contains unknown tag ID {tag_id}."
+                )
+            elif tag_info["type"] not in expected_types:
+                expected = ", ".join(sorted(expected_types))
+                failures.append(
+                    f"Entry {index}: '{label}' tag {tag_id} is type "
+                    f"'{tag_info['type']}', expected {expected}."
+                )
+        normalized_date = entry.get("normalized_date")
+        if normalized_date is not None and (
+            not isinstance(normalized_date, str)
+            or not ISO_DATE_PATTERN.fullmatch(normalized_date)
+            or not is_valid_iso_date(normalized_date)
+        ):
+            failures.append(
+                f"Entry {index}: '{label}.normalized_date' must be YYYY-MM-DD or null."
+            )
+        failures.extend(
+            validate_standardized_single_value_cardinality(
+                index=index,
+                property_name=label,
+                value=entry,
+                tag_details=tag_details,
+            )
+        )
+    for kind, count in sorted(current_kinds.items()):
+        if count > 1:
+            failures.append(
+                f"Entry {index}: 'dates' has {count} current entries of kind "
+                f"'{kind}'. One instrument has one {kind} date; a term stated "
+                "before and after a change marks the earlier one `prior: true`, "
+                "and two unrelated values are two instruments."
+            )
+    return failures
+
+
 def validate_amounts_property(
     *,
     index: int,
@@ -2612,6 +2731,8 @@ def validate_amounts_property(
             failures.append(
                 f"Entry {index}: '{label}.as_of_date' must be YYYY-MM-DD or null."
             )
+        if not isinstance(entry.get("prior", False), bool):
+            failures.append(f"Entry {index}: '{label}.prior' must be true or false.")
         failures.extend(
             validate_amount_is_not_rate(
                 index=index,
@@ -2847,6 +2968,7 @@ def debt_instrument_mention_id_for(
     """Return a stable persisted debt-instrument-mention ID."""
     payload = {
         "amounts_json": normalize_json_text(mention_row.get("amounts_json")),
+        "dates_json": normalize_json_text(mention_row.get("dates_json")),
         "commitment_termination_date": mention_row.get("commitment_termination_date"),
         "commitment_termination_date_json": normalize_json_text(
             mention_row.get("commitment_termination_date_json")
@@ -3482,6 +3604,9 @@ def standardized_amounts_payloads(
                 and is_valid_iso_date(as_of)
                 else None
             )
+            # A term stated as it stood before a change is history, not the
+            # instrument's current figure.
+            payload["prior"] = entry.get("prior") is True
             payloads.append(payload)
     elif "amount" in obj:
         payload = standardized_amount_payload(
@@ -3491,6 +3616,7 @@ def standardized_amounts_payloads(
         )
         payload["kind"] = None
         payload["as_of_date"] = None
+        payload["prior"] = False
         payloads.append(payload)
     if not any(payload.get("normalized_amount") for payload in payloads):
         synthesized = standardized_amount_payload(
@@ -3501,6 +3627,7 @@ def standardized_amounts_payloads(
         if synthesized.get("normalized_amount") is not None:
             synthesized["kind"] = "principal"
             synthesized["as_of_date"] = None
+            synthesized["prior"] = False
             payloads.append(synthesized)
     return payloads
 
@@ -3513,13 +3640,14 @@ def select_principal_amount(payloads: list[dict[str, object]]) -> dict[str, obje
     value carried the same meaning. Balances, draws, repayments, and proceeds
     never become the headline amount.
     """
-    for payload in payloads:
+    current = [payload for payload in payloads if not payload.get("prior")]
+    for payload in current:
         if (
             payload.get("normalized_amount") is not None
             and payload.get("kind") in PRINCIPAL_AMOUNT_KINDS
         ):
             return payload
-    for payload in payloads:
+    for payload in current:
         if payload.get("normalized_amount") is not None and payload.get("kind") is None:
             return payload
     return {}
@@ -3572,6 +3700,110 @@ def parsed_date_from_spans(
     """Return the one date the cited spans state, or None when they disagree."""
     parsed = {value for value in (parser(text) for text in span_texts) if value}
     return next(iter(parsed)) if len(parsed) == 1 else None
+
+
+def instrument_date_entries(obj: dict[str, Any]) -> list[tuple[str, object, bool]]:
+    """Return (kind, value, prior) date entries for one instrument object.
+
+    Reads the ``dates`` list, falling back to the pre-dates[] single-value
+    properties (kind implied by the property name) so stored responses replay.
+    """
+    entries: list[tuple[str, object, bool]] = []
+    dates = obj.get("dates")
+    if isinstance(dates, list):
+        for entry in dates:
+            if not isinstance(entry, dict) or entry.get("kind") not in DATE_KINDS:
+                continue
+            entries.append((str(entry["kind"]), entry, entry.get("prior") is True))
+        return entries
+    for property_name, kind in LEGACY_DATE_PROPERTY_KINDS.items():
+        if property_name in obj:
+            if property_name == "end_date" and "maturity_date" in obj:
+                continue
+            entries.append((kind, obj[property_name], False))
+    return entries
+
+
+def date_precision(
+    normalized_date: str | None,
+    span_texts: list[str],
+    derived_from: str | None,
+) -> str | None:
+    """Return day / month / year for how precisely the cited text states the date."""
+    if normalized_date is None:
+        return None
+    if derived_from == DERIVED_FROM_COMPUTED:
+        return "day"
+    if any(normalized_date_from_text(text) == normalized_date for text in span_texts):
+        return "day"
+    if any(
+        normalized_month_year_from_text(text) == normalized_date for text in span_texts
+    ) or any(
+        MATURITY_MONTH_YEAR_PATTERN.search(text) is not None for text in span_texts
+    ):
+        return "month"
+    if normalized_date.endswith(YEAR_ONLY_MATURITY_SUFFIX):
+        return "year"
+    return "day"
+
+
+def standardized_dates_payloads(
+    obj: dict[str, Any],
+    tag_details: dict[str, dict[str, object]],
+    *,
+    name_text: str | None,
+) -> list[dict[str, object]]:
+    """Return the kind-typed date payloads for one instrument entry.
+
+    Each payload carries ``kind``, ``prior``, ``precision`` and the evidence
+    fields of the single-value payloads it replaces. A maturity keeps the
+    name-derived and computed fallbacks (#128, #166); when the object states
+    no maturity at all but its name embeds one, that name-derived maturity is
+    synthesized, as before.
+    """
+    payloads: list[dict[str, object]] = []
+    saw_maturity = False
+    for kind, value, prior in instrument_date_entries(obj):
+        if kind == "maturity":
+            saw_maturity = True
+            payload = standardized_end_date_payload(
+                value, tag_details, name_text=name_text
+            )
+        else:
+            payload = standardized_date_payload(value, tag_details)
+        payload["kind"] = kind
+        payload["prior"] = prior
+        payload["precision"] = date_precision(
+            cast(str | None, payload.get("normalized_date")),
+            cluster_span_texts(single_value_evidence_tag_ids(value), tag_details)
+            + ([name_text] if name_text else []),
+            cast(str | None, payload.get("derived_from")),
+        )
+        payloads.append(payload)
+    if not saw_maturity:
+        synthesized = standardized_end_date_payload(
+            None, tag_details, name_text=name_text
+        )
+        if synthesized.get("normalized_date") is not None:
+            synthesized["kind"] = "maturity"
+            synthesized["prior"] = False
+            synthesized["precision"] = date_precision(
+                cast(str | None, synthesized.get("normalized_date")),
+                [name_text] if name_text else [],
+                cast(str | None, synthesized.get("derived_from")),
+            )
+            payloads.append(synthesized)
+    return payloads
+
+
+def select_date_payload(
+    payloads: list[dict[str, object]], kind: str
+) -> dict[str, object]:
+    """Return the current (non-prior) payload of one kind for the flat columns."""
+    for payload in payloads:
+        if payload.get("kind") == kind and not payload.get("prior"):
+            return payload
+    return {"spans": [], "normalized_date": None, "derived_from": None}
 
 
 def standardized_end_date_payload(

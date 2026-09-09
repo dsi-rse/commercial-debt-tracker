@@ -4765,3 +4765,206 @@ def test_instrument_ie_accepts_a_bare_object_as_one_entry() -> None:
         {"name": ["tag-1"]}
     ]
     assert instrument_entries_from_response("[]") == []
+
+
+def _dates_tag_details() -> dict[str, dict[str, object]]:
+    return {
+        "tag-1": {
+            "text": "5.000% Senior Notes due 2031",
+            "type": "debt_instrument",
+            "char_start": 0,
+            "char_end": 28,
+        },
+        "tag-2": {
+            "text": "March 5, 2026",
+            "type": "date",
+            "char_start": 40,
+            "char_end": 53,
+        },
+        "tag-3": {
+            "text": "March 12, 2026",
+            "type": "date",
+            "char_start": 60,
+            "char_end": 74,
+        },
+        "tag-4": {
+            "text": "June 28, 2026",
+            "type": "date",
+            "char_start": 80,
+            "char_end": 93,
+        },
+        "tag-5": {
+            "text": "June 23, 2031",
+            "type": "date",
+            "char_start": 100,
+            "char_end": 113,
+        },
+        "tag-6": {
+            "text": "in March 2056",
+            "type": "date",
+            "char_start": 120,
+            "char_end": 133,
+        },
+    }
+
+
+def test_dates_facts_publish_columns_from_current_closing_and_maturity() -> None:
+    """dates[] replaces the single-value slots; prior and projected dates stay out of the columns."""
+    from cdt.extractor.core import select_date_payload, standardized_dates_payloads
+
+    obj = {
+        "name": ["tag-1"],
+        "dates": [
+            {
+                "kind": "announcement",
+                "evidence": ["tag-2"],
+                "normalized_date": "2026-03-05",
+            },
+            {
+                "kind": "expected_closing",
+                "evidence": ["tag-3"],
+                "normalized_date": "2026-03-12",
+            },
+            {
+                "kind": "maturity",
+                "evidence": ["tag-4"],
+                "normalized_date": "2026-06-28",
+                "prior": True,
+            },
+            {
+                "kind": "maturity",
+                "evidence": ["tag-5"],
+                "normalized_date": "2031-06-23",
+            },
+        ],
+    }
+    payloads = standardized_dates_payloads(
+        obj, _dates_tag_details(), name_text="5.000% Senior Notes due 2031"
+    )
+    by_kind = {(p["kind"], p["prior"]): p for p in payloads}
+    assert by_kind[("announcement", False)]["normalized_date"] == "2026-03-05"
+    assert by_kind[("expected_closing", False)]["normalized_date"] == "2026-03-12"
+    assert by_kind[("maturity", True)]["normalized_date"] == "2026-06-28"
+    assert by_kind[("maturity", False)]["normalized_date"] == "2031-06-23"
+    assert by_kind[("maturity", False)]["precision"] == "day"
+    # No closing fact: the announced instrument publishes no start date.
+    assert select_date_payload(payloads, "closing")["normalized_date"] is None
+    assert select_date_payload(payloads, "maturity")["normalized_date"] == "2031-06-23"
+
+
+def test_dates_facts_precision_and_legacy_shape() -> None:
+    """Month and year precision are read off the text; old responses replay with implied kinds."""
+    from cdt.extractor.core import standardized_dates_payloads
+
+    tags = _dates_tag_details()
+    month = standardized_dates_payloads(
+        {
+            "dates": [
+                {
+                    "kind": "maturity",
+                    "evidence": ["tag-6"],
+                    "normalized_date": "2056-03-31",
+                }
+            ]
+        },
+        tags,
+        name_text="Class A-2 Notes",
+    )
+    assert (
+        month[0]["normalized_date"] == "2056-03-31" and month[0]["precision"] == "month"
+    )
+    year = standardized_dates_payloads(
+        {"name": ["tag-1"]}, tags, name_text="5.000% Senior Notes due 2031"
+    )
+    assert year[0]["kind"] == "maturity" and year[0]["normalized_date"] == "2031-12-31"
+    assert year[0]["precision"] == "year" and year[0]["derived_from"] == "name"
+    legacy = standardized_dates_payloads(
+        {
+            "start_date": {"evidence": ["tag-2"], "normalized_date": "2026-03-05"},
+            "maturity_date": {"evidence": ["tag-5"], "normalized_date": "2031-06-23"},
+        },
+        tags,
+        name_text=None,
+    )
+    assert {(p["kind"], p["normalized_date"]) for p in legacy} == {
+        ("closing", "2026-03-05"),
+        ("maturity", "2031-06-23"),
+    }
+
+
+def test_dates_property_validation_rejects_bad_kind_and_two_current_maturities() -> (
+    None
+):
+    """Two current maturities are two instruments; a prior one is history."""
+    from cdt.extractor.core import validate_dates_property
+
+    tags = _dates_tag_details()
+    bad_kind = validate_dates_property(
+        index=0,
+        obj={
+            "dates": [{"kind": "issue", "evidence": ["tag-2"], "normalized_date": None}]
+        },
+        tag_details=tags,
+    )
+    assert any("kind" in failure for failure in bad_kind)
+    two = validate_dates_property(
+        index=0,
+        obj={
+            "dates": [
+                {
+                    "kind": "maturity",
+                    "evidence": ["tag-4"],
+                    "normalized_date": "2026-06-28",
+                },
+                {
+                    "kind": "maturity",
+                    "evidence": ["tag-5"],
+                    "normalized_date": "2031-06-23",
+                },
+            ]
+        },
+        tag_details=tags,
+    )
+    assert any("2 current entries of kind 'maturity'" in failure for failure in two)
+    ok = validate_dates_property(
+        index=0,
+        obj={
+            "dates": [
+                {
+                    "kind": "maturity",
+                    "evidence": ["tag-4"],
+                    "normalized_date": "2026-06-28",
+                    "prior": True,
+                },
+                {
+                    "kind": "maturity",
+                    "evidence": ["tag-5"],
+                    "normalized_date": "2031-06-23",
+                },
+            ]
+        },
+        tag_details=tags,
+    )
+    assert ok == []
+    name_as_closing = validate_dates_property(
+        index=0,
+        obj={
+            "dates": [
+                {"kind": "closing", "evidence": ["tag-1"], "normalized_date": None}
+            ]
+        },
+        tag_details=tags,
+    )
+    assert any("expected date" in failure for failure in name_as_closing)
+
+
+def test_prior_amounts_never_supply_the_principal() -> None:
+    """A `prior: true` commitment is history; the current figure supplies the principal."""
+    from cdt.extractor.core import select_principal_amount
+
+    payloads = [
+        {"kind": "commitment", "normalized_amount": "25000000", "prior": True},
+        {"kind": "commitment", "normalized_amount": "50000000", "prior": False},
+    ]
+    assert select_principal_amount(payloads)["normalized_amount"] == "50000000"
+    assert select_principal_amount(payloads[:1]) == {}
