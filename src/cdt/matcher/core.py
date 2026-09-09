@@ -199,11 +199,14 @@ class ClusterProfile:
     lender_signatures: set[str]
     relation_target_ids: set[str] = field(default_factory=set)
     member_item_ids: set[str] = field(default_factory=set)
+    retired: bool = False
 
     def add_member(self: ClusterProfile, mention: PreparedMention) -> None:
         """Update the cluster cache with one newly accepted member."""
         if mention.debt_instrument_mention_id not in self.member_ids:
             self.member_ids.append(mention.debt_instrument_mention_id)
+        if mention.retired_by or mention.status in TERMINAL_STATUS_EVENTS:
+            self.retired = True
         if mention.item_id:
             self.member_item_ids.add(mention.item_id)
         if mention.normalized_amount:
@@ -229,6 +232,9 @@ class CandidateScore:
     match_score: float
     support_family: str | None
     basis: str = "amount_start"
+    exact_name: bool = False
+    cluster_size: int = 0
+    cluster_retired: bool = False
 
     @property
     def base_match_via(self: CandidateScore) -> str:
@@ -605,11 +611,35 @@ def apply_lifecycle_rollup(
                 if mention_index[member_id].accession_number
             }
         )
+        row["_member_ids"] = member_ids
+    # Event-based statuses first, so the derived legs below can ask whether the
+    # instrument that retired this one exists yet or is itself only announced.
+    event_status: dict[str, tuple[str, str | None, str | None] | None] = {}
+    pending: set[str] = set()
+    for row in rows:
+        row_id = str(row["debt_instrument_id"])
+        result, is_pending = event_status_for_instrument(
+            row["_member_ids"], mention_index
+        )
+        event_status[row_id] = result
+        if is_pending:
+            pending.add(row_id)
+    announced_ids = {
+        row_id
+        for row_id, result in event_status.items()
+        if result is not None and result[0] == "announced"
+    }
+    for row in rows:
+        row_id = str(row["debt_instrument_id"])
+        member_ids = row.pop("_member_ids")
         status, status_date, status_source = derive_instrument_status(
             row,
             member_ids,
             mention_index,
             reference_date=reference_date,
+            event_result=event_status[row_id],
+            retirement_pending=row_id in pending,
+            announced_instrument_ids=announced_ids,
         )
         row["status"] = status
         row["status_date"] = status_date
@@ -622,6 +652,9 @@ def derive_instrument_status(
     mention_index: dict[str, PreparedMention],
     *,
     reference_date: str | None,
+    event_result: tuple[str, str | None, str | None] | None = None,
+    retirement_pending: bool = False,
+    announced_instrument_ids: set[str] | None = None,
 ) -> tuple[str, str | None, str | None]:
     """Return (status, status_date, source_mention_id) for one instrument.
 
@@ -630,30 +663,84 @@ def derive_instrument_status(
     so they fall through to the derived legs: superseded by an amendment
     child, matured against the run's newest filing date, else active.
     """
+    if (
+        event_result is None
+        and not retirement_pending
+        and announced_instrument_ids is None
+    ):
+        event_result, retirement_pending = event_status_for_instrument(
+            member_ids, mention_index
+        )
+    if event_result is not None:
+        return event_result
+    if row.get("superseded_by_debt_instrument_id"):
+        return "superseded", None, None
+    retired_by = coerce_optional_text(row.get("retired_by_debt_instrument_ids"))
+    if retired_by and not retirement_pending:
+        # A retired_by pointer without a mention-level event still means the
+        # obligation ended — unless the retiring instrument is itself only
+        # announced (a use-of-proceeds financing that has not closed), in which
+        # case the retirement has not happened yet either.
+        retiring_ids = [str(value) for value in json.loads(retired_by)]
+        if not any(
+            retiring_id in (announced_instrument_ids or set())
+            for retiring_id in retiring_ids
+        ):
+            return "repaid", None, None
+    maturity = coerce_optional_text(row.get("maturity_date"))
+    if (
+        maturity
+        and reference_date
+        and maturity < reference_date
+        and not retirement_pending
+    ):
+        return "matured", maturity, None
+    return "active", None, None
+
+
+def event_status_for_instrument(
+    member_ids: list[str],
+    mention_index: dict[str, PreparedMention],
+) -> tuple[tuple[str, str | None, str | None] | None, bool]:
+    """Return the newest extracted event that decides a status, and a pending flag.
+
+    A terminal event dated after its own filing describes an intended
+    retirement (a redemption notice, a use-of-proceeds target), not one that
+    happened; it does not decide the status but marks the retirement pending so
+    the derived legs do not assert `repaid` or `matured` either. An `announced`
+    event is dated no later than the filing that announced it — the expected
+    closing date is when the instrument will start, not when it was announced.
+    """
     ordered = sorted(
         member_ids,
         key=lambda member_id: mention_recency_key(mention_index[member_id]),
         reverse=True,
     )
+    pending = False
     for member_id in ordered:
         mention = mention_index[member_id]
         if mention.status is None:
             continue
         if mention.status in TERMINAL_STATUS_EVENTS:
-            return mention.status, mention.status_date or mention.date, member_id
+            if (
+                mention.status_date
+                and mention.date
+                and mention.status_date > mention.date
+            ):
+                pending = True
+                continue
+            return (
+                mention.status,
+                mention.status_date or mention.date,
+                member_id,
+            ), pending
         if mention.status == "announced":
-            return "announced", mention.status_date or mention.date, member_id
+            status_date = mention.status_date or mention.date
+            if status_date and mention.date and status_date > mention.date:
+                status_date = mention.date
+            return ("announced", status_date, member_id), pending
         break
-    if row.get("superseded_by_debt_instrument_id"):
-        return "superseded", None, None
-    if coerce_optional_text(row.get("retired_by_debt_instrument_ids")):
-        # A retired_by pointer without a mention-level event still means the
-        # obligation ended; the lineage said so.
-        return "repaid", None, None
-    maturity = coerce_optional_text(row.get("maturity_date"))
-    if maturity and reference_date and maturity < reference_date:
-        return "matured", maturity, None
-    return "active", None, None
+    return None, pending
 
 
 def build_cluster_profiles(
@@ -894,6 +981,18 @@ def score_candidates_for_mention(
         )
         if not keys_match:
             if name_compatible:
+                # A cluster whose every name is generic (`senior notes`) cannot
+                # claim a mention whose name individuates a series; letting it
+                # seeded the tie cascade that shattered GEO's note histories.
+                if (
+                    name_is_identifying
+                    and profile.normalized_name_fingerprints
+                    and not any(
+                        name_fingerprint_is_identifying(candidate_name)
+                        for candidate_name in profile.normalized_name_fingerprints
+                    )
+                ):
+                    continue
                 # Launch, pricing, and closing 8-Ks for one offering drift on
                 # amount (upsizes) and start date (pricing vs settlement), so an
                 # identifying name may attach a mention whose keys conflict.
@@ -909,6 +1008,12 @@ def score_candidates_for_mention(
                             match_score=round(strong_match_threshold, 4),
                             support_family="name",
                             basis="name_fingerprint",
+                            exact_name=(
+                                mention.normalized_name_fingerprint
+                                in profile.normalized_name_fingerprints
+                            ),
+                            cluster_size=len(profile.member_ids),
+                            cluster_retired=profile.retired,
                         )
                     )
             continue
@@ -973,6 +1078,54 @@ def resolve_candidates(
             for candidate in qualifying_members[1:]
             if top_candidate.match_score - candidate.match_score <= ambiguity_margin
         ]
+        tied = [top_candidate, *close_competitors]
+        name_only_tie = bool(close_competitors) and all(
+            candidate.basis == "name_fingerprint" for candidate in tied
+        )
+        if name_only_tie:
+            # A mention that ties several existing clusters on its name belongs
+            # to at most one of them; seeding a third can never be right, and
+            # the third guarantees every later mention of the series ties too
+            # (the cascade behind 263 ambiguous edges on the 2026-09 window).
+            # Prefer the cluster already carrying this exact name, then a live
+            # obligation over a retired one, then the largest cluster.
+            tied.sort(
+                key=lambda candidate: (
+                    not candidate.exact_name,
+                    candidate.cluster_retired,
+                    -candidate.cluster_size,
+                    candidate.debt_instrument_id,
+                )
+            )
+            top_candidate = tied[0]
+            edge_rows = [
+                build_edge_row(
+                    mention_id=mention.debt_instrument_mention_id,
+                    debt_instrument_id=top_candidate.debt_instrument_id,
+                    edge_type="member",
+                    match_score=top_candidate.match_score,
+                    candidate_rank=1,
+                    match_via=render_match_via(
+                        "member", top_candidate.support_family, top_candidate.basis
+                    ),
+                    evaluated_run_id=evaluated_run_id,
+                )
+            ]
+            for rank, candidate in enumerate(tied[1:], start=2):
+                edge_rows.append(
+                    build_edge_row(
+                        mention_id=mention.debt_instrument_mention_id,
+                        debt_instrument_id=candidate.debt_instrument_id,
+                        edge_type="ambiguous_candidate",
+                        match_score=candidate.match_score,
+                        candidate_rank=rank,
+                        match_via=render_match_via(
+                            "ambiguous", candidate.support_family, candidate.basis
+                        ),
+                        evaluated_run_id=evaluated_run_id,
+                    )
+                )
+            return top_candidate.debt_instrument_id, edge_rows
         if not close_competitors:
             edge_rows = [
                 build_edge_row(

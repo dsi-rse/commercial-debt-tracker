@@ -4552,3 +4552,112 @@ def test_tenor_parsing_and_date_arithmetic() -> None:
     assert date_plus_tenor("2026-06-24", (5, "year")) == "2031-06-24"
     assert date_plus_tenor("2026-01-02", (364, "day")) == "2027-01-01"
     assert date_plus_tenor("2026-08-31", (18, "month")) == "2028-02-29"
+
+
+def test_lifecycle_status_treats_future_dated_retirement_as_pending() -> None:
+    """A `repaid` event dated after its filing is an intent; the row stays active."""
+    from cdt.matcher.core import apply_lifecycle_rollup, prepare_mention
+
+    target = prepare_mention(
+        build_mention_row(
+            mention_id="m-target",
+            item_id="item-1",
+            accession_number="0001",
+            cik="320193",
+            date="2026-03-04",
+            name="5.25% Senior Notes due 2027",
+            start_date=None,
+            amount=None,
+        )
+        | {"status": "repaid", "status_date": "2026-04-03"}
+    )
+    new_notes = prepare_mention(
+        build_mention_row(
+            mention_id="m-new",
+            item_id="item-1",
+            accession_number="0001",
+            cik="320193",
+            date="2026-03-04",
+            name="6.00% Senior Notes due 2031",
+            start_date=None,
+            amount=None,
+        )
+        | {"status": "announced", "status_date": "2026-03-18"}
+    )
+    rows = [
+        {
+            "debt_instrument_id": "inst-target",
+            "amendment_of_debt_instrument_id": None,
+            "split_of_debt_instrument_id": None,
+            "retired_by_debt_instrument_ids": '["inst-new"]',
+            "maturity_date": "2027-12-31",
+        },
+        {
+            "debt_instrument_id": "inst-new",
+            "amendment_of_debt_instrument_id": None,
+            "split_of_debt_instrument_id": None,
+            "retired_by_debt_instrument_ids": None,
+            "maturity_date": "2031-12-31",
+        },
+    ]
+    apply_lifecycle_rollup(
+        rows,
+        member_groups={"inst-target": ["m-target"], "inst-new": ["m-new"]},
+        mention_index={"m-target": target, "m-new": new_notes},
+    )
+    target_row, new_row = rows
+    # The redemption has not happened, and the retiring notes have not closed.
+    assert target_row["status"] == "active"
+    assert target_row["status_source_mention_id"] is None
+    # An announcement is dated no later than the filing that announced it.
+    assert new_row["status"] == "announced"
+    assert new_row["status_date"] == "2026-03-04"
+
+
+def test_resolve_candidates_attaches_on_name_only_tie_instead_of_seeding() -> None:
+    """A mention tying two clusters on its name joins the exact-name one."""
+    from cdt.matcher.core import CandidateScore, prepare_mention, resolve_candidates
+
+    mention = prepare_mention(
+        build_mention_row(
+            mention_id="m-3",
+            item_id="item-3",
+            accession_number="0003",
+            cik="923796",
+            date="2022-01-06",
+            name="5.875% Senior Notes due 2024",
+            start_date=None,
+            amount=None,
+        )
+    )
+    candidates = [
+        CandidateScore(
+            debt_instrument_id="inst-generic",
+            match_score=0.9,
+            support_family="name",
+            basis="name_fingerprint",
+            exact_name=False,
+            cluster_size=3,
+        ),
+        CandidateScore(
+            debt_instrument_id="inst-series",
+            match_score=0.9,
+            support_family="name",
+            basis="name_fingerprint",
+            exact_name=True,
+            cluster_size=1,
+        ),
+    ]
+    cluster_id, edges = resolve_candidates(
+        mention,
+        candidates,
+        strong_match_threshold=0.9,
+        loose_match_threshold=0.75,
+        ambiguity_margin=0.05,
+        evaluated_run_id="run-1",
+    )
+    assert cluster_id == "inst-series"
+    by_type = {edge["edge_type"]: edge for edge in edges}
+    assert by_type["member"]["debt_instrument_id"] == "inst-series"
+    assert by_type["member"]["match_via"] == "member:name_fingerprint"
+    assert by_type["ambiguous_candidate"]["debt_instrument_id"] == "inst-generic"
