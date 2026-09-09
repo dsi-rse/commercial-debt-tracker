@@ -35,6 +35,7 @@ from cdt.extractor import (
 from cdt.ingest import (
     DEFAULT_AWS_PROFILE,
     DEFAULT_BUCKET,
+    SIXK_DOCUMENT_DATASET_NAME,
     IngestConfig,
     default_output_root,
     documents_root,
@@ -58,6 +59,12 @@ from cdt.pipeline import (
     ALL_TIME_START_DATE as PIPELINE_ALL_TIME_START_DATE,
 )
 from cdt.pipeline import PipelineConfig, resolve_mode_dates, run_pipeline
+from cdt.sixk.edgar import (
+    SIXK_FORM_TYPES,
+    UndeclaredUserAgentError,
+    acquire_sixk_documents,
+    mirror_root,
+)
 
 ALL_TIME_START_DATE = date(1994, 1, 1)
 DEFAULT_BATCH_SIZE = 100
@@ -167,6 +174,56 @@ def build_parser() -> argparse.ArgumentParser:
             default=None if mode_name == "daily" else date.today(),
         )
         subparser.set_defaults(func=run_ingest)
+
+    sixk_ingest_parser = subparsers.add_parser(
+        "ingest-sixk",
+        help="Acquire 6-K filings from EDGAR into the 6-K documents dataset.",
+    )
+    add_artifact_root_argument(sixk_ingest_parser)
+    sixk_ingest_parser.add_argument("--force", action="store_true")
+    sixk_ingest_parser.add_argument(
+        "--batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
+    )
+    sixk_ingest_parser.add_argument("--failure-file", default=None)
+    sixk_ingest_parser.add_argument(
+        "--form-types",
+        type=parse_form_types,
+        default=SIXK_FORM_TYPES,
+        help="Comma-separated SEC form names to acquire.",
+    )
+    sixk_ingest_parser.add_argument(
+        "--index-file",
+        type=Path,
+        default=None,
+        help=(
+            "Read filings from a local EDGAR form.idx (or a zip holding one) "
+            "instead of fetching one daily index per day. Worth it for a wide "
+            "backfill: one quarterly index replaces ~63 daily requests."
+        ),
+    )
+    add_logging_arguments(sixk_ingest_parser, noun="6-K ingest")
+    sixk_ingest_subparsers = sixk_ingest_parser.add_subparsers(
+        dest="ingest_mode", required=True
+    )
+    for mode_name, help_text in (
+        ("daily", "Acquire 6-K filings from a daily date window."),
+        ("historical", "Acquire 6-K filings over an explicit date range."),
+    ):
+        sixk_subparser = sixk_ingest_subparsers.add_parser(mode_name, help=help_text)
+        sixk_subparser.add_argument(
+            "cik_file", help="Local path or s3:// URI for one-CIK-per-line input."
+        )
+        sixk_subparser.add_argument(
+            "--start-date",
+            type=parse_date,
+            default=None if mode_name == "daily" else ALL_TIME_START_DATE,
+        )
+        sixk_subparser.add_argument(
+            "--end-date",
+            type=parse_date,
+            default=None if mode_name == "daily" else date.today(),
+        )
+        sixk_subparser.set_defaults(func=run_sixk_ingest)
 
     itemize_parser = subparsers.add_parser(
         "itemize", help="Extract 8-K item sections from document partitions."
@@ -399,6 +456,70 @@ def run_ingest(args: argparse.Namespace) -> int:
     print(f"Documents dataset: {result.documents_root}.")
     print(f"Run manifest: {result.run_manifest}.")
     print(f"Failure registry: {result.failure_file}.")
+    return 0
+
+
+def run_sixk_ingest(args: argparse.Namespace) -> int:
+    """Run the 6-K EDGAR ingest subcommand."""
+    configure_logging(quiet=args.quiet, log_file=args.log_file)
+    logger = logging.getLogger(__name__)
+    output_root = args.artifact_root or default_output_root()
+    lease = acquire_stage_lease(output_root, logger, "6-K ingest")
+    if lease is None:
+        return 1
+    try:
+        start_date, end_date = resolve_ingest_dates(args)
+        config = IngestConfig(
+            mode=args.ingest_mode,
+            # Unused by the EDGAR source, which reads sec.gov rather than the
+            # scraper's bucket. Kept on the config so the run manifest and the
+            # rest of the pipeline are shaped identically for both genres.
+            bucket=DEFAULT_BUCKET,
+            cik_file=Path(str(args.cik_file)),
+            start_date=start_date,
+            end_date=end_date,
+            output_root=output_root,
+            force=args.force,
+            batch_size=args.batch_size,
+            failure_file=args.failure_file,
+            form_types=args.form_types,
+            dataset_name=SIXK_DOCUMENT_DATASET_NAME,
+        )
+        logger.info(
+            "Starting 6-K ingest: mode=%s forms=%s start_date=%s end_date=%s index_file=%s output_root=%s",
+            config.mode,
+            ",".join(config.form_types),
+            config.start_date,
+            config.end_date,
+            args.index_file,
+            config.output_root,
+        )
+        _, result = acquire_sixk_documents(
+            config,
+            ciks=read_cik_file(args.cik_file),
+            index_file=args.index_file,
+        )
+    except UndeclaredUserAgentError as exc:
+        logger.error("%s", exc)
+        return 2
+    except ValueError as exc:
+        logger.error("Invalid 6-K ingest arguments: %s", exc)
+        return 2
+    except Exception:
+        logger.exception("6-K ingest failed")
+        return 1
+    finally:
+        release_lease(lease)
+    print(
+        f"Acquired {result.total_rows} 6-K document rows from {result.start_date} "
+        f"through {result.end_date}."
+    )
+    print(f"Documents dataset: {result.documents_root}.")
+    print(f"Mirrored submissions: {mirror_root(result.output_root)}.")
+    print(f"Run manifest: {result.run_manifest}.")
+    print(f"Failure registry: {result.failure_file}.")
+    if result.failures:
+        print(f"Filings that could not be acquired: {result.failures}.")
     return 0
 
 
@@ -766,6 +887,15 @@ def positive_int(value: str) -> int:
         msg = f"expected a positive integer, got {value!r}"
         raise argparse.ArgumentTypeError(msg)
     return parsed
+
+
+def parse_form_types(value: str) -> tuple[str, ...]:
+    """Parse a comma-separated list of SEC form names."""
+    forms = tuple(part.strip() for part in value.split(",") if part.strip())
+    if not forms:
+        msg = "at least one form type is required"
+        raise argparse.ArgumentTypeError(msg)
+    return forms
 
 
 def parse_item_numbers(value: str) -> tuple[str, ...]:

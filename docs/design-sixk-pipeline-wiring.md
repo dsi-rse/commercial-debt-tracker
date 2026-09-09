@@ -339,7 +339,9 @@ following their fake-client pattern:
 1. **Ingest generality.** `form_types`, `dataset_name`, the two new columns.
    Ships alone; the 8-K path is unchanged and provable by the existing suite.
 2. **EDGAR fallback.** `sixk/edgar.py` + mirror. Verifiable without any LLM
-   call: run one day, count rows in `documents-sixk`.
+   call: run one day, count rows in `documents-sixk`. The `cdt ingest-sixk`
+   command moved forward from phase 5 into this phase, because "run one day" is
+   this phase's acceptance check and it needs an entry point.
 3. **The stage.** `sixk/documents.py` + `sixk/stage.py` + tests. Still no
    pipeline change; drive it with `cdt sixk`.
 4. **Extractor source list.** Including the backfill-heuristic fix and its test.
