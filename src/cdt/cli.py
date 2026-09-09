@@ -65,6 +65,8 @@ from cdt.sixk.edgar import (
     acquire_sixk_documents,
     mirror_root,
 )
+from cdt.sixk.stage import DEFAULT_CONCURRENCY as SIXK_DEFAULT_CONCURRENCY
+from cdt.sixk.stage import sixk_snippets_root, triage_pending_documents
 
 ALL_TIME_START_DATE = date(1994, 1, 1)
 DEFAULT_BATCH_SIZE = 100
@@ -240,6 +242,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_logging_arguments(itemize_parser, noun="itemization")
     itemize_parser.set_defaults(func=run_itemize)
+
+    sixk_parser = subparsers.add_parser(
+        "sixk",
+        help="Window and triage 6-K documents into snippet partitions.",
+    )
+    add_artifact_root_argument(sixk_parser)
+    sixk_parser.add_argument(
+        "--batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
+    )
+    sixk_parser.add_argument("--force", action="store_true")
+    sixk_parser.add_argument(
+        "--model-dir",
+        type=Path,
+        default=None,
+        help="Stage-1 artifact directory; defaults to DATA_DIR/models/sixk/...",
+    )
+    sixk_parser.add_argument(
+        "--concurrency",
+        type=positive_int,
+        default=SIXK_DEFAULT_CONCURRENCY,
+        help="Filings whose stage-2 calls may be in flight at once.",
+    )
+    add_logging_arguments(sixk_parser, noun="6-K triage")
+    sixk_parser.set_defaults(func=run_sixk_stage)
 
     classify_parser = subparsers.add_parser(
         "classify", help="Train or run binary item relevance classification."
@@ -618,6 +644,41 @@ def run_pipeline_command(args: argparse.Namespace) -> int:
     )
     print(f"Extractor runs: {result.extractor_run_path}.")
     print(f"Failure registry: {result.ingest.failure_file}.")
+    return 0
+
+
+def run_sixk_stage(args: argparse.Namespace) -> int:
+    """Run the 6-K triage subcommand."""
+    configure_logging(quiet=args.quiet, log_file=args.log_file)
+    logger = logging.getLogger(__name__)
+    artifact_root = args.artifact_root or default_output_root()
+    lease = acquire_stage_lease(artifact_root, logger, "6-K triage")
+    if lease is None:
+        return 1
+    try:
+        logger.info(
+            "Starting 6-K triage: batch_size=%s concurrency=%s force=%s documents=%s output=%s",
+            args.batch_size,
+            args.concurrency,
+            args.force,
+            documents_root(artifact_root, dataset_name=SIXK_DOCUMENT_DATASET_NAME),
+            sixk_snippets_root(artifact_root),
+        )
+        snippets = triage_pending_documents(
+            artifact_root=artifact_root,
+            batch_size=args.batch_size,
+            force=args.force,
+            model_dir=args.model_dir,
+            concurrency=args.concurrency,
+        )
+    except Exception:
+        logger.exception("6-K triage failed")
+        return 1
+    finally:
+        release_lease(lease)
+    relevant = int(snippets["relevance"].fillna(False).sum()) if len(snippets) else 0
+    print(f"Triaged {len(snippets)} admitted 6-K snippets; {relevant} kept.")
+    print(f"Wrote snippet partitions to {sixk_snippets_root(artifact_root)}.")
     return 0
 
 
