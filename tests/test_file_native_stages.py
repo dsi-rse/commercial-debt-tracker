@@ -4661,3 +4661,107 @@ def test_resolve_candidates_attaches_on_name_only_tie_instead_of_seeding() -> No
     assert by_type["member"]["debt_instrument_id"] == "inst-series"
     assert by_type["member"]["match_via"] == "member:name_fingerprint"
     assert by_type["ambiguous_candidate"]["debt_instrument_id"] == "inst-generic"
+
+
+def test_date_payload_verifies_against_every_cited_span() -> None:
+    """A date co-cited with a defined term keeps its value (2026-09 window)."""
+    from cdt.extractor.core import standardized_date_payload
+
+    tags = {
+        "tag-7": {
+            "text": "March 2, 2026",
+            "type": "date",
+            "char_start": 0,
+            "char_end": 13,
+        },
+        "tag-8": {
+            "text": "Redemption Date",
+            "type": "date",
+            "char_start": 20,
+            "char_end": 35,
+        },
+    }
+    payload = standardized_date_payload(
+        {"evidence": ["tag-7", "tag-8"], "normalized_date": "2026-03-02"}, tags
+    )
+    assert payload["normalized_date"] == "2026-03-02"
+    assert payload["derived_from"] == "stated"
+
+
+def test_month_year_maturity_is_read_outside_due_phrases() -> None:
+    """`in March 2056` is a stated month-resolution maturity, not a start date."""
+    from cdt.extractor.core import (
+        normalized_date_from_text,
+        normalized_month_year_from_text,
+        standardized_date_payload,
+    )
+
+    assert normalized_month_year_from_text("in March 2056") == "2056-03-31"
+    assert normalized_month_year_from_text("June 2016") == "2016-06-30"
+    assert normalized_month_year_from_text("Series 2026A") is None
+    assert normalized_month_year_from_text("April 2033 and June 2035") is None
+    assert normalized_date_from_text("in March 2056") is None
+    tags = {
+        "tag-3": {
+            "text": "in March 2056",
+            "type": "date",
+            "char_start": 0,
+            "char_end": 13,
+        }
+    }
+    value = {"evidence": ["tag-3"], "normalized_date": "2056-03-31"}
+    maturity = standardized_date_payload(value, tags, allow_maturity_phrase=True)
+    assert maturity["normalized_date"] == "2056-03-31"
+    assert maturity["derived_from"] == "stated"
+    start = standardized_date_payload(value, tags)
+    assert start["normalized_date"] is None
+
+
+def test_rate_spelled_percent_parses() -> None:
+    """`6.5 percent` is a rate, for the rate payload and the amount guard alike."""
+    from cdt.extractor.core import RATE_PCT_PATTERN, is_rate_like_amount_text
+
+    assert RATE_PCT_PATTERN.findall("6.5 percent senior notes due 2028") == ["6.5"]
+    assert RATE_PCT_PATTERN.findall("4.950% notes") == ["4.950"]
+    assert is_rate_like_amount_text("6.5 percent") is True
+
+
+def test_computed_maturity_accepts_a_cited_date_minus_a_tenor() -> None:
+    """`extended six months to September 3, 2027` anchors the prior maturity (#166)."""
+    from cdt.extractor.core import computed_maturity_date, date_plus_tenor
+
+    assert date_plus_tenor("2027-09-03", (6, "month"), sign=-1) == "2027-03-03"
+    tags = {
+        "tag-1": {
+            "text": "September 3, 2027",
+            "type": "date",
+            "char_start": 0,
+            "char_end": 17,
+        },
+        "tag-2": {
+            "text": "six months",
+            "type": "duration",
+            "char_start": 20,
+            "char_end": 30,
+        },
+    }
+    assert (
+        computed_maturity_date(["tag-1", "tag-2"], tags, "2027-03-03") == "2027-03-03"
+    )
+    assert (
+        computed_maturity_date(["tag-1", "tag-2"], tags, "2028-03-03") == "2028-03-03"
+    )
+    assert computed_maturity_date(["tag-1", "tag-2"], tags, "2027-04-03") is None
+
+
+def test_instrument_ie_accepts_a_bare_object_as_one_entry() -> None:
+    """A bare object is the one-instrument case, not a validation failure."""
+    from cdt.extractor.core import instrument_entries_from_response
+
+    assert instrument_entries_from_response('{"name": ["tag-1"]}') == [
+        {"name": ["tag-1"]}
+    ]
+    assert instrument_entries_from_response('[{"name": ["tag-1"]}]') == [
+        {"name": ["tag-1"]}
+    ]
+    assert instrument_entries_from_response("[]") == []

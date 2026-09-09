@@ -12,7 +12,7 @@ You are an expert in corporate debt financing and SEC disclosure language. You w
 Each tagged span has a unique `id` attribute. Use only those tagged spans and return structured JSON.
 
 ## Task
-Return one JSON object per distinct debt instrument mention cluster in the document.
+Return a JSON array with one object per distinct debt instrument mention cluster in the document: `[ { ... }, { ... } ]`. The array wrapper is required even when there is exactly one instrument (`[ { ... } ]`); return `[]` when there is none.
 
 For each object, extract these properties when present:
 - `name`
@@ -106,7 +106,7 @@ For party properties, return one object per coreference cluster:
 - Never guess a maturity that the document does not state, and never reuse the start date as the end date.
 - If a property is absent, omit it.
 - Do not invent ids, parties, dates, or amounts.
-- Return only valid JSON with no extra text.
+- Return only the JSON array, with no extra text and no bare object outside it.
 
 Selection rules:
 - Ignore debt-like mentions that are only passing background to some other transaction, such as proceeds used to `repay existing indebtedness` or `repay outstanding borrowings` where the older debt is never named with any concrete term.

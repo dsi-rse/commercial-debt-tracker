@@ -9,6 +9,7 @@ import calendar
 import hashlib
 import json
 import re
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -128,7 +129,8 @@ AMOUNT_EVIDENCE_TAG_TYPES = {"amount", "debt_instrument"}
 # from maturity_date instead.
 INTEREST_RATE_KINDS = {"fixed", "floating"}
 INTEREST_RATE_EVIDENCE_TAG_TYPES = {"interest_rate", "debt_instrument"}
-RATE_PCT_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+# `6.5 percent senior notes` spells the marker out; it is still a rate, not an amount.
+RATE_PCT_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*(?:%|percent\b)", re.IGNORECASE)
 # The four instrument categories the site facets on (#156); anything else
 # stays null rather than stretching a bucket.
 INSTRUMENT_TYPES = {
@@ -213,7 +215,7 @@ YEAR_ONLY_MATURITY_SUFFIX = "-12-31"
 # A rate marker counts only where it sits on a number, so the value the parser
 # would read is the rate itself rather than a percentage of something else (#103).
 AMOUNT_VALUE_PATTERN = re.compile(r"\d[\d,]*(?:\.\d+)?")
-RATE_SUFFIX_PATTERN = re.compile(r"\s*(?:%|basis\s+points?\b)", re.IGNORECASE)
+RATE_SUFFIX_PATTERN = re.compile(r"\s*(?:%|percent\b|basis\s+points?\b)", re.IGNORECASE)
 # A principal stated inside an instrument name: `$183.36 million term loan`,
 # `C$300 million notes due 2033`. The currency marker is required, so a coupon
 # rate or a maturity year in the same name cannot be read as the principal.
@@ -246,6 +248,13 @@ MONTH_FIRST_DATE_PATTERN = re.compile(
 # `28 July 2026`, as non-US issuers write it.
 DAY_FIRST_DATE_PATTERN = re.compile(
     r"(?<!\d)(?P<day>\d{1,2})\s+(?P<month>[A-Za-z]+),?\s+(?P<year>\d{4})(?!\d)"
+)
+# `June 2016`, `in March 2056`: a month-resolution date outside an instrument
+# name. #164 only read these after `due`, so `matures in June 2016` and `legal
+# final maturity date is in March 2056` published nothing. Read for maturities
+# only (`normalized_month_year_from_text`), to the month's last day.
+MONTH_YEAR_DATE_PATTERN = re.compile(
+    r"(?<![A-Za-z\d])(?P<month>[A-Za-z]+),?\s+(?P<year>\d{4})(?!\d)"
 )
 MONTH_MAP = {
     "january": "01",
@@ -853,7 +862,7 @@ class InstrumentIEStage:
         if not row_state.ner_tagged_xml:
             return ["ner_tagged_xml is required for instrument_ie validation."]
         try:
-            data = json.loads(response)
+            data = instrument_entries_from_response(response)
         except json.JSONDecodeError as exc:
             return [f"Output is not valid JSON: {exc}"]
         if not isinstance(data, list):
@@ -872,8 +881,10 @@ class InstrumentIEStage:
         if not response:
             return
         try:
-            data = json.loads(response)
+            data = instrument_entries_from_response(response)
         except json.JSONDecodeError:
+            return
+        if not isinstance(data, list):
             return
         _, roundtrip_text, tag_details = parse_tag_details(row_state.ner_tagged_xml)
         # Published evidence offsets index the item's own text, not the model's
@@ -995,7 +1006,7 @@ class InstrumentIEStage:
             "Your previous instrument extraction output failed validation.\n"
             f"Validation errors: {failures}\n"
             "Retry requirements:\n"
-            "- Return one JSON object per concrete debt instrument described as its own obligation.\n"
+            "- Return a JSON array with one object per concrete debt instrument described as its own obligation: `[ { ... } ]` even for a single instrument, `[]` for none.\n"
             "- Ignore collective labels or contextual references that should not become standalone debt instruments.\n"
             "- If one object would have multiple distinct start dates or amounts, split it into separate debt instrument objects.\n"
             "- Shared evidence tags may appear in more than one object when the text supports that.\n"
@@ -1993,6 +2004,20 @@ def _salvage_or_fail(
     return None
 
 
+def instrument_entries_from_response(response: str) -> object:
+    """Parse an instrument_ie response, accepting a bare object as a one-entry list.
+
+    The model returns one object instead of a one-element array on most
+    single-instrument items (73 of 300 on the 2026-09 window, every one of them
+    recovered on retry); the object is the same entry, so it is read as such
+    rather than paid for twice.
+    """
+    data = json.loads(response)
+    if isinstance(data, dict):
+        return [data]
+    return data
+
+
 def salvage_instrument_ie_entries(row_state: ExtractionRowState) -> int | None:
     """Filter the final instrument_ie response down to its valid entries.
 
@@ -2007,7 +2032,7 @@ def salvage_instrument_ie_entries(row_state: ExtractionRowState) -> int | None:
     if not response:
         return None
     try:
-        data = json.loads(response)
+        data = instrument_entries_from_response(response)
     except json.JSONDecodeError:
         return None
     if not isinstance(data, list):
@@ -3161,6 +3186,27 @@ def normalized_date_from_text(text: str | None) -> str | None:
     return None
 
 
+def normalized_month_year_from_text(text: str | None) -> str | None:
+    """Parse a month-resolution date such as `in March 2056` to the month's last day.
+
+    Only maturities accept month resolution (#164): `matures in June 2016` and
+    `legal final maturity date is in March 2056` state the maturity as precisely
+    as the filing ever will, while a start or status date at month resolution
+    would be a guess. A span naming two months names no single date.
+    """
+    if not text:
+        return None
+    found: set[str] = set()
+    for match in MONTH_YEAR_DATE_PATTERN.finditer(text):
+        month = MONTH_MAP.get(match.group("month").lower())
+        if month is None:
+            continue
+        year = int(match.group("year"))
+        last_day = calendar.monthrange(year, int(month))[1]
+        found.add(date(year, int(month), last_day).isoformat())
+    return next(iter(found)) if len(found) == 1 else None
+
+
 def dates_agree(model_date: object, parsed_date: str | None) -> bool:
     """Return whether the model's date is the same day the parser read.
 
@@ -3265,13 +3311,14 @@ def tenor_from_text(text: str | None) -> tuple[int, str] | None:
     return tenors.pop()
 
 
-def date_plus_tenor(start: str, tenor: tuple[int, str]) -> str | None:
-    """Return start advanced by one tenor, clamping to month ends."""
+def date_plus_tenor(start: str, tenor: tuple[int, str], *, sign: int = 1) -> str | None:
+    """Return start moved by one tenor (back when ``sign`` is -1), clamping to month ends."""
     try:
         anchor = date.fromisoformat(start)
     except ValueError:
         return None
     number, unit = tenor
+    number *= sign
     if unit == "day":
         return (anchor + timedelta(days=number)).isoformat()
     months = number * 12 if unit == "year" else number
@@ -3287,7 +3334,7 @@ def computed_maturity_date(
     tag_details: dict[str, dict[str, object]],
     model_date: object,
 ) -> str | None:
-    """Return the model's maturity when it equals a cited start plus tenor (#166).
+    """Return the model's maturity when it equals a cited date plus or minus a tenor (#166).
 
     A filing that states a facility's closing date and its tenor but never the
     maturity supports exactly one arithmetic answer. The model must cite both
@@ -3318,9 +3365,15 @@ def computed_maturity_date(
             tenor = tenor_from_text(text)
             if tenor is not None:
                 tenors.add(tenor)
+    # `extended six months to September 3, 2027` states the prior maturity as
+    # the new one minus the tenor, so the arithmetic runs both ways; each
+    # direction still lands only on a date the cited spans determine exactly.
     for start in starts:
         for tenor in tenors:
-            if date_plus_tenor(start, tenor) == model_date:
+            if model_date in (
+                date_plus_tenor(start, tenor),
+                date_plus_tenor(start, tenor, sign=-1),
+            ):
                 return model_date
     return None
 
@@ -3481,13 +3534,24 @@ def standardized_date_payload(
     """Return evidence payload plus validated normalized date field."""
     evidence_tag_ids = single_value_evidence_tag_ids(value)
     payload = cluster_payload(evidence_tag_ids, tag_details)
-    evidence_text = canonical_value(evidence_tag_ids, tag_details)
-    parsed_date = normalized_date_from_text(evidence_text)
+    # Every cited span is a candidate reading. Checking only the longest span
+    # threw away a correct `March 2, 2026` whenever the model also cited the
+    # defined term `Redemption Date` (the longer string) as evidence for the
+    # same date; the multiple-distinct-values validator already guarantees the
+    # parseable spans agree.
+    span_texts = cluster_span_texts(evidence_tag_ids, tag_details)
+    parsed_date = parsed_date_from_spans(span_texts, normalized_date_from_text)
     derived_from = DERIVED_FROM_STATED if parsed_date is not None else None
+    if parsed_date is None and allow_maturity_phrase:
+        # A stated month-resolution maturity (`in March 2056`) is still stated.
+        parsed_date = parsed_date_from_spans(
+            span_texts, normalized_month_year_from_text
+        )
+        derived_from = DERIVED_FROM_STATED if parsed_date is not None else None
     if parsed_date is None and allow_maturity_phrase:
         # A maturity phrase lives inside the instrument's own name span, so a
         # value parsed this way is name-derived even though evidence is cited.
-        parsed_date = normalized_maturity_from_text(evidence_text)
+        parsed_date = parsed_date_from_spans(span_texts, normalized_maturity_from_text)
         derived_from = DERIVED_FROM_NAME if parsed_date is not None else None
     model_date = value.get("normalized_date") if isinstance(value, dict) else None
     # The parser's own string is published, so a model writing the same day in a
@@ -3499,6 +3563,15 @@ def standardized_date_payload(
         derived_from if payload["normalized_date"] is not None else None
     )
     return payload
+
+
+def parsed_date_from_spans(
+    span_texts: list[str],
+    parser: Callable[[str | None], str | None],
+) -> str | None:
+    """Return the one date the cited spans state, or None when they disagree."""
+    parsed = {value for value in (parser(text) for text in span_texts) if value}
+    return next(iter(parsed)) if len(parsed) == 1 else None
 
 
 def standardized_end_date_payload(
