@@ -1007,10 +1007,19 @@ def validate_cross_field_semantics(*, index: int, obj: dict[str, Any]) -> list[s
             "`repayment` entry in 'amounts' when the document states one; if it states "
             "no figure, the payment is a `retirement` (in full) or nothing."
         )
-    if "repayment" in amount_kinds and "repayment" not in date_kinds and dates:
+    if (
+        "repayment" in amount_kinds
+        and dates
+        and not date_kinds & {"repayment", *TERMINAL_DATE_KINDS}
+    ):
+        # A repayment figure is dated by the payment event that produced it: a
+        # partial paydown (`repayment`) or the retirement/exchange that paid the
+        # rest. Requiring a separate `repayment` date beside a `retirement` made
+        # the model manufacture undated placeholder events (HASI, Smith Micro).
         failures.append(
             f"Entry {index}: a `repayment` amount is an event; add a `repayment` entry to "
-            "'dates' (with `evidence` [] and `normalized_date` null when no date is stated)."
+            "'dates' (with `evidence` [] and `normalized_date` null when no date is stated), "
+            "unless a retirement, termination or exchange entry already dates the payment."
         )
     instrument_type = obj.get("instrument_type")
     for kind in sorted(k for k in amount_kinds if isinstance(k, str)):
@@ -1115,6 +1124,7 @@ class InstrumentIEStage:
         # Published evidence offsets index the item's own text, not the model's
         # whitespace-drifted echo of it (#154).
         tag_details = realign_tag_details(tag_details, roundtrip_text, row_state.text)
+        document_currencies = frozenset(currency_candidates_from_text(row_state.text))
         mention_entries = iter_instrument_entries(
             cast(list[dict[str, Any]], data), tag_details
         )
@@ -1127,6 +1137,7 @@ class InstrumentIEStage:
                 obj,
                 tag_details,
                 name_text=name_text,
+                document_currencies=document_currencies,
             )
             principal = select_principal_amount(amount_payloads)
             date_payloads = standardized_dates_payloads(
@@ -3084,6 +3095,41 @@ def validate_interest_rate(
     return failures
 
 
+# `6 1/2%`, `5 7/8 %`: coupons written as vulgar fractions, common in older
+# indentures and in Targa's note names. Read as a decimal rate.
+FRACTION_RATE_PATTERN = re.compile(
+    r"(\d+)\s+(\d+)\s*/\s*(\d+)\s*(?:%|percent\b)", re.IGNORECASE
+)
+
+
+def rate_tokens(text: str) -> list[str]:
+    """Return every rate figure in a span as a decimal string, fractions included."""
+    tokens: list[str] = []
+    for whole, numerator, denominator in FRACTION_RATE_PATTERN.findall(text):
+        if int(denominator):
+            value = Decimal(whole) + Decimal(numerator) / Decimal(denominator)
+            tokens.append(format(value.normalize(), "f"))
+    stripped = FRACTION_RATE_PATTERN.sub(" ", text)
+    tokens.extend(RATE_PCT_PATTERN.findall(stripped))
+    return tokens
+
+
+def rate_tokens_in_rate_span(text: str) -> list[str]:
+    """Return the rate figures in a span the tagger already typed `interest_rate`.
+
+    A prose span carries its own marker (`4.125%`, `6.5 percent`, `6 1/2%`). A
+    table cell under a `COUPON PCT` header is the bare number `4.125`: the
+    tagger's type is the marker, so a span that is nothing but a number is that
+    rate. FHLB consolidated-obligation schedules lost every coupon this way (47
+    mentions with kind fixed and no pct on the 2026-09 window).
+    """
+    marked = rate_tokens(text)
+    if marked:
+        return marked
+    bare = text.strip()
+    return [bare] if NUMERIC_STRING_PATTERN.fullmatch(bare) else []
+
+
 def standardized_interest_rate_payload(
     value: object,
     tag_details: dict[str, dict[str, object]],
@@ -3108,7 +3154,7 @@ def standardized_interest_rate_payload(
         for tag_id in tag_ids
         if isinstance(tag_id, str)
         and tag_details.get(tag_id, {}).get("type") == "interest_rate"
-        for rate in RATE_PCT_PATTERN.findall(str(tag_details[tag_id]["text"]))
+        for rate in rate_tokens_in_rate_span(str(tag_details[tag_id]["text"]))
     }
     # A rate read off the instrument's own name span is name-derived, exactly
     # like a maturity embedded in `notes due 2028`.
@@ -3117,10 +3163,10 @@ def standardized_interest_rate_payload(
         for tag_id in tag_ids
         if isinstance(tag_id, str)
         and tag_details.get(tag_id, {}).get("type") == "debt_instrument"
-        for rate in RATE_PCT_PATTERN.findall(str(tag_details[tag_id]["text"]))
+        for rate in rate_tokens(str(tag_details[tag_id]["text"]))
     }
     if not stated_rates and not name_rates and name_text:
-        name_rates = set(RATE_PCT_PATTERN.findall(name_text))
+        name_rates = set(rate_tokens(name_text))
     evidence_rates = stated_rates or name_rates
     derived_from = (
         DERIVED_FROM_STATED
@@ -3744,8 +3790,17 @@ def standardized_amount_payload(
     tag_details: dict[str, dict[str, object]],
     *,
     name_text: str | None = None,
+    document_currencies: frozenset[str] | None = None,
 ) -> dict[str, object]:
-    """Return evidence payload plus validated normalized amount fields."""
+    """Return evidence payload plus validated normalized amount fields.
+
+    ``document_currencies`` are the currencies the whole item text evidences.
+    A table cell (`35,000,000` under a `BANK PAR ($)` header) carries no marker
+    of its own, so the model's `USD` used to be rejected and published as null
+    (59 of 901 mentions on the 2026-09 window, all FHLB schedules and one
+    private-credit filer). When the cited span shows no currency and the
+    document as a whole shows exactly one, that one is accepted.
+    """
     evidence_tag_ids = single_value_evidence_tag_ids(value)
     payload = cluster_payload(evidence_tag_ids, tag_details)
     evidence_text = canonical_amount_value(evidence_tag_ids, tag_details)
@@ -3785,6 +3840,13 @@ def standardized_amount_payload(
                 for text in cluster_span_texts(evidence_tag_ids, tag_details)
                 for currency in currency_candidates_from_text(text)
             }
+    if (
+        not parsed_currency_candidates
+        and document_currencies is not None
+        and len(document_currencies) == 1
+        and not is_rate_like_amount_text(evidence_text)
+    ):
+        parsed_currency_candidates = set(document_currencies)
     payload["currency"] = (
         model_currency
         if isinstance(model_currency, str)
@@ -3803,6 +3865,7 @@ def standardized_amounts_payloads(
     tag_details: dict[str, dict[str, object]],
     *,
     name_text: str | None,
+    document_currencies: frozenset[str] | None = None,
 ) -> list[dict[str, object]]:
     """Return the kind-typed amount payloads for one instrument entry (#140).
 
@@ -3821,6 +3884,7 @@ def standardized_amounts_payloads(
                 entry,
                 tag_details,
                 name_text=name_text,
+                document_currencies=document_currencies,
             )
             kind = entry.get("kind")
             payload["kind"] = kind if kind in AMOUNT_KINDS else None
@@ -3841,6 +3905,7 @@ def standardized_amounts_payloads(
             obj.get("amount"),
             tag_details,
             name_text=name_text,
+            document_currencies=document_currencies,
         )
         payload["kind"] = None
         payload["as_of_date"] = None

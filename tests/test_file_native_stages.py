@@ -5542,3 +5542,133 @@ def test_relation_manifest_marks_expected_retirement() -> None:
     assert 'id="i-2"' in manifest and 'expected_retirement="true"' in manifest
     assert manifest.count('expected_retirement="true"') == 1
     assert 'status="announced"' in manifest
+
+
+def test_repayment_amount_is_dated_by_a_terminal_event() -> None:
+    """A repayment figure beside a retirement needs no separate repayment date."""
+    from cdt.extractor.core import validate_cross_field_semantics
+
+    obj = {
+        "dates": [
+            {
+                "kind": "retirement",
+                "evidence": ["tag-2"],
+                "normalized_date": "2026-03-05",
+            }
+        ],
+        "amounts": [
+            {
+                "kind": "repayment",
+                "evidence": ["tag-3"],
+                "normalized_amount": "100000000",
+            }
+        ],
+    }
+    assert validate_cross_field_semantics(index=0, obj=obj) == []
+
+
+def test_table_cells_publish_coupon_and_document_currency() -> None:
+    """FHLB schedules: a bare `4.125` under COUPON PCT is the rate; `($)` in the header is the currency."""
+    from cdt.extractor.core import (
+        currency_candidates_from_text,
+        standardized_amount_payload,
+        standardized_interest_rate_payload,
+    )
+
+    tags = {
+        "tag-51": {
+            "text": "4.125",
+            "type": "interest_rate",
+            "char_start": 0,
+            "char_end": 5,
+        },
+        "tag-52": {
+            "text": "35,000,000",
+            "type": "amount",
+            "char_start": 10,
+            "char_end": 20,
+        },
+        "tag-53": {
+            "text": "4.125% per annum",
+            "type": "interest_rate",
+            "char_start": 30,
+            "char_end": 46,
+        },
+    }
+    rate = standardized_interest_rate_payload(
+        {"kind": "fixed", "rate_pct": "4.125", "evidence": ["tag-51"]},
+        tags,
+        name_text=None,
+    )
+    assert rate["rate_pct"] == "4.125" and rate["derived_from"] == "stated"
+    assert (
+        standardized_interest_rate_payload(
+            {"kind": "fixed", "rate_pct": "4.125", "evidence": ["tag-53"]},
+            tags,
+            name_text=None,
+        )["rate_pct"]
+        == "4.125"
+    )
+    doc = frozenset(currency_candidates_from_text("BANK PAR ($)\n35,000,000"))
+    assert doc == {"USD"}
+    usd = standardized_amount_payload(
+        {
+            "kind": "principal",
+            "evidence": ["tag-52"],
+            "normalized_amount": "35000000",
+            "currency": "USD",
+        },
+        tags,
+        document_currencies=doc,
+    )
+    assert usd["currency"] == "USD"
+    # No document-level evidence, or two currencies in the document: the model's code is still rejected.
+    assert (
+        standardized_amount_payload(
+            {
+                "kind": "principal",
+                "evidence": ["tag-52"],
+                "normalized_amount": "35000000",
+                "currency": "USD",
+            },
+            tags,
+            document_currencies=frozenset(),
+        )["currency"]
+        is None
+    )
+    assert (
+        standardized_amount_payload(
+            {
+                "kind": "principal",
+                "evidence": ["tag-52"],
+                "normalized_amount": "35000000",
+                "currency": "USD",
+            },
+            tags,
+            document_currencies=frozenset({"USD", "CAD"}),
+        )["currency"]
+        is None
+    )
+
+
+def test_fractional_coupons_publish_as_decimal_rates() -> None:
+    """`6 1/2%` and `5 7/8% Senior Notes due 2026` are 6.5 and 5.875, not missing rates."""
+    from cdt.extractor.core import rate_tokens, standardized_interest_rate_payload
+
+    assert rate_tokens("6 1/2%") == ["6.5"]
+    assert rate_tokens("5 7/8 % senior unsecured notes due 2030") == ["5.875"]
+    assert rate_tokens("4.125% per annum") == ["4.125"]
+    tags = {
+        "tag-1": {
+            "text": "5 7/8% Senior Notes due 2026",
+            "type": "debt_instrument",
+            "char_start": 0,
+            "char_end": 28,
+        }
+    }
+    payload = standardized_interest_rate_payload(
+        {"kind": "fixed", "rate_pct": "5.875", "evidence": ["tag-1"]},
+        tags,
+        name_text="5 7/8% Senior Notes due 2026",
+    )
+    assert payload["rate_pct"] == "5.875" and payload["derived_from"] == "name"
