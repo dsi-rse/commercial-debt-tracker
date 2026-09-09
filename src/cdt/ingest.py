@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import gzip
 import json
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from enum import StrEnum
@@ -163,6 +163,44 @@ class DocumentCandidate:
     date: str
     form_type: str = ""
     source: str = DocumentSource.S3_MANIFEST
+
+
+class DocumentCandidateSource(Protocol):
+    """A source of document candidates for one ingest run.
+
+    ``failures`` is read once iteration is done and folded into the run's
+    failure count. A source that only *indexes* filings (the scraper path, where
+    bodies stay in S3 until a stage needs them) reports zero; one that acquires
+    the bodies itself, as the direct-EDGAR 6-K path must, reports what it could
+    not fetch — the same thing ``download=True`` counts.
+    """
+
+    def __iter__(self: Self) -> Iterator[DocumentCandidate]:
+        """Yield the candidates this source acquired."""
+
+    @property
+    def failures(self: Self) -> int:
+        """Return the number of candidates the source could not acquire."""
+
+
+@dataclass(frozen=True)
+class ListCandidateSource:
+    """A source over an already-materialized candidate list."""
+
+    candidates: list[DocumentCandidate]
+
+    def __iter__(self: Self) -> Iterator[DocumentCandidate]:
+        """Yield the listed candidates."""
+        return iter(self.candidates)
+
+    @property
+    def failures(self: Self) -> int:
+        """Return zero: a list cannot have failed to acquire anything.
+
+        Failures on the scraper path are per-manifest and already recorded in
+        the failure registry by the iterator that built the list.
+        """
+        return 0
 
 
 @dataclass(frozen=True)
@@ -369,13 +407,32 @@ def run_ingest_pipeline(
     *,
     ciks: set[str] | None = None,
     s3_client: S3Client | None = None,
+    candidate_source: Callable[[FailureRegistry], DocumentCandidateSource]
+    | None = None,
 ) -> tuple[pd.DataFrame, IngestRunResult]:
-    """Run ingest using an orchestrator-style config object."""
+    """Run ingest using an orchestrator-style config object.
+
+    ``candidate_source`` replaces the scraper-manifest scan with another way of
+    finding filings — the direct-EDGAR 6-K path. It is a factory rather than a
+    source because the failure registry lives here: two registries over one
+    ``failures.json`` would overwrite each other's entries. Everything after the
+    candidates is shared, which is what makes switching sources cheap: accession
+    dedup, batched partition merges, the read-back window and the run manifest
+    do not care where a filing came from.
+    """
     if config.batch_size <= 0:
         msg = f"batch_size must be positive, got {config.batch_size}"
         raise ValueError(msg)
 
-    client = s3_client or default_s3_client(config.aws_profile)
+    # Built on demand: a run that reads EDGAR and writes a local artifact root
+    # has no business constructing an S3 client (or requiring its profile).
+    resolved_client: list[S3Client] = [s3_client] if s3_client is not None else []
+
+    def client() -> S3Client:
+        if not resolved_client:
+            resolved_client.append(default_s3_client(config.aws_profile))
+        return resolved_client[0]
+
     normalized_ciks = _normalize_ciks(ciks)
     output_root = config.output_root or default_output_root(config.data_dir)
     documents_dataset_root = documents_root(
@@ -444,21 +501,29 @@ def run_ingest_pipeline(
         )
         pending_rows = []
 
-    for candidate in iter_document_candidates_for_date_range(
-        client,
-        config.bucket,
-        config.start_date,
-        config.end_date,
-        normalized_ciks,
-        failure_registry=failure_registry,
-        s3_prefix=config.s3_prefix,
-        form_types=config.form_types,
-        # --force retries even permanently registered failures: a variant
-        # document label or a since-fixed scraper bug would otherwise poison a
-        # filing forever, with hand-editing failures.json as the only remedy
-        # (#67). New failures are still recorded through the registry.
-        retry_registered_failures=config.force,
-    ):
+    source: DocumentCandidateSource = (
+        candidate_source(failure_registry)
+        if candidate_source is not None
+        else ListCandidateSource(
+            iter_document_candidates_for_date_range(
+                client(),
+                config.bucket,
+                config.start_date,
+                config.end_date,
+                normalized_ciks,
+                failure_registry=failure_registry,
+                s3_prefix=config.s3_prefix,
+                form_types=config.form_types,
+                # --force retries even permanently registered failures: a
+                # variant document label or a since-fixed scraper bug would
+                # otherwise poison a filing forever, with hand-editing
+                # failures.json as the only remedy (#67). New failures are
+                # still recorded through the registry.
+                retry_registered_failures=config.force,
+            )
+        )
+    )
+    for candidate in source:
         candidates_seen += 1
         if candidate.accession_number in seen_accessions:
             continue
@@ -481,7 +546,7 @@ def run_ingest_pipeline(
         }
         if config.download:
             try:
-                row["text"] = _download_candidate(client, candidate)
+                row["text"] = _download_candidate(client(), candidate)
             except Exception:
                 LOGGER.exception(
                     "Failed to download candidate: accession=%s resource=%s",
@@ -505,6 +570,9 @@ def run_ingest_pipeline(
             flush_pending_rows()
 
     flush_pending_rows()
+    # Folded in after iteration: a source that fetches bodies knows what it
+    # could not acquire, and those filings never reach the loop above.
+    failures += source.failures
     if config.force:
         # A forced re-ingest rewrites every accession under its crc32 shard;
         # copies stored under a pre-#61 salted shard would survive as

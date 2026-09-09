@@ -873,3 +873,120 @@ def test_final_database_root_only_where_honored() -> None:
 
     with pytest.raises(SystemExit):
         parser.parse_args(["itemize", "--final-database-root", "/final"])
+
+
+def test_ingest_sixk_targets_the_sixk_dataset_and_forms(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`cdt ingest-sixk` acquires 6-K forms into the 6-K documents dataset."""
+    calls: list[dict[str, object]] = []
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("312069\n")
+    index_file = tmp_path / "form.idx"
+    index_file.write_text("")
+
+    def fake_acquire_sixk_documents(
+        config: cli.IngestConfig,
+        *,
+        ciks: set[str] | None = None,
+        index_file: Path | None = None,
+    ) -> tuple[pd.DataFrame, IngestRunResult]:
+        calls.append(
+            {
+                "mode": config.mode,
+                "form_types": config.form_types,
+                "dataset_name": config.dataset_name,
+                "start_date": config.start_date,
+                "end_date": config.end_date,
+                "ciks": ciks,
+                "index_file": index_file,
+                "download": config.download,
+            }
+        )
+        return pd.DataFrame(), IngestRunResult(
+            mode=config.mode,
+            start_date=config.start_date,
+            end_date=config.end_date,
+            ciks_count=len(ciks or set()),
+            candidates_seen=1,
+            skipped_existing=0,
+            downloaded=0,
+            failures=0,
+            total_rows=1,
+            output_root=str(tmp_path),
+            documents_root=str(tmp_path / "documents-sixk"),
+            document_partitions=(),
+            failure_file=str(tmp_path / "failures" / "ingest_failures.json"),
+            run_manifest=str(tmp_path / "runs" / "ingest" / "run_id=1.json"),
+            dataset_name="documents-sixk",
+        )
+
+    monkeypatch.setattr(cli, "acquire_sixk_documents", fake_acquire_sixk_documents)
+
+    status = cli.main(
+        [
+            "ingest-sixk",
+            "--artifact-root",
+            str(tmp_path),
+            "--index-file",
+            str(index_file),
+            "--quiet",
+            "historical",
+            str(cik_file),
+            "--start-date",
+            "2026-04-29",
+            "--end-date",
+            "2026-04-30",
+        ]
+    )
+
+    assert status == 0
+    assert calls == [
+        {
+            "mode": "historical",
+            "form_types": ("6-K", "6-K/A"),
+            "dataset_name": "documents-sixk",
+            "start_date": date(2026, 4, 29),
+            "end_date": date(2026, 4, 30),
+            "ciks": {"312069"},
+            "index_file": index_file,
+            # The body is mirrored and read from resource_uri, never inlined.
+            "download": False,
+        }
+    ]
+
+
+def test_ingest_sixk_reports_a_missing_declared_contact_as_a_config_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unset SEC_USER_AGENT exits 2, not 1: it is an argument-shaped fault."""
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("312069\n")
+
+    def fake_acquire_sixk_documents(
+        config: cli.IngestConfig,
+        *,
+        ciks: set[str] | None = None,
+        index_file: Path | None = None,
+    ) -> tuple[pd.DataFrame, IngestRunResult]:
+        del config, ciks, index_file
+        raise cli.UndeclaredUserAgentError("SEC_USER_AGENT is required")
+
+    monkeypatch.setattr(cli, "acquire_sixk_documents", fake_acquire_sixk_documents)
+
+    status = cli.main(
+        [
+            "ingest-sixk",
+            "--artifact-root",
+            str(tmp_path),
+            "--quiet",
+            "historical",
+            str(cik_file),
+            "--start-date",
+            "2026-04-29",
+            "--end-date",
+            "2026-04-29",
+        ]
+    )
+
+    assert status == 2
