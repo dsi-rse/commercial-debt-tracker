@@ -172,6 +172,9 @@ class PreparedMention:
     interest_rate_pct: str | None
     status: str | None
     status_date: str | None
+    # Stage 2: the extractor records a planned redemption or termination as an
+    # `expected` date fact instead of a status; the rollup treats it as pending.
+    expected_retirement: bool
     amendment_of: str | None
     retired_by: tuple[str, ...]
     split_of: str | None
@@ -719,6 +722,8 @@ def event_status_for_instrument(
     pending = False
     for member_id in ordered:
         mention = mention_index[member_id]
+        if mention.expected_retirement:
+            pending = True
         if mention.status is None:
             continue
         if mention.status in TERMINAL_STATUS_EVENTS:
@@ -1775,6 +1780,7 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
         interest_rate_pct=coerce_optional_text(row.get("interest_rate_pct")),
         status=coerce_optional_text(row.get("status")),
         status_date=coerce_optional_text(row.get("status_date")),
+        expected_retirement=expected_retirement_from_dates_json(row.get("dates_json")),
         amendment_of=coerce_optional_text(row.get("amendment_of")),
         retired_by=tuple(json.loads(str(row.get("retired_by_json") or "[]"))),
         split_of=coerce_optional_text(row.get("split_of")),
@@ -1801,6 +1807,25 @@ def mention_sort_key(mention: PreparedMention) -> tuple[str, str, str, str]:
         mention.accession_number or "",
         mention.item_id,
         mention.debt_instrument_mention_id,
+    )
+
+
+EXPECTED_RETIREMENT_KINDS = {"retirement", "termination", "exchange", "default"}
+
+
+def expected_retirement_from_dates_json(value: object) -> bool:
+    """Return whether a mention's date facts include a planned retirement."""
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        facts = json.loads(value)
+    except json.JSONDecodeError:
+        return False
+    return any(
+        isinstance(fact, dict)
+        and fact.get("kind") in EXPECTED_RETIREMENT_KINDS
+        and fact.get("expected") is True
+        for fact in facts
     )
 
 

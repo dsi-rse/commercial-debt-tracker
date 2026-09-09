@@ -4843,7 +4843,8 @@ def test_dates_facts_publish_columns_from_current_closing_and_maturity() -> None
     )
     by_kind = {(p["kind"], p["prior"]): p for p in payloads}
     assert by_kind[("announcement", False)]["normalized_date"] == "2026-03-05"
-    assert by_kind[("expected_closing", False)]["normalized_date"] == "2026-03-12"
+    expected = [p for p in payloads if p["kind"] == "closing" and p["expected"]]
+    assert expected and expected[0]["normalized_date"] == "2026-03-12"
     assert by_kind[("maturity", True)]["normalized_date"] == "2026-06-28"
     assert by_kind[("maturity", False)]["normalized_date"] == "2031-06-23"
     assert by_kind[("maturity", False)]["precision"] == "day"
@@ -4968,3 +4969,252 @@ def test_prior_amounts_never_supply_the_principal() -> None:
     ]
     assert select_principal_amount(payloads)["normalized_amount"] == "50000000"
     assert select_principal_amount(payloads[:1]) == {}
+
+
+def test_status_is_derived_from_event_date_facts() -> None:
+    """Stage 2: the newest completed event decides status; expected events decide nothing."""
+    from cdt.extractor.core import (
+        derived_status_payload,
+        expected_retirement_in_payloads,
+    )
+
+    facts = [
+        {
+            "kind": "closing",
+            "normalized_date": "2023-10-11",
+            "spans": [],
+            "derived_from": "stated",
+            "prior": False,
+            "expected": False,
+        },
+        {
+            "kind": "termination",
+            "normalized_date": "2026-06-02",
+            "spans": [],
+            "derived_from": "stated",
+            "prior": False,
+            "expected": False,
+        },
+    ]
+    status = derived_status_payload(facts)
+    assert (
+        status["status"] == "terminated"
+        and status["status_date"]["normalized_date"] == "2026-06-02"
+    )
+    announced = derived_status_payload(
+        [
+            {
+                "kind": "closing",
+                "normalized_date": "2026-07-06",
+                "spans": [],
+                "derived_from": "stated",
+                "prior": False,
+                "expected": True,
+            }
+        ]
+    )
+    assert announced["status"] == "announced"
+    pending = [
+        {
+            "kind": "retirement",
+            "normalized_date": None,
+            "spans": [],
+            "derived_from": None,
+            "prior": False,
+            "expected": True,
+        }
+    ]
+    assert derived_status_payload(pending)["status"] is None
+    assert expected_retirement_in_payloads(pending) is True
+    undated = [
+        {
+            "kind": "closing",
+            "normalized_date": None,
+            "spans": [],
+            "derived_from": None,
+            "prior": False,
+            "expected": False,
+        },
+        {
+            "kind": "retirement",
+            "normalized_date": None,
+            "spans": [],
+            "derived_from": None,
+            "prior": False,
+            "expected": False,
+        },
+    ]
+    assert derived_status_payload(undated)["status"] == "repaid"
+    assert (
+        derived_status_payload(
+            [
+                {
+                    "kind": "maturity",
+                    "normalized_date": "2031-12-31",
+                    "spans": [],
+                    "derived_from": "name",
+                    "prior": False,
+                    "expected": False,
+                }
+            ]
+        )["status"]
+        is None
+    )
+
+
+def test_parties_list_derives_lender_incompleteness() -> None:
+    """Stage 2: one parties list; the undisclosed-holders flag follows from the lender clusters."""
+    from cdt.extractor.core import party_payloads_and_incompleteness
+
+    tags = {
+        "tag-1": {
+            "text": "JPMorgan Chase Bank, N.A.",
+            "type": "organization",
+            "char_start": 0,
+            "char_end": 25,
+        },
+        "tag-2": {
+            "text": "the other lenders party thereto",
+            "type": "organization",
+            "char_start": 30,
+            "char_end": 61,
+        },
+        "tag-3": {
+            "text": "Wells Fargo Bank",
+            "type": "organization",
+            "char_start": 70,
+            "char_end": 86,
+        },
+        "tag-4": {
+            "text": "The Bank of New York Mellon",
+            "type": "organization",
+            "char_start": 90,
+            "char_end": 117,
+        },
+    }
+    parties, incomplete = party_payloads_and_incompleteness(
+        {
+            "parties": [
+                {"tag_ids": ["tag-1"], "role": "lender"},
+                {"tag_ids": ["tag-2"], "role": "lender", "kind": "collective"},
+            ]
+        },
+        tags,
+    )
+    assert [(p["role"], p["kind"]) for p in parties] == [
+        ("lender", "named"),
+        ("lender", "collective"),
+    ]
+    assert incomplete is True
+    _, complete = party_payloads_and_incompleteness(
+        {
+            "parties": [
+                {"tag_ids": ["tag-1"], "role": "lender"},
+                {"tag_ids": ["tag-3"], "role": "lender", "kind": "named"},
+            ]
+        },
+        tags,
+    )
+    assert complete is False
+    trustee_only, public = party_payloads_and_incompleteness(
+        {"parties": [{"tag_ids": ["tag-4"], "role": "trustee"}]}, tags
+    )
+    assert trustee_only[0]["role"] == "trustee" and public is True
+
+
+def test_lifecycle_treats_expected_retirement_fact_as_pending() -> None:
+    """A planned redemption recorded as an expected date fact keeps the row active."""
+    from cdt.matcher.core import apply_lifecycle_rollup, prepare_mention
+
+    target = prepare_mention(
+        build_mention_row(
+            mention_id="m-t",
+            item_id="item-1",
+            accession_number="0001",
+            cik="320193",
+            date="2026-03-04",
+            name="5.25% Senior Notes due 2027",
+            start_date=None,
+            amount=None,
+        )
+        | {
+            "status": None,
+            "dates_json": json.dumps(
+                [
+                    {
+                        "kind": "retirement",
+                        "normalized_date": None,
+                        "expected": True,
+                        "prior": False,
+                        "spans": [],
+                    }
+                ]
+            ),
+        }
+    )
+    rows = [
+        {
+            "debt_instrument_id": "inst-t",
+            "amendment_of_debt_instrument_id": None,
+            "split_of_debt_instrument_id": None,
+            "retired_by_debt_instrument_ids": '["inst-new"]',
+            "maturity_date": "2027-12-31",
+        }
+    ]
+    apply_lifecycle_rollup(
+        rows, member_groups={"inst-t": ["m-t"]}, mention_index={"m-t": target}
+    )
+    assert rows[0]["status"] == "active"
+
+
+def test_post_filing_closing_is_expected_and_agreement_supplies_start() -> None:
+    """Pilot fixes: a closing dated after the filing is planned; a lone agreement date is the start."""
+    from cdt.extractor.core import (
+        derived_status_payload,
+        mark_post_filing_events_expected,
+        normalized_date_from_text,
+        select_date_payload,
+    )
+
+    facts = [
+        {
+            "kind": "closing",
+            "normalized_date": "2022-04-06",
+            "spans": [],
+            "derived_from": "stated",
+            "prior": False,
+            "expected": False,
+        },
+        {
+            "kind": "announcement",
+            "normalized_date": "2022-03-25",
+            "spans": [],
+            "derived_from": "stated",
+            "prior": False,
+            "expected": False,
+        },
+    ]
+    mark_post_filing_events_expected(facts, "2022-03-25")
+    assert facts[0]["expected"] is True and facts[1]["expected"] is False
+    assert select_date_payload(facts, "closing")["normalized_date"] is None
+    assert derived_status_payload(facts)["status"] == "announced"
+    agreement_only = [
+        {
+            "kind": "agreement",
+            "normalized_date": "2015-02-27",
+            "spans": [],
+            "derived_from": "stated",
+            "prior": False,
+            "expected": False,
+        }
+    ]
+    assert (
+        select_date_payload(agreement_only, "agreement")["normalized_date"]
+        == "2015-02-27"
+    )
+    status = derived_status_payload(agreement_only)
+    assert (
+        status["status"] == "entered_into"
+        and status["status_date"]["normalized_date"] == "2015-02-27"
+    )
+    assert normalized_date_from_text("March 5 , 2026") == "2026-03-05"

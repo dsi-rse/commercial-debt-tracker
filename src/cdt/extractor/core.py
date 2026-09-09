@@ -130,15 +130,70 @@ PRINCIPAL_AMOUNT_KINDS = ("commitment", "principal")
 DATE_KINDS = {
     "agreement",  # the instrument's own `dated as of` date
     "announcement",  # pricing, launch, or commitment-letter date
-    "expected_closing",  # `expected to close on or about`
+    "expected_closing",  # stage-1 shape for `closing` + `expected: true`; replays only
     "closing",  # closing, issuance, funding, or effective date: the start
     "maturity",  # when the borrowed money must be repaid
     "commitment_termination",  # when the lender's obligation to lend ends
+    # Stage 2: events are dated facts too, and the mention's status is derived.
+    "amendment",  # terms modified; the amendment's effective or signing date
+    "repayment",  # a payment that leaves the obligation outstanding
+    "retirement",  # repaid in full, redeemed in whole, defeased, discharged
+    "termination",  # the agreement or facility ended before its scheduled end
+    "exchange",  # satisfied by delivering other securities or equity
+    "default",  # default, event of default, or acceleration
+}
+EVENT_DATE_KINDS = {
+    "announcement",
+    "closing",
+    "amendment",
+    "repayment",
+    "retirement",
+    "termination",
+    "exchange",
+    "default",
+}
+TERMINAL_DATE_KINDS = {"retirement", "termination", "exchange", "default"}
+# Kinds that are only meaningful with a value: a stated maturity without a
+# date is nothing, whereas `the notes were redeemed` with no date is still an
+# event the filing states.
+DATE_KINDS_REQUIRING_EVIDENCE = {"maturity", "commitment_termination", "agreement"}
+# The mention-level `status` column derived from the newest completed event.
+STATUS_FOR_DATE_KIND = {
+    "announcement": "announced",
+    "closing": "entered_into",
+    "amendment": "amended",
+    "retirement": "repaid",
+    "termination": "terminated",
+    "exchange": "exchanged",
+    "default": "defaulted",
+}
+# Ties among undated events resolve by how much the event says about the
+# obligation's life: its end beats a change beats its start.
+EVENT_KIND_PRECEDENCE = {
+    "default": 6,
+    "exchange": 5,
+    "retirement": 4,
+    "termination": 4,
+    "amendment": 3,
+    "closing": 2,
+    "announcement": 1,
 }
 DATE_KIND_EVIDENCE_TAG_TYPES = {
     "maturity": {"date", "debt_instrument", "duration"},
 }
 DEFAULT_DATE_EVIDENCE_TAG_TYPES = {"date"}
+# Stage 2: one `parties` list with a role per cluster replaces `lenders` +
+# `other_interested_parties`; `lenders_known_incomplete` is derived from it.
+PARTY_ROLES = {
+    "lender",
+    "agent",
+    "trustee",
+    "underwriter",
+    "guarantor",
+    "borrower",
+    "other",
+}
+PARTY_KINDS = {"named", "collective"}
 # Published flat columns and the fact kind each one reads.
 DATE_COLUMN_KINDS = {
     "start_date": "closing",
@@ -875,11 +930,60 @@ def validate_instrument_entry(
             )
         )
     failures.extend(
+        validate_parties_property(index=index, obj=obj, tag_details=tag_details)
+    )
+    failures.extend(
         validate_lenders_known_incomplete(
             index=index,
             obj=obj,
         )
     )
+    return failures
+
+
+def validate_parties_property(
+    *,
+    index: int,
+    obj: dict[str, Any],
+    tag_details: dict[str, dict[str, object]],
+) -> list[str]:
+    """Validate the unified `parties` list: role required, kind optional."""
+    if "parties" not in obj:
+        return []
+    value = obj["parties"]
+    if not isinstance(value, list):
+        return [
+            f"Entry {index}: 'parties' must be a list of cluster objects shaped like "
+            '{"tag_ids": ["tag-..."], "role": "...", "kind": "named" | "collective"}.'
+        ]
+    failures: list[str] = []
+    roles = ", ".join(sorted(PARTY_ROLES))
+    for cluster_index, cluster in enumerate(value):
+        location = f"Entry {index}: 'parties'[{cluster_index}]"
+        if not isinstance(cluster, dict):
+            failures.append(f"{location} must be an object with 'tag_ids' and 'role'.")
+            continue
+        if cluster.get("role") not in PARTY_ROLES:
+            failures.append(f"{location} 'role' must be one of {roles}.")
+        if "kind" in cluster and cluster["kind"] not in PARTY_KINDS:
+            failures.append(f"{location} 'kind' must be named or collective.")
+        tag_ids = cluster.get("tag_ids")
+        if not isinstance(tag_ids, list):
+            failures.append(f"{location} 'tag_ids' must be a list of tag IDs.")
+            continue
+        for tag_id in tag_ids:
+            if not isinstance(tag_id, str):
+                failures.append(
+                    f"{location} 'tag_ids' must contain string tag IDs only."
+                )
+                continue
+            tag_info = tag_details.get(tag_id)
+            if tag_info is None:
+                failures.append(f"{location} contains unknown tag ID {tag_id}.")
+            elif tag_info["type"] not in LENDER_TAG_TYPES:
+                failures.append(
+                    f"{location} tag {tag_id} must be person or organization."
+                )
     return failures
 
 
@@ -947,13 +1051,24 @@ class InstrumentIEStage:
                 tag_details,
                 name_text=name_text,
             )
+            mark_post_filing_events_expected(
+                date_payloads, str(row_state.item_row.get("date") or "")
+            )
             start_date_payload = select_date_payload(date_payloads, "closing")
+            if start_date_payload.get("normalized_date") is None:
+                # A facility whose only stated date is its `dated as of` date
+                # started then; the old single slot read it that way too.
+                start_date_payload = select_date_payload(date_payloads, "agreement")
             maturity_payload = select_date_payload(date_payloads, "maturity")
             commitment_termination_payload = select_date_payload(
                 date_payloads, "commitment_termination"
             )
-            status_payload = standardized_status_payload(
-                obj.get("status_event"), tag_details
+            status_payload = (
+                # Stage-2 responses carry events as date facts; anything older
+                # (a status_event, or no dates list at all) replays verbatim.
+                derived_status_payload(date_payloads)
+                if "dates" in obj and "status_event" not in obj
+                else standardized_status_payload(obj.get("status_event"), tag_details)
             )
             interest_rate_payload = standardized_interest_rate_payload(
                 obj.get("interest_rate"),
@@ -2602,14 +2717,26 @@ def validate_dates_property(
         prior = entry.get("prior", False)
         if not isinstance(prior, bool):
             failures.append(f"Entry {index}: '{label}.prior' must be true or false.")
-        elif kind is not None and not prior:
+        elif kind is not None and not prior and kind not in EVENT_DATE_KINDS:
             current_kinds[kind] = current_kinds.get(kind, 0) + 1
+        if not isinstance(entry.get("expected", False), bool):
+            failures.append(f"Entry {index}: '{label}.expected' must be true or false.")
         evidence = entry.get("evidence")
         if not isinstance(evidence, list):
             failures.append(
                 f"Entry {index}: '{label}.evidence' must be a list of tag IDs."
             )
             continue
+        if not evidence:
+            if kind in DATE_KINDS_REQUIRING_EVIDENCE:
+                failures.append(
+                    f"Entry {index}: '{label}' of kind '{kind}' must cite a date span."
+                )
+            if entry.get("normalized_date") is not None:
+                failures.append(
+                    f"Entry {index}: '{label}.normalized_date' must be null when no "
+                    "span is cited."
+                )
         expected_types = DATE_KIND_EVIDENCE_TAG_TYPES.get(
             kind or "", DEFAULT_DATE_EVIDENCE_TAG_TYPES
         )
@@ -3281,7 +3408,8 @@ def normalized_date_from_text(text: str | None) -> str | None:
     """
     if not text:
         return None
-    stripped = text.strip()
+    # `March 5 , 2026` — a stray space before the comma is a formatting artefact.
+    stripped = re.sub(r"\s+,", ",", text.strip())
     iso = LENIENT_ISO_DATE_PATTERN.fullmatch(stripped)
     if iso is not None:
         candidate = iso_date_from_numeric_parts(
@@ -3724,6 +3852,18 @@ def instrument_date_entries(obj: dict[str, Any]) -> list[tuple[str, object, bool
     return entries
 
 
+LEGACY_STATUS_DATE_KINDS = {
+    status: kind for kind, status in STATUS_FOR_DATE_KIND.items()
+}
+
+
+def date_fact_is_expected(kind: str, entry: object) -> bool:
+    """Return whether a fact states a planned date rather than one that occurred."""
+    if kind == "expected_closing":
+        return True
+    return isinstance(entry, dict) and entry.get("expected") is True
+
+
 def date_precision(
     normalized_date: str | None,
     span_texts: list[str],
@@ -3771,7 +3911,8 @@ def standardized_dates_payloads(
             )
         else:
             payload = standardized_date_payload(value, tag_details)
-        payload["kind"] = kind
+        payload["expected"] = date_fact_is_expected(kind, value)
+        payload["kind"] = "closing" if kind == "expected_closing" else kind
         payload["prior"] = prior
         payload["precision"] = date_precision(
             cast(str | None, payload.get("normalized_date")),
@@ -3787,6 +3928,7 @@ def standardized_dates_payloads(
         if synthesized.get("normalized_date") is not None:
             synthesized["kind"] = "maturity"
             synthesized["prior"] = False
+            synthesized["expected"] = False
             synthesized["precision"] = date_precision(
                 cast(str | None, synthesized.get("normalized_date")),
                 [name_text] if name_text else [],
@@ -3799,11 +3941,125 @@ def standardized_dates_payloads(
 def select_date_payload(
     payloads: list[dict[str, object]], kind: str
 ) -> dict[str, object]:
-    """Return the current (non-prior) payload of one kind for the flat columns."""
+    """Return the current (non-prior, not merely expected) payload of one kind."""
     for payload in payloads:
-        if payload.get("kind") == kind and not payload.get("prior"):
+        if (
+            payload.get("kind") == kind
+            and not payload.get("prior")
+            and not payload.get("expected")
+        ):
             return payload
     return {"spans": [], "normalized_date": None, "derived_from": None}
+
+
+def mark_post_filing_events_expected(
+    date_payloads: list[dict[str, object]], filing_date: str
+) -> None:
+    """An event dated after its own filing has not happened yet.
+
+    `Interest on the Notes will accrue from April 6, 2022` in a March 25 pricing
+    8-K and a bond table's settlement dates a week after filing both read as
+    completed closings to the model; the calendar says otherwise.
+    """
+    if not filing_date:
+        return
+    for payload in date_payloads:
+        value = payload.get("normalized_date")
+        if (
+            payload.get("kind") in EVENT_DATE_KINDS
+            and payload.get("kind") != "announcement"
+            and isinstance(value, str)
+            and value > filing_date
+        ):
+            payload["expected"] = True
+
+
+def derived_status_payload(
+    date_payloads: list[dict[str, object]],
+) -> dict[str, object]:
+    """Derive what this mention says happened from its dated event facts.
+
+    The newest completed (not `expected`, not `prior`) event wins; undated
+    events sort with the newest dated one and ties resolve by how much the
+    event says about the obligation's life. A planned retirement or a planned
+    closing decides nothing here — an instrument whose only closing is expected
+    is `announced`, and a pending retirement is left to the matcher, which reads
+    the expected facts off `dates_json`.
+    """
+    completed = [
+        payload
+        for payload in date_payloads
+        if payload.get("kind") in EVENT_DATE_KINDS
+        and not payload.get("prior")
+        and not payload.get("expected")
+        and payload.get("kind") != "repayment"
+    ]
+    if not completed:
+        expected_closing = [
+            payload
+            for payload in date_payloads
+            if payload.get("kind") == "closing" and payload.get("expected")
+        ]
+        if expected_closing:
+            return {
+                "status": "announced",
+                "status_date": {
+                    "spans": [],
+                    "normalized_date": None,
+                    "derived_from": None,
+                },
+                "derived_from_kind": "closing:expected",
+            }
+        agreement = [
+            payload
+            for payload in date_payloads
+            if payload.get("kind") == "agreement" and not payload.get("prior")
+        ]
+        if agreement:
+            # A dated agreement with no other event is an instrument that was
+            # entered into on that date.
+            return {
+                "status": "entered_into",
+                "status_date": {
+                    key: agreement[0].get(key)
+                    for key in ("spans", "normalized_date", "derived_from")
+                },
+                "derived_from_kind": "agreement",
+            }
+        return {"status": None, "status_date": None, "derived_from_kind": None}
+    newest_dated = max(
+        (
+            str(payload["normalized_date"])
+            for payload in completed
+            if payload.get("normalized_date")
+        ),
+        default=None,
+    )
+
+    def rank(payload: dict[str, object]) -> tuple[str, int]:
+        value = payload.get("normalized_date")
+        return (
+            str(value) if value else (newest_dated or ""),
+            EVENT_KIND_PRECEDENCE.get(str(payload.get("kind")), 0),
+        )
+
+    winner = max(completed, key=rank)
+    kind = str(winner["kind"])
+    return {
+        "status": STATUS_FOR_DATE_KIND[kind],
+        "status_date": {
+            key: winner.get(key) for key in ("spans", "normalized_date", "derived_from")
+        },
+        "derived_from_kind": kind,
+    }
+
+
+def expected_retirement_in_payloads(date_payloads: list[dict[str, object]]) -> bool:
+    """Return whether the mention states a planned retirement of the obligation."""
+    return any(
+        payload.get("kind") in TERMINAL_DATE_KINDS and payload.get("expected")
+        for payload in date_payloads
+    )
 
 
 def standardized_end_date_payload(
@@ -3972,6 +4228,40 @@ def party_payloads_and_incompleteness(
                 "spans": payload["spans"],
             }
         )
+    stage2_shape = "parties" in obj or (
+        "dates" in obj
+        and not any(key in obj for key in ("lenders", "other_interested_parties"))
+    )
+    if stage2_shape:
+        # Stage 2 shape: one list, one role per cluster. The undisclosed-holders
+        # flag is derived — a collective lender cluster, or no lender cluster at
+        # all (a public-market series, a syndicate where only the agent is
+        # named), means the document did not name who holds the debt.
+        parties = []
+        raw_parties = obj.get("parties")
+        for cluster in raw_parties if isinstance(raw_parties, list) else []:
+            if not isinstance(cluster, dict):
+                continue
+            payload = cluster_payload(cluster.get("tag_ids"), tag_details)
+            if not payload["spans"]:
+                continue
+            role = cluster.get("role")
+            kind = cluster.get("kind")
+            parties.append(
+                {
+                    "canonical_name": canonical_value(
+                        payload_tag_ids(payload), tag_details
+                    ),
+                    "role": role if role in PARTY_ROLES else "other",
+                    "kind": kind
+                    if kind in PARTY_KINDS
+                    else DEFAULT_LENDER_CLUSTER_KIND,
+                    "spans": payload["spans"],
+                }
+            )
+        lender_kinds = [p["kind"] for p in parties if p["role"] == LENDER_PARTY_ROLE]
+        incomplete = not lender_kinds or COLLECTIVE_LENDER_KIND in lender_kinds
+        return parties, incomplete
     declared_incomplete = obj.get("lenders_known_incomplete") is True
     return parties, has_collective or declared_incomplete
 
