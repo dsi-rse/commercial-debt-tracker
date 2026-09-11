@@ -28,6 +28,12 @@ from cdt.storage import (
 
 LOGGER = get_logger(__name__)
 
+# The 6-K triage stage's output dataset. Named here rather than beside its
+# writer, as the other dataset names are, because the extractor must name it to
+# claim work from it and cannot import `cdt.sixk`: `cdt.sixk.triage` imports
+# `normalize_reasoning_effort` from `cdt.extractor.core`, so the dependency runs
+# the other way. This module is the leaf both sides already import.
+SIXK_SNIPPET_DATASET_NAME = "sixk-snippets"
 ITEMIZE_CLASSIFY_EXTRACT_SHARDS = 8
 MATCH_SHARDS = 64
 PARTITION_PATTERN = re.compile(

@@ -393,6 +393,24 @@ def write_text_artifact(path: ArtifactPath, body: str) -> str:
     return str(local_path)
 
 
+def write_bytes_artifact(path: ArtifactPath, body: bytes) -> str:
+    """Persist raw bytes to local storage or S3.
+
+    Used where a byte-for-byte copy is the point: a mirrored SEC submission is
+    read back through ``ingest.decode_document_bytes``, so re-encoding it here
+    would change the text a stage extracts from.
+    """
+    normalized = normalize_artifact_path(path)
+    if is_s3_uri(normalized):
+        bucket, key = parse_s3_uri(normalized)
+        _s3_client().put_object(Bucket=bucket, Key=key, Body=body)
+        return normalized
+    local_path = Path(normalized)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    local_path.write_bytes(body)
+    return str(local_path)
+
+
 MISSING_TEXT_VALUES = frozenset({"nan", "none", "null", "<na>", "n/a"})
 
 

@@ -24,6 +24,7 @@ from cdt import settings
 from cdt.classifier.core import CLASSIFICATION_DATASET_NAME, CLASSIFIED_ITEM_COLUMNS
 from cdt.datasets import (
     PARTITION_PATTERN,
+    SIXK_SNIPPET_DATASET_NAME,
     CompletedPartition,
     completion_registry_path,
     dataset_root,
@@ -935,6 +936,14 @@ class InstrumentRelationStage:
         )
 
 
+#: Datasets the extractor takes work from, in claim order. Both hold rows in
+#: CLASSIFIED_ITEM_COLUMNS with a `relevance` flag — 8-K items scored by the
+#: item classifier, 6-K windows scored by the two-stage triage — so every stage
+#: below reads them identically and none of them knows which genre it has.
+CLASSIFICATION_SOURCES: tuple[str, ...] = (
+    CLASSIFICATION_DATASET_NAME,
+    SIXK_SNIPPET_DATASET_NAME,
+)
 MENTIONS_DATASET_NAME = "mentions"
 
 # The ordered extraction stages. They are stateless singletons; the resumable
@@ -997,7 +1006,11 @@ def extracted_tables_path(
 
 @dataclass
 class PendingExtractPartition:
-    """One classification partition with extraction work outstanding."""
+    """One source partition with extraction work outstanding.
+
+    ``classification_path`` points into any of CLASSIFICATION_SOURCES; the rows
+    it holds are classification rows either way.
+    """
 
     classification_path: str
     date: str
@@ -1033,18 +1046,26 @@ def pending_extract_partitions(
             "extract", artifact_root=resolved_root, data_dir=data_dir
         )
     )
-    fingerprints = {
-        path: version
-        for path, version in list_artifacts_with_versions(
-            dataset_root(
-                CLASSIFICATION_DATASET_NAME,
-                artifact_root=resolved_root,
-                data_dir=data_dir,
-            ),
-            suffix=".parquet",
-        ).items()
-        if PARTITION_PATTERN.search(path)
-    }
+    fingerprints: dict[str, str | None] = {}
+    # Paths the mentions-backfill adoption below may apply to. Scoped to the 8-K
+    # source deliberately; see the comment at its use.
+    adoptable_paths: set[str] = set()
+    for source in CLASSIFICATION_SOURCES:
+        source_fingerprints = {
+            path: version
+            for path, version in list_artifacts_with_versions(
+                dataset_root(
+                    source,
+                    artifact_root=resolved_root,
+                    data_dir=data_dir,
+                ),
+                suffix=".parquet",
+            ).items()
+            if PARTITION_PATTERN.search(path)
+        }
+        fingerprints.update(source_fingerprints)
+        if source == CLASSIFICATION_DATASET_NAME:
+            adoptable_paths.update(source_fingerprints)
     existing_mention_ids = (
         set()
         if force
@@ -1062,9 +1083,18 @@ def pending_extract_partitions(
         if force or entry is None:
             if (
                 not force
+                and classification_path in adoptable_paths
                 and (partition["date"], partition["shard"]) in existing_mention_ids
             ):
                 # Mentions predate the registry: complete as of this version.
+                #
+                # Only for the 8-K source. Every source writes into one mentions
+                # dataset keyed by (date, shard), so a 6-K snippet partition
+                # sharing a date and shard with already-extracted 8-K mentions
+                # would be adopted as complete here and never extracted — no
+                # error, no rows, nothing to notice. And it cannot be a genuine
+                # backfill: this adoption exists for partitions written before
+                # the registry did, which no 6-K partition can be.
                 registry[classification_path] = CompletedPartition(
                     fingerprint=fingerprint
                 )
