@@ -5851,6 +5851,7 @@ def test_published_instrument_columns_are_pinned() -> None:
         "interest_rate_source_mention_id",
         "parties_json",
         "lender_disclosure",
+        "amendment_inferred_by",
     ]
 
 

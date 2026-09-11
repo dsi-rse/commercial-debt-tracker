@@ -30,6 +30,7 @@ from cdt.extractor.core import (
     LENDER_DISCLOSURE_VALUES,
     MENTIONS_DATASET_NAME,
 )
+from cdt.matcher.lineage_inference import infer_amendment_parents
 from cdt.storage import (
     coerce_dataset_text,
     read_dataset,
@@ -112,6 +113,7 @@ DEBT_INSTRUMENT_COLUMNS = [
     "interest_rate_source_mention_id",
     "parties_json",
     "lender_disclosure",
+    "amendment_inferred_by",
 ]
 MENTION_CLUSTER_EDGE_DATASET_NAME = "mention-cluster-edges"
 DEBT_INSTRUMENT_DATASET_NAME = "debt-instruments"
@@ -261,6 +263,7 @@ def match_pending_mentions(
     strong_match_threshold: float = DEFAULT_MEMBERSHIP_THRESHOLD,
     loose_match_threshold: float = DEFAULT_RELATED_THRESHOLD,
     ambiguity_margin: float = DEFAULT_AMBIGUITY_MARGIN,
+    infer_lineage: bool = False,
     renew: Callable[[], None] | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Match canonical debt instrument mentions into canonical matcher outputs.
@@ -272,6 +275,12 @@ def match_pending_mentions(
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    item_texts: dict[str, str] | None = None
+    if infer_lineage:
+        item_texts = read_item_texts(resolved_root)
+        LOGGER.info(
+            "Lineage inference enabled; loaded text for %s items", len(item_texts)
+        )
     mention_rows = read_dataset(
         dataset_root(
             MENTIONS_DATASET_NAME, artifact_root=resolved_root, data_dir=data_dir
@@ -402,8 +411,16 @@ def match_tables(
     loose_match_threshold: float = DEFAULT_RELATED_THRESHOLD,
     ambiguity_margin: float = DEFAULT_AMBIGUITY_MARGIN,
     company_names: dict[str, str] | None = None,
+    infer_lineage: bool = False,
+    item_texts: dict[str, str] | None = None,
 ) -> dict[str, pd.DataFrame]:
-    """Match in-memory debt instrument mentions into stable debt instrument clusters."""
+    """Match in-memory debt instrument mentions into stable debt instrument clusters.
+
+    ``infer_lineage`` fills amendment pointers the item-scoped relation stage
+    cannot express; see ``cdt.matcher.lineage_inference``. Off by default, so the
+    published contract is unchanged unless a caller opts in. ``item_texts`` maps
+    item_id to filing text and enables the dated-reference rule.
+    """
     if strong_match_threshold < loose_match_threshold:
         raise ValueError("strong_match_threshold must be >= loose_match_threshold")
     if ambiguity_margin < 0:
@@ -2193,3 +2210,99 @@ def name_rates_are_compatible(left: str | None, right: str | None) -> bool:
     if left_rates and right_rates:
         return bool(left_rates & right_rates)
     return True
+
+
+def read_item_texts(artifact_root: str) -> dict[str, str]:
+    """Return item_id -> filing text from the classifications dataset.
+
+    Only the dated-reference lineage rule needs this, so it is read behind the
+    `infer_lineage` flag rather than on every match pass. The matcher otherwise
+    never touches item text, and a production implementation should prefer
+    recording the predecessor reference as an extracted fact (#167) over
+    re-reading the corpus here.
+    """
+    texts: dict[str, str] = {}
+    root = Path(str(artifact_root)) / "classifications"
+    for path in sorted(root.glob("date=*/shard=*/*.parquet")):
+        try:
+            frame = pd.read_parquet(path, columns=["item_id", "text"])
+        except Exception:  # noqa: BLE001 - a malformed partition must not stop matching
+            LOGGER.warning("Could not read item text from %s", path)
+            continue
+        for row in frame.itertuples():
+            if row.item_id and isinstance(row.text, str):
+                texts[str(row.item_id)] = row.text
+    return texts
+
+
+def apply_lineage_inference_pass(artifact_root: str) -> dict[str, int]:
+    """Infer amendment lineage across the whole corpus, after all shards match.
+
+    This cannot run inside `match_tables`: that is called once per shard batch
+    and sees only the clusters a batch touched (measured at 1-7 rows per call on
+    a 364-item window), so no rule can ever see both states of one facility. The
+    rules need every cluster for a CIK at once, which only exists after the shard
+    loop has written them all.
+
+    Rewrites `amendment_of_debt_instrument_id` where it was null and re-derives
+    the rollup columns from the updated pointers, so `superseded_by`,
+    `lineage_family_id`, `is_lineage_head` and `status` stay consistent.
+    """
+    instruments = read_dataset(debt_instruments_root(artifact_root))
+    edges = read_dataset(mention_cluster_edges_root(artifact_root))
+    mentions = read_dataset(
+        dataset_root(MENTIONS_DATASET_NAME, artifact_root=artifact_root),
+        columns=EXTRACTED_MENTION_COLUMNS,
+    )
+    if instruments.empty or edges.empty or mentions.empty:
+        return {"links": 0, "heads_before": 0, "heads_after": 0}
+
+    member_edges = edges[edges["edge_type"] == "member"]
+    member_groups: dict[str, list[str]] = {}
+    for row in member_edges.to_dict("records"):
+        member_groups.setdefault(str(row["debt_instrument_id"]), []).append(
+            str(row["debt_instrument_mention_id"])
+        )
+    mention_index = {
+        str(row["debt_instrument_mention_id"]): prepare_mention(row)
+        for row in mentions.to_dict("records")
+    }
+    rows = instruments.to_dict("records")
+    heads_before = sum(1 for row in rows if row.get("is_lineage_head"))
+
+    inferred = infer_amendment_parents(
+        rows,
+        member_groups=member_groups,
+        mention_index=mention_index,
+        item_texts=read_item_texts(artifact_root),
+    )
+    by_id = {str(row["debt_instrument_id"]): row for row in rows}
+    for child_id, (parent_id, rule) in inferred.items():
+        by_id[child_id]["amendment_of_debt_instrument_id"] = parent_id
+        by_id[child_id]["amendment_inferred_by"] = rule
+
+    apply_lifecycle_rollup(
+        rows, member_groups=member_groups, mention_index=mention_index
+    )
+    heads_after = sum(1 for row in rows if row.get("is_lineage_head"))
+    frame = pd.DataFrame(rows, columns=DEBT_INSTRUMENT_COLUMNS)
+    frame["_shard"] = frame["cik"].map(lambda value: shard_for_cik(str(value)))
+    for cik_shard, shard_rows in frame.groupby("_shard"):
+        write_partition_table(
+            debt_instruments_root(artifact_root),
+            partition={"cik_shard": str(cik_shard)},
+            table=shard_rows.drop(columns=["_shard"]).reindex(
+                columns=DEBT_INSTRUMENT_COLUMNS
+            ),
+        )
+    LOGGER.info(
+        "Lineage inference pass: %s links, heads %s -> %s",
+        len(inferred),
+        heads_before,
+        heads_after,
+    )
+    return {
+        "links": len(inferred),
+        "heads_before": heads_before,
+        "heads_after": heads_after,
+    }

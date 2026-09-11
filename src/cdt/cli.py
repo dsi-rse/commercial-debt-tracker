@@ -54,6 +54,7 @@ from cdt.matcher import (
     match_pending_mentions,
     mention_cluster_edges_root,
 )
+from cdt.matcher.core import apply_lineage_inference_pass
 from cdt.pipeline import (
     ALL_TIME_START_DATE as PIPELINE_ALL_TIME_START_DATE,
 )
@@ -275,6 +276,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--ambiguity-margin",
         type=float,
         default=DEFAULT_AMBIGUITY_MARGIN,
+    )
+    match_parser.add_argument(
+        "--infer-lineage",
+        action="store_true",
+        help=(
+            "fill amendment pointers the item-scoped relation stage cannot "
+            "express (prior-marked terms, amend-and-restate ordinals, "
+            "dated-as-of references); off by default (#170)"
+        ),
     )
     add_logging_arguments(match_parser, noun="matching")
     match_parser.set_defaults(func=run_matcher)
@@ -704,6 +714,14 @@ def run_matcher(args: argparse.Namespace) -> int:
             loose_match_threshold=args.loose_match_threshold,
             ambiguity_margin=args.ambiguity_margin,
         )
+        if args.infer_lineage:
+            stats = apply_lineage_inference_pass(str(artifact_root))
+            logger.info(
+                "Lineage inference: %s links, lineage heads %s -> %s",
+                stats["links"],
+                stats["heads_before"],
+                stats["heads_after"],
+            )
     except Exception:
         logger.exception("Matcher failed")
         return 1
