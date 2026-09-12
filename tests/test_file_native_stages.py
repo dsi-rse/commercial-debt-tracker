@@ -25,6 +25,7 @@ from cdt.datasets import (
 )
 from cdt.extractor import extract_pending_items, mentions_root
 from cdt.extractor.core import (
+    DEBT_INSTRUMENT_MENTION_COLUMNS,
     INSTRUMENT_RELATION_TYPES,
     CompletionResult,
     ExtractionRowState,
@@ -32,21 +33,29 @@ from cdt.extractor.core import (
     InstrumentRelationStage,
     NERStage,
     canonical_amount_value,
+    canonical_instrument_name,
     completion_result_from_batch_line,
     completion_result_from_response,
     currency_candidates_from_text,
     currency_from_name,
+    date_plus_tenor,
     dates_agree,
     is_rate_like_amount_text,
     load_prompt,
+    name_derived_principal_payload,
     normalized_amount_from_name,
     normalized_amount_from_text,
     normalized_date_from_text,
     normalized_maturity_from_text,
+    normalized_month_year_from_text,
     oriented_lineage_pair,
     parse_tag_details,
+    realign_tag_details,
     repair_unescaped_ampersands,
     validate_amount_is_not_rate,
+    validate_dates_property,
+    validate_interest_rate,
+    validate_parties_property,
 )
 from cdt.ingest import DOCUMENT_COLUMNS
 from cdt.itemizer import core as itemizer_core
@@ -57,6 +66,9 @@ from cdt.matcher import (
     mention_matches_root,
 )
 from cdt.matcher.core import (
+    DEBT_INSTRUMENT_COLUMNS,
+    MATCHER_SCHEMA_VERSION,
+    MENTION_CLUSTER_EDGE_COLUMNS,
     coerce_optional_text,
     company_names_by_cik,
     lender_signature,
@@ -197,32 +209,44 @@ def build_mention_row(
     start_date: str,
     amount: str,
     parties_json: str = "[]",
-    lenders_known_incomplete: bool = False,
+    lender_disclosure: str = "complete",
     company_name: str | None = "Example Inc.",
+    **overrides: object,
 ) -> dict[str, object]:
-    """Return one canonical mention row for matcher tests."""
-    return {
-        "debt_instrument_mention_id": mention_id,
-        "item_id": item_id,
-        "accession_number": accession_number,
-        "cik": cik,
-        "company_name": company_name,
-        "date": date,
-        "raw_id": "i-1",
-        "name": name,
-        "start_date": start_date,
-        "maturity_date": None,
-        "principal_amount": amount,
-        "amendment_of": None,
-        "retired_by_json": "[]",
-        "split_of": None,
-        "parties_json": parties_json,
-        "lenders_known_incomplete": lenders_known_incomplete,
-        "name_json": "{}",
-        "start_date_json": "{}",
-        "maturity_date_json": "{}",
-        "amounts_json": "[]",
-    }
+    """Return one canonical mention row for matcher tests.
+
+    Built from `DEBT_INSTRUMENT_MENTION_COLUMNS` so every published column is
+    present. Listing only the columns a test happened to need let a renamed or
+    dropped column pass unnoticed: `prepare_mention` reads them all with
+    `row.get`, so an absent one silently became None.
+    """
+    row: dict[str, object] = dict.fromkeys(DEBT_INSTRUMENT_MENTION_COLUMNS)
+    row.update(
+        {
+            "debt_instrument_mention_id": mention_id,
+            "item_id": item_id,
+            "accession_number": accession_number,
+            "cik": cik,
+            "company_name": company_name,
+            "date": date,
+            "raw_id": "i-1",
+            "name": name,
+            "start_date": start_date,
+            "principal_amount": amount,
+            "retired_by_json": "[]",
+            "parties_json": parties_json,
+            "lender_disclosure": lender_disclosure,
+            "name_json": "{}",
+            "start_date_json": "{}",
+            "maturity_date_json": "{}",
+            "amounts_json": "[]",
+            "dates_json": "[]",
+        }
+    )
+    unknown = set(overrides) - set(DEBT_INSTRUMENT_MENTION_COLUMNS)
+    assert not unknown, f"not published mention columns: {sorted(unknown)}"
+    row.update(overrides)
+    return row
 
 
 def test_coerce_dataset_text_treats_placeholder_values_as_missing() -> None:
@@ -1053,7 +1077,7 @@ def test_instrument_ie_postprocess_persists_every_party_with_role_and_kind() -> 
         set(party) == {"canonical_name", "role", "kind", "spans"} for party in parties
     )
     assert all(party["canonical_name"] for party in parties)
-    assert mention["lenders_known_incomplete"] is True
+    assert mention["lender_disclosure"] == "collective_present"
 
 
 def test_instrument_ie_postprocess_leaves_named_only_lenders_unflagged() -> None:
@@ -1069,7 +1093,7 @@ def test_instrument_ie_postprocess_leaves_named_only_lenders_unflagged() -> None
         )
     )
 
-    assert mention["lenders_known_incomplete"] is False
+    assert mention["lender_disclosure"] == "complete"
     assert len(json.loads(str(mention["parties_json"]))) == 1
 
 
@@ -1087,7 +1111,7 @@ def test_instrument_ie_postprocess_honors_declared_incompleteness() -> None:
         )
     )
 
-    assert mention["lenders_known_incomplete"] is True
+    assert mention["lender_disclosure"] == "collective_present"
     assert len(json.loads(str(mention["parties_json"]))) == 1
 
 
@@ -1110,7 +1134,7 @@ def test_instrument_ie_postprocess_keeps_collective_lenders_and_flags() -> None:
     assert [(party["role"], party["kind"]) for party in parties] == [
         ("lender", "collective")
     ]
-    assert mention["lenders_known_incomplete"] is True
+    assert mention["lender_disclosure"] == "collective_present"
 
 
 def test_instrument_ie_postprocess_keeps_the_borrower_with_its_role() -> None:
@@ -1156,7 +1180,7 @@ def test_lender_signature_uses_stored_lender_clusters() -> None:
     assert lender_signature(payload) == "acme bank"
 
 
-def test_match_pending_mentions_carries_lender_incompleteness(tmp_path: Path) -> None:
+def test_match_pending_mentions_carries_lender_disclosure(tmp_path: Path) -> None:
     """Matcher output should carry mention-level lender incompleteness forward."""
     mention_rows = pd.DataFrame(
         [
@@ -1172,7 +1196,7 @@ def test_match_pending_mentions_carries_lender_incompleteness(tmp_path: Path) ->
                 parties_json=(
                     '[{"mentions": [{"text": "Acme Bank"}], "tag_ids": ["tag-l-1"]}]'
                 ),
-                lenders_known_incomplete=True,
+                lender_disclosure="collective_present",
             )
         ]
     )
@@ -1185,7 +1209,7 @@ def test_match_pending_mentions_carries_lender_incompleteness(tmp_path: Path) ->
     match_pending_mentions(artifact_root=tmp_path, batch_size=5)
 
     written_instruments = read_dataset(debt_instruments_root(tmp_path))
-    assert written_instruments["lenders_known_incomplete"].to_list() == [True]
+    assert written_instruments["lender_disclosure"].to_list() == ["collective_present"]
 
 
 def test_instrument_ie_validate_rejects_conflicting_start_dates() -> None:
@@ -5159,9 +5183,9 @@ def test_status_is_derived_from_event_date_facts() -> None:
     )
 
 
-def test_parties_list_derives_lender_incompleteness() -> None:
-    """Stage 2: one parties list; the undisclosed-holders flag follows from the lender clusters."""
-    from cdt.extractor.core import party_payloads_and_incompleteness
+def test_parties_list_derives_lender_disclosure() -> None:
+    """Stage 2: one parties list, and disclosure distinguishes its three states."""
+    from cdt.extractor.core import party_payloads_and_disclosure
 
     tags = {
         "tag-1": {
@@ -5189,7 +5213,7 @@ def test_parties_list_derives_lender_incompleteness() -> None:
             "char_end": 117,
         },
     }
-    parties, incomplete = party_payloads_and_incompleteness(
+    parties, disclosure = party_payloads_and_disclosure(
         {
             "parties": [
                 {"tag_ids": ["tag-1"], "role": "lender"},
@@ -5202,8 +5226,8 @@ def test_parties_list_derives_lender_incompleteness() -> None:
         ("lender", "named"),
         ("lender", "collective"),
     ]
-    assert incomplete is True
-    _, complete = party_payloads_and_incompleteness(
+    assert disclosure == "collective_present"
+    _, every_lender_named = party_payloads_and_disclosure(
         {
             "parties": [
                 {"tag_ids": ["tag-1"], "role": "lender"},
@@ -5212,11 +5236,77 @@ def test_parties_list_derives_lender_incompleteness() -> None:
         },
         tags,
     )
-    assert complete is False
-    trustee_only, public = party_payloads_and_incompleteness(
+    assert every_lender_named == "complete"
+    trustee_only, no_lender = party_payloads_and_disclosure(
         {"parties": [{"tag_ids": ["tag-4"], "role": "trustee"}]}, tags
     )
-    assert trustee_only[0]["role"] == "trustee" and public is True
+    assert trustee_only[0]["role"] == "trustee"
+    # A trustee-only indenture names nobody who holds the debt. Under the
+    # boolean this replaced, that read the same as a collective phrase.
+    assert no_lender == "none_named"
+
+
+def test_current_shape_entry_without_parties_or_dates_is_not_legacy() -> None:
+    """An entry omitting both keys is current-schema, so disclosure is derived.
+
+    The prompt tells the model to omit a property the document says nothing
+    about, so `{name, instrument_type, amounts}` is an ordinary response.
+    Inferring the shape from the *presence* of `parties`/`dates` sent it down
+    the legacy path, which published "every lender named" next to an empty
+    party list.
+    """
+    from cdt.extractor.core import party_payloads_and_disclosure
+
+    parties, disclosure = party_payloads_and_disclosure(
+        {"name": ["tag-i-1"], "instrument_type": "revolving_credit", "amounts": []},
+        {},
+    )
+    assert parties == []
+    assert disclosure == "none_named"
+
+
+def test_legacy_declared_incompleteness_maps_onto_the_three_values() -> None:
+    """A stored response's declared boolean still replays, onto the new field."""
+    from cdt.extractor.core import party_payloads_and_disclosure
+
+    tags = {
+        "tag-1": {
+            "text": "JPMorgan Chase Bank, N.A.",
+            "type": "organization",
+            "char_start": 0,
+            "char_end": 25,
+        },
+    }
+    _, declared = party_payloads_and_disclosure(
+        {"lenders": [["tag-1"]], "lenders_known_incomplete": True}, tags
+    )
+    assert declared == "collective_present"
+    _, undeclared = party_payloads_and_disclosure(
+        {"lenders": [["tag-1"]], "lenders_known_incomplete": False}, tags
+    )
+    assert undeclared == "complete"
+    _, nobody = party_payloads_and_disclosure(
+        {"lenders": [], "lenders_known_incomplete": False}, tags
+    )
+    assert nobody == "none_named"
+
+
+def test_aggregate_lender_disclosure_precedence() -> None:
+    """Worst-of across an instrument's mentions, `complete` beating `none_named`."""
+    from cdt.matcher.core import aggregate_lender_disclosure
+
+    assert aggregate_lender_disclosure(["complete", "none_named"]) == "complete"
+    assert (
+        aggregate_lender_disclosure(["complete", "collective_present"])
+        == "collective_present"
+    )
+    assert (
+        aggregate_lender_disclosure(["none_named", "collective_present"])
+        == "collective_present"
+    )
+    assert aggregate_lender_disclosure(["none_named"]) == "none_named"
+    # A missing or unrecognized value cannot invent a complete syndicate list.
+    assert aggregate_lender_disclosure([None, "junk"]) == "none_named"
 
 
 def test_lifecycle_treats_expected_retirement_fact_as_pending() -> None:
@@ -5672,3 +5762,948 @@ def test_fractional_coupons_publish_as_decimal_rates() -> None:
         name_text="5 7/8% Senior Notes due 2026",
     )
     assert payload["rate_pct"] == "5.875" and payload["derived_from"] == "name"
+
+
+# --- Published schema contract -------------------------------------------------
+# Nothing referenced these lists, so dropping a column from either silently
+# dropped the data: `match_tables` publishes via
+# `pd.DataFrame(rows, columns=DEBT_INSTRUMENT_COLUMNS)`.
+
+
+def test_published_mention_columns_are_pinned() -> None:
+    """The mention schema is a contract; a rename must fail here first."""
+    assert DEBT_INSTRUMENT_MENTION_COLUMNS == [
+        "debt_instrument_mention_id",
+        "item_id",
+        "accession_number",
+        "cik",
+        "company_name",
+        "date",
+        "raw_id",
+        "name",
+        "instrument_type",
+        "start_date",
+        "maturity_date",
+        "commitment_termination_date",
+        "principal_amount",
+        "principal_currency",
+        "principal_amount_kind",
+        "status",
+        "status_date",
+        "interest_rate_kind",
+        "interest_rate_pct",
+        "amendment_of",
+        "retired_by_json",
+        "split_of",
+        "parties_json",
+        "name_json",
+        "start_date_json",
+        "maturity_date_json",
+        "commitment_termination_date_json",
+        "amounts_json",
+        "status_json",
+        "interest_rate_json",
+        "dates_json",
+        "lender_disclosure",
+    ]
+
+
+def test_published_instrument_columns_are_pinned() -> None:
+    """The instrument schema is what the dashboard publisher reads (#151, #155)."""
+    assert DEBT_INSTRUMENT_COLUMNS == [
+        "debt_instrument_id",
+        "cik",
+        "company_name",
+        "seed_debt_instrument_mention_id",
+        "amendment_of_debt_instrument_id",
+        "retired_by_debt_instrument_ids",
+        "split_of_debt_instrument_id",
+        "superseded_by_debt_instrument_id",
+        "lineage_family_id",
+        "is_lineage_head",
+        "status",
+        "status_date",
+        "status_source_mention_id",
+        "first_seen_filing_date",
+        "last_seen_filing_date",
+        "mention_count",
+        "document_count",
+        "name",
+        "name_source_mention_id",
+        "instrument_type",
+        "instrument_type_source_mention_id",
+        "start_date",
+        "start_date_source_mention_id",
+        "maturity_date",
+        "maturity_source_mention_id",
+        "commitment_termination_date",
+        "commitment_termination_source_mention_id",
+        "principal_amount",
+        "principal_currency",
+        "principal_amount_kind",
+        "principal_source_mention_id",
+        "outstanding_balance",
+        "outstanding_balance_currency",
+        "outstanding_balance_as_of",
+        "outstanding_balance_source_mention_id",
+        "interest_rate_kind",
+        "interest_rate_pct",
+        "interest_rate_source_mention_id",
+        "parties_json",
+        "lender_disclosure",
+    ]
+
+
+def test_matcher_schema_version_is_pinned() -> None:
+    """The version is how a downstream reader learns a rebuild is required."""
+    assert MATCHER_SCHEMA_VERSION == 4
+
+
+def test_match_tables_publishes_exactly_the_declared_columns() -> None:
+    """A column removed from the list would otherwise vanish without a failure."""
+    tables = match_tables(
+        pd.DataFrame(
+            [
+                build_mention_row(
+                    mention_id="m-1",
+                    item_id="item-1",
+                    accession_number="0001",
+                    cik="0000320193",
+                    date="2024-01-02",
+                    name="7% Senior Notes due 2030",
+                    start_date="2024-01-01",
+                    amount="500000000",
+                )
+            ]
+        )
+    )
+    assert list(tables["debt_instrument"].columns) == DEBT_INSTRUMENT_COLUMNS
+    assert (
+        list(tables["debt_instrument_mentions"].columns) == MENTION_CLUSTER_EDGE_COLUMNS
+    )
+
+
+def test_published_evidence_spans_index_the_item_text_exactly() -> None:
+    """#154's contract, asserted on a published payload rather than the helper.
+
+    Every other span assertion in this suite projects to `tag_id` or `text`, so
+    stripping the offsets out of `cluster_payload` entirely went unnoticed.
+    """
+    item_text = (
+        "On March 5, 2026 the Company entered into a $500,000,000 term loan "
+        "under the Credit Agreement."
+    )
+    tagged = (
+        '<document>On <date id="tag-d-1">March 5, 2026</date> the Company '
+        'entered into a <amount id="tag-a-1">$500,000,000</amount> '
+        '<debt_instrument id="tag-i-1">term loan</debt_instrument> under the '
+        "Credit Agreement.</document>"
+    )
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1", "text": item_text, "date": "2026-03-10"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = tagged
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "instrument_type": "term_loan",
+                "amounts": [
+                    {
+                        "kind": "principal",
+                        "evidence": ["tag-a-1"],
+                        "normalized_amount": "500000000",
+                        "currency": "USD",
+                    }
+                ],
+                "dates": [
+                    {
+                        "kind": "closing",
+                        "evidence": ["tag-d-1"],
+                        "normalized_date": "2026-03-05",
+                    }
+                ],
+                "parties": [],
+            }
+        ]
+    )
+    InstrumentIEStage().postprocess(row_state)
+    mention = row_state.debt_instrument_mentions[0]
+
+    checked = 0
+    for column in ("name_json", "amounts_json", "dates_json", "start_date_json"):
+        payload = json.loads(str(mention[column]))
+        for entry in payload if isinstance(payload, list) else [payload]:
+            for span in entry.get("spans", []):
+                assert (
+                    item_text[span["char_start"] : span["char_end"]] == span["text"]
+                ), f"{column} span does not index the item text"
+                checked += 1
+    assert checked >= 3
+
+
+def test_instrument_rollup_publishes_balance_and_rate_columns() -> None:
+    """The seven #140/#157 instrument columns had no test at all."""
+    from cdt.matcher.core import build_debt_instrument_rows, prepare_mention
+
+    older = prepare_mention(
+        build_mention_row(
+            mention_id="m-old",
+            item_id="item-1",
+            accession_number="0001",
+            cik="0000320193",
+            date="2026-01-01",
+            name="Revolving Credit Facility",
+            start_date="2024-01-01",
+            amount="300000000",
+            interest_rate_kind="fixed",
+            interest_rate_pct="7.000",
+            amounts_json=json.dumps(
+                [
+                    {
+                        "kind": "outstanding_balance",
+                        "normalized_amount": "270500000",
+                        "currency": "USD",
+                        "as_of_date": None,
+                    }
+                ]
+            ),
+        )
+    )
+    rows = build_debt_instrument_rows(
+        {"inst-1": ["m-old"]},
+        {"m-old": older},
+        {},
+        existing_instruments=pd.DataFrame(),
+        company_names={},
+    )
+    row = rows[0]
+    assert row["outstanding_balance"] == "270500000"
+    assert row["outstanding_balance_currency"] == "USD"
+    # An undated balance is bounded by the filing that observed it.
+    assert row["outstanding_balance_as_of"] == "2026-01-01"
+    assert row["outstanding_balance_source_mention_id"] == "m-old"
+    assert row["interest_rate_kind"] == "fixed"
+    assert row["interest_rate_pct"] == "7.000"
+    assert row["interest_rate_source_mention_id"] == "m-old"
+    # A balance is never the headline amount (#140).
+    assert row["principal_amount"] == "300000000"
+
+
+# --- Lifecycle rollup: the branches the hand-built fixtures never reached ------
+
+
+def _rollup_row(row_id: str, **overrides: object) -> dict[str, object]:
+    """Return one bare instrument row for `apply_lifecycle_rollup`."""
+    row: dict[str, object] = {
+        "debt_instrument_id": row_id,
+        "amendment_of_debt_instrument_id": None,
+        "split_of_debt_instrument_id": None,
+        "retired_by_debt_instrument_ids": None,
+        "maturity_date": None,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_lineage_family_id_is_the_lowest_member_id_not_merely_shared() -> None:
+    """Asserting only that a family is *shared* let `min` become `max`."""
+    from cdt.matcher.core import apply_lifecycle_rollup
+
+    rows = [
+        _rollup_row("zzz-parent"),
+        _rollup_row("mmm-child", amendment_of_debt_instrument_id="zzz-parent"),
+        _rollup_row("aaa-grandchild", amendment_of_debt_instrument_id="mmm-child"),
+    ]
+    apply_lifecycle_rollup(rows, member_groups={}, mention_index={})
+
+    assert {row["lineage_family_id"] for row in rows} == {"aaa-grandchild"}
+
+
+def test_lineage_families_span_retirement_and_split_pointers() -> None:
+    """Only amendment edges were exercised, so dropping the other two passed."""
+    from cdt.matcher.core import apply_lifecycle_rollup
+
+    retired = _rollup_row(
+        "b-retired", retired_by_debt_instrument_ids=json.dumps(["a-retirer"])
+    )
+    retirer = _rollup_row("a-retirer")
+    split_child = _rollup_row("d-split", split_of_debt_instrument_id="c-parent")
+    split_parent = _rollup_row("c-parent")
+    rows = [retired, retirer, split_child, split_parent]
+    apply_lifecycle_rollup(rows, member_groups={}, mention_index={})
+
+    assert retired["lineage_family_id"] == retirer["lineage_family_id"] == "a-retirer"
+    assert split_child["lineage_family_id"] == split_parent["lineage_family_id"]
+    assert split_child["lineage_family_id"] == "c-parent"
+    # A retirement is not an amendment, so neither row is superseded by it.
+    assert retired["superseded_by_debt_instrument_id"] is None
+    assert retired["is_lineage_head"] is True
+
+
+def test_two_amendment_children_publish_no_superseded_pointer() -> None:
+    """An ambiguous inverse publishes nothing, as the parent pointers do."""
+    from cdt.matcher.core import apply_lifecycle_rollup
+
+    parent = _rollup_row("p")
+    rows = [
+        parent,
+        _rollup_row("c1", amendment_of_debt_instrument_id="p"),
+        _rollup_row("c2", amendment_of_debt_instrument_id="p"),
+    ]
+    apply_lifecycle_rollup(rows, member_groups={}, mention_index={})
+
+    assert parent["superseded_by_debt_instrument_id"] is None
+    # The rollup still knows the row was replaced, so it is not a live head.
+    assert parent["is_lineage_head"] is False
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Known: `derive_instrument_status` reads the nulled pointer, not the "
+        "child set, so a parent with two amendment children publishes `active` "
+        "while being excluded from every is_lineage_head view — unreachable "
+        "either way. Fix is in matcher/core.py, outside this commit's scope."
+    ),
+)
+def test_two_amendment_children_leave_no_unreachable_parent() -> None:
+    """A row replaced by two amendments must not read as a live obligation."""
+    from cdt.matcher.core import apply_lifecycle_rollup
+
+    parent = _rollup_row("p")
+    rows = [
+        parent,
+        _rollup_row("c1", amendment_of_debt_instrument_id="p"),
+        _rollup_row("c2", amendment_of_debt_instrument_id="p"),
+    ]
+    apply_lifecycle_rollup(rows, member_groups={}, mention_index={})
+
+    assert parent["status"] == "superseded"
+
+
+def test_first_and_last_seen_span_distinct_filing_dates() -> None:
+    """Both fixture mentions shared a date, so a swap was invisible."""
+    from cdt.matcher.core import apply_lifecycle_rollup, prepare_mention
+
+    def mention(mention_id: str, accession: str, date: str) -> object:
+        return prepare_mention(
+            build_mention_row(
+                mention_id=mention_id,
+                item_id=f"item-{accession}",
+                accession_number=accession,
+                cik="0000320193",
+                date=date,
+                name="7% Senior Notes due 2030",
+                start_date="2024-01-01",
+                amount="500000000",
+            )
+        )
+
+    rows = [_rollup_row("inst-1")]
+    apply_lifecycle_rollup(
+        rows,
+        member_groups={"inst-1": ["m-a", "m-b", "m-c"]},
+        mention_index={
+            "m-a": mention("m-a", "0002", "2024-03-01"),
+            "m-b": mention("m-b", "0001", "2024-01-15"),
+            "m-c": mention("m-c", "0002", "2024-06-30"),
+        },
+    )
+    row = rows[0]
+    assert row["first_seen_filing_date"] == "2024-01-15"
+    assert row["last_seen_filing_date"] == "2024-06-30"
+    assert row["mention_count"] == 3
+    # Three mentions, two filings.
+    assert row["document_count"] == 2
+
+
+def test_superseded_wins_over_a_retirement_pointer() -> None:
+    """Leg order: no fixture had both, so reordering them passed."""
+    from cdt.matcher.core import derive_instrument_status
+
+    row = {
+        "debt_instrument_id": "p",
+        "superseded_by_debt_instrument_id": "c",
+        "retired_by_debt_instrument_ids": json.dumps(["r"]),
+        "maturity_date": None,
+    }
+    status, _, _ = derive_instrument_status(
+        row,
+        [],
+        {},
+        reference_date="2026-01-01",
+        event_result=None,
+        retirement_pending=False,
+        announced_instrument_ids=set(),
+    )
+    assert status == "superseded"
+
+
+def test_a_retirement_by_an_announced_instrument_is_not_yet_repaid() -> None:
+    """The announced-retirer guard, reached without `retirement_pending` masking it.
+
+    The existing test's row was already pending, so `retired_by and not
+    retirement_pending` short-circuited and this guard never ran.
+    """
+    from cdt.matcher.core import derive_instrument_status
+
+    row = {
+        "debt_instrument_id": "old",
+        "superseded_by_debt_instrument_id": None,
+        "retired_by_debt_instrument_ids": json.dumps(["new"]),
+        "maturity_date": None,
+    }
+    kwargs = {
+        "reference_date": "2026-01-01",
+        "event_result": None,
+        "retirement_pending": False,
+    }
+    unclosed, _, _ = derive_instrument_status(
+        row, [], {}, announced_instrument_ids={"new"}, **kwargs
+    )
+    assert unclosed == "active"
+    closed, _, _ = derive_instrument_status(
+        row, [], {}, announced_instrument_ids=set(), **kwargs
+    )
+    assert closed == "repaid"
+
+
+def test_a_pending_retirement_blocks_the_matured_leg() -> None:
+    """Removing `and not retirement_pending` from the matured leg passed."""
+    from cdt.matcher.core import derive_instrument_status
+
+    row = {
+        "debt_instrument_id": "x",
+        "superseded_by_debt_instrument_id": None,
+        "retired_by_debt_instrument_ids": None,
+        "maturity_date": "2020-01-01",
+    }
+    kwargs = {
+        "reference_date": "2026-01-01",
+        "event_result": None,
+        "announced_instrument_ids": set(),
+    }
+    assert (
+        derive_instrument_status(row, [], {}, retirement_pending=False, **kwargs)[0]
+        == "matured"
+    )
+    assert (
+        derive_instrument_status(row, [], {}, retirement_pending=True, **kwargs)[0]
+        == "active"
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Known: `event_status_for_instrument` breaks the scan at the newest "
+        "entered_into/amended status, so an older mention's expected "
+        "retirement never reaches the pending flag and the rollup asserts "
+        "`repaid`. Fix is in matcher/core.py, outside this commit's scope."
+    ),
+)
+def test_a_planned_retirement_survives_a_newer_amendment_mention() -> None:
+    """The status scan's `break` must not also discard the pending flag.
+
+    A newer `amended` mention stopped the scan before an older mention's
+    `expected` retirement was seen, so the rollup asserted `repaid` for a
+    retirement the filings say is only planned.
+    """
+    from cdt.matcher.core import event_status_for_instrument, prepare_mention
+
+    planned = prepare_mention(
+        build_mention_row(
+            mention_id="m-planned",
+            item_id="item-1",
+            accession_number="0001",
+            cik="0000320193",
+            date="2026-06-01",
+            name="7% Senior Notes due 2030",
+            start_date="2024-01-01",
+            amount="500000000",
+            dates_json=json.dumps(
+                [
+                    {
+                        "kind": "retirement",
+                        "expected": True,
+                        "normalized_date": "2026-09-01",
+                    }
+                ]
+            ),
+        )
+    )
+    amended = prepare_mention(
+        build_mention_row(
+            mention_id="m-amended",
+            item_id="item-2",
+            accession_number="0002",
+            cik="0000320193",
+            date="2026-08-01",
+            name="7% Senior Notes due 2030",
+            start_date="2024-01-01",
+            amount="500000000",
+            status="amended",
+        )
+    )
+    index = {"m-planned": planned, "m-amended": amended}
+
+    _, pending_alone = event_status_for_instrument(["m-planned"], index)
+    assert pending_alone is True
+    _, pending_with_amendment = event_status_for_instrument(
+        ["m-planned", "m-amended"], index
+    )
+    assert pending_with_amendment is True
+
+
+# --- Fixes made in this commit -------------------------------------------------
+
+
+def test_two_current_closing_dates_are_rejected() -> None:
+    """`closing` is singular too, though it is an event kind.
+
+    The cap counted only kinds outside `EVENT_DATE_KINDS`, so `closing` escaped
+    it while `maturity`, `agreement` and `commitment_termination` did not —
+    contradicting the prompt's own "(validated)" claim. One of the two dates
+    then published and the other was silently dropped.
+    """
+    tags = _dates_tag_details()
+    date_ids = [tag_id for tag_id, detail in tags.items() if detail["type"] == "date"][
+        :2
+    ]
+    assert len(date_ids) == 2
+
+    def two_of(kind: str) -> list[str]:
+        return validate_dates_property(
+            index=0,
+            obj={
+                "dates": [
+                    {"kind": kind, "evidence": [date_ids[0]]},
+                    {"kind": kind, "evidence": [date_ids[1]]},
+                ]
+            },
+            tag_details=tags,
+        )
+
+    for kind in ("closing", "maturity", "agreement", "commitment_termination"):
+        failures = two_of(kind)
+        assert any(
+            f"'dates' has 2 current entries of kind '{kind}'" in failure
+            for failure in failures
+        ), f"{kind} should be capped at one current entry"
+    # Events genuinely may repeat: two amendments are two amendments.
+    assert not any(
+        "current entries of kind" in failure for failure in two_of("amendment")
+    )
+
+
+def test_interest_rate_without_an_evidence_key_is_accepted() -> None:
+    """The prompt's own `3.875% senior notes due 2028` example omits `evidence`.
+
+    Rejecting it cost a full retry cycle on a shape postprocess already handles
+    by verifying the rate against the instrument's name.
+    """
+    assert (
+        validate_interest_rate(
+            index=0,
+            obj={"interest_rate": {"kind": "fixed", "rate_pct": "3.875"}},
+            tag_details={},
+        )
+        == []
+    )
+    # A present-but-wrong evidence value is still a failure.
+    assert validate_interest_rate(
+        index=0,
+        obj={"interest_rate": {"kind": "fixed", "rate_pct": "3.875", "evidence": "x"}},
+        tag_details={},
+    )
+
+
+def test_name_derived_principal_is_synthesized_when_no_amount_supplies_one() -> None:
+    """#129's fallback was unreachable: its payload had no model value to agree with."""
+    assert name_derived_principal_payload("$183.36 million term loan") == {
+        "spans": [],
+        "normalized_amount": "183360000",
+        "currency": "USD",
+        "derived_from": "name",
+        "kind": "principal",
+        "as_of_date": None,
+        "prior": False,
+    }
+    assert (
+        name_derived_principal_payload("C$300 million notes due 2033")["currency"]
+        == "CAD"
+    )
+    # A name with no embedded principal synthesizes nothing.
+    assert name_derived_principal_payload("Revolving Credit Facility") is None
+
+
+def test_a_repayment_figure_does_not_suppress_the_name_derived_principal() -> None:
+    """The old gate asked "any amount at all", so an unrelated figure hid the name."""
+    from cdt.extractor.core import standardized_amounts_payloads
+
+    tags = {
+        "tag-i-1": {
+            "type": "debt_instrument",
+            "text": "$183.36 million term loan",
+            "char_start": 0,
+            "char_end": 25,
+        }
+    }
+    payloads = standardized_amounts_payloads(
+        {
+            "name": ["tag-i-1"],
+            "amounts": [
+                {"kind": "repayment", "evidence": [], "normalized_amount": None}
+            ],
+        },
+        tags,
+        name_text="$183.36 million term loan",
+    )
+    principal = [p for p in payloads if p["kind"] == "principal"]
+    assert principal and principal[0]["normalized_amount"] == "183360000"
+
+
+def test_out_of_range_date_arithmetic_returns_none_instead_of_raising() -> None:
+    """These raised out of postprocess, past the driver, killing the whole run.
+
+    `extract_pending_items` catches only `InfrastructureError`, so the exception
+    unwound past the failure registry, the mentions write and the audit write.
+    """
+    assert date_plus_tenor("9999-01-01", (999, "year")) is None
+    assert date_plus_tenor("9999-12-31", (999, "day")) is None
+    assert normalized_month_year_from_text("notes due January 0000") is None
+    # The ordinary cases still work.
+    assert date_plus_tenor("2026-05-15", (364, "day")) == "2027-05-14"
+    assert normalized_month_year_from_text("matures in March 2056") == "2056-03-31"
+
+
+def test_canonical_instrument_name_keeps_the_obligation_over_the_agreement() -> None:
+    """`ner.md` rule 11: the descriptive phrase must survive the agreement title.
+
+    Longest-span selection did the opposite on 9 of the 476 multi-span names in
+    the 2026-09 window, and the published name feeds the matcher's fingerprint.
+    """
+
+    def tags(*texts: str) -> dict[str, dict[str, object]]:
+        return {
+            f"tag-{index}": {
+                "type": "debt_instrument",
+                "text": text,
+                "char_start": 0,
+                "char_end": len(text),
+            }
+            for index, text in enumerate(texts)
+        }
+
+    pair = tags("Second Amended and Restated Credit Agreement", "term loan B facility")
+    assert canonical_instrument_name(list(pair), pair) == "term loan B facility"
+
+    dip = tags("Super-Priority Senior Secured Priming Credit Agreement", "DIP Facility")
+    assert canonical_instrument_name(list(dip), dip) == "DIP Facility"
+
+    # An instrument the filing only ever names by its agreement keeps that name.
+    only_agreement = tags("Credit Agreement", "Amended Credit Agreement")
+    assert (
+        canonical_instrument_name(list(only_agreement), only_agreement)
+        == "Amended Credit Agreement"
+    )
+    # With no agreement title in play, the longest span still wins.
+    notes = tags("the Notes", "5.875% Senior Notes due 2034")
+    assert (
+        canonical_instrument_name(list(notes), notes) == "5.875% Senior Notes due 2034"
+    )
+
+
+def test_realign_tag_details_leaves_unalignable_text_untouched() -> None:
+    """The documented degradation path: degrade to old offsets, never guess.
+
+    Proceeding with a partial alignment map would emit realigned-but-wrong
+    offsets for some tags, which is worse than the stale ones.
+    """
+    details = {
+        "tag-1": {
+            "type": "date",
+            "text": "March 5, 2026",
+            "char_start": 3,
+            "char_end": 16,
+        }
+    }
+    # Differs by more than whitespace, so no alignment exists.
+    assert (
+        realign_tag_details(details, "on March 5, 2026", "on April 5, 2026") is details
+    )
+    # A span whose recorded offsets include surrounding whitespace still snaps
+    # onto the non-whitespace run.
+    padded = {
+        "tag-1": {
+            "type": "date",
+            "text": " March 5, 2026 ",
+            "char_start": 2,
+            "char_end": 17,
+        }
+    }
+    realigned = realign_tag_details(padded, "on  March 5, 2026 .", "on March 5, 2026.")
+    span = realigned["tag-1"]
+    assert "on March 5, 2026."[span["char_start"] : span["char_end"]] == span["text"]
+    assert span["text"] == "March 5, 2026"
+
+
+def test_validate_parties_property_rejects_every_bad_shape() -> None:
+    """The new validator was indistinguishable from absent: `return []` passed.
+
+    The test that looked like its coverage feeds the legacy `lenders` key, so
+    its message assertion was satisfied by the older validator instead.
+    """
+    tags = {
+        "tag-p-1": {
+            "type": "organization",
+            "text": "Acme Bank",
+            "char_start": 0,
+            "char_end": 9,
+        },
+        "tag-d-1": {
+            "type": "date",
+            "text": "March 5, 2026",
+            "char_start": 10,
+            "char_end": 23,
+        },
+    }
+
+    def failures(parties: object) -> list[str]:
+        return validate_parties_property(
+            index=0, obj={"parties": parties}, tag_details=tags
+        )
+
+    assert any("must be a list of cluster objects" in f for f in failures({}))
+    assert any("must be an object with" in f for f in failures([["tag-p-1"]]))
+    assert any(
+        "'role' must be one of" in f
+        for f in failures([{"tag_ids": ["tag-p-1"], "role": "financier"}])
+    )
+    assert any(
+        "'kind' must be named or collective" in f
+        for f in failures(
+            [{"tag_ids": ["tag-p-1"], "role": "lender", "kind": "anonymous"}]
+        )
+    )
+    assert any(
+        "'tag_ids' must be a list" in f
+        for f in failures([{"tag_ids": "tag-p-1", "role": "lender"}])
+    )
+    assert any(
+        "string tag IDs only" in f
+        for f in failures([{"tag_ids": [7], "role": "lender"}])
+    )
+    assert any(
+        "unknown tag ID" in f
+        for f in failures([{"tag_ids": ["tag-missing"], "role": "lender"}])
+    )
+    assert any(
+        "must be person or organization" in f
+        for f in failures([{"tag_ids": ["tag-d-1"], "role": "lender"}])
+    )
+    # The shape the prompt describes passes.
+    assert failures([{"tag_ids": ["tag-p-1"], "role": "lender", "kind": "named"}]) == []
+
+
+def test_a_salvaged_row_registers_the_salvage_note_not_the_last_stage() -> None:
+    """A PARTIAL row's registry entry must say what salvage dropped (#152).
+
+    `_failure_record` read `current_attempt`, so a row salvaged at
+    `instrument_ie` that then completed `instrument_relation` published
+    `stage: instrument_relation` and the invented error "Unexpected response at
+    stage instrument_relation" — naming a stage that succeeded and describing a
+    failure that never happened. The one PARTIAL row in the 364-unit 2026-09 run
+    published exactly that, so the row here keeps two mentions in order to
+    advance past the stage it was salvaged at.
+    """
+    from cdt.extractor.core import _failure_record, failed_stage_name, handle_response
+
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1", "accession_number": "0001", "cik": "0000320193"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = PARTY_ROLE_XML
+    # Two valid entries plus one whose name tag is an organization: salvage keeps
+    # the pair, which is enough mentions to run the relation stage. The two differ
+    # on `instrument_type` so they hash to distinct mention ids rather than
+    # collapsing into one.
+    advanced = handle_response(
+        row_state,
+        json.dumps(
+            [
+                {"name": ["tag-i-1"], "instrument_type": "term_loan"},
+                {"name": ["tag-i-1"], "instrument_type": "revolving_credit"},
+                {"name": ["tag-o-named"]},
+            ]
+        ),
+        max_attempts=1,
+    )
+    assert advanced is not None, "salvage should advance to instrument_relation"
+    assert len(row_state.debt_instrument_mentions) == 2
+
+    # The relation stage then succeeds, so the row's last attempt is clean.
+    assert handle_response(row_state, json.dumps([]), max_attempts=1) is None
+    assert row_state.state == "PARTIAL"
+    assert row_state.current_attempt.stage_name == "instrument_relation"
+    assert not row_state.current_attempt.validation_errors
+
+    record = _failure_record(
+        row_state,
+        partition_date="2026-09-04",
+        shard="0025",
+        run_id="run-1",
+        backend="batch",
+    )
+    assert record["state"] == "PARTIAL"
+    # The stage salvage fired in, not the last stage the row ran.
+    assert record["stage"] == "instrument_ie"
+    assert failed_stage_name(row_state) == "instrument_ie"
+    assert "Unexpected response" not in str(record["error"])
+    assert record["error"] == "; ".join(row_state.salvage_notes)
+    assert "dropped 1" in str(record["error"])
+
+
+def test_a_whole_response_rejection_that_drops_nothing_says_so() -> None:
+    """`dropped 0` is a shape rejection, not a loss; the note must not claim one."""
+    from cdt.extractor.core import handle_response
+
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = PARTY_ROLE_XML
+    # A bare object, plus a legacy property that only the whole-response check
+    # rejects: every entry validates on its own, so nothing is dropped.
+    handle_response(
+        row_state,
+        json.dumps({"name": ["tag-i-1"], "lenders_known_incomplete": True}),
+        max_attempts=1,
+    )
+
+    assert row_state.state == "PARTIAL"
+    assert row_state.salvage_notes
+    assert "dropped 0" not in row_state.salvage_notes[0]
+    assert "published every entry" in row_state.salvage_notes[0]
+
+
+def test_normalize_snapshot_text_pads_the_cik_column() -> None:
+    """#153's snapshot padding had no test, so disabling it passed."""
+    table = pd.DataFrame(
+        [
+            {"cik": "320193", "company_name": "Example Inc."},
+            {"cik": "0000707605", "company_name": "Already Padded Co"},
+            {"cik": None, "company_name": "No CIK Co"},
+        ]
+    )
+
+    normalized = normalize_snapshot_text(table)
+
+    assert normalized["cik"].to_list() == ["0000320193", "0000707605", None]
+
+
+def test_computed_sum_needs_two_addends_even_when_no_span_matches() -> None:
+    """The two guards masked each other: either alone rejected the only case.
+
+    The existing test cites one span whose value equals the model's, so both
+    "at least two addends" and "no single span equals the value" reject it. This
+    case isolates the first: two spans, neither equal to the model's figure, but
+    only one of them parseable.
+    """
+    from cdt.extractor.core import computed_sum_amount
+
+    tags = {
+        "tag-a-1": {
+            "type": "amount",
+            "text": "$200 million",
+            "char_start": 0,
+            "char_end": 12,
+        },
+        "tag-a-2": {
+            "type": "amount",
+            "text": "an undisclosed amount",
+            "char_start": 13,
+            "char_end": 34,
+        },
+        "tag-a-3": {
+            "type": "amount",
+            "text": "$50 million",
+            "char_start": 35,
+            "char_end": 46,
+        },
+    }
+    # One parseable addend is not a sum, however many spans are cited.
+    assert computed_sum_amount(["tag-a-1", "tag-a-2"], tags, "250000000") is None
+    # Two parseable addends that do sum to the model's figure are accepted.
+    assert computed_sum_amount(["tag-a-1", "tag-a-3"], tags, "250000000") == "250000000"
+    # And the second guard, isolated: two addends, but one already equals the
+    # model's value, so this is agreement rather than arithmetic.
+    equal_tags = dict(tags)
+    equal_tags["tag-a-4"] = {
+        "type": "amount",
+        "text": "$250 million",
+        "char_start": 50,
+        "char_end": 62,
+    }
+    assert computed_sum_amount(["tag-a-1", "tag-a-4"], equal_tags, "250000000") is None
+
+
+def test_a_partial_row_publishes_its_mentions_and_registers_the_loss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#152's contract, end to end rather than on a row-state object.
+
+    `PARTIAL` appeared only in assertions against `ExtractionRowState`, so the
+    pipeline wiring was untested: counting PARTIAL as a success (dropping its
+    registry entry) or removing it from `PUBLISHABLE_ROW_STATES` (dropping its
+    mentions) both left the suite green.
+    """
+    seed_document_partition(tmp_path)
+    itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
+    monkeypatch.setattr(
+        classifier_core,
+        "load_training_artifacts",
+        lambda path: (FakeModel(), 0.5, {"threshold": 0.5}),
+    )
+    classify_pending_items(artifact_root=tmp_path, batch_size=5)
+
+    async def salvaged_workflow(**kwargs: object) -> ExtractionRowState:
+        item_row = kwargs["item_row"]
+        row_state = ExtractionRowState(item_row=item_row, stage_name="instrument_ie")
+        row_state.debt_instrument_mentions = [
+            build_mention_row(
+                mention_id="m-salvaged",
+                item_id=str(item_row["item_id"]),
+                accession_number=str(item_row["accession_number"]),
+                cik=str(item_row["cik"]),
+                date=str(item_row["date"]),
+                name="Term Loan",
+                start_date="2025-03-17",
+                amount="500000000",
+            )
+        ]
+        row_state.salvage_notes.append(
+            "instrument_ie kept the valid entries and dropped 2 "
+            "invalid ones after 3 failed attempts"
+        )
+        # Salvage finishes the row SUCCESS; the notes coerce it to PARTIAL.
+        row_state.finish("SUCCESS")
+        return row_state
+
+    monkeypatch.setattr("cdt.extractor.core.run_extraction_workflow", salvaged_workflow)
+    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+
+    # Half one: the salvaged mentions publish, exactly like a SUCCESS row.
+    written = read_dataset(mentions_root(tmp_path))
+    assert written["debt_instrument_mention_id"].to_list() == ["m-salvaged"]
+
+    # Half two: the registry still records what was lost.
+    failures = load_row_failures("extract", artifact_root=tmp_path)
+    assert len(failures) == 1
+    entry = next(iter(failures.values()))
+    assert entry["state"] == "PARTIAL"
+    assert entry["stage"] == "instrument_ie"
+    assert "dropped 2" in str(entry["error"])

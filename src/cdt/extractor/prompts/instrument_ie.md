@@ -94,16 +94,18 @@ One entry per money fact the document states about the instrument.
 Rules:
 - `normalized_amount` is digits with at most one decimal point, or `null` (validated). `currency` is one 3-letter ISO 4217 code or `null` (validated). `as_of_date` is `YYYY-MM-DD` when the document states the date the figure is measured at, else `null`; only balances normally carry one.
 - A balance, draw, repayment, or proceeds figure goes under its own kind, never as `commitment` or `principal`. Facility size plus balance → both entries.
+- A `repayment` figure is an event, so it needs the event that produced it: add a `repayment` entry to `dates`, unless a `retirement`, `termination`, or `exchange` entry already dates the payment (validated).
 - Interest rates, margins, spreads, fees, discounts, and per-annum percentages are never amounts of any kind (validated). Omit `amounts` when the document states no money amount for the instrument.
+- The kind must fit `instrument_type` (validated): a `revolving_credit` or `credit_line` facility's size is a `commitment`, never a `principal`; a `note_bond`'s face amount is a `principal`, never a `commitment`. A ceiling on notes issuable in series (`may purchase up to $50.0 million of Convertible Notes`) is still the `principal` of what is issued. A `term_loan` takes either.
 - Never put an aggregate that covers several instruments on any one of them: a combined total for a group, or an agreement's total across facilities, is omitted from the individual instruments.
-- `prior: true` marks a figure stated as it stood before a change; the current figure is the new one. `reduced the lender commitments from $100,000,000 to $50,000,000` → `commitment` 50000000; `commitment` 100000000 `prior`.
+- `prior: true` marks a figure stated as it stood before a change; the current figure is the new one. Only a `commitment` or `principal` takes `prior` (validated): a balance, draw, repayment, or proceeds is dated by `as_of_date` or by its own event, never marked `prior`. `borrowings fell from $80 million to $60 million` → one `outstanding_balance` 60000000, not a `prior` balance. `reduced the lender commitments from $100,000,000 to $50,000,000` → `commitment` 50000000; `commitment` 100000000 `prior`.
 - An increase *by* an amount is never an object sized at the increment. `increased the commitments by $353 million`, `$500,000 Credit Increase` describe a change to one facility. Before and after totals stated → after as current `commitment`, before as `prior`. Only the before total stated (`its existing $200 million facility ... increased by $50 million`) → `prior` `commitment` 200000000 and a current `commitment` 250000000 citing **both** spans; summing the exact cited spans is the only arithmetic allowed, and the pre-increase total is never the current figure. Only the increment stated → omit it. An increase *to* an amount is the current total.
 
 Mini-examples:
 - `$183.36 million term loan`, no separate amount tag → `principal` 183360000 USD citing the instrument's own span.
 - `$750 million` of notes closing with `net proceeds of $718.8 million` → `principal` 750000000; `proceeds` 718800000.
 - Revolver providing `$300 million` of commitments, `as of June 9, 2026, we had $270.5 million outstanding` → `commitment` 300000000; `outstanding_balance` 270500000 `as_of_date` 2026-06-09.
-- `will repay $68 million in outstanding amounts under the credit facility` → `repayment` 68000000 on the facility, not its principal.
+- `will repay $68 million in outstanding amounts under the credit facility` → `repayment` 68000000 on the facility, not its principal, **plus** a `repayment` entry in `dates` (`evidence` `[]` and `normalized_date` `null` when the text gives no date).
 - ABR Loans bear interest at `0.875% per annum` → not an amount; the loan's `interest_rate` is floating with `rate_pct` null.
 
 ## `interest_rate`

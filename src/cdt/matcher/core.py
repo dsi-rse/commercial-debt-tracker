@@ -24,7 +24,12 @@ from cdt.datasets import (
 from cdt.extractor.core import (
     DEBT_INSTRUMENT_MENTION_COLUMNS as EXTRACTED_MENTION_COLUMNS,
 )
-from cdt.extractor.core import MENTIONS_DATASET_NAME
+from cdt.extractor.core import (
+    LENDER_DISCLOSURE_NONE_NAMED,
+    LENDER_DISCLOSURE_PRECEDENCE,
+    LENDER_DISCLOSURE_VALUES,
+    MENTIONS_DATASET_NAME,
+)
 from cdt.storage import (
     coerce_dataset_text,
     read_dataset,
@@ -106,7 +111,7 @@ DEBT_INSTRUMENT_COLUMNS = [
     "interest_rate_pct",
     "interest_rate_source_mention_id",
     "parties_json",
-    "lenders_known_incomplete",
+    "lender_disclosure",
 ]
 MENTION_CLUSTER_EDGE_DATASET_NAME = "mention-cluster-edges"
 DEBT_INSTRUMENT_DATASET_NAME = "debt-instruments"
@@ -179,7 +184,7 @@ class PreparedMention:
     retired_by: tuple[str, ...]
     split_of: str | None
     parties_json: str
-    lenders_known_incomplete: bool
+    lender_disclosure: str
     normalized_amount: str | None
     normalized_start_date: str | None
     normalized_end_date: str | None
@@ -1410,11 +1415,14 @@ def build_debt_instrument_rows(
             ),
             sort_keys=True,
         )
-        lenders_known_incomplete = coerce_flag(
-            existing_row.get("lenders_known_incomplete")
-        ) or any(
-            mention_index[mention_id].lenders_known_incomplete
-            for mention_id in present_member_ids
+        lender_disclosure = aggregate_lender_disclosure(
+            [
+                coerce_optional_text(existing_row.get("lender_disclosure")),
+                *[
+                    mention_index[mention_id].lender_disclosure
+                    for mention_id in present_member_ids
+                ],
+            ]
         )
         rows.append(
             {
@@ -1476,7 +1484,7 @@ def build_debt_instrument_rows(
                 ),
                 **interest_rate_fields(ordered_member_ids, mention_index, existing_row),
                 "parties_json": parties_json,
-                "lenders_known_incomplete": lenders_known_incomplete,
+                "lender_disclosure": lender_disclosure,
             }
         )
     return rows
@@ -1785,7 +1793,7 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
         retired_by=tuple(json.loads(str(row.get("retired_by_json") or "[]"))),
         split_of=coerce_optional_text(row.get("split_of")),
         parties_json=str(row.get("parties_json") or "[]"),
-        lenders_known_incomplete=coerce_flag(row.get("lenders_known_incomplete")),
+        lender_disclosure=coerce_lender_disclosure(row.get("lender_disclosure")),
         normalized_amount=normalize_amount(
             coerce_optional_text(row.get("principal_amount"))
         ),
@@ -1839,21 +1847,34 @@ def mention_recency_key(mention: PreparedMention) -> tuple[str, str, str, str]:
     )
 
 
-def coerce_flag(value: object) -> bool:
-    """Return one boolean flag, treating missing parquet values as False."""
-    if value is None:
-        return False
-    try:
-        if pd.isna(value):
-            return False
-    except TypeError:
-        pass
-    return bool(value)
-
-
 def coerce_optional_text(value: object) -> str | None:
     """Return one trimmed string or None, treating placeholder text as missing."""
     return coerce_dataset_text(value)
+
+
+def coerce_lender_disclosure(value: object) -> str:
+    """Return one known lender-disclosure value, defaulting to `none_named`.
+
+    A mention that records nothing about who holds the debt has named no
+    lender, which is exactly `none_named` — the conservative reading, and the
+    one that cannot invent a complete syndicate list out of a missing value.
+    """
+    text = coerce_dataset_text(value)
+    return text if text in LENDER_DISCLOSURE_VALUES else LENDER_DISCLOSURE_NONE_NAMED
+
+
+def aggregate_lender_disclosure(values: list[str | None]) -> str:
+    """Roll several mentions' disclosure answers into one for the instrument.
+
+    Worst-of by `LENDER_DISCLOSURE_PRECEDENCE`: a single filing showing a
+    collective lender phrase means holders are hidden however many other
+    filings name some, while a filing that named every lender supersedes one
+    that named none.
+    """
+    known = [value for value in values if value in LENDER_DISCLOSURE_VALUES]
+    if not known:
+        return LENDER_DISCLOSURE_NONE_NAMED
+    return max(known, key=lambda value: LENDER_DISCLOSURE_PRECEDENCE[value])
 
 
 def coerce_optional_cik(value: object) -> str | None:

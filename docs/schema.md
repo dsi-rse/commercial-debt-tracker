@@ -224,7 +224,7 @@ Columns:
 - `dates_json`: JSON array of kind-typed date facts: `{kind, normalized_date, precision, prior, expected, spans, derived_from}`. Kinds: `agreement` (the instrument's own dated-as-of date), `announcement`, `closing` (closing, issuance, funding, effective — the start), `amendment`, `repayment` (a payment that leaves the obligation outstanding), `retirement` (repaid in full, redeemed in whole, defeased, discharged), `termination`, `exchange`, `default`, `maturity`, `commitment_termination`. `precision` is `day`, `month` or `year` for how precisely the cited text states the date. `prior` marks a term stated as it stood before an amendment; `expected` marks a date the filing states as planned rather than occurred (an expected closing, a noticed redemption). An event the filing states without a date is a fact with `normalized_date` null. The flat `start_date`, `maturity_date` and `commitment_termination_date` columns are the current (non-prior, non-expected) `closing`, `maturity` and `commitment_termination` facts. Responses in the pre-dates[] shape replay with the kind implied by the old property name.
 - `status_json`: `{status, status_date}` where `status_date` is a full evidence payload (#141).
 - `interest_rate_json`: `{kind, rate_pct, spans, derived_from}` (#157).
-- `lenders_known_incomplete`: Derived from the party clusters: true when any `lender` cluster is `collective` or when the mention names no lender at all (a public-market series, a redemption notice, a syndicate where only the agent is named); false only when every lender is named. Pre-stage-2 responses replay the flag the model declared.
+- `lender_disclosure`: How completely this mention identifies who holds the debt, derived from the party clusters: `complete` when every `lender` cluster is `named`; `collective_present` when any is `collective` (`the other lenders party thereto`); `none_named` when the mention names no lender at all (a public-market series, a redemption notice, a syndicate where only the agent is named). Replaces the `lenders_known_incomplete` boolean, which was true for the second and third cases alike and so could not distinguish "something is undisclosed" from "nothing was disclosed here". Pre-stage-2 responses replay the flag the model declared, mapped onto these values.
 
 Primary key: `debt_instrument_mention_id`
 
@@ -267,7 +267,7 @@ Columns:
 - `interest_rate_kind`, `interest_rate_pct`: Canonical interest rate (#157).
 - `*_source_mention_id` (name, instrument_type, start_date, maturity, commitment_termination, principal, outstanding_balance, interest_rate): The mention each canonical value actually came from (#151), so evidence attribution never has to be guessed.
 - `parties_json`: JSON aggregation of party clusters from direct mentions, deduped by role plus normalized canonical name (#150).
-- `lenders_known_incomplete`: True when any direct mention showed undisclosed lenders.
+- `lender_disclosure`: The instrument's worst-case answer across its direct mentions. `collective_present` wins outright — one filing showing a collective lender phrase means holders are hidden however many others name some — and `complete` beats `none_named`, so a filing that named every lender is not erased by one that named none.
 
 Primary key: `debt_instrument_id`
 

@@ -806,3 +806,36 @@ def test_key_matches_ciks_with_multi_segment_prefix() -> None:
     assert _key_matches_ciks(single, {"320193"})
     assert _key_matches_ciks(multi, {"320193"})
     assert not _key_matches_ciks(multi, {"999999"})
+
+
+def test_filing_from_manifest_pads_the_cik() -> None:
+    """#153: the manifest reader is where padding enters the pipeline.
+
+    It previously stripped leading zeros instead, and reverting it to
+    `.lstrip("0")` left the suite green because nothing asserted the CIK here.
+    """
+    from cdt.ingest import _filing_from_manifest
+
+    filing = _filing_from_manifest(
+        {
+            "cik": "320193",
+            "accession_number": "0000320193-24-000001",
+            "form_type": "8-K",
+            "filing_date": "2024-01-02",
+            "company_name": "Example Inc.",
+            "documents": [],
+        }
+    )
+    assert filing.cik == "0000320193"
+
+    already_padded = _filing_from_manifest(
+        {
+            "cik": "0000707605",
+            "accession_number": "0000707605-24-000001",
+            "form_type": "8-K",
+            "filing_date": "2024-01-02",
+            "company_name": "Padded Co",
+            "documents": [],
+        }
+    )
+    assert already_padded.cik == "0000707605"

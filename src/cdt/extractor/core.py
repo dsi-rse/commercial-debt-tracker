@@ -153,6 +153,18 @@ EVENT_DATE_KINDS = {
     "default",
 }
 TERMINAL_DATE_KINDS = {"retirement", "termination", "exchange", "default"}
+# The kinds an instrument has at most one current value of, which
+# `instrument_ie.md` advertises as "(validated)". `closing` is an event kind but
+# still singular: two current closings describe two instruments, exactly as two
+# maturities do. Keying the cap off `not in EVENT_DATE_KINDS` silently exempted
+# it, so one of the two dates published and the other was dropped.
+SINGLE_CURRENT_DATE_KINDS = {
+    "agreement",
+    "closing",
+    "expected_closing",
+    "maturity",
+    "commitment_termination",
+}
 # Kinds that are only meaningful with a value: a stated maturity without a
 # date is nothing, whereas `the notes were redeemed` with no date is still an
 # event the filing states.
@@ -183,7 +195,7 @@ DATE_KIND_EVIDENCE_TAG_TYPES = {
 }
 DEFAULT_DATE_EVIDENCE_TAG_TYPES = {"date"}
 # Stage 2: one `parties` list with a role per cluster replaces `lenders` +
-# `other_interested_parties`; `lenders_known_incomplete` is derived from it.
+# `other_interested_parties`; `lender_disclosure` is derived from it.
 PARTY_ROLES = {
     "lender",
     "agent",
@@ -194,6 +206,30 @@ PARTY_ROLES = {
     "other",
 }
 PARTY_KINDS = {"named", "collective"}
+# How completely the document identifies who holds the debt. The boolean this
+# replaces was true for two different reasons — a collective lender phrase, or
+# no named lender at all — and 395 of 517 true values on the 2026-09 window were
+# the second case, so a consumer reading the flag could not tell "something is
+# undisclosed" from "nothing was disclosed here".
+LENDER_DISCLOSURE_COMPLETE = "complete"
+LENDER_DISCLOSURE_COLLECTIVE_PRESENT = "collective_present"
+LENDER_DISCLOSURE_NONE_NAMED = "none_named"
+LENDER_DISCLOSURE_VALUES = {
+    LENDER_DISCLOSURE_COMPLETE,
+    LENDER_DISCLOSURE_COLLECTIVE_PRESENT,
+    LENDER_DISCLOSURE_NONE_NAMED,
+}
+# Precedence for rolling several mentions of one instrument into one answer.
+# `collective_present` wins outright: one filing showing `the other lenders
+# party thereto` means holders are hidden however many other filings name some.
+# `complete` beats `none_named` because a filing that named every lender
+# supersedes one that named none — the reverse would let a passing reference
+# erase a full syndicate list.
+LENDER_DISCLOSURE_PRECEDENCE = {
+    LENDER_DISCLOSURE_NONE_NAMED: 0,
+    LENDER_DISCLOSURE_COMPLETE: 1,
+    LENDER_DISCLOSURE_COLLECTIVE_PRESENT: 2,
+}
 # Published flat columns and the fact kind each one reads.
 DATE_COLUMN_KINDS = {
     "start_date": "closing",
@@ -435,7 +471,7 @@ DEBT_INSTRUMENT_MENTION_COLUMNS = [
     "status_json",
     "interest_rate_json",
     "dates_json",
-    "lenders_known_incomplete",
+    "lender_disclosure",
 ]
 
 
@@ -1132,7 +1168,7 @@ class InstrumentIEStage:
         seen_mention_ids: set[str] = set()
         for index, obj in mention_entries:
             raw_id = raw_id_for(index)
-            name_text = canonical_value(obj.get("name", []), tag_details)
+            name_text = canonical_instrument_name(obj.get("name", []), tag_details)
             amount_payloads = standardized_amounts_payloads(
                 obj,
                 tag_details,
@@ -1169,8 +1205,8 @@ class InstrumentIEStage:
                 tag_details,
                 name_text=name_text,
             )
-            party_clusters, lenders_known_incomplete = (
-                party_payloads_and_incompleteness(obj, tag_details)
+            party_clusters, lender_disclosure = party_payloads_and_disclosure(
+                obj, tag_details
             )
             mention_row: dict[str, object] = {
                 "item_id": row_state.item_id,
@@ -1208,7 +1244,7 @@ class InstrumentIEStage:
                 "retired_by_json": "[]",
                 "split_of": None,
                 "parties_json": json.dumps(party_clusters, sort_keys=True),
-                "lenders_known_incomplete": lenders_known_incomplete,
+                "lender_disclosure": lender_disclosure,
                 "name_json": json.dumps(
                     cluster_payload(obj.get("name", []), tag_details),
                     sort_keys=True,
@@ -2226,6 +2262,10 @@ def _salvage_or_fail(
             row_state.salvage_notes.append(
                 f"instrument_ie kept the valid entries and dropped {dropped} "
                 f"invalid ones after {max_attempts} failed attempts"
+                if dropped
+                else "instrument_ie published every entry after "
+                f"{max_attempts} failed attempts; the response was rejected as a "
+                "whole but each entry validated on its own"
             )
             stage.postprocess(row_state)
             return _advance_after_stage(row_state, stage, stage_index)
@@ -2811,7 +2851,7 @@ def validate_dates_property(
         prior = entry.get("prior", False)
         if not isinstance(prior, bool):
             failures.append(f"Entry {index}: '{label}.prior' must be true or false.")
-        elif kind is not None and not prior and kind not in EVENT_DATE_KINDS:
+        elif kind is not None and not prior and kind in SINGLE_CURRENT_DATE_KINDS:
             current_kinds[kind] = current_kinds.get(kind, 0) + 1
         if not isinstance(entry.get("expected", False), bool):
             failures.append(f"Entry {index}: '{label}.expected' must be true or false.")
@@ -3069,7 +3109,10 @@ def validate_interest_rate(
         failures.append(
             f"Entry {index}: 'interest_rate.rate_pct' must be a numeric string or null."
         )
-    evidence = value.get("evidence")
+    # An absent `evidence` key is an empty citation list, not a malformed
+    # response: the prompt's own `3.875% senior notes due 2028` example omits it
+    # and postprocess verifies the rate off the instrument name instead.
+    evidence = value.get("evidence", [])
     if not isinstance(evidence, list):
         failures.append(
             f"Entry {index}: 'interest_rate.evidence' must be a list of tag IDs."
@@ -3255,7 +3298,7 @@ def debt_instrument_mention_id_for(
             mention_row.get("interest_rate_json")
         ),
         "item_id": item_id,
-        "lenders_known_incomplete": mention_row.get("lenders_known_incomplete"),
+        "lender_disclosure": mention_row.get("lender_disclosure"),
         "name_json": normalize_json_text(mention_row.get("name_json")),
         "name": mention_row.get("name"),
         "parties_json": normalize_json_text(mention_row.get("parties_json")),
@@ -3303,6 +3346,45 @@ def canonical_value(
     if not values:
         return None
     return max(values, key=len)
+
+
+# The title of the contract, as opposed to a description of the obligation it
+# creates: `Amended and Restated Credit Agreement`, `Indenture`, `Note Purchase
+# Agreement`. NER now tags both for one facility (ner.md rule 11), and the
+# agreement title is usually the longer string.
+AGREEMENT_NAME_PATTERN = re.compile(
+    r"\b(?:agreement|indenture|supplemental\s+indenture)\b", re.IGNORECASE
+)
+
+
+def canonical_instrument_name(
+    tag_ids: object,
+    tag_details: dict[str, dict[str, object]],
+) -> str | None:
+    """Return the name that describes the obligation, not the contract.
+
+    `ner.md` rule 11 has NER tag both the facility phrase and its agreement
+    name, and says the descriptive phrase "must never be dropped in favour of
+    the agreement name". Plain longest-span selection did exactly that on 9 of
+    the 476 multi-span names in the 2026-09 window — publishing `Second Amended
+    and Restated Credit Agreement` over `term loan B facility`, and the
+    `Super-Priority Senior Secured Priming ...` title over `DIP Facility`.
+
+    That is not only a display problem: the published name feeds the matcher's
+    `normalize_name_fingerprint`, and an amendment title is the generic,
+    near-duplicate string that `NAME_CLASS_GATE` and the identifying-name guard
+    then have to defend against. Preferring the obligation's own description
+    keeps the individuating name where those heuristics can use it.
+
+    Falls back to the longest span when every span names the contract, which is
+    the right answer for an instrument the filing only ever calls by its
+    agreement.
+    """
+    values = cluster_span_texts(tag_ids, tag_details)
+    if not values:
+        return None
+    described = [value for value in values if not AGREEMENT_NAME_PATTERN.search(value)]
+    return max(described or values, key=len)
 
 
 def canonical_amount_value(
@@ -3594,12 +3676,9 @@ def normalized_month_year_from_text(text: str | None) -> str | None:
         return None
     found: set[str] = set()
     for match in MONTH_YEAR_DATE_PATTERN.finditer(text):
-        month = MONTH_MAP.get(match.group("month").lower())
-        if month is None:
-            continue
-        year = int(match.group("year"))
-        last_day = calendar.monthrange(year, int(month))[1]
-        found.add(date(year, int(month), last_day).isoformat())
+        normalized = iso_month_end_from_parts(match.group("year"), match.group("month"))
+        if normalized is not None:
+            found.add(normalized)
     return next(iter(found)) if len(found) == 1 else None
 
 
@@ -3715,14 +3794,21 @@ def date_plus_tenor(start: str, tenor: tuple[int, str], *, sign: int = 1) -> str
         return None
     number, unit = tenor
     number *= sign
-    if unit == "day":
-        return (anchor + timedelta(days=number)).isoformat()
-    months = number * 12 if unit == "year" else number
-    total = anchor.month - 1 + months
-    year = anchor.year + total // 12
-    month = total % 12 + 1
-    day = min(anchor.day, calendar.monthrange(year, month)[1])
-    return date(year, month, day).isoformat()
+    # A tenor that lands outside the representable calendar is not an answer.
+    # Raising here would unwind out of postprocess and past the driver, which
+    # catches only InfrastructureError, killing the run before the failure
+    # registry, the mentions and the audit log were written.
+    try:
+        if unit == "day":
+            return (anchor + timedelta(days=number)).isoformat()
+        months = number * 12 if unit == "year" else number
+        total = anchor.month - 1 + months
+        year = anchor.year + total // 12
+        month = total % 12 + 1
+        day = min(anchor.day, calendar.monthrange(year, month)[1])
+        return date(year, month, day).isoformat()
+    except (ValueError, OverflowError):
+        return None
 
 
 def computed_maturity_date(
@@ -3911,18 +3997,37 @@ def standardized_amounts_payloads(
         payload["as_of_date"] = None
         payload["prior"] = False
         payloads.append(payload)
-    if not any(payload.get("normalized_amount") for payload in payloads):
-        synthesized = standardized_amount_payload(
-            None,
-            tag_details,
-            name_text=name_text,
-        )
-        if synthesized.get("normalized_amount") is not None:
-            synthesized["kind"] = "principal"
-            synthesized["as_of_date"] = None
-            synthesized["prior"] = False
+    if not select_principal_amount(payloads):
+        synthesized = name_derived_principal_payload(name_text)
+        if synthesized is not None:
             payloads.append(synthesized)
     return payloads
+
+
+def name_derived_principal_payload(name_text: str | None) -> dict[str, object] | None:
+    """Return a principal payload read off the instrument's own name (#129).
+
+    `$183.36 million term loan` states its principal in its name and cites no
+    `amount` span, so when the entry supplies no principal-bearing amount the
+    name is the only evidence there is. There is no model value to agree with
+    here — the parser's own reading is the value — so this cannot route through
+    `standardized_amount_payload`, whose `amounts_agree` gate rejects a null
+    model amount and made the previous version of this fallback unreachable.
+    """
+    parsed_amount = normalized_amount_from_name(name_text)
+    if parsed_amount is None:
+        return None
+    return {
+        "spans": [],
+        "normalized_amount": parsed_amount,
+        # `currency_from_name` already resolves through `currency_candidates_from_text`,
+        # so it is either a supported code or None.
+        "currency": currency_from_name(name_text),
+        "derived_from": DERIVED_FROM_NAME,
+        "kind": "principal",
+        "as_of_date": None,
+        "prior": False,
+    }
 
 
 def select_principal_amount(payloads: list[dict[str, object]]) -> dict[str, object]:
@@ -4345,11 +4450,11 @@ def annotated_party_clusters(
 LENDER_PARTY_ROLE = "lender"
 
 
-def party_payloads_and_incompleteness(
+def party_payloads_and_disclosure(
     obj: dict[str, Any],
     tag_details: dict[str, dict[str, object]],
-) -> tuple[list[dict[str, object]], bool]:
-    """Return every party cluster with its role and kind, plus the lender flag.
+) -> tuple[list[dict[str, object]], str]:
+    """Return every party cluster with its role and kind, plus lender disclosure.
 
     The model already labels every cluster; the labels persist rather than only
     steering what to drop (#150). Lender clusters carry ``role: "lender"`` and
@@ -4365,9 +4470,7 @@ def party_payloads_and_incompleteness(
         tag_details,
         property_name="lenders",
     )
-    has_collective = False
     for payload, kind in lender_pairs:
-        has_collective = has_collective or kind == COLLECTIVE_LENDER_KIND
         parties.append(
             {
                 "canonical_name": canonical_value(
@@ -4393,15 +4496,17 @@ def party_payloads_and_incompleteness(
                 "spans": payload["spans"],
             }
         )
-    stage2_shape = "parties" in obj or (
-        "dates" in obj
-        and not any(key in obj for key in ("lenders", "other_interested_parties"))
+    # Detect the *legacy* shape positively. Inferring the current shape from the
+    # presence of `parties` or `dates` misread a perfectly ordinary current-schema
+    # entry that omitted both — the prompt tells the model to omit anything the
+    # document does not mention — and sent it down the legacy path, where it
+    # published "holders fully disclosed" beside an empty party list.
+    legacy_shape = any(
+        key in obj
+        for key in ("lenders", "other_interested_parties", "lenders_known_incomplete")
     )
-    if stage2_shape:
-        # Stage 2 shape: one list, one role per cluster. The undisclosed-holders
-        # flag is derived — a collective lender cluster, or no lender cluster at
-        # all (a public-market series, a syndicate where only the agent is
-        # named), means the document did not name who holds the debt.
+    if not legacy_shape:
+        # Current shape: one list, one role per cluster, disclosure derived.
         parties = []
         raw_parties = obj.get("parties")
         for cluster in raw_parties if isinstance(raw_parties, list) else []:
@@ -4424,11 +4529,30 @@ def party_payloads_and_incompleteness(
                     "spans": payload["spans"],
                 }
             )
-        lender_kinds = [p["kind"] for p in parties if p["role"] == LENDER_PARTY_ROLE]
-        incomplete = not lender_kinds or COLLECTIVE_LENDER_KIND in lender_kinds
-        return parties, incomplete
-    declared_incomplete = obj.get("lenders_known_incomplete") is True
-    return parties, has_collective or declared_incomplete
+        return parties, lender_disclosure_for(
+            [p["kind"] for p in parties if p["role"] == LENDER_PARTY_ROLE]
+        )
+    # Legacy replay: the model declared the flag itself. A declared `true`
+    # alongside named lenders is the collective case by another name.
+    lender_kinds = [kind for payload, kind in lender_pairs]
+    if obj.get("lenders_known_incomplete") is True and lender_kinds:
+        return parties, LENDER_DISCLOSURE_COLLECTIVE_PRESENT
+    return parties, lender_disclosure_for(lender_kinds)
+
+
+def lender_disclosure_for(lender_kinds: list[object]) -> str:
+    """Return how completely the lender clusters identify who holds the debt.
+
+    No lender cluster at all is `none_named` — a public-market series, a
+    redemption notice, a syndicate where only the agent is named. A collective
+    cluster (`the other lenders party thereto`) is `collective_present`. Only
+    when every lender cluster is named is the list `complete`.
+    """
+    if not lender_kinds:
+        return LENDER_DISCLOSURE_NONE_NAMED
+    if COLLECTIVE_LENDER_KIND in lender_kinds:
+        return LENDER_DISCLOSURE_COLLECTIVE_PRESENT
+    return LENDER_DISCLOSURE_COMPLETE
 
 
 def relation_prompt_xml(row_state: ExtractionRowState) -> str:
@@ -4530,13 +4654,35 @@ def render_relation_body(root: ET.Element, tag_to_raw_id: dict[str, str]) -> str
 
 
 def summarize_failure(row_state: ExtractionRowState) -> str:
-    """Summarize the last failure message for one row."""
+    """Summarize what this row lost, for its failure-registry entry.
+
+    A salvaged row (#152) is terminal-but-publishable: its last attempt often
+    succeeded, so the attempt carries no validation errors and the generic
+    "unexpected response" summary below would describe a stage that worked.
+    The salvage notes are the only record of what was actually dropped, so they
+    are what the registry reports.
+    """
+    if row_state.salvage_notes:
+        return "; ".join(row_state.salvage_notes)
     failures = row_state.current_attempt.validation_errors
     if failures:
         return "; ".join(failures)
     if row_state.current_attempt.response:
         return f"Unexpected response at stage {row_state.current_attempt.stage_name}"
     return f"Extractor failed at stage {row_state.current_attempt.stage_name}"
+
+
+def failed_stage_name(row_state: ExtractionRowState) -> str:
+    """Return the stage whose failure this row is registered for.
+
+    For a salvaged row that is the stage salvage fired in, not the last stage
+    the row ran — an operator retrying the row needs the former.
+    """
+    for note in row_state.salvage_notes:
+        stage_name, _, _ = note.partition(" ")
+        if stage_name in {stage.name for stage in EXTRACTOR_STAGES}:
+            return stage_name
+    return row_state.current_attempt.stage_name
 
 
 def normalize_reasoning_effort(reasoning_effort: str | None) -> str:
@@ -4568,7 +4714,7 @@ def _failure_record(
         "date": partition_date,
         "shard": shard,
         "state": row_state.state,
-        "stage": row_state.current_attempt.stage_name,
+        "stage": failed_stage_name(row_state),
         "run_id": run_id,
         "backend": backend,
         "error": summarize_failure(row_state),

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 
+from cdt.extractor.core import DEBT_INSTRUMENT_MENTION_COLUMNS
 from cdt.matcher.core import (
+    NAME_CLASS_GATE,
     PreparedMention,
     build_empty_profile,
     derive_parent_links,
@@ -16,26 +18,36 @@ from cdt.matcher.core import (
 
 
 def mention_row(**overrides: object) -> dict[str, object]:
-    """Return one mention row with sensible defaults."""
-    row: dict[str, object] = {
-        "debt_instrument_mention_id": "mention-1",
-        "item_id": "item-1",
-        "raw_id": "raw-1",
-        "accession_number": "0000000000-24-000001",
-        "cik": "0000320193",
-        "company_name": "Example Co",
-        "date": "2024-06-01",
-        "name": "5.25% senior notes due 2028",
-        "start_date": "2024-06-01",
-        "maturity_date": "2028-06-01",
-        "principal_amount": "500000000",
-        "amendment_of": None,
-        "retired_by_json": "[]",
-        "split_of": None,
-        "parties_json": "[]",
-        "lenders_known_incomplete": False,
-        "maturity_date_json": "{}",
-    }
+    """Return one mention row with sensible defaults.
+
+    Seeded from `DEBT_INSTRUMENT_MENTION_COLUMNS` so every published column is
+    present: `prepare_mention` reads them all with `row.get`, so a column this
+    fixture forgot silently arrived as None and a rename went unnoticed.
+    """
+    row: dict[str, object] = dict.fromkeys(DEBT_INSTRUMENT_MENTION_COLUMNS)
+    row.update(
+        {
+            "debt_instrument_mention_id": "mention-1",
+            "item_id": "item-1",
+            "raw_id": "raw-1",
+            "accession_number": "0000000000-24-000001",
+            "cik": "0000320193",
+            "company_name": "Example Co",
+            "date": "2024-06-01",
+            "name": "5.25% senior notes due 2028",
+            "start_date": "2024-06-01",
+            "maturity_date": "2028-06-01",
+            "principal_amount": "500000000",
+            "retired_by_json": "[]",
+            "parties_json": "[]",
+            "lender_disclosure": "complete",
+            "maturity_date_json": "{}",
+            "amounts_json": "[]",
+            "dates_json": "[]",
+        }
+    )
+    unknown = set(overrides) - set(DEBT_INSTRUMENT_MENTION_COLUMNS)
+    assert not unknown, f"not published mention columns: {sorted(unknown)}"
     row.update(overrides)
     return row
 
@@ -637,3 +649,164 @@ def test_computed_maturity_collapses_to_month_resolution() -> None:
     assert prepare_mention(computed).normalized_end_date == "2031-06"
     assert end_dates_are_compatible("2031-06", "2031-06-30")
     assert not end_dates_are_compatible("2031-06", "2031-09-30")
+
+
+def test_a_generic_cluster_cannot_claim_an_individuating_name() -> None:
+    """The guard behind GEO's shattered note histories had no test.
+
+    A cluster whose every name is the generic `senior notes` must not absorb a
+    mention whose name individuates a series; letting it seeded the tie cascade
+    that produced 263 ambiguous edges on the 2026-09 window.
+    """
+    generic = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-generic",
+            name="senior notes",
+            start_date="2020-01-01",
+            principal_amount="100000000",
+            maturity_date=None,
+        )
+    )
+    individuating = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-series",
+            item_id="item-2",
+            name="5.25% senior notes due 2028",
+            start_date="2024-06-01",
+            principal_amount="500000000",
+        )
+    )
+
+    assert score(individuating, profile_from(generic)) == []
+
+    # Control: the same mention against a cluster that carries an identifying
+    # name attaches on the fingerprint path, so it is the cluster's genericness
+    # that blocked it above, not its keys.
+    identifying = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-identifying",
+            name="5.25% senior notes due 2028",
+            start_date="2020-01-01",
+            principal_amount="100000000",
+            maturity_date=None,
+        )
+    )
+    attached = score(individuating, profile_from(identifying))
+    assert [candidate.basis for candidate in attached] == ["name_fingerprint"]
+
+
+def test_name_only_tie_prefers_a_live_cluster_over_a_retired_one() -> None:
+    """The second of four sort components, which no fixture varied."""
+    from cdt.matcher.core import CandidateScore, resolve_candidates
+
+    mention = prepare_mention(mention_row(debt_instrument_mention_id="mention-new"))
+
+    def candidate(instrument_id: str, *, retired: bool) -> CandidateScore:
+        return CandidateScore(
+            debt_instrument_id=instrument_id,
+            match_score=0.90,
+            support_family="name",
+            basis="name_fingerprint",
+            exact_name=True,
+            cluster_size=2,
+            cluster_retired=retired,
+        )
+
+    chosen, _ = resolve_candidates(
+        mention,
+        [
+            candidate("inst-retired", retired=True),
+            candidate("inst-live", retired=False),
+        ],
+        strong_match_threshold=0.90,
+        loose_match_threshold=0.75,
+        ambiguity_margin=0.05,
+        evaluated_run_id="run-1",
+    )
+    assert chosen == "inst-live"
+
+
+def test_name_only_tie_prefers_the_largest_cluster_then_the_lowest_id() -> None:
+    """The third and fourth sort components; the fourth is what makes it stable."""
+    from cdt.matcher.core import CandidateScore, resolve_candidates
+
+    mention = prepare_mention(mention_row(debt_instrument_mention_id="mention-new"))
+
+    def candidate(instrument_id: str, *, size: int) -> CandidateScore:
+        return CandidateScore(
+            debt_instrument_id=instrument_id,
+            match_score=0.90,
+            support_family="name",
+            basis="name_fingerprint",
+            exact_name=True,
+            cluster_size=size,
+            cluster_retired=False,
+        )
+
+    kwargs = {
+        "strong_match_threshold": 0.90,
+        "loose_match_threshold": 0.75,
+        "ambiguity_margin": 0.05,
+        "evaluated_run_id": "run-1",
+    }
+    bigger, _ = resolve_candidates(
+        mention,
+        [candidate("inst-small", size=1), candidate("inst-big", size=5)],
+        **kwargs,
+    )
+    assert bigger == "inst-big"
+    # Equal on every earlier component, the id breaks the tie deterministically,
+    # which is what keeps resolution reproducible across runs (#171).
+    stable, _ = resolve_candidates(
+        mention, [candidate("zzz", size=3), candidate("aaa", size=3)], **kwargs
+    )
+    assert stable == "aaa"
+
+
+def test_relaxed_key_rule_is_gated_at_exactly_the_name_class_gate() -> None:
+    """Pin the gate's value, not just a wide straddle around it.
+
+    `test_a_generic_issuer_name_turns_off_the_relaxed_key_rule` compares 2
+    against 9, so raising `NAME_CLASS_GATE` from 2 to 8 left it passing. Testing
+    the boundary itself is what fixes the constant in place.
+    """
+    first = prepare_mention(
+        mention_row(
+            name="Consolidated Obligation Bonds",
+            principal_amount="10000000",
+            start_date=None,
+            maturity_date=None,
+        )
+    )
+    second = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-2",
+            item_id="item-2",
+            name="Consolidated Obligation Bonds",
+            principal_amount="10000000",
+            start_date=None,
+            maturity_date=None,
+        )
+    )
+    profiles = profile_from(first)
+
+    assert len(score(second, profiles, name_class_size=NAME_CLASS_GATE)) == 1
+    assert score(second, profiles, name_class_size=NAME_CLASS_GATE + 1) == []
+
+
+def test_lender_keys_reads_only_lender_clusters() -> None:
+    """Without the role filter a borrower's name joins the lender signature."""
+    from cdt.matcher.core import lender_keys
+
+    payload = json.dumps(
+        [
+            {"role": "lender", "spans": [{"text": "Acme Bank, N.A."}]},
+            {"role": "borrower", "spans": [{"text": "Example Co"}]},
+            {"role": "agent", "spans": [{"text": "Agent Trust Company"}]},
+        ]
+    )
+    assert lender_keys(payload) == ["acme bank"]
+    # A cluster with no role at all predates the unified parties list (#150)
+    # and is still read as a lender.
+    legacy = json.dumps([{"spans": [{"text": "Acme Bank, N.A."}]}])
+    assert lender_keys(legacy) == ["acme bank"]
