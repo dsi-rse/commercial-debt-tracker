@@ -204,7 +204,7 @@ Columns:
 - `raw_id`: Row-local extractor identifier used inside a single item during relation extraction.
 - `name`: Canonicalized debt instrument name text extracted from the item.
 - `instrument_type`: One of `term_loan`, `revolving_credit`, `credit_line`, `note_bond`, or null when none fits or the document does not say (#156).
-- `start_date`: Normalized instrument start or issuance date when present — the current `closing` fact in `dates_json`. An instrument whose status is `announced` has not started and carries none; its projected close lives in `dates_json` as `expected_closing`.
+- `start_date`: Normalized instrument start or issuance date when present — the current `closing` fact in `dates_json`. An instrument whose status is `announced` has not started and carries none; its projected close lives in `dates_json` as a `closing` fact marked `expected` (the stage-1 `expected_closing` kind is rewritten to that shape on the way in). The instrument-level `expected_active` leg is measured against it.
 - `maturity_date`: Normalized final maturity or expiration of the obligation — when the borrowed money must be repaid (#158). Year-only maturities normalize to `YYYY-12-31` with `derived_from: "name"`.
 - `commitment_termination_date`: When the lender's obligation to lend ends — the close of a draw, availability, or revolving period — when the document states one distinct from the maturity (#158). Null for notes and bonds.
 - `principal_amount`: The single commitment or principal figure, as digits with at most one decimal point. Balances, draws, repayments, and proceeds never populate this column (#140).
@@ -256,9 +256,24 @@ Columns:
 - `superseded_by_debt_instrument_id`: The amendment child that replaced this state, when exactly one exists (#155). A row with this set is a superseded state, not a live obligation.
 - `lineage_family_id`: One ID per connected lineage component over amendment, split, and retirement pointers — every state of one obligation history shares it (#155). Singleton instruments use their own ID.
 - `is_lineage_head`: True when no amendment child supersedes this row; the browse index should show heads and collapse the rest of the family beneath them.
-- `status`: Derived lifecycle answer (#155): the newest terminal extracted event (`terminated`, `repaid`, `exchanged`, `defaulted`) or `announced` wins; else `superseded` when an amendment child exists; else `repaid` when only the retirement lineage says the obligation ended and the retiring instrument is not itself merely `announced`; else `matured` when `maturity_date` is before the run's newest filing date; else `active`. A terminal event dated after its own filing (a redemption notice, a use-of-proceeds target) is an intended retirement, not one that happened: it decides nothing and blocks the `repaid`/`matured` legs, so the instrument stays `active` until a later filing confirms. An `announced` status is dated no later than the filing that announced it.
-- `status_date`: The winning event's date, or the maturity date for `matured`.
-- `status_source_mention_id`: The mention whose extracted event decided `status`, when one did.
+- `status`: Derived lifecycle answer (#155, vocabulary per #183). One of five values, which separate what the filings confirm from what they only imply:
+
+  | value | meaning |
+  |---|---|
+  | `announced` | The newest decisive event is the announcement, and either no planned start is recorded or that planned start is still ahead of the reference date. |
+  | `active` | The reference date is past an explicit `start_date`, and not yet past every end date the instrument records. |
+  | `expected_active` | No filing confirms it started, but the reference date is past its planned start. |
+  | `closed` | An explicit terminal status. Always carries a `status_subtype`. |
+  | `expected_closed` | The reference date is past every end date the instrument records — scheduled or merely planned — with no terminal event recorded. |
+
+  The legs are tried in order: an extracted terminal event; then `closed`/`superseded` when any amendment child replaced this state; then `closed`/`repaid` when only the retirement lineage says the obligation ended; then the date legs. An explicit `start_date` the reference date has passed outranks a later announcement, so re-announcing an instrument that already closed does not revert it (#169). An instrument with no dates and no events stays `active`: the filing describes an obligation it treats as outstanding, and there is no evidence against that.
+
+  The reference date is the newest filing date among this run's mentions, so a rerun over the same inputs reproduces the same statuses. End dates are `maturity_date`, `commitment_termination_date`, and any planned retirement the mentions record (an `expected` terminal date fact, or a terminal status dated after the filing that carries it — a redemption notice). The *latest* of them governs: a lapsed commitment does not close a facility whose principal is still owed to a later maturity. A planned retirement stated with no date can never be shown to have come due, so it blocks `expected_closed` indefinitely.
+- `status_subtype`: The cause of a `closed` status, null for every other status: `repaid`, `terminated`, `exchanged` or `defaulted` from the extracted terminal event, or `superseded` when a later amendment replaced this state. The display form joins the two with a dash — `closed - repaid` — so a reader sees the state and its cause together.
+- `status_date`: The date that decided `status`: the winning event's date, the `start_date` behind `active`, the planned start behind `expected_active`, or the end date behind `expected_closed`. Null for a `closed` status derived from lineage rather than an event. An `announced` status is dated no later than the filing that announced it.
+- `status_source_mention_id`: The mention whose extracted event decided `status`, when one did. Null on the inferred statuses, because no mention states them.
+
+Presenting `status` (UI contract): a `closed` or `expected_closed` row should name the instrument that ended it when one is known — `superseded by <name>` linking to `superseded_by_debt_instrument_id`, or `retired by <name>` linking to the entries in `retired_by_debt_instrument_ids`. Both pointers are published on the row, so the link needs no extra lookup beyond resolving the target's `name`.
 - `first_seen_filing_date` / `last_seen_filing_date`: Filing-date range of the instrument's direct mentions.
 - `mention_count` / `document_count`: Direct mentions, and distinct filings containing them.
 - `name`, `instrument_type`, `start_date`, `maturity_date`, `commitment_termination_date`: Matcher-selected canonical values (newest non-null across direct mentions).
