@@ -6433,6 +6433,22 @@ def test_canonical_instrument_name_keeps_the_obligation_over_the_agreement() -> 
     dip = tags("Super-Priority Senior Secured Priming Credit Agreement", "DIP Facility")
     assert canonical_instrument_name(list(dip), dip) == "DIP Facility"
 
+    # A non-agreement span that names no obligation is not an improvement:
+    # preferring it published `Local Currency Addendums` over `Credit Agreement
+    # (2025 364-Day Facility)` and `RFA` over `receivables financing agreement`.
+    vacuous = tags(
+        "Credit Agreement (2025 364-Day Facility)", "Local Currency Addendums"
+    )
+    assert (
+        canonical_instrument_name(list(vacuous), vacuous)
+        == "Credit Agreement (2025 364-Day Facility)"
+    )
+    abbreviation = tags("receivables financing agreement", "RFA")
+    assert (
+        canonical_instrument_name(list(abbreviation), abbreviation)
+        == "receivables financing agreement"
+    )
+
     # An instrument the filing only ever names by its agreement keeps that name.
     only_agreement = tags("Credit Agreement", "Amended Credit Agreement")
     assert (

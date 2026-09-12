@@ -3384,6 +3384,14 @@ def canonical_value(
 AGREEMENT_NAME_PATTERN = re.compile(
     r"\b(?:agreement|indenture|supplemental\s+indenture)\b", re.IGNORECASE
 )
+# What an obligation is called, as opposed to a defined term that merely happens
+# not to be an agreement title (`Local Currency Addendums`, `RFA`).
+INSTRUMENT_NOUN_PATTERN = re.compile(
+    r"\b(?:facility|facilities|loan|loans|note|notes|bond|bonds|debenture|"
+    r"debentures|line\s+of\s+credit|revolver|commitment|commitments|"
+    r"financing|borrowing|borrowings|credit)\b",
+    re.IGNORECASE,
+)
 
 
 def canonical_instrument_name(
@@ -3412,7 +3420,18 @@ def canonical_instrument_name(
     values = cluster_span_texts(tag_ids, tag_details)
     if not values:
         return None
-    described = [value for value in values if not AGREEMENT_NAME_PATTERN.search(value)]
+    described = [
+        value
+        for value in values
+        if not AGREEMENT_NAME_PATTERN.search(value)
+        # The alternative has to actually name an obligation. Preferring any
+        # non-agreement span published `Local Currency Addendums` over `Credit
+        # Agreement (2025 364-Day Facility)` and `RFA` over `receivables
+        # financing agreement` — trading the agreement-title problem for a
+        # vacuous-name one, and manufacturing the repeated template names that
+        # `NAME_CLASS_GATE` then has to defend against.
+        and INSTRUMENT_NOUN_PATTERN.search(value)
+    ]
     return max(described or values, key=len)
 
 
