@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
+
 from cdt.matcher.core import (
     PreparedMention,
     build_empty_profile,
+    derive_parent_links,
     end_dates_are_compatible,
     name_rates_are_compatible,
     prepare_mention,
@@ -27,7 +30,7 @@ def mention_row(**overrides: object) -> dict[str, object]:
         "end_date": "2028-06-01",
         "amount": "500000000",
         "amendment_of": None,
-        "retired_of": None,
+        "retired_by_json": "[]",
         "split_of": None,
         "lenders_json": "[]",
         "lenders_known_incomplete": False,
@@ -436,43 +439,43 @@ def test_exact_key_match_keeps_amount_start_basis() -> None:
 
 
 def test_relation_target_cannot_join_declaring_cluster() -> None:
-    """Old notes retired by an exchange stay outside the new notes' cluster."""
-    new_notes = prepare_mention(
-        mention_row(
-            name="6.375% Senior Notes due 2025",
-            amount="231800000",
-            retired_of="mention-old",
-        )
-    )
+    """The new exchange notes stay outside the retired old notes' cluster."""
     old_notes = prepare_mention(
         mention_row(
-            debt_instrument_mention_id="mention-old",
             name="6.375% Senior Notes due 2025",
             amount="38400000",
             start_date="2010-05-11",
-        )
-    )
-    assert score(old_notes, profile_from(new_notes)) == []
-
-
-def test_declaring_mention_cannot_join_target_cluster() -> None:
-    """The new exchange notes stay outside the old notes' cluster too."""
-    old_notes = prepare_mention(
-        mention_row(
-            debt_instrument_mention_id="mention-old",
-            name="6.375% Senior Notes due 2025",
-            amount="38400000",
-            start_date="2010-05-11",
+            retired_by_json='["mention-new"]',
         )
     )
     new_notes = prepare_mention(
         mention_row(
+            debt_instrument_mention_id="mention-new",
             name="6.375% Senior Notes due 2025",
             amount="231800000",
-            retired_of="mention-old",
         )
     )
     assert score(new_notes, profile_from(old_notes)) == []
+
+
+def test_declaring_mention_cannot_join_target_cluster() -> None:
+    """The retired old notes stay outside the new notes' cluster too."""
+    new_notes = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-new",
+            name="6.375% Senior Notes due 2025",
+            amount="231800000",
+        )
+    )
+    old_notes = prepare_mention(
+        mention_row(
+            name="6.375% Senior Notes due 2025",
+            amount="38400000",
+            start_date="2010-05-11",
+            retired_by_json='["mention-new"]',
+        )
+    )
+    assert score(old_notes, profile_from(new_notes)) == []
 
 
 LENDER_JSON = (
@@ -515,3 +518,29 @@ def test_lender_support_still_applies_without_name_conflict() -> None:
     assert len(candidates) == 1
     assert candidates[0].support_family == "lenders"
     assert candidates[0].match_score == 1.0
+
+
+def test_published_retirers_are_sorted_not_set_order() -> None:
+    """The published retirer array is sorted rather than set-iteration order (#180).
+
+    `derive_parent_links` collects retirers in a set, so dropping its `sorted()`
+    leaves the published order down to how the ids happen to hash. A realistic
+    two-retirer fixture therefore catches that only about half the time, and
+    which half depends on `PYTHONHASHSEED`. Eight ids, fed in reverse order,
+    make an accidentally sorted set vanishingly unlikely.
+    """
+    retirers = [f"m-retirer-{index}" for index in range(8)]
+    retired = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="m-old",
+            retired_by_json=json.dumps(list(reversed(retirers))),
+        )
+    )
+
+    links = derive_parent_links(
+        {"m-old": ["m-old"]},
+        {"m-old": retired},
+        {"m-old": "m-old", **{retirer: retirer for retirer in retirers}},
+    )
+
+    assert links["m-old"]["retired_by_debt_instrument_ids"] == json.dumps(retirers)
