@@ -1,7 +1,7 @@
 ## Background
 You will be given an `<instruments>` list followed by HTML that contains only `debt_instrument` tags. Each tag has an `instrument-id` attribute such as `i-1`, `i-2`, and so on. Each `instrument-id` refers to one already-extracted debt instrument mention cluster.
 
-The `<instruments>` list gives the terms already extracted for each id: its `name`, and its `amount`, `start_date`, and `end_date` where those were found. Use it to tell ids apart. Two ids often point at the same tagged text, because two objects were built from one name span, and then the list is the only thing that distinguishes them. An id whose `start_date` is later, or whose `amount` and `end_date` match the post-change figures in the text, is the newer state.
+The `<instruments>` list gives the terms already extracted for each id: its `name`, and its `amount`, `start_date`, `maturity_date`, and `status` where those were found, plus `expected_retirement="true"` when the extraction recorded that the filing plans to redeem, repay, exchange or terminate it — the usual mark of a use-of-proceeds target. Use it to tell ids apart when two ids point at the same tagged text.
 
 Your task is to identify lineage relationships between these mention clusters only.
 
@@ -17,10 +17,10 @@ Use `retired_by` when the text says a debt obligation ceased to exist because it
 Use `retired_by` also when the text says the older debt will be redeemed, repaid, or retired with the proceeds of the newer instrument. Proceeds-financed retirement counts, whether or not the new instrument structurally replaces the old one.
 
 ## Examples
-- A commitment increase, maturity extension, amendment, or amendment and restatement filing that also describes the predecessor instrument: the mention cluster for the instrument as amended is `amendment_of` the predecessor's mention cluster. The cluster for the instrument as amended, carrying the newer terms, is always `from`; the predecessor, carrying the older terms, is always `to`.
-- Read "newer terms" off the figures the text gives, not off which id comes first. When a filing says commitments were reduced `from $100,000,000 to $50,000,000` and the maturity extended `from June 28, 2026 to June 23, 2031`, the id holding `$100,000,000` and `2026-06-28` is the predecessor and belongs in `to`; the id holding `$50,000,000` and `2031-06-23` is the instrument as amended and belongs in `from`.
+- An amendment of one facility is normally a single mention cluster carrying its old terms as prior figures, so it needs no relation. Only when the extraction produced two clusters for one obligation carried forward with changed terms — an amended-and-restated agreement described alongside the facility it restates — is the newer cluster `amendment_of` the older one. The cluster for the instrument as amended is `from`; the predecessor is `to`.
+- When two ids for one obligation do exist, read which is newer off the figures the text gives, not off which id comes first: the id holding the pre-change `$100,000,000` and `2026-06-28` is the predecessor (`to`); the id holding `$50,000,000` and `2031-06-23` is the instrument as amended (`from`).
 - A new facility that `refinances and replaces` an existing facility: the replaced facility is `retired_by` the new facility, not `amendment_of` it, because the old facility ceased to exist. The replaced facility is `from`; the new facility is `to`.
-- New notes whose stated use of proceeds is to redeem the company's outstanding `5.25% Senior Notes due 2027`: the 2027 notes are `retired_by` the new notes, even though the new notes do not structurally replace them.
+- New notes whose stated use of proceeds is to redeem the company's outstanding `5.25% Senior Notes due 2027`: the 2027 notes (`expected_retirement="true"` in the list) are `retired_by` the new notes, even though the new notes do not structurally replace them.
 
 ## Output Rules
 1. Return a JSON array of objects with exactly the keys `from`, `to`, and `type`.

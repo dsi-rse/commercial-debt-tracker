@@ -612,9 +612,29 @@ def shard_for_accession(accession_number: str) -> str:
     return shard_label(accession_number, ITEMIZE_CLASSIFY_EXTRACT_SHARDS)
 
 
+CIK_DIGITS = 10
+
+
+def normalize_cik(cik: object) -> str:
+    """Return SEC's canonical 10-digit zero-padded CIK string.
+
+    Published rows carry this form so they join against anything keyed on SEC's
+    canonical CIKs (#153). Non-numeric input is returned stripped rather than
+    padded, so a malformed manifest value stays visibly malformed.
+    """
+    text = str(cik).strip()
+    return text.zfill(CIK_DIGITS) if text.isdigit() else text
+
+
 def shard_for_cik(cik: str) -> str:
-    """Return the canonical cik-shard partition for one CIK."""
-    return shard_label(cik, MATCH_SHARDS)
+    """Return the canonical cik-shard partition for one CIK.
+
+    Hashes the unpadded form: partitions written before CIKs were zero-padded
+    (#153) hashed bare strings like ``707605``, and per `shard_label`'s
+    contract a changed input strands them. Padded and unpadded spellings of one
+    CIK therefore always land in the same shard.
+    """
+    return shard_label(str(cik).lstrip("0") or "0", MATCH_SHARDS)
 
 
 def zlib_crc32(value: str) -> int:

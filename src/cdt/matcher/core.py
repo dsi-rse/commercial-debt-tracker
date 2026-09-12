@@ -16,6 +16,7 @@ import pandas as pd
 from cdt.datasets import (
     cik_shard_partition_path,
     dataset_root,
+    normalize_cik,
     resolve_artifact_root,
     run_manifest_path,
     shard_for_cik,
@@ -23,7 +24,12 @@ from cdt.datasets import (
 from cdt.extractor.core import (
     DEBT_INSTRUMENT_MENTION_COLUMNS as EXTRACTED_MENTION_COLUMNS,
 )
-from cdt.extractor.core import MENTIONS_DATASET_NAME
+from cdt.extractor.core import (
+    LENDER_DISCLOSURE_NONE_NAMED,
+    LENDER_DISCLOSURE_PRECEDENCE,
+    LENDER_DISCLOSURE_VALUES,
+    MENTIONS_DATASET_NAME,
+)
 from cdt.storage import (
     coerce_dataset_text,
     read_dataset,
@@ -36,7 +42,7 @@ DEFAULT_RELATED_THRESHOLD = 0.75
 DEFAULT_MEMBERSHIP_THRESHOLD = 0.90
 DEFAULT_AMBIGUITY_MARGIN = 0.05
 DEFAULT_LENDER_SUPPORT_THRESHOLD = 0.5
-MATCHER_SCHEMA_VERSION = 3
+MATCHER_SCHEMA_VERSION = 4
 EDGE_TYPES = ("member", "related", "ambiguous_candidate")
 GENERIC_LENDER_TERMS = frozenset(
     {
@@ -73,13 +79,39 @@ DEBT_INSTRUMENT_COLUMNS = [
     "amendment_of_debt_instrument_id",
     "retired_by_debt_instrument_ids",
     "split_of_debt_instrument_id",
+    "superseded_by_debt_instrument_id",
+    "lineage_family_id",
+    "is_lineage_head",
+    "status",
+    "status_date",
+    "status_source_mention_id",
+    "first_seen_filing_date",
+    "last_seen_filing_date",
+    "mention_count",
+    "document_count",
     "name",
+    "name_source_mention_id",
+    "instrument_type",
+    "instrument_type_source_mention_id",
     "start_date",
-    "end_date",
-    "amount",
-    "lenders_json",
-    "other_interested_parties_json",
-    "lenders_known_incomplete",
+    "start_date_source_mention_id",
+    "maturity_date",
+    "maturity_source_mention_id",
+    "commitment_termination_date",
+    "commitment_termination_source_mention_id",
+    "principal_amount",
+    "principal_currency",
+    "principal_amount_kind",
+    "principal_source_mention_id",
+    "outstanding_balance",
+    "outstanding_balance_currency",
+    "outstanding_balance_as_of",
+    "outstanding_balance_source_mention_id",
+    "interest_rate_kind",
+    "interest_rate_pct",
+    "interest_rate_source_mention_id",
+    "parties_json",
+    "lender_disclosure",
 ]
 MENTION_CLUSTER_EDGE_DATASET_NAME = "mention-cluster-edges"
 DEBT_INSTRUMENT_DATASET_NAME = "debt-instruments"
@@ -132,15 +164,27 @@ class PreparedMention:
     company_name: str | None
     date: str | None
     name: str | None
+    instrument_type: str | None
     start_date: str | None
-    end_date: str | None
-    amount: str | None
+    maturity_date: str | None
+    maturity_is_derived: bool
+    commitment_termination_date: str | None
+    principal_amount: str | None
+    principal_currency: str | None
+    principal_amount_kind: str | None
+    amounts_json: str
+    interest_rate_kind: str | None
+    interest_rate_pct: str | None
+    status: str | None
+    status_date: str | None
+    # Stage 2: the extractor records a planned redemption or termination as an
+    # `expected` date fact instead of a status; the rollup treats it as pending.
+    expected_retirement: bool
     amendment_of: str | None
     retired_by: tuple[str, ...]
     split_of: str | None
-    lenders_json: str
-    lenders_known_incomplete: bool
-    other_interested_parties_json: str
+    parties_json: str
+    lender_disclosure: str
     normalized_amount: str | None
     normalized_start_date: str | None
     normalized_end_date: str | None
@@ -163,11 +207,14 @@ class ClusterProfile:
     lender_signatures: set[str]
     relation_target_ids: set[str] = field(default_factory=set)
     member_item_ids: set[str] = field(default_factory=set)
+    retired: bool = False
 
     def add_member(self: ClusterProfile, mention: PreparedMention) -> None:
         """Update the cluster cache with one newly accepted member."""
         if mention.debt_instrument_mention_id not in self.member_ids:
             self.member_ids.append(mention.debt_instrument_mention_id)
+        if mention.retired_by or mention.status in TERMINAL_STATUS_EVENTS:
+            self.retired = True
         if mention.item_id:
             self.member_item_ids.add(mention.item_id)
         if mention.normalized_amount:
@@ -193,6 +240,9 @@ class CandidateScore:
     match_score: float
     support_family: str | None
     basis: str = "amount_start"
+    exact_name: bool = False
+    cluster_size: int = 0
+    cluster_retired: bool = False
 
     @property
     def base_match_via(self: CandidateScore) -> str:
@@ -463,6 +513,11 @@ def match_tables(
         existing_instruments=instrument_rows,
         company_names=company_names or company_names_by_cik(debt_instrument_mentions),
     )
+    apply_lifecycle_rollup(
+        debt_instrument_rows,
+        member_groups=normalized_members,
+        mention_index=mention_index,
+    )
     return {
         "debt_instrument_mentions": combined_edges.reindex(
             columns=MENTION_CLUSTER_EDGE_COLUMNS
@@ -471,6 +526,231 @@ def match_tables(
             debt_instrument_rows, columns=DEBT_INSTRUMENT_COLUMNS
         ),
     }
+
+
+TERMINAL_STATUS_EVENTS = {"terminated", "repaid", "exchanged", "defaulted"}
+
+
+def apply_lifecycle_rollup(
+    rows: list[dict[str, object]],
+    *,
+    member_groups: dict[str, list[str]],
+    mention_index: dict[str, PreparedMention],
+) -> None:
+    """Fill lineage-head, derived status, and observation columns in place (#155).
+
+    The browse index needs one row per live obligation: `superseded_by` marks a
+    state that a later amendment replaced, `lineage_family_id` groups every
+    state of one obligation history, and `status` answers "is this borrowing
+    still alive as far as the filings say". The maturity comparison uses the
+    newest filing date in this run's mentions as its reference so a rerun over
+    the same inputs reproduces the same rows exactly.
+    """
+    rows_by_id = {str(row["debt_instrument_id"]): row for row in rows}
+    superseded_by: dict[str, set[str]] = {}
+    for row in rows:
+        parent = coerce_optional_text(row.get("amendment_of_debt_instrument_id"))
+        if parent and parent in rows_by_id:
+            superseded_by.setdefault(parent, set()).add(str(row["debt_instrument_id"]))
+
+    # Lineage families: connected components over every lineage pointer kind.
+    neighbors: dict[str, set[str]] = {
+        str(row["debt_instrument_id"]): set() for row in rows
+    }
+    for row in rows:
+        row_id = str(row["debt_instrument_id"])
+        targets = [
+            coerce_optional_text(row.get("amendment_of_debt_instrument_id")),
+            coerce_optional_text(row.get("split_of_debt_instrument_id")),
+        ]
+        retired = coerce_optional_text(row.get("retired_by_debt_instrument_ids"))
+        if retired:
+            targets.extend(json.loads(retired))
+        for target in targets:
+            if target and target in neighbors:
+                neighbors[row_id].add(target)
+                neighbors[target].add(row_id)
+    family_by_id: dict[str, str] = {}
+    for start in sorted(neighbors):
+        if start in family_by_id:
+            continue
+        component = {start}
+        frontier = [start]
+        while frontier:
+            node = frontier.pop()
+            for neighbor in neighbors[node]:
+                if neighbor not in component:
+                    component.add(neighbor)
+                    frontier.append(neighbor)
+        family_id = min(component)
+        for member in component:
+            family_by_id[member] = family_id
+
+    reference_date = max(
+        (mention.date for mention in mention_index.values() if mention.date),
+        default=None,
+    )
+    for row in rows:
+        row_id = str(row["debt_instrument_id"])
+        children = superseded_by.get(row_id, set())
+        # Like the parent pointers, an ambiguous inverse publishes nothing.
+        row["superseded_by_debt_instrument_id"] = (
+            next(iter(children)) if len(children) == 1 else None
+        )
+        row["lineage_family_id"] = family_by_id.get(row_id, row_id)
+        row["is_lineage_head"] = not children
+        member_ids = [
+            member_id
+            for member_id in member_groups.get(row_id, [])
+            if member_id in mention_index
+        ]
+        dates = sorted(
+            mention_index[member_id].date
+            for member_id in member_ids
+            if mention_index[member_id].date
+        )
+        row["first_seen_filing_date"] = dates[0] if dates else None
+        row["last_seen_filing_date"] = dates[-1] if dates else None
+        row["mention_count"] = len(member_ids)
+        row["document_count"] = len(
+            {
+                mention_index[member_id].accession_number
+                for member_id in member_ids
+                if mention_index[member_id].accession_number
+            }
+        )
+        row["_member_ids"] = member_ids
+    # Event-based statuses first, so the derived legs below can ask whether the
+    # instrument that retired this one exists yet or is itself only announced.
+    event_status: dict[str, tuple[str, str | None, str | None] | None] = {}
+    pending: set[str] = set()
+    for row in rows:
+        row_id = str(row["debt_instrument_id"])
+        result, is_pending = event_status_for_instrument(
+            row["_member_ids"], mention_index
+        )
+        event_status[row_id] = result
+        if is_pending:
+            pending.add(row_id)
+    announced_ids = {
+        row_id
+        for row_id, result in event_status.items()
+        if result is not None and result[0] == "announced"
+    }
+    for row in rows:
+        row_id = str(row["debt_instrument_id"])
+        member_ids = row.pop("_member_ids")
+        status, status_date, status_source = derive_instrument_status(
+            row,
+            member_ids,
+            mention_index,
+            reference_date=reference_date,
+            event_result=event_status[row_id],
+            retirement_pending=row_id in pending,
+            announced_instrument_ids=announced_ids,
+        )
+        row["status"] = status
+        row["status_date"] = status_date
+        row["status_source_mention_id"] = status_source
+
+
+def derive_instrument_status(
+    row: dict[str, object],
+    member_ids: list[str],
+    mention_index: dict[str, PreparedMention],
+    *,
+    reference_date: str | None,
+    event_result: tuple[str, str | None, str | None] | None = None,
+    retirement_pending: bool = False,
+    announced_instrument_ids: set[str] | None = None,
+) -> tuple[str, str | None, str | None]:
+    """Return (status, status_date, source_mention_id) for one instrument.
+
+    The newest extracted event wins when it is terminal or `announced`;
+    `entered_into` and `amended` say the instrument existed, not how it ended,
+    so they fall through to the derived legs: superseded by an amendment
+    child, matured against the run's newest filing date, else active.
+    """
+    if (
+        event_result is None
+        and not retirement_pending
+        and announced_instrument_ids is None
+    ):
+        event_result, retirement_pending = event_status_for_instrument(
+            member_ids, mention_index
+        )
+    if event_result is not None:
+        return event_result
+    if row.get("superseded_by_debt_instrument_id"):
+        return "superseded", None, None
+    retired_by = coerce_optional_text(row.get("retired_by_debt_instrument_ids"))
+    if retired_by and not retirement_pending:
+        # A retired_by pointer without a mention-level event still means the
+        # obligation ended — unless the retiring instrument is itself only
+        # announced (a use-of-proceeds financing that has not closed), in which
+        # case the retirement has not happened yet either.
+        retiring_ids = [str(value) for value in json.loads(retired_by)]
+        if not any(
+            retiring_id in (announced_instrument_ids or set())
+            for retiring_id in retiring_ids
+        ):
+            return "repaid", None, None
+    maturity = coerce_optional_text(row.get("maturity_date"))
+    if (
+        maturity
+        and reference_date
+        and maturity < reference_date
+        and not retirement_pending
+    ):
+        return "matured", maturity, None
+    return "active", None, None
+
+
+def event_status_for_instrument(
+    member_ids: list[str],
+    mention_index: dict[str, PreparedMention],
+) -> tuple[tuple[str, str | None, str | None] | None, bool]:
+    """Return the newest extracted event that decides a status, and a pending flag.
+
+    A terminal event dated after its own filing describes an intended
+    retirement (a redemption notice, a use-of-proceeds target), not one that
+    happened; it does not decide the status but marks the retirement pending so
+    the derived legs do not assert `repaid` or `matured` either. An `announced`
+    event is dated no later than the filing that announced it — the expected
+    closing date is when the instrument will start, not when it was announced.
+    """
+    ordered = sorted(
+        member_ids,
+        key=lambda member_id: mention_recency_key(mention_index[member_id]),
+        reverse=True,
+    )
+    pending = False
+    for member_id in ordered:
+        mention = mention_index[member_id]
+        if mention.expected_retirement:
+            pending = True
+        if mention.status is None:
+            continue
+        if mention.status in TERMINAL_STATUS_EVENTS:
+            if (
+                mention.status_date
+                and mention.date
+                and mention.status_date > mention.date
+            ):
+                pending = True
+                continue
+            return (
+                mention.status,
+                mention.status_date or mention.date,
+                member_id,
+            ), pending
+        if mention.status == "announced":
+            status_date = mention.status_date or mention.date
+            if status_date and mention.date and status_date > mention.date:
+                status_date = mention.date
+            return ("announced", status_date, member_id), pending
+        break
+    return None, pending
 
 
 def build_cluster_profiles(
@@ -505,7 +785,7 @@ def build_cluster_profiles(
         )
         profile = ClusterProfile(
             debt_instrument_id=debt_instrument_id,
-            cik=coerce_optional_text(instrument_row.get("cik")) or "",
+            cik=coerce_optional_cik(instrument_row.get("cik")) or "",
             seed_mention_id=seed_mention_id,
             member_ids=list(member_ids),
             normalized_amounts=set(),
@@ -515,7 +795,8 @@ def build_cluster_profiles(
             lender_signatures=set(),
         )
         normalized_amount = normalize_amount(
-            coerce_optional_text(instrument_row.get("amount"))
+            coerce_optional_text(instrument_row.get("principal_amount"))
+            or coerce_optional_text(instrument_row.get("amount"))
         )
         if normalized_amount:
             profile.normalized_amounts.add(normalized_amount)
@@ -525,7 +806,8 @@ def build_cluster_profiles(
         if normalized_start_date:
             profile.normalized_start_dates.add(normalized_start_date)
         normalized_end_date = normalize_date(
-            coerce_optional_text(instrument_row.get("end_date"))
+            coerce_optional_text(instrument_row.get("maturity_date"))
+            or coerce_optional_text(instrument_row.get("end_date"))
         )
         if normalized_end_date:
             profile.normalized_end_dates.add(normalized_end_date)
@@ -534,7 +816,9 @@ def build_cluster_profiles(
         )
         if normalized_name:
             profile.normalized_name_fingerprints.add(normalized_name)
-        lenders = lender_signature(instrument_row.get("lenders_json"))
+        lenders = lender_signature(
+            instrument_row.get("parties_json") or instrument_row.get("lenders_json")
+        )
         if lenders:
             profile.lender_signatures.add(lenders)
         for member_id in member_ids:
@@ -590,37 +874,6 @@ def build_empty_profile(
         normalized_end_dates=set(),
         normalized_name_fingerprints=set(),
         lender_signatures=set(),
-    )
-
-
-def is_same_item_sibling(
-    mention: PreparedMention,
-    profile: ClusterProfile,
-) -> bool:
-    """Return whether the mention is a sibling of a cluster member, not the same debt.
-
-    The key-conflicting fingerprint path exists because one offering is observed
-    across several filings — launch, pricing, closing — which drift on amount and
-    start date. Cleveland-Cliffs launched $800M and priced $900M of the same
-    notes on one day, so a shared start date alone cannot rule the merge out.
-
-    Inside a single item it can. The extractor is told that two different start
-    dates or two different principal amounts in one document are "strong evidence
-    there are two separate debt instruments", so two objects from one item that
-    agree on the start date and disagree on the principal are siblings by
-    construction. Longevity Health issued a $1,250,000 and a $1,100,000 `10%
-    Senior Secured Convertible Note` on one day in one item; both maturities were
-    null and both coupons `10%`, so neither of #64's gates could separate them
-    (#131). An add-on to an existing series carries the add-on's own start date,
-    so it stays mergeable.
-    """
-    return (
-        mention.item_id in profile.member_item_ids
-        and mention.normalized_start_date is not None
-        and mention.normalized_start_date in profile.normalized_start_dates
-        and mention.normalized_amount is not None
-        and bool(profile.normalized_amounts)
-        and mention.normalized_amount not in profile.normalized_amounts
     )
 
 
@@ -693,6 +946,18 @@ def score_candidates_for_mention(
     for profile in profiles.values():
         if profile.cik != mention.cik:
             continue
+        if mention.item_id in profile.member_item_ids:
+            # One item returns one object per instrument — the extractor's
+            # invariant — so a same-item pair is two instruments by
+            # construction, whatever their names and keys say. The partial
+            # sibling test this replaces needed a shared start date and both
+            # amounts present, so Gray Media's $70M add-on tap, whose parent
+            # series stated no start date, slid through the identifying-name
+            # path and published the series at the add-on's size (#161). It
+            # also covers Longevity Health's same-day twin notes (#131) and
+            # Kestra's four tranches. Cross-filing launch/pricing/closing
+            # merges are different items and unaffected.
+            continue
         if mention.amendment_of and mention.amendment_of in profile.member_ids:
             continue
         if any(target in profile.member_ids for target in mention.retired_by):
@@ -725,13 +990,19 @@ def score_candidates_for_mention(
             for candidate_name in profile.normalized_name_fingerprints
         )
         if not keys_match:
-            # One item returns one object per instrument, so two objects from the
-            # same item whose names do not even describe the same debt are two
-            # debts. Kestra Medical's four tranches share an item, a maturity,
-            # and in two cases an amount.
-            if mention.item_id in profile.member_item_ids and not name_compatible:
-                continue
-            if name_compatible and not is_same_item_sibling(mention, profile):
+            if name_compatible:
+                # A cluster whose every name is generic (`senior notes`) cannot
+                # claim a mention whose name individuates a series; letting it
+                # seeded the tie cascade that shattered GEO's note histories.
+                if (
+                    name_is_identifying
+                    and profile.normalized_name_fingerprints
+                    and not any(
+                        name_fingerprint_is_identifying(candidate_name)
+                        for candidate_name in profile.normalized_name_fingerprints
+                    )
+                ):
+                    continue
                 # Launch, pricing, and closing 8-Ks for one offering drift on
                 # amount (upsizes) and start date (pricing vs settlement), so an
                 # identifying name may attach a mention whose keys conflict.
@@ -747,6 +1018,12 @@ def score_candidates_for_mention(
                             match_score=round(strong_match_threshold, 4),
                             support_family="name",
                             basis="name_fingerprint",
+                            exact_name=(
+                                mention.normalized_name_fingerprint
+                                in profile.normalized_name_fingerprints
+                            ),
+                            cluster_size=len(profile.member_ids),
+                            cluster_retired=profile.retired,
                         )
                     )
             continue
@@ -811,6 +1088,54 @@ def resolve_candidates(
             for candidate in qualifying_members[1:]
             if top_candidate.match_score - candidate.match_score <= ambiguity_margin
         ]
+        tied = [top_candidate, *close_competitors]
+        name_only_tie = bool(close_competitors) and all(
+            candidate.basis == "name_fingerprint" for candidate in tied
+        )
+        if name_only_tie:
+            # A mention that ties several existing clusters on its name belongs
+            # to at most one of them; seeding a third can never be right, and
+            # the third guarantees every later mention of the series ties too
+            # (the cascade behind 263 ambiguous edges on the 2026-09 window).
+            # Prefer the cluster already carrying this exact name, then a live
+            # obligation over a retired one, then the largest cluster.
+            tied.sort(
+                key=lambda candidate: (
+                    not candidate.exact_name,
+                    candidate.cluster_retired,
+                    -candidate.cluster_size,
+                    candidate.debt_instrument_id,
+                )
+            )
+            top_candidate = tied[0]
+            edge_rows = [
+                build_edge_row(
+                    mention_id=mention.debt_instrument_mention_id,
+                    debt_instrument_id=top_candidate.debt_instrument_id,
+                    edge_type="member",
+                    match_score=top_candidate.match_score,
+                    candidate_rank=1,
+                    match_via=render_match_via(
+                        "member", top_candidate.support_family, top_candidate.basis
+                    ),
+                    evaluated_run_id=evaluated_run_id,
+                )
+            ]
+            for rank, candidate in enumerate(tied[1:], start=2):
+                edge_rows.append(
+                    build_edge_row(
+                        mention_id=mention.debt_instrument_mention_id,
+                        debt_instrument_id=candidate.debt_instrument_id,
+                        edge_type="ambiguous_candidate",
+                        match_score=candidate.match_score,
+                        candidate_rank=rank,
+                        match_via=render_match_via(
+                            "ambiguous", candidate.support_family, candidate.basis
+                        ),
+                        evaluated_run_id=evaluated_run_id,
+                    )
+                )
+            return top_candidate.debt_instrument_id, edge_rows
         if not close_competitors:
             edge_rows = [
                 build_edge_row(
@@ -1078,35 +1403,26 @@ def build_debt_instrument_rows(
             cik = coerce_optional_text(existing_row.get("cik"))
         if seed_mention_id is None or cik is None:
             continue
-        lenders_json = json.dumps(
+        parties_json = json.dumps(
             dedupe_party_clusters(
                 [
-                    str(existing_row.get("lenders_json") or "[]"),
+                    str(existing_row.get("parties_json") or "[]"),
                     *[
-                        mention_index[mention_id].lenders_json
+                        mention_index[mention_id].parties_json
                         for mention_id in present_member_ids
                     ],
                 ]
             ),
             sort_keys=True,
         )
-        lenders_known_incomplete = coerce_flag(
-            existing_row.get("lenders_known_incomplete")
-        ) or any(
-            mention_index[mention_id].lenders_known_incomplete
-            for mention_id in present_member_ids
-        )
-        other_interested_parties_json = json.dumps(
-            dedupe_party_clusters(
-                [
-                    str(existing_row.get("other_interested_parties_json") or "[]"),
-                    *[
-                        mention_index[mention_id].other_interested_parties_json
-                        for mention_id in present_member_ids
-                    ],
-                ]
-            ),
-            sort_keys=True,
+        lender_disclosure = aggregate_lender_disclosure(
+            [
+                coerce_optional_text(existing_row.get("lender_disclosure")),
+                *[
+                    mention_index[mention_id].lender_disclosure
+                    for mention_id in present_member_ids
+                ],
+            ]
         )
         rows.append(
             {
@@ -1129,21 +1445,46 @@ def build_debt_instrument_rows(
                 "split_of_debt_instrument_id": parent_links.get(
                     debt_instrument_id, {}
                 ).get("split_of_debt_instrument_id"),
-                "name": first_non_null(ordered_member_ids, mention_index, "name")
-                or coerce_optional_text(existing_row.get("name")),
-                "start_date": first_non_null(
-                    ordered_member_ids, mention_index, "start_date"
-                )
-                or coerce_optional_text(existing_row.get("start_date")),
-                "end_date": first_non_null(
-                    ordered_member_ids, mention_index, "end_date"
-                )
-                or coerce_optional_text(existing_row.get("end_date")),
-                "amount": first_non_null(ordered_member_ids, mention_index, "amount")
-                or coerce_optional_text(existing_row.get("amount")),
-                "lenders_json": lenders_json,
-                "lenders_known_incomplete": lenders_known_incomplete,
-                "other_interested_parties_json": other_interested_parties_json,
+                **canonical_scalar_fields(
+                    ordered_member_ids,
+                    mention_index,
+                    existing_row,
+                    field_name="name",
+                    source_column="name_source_mention_id",
+                ),
+                **canonical_scalar_fields(
+                    ordered_member_ids,
+                    mention_index,
+                    existing_row,
+                    field_name="instrument_type",
+                    source_column="instrument_type_source_mention_id",
+                ),
+                **canonical_scalar_fields(
+                    ordered_member_ids,
+                    mention_index,
+                    existing_row,
+                    field_name="start_date",
+                    source_column="start_date_source_mention_id",
+                ),
+                **canonical_maturity_fields(
+                    ordered_member_ids, mention_index, existing_row
+                ),
+                **canonical_scalar_fields(
+                    ordered_member_ids,
+                    mention_index,
+                    existing_row,
+                    field_name="commitment_termination_date",
+                    source_column="commitment_termination_source_mention_id",
+                ),
+                **principal_amount_fields(
+                    ordered_member_ids, mention_index, existing_row
+                ),
+                **outstanding_balance_fields(
+                    ordered_member_ids, mention_index, existing_row
+                ),
+                **interest_rate_fields(ordered_member_ids, mention_index, existing_row),
+                "parties_json": parties_json,
+                "lender_disclosure": lender_disclosure,
             }
         )
     return rows
@@ -1155,7 +1496,7 @@ def company_names_by_cik(mention_rows: pd.DataFrame) -> dict[str, str]:
         return {}
     newest: dict[str, tuple[tuple[str, str], str]] = {}
     for row in mention_rows.to_dict("records"):
-        cik = coerce_optional_text(row.get("cik"))
+        cik = coerce_optional_cik(row.get("cik"))
         company_name = coerce_optional_text(row.get("company_name"))
         if cik is None or company_name is None:
             continue
@@ -1182,13 +1523,203 @@ def first_non_null(
     return None
 
 
+def canonical_scalar_fields(
+    ordered_member_ids: list[str],
+    mention_index: dict[str, PreparedMention],
+    existing_row: dict[str, object],
+    *,
+    field_name: str,
+    source_column: str,
+    existing_keys: tuple[str, ...] | None = None,
+) -> dict[str, str | None]:
+    """Return one canonical field plus the mention it actually came from (#151).
+
+    The site attributes each canonical value to a source document; without the
+    pointer it guessed, and could stamp the value with the wrong filing. A
+    value carried forward from the existing row keeps that row's recorded
+    source.
+    """
+    for mention_id in ordered_member_ids:
+        value = getattr(mention_index[mention_id], field_name)
+        if value is not None:
+            return {field_name: value, source_column: mention_id}
+    for key in existing_keys or (field_name,):
+        value = coerce_optional_text(existing_row.get(key))
+        if value is not None:
+            return {
+                field_name: value,
+                source_column: coerce_optional_text(existing_row.get(source_column)),
+            }
+    return {field_name: None, source_column: None}
+
+
+def canonical_maturity_fields(
+    ordered_member_ids: list[str],
+    mention_index: dict[str, PreparedMention],
+    existing_row: dict[str, object],
+) -> dict[str, str | None]:
+    """Return the canonical maturity, preferring stated dates over name-derived.
+
+    Every post-closing `due 2030` mention re-introduces the synthesized
+    year-end, so recency-only selection let a name-derived `2030-12-31`
+    outrank the closing 8-K's stated `2030-07-01` (#162). The newest stated
+    maturity wins; a derived value — name-derived or computed (#166) —
+    publishes only when no mention in the cluster states one.
+    """
+    fallback: dict[str, str | None] | None = None
+    for mention_id in ordered_member_ids:
+        mention = mention_index[mention_id]
+        if mention.maturity_date is None:
+            continue
+        fields = {
+            "maturity_date": mention.maturity_date,
+            "maturity_source_mention_id": mention_id,
+        }
+        if not mention.maturity_is_derived:
+            return fields
+        if fallback is None:
+            fallback = fields
+    if fallback is not None:
+        return fallback
+    value = coerce_optional_text(
+        existing_row.get("maturity_date") or existing_row.get("end_date")
+    )
+    return {
+        "maturity_date": value,
+        "maturity_source_mention_id": (
+            coerce_optional_text(existing_row.get("maturity_source_mention_id"))
+            if value is not None
+            else None
+        ),
+    }
+
+
+def principal_amount_fields(
+    ordered_member_ids: list[str],
+    mention_index: dict[str, PreparedMention],
+    existing_row: dict[str, object],
+) -> dict[str, str | None]:
+    """Return the canonical principal columns from the newest carrying mention.
+
+    Currency and kind travel with the amount they describe (#140): mixing the
+    newest amount with an older mention's currency could relabel an AUD
+    facility as USD.
+    """
+    for mention_id in ordered_member_ids:
+        mention = mention_index[mention_id]
+        if mention.principal_amount is not None:
+            return {
+                "principal_amount": mention.principal_amount,
+                "principal_currency": mention.principal_currency,
+                "principal_amount_kind": mention.principal_amount_kind,
+                "principal_source_mention_id": mention_id,
+            }
+    return {
+        "principal_amount": coerce_optional_text(
+            existing_row.get("principal_amount") or existing_row.get("amount")
+        ),
+        "principal_currency": coerce_optional_text(
+            existing_row.get("principal_currency")
+        ),
+        "principal_amount_kind": coerce_optional_text(
+            existing_row.get("principal_amount_kind")
+        ),
+        "principal_source_mention_id": coerce_optional_text(
+            existing_row.get("principal_source_mention_id")
+        ),
+    }
+
+
+def outstanding_balance_fields(
+    ordered_member_ids: list[str],
+    mention_index: dict[str, PreparedMention],
+    existing_row: dict[str, object],
+) -> dict[str, str | None]:
+    """Return the newest outstanding-balance observation.
+
+    Kept apart from principal so a balance can never double-count as the
+    headline amount (#140).
+    """
+    for mention_id in ordered_member_ids:
+        mention = mention_index[mention_id]
+        for entry in parse_cluster_list(mention.amounts_json):
+            if (
+                entry.get("kind") == "outstanding_balance"
+                and entry.get("normalized_amount") is not None
+            ):
+                as_of = entry.get("as_of_date")
+                return {
+                    "outstanding_balance": str(entry["normalized_amount"]),
+                    "outstanding_balance_currency": (
+                        str(entry["currency"])
+                        if entry.get("currency") is not None
+                        else None
+                    ),
+                    # The mention's filing date bounds an undated balance.
+                    "outstanding_balance_as_of": (
+                        str(as_of) if as_of is not None else mention.date
+                    ),
+                    "outstanding_balance_source_mention_id": mention_id,
+                }
+    return {
+        "outstanding_balance": coerce_optional_text(
+            existing_row.get("outstanding_balance")
+        ),
+        "outstanding_balance_currency": coerce_optional_text(
+            existing_row.get("outstanding_balance_currency")
+        ),
+        "outstanding_balance_as_of": coerce_optional_text(
+            existing_row.get("outstanding_balance_as_of")
+        ),
+        "outstanding_balance_source_mention_id": coerce_optional_text(
+            existing_row.get("outstanding_balance_source_mention_id")
+        ),
+    }
+
+
+def interest_rate_fields(
+    ordered_member_ids: list[str],
+    mention_index: dict[str, PreparedMention],
+    existing_row: dict[str, object],
+) -> dict[str, str | None]:
+    """Return the canonical interest rate from the newest carrying mention (#157)."""
+    for mention_id in ordered_member_ids:
+        mention = mention_index[mention_id]
+        if mention.interest_rate_kind is not None or (
+            mention.interest_rate_pct is not None
+        ):
+            return {
+                "interest_rate_kind": mention.interest_rate_kind,
+                "interest_rate_pct": mention.interest_rate_pct,
+                "interest_rate_source_mention_id": mention_id,
+            }
+    return {
+        "interest_rate_kind": coerce_optional_text(
+            existing_row.get("interest_rate_kind")
+        ),
+        "interest_rate_pct": coerce_optional_text(
+            existing_row.get("interest_rate_pct")
+        ),
+        "interest_rate_source_mention_id": coerce_optional_text(
+            existing_row.get("interest_rate_source_mention_id")
+        ),
+    }
+
+
 def dedupe_party_clusters(payloads: list[str]) -> list[dict[str, object]]:
-    """Return deduped party cluster payloads."""
+    """Return deduped party cluster payloads, keyed by role plus canonical name.
+
+    The role is part of the key so one entity appearing in two roles — an agent
+    that is also a lender — keeps both rows (#150).
+    """
     deduped: dict[str, dict[str, object]] = {}
     for payload in payloads:
         for cluster in parse_cluster_list(payload):
-            key = cluster_canonical_key(cluster)
-            if key and key not in deduped:
+            canonical = cluster_canonical_key(cluster)
+            if not canonical:
+                continue
+            key = f"{cluster.get('role', 'lender')}::{canonical}"
+            if key not in deduped:
                 deduped[key] = cluster
     return [deduped[key] for key in sorted(deduped)]
 
@@ -1211,13 +1742,15 @@ def cluster_canonical_key(cluster: dict[str, object]) -> str:
     `Oaktree` and `Purchasers`. The specific name is the useful key, so generic
     party words lose to it even when the alias is the longer string.
     """
-    mentions = cluster.get("mentions", [])
-    if not isinstance(mentions, list):
+    # Current payloads carry `spans`; partitions written before the evidence
+    # shape change (#128) carry `mentions`. Both list {text, offsets} dicts.
+    spans = cluster.get("spans", cluster.get("mentions", []))
+    if not isinstance(spans, list):
         return ""
     texts = [
-        normalize_party_text(str(mention.get("text", "")))
-        for mention in mentions
-        if isinstance(mention, dict) and mention.get("text")
+        normalize_party_text(str(span.get("text", "")))
+        for span in spans
+        if isinstance(span, dict) and span.get("text")
     ]
     texts = [text for text in texts if text]
     if not texts:
@@ -1233,30 +1766,45 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
         item_id=str(row["item_id"]),
         raw_id=str(row["raw_id"]),
         accession_number=coerce_optional_text(row.get("accession_number")),
-        cik=coerce_optional_text(row.get("cik")),
+        # Normalized so mentions written before CIKs were zero-padded (#153)
+        # still group with rows written after.
+        cik=coerce_optional_cik(row.get("cik")),
         company_name=coerce_optional_text(row.get("company_name")),
         date=coerce_optional_text(row.get("date")),
         name=coerce_optional_text(row.get("name")),
+        instrument_type=coerce_optional_text(row.get("instrument_type")),
         start_date=coerce_optional_text(row.get("start_date")),
-        end_date=coerce_optional_text(row.get("end_date")),
-        amount=coerce_optional_text(row.get("amount")),
+        maturity_date=coerce_optional_text(row.get("maturity_date")),
+        maturity_is_derived=maturity_derivation(row.get("maturity_date_json"))
+        in DERIVED_MATURITY_KINDS,
+        commitment_termination_date=coerce_optional_text(
+            row.get("commitment_termination_date")
+        ),
+        principal_amount=coerce_optional_text(row.get("principal_amount")),
+        principal_currency=coerce_optional_text(row.get("principal_currency")),
+        principal_amount_kind=coerce_optional_text(row.get("principal_amount_kind")),
+        amounts_json=str(row.get("amounts_json") or "[]"),
+        interest_rate_kind=coerce_optional_text(row.get("interest_rate_kind")),
+        interest_rate_pct=coerce_optional_text(row.get("interest_rate_pct")),
+        status=coerce_optional_text(row.get("status")),
+        status_date=coerce_optional_text(row.get("status_date")),
+        expected_retirement=expected_retirement_from_dates_json(row.get("dates_json")),
         amendment_of=coerce_optional_text(row.get("amendment_of")),
         retired_by=tuple(json.loads(str(row.get("retired_by_json") or "[]"))),
         split_of=coerce_optional_text(row.get("split_of")),
-        lenders_json=str(row.get("lenders_json") or "[]"),
-        lenders_known_incomplete=coerce_flag(row.get("lenders_known_incomplete")),
-        other_interested_parties_json=str(
-            row.get("other_interested_parties_json") or "[]"
+        parties_json=str(row.get("parties_json") or "[]"),
+        lender_disclosure=coerce_lender_disclosure(row.get("lender_disclosure")),
+        normalized_amount=normalize_amount(
+            coerce_optional_text(row.get("principal_amount"))
         ),
-        normalized_amount=normalize_amount(coerce_optional_text(row.get("amount"))),
         normalized_start_date=normalize_date(
             coerce_optional_text(row.get("start_date"))
         ),
-        normalized_end_date=normalize_date(coerce_optional_text(row.get("end_date"))),
+        normalized_end_date=normalized_end_date_for_matching(row),
         normalized_name_fingerprint=normalize_name_fingerprint(
             coerce_optional_text(row.get("name"))
         ),
-        lender_signature=lender_signature(row.get("lenders_json")),
+        lender_signature=lender_signature(row.get("parties_json")),
     )
 
 
@@ -1270,6 +1818,25 @@ def mention_sort_key(mention: PreparedMention) -> tuple[str, str, str, str]:
     )
 
 
+EXPECTED_RETIREMENT_KINDS = {"retirement", "termination", "exchange", "default"}
+
+
+def expected_retirement_from_dates_json(value: object) -> bool:
+    """Return whether a mention's date facts include a planned retirement."""
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        facts = json.loads(value)
+    except json.JSONDecodeError:
+        return False
+    return any(
+        isinstance(fact, dict)
+        and fact.get("kind") in EXPECTED_RETIREMENT_KINDS
+        and fact.get("expected") is True
+        for fact in facts
+    )
+
+
 def mention_recency_key(mention: PreparedMention) -> tuple[str, str, str, str]:
     """Return recency ordering for field resolution."""
     return (
@@ -1280,21 +1847,40 @@ def mention_recency_key(mention: PreparedMention) -> tuple[str, str, str, str]:
     )
 
 
-def coerce_flag(value: object) -> bool:
-    """Return one boolean flag, treating missing parquet values as False."""
-    if value is None:
-        return False
-    try:
-        if pd.isna(value):
-            return False
-    except TypeError:
-        pass
-    return bool(value)
-
-
 def coerce_optional_text(value: object) -> str | None:
     """Return one trimmed string or None, treating placeholder text as missing."""
     return coerce_dataset_text(value)
+
+
+def coerce_lender_disclosure(value: object) -> str:
+    """Return one known lender-disclosure value, defaulting to `none_named`.
+
+    A mention that records nothing about who holds the debt has named no
+    lender, which is exactly `none_named` — the conservative reading, and the
+    one that cannot invent a complete syndicate list out of a missing value.
+    """
+    text = coerce_dataset_text(value)
+    return text if text in LENDER_DISCLOSURE_VALUES else LENDER_DISCLOSURE_NONE_NAMED
+
+
+def aggregate_lender_disclosure(values: list[str | None]) -> str:
+    """Roll several mentions' disclosure answers into one for the instrument.
+
+    Worst-of by `LENDER_DISCLOSURE_PRECEDENCE`: a single filing showing a
+    collective lender phrase means holders are hidden however many other
+    filings name some, while a filing that named every lender supersedes one
+    that named none.
+    """
+    known = [value for value in values if value in LENDER_DISCLOSURE_VALUES]
+    if not known:
+        return LENDER_DISCLOSURE_NONE_NAMED
+    return max(known, key=lambda value: LENDER_DISCLOSURE_PRECEDENCE[value])
+
+
+def coerce_optional_cik(value: object) -> str | None:
+    """Return one canonical zero-padded CIK or None (#153)."""
+    text = coerce_dataset_text(value)
+    return normalize_cik(text) if text is not None else None
 
 
 def normalize_amount(value: str | None) -> str | None:
@@ -1368,9 +1954,16 @@ def normalize_name_fingerprint(value: str | None) -> str | None:
 
 
 def lender_keys(value: object) -> list[str]:
-    """Return normalized lender cluster keys in deterministic order."""
+    """Return normalized lender cluster keys in deterministic order.
+
+    Clusters without a ``role`` key are treated as lenders: they come from
+    payloads written before parties were unified (#150), when the lender list
+    was its own column.
+    """
     keys: list[str] = []
     for cluster in parse_cluster_list(str(value or "[]")):
+        if str(cluster.get("role", "lender")) != "lender":
+            continue
         key = cluster_canonical_key(cluster)
         if key:
             keys.append(key)
@@ -1403,17 +1996,72 @@ def lender_similarity_score(left: str, right: str) -> float:
     return round(SequenceMatcher(a=left, b=right).ratio(), 4)
 
 
+YEAR_TEXT_LENGTH = 4
+MONTH_TEXT_LENGTH = 7
+
+
+def normalized_end_date_for_matching(row: dict[str, object]) -> str | None:
+    """Return the end date the matcher compares, at its true resolution.
+
+    A year-only maturity such as "due 2030" is synthesized to ``2030-12-31`` on
+    the way into the dataset, and its payload says ``derived_from: "name"``.
+    Comparing that synthesized day would either invent precision or force every
+    genuine December 31 maturity to be treated loosely — which is what happened
+    while the provenance flag was missing (#128). Name-derived year-end values
+    collapse to the bare year here; other name-derived values — the month-end
+    synthesized from "due April 2033" (#164), or a full date embedded in the
+    name — collapse to their month, so a stated mid-month maturity does not
+    falsely conflict with the name's synthetic day. Stated dates keep their
+    day.
+    """
+    value = normalize_date(coerce_optional_text(row.get("maturity_date")))
+    if not value:
+        return None
+    derivation = maturity_derivation(row.get("maturity_date_json"))
+    if derivation not in DERIVED_MATURITY_KINDS:
+        return value
+    if derivation == "name" and value.endswith("-12-31"):
+        return value[:YEAR_TEXT_LENGTH]
+    # Name-embedded full dates, month-end synthetics (#164), and start-plus-
+    # tenor arithmetic (#166) are all month-trustworthy but not day-exact.
+    return value[:MONTH_TEXT_LENGTH]
+
+
+# Maturities the extractor derived rather than read off a stated date: from
+# the instrument's name, or computed as start plus tenor (#166).
+DERIVED_MATURITY_KINDS = frozenset({"name", "computed"})
+
+
+def maturity_derivation(payload_text: object) -> str | None:
+    """Return one maturity payload's derived_from marker."""
+    try:
+        payload = json.loads(str(payload_text or "{}"))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    derivation = payload.get("derived_from")
+    return str(derivation) if isinstance(derivation, str) else None
+
+
 def end_dates_are_compatible(left: str | None, right: str | None) -> bool:
-    """Return whether two normalized end dates can still describe one instrument."""
+    """Return whether two normalized end dates can still describe one instrument.
+
+    A bare four-digit year is a year-resolution value from a name-derived
+    maturity (#128) and matches any date in that year; a seven-character
+    ``YYYY-MM`` is month-resolution (#164) and matches any date in that month.
+    Full stated dates — including a genuine December 31 — must agree exactly.
+    """
     if not left or not right:
         return True
     if left == right:
         return True
-    if left[:4] != right[:4]:
+    if left[:YEAR_TEXT_LENGTH] != right[:YEAR_TEXT_LENGTH]:
         return False
-    # A YYYY-12-31 value may come from a year-only maturity such as "due 2030",
-    # so it is only year-resolution evidence and matches any date in that year.
-    return left.endswith("-12-31") or right.endswith("-12-31")
+    if len(left) == YEAR_TEXT_LENGTH or len(right) == YEAR_TEXT_LENGTH:
+        return True
+    shorter, longer = sorted((left, right), key=len)
+    return len(shorter) == MONTH_TEXT_LENGTH and longer[:MONTH_TEXT_LENGTH] == shorter
 
 
 NAME_RATE_PATTERN = re.compile(r"\d+(?:\.\d+)?%")

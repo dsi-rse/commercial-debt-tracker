@@ -17,6 +17,7 @@ import pandas as pd
 from cdt import settings
 from cdt.datasets import (
     iter_date_shard_partitions,
+    normalize_cik,
     parse_date_shard_partition,
     shard_label,
 )
@@ -769,7 +770,7 @@ def _filing_from_manifest(manifest: dict[str, object]) -> ScrapedFiling:
         for document in cast(list[dict[str, object]], manifest.get("documents", []))
     )
     return ScrapedFiling(
-        cik=str(manifest.get("cik", "")).lstrip("0"),
+        cik=normalize_cik(manifest.get("cik", "")),
         accession_number=str(manifest.get("accession_number", "")),
         form_type=str(manifest.get("form_type", "")),
         filing_date=date.fromisoformat(str(manifest["filing_date"])),

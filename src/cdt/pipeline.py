@@ -11,7 +11,7 @@ from typing import Self
 import pandas as pd
 
 from cdt.classifier import classify_pending_items, default_model_dir
-from cdt.datasets import resolve_artifact_root
+from cdt.datasets import normalize_cik, resolve_artifact_root
 from cdt.extractor import (
     DEFAULT_MAX_ATTEMPTS,
     DEFAULT_MODEL,
@@ -603,6 +603,12 @@ def normalize_snapshot_text(table: pd.DataFrame) -> pd.DataFrame:
         if normalized[column].dtype != object:
             continue
         normalized[column] = normalized[column].map(normalize_snapshot_cell)
+    if "cik" in normalized.columns:
+        # Partitions written before #153 carry unpadded CIKs; published
+        # snapshots always carry SEC's canonical zero-padded form.
+        normalized["cik"] = normalized["cik"].map(
+            lambda value: normalize_cik(value) if isinstance(value, str) else value
+        )
     return normalized
 
 

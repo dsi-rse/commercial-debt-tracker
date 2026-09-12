@@ -6,6 +6,11 @@ The pipeline can also write optional final snapshot parquet files under a separa
 
 Text columns are normalized on the way into a snapshot: a cell whose whole value is a placeholder such as `nan`, `none`, `null`, `<na>`, or `n/a` is written as a null. Partitions written before a column existed, or by a stage that stringified a missing value, would otherwise publish the placeholder as if it were real text.
 
+Two schema-wide contracts:
+
+- `cik` columns carry SEC's canonical 10-digit zero-padded form (#153). Snapshots pad legacy unpadded partitions on the way out, and `shard_for_cik` hashes the unpadded form so existing `cik_shard` partitions stay where they are.
+- Every evidence payload records `spans`: a list of `{tag_id, char_start, char_end, text}` whose offsets index the source item's `text` **exactly** (#154) — the extractor realigns model output whose whitespace drifted. Value-bearing payloads also record `derived_from`: `"stated"` when the value was parsed from cited evidence, `"name"` when it was derived from the instrument's own name (a `due 2028` maturity, a `$183.36 million term loan` principal, a coupon in the name), and null when there is no value (#128).
+
 ## Root Layout
 
 ```text
@@ -190,29 +195,40 @@ Primary key: `item_id`
 
 Columns:
 
-- `debt_instrument_mention_id`: Deterministic identifier for one extracted debt-instrument mention.
+- `debt_instrument_mention_id`: Deterministic identifier for one extracted debt-instrument mention (a content hash over the extracted fields plus `item_id`).
 - `item_id`: Source item section identifier.
 - `accession_number`: Filing accession number for the source item.
-- `cik`: Issuer CIK for the source item.
+- `cik`: Issuer CIK for the source item, zero-padded.
 - `company_name`: Issuer display name for the source item.
 - `date`: Filing date for the source item in `YYYY-MM-DD` format.
 - `raw_id`: Row-local extractor identifier used inside a single item during relation extraction.
 - `name`: Canonicalized debt instrument name text extracted from the item.
-- `start_date`: Normalized instrument start or issuance date when present.
-- `end_date`: Normalized maturity, termination, or end date when present.
-- `amount`: Normalized principal or commitment amount when present.
+- `instrument_type`: One of `term_loan`, `revolving_credit`, `credit_line`, `note_bond`, or null when none fits or the document does not say (#156).
+- `start_date`: Normalized instrument start or issuance date when present — the current `closing` fact in `dates_json`. An instrument whose status is `announced` has not started and carries none; its projected close lives in `dates_json` as `expected_closing`.
+- `maturity_date`: Normalized final maturity or expiration of the obligation — when the borrowed money must be repaid (#158). Year-only maturities normalize to `YYYY-12-31` with `derived_from: "name"`.
+- `commitment_termination_date`: When the lender's obligation to lend ends — the close of a draw, availability, or revolving period — when the document states one distinct from the maturity (#158). Null for notes and bonds.
+- `principal_amount`: The single commitment or principal figure, as digits with at most one decimal point. Balances, draws, repayments, and proceeds never populate this column (#140).
+- `principal_currency`: ISO 4217 code for `principal_amount` when stated.
+- `principal_amount_kind`: `commitment` or `principal`; null on rows replayed from the pre-#140 single-amount shape.
+- `status`: What this mention says happened to the instrument, derived from its event facts in `dates_json`: the newest completed event wins (`retirement`→`repaid`, `termination`→`terminated`, `exchange`→`exchanged`, `default`→`defaulted`, `amendment`→`amended`, `closing`→`entered_into`, `announcement`→`announced`); an instrument whose only closing is `expected` is `announced`; a planned retirement decides nothing here and is read by the matcher as pending. Null when the mention states no event. `matured` is never extracted; the matcher derives it. Pre-stage-2 responses that carried a `status_event` replay it verbatim.
+- `status_date`: The date of the event that decided `status`, when stated.
+- `interest_rate_kind`: `fixed` or `floating` (#157).
+- `interest_rate_pct`: The stated fixed or all-in rate as a numeric string, parser-verified against the cited evidence or the instrument's name. Null for floating rates; benchmarks and margins are not recorded.
 - `amendment_of`: `debt_instrument_mention_id` of the mention this row amends, when the extractor found that relation.
 - `split_of`: `debt_instrument_mention_id` of the mention this row splits from, when the extractor found that relation.
-- `retired_by_json`: JSON array of `debt_instrument_mention_id`s of the mentions that retired this row's obligation, when the extractor found that relation. The pointer sits on the retired instrument's mention, and it is a list because one obligation may be retired jointly by several instruments (a dual-tranche offering funding one redemption). Proceeds-financed redemption counts (#142), so the targets need not structurally replace this row.
-- `lenders_json`: JSON array of lender or counterparty mention clusters with evidence text. Collective phrases such as `the other lenders party thereto` are excluded; `lenders_known_incomplete` records that they were present.
-- `other_interested_parties_json`: JSON array of additional related-party clusters with evidence text, excluding the filer or borrower itself.
-- `name_json`: JSON payload describing the evidence tags and surface text used to construct `name`.
-- `start_date_json`: JSON payload containing normalized start-date value plus extraction evidence.
-- `end_date_json`: JSON payload containing normalized end-date value plus extraction evidence. The maturity may come from the instrument name, such as `notes due 2028`, in which case the evidence list can be empty; year-only maturities normalize to `YYYY-12-31`.
-- `amount_json`: JSON payload containing normalized amount value plus extraction evidence.
-- `lenders_known_incomplete`: Boolean flag that is true when the mention shows the document referred to lenders it did not name, such as `the other lenders party thereto`. A true value with an empty `lenders_json` means the instrument has counterparties the document never named — the normal case for an instrument placed into the public market or sold to unnamed holders through underwriters, where the underwriters are recorded in `other_interested_parties_json` instead. A false value with an empty `lenders_json` means the document named no counterparty and signalled none, so there is nothing to disclose rather than something undisclosed.
+- `retired_by_json`: JSON array of `debt_instrument_mention_id`s of the mentions that retired this row's obligation. The pointer sits on the retired instrument's mention; proceeds-financed redemption counts (#142).
+- `parties_json`: JSON array of every party cluster with `canonical_name` (longest span), `role` (`lender`, `borrower`, `agent`, `trustee`, `underwriter`, `guarantor`, `other`), `kind` (`named` or `collective`), and evidence `spans` (#150). The extractor returns one `parties` list with a role per cluster; nothing the model labels is discarded.
+- `name_json`: Evidence payload (`spans`) for `name`.
+- `start_date_json`, `maturity_date_json`, `commitment_termination_date_json`: Evidence payloads with `normalized_date` and `derived_from`.
+- `amounts_json`: JSON array of kind-typed money facts (#140): `{kind, normalized_amount, currency, as_of_date, spans, derived_from, prior}` with `kind` one of `commitment`, `principal`, `outstanding_balance`, `draw`, `repayment`, `proceeds` (null on legacy replays). `as_of_date` is normally present only on balances. `prior` is true for a figure the filing states as it stood before an amendment (`from $25,000,000 to $50,000,000`); prior facts never supply `principal_amount`.
+- `dates_json`: JSON array of kind-typed date facts: `{kind, normalized_date, precision, prior, expected, spans, derived_from}`. Kinds: `agreement` (the instrument's own dated-as-of date), `announcement`, `closing` (closing, issuance, funding, effective — the start), `amendment`, `repayment` (a payment that leaves the obligation outstanding), `retirement` (repaid in full, redeemed in whole, defeased, discharged), `termination`, `exchange`, `default`, `maturity`, `commitment_termination`. `precision` is `day`, `month` or `year` for how precisely the cited text states the date. `prior` marks a term stated as it stood before an amendment; `expected` marks a date the filing states as planned rather than occurred (an expected closing, a noticed redemption). An event the filing states without a date is a fact with `normalized_date` null. The flat `start_date`, `maturity_date` and `commitment_termination_date` columns are the current (non-prior, non-expected) `closing`, `maturity` and `commitment_termination` facts. Responses in the pre-dates[] shape replay with the kind implied by the old property name.
+- `status_json`: `{status, status_date}` where `status_date` is a full evidence payload (#141).
+- `interest_rate_json`: `{kind, rate_pct, spans, derived_from}` (#157).
+- `lender_disclosure`: How completely this mention identifies who holds the debt, derived from the party clusters: `complete` when every `lender` cluster is `named`; `collective_present` when any is `collective` (`the other lenders party thereto`); `none_named` when the mention names no lender at all (a public-market series, a redemption notice, a syndicate where only the agent is named). Replaces the `lenders_known_incomplete` boolean, which was true for the second and third cases alike and so could not distinguish "something is undisclosed" from "nothing was disclosed here". Pre-stage-2 responses replay the flag the model declared, mapped onto these values.
 
 Primary key: `debt_instrument_mention_id`
+
+Rows publish from extractor states `SUCCESS` and `PARTIAL` (#152). A `PARTIAL` row salvaged what a terminal failure left intact — individually valid entries after a final `instrument_ie` validation failure, or mentions without lineage after a terminal `instrument_relation` failure — and also carries a failure-registry entry recording what was lost.
 
 ### `mention-cluster-edges`
 
@@ -231,21 +247,27 @@ Columns:
 Columns:
 
 - `debt_instrument_id`: Canonical entity identifier for one consolidated debt instrument history.
-- `cik`: Issuer CIK shared by the instrument's directly matched mentions.
+- `cik`: Issuer CIK shared by the instrument's directly matched mentions, zero-padded.
 - `company_name`: Issuer display name resolved from the instrument's directly matched mentions, falling back to the newest name any mention for the same CIK carries.
 - `seed_debt_instrument_mention_id`: First direct mention used as the representative seed for the instrument record.
 - `amendment_of_debt_instrument_id`: Parent instrument ID when this instrument is an amendment lineage child.
+- `retired_by_debt_instrument_ids`: JSON array of IDs of the instruments that retired this one, set on the retired instrument's own row (null when none).
 - `split_of_debt_instrument_id`: Parent instrument ID when this instrument is a split lineage child.
-- `retired_by_debt_instrument_ids`: JSON array of IDs of the instruments that retired this one, set on the retired instrument's own row (null when none). Unlike the two parent columns above, the pointer marks this row's obligation as ended, not as a lineage child, and several retirers are legitimate rather than ambiguous, so all are kept.
-- `name`: Matcher-selected canonical instrument name derived from the instrument's direct mentions.
-- `start_date`: Matcher-selected canonical start date derived from the instrument's direct mentions.
-- `end_date`: Matcher-selected canonical end date derived from the instrument's direct mentions.
-- `amount`: Matcher-selected canonical amount derived from the instrument's direct mentions.
-- `direct_mentions_json`: JSON array of directly assigned `debt_instrument_mention_id` values for this instrument.
-- `lenders_json`: JSON aggregation of lender clusters carried forward from the instrument's direct mentions.
-- `other_interested_parties_json`: JSON aggregation of other related-party clusters carried forward from the instrument's direct mentions.
-- `possibly_related_json`: JSON array of advisory mention IDs that look related but were not directly matched into the instrument.
-- `lenders_known_incomplete`: Boolean flag that is true when any direct mention of the instrument showed undisclosed lenders.
+- `superseded_by_debt_instrument_id`: The amendment child that replaced this state, when exactly one exists (#155). A row with this set is a superseded state, not a live obligation.
+- `lineage_family_id`: One ID per connected lineage component over amendment, split, and retirement pointers — every state of one obligation history shares it (#155). Singleton instruments use their own ID.
+- `is_lineage_head`: True when no amendment child supersedes this row; the browse index should show heads and collapse the rest of the family beneath them.
+- `status`: Derived lifecycle answer (#155): the newest terminal extracted event (`terminated`, `repaid`, `exchanged`, `defaulted`) or `announced` wins; else `superseded` when an amendment child exists; else `repaid` when only the retirement lineage says the obligation ended and the retiring instrument is not itself merely `announced`; else `matured` when `maturity_date` is before the run's newest filing date; else `active`. A terminal event dated after its own filing (a redemption notice, a use-of-proceeds target) is an intended retirement, not one that happened: it decides nothing and blocks the `repaid`/`matured` legs, so the instrument stays `active` until a later filing confirms. An `announced` status is dated no later than the filing that announced it.
+- `status_date`: The winning event's date, or the maturity date for `matured`.
+- `status_source_mention_id`: The mention whose extracted event decided `status`, when one did.
+- `first_seen_filing_date` / `last_seen_filing_date`: Filing-date range of the instrument's direct mentions.
+- `mention_count` / `document_count`: Direct mentions, and distinct filings containing them.
+- `name`, `instrument_type`, `start_date`, `maturity_date`, `commitment_termination_date`: Matcher-selected canonical values (newest non-null across direct mentions).
+- `principal_amount`, `principal_currency`, `principal_amount_kind`: Canonical headline amount, taken together from the newest mention that carries one so the currency can never detach from its figure (#140).
+- `outstanding_balance`, `outstanding_balance_currency`, `outstanding_balance_as_of`: The newest balance observation, kept apart from principal so it never double-counts (#140). `as_of` falls back to the observing mention's filing date.
+- `interest_rate_kind`, `interest_rate_pct`: Canonical interest rate (#157).
+- `*_source_mention_id` (name, instrument_type, start_date, maturity, commitment_termination, principal, outstanding_balance, interest_rate): The mention each canonical value actually came from (#151), so evidence attribution never has to be guessed.
+- `parties_json`: JSON aggregation of party clusters from direct mentions, deduped by role plus normalized canonical name (#150).
+- `lender_disclosure`: The instrument's worst-case answer across its direct mentions. `collective_present` wins outright — one filing showing a collective lender phrase means holders are hidden however many others name some — and `complete` beats `none_named`, so a filing that named every lender is not erased by one that named none.
 
 Primary key: `debt_instrument_id`
 
@@ -353,10 +375,12 @@ reads it to decide what to process, and writing it does not change which partiti
 skipped. What it provides is a durable, queryable work-list of dropped rows — previously
 recoverable only by parsing every `extractor-runs/run_id=*/full.jsonl` audit file.
 
-Entries are keyed by `item_id` and accumulate across runs. A row that succeeds in a later
-run (typically a `--force` re-extract) has its entry removed, so the registry always
-reflects the latest known outcome per row rather than a growing history. Retrying the
-listed rows is still manual, and still partition-granular via `--force`.
+Entries are keyed by `item_id` and accumulate across runs. A row that fully succeeds in a
+later run (typically a `--force` re-extract) has its entry removed, so the registry always
+reflects the latest known outcome per row rather than a growing history. A `PARTIAL` row
+(#152) appears here too — its mentions published, but the entry records what salvage
+dropped. Retrying the listed rows is still manual, and still partition-granular via
+`--force`.
 
 ## Operational Semantics
 

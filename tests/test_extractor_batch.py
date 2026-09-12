@@ -78,7 +78,13 @@ MULTI_IE = json.dumps(
     [
         {
             "name": ["tag-1"],
-            "start_date": {"evidence": ["tag-2"], "normalized_date": "2024-01-01"},
+            "dates": [
+                {
+                    "kind": "closing",
+                    "evidence": ["tag-2"],
+                    "normalized_date": "2024-01-01",
+                }
+            ],
         }
     ]
 )
