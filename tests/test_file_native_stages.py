@@ -6296,6 +6296,36 @@ def test_two_current_closing_dates_are_rejected() -> None:
     assert not any(
         "current entries of kind" in failure for failure in two_of("amendment")
     )
+    # A planned closing beside a real one is one *current* closing, not two:
+    # `select_date_payload` skips `expected` entries, so counting them rejected
+    # Costamare's 6-K, which states both for one facility.
+    assert not any(
+        "current entries of kind" in failure
+        for failure in validate_dates_property(
+            index=0,
+            obj={
+                "dates": [
+                    {"kind": "closing", "evidence": [date_ids[0]]},
+                    {"kind": "closing", "evidence": [date_ids[1]], "expected": True},
+                ]
+            },
+            tag_details=tags,
+        )
+    )
+    # A `prior` term is likewise not current.
+    assert not any(
+        "current entries of kind" in failure
+        for failure in validate_dates_property(
+            index=0,
+            obj={
+                "dates": [
+                    {"kind": "maturity", "evidence": [date_ids[0]]},
+                    {"kind": "maturity", "evidence": [date_ids[1]], "prior": True},
+                ]
+            },
+            tag_details=tags,
+        )
+    )
 
 
 def test_interest_rate_without_an_evidence_key_is_accepted() -> None:
@@ -6707,3 +6737,28 @@ def test_a_partial_row_publishes_its_mentions_and_registers_the_loss(
     assert entry["state"] == "PARTIAL"
     assert entry["stage"] == "instrument_ie"
     assert "dropped 2" in str(entry["error"])
+
+
+def test_abbreviated_magnitudes_parse_to_full_amounts() -> None:
+    """#182: `mil.`, `mm`, `bn` and `trillion` were unknown to the multiplier table.
+
+    On a cited span the wrong parse merely published null, because `amounts_agree`
+    rejected the mismatch. On the name-derived path (#129) there is no model value
+    to disagree with, so `Citibank $382.5 mil. Revolving Credit Facility` published
+    a principal of 382.5 — six orders of magnitude out.
+    """
+    assert (
+        normalized_amount_from_name("Citibank $382.5 mil. Revolving Credit Facility")
+        == "382500000"
+    )
+    assert normalized_amount_from_name("Syndicated $850.0 mil. Facility") == "850000000"
+    assert normalized_amount_from_name("$500mm notes") == "500000000"
+    assert normalized_amount_from_name("$1.2 bn facility") == "1200000000"
+    # `trillion` matched the name pattern's scale group but multiplied nowhere.
+    assert normalized_amount_from_name("$1.5 trillion facility") == "1500000000000"
+    # The spelled-out forms and the no-magnitude case are unchanged.
+    assert normalized_amount_from_name("$183.36 million term loan") == "183360000"
+    assert normalized_amount_from_name("C$300 million notes due 2033") == "300000000"
+    assert normalized_amount_from_text("$472,934,000") == "472934000"
+    # A magnitude abbreviation cannot match inside a longer word.
+    assert normalized_amount_from_text("$5 millions") == "5000000"

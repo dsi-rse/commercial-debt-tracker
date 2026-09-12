@@ -340,10 +340,37 @@ RATE_SUFFIX_PATTERN = re.compile(r"\s*(?:%|percent\b|basis\s+points?\b)", re.IGN
 # A principal stated inside an instrument name: `$183.36 million term loan`,
 # `C$300 million notes due 2033`. The currency marker is required, so a coupon
 # rate or a maturity year in the same name cannot be read as the principal.
+# Magnitude words, spelled out and abbreviated (#182). The abbreviations matter
+# because #129's name-derived principal reads the instrument's own name, and
+# names use them: `Citibank $382.5 mil. Revolving Credit Facility`, `Syndicated
+# $850.0 mil. Facility` (Costamare's 6-K facility schedules). Without them
+# `$382.5 mil.` parsed as 382.5 — six orders out. On a cited span that merely
+# published null, because `amounts_agree` rejected the mismatch; on the
+# name-derived path there is no model value to disagree with, so it published.
+AMOUNT_MULTIPLIERS = {
+    "thousand": 1_000,
+    "thousands": 1_000,
+    "million": 1_000_000,
+    "millions": 1_000_000,
+    "mil": 1_000_000,
+    "mils": 1_000_000,
+    "mm": 1_000_000,
+    "billion": 1_000_000_000,
+    "billions": 1_000_000_000,
+    "bil": 1_000_000_000,
+    "bln": 1_000_000_000,
+    "bn": 1_000_000_000,
+    "trillion": 1_000_000_000_000,
+    "trillions": 1_000_000_000_000,
+}
+# Built from the table above so a magnitude this pattern recognizes is always one
+# the parser can apply. The two drifted before: `trillion` matched here and
+# multiplied nowhere.
+AMOUNT_SCALE_ALTERNATION = "|".join(sorted(AMOUNT_MULTIPLIERS, key=len, reverse=True))
 NAME_EMBEDDED_AMOUNT_PATTERN = re.compile(
     r"(?P<currency>[A-Z]{0,2}\$|€|£|¥)\s?"
     r"(?P<value>\d[\d,]*(?:\.\d+)?)"
-    r"(?:\s+(?P<scale>thousand|million|billion|trillion))?",
+    rf"(?:\s*(?P<scale>{AMOUNT_SCALE_ALTERNATION})\b\.?)?",
     re.IGNORECASE,
 )
 ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -404,14 +431,6 @@ QUALIFIED_DOLLAR_PATTERN = re.compile(
     rf"\b({'|'.join(sorted(QUALIFIED_DOLLAR_CODES, key=len, reverse=True))})\$",
     re.IGNORECASE,
 )
-AMOUNT_MULTIPLIERS = {
-    "thousand": 1_000,
-    "thousands": 1_000,
-    "million": 1_000_000,
-    "millions": 1_000_000,
-    "billion": 1_000_000_000,
-    "billions": 1_000_000_000,
-}
 COMMON_CURRENCY_CODES = {
     "AED",
     "AUD",
@@ -2851,7 +2870,17 @@ def validate_dates_property(
         prior = entry.get("prior", False)
         if not isinstance(prior, bool):
             failures.append(f"Entry {index}: '{label}.prior' must be true or false.")
-        elif kind is not None and not prior and kind in SINGLE_CURRENT_DATE_KINDS:
+        elif (
+            kind is not None
+            and not prior
+            # `expected` is not current either: `select_date_payload` publishes
+            # the entry that is neither prior nor expected, so a real closing
+            # beside a planned one is one current closing, not two. Counting the
+            # planned one rejected Costamare's 6-K, which states a 2026-04-30
+            # closing and a 2026-06-30 expected closing for one facility.
+            and entry.get("expected") is not True
+            and kind in SINGLE_CURRENT_DATE_KINDS
+        ):
             current_kinds[kind] = current_kinds.get(kind, 0) + 1
         if not isinstance(entry.get("expected", False), bool):
             failures.append(f"Entry {index}: '{label}.expected' must be true or false.")
@@ -3530,9 +3559,11 @@ def normalized_amount_from_text(text: str | None) -> str | None:
     amount = decimal_from_amount_string(match.group(0))
     if amount is None:
         return None
-    for word, multiplier in AMOUNT_MULTIPLIERS.items():
-        if re.search(rf"\b{word}\b", lowered):
-            amount *= multiplier
+    for word in sorted(AMOUNT_MULTIPLIERS, key=len, reverse=True):
+        # `(?<![a-z])` rather than `\b` on the left so `$500mm` reads as well as
+        # `$500 mm`, while `million` still cannot match inside a longer word.
+        if re.search(rf"(?<![a-z]){word}\b", lowered):
+            amount *= AMOUNT_MULTIPLIERS[word]
             break
     return normalize_numeric_string(amount)
 
