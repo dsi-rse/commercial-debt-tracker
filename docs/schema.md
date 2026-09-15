@@ -250,7 +250,7 @@ Columns:
 - `cik`: Issuer CIK shared by the instrument's directly matched mentions, zero-padded.
 - `company_name`: Issuer display name resolved from the instrument's directly matched mentions, falling back to the newest name any mention for the same CIK carries.
 - `seed_debt_instrument_mention_id`: First direct mention used as the representative seed for the instrument record.
-- `amendment_of_debt_instrument_id`: Parent instrument ID when this instrument is an amendment lineage child.
+- `amendment_of_debt_instrument_id`: Parent instrument ID when this instrument is an amendment lineage child. Every lineage pointer on this table carries a relation the **extractor** asserted and cited; the matcher resolves the `raw_id` to an instrument ID but never invents the relation. A pointer that records a matcher inference rather than an extracted fact needs a provenance column alongside it, documented here, and that column has to survive an incremental rematch — see the stage boundary in `docs/architecture.md` (#184).
 - `retired_by_debt_instrument_ids`: JSON array of IDs of the instruments that retired this one, set on the retired instrument's own row (null when none).
 - `split_of_debt_instrument_id`: Parent instrument ID when this instrument is a split lineage child.
 - `superseded_by_debt_instrument_id`: The amendment child that replaced this state, when exactly one exists (#155). A row with this set is a superseded state, not a live obligation.

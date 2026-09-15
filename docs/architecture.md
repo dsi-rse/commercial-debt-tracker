@@ -194,15 +194,40 @@ Two `cdt` commands cover the same ground manually:
 
 Matcher outputs are partitioned by `cik_shard` instead of by filing date because the matching problem is company-scoped. Mentions for the same issuer need to be considered together across time.
 
-The matcher uses deterministic surfaces derived from:
+The matcher uses deterministic surfaces, every one of them derived from extractor output or filing metadata:
 
-- normalized instrument names
-- normalized dates
+- normalized instrument name fingerprints
 - normalized amounts
-- lender signatures
-- one-hop lineage cues like `amendment_of` and `split_of`
+- normalized start dates, and normalized end dates (maturity or commitment termination)
+- lender signatures derived from the extracted `parties_json`
+- one-hop relation cues: `amendment_of`, `split_of`, `retired_by`
+- extracted status events, for the lifecycle rollup
+- filing metadata: `cik` for sharding, filing date for recency and first/last-seen, `accession_number` for document counts, `item_id` to keep same-filing siblings apart
 
 This is a pragmatic middle ground: simpler than a graph database or long-lived entity service, but enough to build useful instrument histories from noisy filing text.
+
+### Stage boundary: the matcher does not extract (#184)
+
+**The matcher consumes extraction output and filing metadata. It never derives a new fact about an instrument from source text.** Deciding which mentions are the same instrument, and rolling up what the extractor already asserted, is the whole of its job.
+
+This is not stylistic. Two invariants depend on it:
+
+- **Every published value is citable (#154).** Each evidence payload records `spans` whose offsets index the source item's `text` exactly. A value the matcher derives from text has no span and cannot acquire one, because no span was ever bound to that object — it would publish as fact with no route back to the sentence behind it.
+- **Facts are bound to objects; text is bound to documents.** The extractor resolves a fact to one object through `raw_id`. Item text carries no such scoping, so a rule that reads item text here attributes a document-level observation to whichever objects happen to be in scope. In a filing that names several instruments, that is all of them.
+
+The line is not "no heuristics in the matcher". The matcher does parse text-like attributes — `name_rates_are_compatible` pulls coupon rates out of name fingerprints — and that is fine, because of *how* the result is used:
+
+> A matcher heuristic may **refuse** a match. It may not **assert** a fact or a relation about an object.
+
+Refusing is conservative and self-announcing: a false positive costs a missed merge, which surfaces as a duplicate row someone can see. Asserting is neither. A wrongly asserted relation silently rewrites a published history, and there is no duplicate row to notice it. So a heuristic belongs at a `continue` that rejects a candidate, not at an assignment that writes a published column.
+
+Practical consequences when extending the matcher:
+
+- Reading the `classifications` dataset, or any other raw document text, from matcher code is out of bounds. Consume the extractor's facts instead.
+- If a needed fact is not in the extractor's output, the fix belongs in the extractor — add the property there, bound to an object and cited with spans — not in a matcher heuristic that reconstructs it from text.
+- A new published column that records a matcher inference, rather than an extractor fact, needs a provenance column that survives an incremental rematch, and it needs saying so in `docs/schema.md`.
+
+`prior_fact` and `ordinal_chain` in `cdt.matcher.lineage_inference` illustrate the right side of the line: they reason over the `prior` marks in `amounts_json` and over the `name` column, both of which the extractor bound to an object and cited.
 
 ## Dashboard Handoff
 
