@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 
 import pandas as pd
 
+from cdt.matcher import core, lineage_inference
 from cdt.matcher.core import prepare_mention
 from cdt.matcher.lineage_inference import infer_amendment_parents
 
@@ -41,6 +43,7 @@ def instrument(instrument_id: str, name: str, **overrides: object) -> dict[str, 
         "name": name,
         "principal_amount": None,
         "maturity_date": None,
+        "start_date": None,
         "amendment_of_debt_instrument_id": None,
         "first_seen_filing_date": "2026-01-01",
     }
@@ -110,29 +113,145 @@ def test_prior_marked_amount_links_to_the_instrument_stating_it() -> None:
     assert result == {"i2": ("i1", "prior_fact")}
 
 
-def test_dated_reference_resolves_a_named_predecessor() -> None:
-    """A replacement clause naming a dated-as-of predecessor links to that cluster."""
+def test_the_matcher_never_reads_filing_text(monkeypatch: object) -> None:
+    """The stage boundary (#184): no lineage rule may derive a fact from item text.
+
+    A text-reading rule attributes a document-level observation to every
+    instrument the filing names, and publishes a relation with no evidence span
+    (#154). Two tranches of one new agreement named in one filing must therefore
+    produce nothing, however suggestive the prose.
+    """
     mentions = [
-        mention("m1", start_date="2022-07-07", name="2022 Credit Agreement"),
-        mention("m2", start_date="2026-04-13", name="New Credit Agreement"),
+        mention("m1", item_id="item-1", name="term loan A facility"),
+        mention("m2", item_id="item-1", name="revolving facility"),
     ]
     rows = [
-        instrument("i1", "2022 Credit Agreement", first_seen_filing_date="2022-07-07"),
-        instrument("i2", "New Credit Agreement", first_seen_filing_date="2026-04-13"),
+        instrument("i1", "term loan A facility", first_seen_filing_date="2026-05-28"),
+        instrument("i2", "revolving facility", first_seen_filing_date="2026-05-28"),
     ]
-    texts = {
-        "item-m2": (
-            "The New Credit Agreement replaced the Company's previously existing "
-            "$2.0 billion credit agreement, dated as of July 7, 2022."
-        )
-    }
     result = infer_amendment_parents(
         rows,
         member_groups={"i1": ["m1"], "i2": ["m2"]},
         mention_index=index(mentions),
-        item_texts=texts,
     )
-    assert result == {"i2": ("i1", "dated_reference")}
+    assert result == {}
+    assert not hasattr(lineage_inference, "DATED_REFERENCE")
+    assert not hasattr(core, "read_item_texts")
+    signature = inspect.signature(infer_amendment_parents)
+    assert "item_texts" not in signature.parameters
+    for name in ("match_tables", "match_pending_mentions"):
+        parameters = inspect.signature(getattr(core, name)).parameters
+        assert "item_texts" not in parameters, name
+        assert "infer_lineage" not in parameters, name
+
+
+def test_a_same_rank_tie_is_refused_rather_than_decided_by_id_order() -> None:
+    """Two equally-ranked predecessors are ambiguity, not a sort-order question."""
+    rows = [
+        instrument(
+            "iA",
+            "Amended and Restated Credit Agreement",
+            first_seen_filing_date="2021-01-01",
+        ),
+        instrument(
+            "iB",
+            "Amended and Restated Credit Agreement",
+            first_seen_filing_date="2022-01-01",
+        ),
+        instrument(
+            "iC",
+            "Second Amended and Restated Credit Agreement",
+            first_seen_filing_date="2023-01-01",
+        ),
+    ]
+    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+    assert result == {}
+
+
+def test_both_directions_of_a_mutual_pair_are_dropped() -> None:
+    """When the rules offer A->B and B->A the evidence has not settled direction."""
+    mentions = [
+        mention(
+            "m1",
+            name="Note",
+            amounts_json=json.dumps(
+                [{"normalized_amount": "2000000000", "prior": True}]
+            ),
+        ),
+        mention(
+            "m2",
+            name="Note",
+            amounts_json=json.dumps(
+                [{"normalized_amount": "3000000000", "prior": True}]
+            ),
+        ),
+    ]
+    rows = [
+        instrument(
+            "i1",
+            "Note",
+            principal_amount="3000000000",
+            first_seen_filing_date="2024-01-01",
+        ),
+        instrument(
+            "i2",
+            "Note",
+            principal_amount="2000000000",
+            first_seen_filing_date="2024-01-01",
+        ),
+    ]
+    result = infer_amendment_parents(
+        rows,
+        member_groups={"i1": ["m1"], "i2": ["m2"]},
+        mention_index=index(mentions),
+    )
+    assert result == {}
+
+
+def test_an_unmarked_amount_does_not_link() -> None:
+    """`prior_fact` rests on the `prior` mark, not on amount equality alone."""
+    mentions = [
+        mention(
+            "m2",
+            name="New Note",
+            amounts_json=json.dumps([{"normalized_amount": "2000000000"}]),
+        ),
+    ]
+    rows = [
+        instrument(
+            "i1",
+            "Old Note",
+            principal_amount="2000000000",
+            first_seen_filing_date="2020-01-01",
+        ),
+        instrument("i2", "New Note", first_seen_filing_date="2024-01-01"),
+    ]
+    result = infer_amendment_parents(
+        rows,
+        member_groups={"i2": ["m2"]},
+        mention_index=index(mentions),
+    )
+    assert result == {}
+
+
+def test_a_parent_dated_after_its_child_is_rejected() -> None:
+    """Own start dates outrank filing dates, which cannot separate one filing."""
+    rows = [
+        instrument(
+            "i1",
+            "Credit Agreement",
+            start_date="2026-01-01",
+            first_seen_filing_date="2026-05-28",
+        ),
+        instrument(
+            "i2",
+            "Second Amended and Restated Credit Agreement",
+            start_date="2022-01-01",
+            first_seen_filing_date="2026-05-28",
+        ),
+    ]
+    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+    assert result == {}
 
 
 def test_an_ambiguous_predecessor_is_left_alone() -> None:

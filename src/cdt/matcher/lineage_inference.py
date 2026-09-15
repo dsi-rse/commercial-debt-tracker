@@ -10,25 +10,33 @@ instruments came out as lineage heads, with EQT publishing three simultaneously
 active revolvers (#170).
 
 The matcher, unlike the relation stage, already works across filings within a
-CIK. So the missing links can be inferred here from evidence the extractor
-already records. Three rules, each conservative and each measured:
+CIK, so the missing links can be inferred here. Two rules, both reasoning only
+over facts the extractor bound to an object and cited:
 
-* **prior_fact** — an instrument carrying a `prior`-marked amount or date whose
-  value equals an earlier instrument's canonical principal or maturity. The
-  `prior` mark *is* the predecessor's term, so an exact match on it is strong.
+* **prior_fact** — an instrument carrying a `prior`-marked amount whose value
+  equals an earlier instrument's canonical principal. The `prior` mark *is* the
+  predecessor's term, so an exact match on it is strong evidence.
 * **ordinal_chain** — "Fifth Amended and Restated X" follows "Fourth Amended and
   Restated X" follows "X". The ordinal in the name literally encodes chain
   position within one issuer and name stem.
-* **dated_reference** — a replacement clause naming a predecessor by its
-  dated-as-of date ("replaced the previously existing $2.0 billion credit
-  agreement, dated as of July 7, 2022"), resolved against the agreement and
-  closing dates of the issuer's other clusters. This is the lineage half of
-  #167; it needs the item text, so it is skipped when text is unavailable.
 
-All three only ever fill an `amendment_of_debt_instrument_id` that is already
-null, never overwrite an extracted pointer, and refuse a candidate when more than
-one parent qualifies — an ambiguous guess is worse than the status quo, because
-a wrong pointer silently rewrites a published history.
+Both only ever fill an `amendment_of_debt_instrument_id` that is already null,
+never overwrite an extracted pointer, and refuse a candidate whenever the
+evidence does not single out one parent — an ambiguous guess is worse than the
+status quo, because a wrong pointer silently rewrites a published history.
+
+Stage boundary (#184). Every input here is extractor output: the `prior` marks in
+`amounts_json`, the canonical `name`, `principal_amount`, and `start_date`. This
+module does **not** read filing text, and must not: a value derived from text in
+the matcher carries no evidence span (#154) and cannot acquire one, and item text
+is scoped to a document rather than to an object, so a text rule attributes a
+document-level observation to every instrument the filing names. A third rule
+(`dated_reference`) did read item text and was removed for exactly that reason;
+it resolved a replacement clause's "dated as of" date against other clusters and,
+on real filings, linked sibling tranches of one agreement and whole enumerated
+lists to a single parent. The evidence it needed — which object a clause is about
+— exists at extraction time and is discarded before the matcher runs. Recording
+it belongs in the extractor as a `governing_agreement` property (#167).
 """
 
 from __future__ import annotations
@@ -58,46 +66,6 @@ BARE_AR = re.compile(r"\bamended\s+and\s+restated\b", re.IGNORECASE)
 NAME_NOISE = frozenset({"the", "a", "an", "that", "certain"})
 # A stem needs at least two states before an ordinal can order them into a chain.
 MIN_CHAIN_MEMBERS = 2
-# A replacement clause and the predecessor's dated-as-of date in one clause. The
-# clause bound matters: across a sentence boundary the date usually belongs to
-# the new agreement, not the one it replaces.
-DATED_REFERENCE = re.compile(
-    r"(replac\w+|refinanc\w+|amend\w+\s+and\s+restat\w+|supersed\w+|previously\s+existing|prior)"
-    # A period followed by whitespace ends the sentence; one followed by a digit
-    # is a decimal ("$2.0 billion"), which the predecessor's own amount routinely
-    # contains. Excluding all periods silently refused those clauses.
-    r"(?:[^.;]|\.(?=\d))"
-    r"{0,200}?dated\s+as\s+of\s+([A-Z][a-z]+\s+\d{1,2},\s+\d{4})",
-    re.IGNORECASE,
-)
-MONTHS = {
-    name: index
-    for index, name in enumerate(
-        (
-            "January",
-            "February",
-            "March",
-            "April",
-            "May",
-            "June",
-            "July",
-            "August",
-            "September",
-            "October",
-            "November",
-            "December",
-        ),
-        start=1,
-    )
-}
-
-
-def _iso(text: str) -> str | None:
-    """Normalize 'July 7, 2022' to '2022-07-07'."""
-    match = re.match(r"([A-Z][a-z]+)\s+(\d{1,2}),\s+(\d{4})", text.strip())
-    if not match or match.group(1) not in MONTHS:
-        return None
-    return f"{match.group(3)}-{MONTHS[match.group(1)]:02d}-{int(match.group(2)):02d}"
 
 
 def _name_rank_and_stem(name: object) -> tuple[int, str]:
@@ -113,46 +81,36 @@ def _name_rank_and_stem(name: object) -> tuple[int, str]:
     return rank, " ".join(w for w in stripped.split() if w not in NAME_NOISE)
 
 
-def _prior_values(member_ids: list[str], mention_index: dict) -> set[str]:
-    """Return every `prior`-marked amount and date across a cluster's mentions."""
+def _prior_amounts(member_ids: list[str], mention_index: dict) -> set[str]:
+    """Return every `prior`-marked amount across a cluster's mentions.
+
+    Reads `amounts_json` by direct attribute access rather than `getattr` with a
+    default: if `PreparedMention` ever stops carrying the field, that should be a
+    loud `AttributeError` and not a silently empty set. `PreparedMention` carries
+    no `dates_json`, so prior *dates* are not available here — adding the field
+    would let this rule match a predecessor's maturity as well (#170).
+    """
     values: set[str] = set()
     for member_id in member_ids:
         mention = mention_index.get(member_id)
         if mention is None:
             continue
-        for column, key in (
-            ("amounts_json", "normalized_amount"),
-            ("dates_json", "normalized_date"),
-        ):
-            try:
-                payloads = json.loads(getattr(mention, column, None) or "[]")
-            except (TypeError, ValueError):
-                continue
-            for payload in payloads:
-                if payload.get("prior") and payload.get(key):
-                    values.add(str(payload[key]))
-    return values
-
-
-def _identity_dates(member_ids: list[str], mention_index: dict) -> set[str]:
-    """Return the dates by which a cluster could be referred to elsewhere."""
-    dates: set[str] = set()
-    for member_id in member_ids:
-        mention = mention_index.get(member_id)
-        if mention is None:
-            continue
-        if getattr(mention, "start_date", None):
-            dates.add(str(mention.start_date))
         try:
-            payloads = json.loads(getattr(mention, "dates_json", None) or "[]")
+            payloads = json.loads(mention.amounts_json or "[]")
         except (TypeError, ValueError):
             continue
         for payload in payloads:
-            if payload.get("kind") in ("agreement", "closing") and payload.get(
-                "normalized_date"
-            ):
-                dates.add(str(payload["normalized_date"]))
-    return dates
+            if payload.get("prior") and payload.get("normalized_amount"):
+                values.add(str(payload["normalized_amount"]))
+    return values
+
+
+def _canonical_date(row: dict[str, object]) -> str | None:
+    """Return the date a row's own evidence says it started, when it has one."""
+    value = row.get("start_date")
+    if value in (None, "", "None") or str(value) == "nan":
+        return None
+    return str(value)
 
 
 def infer_amendment_parents(
@@ -160,12 +118,12 @@ def infer_amendment_parents(
     *,
     member_groups: dict[str, list[str]],
     mention_index: dict,
-    item_texts: dict[str, str] | None = None,
 ) -> dict[str, tuple[str, str]]:
-    """Return {child_id: (parent_id, rule)} for links the three rules support.
+    """Return {child_id: (parent_id, rule)} for links the two rules support.
 
     Only instruments whose `amendment_of_debt_instrument_id` is null are
-    considered, and a child with more than one candidate parent is left alone.
+    considered, and a child is left alone whenever the evidence does not single
+    out one parent.
     """
     by_id = {str(row["debt_instrument_id"]): row for row in rows}
     by_cik: dict[str, list[str]] = {}
@@ -185,29 +143,37 @@ def infer_amendment_parents(
         child, parent = by_id[child_id], by_id[parent_id]
         if str(child.get("cik")) != str(parent.get("cik")):
             return
-        # the predecessor must not first appear after the state that replaces it
+        # The predecessor must not first appear after the state that replaces it.
+        # Equality is allowed and must stay allowed: the predecessor objects the
+        # extractor mints to carry a pre-amendment figure are always first seen in
+        # the same filing as the successor describing them (#155), the corpus has
+        # a left edge, and 8-K Item 1.01 postdates 2004 — so a real predecessor is
+        # routinely first heard about no earlier than its successor.
         if (parent.get("first_seen_filing_date") or "") > (
             child.get("first_seen_filing_date") or ""
         ):
+            return
+        # Where both rows carry their own start date, that is direct evidence of
+        # order and outranks the filing-date check above, which cannot separate
+        # two instruments named in one filing.
+        child_date, parent_date = _canonical_date(child), _canonical_date(parent)
+        if child_date and parent_date and parent_date > child_date:
             return
         # never point at something that already points here
         if str(parent.get("amendment_of_debt_instrument_id") or "") == child_id:
             return
         candidates[child_id].setdefault(parent_id, rule)
 
-    # Rule 1: prior-marked value equals an earlier instrument's canonical term.
+    # Rule 1: a prior-marked amount equals an earlier instrument's principal.
     for child_id in open_children:
-        priors = _prior_values(member_groups.get(child_id, []), mention_index)
+        priors = _prior_amounts(member_groups.get(child_id, []), mention_index)
         if not priors:
             continue
         for other_id in by_cik.get(str(by_id[child_id].get("cik") or ""), []):
-            other = by_id[other_id]
-            terms = {
-                str(other.get(field))
-                for field in ("principal_amount", "maturity_date")
-                if other.get(field) not in (None, "", "None")
-            }
-            if priors & terms:
+            principal = by_id[other_id].get("principal_amount")
+            if principal in (None, "", "None") or str(principal) == "nan":
+                continue
+            if str(principal) in priors:
                 offer(child_id, other_id, "prior_fact")
 
     # Rule 2: the ordinal chain within one issuer and name stem.
@@ -221,35 +187,19 @@ def infer_amendment_parents(
         if len(members) < MIN_CHAIN_MEMBERS:
             continue
         members.sort()
-        for index in range(1, len(members)):
-            rank, _, row_id = members[index]
-            prev_rank, _, prev_id = members[index - 1]
-            if rank > prev_rank:
-                offer(row_id, prev_id, "ordinal_chain")
-
-    # Rule 3: a replacement clause naming the predecessor by dated-as-of date.
-    if item_texts:
-        identity = {
-            row_id: _identity_dates(member_groups.get(row_id, []), mention_index)
-            for row_id in by_id
-        }
-        for child_id in open_children:
-            item_ids = {
-                getattr(mention_index[m], "item_id", None)
-                for m in member_groups.get(child_id, [])
-                if m in mention_index
-            }
-            referenced: set[str] = set()
-            for item_id in item_ids:
-                for match in DATED_REFERENCE.finditer(item_texts.get(str(item_id), "")):
-                    iso = _iso(match.group(2))
-                    if iso:
-                        referenced.add(iso)
-            if not referenced:
+        ranks = sorted({rank for rank, _, _ in members})
+        for index, rank in enumerate(ranks):
+            if index == 0:
                 continue
-            for other_id in by_cik.get(str(by_id[child_id].get("cik") or ""), []):
-                if referenced & identity.get(other_id, set()):
-                    offer(child_id, other_id, "dated_reference")
+            previous_rank = ranks[index - 1]
+            # Offer every member holding the preceding rank, not just the one the
+            # sort happens to put first. A tie is genuine ambiguity, and routing
+            # it through the per-child guard below refuses the link instead of
+            # letting instrument-id order decide a published history.
+            parents = [row_id for r, _, row_id in members if r == previous_rank]
+            for _, _, child_id in [m for m in members if m[0] == rank]:
+                for parent_id in parents:
+                    offer(child_id, parent_id, "ordinal_chain")
 
     resolved: dict[str, tuple[str, str]] = {}
     ambiguous = 0
@@ -260,8 +210,27 @@ def infer_amendment_parents(
         elif len(offers) > 1:
             ambiguous += 1
 
-    # Refuse any link that would close a cycle, so lineage_family_id stays a DAG
-    # and `superseded_by` cannot chase its own tail.
+    # A mutual pair means the rules produced both directions, i.e. the evidence
+    # does not settle which instrument is the predecessor. Drop BOTH links rather
+    # than keeping whichever one iteration order reaches first — an arbitrary
+    # survivor is a coin flip written into a published history.
+    mutual = {
+        child_id
+        for child_id, (parent_id, _) in resolved.items()
+        if parent_id in resolved and resolved[parent_id][0] == child_id
+    }
+    for child_id in sorted(mutual):
+        parent_id, rule = resolved.pop(child_id)
+        LOGGER.info(
+            "Lineage inference: dropped %s -> %s (%s), both directions were offered",
+            child_id,
+            parent_id,
+            rule,
+        )
+        ambiguous += 1
+
+    # Refuse any link that would close a longer cycle, so lineage_family_id stays
+    # a DAG and `superseded_by` cannot chase its own tail.
     def parent_of(node: str) -> str | None:
         if node in resolved:
             return resolved[node][0]
@@ -269,6 +238,8 @@ def infer_amendment_parents(
         return str(existing) if existing else None
 
     for child_id in sorted(resolved):
+        if child_id not in resolved:
+            continue
         parent_id, rule = resolved[child_id]
         seen: set[str] = set()
         node: str | None = parent_id
@@ -290,7 +261,7 @@ def infer_amendment_parents(
         len(resolved),
         ", ".join(
             f"{rule}={sum(1 for _, r in resolved.values() if r == rule)}"
-            for rule in ("prior_fact", "ordinal_chain", "dated_reference")
+            for rule in ("prior_fact", "ordinal_chain")
         ),
         ambiguous,
     )

@@ -69,6 +69,7 @@ from cdt.matcher.core import (
     DEBT_INSTRUMENT_COLUMNS,
     MATCHER_SCHEMA_VERSION,
     MENTION_CLUSTER_EDGE_COLUMNS,
+    apply_lineage_inference_pass,
     coerce_optional_text,
     company_names_by_cik,
     lender_signature,
@@ -2460,6 +2461,85 @@ def test_coerce_optional_text_treats_nan_like_text_as_missing() -> None:
     assert coerce_optional_text("N/A") is None
     assert coerce_optional_text("  ") is None
     assert coerce_optional_text("Nantucket Bank") == "Nantucket Bank"
+
+
+def test_lineage_inference_pass_writes_pointers_and_rederives_the_rollup(
+    tmp_path: Path,
+) -> None:
+    """The post-pass is the only production entry point, so cover it end to end.
+
+    Before this existed, gutting the pointer write, deleting the rollup
+    re-derive, or never writing partitions at all each left the suite green
+    (#184).
+    """
+    rows = pd.DataFrame(
+        [
+            build_mention_row(
+                mention_id="m-1",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2020-01-02",
+                name="Credit Agreement",
+                start_date="2020-01-01",
+                amount="$100 million",
+            ),
+            build_mention_row(
+                mention_id="m-2",
+                item_id="item-2",
+                accession_number="0002",
+                cik="320193",
+                date="2024-01-02",
+                name="Second Amended and Restated Credit Agreement",
+                start_date="2024-01-01",
+                amount="$250 million",
+            ),
+        ]
+    )
+    write_partition_table(
+        tmp_path / "mentions",
+        partition={"date": "2024-01-02", "shard": "0001"},
+        table=rows,
+    )
+    match_pending_mentions(artifact_root=tmp_path, batch_size=5)
+    stats = apply_lineage_inference_pass(str(tmp_path))
+
+    published = {
+        str(row["debt_instrument_id"]): row
+        for row in read_dataset(debt_instruments_root(tmp_path)).to_dict("records")
+    }
+    assert stats == {"links": 1, "heads_before": 2, "heads_after": 1}
+    child = published["m-2"]
+    parent = published["m-1"]
+    assert child["amendment_of_debt_instrument_id"] == "m-1"
+    assert child["amendment_inferred_by"] == "ordinal_chain"
+    assert child["is_lineage_head"]
+    # the rollup must be re-derived from the new pointer, not left stale
+    assert parent["is_lineage_head"] is False
+    assert parent["superseded_by_debt_instrument_id"] == "m-2"
+    assert parent["status"] == "closed"
+    assert parent["status_subtype"] == "superseded"
+    assert child["lineage_family_id"] == parent["lineage_family_id"]
+
+    # An ordinary rematch keeps the pointer, so it must keep the provenance too:
+    # a guess that reads as an extracted relation is worse than no guess (#184).
+    match_pending_mentions(artifact_root=tmp_path, batch_size=5)
+    after = {
+        str(row["debt_instrument_id"]): row
+        for row in read_dataset(debt_instruments_root(tmp_path)).to_dict("records")
+    }
+    assert after["m-2"]["amendment_of_debt_instrument_id"] == "m-1"
+    assert after["m-2"]["amendment_inferred_by"] == "ordinal_chain"
+    assert after["m-1"]["status"] == "closed"
+
+    # --force drops both together: no pointer, no stale provenance.
+    match_pending_mentions(artifact_root=tmp_path, batch_size=5, force=True)
+    forced = {
+        str(row["debt_instrument_id"]): row
+        for row in read_dataset(debt_instruments_root(tmp_path)).to_dict("records")
+    }
+    assert forced["m-2"]["amendment_of_debt_instrument_id"] is None
+    assert pd.isna(forced["m-2"]["amendment_inferred_by"])
 
 
 def test_match_pending_mentions_drains_all_shards(tmp_path: Path) -> None:

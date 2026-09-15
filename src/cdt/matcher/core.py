@@ -268,7 +268,6 @@ def match_pending_mentions(
     strong_match_threshold: float = DEFAULT_MEMBERSHIP_THRESHOLD,
     loose_match_threshold: float = DEFAULT_RELATED_THRESHOLD,
     ambiguity_margin: float = DEFAULT_AMBIGUITY_MARGIN,
-    infer_lineage: bool = False,
     renew: Callable[[], None] | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Match canonical debt instrument mentions into canonical matcher outputs.
@@ -280,12 +279,6 @@ def match_pending_mentions(
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
-    item_texts: dict[str, str] | None = None
-    if infer_lineage:
-        item_texts = read_item_texts(resolved_root)
-        LOGGER.info(
-            "Lineage inference enabled; loaded text for %s items", len(item_texts)
-        )
     mention_rows = read_dataset(
         dataset_root(
             MENTIONS_DATASET_NAME, artifact_root=resolved_root, data_dir=data_dir
@@ -416,15 +409,13 @@ def match_tables(
     loose_match_threshold: float = DEFAULT_RELATED_THRESHOLD,
     ambiguity_margin: float = DEFAULT_AMBIGUITY_MARGIN,
     company_names: dict[str, str] | None = None,
-    infer_lineage: bool = False,
-    item_texts: dict[str, str] | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Match in-memory debt instrument mentions into stable debt instrument clusters.
 
-    ``infer_lineage`` fills amendment pointers the item-scoped relation stage
-    cannot express; see ``cdt.matcher.lineage_inference``. Off by default, so the
-    published contract is unchanged unless a caller opts in. ``item_texts`` maps
-    item_id to filing text and enables the dated-reference rule.
+    Lineage inference is not performed here. It cannot be: this is called once
+    per shard batch and sees only the clusters that batch touched, so no rule can
+    ever see both states of one facility. ``apply_lineage_inference_pass`` runs it
+    as a post-pass over the complete dataset instead.
     """
     if strong_match_threshold < loose_match_threshold:
         raise ValueError("strong_match_threshold must be >= loose_match_threshold")
@@ -1516,8 +1507,22 @@ def derive_parent_links(
             amendment_parents.clear()
         if len(split_parents) > 1:
             split_parents.clear()
+        amendment_parent = next(iter(amendment_parents), None)
+        # Provenance travels with the pointer it describes. The amendment pointer
+        # is carried forward from the existing row above, so without this an
+        # ordinary rematch kept an inferred pointer and dropped the column saying
+        # it was inferred — publishing a guess as indistinguishable from an
+        # extracted relation, which is the one thing the column exists to prevent
+        # (#184). Cleared when the pointer changes, because the old rule no
+        # longer describes the new target.
+        inferred_by = coerce_optional_text(existing_row.get("amendment_inferred_by"))
+        if amendment_parent != coerce_optional_text(
+            existing_row.get("amendment_of_debt_instrument_id")
+        ):
+            inferred_by = None
         parent_links[debt_instrument_id] = {
-            "amendment_of_debt_instrument_id": next(iter(amendment_parents), None),
+            "amendment_of_debt_instrument_id": amendment_parent,
+            "amendment_inferred_by": inferred_by,
             "retired_by_debt_instrument_ids": (
                 json.dumps(sorted(retired_parents)) if retired_parents else None
             ),
@@ -1612,6 +1617,9 @@ def build_debt_instrument_rows(
                 "amendment_of_debt_instrument_id": parent_links.get(
                     debt_instrument_id, {}
                 ).get("amendment_of_debt_instrument_id"),
+                "amendment_inferred_by": parent_links.get(debt_instrument_id, {}).get(
+                    "amendment_inferred_by"
+                ),
                 "retired_by_debt_instrument_ids": parent_links.get(
                     debt_instrument_id, {}
                 ).get("retired_by_debt_instrument_ids"),
@@ -2404,29 +2412,6 @@ def name_rates_are_compatible(left: str | None, right: str | None) -> bool:
     return True
 
 
-def read_item_texts(artifact_root: str) -> dict[str, str]:
-    """Return item_id -> filing text from the classifications dataset.
-
-    Only the dated-reference lineage rule needs this, so it is read behind the
-    `infer_lineage` flag rather than on every match pass. The matcher otherwise
-    never touches item text, and a production implementation should prefer
-    recording the predecessor reference as an extracted fact (#167) over
-    re-reading the corpus here.
-    """
-    texts: dict[str, str] = {}
-    root = Path(str(artifact_root)) / "classifications"
-    for path in sorted(root.glob("date=*/shard=*/*.parquet")):
-        try:
-            frame = pd.read_parquet(path, columns=["item_id", "text"])
-        except Exception:  # noqa: BLE001 - a malformed partition must not stop matching
-            LOGGER.warning("Could not read item text from %s", path)
-            continue
-        for row in frame.itertuples():
-            if row.item_id and isinstance(row.text, str):
-                texts[str(row.item_id)] = row.text
-    return texts
-
-
 def apply_lineage_inference_pass(artifact_root: str) -> dict[str, int]:
     """Infer amendment lineage across the whole corpus, after all shards match.
 
@@ -2466,7 +2451,6 @@ def apply_lineage_inference_pass(artifact_root: str) -> dict[str, int]:
         rows,
         member_groups=member_groups,
         mention_index=mention_index,
-        item_texts=read_item_texts(artifact_root),
     )
     by_id = {str(row["debt_instrument_id"]): row for row in rows}
     for child_id, (parent_id, rule) in inferred.items():

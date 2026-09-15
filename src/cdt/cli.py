@@ -282,8 +282,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "fill amendment pointers the item-scoped relation stage cannot "
-            "express (prior-marked terms, amend-and-restate ordinals, "
-            "dated-as-of references); off by default (#170)"
+            "express, from prior-marked amounts and amend-and-restate ordinals; "
+            "off by default, and not part of `cdt pipeline` (#170)"
         ),
     )
     add_logging_arguments(match_parser, noun="matching")
