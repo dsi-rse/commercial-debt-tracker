@@ -1,12 +1,11 @@
 """Where CDT keeps its own copy of a 6-K submission.
 
 A 6-K document row points at one submission through ``resource_uri``, the way an
-8-K row points at the scraper's complete submission text file. Neither 6-K
-source can point at such a file: EDGAR serves one but outside CDT's storage, and
-the scraper stores a filing as one object *per document* with no whole-submission
-object to name. Both therefore write a submission here and name it, which is
-what keeps the row shape — and every stage that reads it — indifferent to where
-the filing came from.
+8-K row points at the scraper's complete submission text file. The 6-K path
+cannot point at such a file, because the scraper stores a filing as one object
+*per document* with no whole-submission object to name. So ingest assembles one
+and writes it here, and the row names it — which is what keeps the row shape,
+and every stage that reads it, identical across the two genres.
 """
 
 from __future__ import annotations
@@ -35,10 +34,9 @@ def mirror_path(
     way. Date-prefixed for navigability and so a storage lifecycle rule can
     address the old ones.
 
-    One path for both sources, deliberately: the mirror is each source's resume
-    ledger (a filing whose mirror exists is not fetched again), so sharing it
-    makes the cutover from EDGAR to the scraper free. Filings EDGAR already
-    supplied keep the bytes it served rather than being re-acquired.
+    Doubles as the resume ledger: a filing whose mirror exists is not read or
+    assembled again, so re-running a range costs one existence check per filing
+    and no document reads.
     """
     return join_artifact_path(
         mirror_root(artifact_root),

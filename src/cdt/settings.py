@@ -65,10 +65,3 @@ DEFAULT_SIXK_TRIAGE_PROVIDER = "openrouter"
 SIXK_TRIAGE_PROVIDER = (
     os.environ.get("SIXK_TRIAGE_PROVIDER") or DEFAULT_SIXK_TRIAGE_PROVIDER
 )
-# SEC fair-access policy requires a declared contact in the User-Agent of every
-# EDGAR request: "Sample Company Name AdminContact@example.com". Requests
-# without one are answered with a 403 and an "Undeclared Automated Tool" page
-# rather than the file, so cdt.sixk.edgar refuses to start without this set
-# instead of persisting that page as filing text. Only the direct-EDGAR 6-K
-# fallback reads it; nothing else in the pipeline talks to sec.gov.
-SEC_USER_AGENT = os.environ.get("SEC_USER_AGENT", "")

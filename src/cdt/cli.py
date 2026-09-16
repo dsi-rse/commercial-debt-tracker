@@ -40,7 +40,6 @@ from cdt.ingest import (
     DEFAULT_S3_PREFIX,
     SIXK_DOCUMENT_DATASET_NAME,
     SIXK_FORM_TYPES,
-    DocumentSource,
     IngestConfig,
     default_output_root,
     documents_root,
@@ -65,7 +64,6 @@ from cdt.pipeline import (
     ALL_TIME_START_DATE as PIPELINE_ALL_TIME_START_DATE,
 )
 from cdt.pipeline import PipelineConfig, resolve_mode_dates, run_pipeline
-from cdt.sixk.edgar import UndeclaredUserAgentError, acquire_sixk_documents
 from cdt.sixk.mirror import mirror_root
 from cdt.sixk.scraper import acquire_scraped_sixk_documents
 from cdt.sixk.stage import DEFAULT_CONCURRENCY as SIXK_DEFAULT_CONCURRENCY
@@ -73,10 +71,6 @@ from cdt.sixk.stage import sixk_snippets_root, triage_pending_documents
 
 ALL_TIME_START_DATE = date(1994, 1, 1)
 DEFAULT_BATCH_SIZE = 100
-# The 6-K source names are the provenance values the rows will carry, so a row's
-# `source` column and the flag that produced it spell the same thing.
-SIXK_SOURCE_SCRAPER = DocumentSource.S3_MANIFEST.value
-SIXK_SOURCE_EDGAR = DocumentSource.EDGAR.value
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -186,7 +180,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sixk_ingest_parser = subparsers.add_parser(
         "ingest-sixk",
-        help="Acquire 6-K filings into the 6-K documents dataset.",
+        help="Acquire 6-K filings from the scraper into the 6-K documents dataset.",
     )
     add_artifact_root_argument(sixk_ingest_parser)
     sixk_ingest_parser.add_argument("--force", action="store_true")
@@ -194,16 +188,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
     )
     sixk_ingest_parser.add_argument("--failure-file", default=None)
-    sixk_ingest_parser.add_argument(
-        "--source",
-        choices=[SIXK_SOURCE_SCRAPER, SIXK_SOURCE_EDGAR],
-        default=SIXK_SOURCE_SCRAPER,
-        help=(
-            "Where to acquire filings. The scraper's bucket carries 6-K over "
-            "its whole history and is the default; EDGAR is for what it has "
-            "not scraped, and needs SEC_USER_AGENT."
-        ),
-    )
     sixk_ingest_parser.add_argument(
         "--form-types",
         type=parse_form_types,
@@ -213,17 +197,6 @@ def build_parser() -> argparse.ArgumentParser:
     sixk_ingest_parser.add_argument("--bucket", default=DEFAULT_BUCKET)
     sixk_ingest_parser.add_argument("--aws-profile", default=DEFAULT_AWS_PROFILE)
     sixk_ingest_parser.add_argument("--s3-prefix", default=DEFAULT_S3_PREFIX)
-    sixk_ingest_parser.add_argument(
-        "--index-file",
-        type=Path,
-        default=None,
-        help=(
-            "--source edgar only: read filings from a local EDGAR form.idx (or "
-            "a zip holding one) instead of fetching one daily index per day. "
-            "Worth it for a wide backfill: one quarterly index replaces ~63 "
-            "daily requests."
-        ),
-    )
     add_logging_arguments(sixk_ingest_parser, noun="6-K ingest")
     sixk_ingest_subparsers = sixk_ingest_parser.add_subparsers(
         dest="ingest_mode", required=True
@@ -516,17 +489,9 @@ def run_ingest(args: argparse.Namespace) -> int:
 
 
 def run_sixk_ingest(args: argparse.Namespace) -> int:
-    """Run the 6-K ingest subcommand against the scraper or EDGAR."""
+    """Run the 6-K ingest subcommand."""
     configure_logging(quiet=args.quiet, log_file=args.log_file)
     logger = logging.getLogger(__name__)
-    from_edgar = args.source == SIXK_SOURCE_EDGAR
-    if args.index_file is not None and not from_edgar:
-        logger.error(
-            "--index-file reads an EDGAR form.idx and has no meaning for "
-            "--source %s; the scraper path finds filings by listing manifests.",
-            args.source,
-        )
-        return 2
     output_root = args.artifact_root or default_output_root()
     lease = acquire_stage_lease(output_root, logger, "6-K ingest")
     if lease is None:
@@ -535,9 +500,6 @@ def run_sixk_ingest(args: argparse.Namespace) -> int:
         start_date, end_date = resolve_ingest_dates(args)
         config = IngestConfig(
             mode=args.ingest_mode,
-            # Unused by the EDGAR source, which reads sec.gov rather than the
-            # scraper's bucket. Kept on the config so the run manifest and the
-            # rest of the pipeline are shaped identically for both genres.
             bucket=args.bucket,
             cik_file=Path(str(args.cik_file)),
             start_date=start_date,
@@ -552,28 +514,18 @@ def run_sixk_ingest(args: argparse.Namespace) -> int:
             dataset_name=SIXK_DOCUMENT_DATASET_NAME,
         )
         logger.info(
-            "Starting 6-K ingest: source=%s mode=%s forms=%s start_date=%s "
-            "end_date=%s index_file=%s output_root=%s",
-            args.source,
+            "Starting 6-K ingest: mode=%s bucket=%s forms=%s start_date=%s "
+            "end_date=%s output_root=%s",
             config.mode,
+            config.bucket,
             ",".join(config.form_types),
             config.start_date,
             config.end_date,
-            args.index_file,
             config.output_root,
         )
-        ciks = read_cik_file(args.cik_file)
-        if from_edgar:
-            _, result = acquire_sixk_documents(
-                config,
-                ciks=ciks,
-                index_file=args.index_file,
-            )
-        else:
-            _, result = acquire_scraped_sixk_documents(config, ciks=ciks)
-    except UndeclaredUserAgentError as exc:
-        logger.error("%s", exc)
-        return 2
+        _, result = acquire_scraped_sixk_documents(
+            config, ciks=read_cik_file(args.cik_file)
+        )
     except ValueError as exc:
         logger.error("Invalid 6-K ingest arguments: %s", exc)
         return 2

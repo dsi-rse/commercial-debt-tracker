@@ -47,9 +47,8 @@ Two genre paths that converge at `extract`:
                                      ┌─ documents ──── itemize ─── items ─── classify ─── classifications ─┐
   scraper S3 (8-K) ──── ingest ──────┤                                                                      │
                                      │                                                                      ├── extract ── mentions ── match ── debt-instruments
-  scraper S3 (6-K)  ─┐               │                                                                      │
-                     ├─ ingest ──────┴─ documents-sixk ─── sixk ──────────────── sixk-snippets ──────────────┘
-  EDGAR (6-K, opt-in)┘                                     (window → stage 1 → stage 2)
+  scraper S3 (6-K) ──── ingest ──────┴─ documents-sixk ─── sixk ──────────────── sixk-snippets ──────────────┘
+                                                            (window → stage 1 → stage 2)
 ```
 
 Everything downstream of `extract` is untouched: mentions carry `item_id`, the
@@ -251,14 +250,15 @@ differing from EDGAR's only in the `<SEC-HEADER>` preamble that
 `prose_documents` discards anyway.
 
 `cdt.sixk.scraper` therefore assembles the submission at ingest and mirrors it
-under the same `raw-documents/sixk/` path the EDGAR source writes. That keeps
+under the `raw-documents/sixk/` path the EDGAR source had written. That keeps
 the row shape (one `resource_uri`), the stage (one submission per row, split
 into prose documents whose index is part of a snippet's identity) and the
 measured triage behaviour all unchanged — verified byte-for-byte on 23 real
 filings spanning 2016 to 2026, including a 6-K/A: every flattened prose
 document came out identical to EDGAR's.
 
-Two things this path does *not* inherit from the EDGAR one:
+Two things this path does *not* inherit from the EDGAR one (which it replaced
+outright — see [Source B](#source-b-the-edgar-fallback-built-then-removed)):
 
 - **No dissemination-feed problem (#90).** The scraper lists by filing date, so
   a range means filing dates and late-listed filings land in their own
@@ -272,74 +272,47 @@ Two things this path does *not* inherit from the EDGAR one:
   for a week: if its steady-state lag exceeds the lookback, the window needs
   widening for both genres.
 
-## Source B: the EDGAR fallback
+## Source B: the EDGAR fallback (built, then removed)
 
-Until then, acquire 6-Ks straight from EDGAR. The prototype already exists and
-already fetched 403 filings (`data/genwindow-6k/documents.jsonl`); this
-promotes it to `src/cdt/sixk/edgar.py` and points it at
-`documents-sixk`.
+While the bucket held no 6-K, this path fetched complete submission text files
+from sec.gov and mirrored them under `raw-documents/sixk/`, with `--source
+edgar` selecting it. It shipped in this branch's commits 2-3 and was **removed
+in commit 7**, once Source A covered the whole corpus: a second way to acquire
+one genre is a second failure taxonomy, a second throttling policy and a second
+thing to keep true, and the 8-K path has exactly one source. `SEC_USER_AGENT`
+and the fair-access handling went with it — nothing in the pipeline talks to
+sec.gov now.
 
-**Index.** `form.idx`, filtered to `6-K` and `6-K/A` with the harness's
-right-anchored `FILING_RE` (the columns are not aligned):
+Two lessons worth keeping if it is ever reinstated, neither visible from the
+research harness (which only ever read a quarterly index from disk):
 
-- daily runs → `https://www.sec.gov/Archives/edgar/daily-index/{yyyy}/QTR{n}/form.{yyyymmdd}.idx`
-  (verified: 800 KB, 147 6-K rows on 2026-09-08)
-- backfills → `https://www.sec.gov/Archives/edgar/full-index/{yyyy}/QTR{n}/form.idx`
-  (verified: 55 MB for one quarter — big enough that it is fetched out of band
-  and passed in as `--index-file` rather than downloaded per run)
+- The quarterly full-index spells a filing date `2026-04-29`; the daily index
+  spells it `20260908`. A regex accepting only the first matches *nothing* in a
+  daily index — 147 of 147 6-K rows dropped, with no error.
+- A daily index is a dissemination feed, not a filing-date bucket: the
+  2026-09-08 index lists filings dated 2026-09-04. Filtering its rows by the
+  run's date range drops those permanently (#90). Neither problem exists on
+  Source A, which lists by filing date.
 
-Two things the live indexes taught, neither visible from the harness (which only
-ever read a quarterly index from disk):
-
-- **The two flavours spell the date differently.** The quarterly index writes
-  `2026-04-29`; the daily index writes `20260908`. The harness's regex accepts
-  only the first, so against a daily index it matches nothing at all — 147 of
-  147 rows dropped, no error.
-- **A daily index is a dissemination feed, not a filing-date bucket.** The
-  2026-09-08 index lists filings dated 2026-09-04. So the daily path must not
-  filter rows by the run's date range: the run for the 4th has already happened
-  and its own index did not list them yet, which is #90's failure mode. Each row
-  is written to the partition for its own filing date, and the run's read-back
-  is the union of its date window and the partitions it wrote, so the summary
-  count matches what landed.
-
-Volume for sizing: 7,640 `6-K`+`6-K/A` rows in 2026 QTR2, i.e. ~120-150 per
-business day across all filers.
-
-**Body.** `https://www.sec.gov/Archives/edgar/data/{cik}/{accession_nodashes}/{accession}.txt`
-— the complete submission, the same object the scraper would have stored.
-
-**Mirror, don't inline.** Write the fetched submission to CDT's own prefix,
-`{artifact_root}/raw-documents/sixk/date=…/{accession}.txt`, and set
-`resource_uri` to it, leaving `text` empty. This makes the 6-K document row
-shape *identical* to an 8-K row — lazy text resolution in the stage, partitions
-that stay small, re-runs that cost nothing — and it pre-stages exactly what the
-scraper will later provide. Inlining full submission text into the parquet
-partitions instead would make every partition read pay for every body (the
-mistake #69 fixed for 8-K).
-
-**Fair access.** SEC requires a declared contact in the User-Agent; requests
-without one get an "Undeclared Automated Tool" page rather than the file. Add
-`SEC_USER_AGENT` to settings and `.env.example`, and fail fast when it is unset
-rather than silently persisting an error page as a filing. Keep the harness's
-`REQUEST_INTERVAL = 0.22` (~4.5 req/s, under SEC's 10/s ceiling) and its
-retry-on-403/429/5xx backoff. At ~120 filings/day this is ~30s of fetching.
-
-**Selection.** `--source edgar` on the 6-K ingest command; everything downstream
-is unchanged, and `source=edgar` lands on the rows.
+The one thing the EDGAR path still buys, and the reason to remember it exists:
+it could serve a filing the scraper has not scraped. Source A's mitigation for
+that is the 8-K path's — `DAILY_LOOKBACK_DAYS`, a re-runnable range, and the
+failure registry — not a second source.
 
 ### Cutover
 
-No migration step. Ingest already dedups on accession
-(`_existing_accessions`), so filings already acquired from EDGAR are skipped
-rather than re-fetched, and both sources write one mirror path — so a filing
-EDGAR mirrored is not even re-assembled. The mirror prefix stays as the resource
-for those rows.
+Done as of 2026-09-16, and it needed no migration step. Both sources wrote the
+same mirror path and ingest dedups on accession (`_existing_accessions`), so
+filings EDGAR had already acquired were neither re-fetched nor re-ingested; the
+mirror stays the resource for those rows. With Source B gone, `cdt ingest-sixk`
+takes the same `--bucket` / `--aws-profile` / `--s3-prefix` flags `cdt ingest`
+does and has no source to choose.
 
-Done as of 2026-09-16: `--source s3-manifest` is the default and `--source
-edgar` is the opt-in fallback for what the scraper has not scraped. The flag's
-values are `DocumentSource`'s own, so a row's `source` column spells the flag
-that produced it.
+Residue worth naming: the `source` column on `documents-sixk` now holds one
+value (`s3-manifest`) on every row it is set on. Kept rather than dropped — it
+is already in the published schema, older partitions legitimately have it null,
+and it is the field that would distinguish a future source — but it no longer
+discriminates anything.
 
 ## Change list
 
@@ -349,9 +322,10 @@ New:
 |---|---|
 | `src/cdt/sixk/documents.py` | `prose_documents`, `KEEP_TYPE_RE` — promoted from the eval harness |
 | `src/cdt/sixk/stage.py` | `sixk_pending_documents`, `sixk_snippets_root`, `SIXK_SNIPPET_COLUMNS`, `snippet_id_for` |
-| `src/cdt/sixk/edgar.py` | index parse, throttled fetch, mirror write, `acquire_sixk_documents_from_edgar` |
+| `src/cdt/sixk/scraper.py` | manifest scan, submission assembly, mirror write, `acquire_scraped_sixk_documents` |
+| `src/cdt/sixk/mirror.py` | the mirror path contract |
 | `tests/test_sixk_stage.py` | the stage, end to end, with a fake chat client |
-| `tests/test_sixk_edgar.py` | index parsing, throttle, mirror, resume |
+| `tests/test_sixk_scraper.py` | assembly order, mirror/resume, malformed and missing documents |
 
 Modified:
 
@@ -359,15 +333,15 @@ Modified:
 |---|---|
 | `ingest.py` | `form_types` + `dataset_name` on `IngestConfig`; `form_type`/`source` on `DocumentCandidate` and `DOCUMENT_COLUMNS`; drop the `CDT_FORM_TYPE` hardcode |
 | `extractor/core.py` | `CLASSIFICATION_SOURCES` loop in `pending_extract_partitions`; scope the mentions-backfill heuristic to the 8-K source |
-| `pipeline.py` | `sixk_enabled` / `sixk_form_types` / `sixk_source` / `sixk_cik_file` on `PipelineConfig`; a `_sixk` phase in `_ingest_itemize_classify` (renamed `_prepare`), with a lease renew at its boundary; counts on `PipelineRunResult`; `FINAL_OUTPUT_TABLES["items"]` becomes a union of `items` and `sixk-snippets` |
-| `cli.py` | `cdt sixk` stage command; `--form-types`, `--source` and `--sixk-cik-file` on `cdt ingest` |
+| `pipeline.py` | `sixk_enabled` / `sixk_form_types` / `sixk_cik_file` on `PipelineConfig`; a `_sixk` phase in `_ingest_itemize_classify` (renamed `_prepare`), with a lease renew at its boundary; counts on `PipelineRunResult`; `FINAL_OUTPUT_TABLES["items"]` becomes a union of `items` and `sixk-snippets` |
+| `cli.py` | `cdt sixk` stage command; `cdt ingest-sixk` with the scraper flags `cdt ingest` takes; `--form-types` and `--sixk-cik-file` on `cdt ingest` |
 | `orchestrator.py` | `--sixk` / `SIXK_ENABLED` and `--sixk-cik-file` / `SIXK_CIK_FILE` (defaulting to `CDT_DEFAULT_CIK_FILE`), threaded into `PipelineConfig` |
-| `settings.py` | `SEC_USER_AGENT`, `SIXK_TRIAGE_PROVIDER`, `SIXK_CIK_FILE` |
+| `settings.py` | `SIXK_TRIAGE_PROVIDER`, `SIXK_CIK_FILE` |
 | `sixk/__init__.py` | re-export the new modules |
 | `docs/architecture.md` | the second genre path; the 6-K stage between ingest and extract |
 | `docs/schema.md` | `documents-sixk`, `sixk-snippets`, `raw-documents/sixk/`; `form_type`/`source` on `documents` |
 | `docs/sixk-two-stage-triage.md` | replace "What is not in this change" with the wiring |
-| `.env.example`, `README.md` | `SEC_USER_AGENT`, running the 6-K path |
+| `.env.example`, `README.md` | running the 6-K path |
 
 ## Tests
 
@@ -391,17 +365,19 @@ following their fake-client pattern:
   partition pending again; interrupted pass → `complete=False`.
 - ingest with `form_types=("6-K", "6-K/A")` writes `documents-sixk` and leaves
   `documents` untouched.
-- EDGAR: `form.idx` parsing (including the 2-space-column quirk), the
-  exclusion/resume path, a missing `SEC_USER_AGENT` failing before any request.
+- Scraper 6-K: documents assembled in `seq` order, a document missing its
+  `<DOCUMENT>` wrapper failing its filing permanently, the mirror as resume
+  ledger, and the assembled prose matching EDGAR's byte for byte.
 
 ## Phases
 
 1. **Ingest generality.** `form_types`, `dataset_name`, the two new columns.
    Ships alone; the 8-K path is unchanged and provable by the existing suite.
-2. **EDGAR fallback.** `sixk/edgar.py` + mirror. Verifiable without any LLM
-   call: run one day, count rows in `documents-sixk`. The `cdt ingest-sixk`
-   command moved forward from phase 5 into this phase, because "run one day" is
-   this phase's acceptance check and it needs an entry point.
+2. **Acquisition.** `sixk/scraper.py` + mirror (originally `sixk/edgar.py`;
+   see Source B). Verifiable without any LLM call: run one day, count rows in
+   `documents-sixk`. The `cdt ingest-sixk` command moved forward from phase 5
+   into this phase, because "run one day" is this phase's acceptance check and
+   it needs an entry point.
 3. **The stage.** `sixk/documents.py` + `sixk/stage.py` + tests. Still no
    pipeline change; drive it with `cdt sixk`.
 4. **Extractor source list.** Including the backfill-heuristic fix and its test.

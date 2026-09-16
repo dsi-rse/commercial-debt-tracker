@@ -1,8 +1,12 @@
 """Acquire Form 6-K filings from the scraper's bucket, like every other form.
 
 The scraper carries 6-K over its whole history — every filing-date partition
-from 2016-01-04 onward has them — so this is the 6-K path's default source and
-:mod:`cdt.sixk.edgar` is the opt-in fallback for what it has not scraped.
+from 2016-01-04 onward has them — so this is the 6-K path's only source, as the
+scraper's bucket is the 8-K path's only source. An earlier direct-EDGAR
+acquisition existed for the window when the bucket held no 6-K at all; it was
+removed once the bucket carried them, because a second way to acquire one genre
+is a second failure taxonomy, a second throttling policy and a second thing to
+keep true for no remaining benefit.
 
 It cannot reuse the 8-K path's candidate scan, for one reason: what the scraper
 stores per filing differs by form. An 8-K filing is one object, the complete
@@ -12,15 +16,14 @@ no whole-submission object exists to name, while the triage stage reads one
 submission per row — it splits a filing into its prose documents itself.
 
 So this source assembles the submission the scraper did not store, and mirrors
-it under CDT's own prefix exactly as the EDGAR source does. Assembly is a
-concatenation and nothing more: each stored object is already the document's
-dissemination-format ``<DOCUMENT>`` block, header lines included, so joining
-them in sequence order reproduces the submission EDGAR serves minus its
-``<SEC-HEADER>`` preamble, which :func:`cdt.sixk.documents.prose_documents`
-discards anyway. Verified against EDGAR on 23 real filings spanning 2016 to
-2026, including a 6-K/A: every flattened prose document came out byte-identical,
-so the measured triage behaviour carries over from the EDGAR-acquired corpus
-unchanged.
+it under CDT's own prefix. Assembly is a concatenation and nothing more: each
+stored object is already the document's dissemination-format ``<DOCUMENT>``
+block, header lines included, so joining them in sequence order reproduces the
+submission EDGAR itself serves, minus the ``<SEC-HEADER>`` preamble that
+:func:`cdt.sixk.documents.prose_documents` discards anyway. Checked against
+EDGAR on 23 real filings spanning 2016 to 2026, including a 6-K/A: every
+flattened prose document came out byte-identical, which is what carries the
+triage stage's measured behaviour over from the corpus it was scored on.
 """
 
 from __future__ import annotations
@@ -50,7 +53,6 @@ from cdt.ingest import (
     run_ingest_pipeline,
 )
 from cdt.shared import FailureRegistry, get_logger
-from cdt.sixk.edgar import submission_url
 from cdt.sixk.mirror import mirror_path
 from cdt.storage import (
     artifact_exists,
@@ -60,6 +62,21 @@ from cdt.storage import (
 )
 
 LOGGER = get_logger(__name__)
+
+
+def submission_url(cik: str, accession_number: str) -> str:
+    """Return the complete-submission text file URL for one filing.
+
+    Not fetched — recorded. It names, publicly, the submission a row's
+    assembled text *is*, which is what an 8-K row's ``url`` names for the
+    object the scraper stored. ``accession_number`` is the manifest's dashed
+    form; the directory segment is the same digits without dashes.
+    """
+    return (
+        f"https://www.sec.gov/Archives/edgar/data/{cik.lstrip('0')}/"
+        f"{accession_number.replace('-', '')}/{accession_number}.txt"
+    )
+
 
 #: The marker every stored document begins with. Checked rather than assumed:
 #: assembly is only faithful because the scraper keeps the ``<DOCUMENT>``
@@ -116,11 +133,10 @@ def _sequence(value: str) -> int:
 class ScraperDocumentSource:
     """6-K candidates assembled from the scraper's per-document objects.
 
-    Acquisition happens during iteration, as in the EDGAR source: a candidate
-    exists only once its submission has been mirrored, and a filing already
-    mirrored is yielded without re-reading its documents. That makes the mirror
-    the resume ledger for both sources, so a range acquired from EDGAR before
-    the cutover costs nothing to re-run here.
+    Acquisition happens during iteration: a candidate exists only once its
+    submission has been mirrored, and a filing already mirrored is yielded
+    without re-reading its documents. That makes the mirror the resume ledger,
+    so re-running a range costs one existence check per filing.
     """
 
     config: IngestConfig
@@ -231,12 +247,11 @@ class ScraperDocumentSource:
             accession_number=normalize_accession_number(filing.accession_number),
             cik=filing.cik.lstrip("0"),
             company_name=filing.company_name,
-            # The submission this row's text is, named where it is public.
-            # Matches what the EDGAR source records, so `url` means the same
-            # thing on both sides of the cutover; the scraper's own per-document
-            # URLs cannot be one value. Built from the manifest's dashed
-            # accession, which is the spelling in the path EDGAR serves — the
-            # stored, dash-stripped one names a file that 404s.
+            # The submission this row's text is, named where it is public —
+            # what an 8-K row's `url` means for the object the scraper stored.
+            # The scraper's own per-document URLs cannot be one value. Built
+            # from the manifest's dashed accession, the spelling sec.gov serves
+            # it under; the stored, dash-stripped one names a file that 404s.
             url=submission_url(filing.cik, filing.accession_number),
             resource_uri=target,
             date=filing.filing_date.isoformat(),

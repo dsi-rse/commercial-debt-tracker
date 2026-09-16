@@ -245,7 +245,7 @@ def test_acquire_writes_six_k_rows_pointing_at_assembled_submissions(
     assert gzip.decompress(Path(mirror).read_bytes()).decode() == (
         HARMONY_BODY + HARMONY_EXHIBIT
     )
-    # The dashed accession, which is the spelling EDGAR serves the submission
+    # The dashed accession, which is the spelling sec.gov serves the submission
     # under; the row's own dash-stripped one names a file that 404s.
     assert table.loc[0, "url"] == (
         "https://www.sec.gov/Archives/edgar/data/1023514/"
@@ -314,11 +314,7 @@ def test_plain_text_documents_are_read_too(tmp_path: Path) -> None:
 
 
 def test_already_mirrored_filings_are_not_reassembled(tmp_path: Path) -> None:
-    """The mirror is the resume ledger, so a second run reads no documents.
-
-    This is also what makes the cutover from EDGAR free: a filing EDGAR already
-    mirrored is yielded from the same path without being re-acquired here.
-    """
+    """The mirror is the resume ledger, so a second run reads no documents."""
     objects = _objects()
     first_client = FakeS3Client(objects)
     acquire_scraped_sixk_documents(_config(tmp_path), s3_client=first_client)
