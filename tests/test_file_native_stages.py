@@ -9,12 +9,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.dataset
 import pytest
 from botocore.exceptions import ClientError, ReadTimeoutError
 
 from cdt import storage as cdt_storage
 from cdt.classifier import classifications_root, classify_pending_items
 from cdt.classifier import core as classifier_core
+from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
 from cdt.datasets import (
     completion_registry_path,
     existing_date_shard_partition_ids,
@@ -61,6 +64,7 @@ from cdt.extractor.core import (
 from cdt.ingest import DOCUMENT_COLUMNS
 from cdt.itemizer import core as itemizer_core
 from cdt.itemizer import itemize_pending_documents, items_root
+from cdt.itemizer.core import ITEM_COLUMNS
 from cdt.matcher import (
     debt_instruments_root,
     match_pending_mentions,
@@ -78,6 +82,7 @@ from cdt.matcher.core import (
 )
 from cdt.pipeline import normalize_snapshot_text
 from cdt.storage import (
+    apply_declared_column_types,
     artifact_exists,
     coerce_dataset_text,
     decimal_column_values,
@@ -5956,6 +5961,74 @@ def test_published_instrument_columns_are_pinned() -> None:
         "lender_disclosure",
         "amendment_inferred_by",
     ]
+
+
+@pytest.mark.parametrize(
+    "columns",
+    [
+        pytest.param(DOCUMENT_COLUMNS, id="documents"),
+        pytest.param(ITEM_COLUMNS, id="items"),
+        pytest.param(CLASSIFIED_ITEM_COLUMNS, id="classifications"),
+        pytest.param(DEBT_INSTRUMENT_MENTION_COLUMNS, id="mentions"),
+        pytest.param(MENTION_CLUSTER_EDGE_COLUMNS, id="mention-cluster-edges"),
+        pytest.param(DEBT_INSTRUMENT_COLUMNS, id="debt-instruments"),
+    ],
+)
+def test_a_columns_physical_type_does_not_depend_on_the_data(
+    columns: list[str],
+) -> None:
+    """One column publishes one type, whatever a given partition happens to hold.
+
+    Arrow infers an object column's type from its values, so a column with no
+    value in this partition serialised as `null` and as `string` in the next.
+    That made 23 of 42 `debt-instruments` columns vary, and every standard
+    reader — `pyarrow.dataset`, `pq.read_table`, `ParquetDataset`,
+    `pandas.read_parquet` — failed on the directory with "Unsupported cast from
+    string to null" (#187). An empty frame was worse: it inferred `null` for
+    every column, counts and flags included.
+    """
+    empty = apply_declared_column_types(pd.DataFrame(columns=columns))
+    populated = apply_declared_column_types(pd.DataFrame([dict.fromkeys(columns)]))
+    assert empty.schema == populated.schema
+    assert not [
+        field.name for field in empty.schema if pa.types.is_null(field.type)
+    ], "a null-typed column has no stable physical type"
+
+
+def test_a_multi_partition_dataset_reads_with_a_standard_reader(
+    tmp_path: Path,
+) -> None:
+    """The consumer promise: point any parquet reader at the directory.
+
+    The first partition read must be the one with no value: Arrow takes the
+    unified type from the first fragment, and casting `null` data up to `string`
+    succeeds while casting `string` data down to `null` is what fails. A test
+    with the partitions the other way round passes even when the fix is removed.
+    """
+    root = tmp_path / "debt-instruments"
+    for shard, subtype in (("0001", None), ("0002", "repaid")):
+        frame = pd.DataFrame(
+            [
+                dict.fromkeys(DEBT_INSTRUMENT_COLUMNS)
+                | {
+                    "debt_instrument_id": f"d-{shard}",
+                    "cik": "320193",
+                    "status": "closed",
+                    "status_subtype": subtype,
+                    "mention_count": 1,
+                    "document_count": 1,
+                    "is_lineage_head": True,
+                }
+            ]
+        )
+        write_partition_table(root, partition={"cik_shard": shard}, table=frame)
+
+    table = pyarrow.dataset.dataset(
+        root, format="parquet", partitioning="hive"
+    ).to_table()
+    assert table.num_rows == 2
+    assert len(pd.read_parquet(root)) == 2
+    assert len(read_dataset(root)) == 2
 
 
 def test_declared_decimal_columns_publish_as_exact_decimals(tmp_path: Path) -> None:

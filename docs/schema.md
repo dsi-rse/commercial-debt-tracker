@@ -165,9 +165,25 @@ scale four). The pipeline's own readers canonicalise that to one spelling, since
 every internal comparison — match keys, prior-amount equality — is textual.
 
 Types are declared once, at the single parquet write path, so they hold for
-every dataset and every partition. That also pins the type of a partition whose
-values are all null, which otherwise serialised as parquet `null` and made a
-column's physical type vary from partition to partition.
+every dataset and every partition — including a partition whose values are all
+null, and an empty one. Inferring them per write made the physical type a
+function of the data: a column with no value in one partition serialised as
+parquet `null` and as `string` in the next, which is why 23 of 42
+`debt-instruments` columns disagreed across partitions and `pyarrow.dataset`,
+`pq.read_table`, `ParquetDataset` and `pandas.read_parquet` all failed on the
+directory with "Unsupported cast from string to null" (#187).
+
+So any standard parquet reader can be pointed at a dataset directory:
+
+```python
+import pandas as pd
+pd.read_parquet("<artifact-root>/debt-instruments")
+```
+
+Partitions written before that fix keep the types they were written with, and a
+dataset that mixes the two is readable only in the order that happens to put a
+typed partition first. A root carried over from an earlier run therefore needs
+rebuilding once (#107).
 
 Dates are text in `YYYY-MM-DD`, not a date type: a year-only maturity normalizes
 to `YYYY-12-31` carrying `derived_from: "name"`, and the distinction between a

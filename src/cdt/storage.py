@@ -415,20 +415,47 @@ def write_bytes_artifact(path: ArtifactPath, body: bytes) -> str:
 
 MISSING_TEXT_VALUES = frozenset({"nan", "none", "null", "<na>", "n/a"})
 
-# Money and rates publish as exact decimals rather than text or floats (#185).
-# Float is not an option: `float("372246148.11")` is not that number, and
-# rendering it at fixed precision leaks the difference, which is what made every
-# amount carrying cents publish as null (#119). Declaring the type here rather
-# than at each write site also pins it for a partition whose values are all
-# null, which otherwise serialised as parquet `null` and made the column's
-# physical type vary across partitions.
+# Every published column's physical type, declared rather than inferred (#187).
+#
+# `pa.Table.from_pandas` infers an object column's type from its values, so a
+# column with no value in one partition serialised as parquet `null` and as
+# `string` in the next. That made the type a function of the data rather than of
+# the schema, and 23 of 42 `debt-instruments` columns did it — enough that
+# `pyarrow.dataset`, `pq.read_table`, `ParquetDataset` and `pandas.read_parquet`
+# all failed on the directory with "Unsupported cast from string to null". Only
+# this module's own `read_dataset` worked, because it concatenates per file in
+# pandas instead of asking Arrow to unify the schemas, which is why it went
+# unnoticed. An empty frame is worse still: it infers `null` for every column,
+# including the counts and flags.
+#
+# Column names carry one meaning across datasets here (`cik` is the same thing
+# everywhere), so keying by name keeps `write_table` generic.
+#
+# Money and rates are exact decimals (#185). Float is not an option:
+# `float("372246148.11")` is not that number, and rendering it at fixed
+# precision leaks the difference, which is what made every amount carrying cents
+# publish as null (#119).
 DECLARED_COLUMN_TYPES: dict[str, pa.DataType] = {
     "principal_amount": pa.decimal128(38, 2),
     "outstanding_balance": pa.decimal128(38, 2),
     # Four places carries basis points with room to spare; the corpus uses at
     # most three.
     "interest_rate_pct": pa.decimal128(9, 4),
+    "mention_count": pa.int64(),
+    "document_count": pa.int64(),
+    "candidate_rank": pa.int64(),
+    "start_line": pa.int64(),
+    "end_line": pa.int64(),
+    "section_char_count": pa.int64(),
+    "is_lineage_head": pa.bool_(),
+    "relevance": pa.bool_(),
+    # Model scores, not measured quantities, so a float is the honest type.
+    "classification_score": pa.float64(),
+    "match_score": pa.float64(),
 }
+# Everything not declared above is nullable text, which is the contract
+# `docs/schema.md` states.
+DEFAULT_COLUMN_TYPE = pa.string()
 
 
 def canonical_numeric_text(value: Decimal) -> str:
@@ -478,19 +505,38 @@ def decimal_column_values(
     return coerced
 
 
+def declared_column_type(name: str, inferred: pa.DataType) -> pa.DataType:
+    """Return the physical type one column publishes as.
+
+    A declared type always wins. Otherwise an inferred `null` — an object column
+    with no value in this frame — becomes text, so the column publishes the same
+    type whether or not this particular partition happened to carry a value.
+    Any other inferred type is left alone: it came from a real pandas dtype and
+    is already stable across partitions.
+    """
+    declared = DECLARED_COLUMN_TYPES.get(name)
+    if declared is not None:
+        return declared
+    if pa.types.is_null(inferred):
+        return DEFAULT_COLUMN_TYPE
+    return inferred
+
+
 def apply_declared_column_types(table: pd.DataFrame) -> pa.Table:
     """Return one Arrow table with the declared physical types applied."""
     arrow = pa.Table.from_pandas(table, preserve_index=False)
-    for name, dtype in DECLARED_COLUMN_TYPES.items():
-        if name not in arrow.column_names:
+    for index, field in enumerate(arrow.schema):
+        dtype = declared_column_type(field.name, field.type)
+        if dtype == field.type:
             continue
-        values = decimal_column_values(
-            arrow.column(name).to_pylist(), dtype, column=name
-        )
-        index = arrow.schema.get_field_index(name)
-        arrow = arrow.set_column(
-            index, pa.field(name, dtype), pa.array(values, type=dtype)
-        )
+        if pa.types.is_decimal(dtype):
+            values = decimal_column_values(
+                arrow.column(field.name).to_pylist(), dtype, column=field.name
+            )
+            column = pa.array(values, type=dtype)
+        else:
+            column = arrow.column(field.name).cast(dtype)
+        arrow = arrow.set_column(index, pa.field(field.name, dtype), column)
     return arrow
 
 
