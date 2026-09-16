@@ -873,3 +873,82 @@ def test_final_database_root_only_where_honored() -> None:
 
     with pytest.raises(SystemExit):
         parser.parse_args(["itemize", "--final-database-root", "/final"])
+
+
+def test_ingest_sixk_reads_the_scraper_bucket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """6-K is acquired from the bucket the 8-K path reads, with its own flags."""
+    calls: list[dict[str, object]] = []
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("1023514\n")
+
+    def fake_acquire_scraped(
+        config: cli.IngestConfig,
+        *,
+        ciks: set[str] | None = None,
+    ) -> tuple[pd.DataFrame, IngestRunResult]:
+        calls.append(
+            {
+                "mode": config.mode,
+                "bucket": config.bucket,
+                "s3_prefix": config.s3_prefix,
+                "form_types": config.form_types,
+                "dataset_name": config.dataset_name,
+                "start_date": config.start_date,
+                "end_date": config.end_date,
+                "ciks": ciks,
+                # The submission is mirrored and read from resource_uri, never
+                # inlined into the partition.
+                "download": config.download,
+            }
+        )
+        return pd.DataFrame(), IngestRunResult(
+            mode=config.mode,
+            start_date=config.start_date,
+            end_date=config.end_date,
+            ciks_count=len(ciks or set()),
+            candidates_seen=1,
+            skipped_existing=0,
+            downloaded=0,
+            failures=0,
+            total_rows=1,
+            output_root=str(tmp_path),
+            documents_root=str(tmp_path / "documents-sixk"),
+            document_partitions=(),
+            failure_file=str(tmp_path / "failures" / "ingest_failures.json"),
+            run_manifest=str(tmp_path / "runs" / "ingest" / "run_id=1.json"),
+            dataset_name="documents-sixk",
+        )
+
+    monkeypatch.setattr(cli, "acquire_scraped_sixk_documents", fake_acquire_scraped)
+
+    status = cli.main(
+        [
+            "ingest-sixk",
+            "--artifact-root",
+            str(tmp_path),
+            "--quiet",
+            "historical",
+            str(cik_file),
+            "--start-date",
+            "2026-09-08",
+            "--end-date",
+            "2026-09-09",
+        ]
+    )
+
+    assert status == 0
+    assert calls == [
+        {
+            "mode": "historical",
+            "bucket": cli.DEFAULT_BUCKET,
+            "s3_prefix": "sec",
+            "form_types": ("6-K", "6-K/A"),
+            "dataset_name": "documents-sixk",
+            "start_date": date(2026, 9, 8),
+            "end_date": date(2026, 9, 9),
+            "ciks": {"1023514"},
+            "download": False,
+        }
+    ]

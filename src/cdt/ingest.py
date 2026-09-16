@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import gzip
 import json
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from enum import StrEnum
@@ -46,6 +46,13 @@ DOCUMENT_COLUMNS = [
     "text",
     "date",
     "resource_uri",
+    # Which SEC form the row is ("8-K", "8-K/A", "6-K", ...) and how it was
+    # acquired. Both are provenance rather than keys, so partitions written
+    # before they existed stay readable: read_table falls back to a full read
+    # plus reindex when a column is absent, and a null form_type is an 8-K,
+    # which is all this pipeline acquired until the 6-K path existed.
+    "form_type",
+    "source",
 ]
 # The SEC scraper's output bucket, which CDT reads. In dev this is the same
 # bucket CDT writes its own artifacts to, separated only by prefix: the scraper
@@ -54,6 +61,13 @@ DEFAULT_BUCKET = "idi-dev-ftm2j-shared-processor-storage"
 DEFAULT_AWS_PROFILE = ""
 DEFAULT_S3_PREFIX = "sec"
 CDT_FORM_TYPE = "8-K"
+# Ingest itself is form-agnostic; this default keeps every existing caller,
+# CLI flag and deployed schedule on 8-K until one asks for another form.
+DEFAULT_FORM_TYPES: tuple[str, ...] = (CDT_FORM_TYPE,)
+# The 6-K genre's forms. Here rather than in either 6-K source, because both
+# acquire the same two forms and the CLI defaults to them before it knows which
+# source will run.
+SIXK_FORM_TYPES: tuple[str, ...] = ("6-K", "6-K/A")
 CDT_DOCUMENT_TYPE = "COMPLETE SUBMISSION TEXT FILE"
 CDT_DOCUMENT_DESCRIPTION = "COMPLETE SUBMISSION TEXT FILE"
 DEFAULT_BATCH_SIZE = 100
@@ -64,6 +78,11 @@ MANIFEST_KEY_CIK_INDEX_FROM_END = -3
 MIN_MANIFEST_KEY_PARTS = 5
 DEFAULT_OUTPUT_PREFIX = "processors/cdt"
 DOCUMENT_DATASET_NAME = "documents"
+# The 6-K genre's own documents dataset (see IngestConfig.dataset_name).
+# Named for the `cdt.sixk` package rather than "documents-6k" only for
+# consistency with it: the partition contract reads a path's date and shard and
+# never its dataset segment, so the name itself carries no behaviour.
+SIXK_DOCUMENT_DATASET_NAME = "documents-sixk"
 RUN_DATASET_NAME = "runs"
 FAILURE_DATASET_NAME = "failures"
 DOCUMENT_PARTITION_SHARDS = 64
@@ -76,6 +95,7 @@ class IngestFailureType(StrEnum):
     INVALID_MANIFEST = "invalid_manifest"
     DOCUMENT_NOT_FOUND = "document_not_found"
     DOCUMENT_DOWNLOAD_FAILED = "document_download_failed"
+    MALFORMED_DOCUMENT = "malformed_document"
 
 
 class IngestFailureClassifier(FailureClassifier):
@@ -88,6 +108,10 @@ class IngestFailureClassifier(FailureClassifier):
             {
                 IngestFailureType.INVALID_MANIFEST,
                 IngestFailureType.DOCUMENT_NOT_FOUND,
+                # Re-reading the same object returns the same bytes, so a
+                # document that is not in dissemination format never becomes
+                # one by retrying.
+                IngestFailureType.MALFORMED_DOCUMENT,
             }
         )
 
@@ -123,6 +147,19 @@ class S3Client(Protocol):
         """Return an S3 object body."""
 
 
+class DocumentSource(StrEnum):
+    """How a document row was acquired.
+
+    Recorded per row because the two sources coexist: the scraper carries no
+    6-K, so those are fetched from EDGAR directly until it does, and a row's
+    provenance has to survive that cutover rather than be inferred from when it
+    was written.
+    """
+
+    S3_MANIFEST = "s3-manifest"
+    EDGAR = "edgar"
+
+
 @dataclass(frozen=True)
 class DocumentCandidate:
     """A manifest-backed SEC document candidate."""
@@ -133,6 +170,46 @@ class DocumentCandidate:
     url: str
     resource_uri: str
     date: str
+    form_type: str = ""
+    source: str = DocumentSource.S3_MANIFEST
+
+
+class DocumentCandidateSource(Protocol):
+    """A source of document candidates for one ingest run.
+
+    ``failures`` is read once iteration is done and folded into the run's
+    failure count. A source that only *indexes* filings (the scraper path, where
+    bodies stay in S3 until a stage needs them) reports zero; one that acquires
+    the bodies itself, as the direct-EDGAR 6-K path must, reports what it could
+    not fetch — the same thing ``download=True`` counts.
+    """
+
+    def __iter__(self: Self) -> Iterator[DocumentCandidate]:
+        """Yield the candidates this source acquired."""
+
+    @property
+    def failures(self: Self) -> int:
+        """Return the number of candidates the source could not acquire."""
+
+
+@dataclass(frozen=True)
+class ListCandidateSource:
+    """A source over an already-materialized candidate list."""
+
+    candidates: list[DocumentCandidate]
+
+    def __iter__(self: Self) -> Iterator[DocumentCandidate]:
+        """Yield the listed candidates."""
+        return iter(self.candidates)
+
+    @property
+    def failures(self: Self) -> int:
+        """Return zero: a list cannot have failed to acquire anything.
+
+        Failures on the scraper path are per-manifest and already recorded in
+        the failure registry by the iterator that built the list.
+        """
+        return 0
 
 
 @dataclass(frozen=True)
@@ -180,6 +257,12 @@ class IngestConfig:
     failure_file: str | Path | None = None
     aws_profile: str = DEFAULT_AWS_PROFILE
     s3_prefix: str = DEFAULT_S3_PREFIX
+    form_types: tuple[str, ...] = DEFAULT_FORM_TYPES
+    # Each genre gets its own documents dataset. Mixing forms into one would
+    # merge new rows into partitions the 8-K path has already processed, and
+    # every downstream stage selects work by source-partition fingerprint (#62):
+    # a 6-K backfill would make the whole 8-K corpus pending again.
+    dataset_name: str = DOCUMENT_DATASET_NAME
 
 
 @dataclass(frozen=True)
@@ -200,6 +283,8 @@ class IngestRunResult:
     document_partitions: tuple[str, ...]
     failure_file: str
     run_manifest: str
+    form_types: tuple[str, ...] = DEFAULT_FORM_TYPES
+    dataset_name: str = DOCUMENT_DATASET_NAME
 
     @property
     def database_path(self: Self) -> str:
@@ -221,10 +306,11 @@ def documents_root(
     output_root: str | None = None,
     *,
     data_dir: Path | None = None,
+    dataset_name: str = DOCUMENT_DATASET_NAME,
 ) -> str:
-    """Return the root URI for canonical document dataset partitions."""
+    """Return the root URI for one canonical document dataset's partitions."""
     return join_artifact_path(
-        output_root or default_output_root(data_dir), DOCUMENT_DATASET_NAME
+        output_root or default_output_root(data_dir), dataset_name
     )
 
 
@@ -264,8 +350,10 @@ def acquire_documents(
     force: bool = False,
     batch_size: int = DEFAULT_BATCH_SIZE,
     download: bool = False,
+    form_types: tuple[str, ...] = DEFAULT_FORM_TYPES,
+    dataset_name: str = DOCUMENT_DATASET_NAME,
 ) -> pd.DataFrame:
-    """Acquire matching 8-K documents and update canonical document partitions."""
+    """Acquire matching documents for a year and update document partitions."""
     documents, _ = run_ingest_pipeline(
         IngestConfig(
             mode="historical",
@@ -278,6 +366,8 @@ def acquire_documents(
             force=force,
             batch_size=batch_size,
             download=download,
+            form_types=form_types,
+            dataset_name=dataset_name,
         ),
         ciks=ciks,
         s3_client=s3_client,
@@ -296,8 +386,10 @@ def acquire_documents_for_date_range(
     force: bool = False,
     batch_size: int = DEFAULT_BATCH_SIZE,
     download: bool = False,
+    form_types: tuple[str, ...] = DEFAULT_FORM_TYPES,
+    dataset_name: str = DOCUMENT_DATASET_NAME,
 ) -> pd.DataFrame:
-    """Acquire matching 8-K documents for a date range and update partitions."""
+    """Acquire matching documents for a date range and update partitions."""
     documents, _ = run_ingest_pipeline(
         IngestConfig(
             mode="historical",
@@ -310,6 +402,8 @@ def acquire_documents_for_date_range(
             force=force,
             batch_size=batch_size,
             download=download,
+            form_types=form_types,
+            dataset_name=dataset_name,
         ),
         ciks=ciks,
         s3_client=s3_client,
@@ -322,16 +416,37 @@ def run_ingest_pipeline(
     *,
     ciks: set[str] | None = None,
     s3_client: S3Client | None = None,
+    candidate_source: Callable[[FailureRegistry], DocumentCandidateSource]
+    | None = None,
 ) -> tuple[pd.DataFrame, IngestRunResult]:
-    """Run ingest using an orchestrator-style config object."""
+    """Run ingest using an orchestrator-style config object.
+
+    ``candidate_source`` replaces the scraper-manifest scan with another way of
+    finding filings — the direct-EDGAR 6-K path. It is a factory rather than a
+    source because the failure registry lives here: two registries over one
+    ``failures.json`` would overwrite each other's entries. Everything after the
+    candidates is shared, which is what makes switching sources cheap: accession
+    dedup, batched partition merges, the read-back window and the run manifest
+    do not care where a filing came from.
+    """
     if config.batch_size <= 0:
         msg = f"batch_size must be positive, got {config.batch_size}"
         raise ValueError(msg)
 
-    client = s3_client or default_s3_client(config.aws_profile)
+    # Built on demand: a run that reads EDGAR and writes a local artifact root
+    # has no business constructing an S3 client (or requiring its profile).
+    resolved_client: list[S3Client] = [s3_client] if s3_client is not None else []
+
+    def client() -> S3Client:
+        if not resolved_client:
+            resolved_client.append(default_s3_client(config.aws_profile))
+        return resolved_client[0]
+
     normalized_ciks = _normalize_ciks(ciks)
     output_root = config.output_root or default_output_root(config.data_dir)
-    documents_dataset_root = documents_root(output_root, data_dir=config.data_dir)
+    documents_dataset_root = documents_root(
+        output_root, data_dir=config.data_dir, dataset_name=config.dataset_name
+    )
     failure_file = config.failure_file or default_failure_file(
         output_root,
         data_dir=config.data_dir,
@@ -350,9 +465,12 @@ def run_ingest_pipeline(
     )
 
     LOGGER.info(
-        "Starting ingest: mode=%s bucket=%s start_date=%s end_date=%s batch_size=%s download=%s",
+        "Starting ingest: mode=%s bucket=%s forms=%s dataset=%s start_date=%s "
+        "end_date=%s batch_size=%s download=%s",
         config.mode,
         config.bucket,
+        ",".join(config.form_types),
+        config.dataset_name,
         config.start_date,
         config.end_date,
         config.batch_size,
@@ -392,20 +510,29 @@ def run_ingest_pipeline(
         )
         pending_rows = []
 
-    for candidate in iter_document_candidates_for_date_range(
-        client,
-        config.bucket,
-        config.start_date,
-        config.end_date,
-        normalized_ciks,
-        failure_registry=failure_registry,
-        s3_prefix=config.s3_prefix,
-        # --force retries even permanently registered failures: a variant
-        # document label or a since-fixed scraper bug would otherwise poison a
-        # filing forever, with hand-editing failures.json as the only remedy
-        # (#67). New failures are still recorded through the registry.
-        retry_registered_failures=config.force,
-    ):
+    source: DocumentCandidateSource = (
+        candidate_source(failure_registry)
+        if candidate_source is not None
+        else ListCandidateSource(
+            iter_document_candidates_for_date_range(
+                client(),
+                config.bucket,
+                config.start_date,
+                config.end_date,
+                normalized_ciks,
+                failure_registry=failure_registry,
+                s3_prefix=config.s3_prefix,
+                form_types=config.form_types,
+                # --force retries even permanently registered failures: a
+                # variant document label or a since-fixed scraper bug would
+                # otherwise poison a filing forever, with hand-editing
+                # failures.json as the only remedy (#67). New failures are
+                # still recorded through the registry.
+                retry_registered_failures=config.force,
+            )
+        )
+    )
+    for candidate in source:
         candidates_seen += 1
         if candidate.accession_number in seen_accessions:
             continue
@@ -423,10 +550,12 @@ def run_ingest_pipeline(
             "date": candidate.date,
             "resource_uri": candidate.resource_uri,
             "text": "",
+            "form_type": candidate.form_type,
+            "source": candidate.source,
         }
         if config.download:
             try:
-                row["text"] = _download_candidate(client, candidate)
+                row["text"] = _download_candidate(client(), candidate)
             except Exception:
                 LOGGER.exception(
                     "Failed to download candidate: accession=%s resource=%s",
@@ -450,6 +579,9 @@ def run_ingest_pipeline(
             flush_pending_rows()
 
     flush_pending_rows()
+    # Folded in after iteration: a source that fetches bodies knows what it
+    # could not acquire, and those filings never reach the loop above.
+    failures += source.failures
     if config.force:
         # A forced re-ingest rewrites every accession under its crc32 shard;
         # copies stored under a pre-#61 salted shard would survive as
@@ -457,35 +589,43 @@ def run_ingest_pipeline(
         repair_document_shards(documents_dataset_root)
     failure_registry.flush()
 
-    # Read back only the run's date window: partition dates equal row dates, so
-    # this is exact — reading the whole dataset here deserialized every
-    # historical 8-K body a second time per run (#69).
-    window_frames = [
-        read_table(path, DOCUMENT_COLUMNS)
-        for path in iter_date_shard_partitions(
-            DOCUMENT_DATASET_NAME,
-            artifact_root=output_root,
-            start_date=config.start_date,
-            end_date=config.end_date,
+    # Read back the run's date window plus whatever it wrote outside it, rather
+    # than the whole dataset — that deserialized every historical 8-K body a
+    # second time per run (#69). The union matters because a source can
+    # legitimately write outside the window: an EDGAR daily index is a
+    # dissemination feed and lists filings dated earlier, each written to its
+    # own filing-date partition. Reading only the window would report fewer rows
+    # than the run wrote. For the scraper path the union is a no-op, because its
+    # candidates come from per-filing-date prefixes.
+    #
+    # No row-level date filter: _write_document_partitions groups on the date
+    # column, so every row in date=D/shard=S has date D, and the partition
+    # selection is already exact.
+    read_paths = sorted(
+        set(
+            iter_date_shard_partitions(
+                config.dataset_name,
+                artifact_root=output_root,
+                start_date=config.start_date,
+                end_date=config.end_date,
+            )
         )
-    ]
-    updated = (
-        pd.concat(window_frames, ignore_index=True)
+        | document_partitions_written
+    )
+    window_frames = [read_table(path, DOCUMENT_COLUMNS) for path in read_paths]
+    filtered_updated = (
+        pd.concat(window_frames, ignore_index=True).reset_index(drop=True)
         if window_frames
         else pd.DataFrame(columns=DOCUMENT_COLUMNS)
     )
-    filtered_updated = updated.loc[
-        updated["date"].between(
-            config.start_date.isoformat(),
-            config.end_date.isoformat(),
-        )
-    ].reset_index(drop=True)
     write_json_artifact(
         run_manifest,
         {
             "run_id": run_id,
             "mode": config.mode,
             "bucket": config.bucket,
+            "form_types": list(config.form_types),
+            "dataset_name": config.dataset_name,
             "start_date": config.start_date.isoformat(),
             "end_date": config.end_date.isoformat(),
             "ciks_count": len(normalized_ciks or set()),
@@ -523,6 +663,8 @@ def run_ingest_pipeline(
         document_partitions=tuple(sorted(document_partitions_written)),
         failure_file=failure_file,
         run_manifest=run_manifest,
+        form_types=config.form_types,
+        dataset_name=config.dataset_name,
     )
 
 
@@ -531,6 +673,8 @@ def iter_document_candidates(
     bucket: str,
     year: int,
     ciks: set[str] | None = None,
+    *,
+    form_types: str | Sequence[str] = DEFAULT_FORM_TYPES,
 ) -> list[DocumentCandidate]:
     """Return manifest-backed document candidates for a year and optional CIKs."""
     return iter_document_candidates_for_date_range(
@@ -539,6 +683,7 @@ def iter_document_candidates(
         date(year, 1, 1),
         date(year, 12, 31),
         ciks,
+        form_types=form_types,
     )
 
 
@@ -552,18 +697,22 @@ def iter_document_candidates_for_date_range(
     failure_registry: FailureRegistry | None = None,
     s3_prefix: str = DEFAULT_S3_PREFIX,
     retry_registered_failures: bool = False,
+    form_types: str | Sequence[str] = DEFAULT_FORM_TYPES,
 ) -> list[DocumentCandidate]:
     """Return manifest-backed document candidates for a date range.
 
     ``retry_registered_failures`` re-attempts filings the failure registry marked
     permanent; the registry is still passed through so a repeat failure is
     re-recorded rather than lost.
+
+    ``form_types`` are SEC form names ("8-K", "6-K/A"); the ``/`` becomes ``_``
+    in the scraper's prefixes, which ``_normalize_form_types`` handles.
     """
     candidates: list[DocumentCandidate] = []
     for manifest_key in _iter_manifest_keys(
         s3_client,
         bucket,
-        CDT_FORM_TYPE,
+        form_types,
         start_date,
         end_date,
         ciks=_normalize_ciks(ciks),
@@ -598,23 +747,56 @@ def iter_document_candidates_for_date_range(
     return candidates
 
 
-def iter_manifest_keys(s3_client: S3Client, bucket: str, year: int) -> list[str]:
-    """List 8-K manifest keys for every day in a filing year."""
+def iter_manifest_keys(
+    s3_client: S3Client,
+    bucket: str,
+    year: int,
+    *,
+    form_types: str | Sequence[str] = DEFAULT_FORM_TYPES,
+) -> list[str]:
+    """List manifest keys for every day in a filing year, per form type."""
     return list(
         _iter_manifest_keys(
             s3_client,
             bucket,
-            CDT_FORM_TYPE,
+            form_types,
             date(year, 1, 1),
             date(year, 12, 31),
         )
     )
 
 
+def iter_manifest_keys_for_date_range(
+    s3_client: S3Client,
+    bucket: str,
+    form_types: str | Sequence[str],
+    start_date: date,
+    end_date: date,
+    *,
+    ciks: set[str] | None = None,
+    s3_prefix: str = DEFAULT_S3_PREFIX,
+) -> Iterator[str]:
+    """Yield manifest keys for the given forms over an inclusive date range.
+
+    The scan itself, without the 8-K path's document selection: a source that
+    needs every document of a filing rather than one named one (the 6-K genre)
+    reads the same keys and builds its own candidates from them.
+    """
+    return _iter_manifest_keys(
+        s3_client,
+        bucket,
+        form_types,
+        start_date,
+        end_date,
+        ciks=_normalize_ciks(ciks),
+        s3_prefix=s3_prefix,
+    )
+
+
 def iter_filings(
     s3_client: S3Client,
     bucket: str,
-    form_types: str | list[str],
+    form_types: str | Sequence[str],
     start_date: date,
     end_date: date,
     *,
@@ -680,16 +862,28 @@ def _candidate_from_filing(
         url=document.url,
         resource_uri=normalize_s3_uri(bucket, document.s3_key),
         date=filing.filing_date.isoformat(),
+        # The manifest's own form_type, not the prefix the key was found under:
+        # the prefix spells "8-K/A" as "8-K_A", and un-spelling it would be a
+        # guess about which underscore was a slash.
+        form_type=filing.form_type,
+        source=DocumentSource.S3_MANIFEST,
     )
 
 
-def _candidate_from_manifest_key(
+def filing_from_manifest_key(
     s3_client: S3Client,
     bucket: str,
     manifest_key: str,
     *,
     failure_registry: FailureRegistry | None = None,
-) -> DocumentCandidate | None:
+) -> ScrapedFiling | None:
+    """Read one manifest into a filing, or None with the failure recorded.
+
+    Shared by both genres: an unreadable manifest, an unparseable one and one
+    the scraper itself marked failed mean the same thing whichever form is
+    being ingested, and a single implementation keeps them classified the same
+    way in ``failures.json``.
+    """
     try:
         manifest = _read_json_object(s3_client, bucket, manifest_key)
     except Exception:
@@ -714,6 +908,21 @@ def _candidate_from_manifest_key(
 
     if filing.failure_reason:
         LOGGER.info("Skipping failed upstream manifest %s", manifest_key)
+        return None
+    return filing
+
+
+def _candidate_from_manifest_key(
+    s3_client: S3Client,
+    bucket: str,
+    manifest_key: str,
+    *,
+    failure_registry: FailureRegistry | None = None,
+) -> DocumentCandidate | None:
+    filing = filing_from_manifest_key(
+        s3_client, bucket, manifest_key, failure_registry=failure_registry
+    )
+    if filing is None:
         return None
 
     candidate = _candidate_from_filing(filing, bucket=bucket)
@@ -797,7 +1006,7 @@ def _document_from_manifest(document: dict[str, object]) -> ScrapedDocument:
 def _iter_manifest_keys(
     s3_client: S3Client,
     bucket: str,
-    form_types: str | list[str],
+    form_types: str | Sequence[str],
     start_date: date,
     end_date: date,
     *,
@@ -820,7 +1029,7 @@ def _iter_manifest_keys(
                 )
 
 
-def _normalize_form_types(form_types: str | list[str]) -> tuple[str, ...]:
+def _normalize_form_types(form_types: str | Sequence[str]) -> tuple[str, ...]:
     values = [form_types] if isinstance(form_types, str) else form_types
     return tuple(form_type.replace("/", "_") for form_type in values)
 
