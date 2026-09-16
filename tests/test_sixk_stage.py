@@ -12,7 +12,7 @@ from typing import Self
 import pandas as pd
 import pytest
 
-from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
+from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS, score_model
 from cdt.datasets import load_completion_registry, run_manifest_path
 from cdt.ingest import DOCUMENT_COLUMNS, SIXK_DOCUMENT_DATASET_NAME
 from cdt.ingest import documents_root as ingest_documents_root
@@ -90,43 +90,43 @@ def _submission(*documents: tuple[str, str]) -> str:
     )
 
 
+#: Margins the stage-1 stand-in answers with. Signed and well clear of the
+#: threshold in both directions; see FakeStage1.
+ADMITTED_MARGIN = 5.0
+REJECTED_MARGIN = -5.0
+
+
 class FakeStage1:
-    """A stage-1 stand-in scoring by whether a window mentions debt."""
+    """A stage-1 stand-in admitting windows that mention debt, rejecting others.
 
-    def decision_function(self: Self, texts: list[str]) -> list[float]:
-        """Score debt-mentioning windows above the threshold."""
-        return [
-            0.9 if "credit agreement" in text or "notes due" in text else 0.1
-            for text in texts
-        ]
-
-
-class SelectiveStage1:
-    """A stage-1 stand-in that actually rejects non-debt windows.
-
-    `FakeStage1` cannot: `score_model` puts a logistic transform over the
-    margin, so its 0.1 arrives as 0.52 — above every plausible threshold. Tests
-    that need some windows admitted and others not therefore need margins with
-    a sign, not small positive numbers.
+    Margins, not probabilities, and signed: `stage1_admit` scores through
+    `classifier.core.score_model`, which puts a logistic transform over
+    whatever `decision_function` returns. A stand-in answering 0.9 and 0.1
+    therefore produces 0.71 and 0.52 — both above any threshold the real
+    artifact carries (0.332), so *every* window would be admitted and no test
+    could observe a stage-1 rejection. ±5 maps to 0.993 and 0.0067, which
+    straddle it the way the fitted model's margins do.
     """
 
     def decision_function(self: Self, texts: list[str]) -> list[float]:
         """Return a positive margin for debt text and a negative one for rest."""
         return [
-            5.0 if "credit agreement" in text or "notes due" in text else -5.0
+            ADMITTED_MARGIN
+            if "credit agreement" in text or "notes due" in text
+            else REJECTED_MARGIN
             for text in texts
         ]
 
 
-class RecordingStage1(SelectiveStage1):
-    """SelectiveStage1, remembering every text it was asked to score."""
+class RecordingStage1(FakeStage1):
+    """FakeStage1, remembering every text it was asked to score."""
 
     def __init__(self: Self) -> None:
         """Start with nothing scored."""
         self.scored: list[str] = []
 
     def decision_function(self: Self, texts: list[str]) -> list[float]:
-        """Record the texts, then score them."""
+        """Record the texts, then score them as FakeStage1 does."""
         self.scored.extend(texts)
         return super().decision_function(texts)
 
@@ -319,7 +319,9 @@ def test_triage_rows_satisfy_the_extractor_s_input_contract(tmp_path: Path) -> N
     assert row["relevance"]
     # classification_score is the logistic-transformed margin, the same
     # transformation the 8-K classifier's score goes through.
-    assert row["classification_score"] == pytest.approx(1 / (1 + math.exp(-0.9)))
+    assert row["classification_score"] == pytest.approx(
+        1 / (1 + math.exp(-ADMITTED_MARGIN))
+    )
     # 6-K item ids cannot collide with 8-K ones, which lets both genres merge
     # mentions into one partition.
     assert row["item_id"] != "000000000026000001-8-01"
@@ -357,6 +359,60 @@ def test_triage_judges_a_whole_filing_in_one_call(tmp_path: Path) -> None:
         True,
         True,
     ]
+
+
+def test_a_window_stage_one_rejects_is_neither_sent_nor_persisted(
+    tmp_path: Path,
+) -> None:
+    """Stage 1 admits 5.8% of windows; the rest leave no row behind.
+
+    Distinct from the vocabulary gate, which rejects a whole *document* for
+    mentioning no debt. Here the document passes the gate — it discusses a
+    credit agreement — and stage 1 still rejects the windows of it that do not,
+    which is the 17x the dataset would grow by if they were persisted to record
+    that nothing happened.
+    """
+    submission = _submission(("6-K", f"<p>{LONG_BODY_ONE_ADMITTED}</p>"))
+    documents = pd.DataFrame(
+        [_document_row(tmp_path, submission=submission)], columns=DOCUMENT_COLUMNS
+    )
+    windows = prepare_filing(prose_documents(submission)[0].text)
+    admitted = [window for window in windows if "credit agreement" in window.text]
+    rejected = [window for window in windows if "credit agreement" not in window.text]
+    assert admitted and rejected
+    client = FakeChatClient(keep_all=True)
+
+    snippets = triage_documents(
+        documents, artifacts=(FakeStage1(), 0.332), client=client
+    )
+
+    # One row for the one admission, and none for the rejections.
+    assert snippets["sixk_member_windows"].to_list() == [str(admitted[0].index)]
+    assert snippets["item"].to_list() == [
+        snippet_id_for("000000000026000001", 0, admitted[0].index)
+    ]
+    # Stage 2 was asked about the admission only: a rejected window's text is
+    # absent from the prompt, so it cost neither a row nor a token.
+    prompt = "".join(message["content"] for message in client.calls[0])
+    assert len(re.findall(r"^--- snippet \d+ \[", prompt, re.MULTILINE)) == 1
+    assert rejected[0].text not in prompt
+
+
+def test_stage_one_scores_every_gated_window_and_admits_some(
+    tmp_path: Path,
+) -> None:
+    """The stand-in must be able to reject, or nothing above proves anything.
+
+    Pinned because the failure is silent and was real: `score_model` puts a
+    logistic transform over the margin, so a stand-in answering 0.1 for
+    "reject" produces 0.52 and every window is admitted. Every assertion about
+    admission in this file would then hold vacuously.
+    """
+    texts = ["a credit agreement dated March 3", "a quarterly dividend of $0.10"]
+    scores = score_model(FakeStage1(), texts)
+
+    assert scores[0] > 0.332
+    assert scores[1] < 0.332
 
 
 def test_triage_makes_no_call_for_a_filing_the_gate_rejects(tmp_path: Path) -> None:
@@ -491,7 +547,7 @@ def test_an_admitted_window_is_sent_with_the_context_its_crop_cut_off(
     client = FakeChatClient(keep_all=True)
 
     snippets = triage_documents(
-        documents, artifacts=(SelectiveStage1(), 0.332), client=client
+        documents, artifacts=(FakeStage1(), 0.332), client=client
     )
 
     row = snippets.iloc[0]
@@ -550,7 +606,7 @@ def test_adjacent_admitted_windows_become_one_row(tmp_path: Path) -> None:
     client = FakeChatClient(keep_all=True)
 
     snippets = triage_documents(
-        documents, artifacts=(SelectiveStage1(), 0.332), client=client
+        documents, artifacts=(FakeStage1(), 0.332), client=client
     )
 
     assert len(snippets) == 1
