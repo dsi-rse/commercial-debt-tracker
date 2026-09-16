@@ -11,6 +11,7 @@ from typing import Self
 
 import pytest
 
+from cdt.datasets import normalize_cik
 from cdt.ingest import (
     DOCUMENT_COLUMNS,
     SIXK_DOCUMENT_DATASET_NAME,
@@ -231,8 +232,9 @@ def test_acquire_writes_six_k_rows_pointing_at_assembled_submissions(
     assert table["form_type"].to_list() == ["6-K", "6-K/A"]
     # The scraper path's own provenance value, the one the 8-K path records.
     assert table["source"].to_list() == ["s3-manifest", "s3-manifest"]
-    # Zero-stripped, as the matcher shards on this value.
-    assert table["cik"].to_list() == ["1023514", "1292814"]
+    # The manifest reader's canonical padded form (#153), the same spelling an
+    # 8-K row carries for the same issuer.
+    assert table["cik"].to_list() == ["0001023514", "0001292814"]
     # Bodies stay out of the partition: the row points at the mirror.
     assert table["text"].to_list() == ["", ""]
     assert result.failures == 0
@@ -262,6 +264,24 @@ def test_acquire_writes_six_k_rows_pointing_at_assembled_submissions(
         )
         == EXPECTED_SIXK_ROWS
     )
+
+
+def test_cik_is_spelled_the_way_the_eight_k_path_spells_it(tmp_path: Path) -> None:
+    """One issuer, one CIK spelling, whichever genre published the row.
+
+    Both genres read the CIK through the same manifest reader, which pads to
+    SEC's canonical 10 digits (#153). Pinned because sharding would not catch a
+    regression here: `shard_for_cik` hashes the unpadded form on purpose, so a
+    genre that stripped would still match — and publish a second spelling.
+    """
+    client = FakeS3Client(_objects())
+
+    table, _ = acquire_scraped_sixk_documents(_config(tmp_path), s3_client=client)
+
+    assert table["cik"].to_list() == [
+        normalize_cik("1023514"),
+        normalize_cik("1292814"),
+    ]
 
 
 def test_mirrored_submission_splits_back_into_its_prose_documents(

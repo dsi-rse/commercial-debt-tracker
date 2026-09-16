@@ -245,7 +245,14 @@ class ScraperDocumentSource:
     def _candidate(self: Self, filing: ScrapedFiling, target: str) -> DocumentCandidate:
         return DocumentCandidate(
             accession_number=normalize_accession_number(filing.accession_number),
-            cik=filing.cik.lstrip("0"),
+            # Exactly what the 8-K candidate records: the manifest reader's
+            # canonical 10-digit padded form (#153). Stripping it here instead
+            # would publish one issuer's CIK in two spellings across the two
+            # genres. Sharding would survive that — `shard_for_cik` hashes the
+            # unpadded form deliberately — but a published column that reads
+            # differently per genre is the inconsistency this path exists to
+            # avoid.
+            cik=filing.cik,
             company_name=filing.company_name,
             # The submission this row's text is, named where it is public —
             # what an 8-K row's `url` means for the object the scraper stored.
