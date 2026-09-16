@@ -928,6 +928,8 @@ def test_ingest_sixk_targets_the_sixk_dataset_and_forms(
             "ingest-sixk",
             "--artifact-root",
             str(tmp_path),
+            "--source",
+            "edgar",
             "--index-file",
             str(index_file),
             "--quiet",
@@ -956,6 +958,116 @@ def test_ingest_sixk_targets_the_sixk_dataset_and_forms(
     ]
 
 
+def test_ingest_sixk_defaults_to_the_scraper_bucket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scraper carries 6-K, so it is the source a plain run reads."""
+    calls: list[dict[str, object]] = []
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("1023514\n")
+
+    def fake_acquire_scraped(
+        config: cli.IngestConfig,
+        *,
+        ciks: set[str] | None = None,
+    ) -> tuple[pd.DataFrame, IngestRunResult]:
+        calls.append(
+            {
+                "bucket": config.bucket,
+                "s3_prefix": config.s3_prefix,
+                "form_types": config.form_types,
+                "dataset_name": config.dataset_name,
+                "ciks": ciks,
+                "download": config.download,
+            }
+        )
+        return pd.DataFrame(), IngestRunResult(
+            mode=config.mode,
+            start_date=config.start_date,
+            end_date=config.end_date,
+            ciks_count=len(ciks or set()),
+            candidates_seen=1,
+            skipped_existing=0,
+            downloaded=0,
+            failures=0,
+            total_rows=1,
+            output_root=str(tmp_path),
+            documents_root=str(tmp_path / "documents-sixk"),
+            document_partitions=(),
+            failure_file=str(tmp_path / "failures" / "ingest_failures.json"),
+            run_manifest=str(tmp_path / "runs" / "ingest" / "run_id=1.json"),
+            dataset_name="documents-sixk",
+        )
+
+    def unexpected_edgar_call(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        msg = "the default 6-K run must not reach EDGAR"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(cli, "acquire_scraped_sixk_documents", fake_acquire_scraped)
+    monkeypatch.setattr(cli, "acquire_sixk_documents", unexpected_edgar_call)
+
+    status = cli.main(
+        [
+            "ingest-sixk",
+            "--artifact-root",
+            str(tmp_path),
+            "--quiet",
+            "historical",
+            str(cik_file),
+            "--start-date",
+            "2026-09-08",
+            "--end-date",
+            "2026-09-09",
+        ]
+    )
+
+    assert status == 0
+    assert calls == [
+        {
+            "bucket": cli.DEFAULT_BUCKET,
+            "s3_prefix": "sec",
+            "form_types": ("6-K", "6-K/A"),
+            "dataset_name": "documents-sixk",
+            "ciks": {"1023514"},
+            "download": False,
+        }
+    ]
+
+
+def test_ingest_sixk_rejects_an_index_file_on_the_scraper_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An EDGAR-only flag silently ignored would look like a narrowed run."""
+
+    def unexpected_call(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        msg = "the run must not start with a flag it cannot honour"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(cli, "acquire_scraped_sixk_documents", unexpected_call)
+    monkeypatch.setattr(cli, "acquire_sixk_documents", unexpected_call)
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("1023514\n")
+    index_file = tmp_path / "form.idx"
+    index_file.write_text("")
+
+    status = cli.main(
+        [
+            "ingest-sixk",
+            "--artifact-root",
+            str(tmp_path),
+            "--index-file",
+            str(index_file),
+            "--quiet",
+            "historical",
+            str(cik_file),
+        ]
+    )
+
+    assert status == 2
+
+
 def test_ingest_sixk_reports_a_missing_declared_contact_as_a_config_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -979,6 +1091,8 @@ def test_ingest_sixk_reports_a_missing_declared_contact_as_a_config_error(
             "ingest-sixk",
             "--artifact-root",
             str(tmp_path),
+            "--source",
+            "edgar",
             "--quiet",
             "historical",
             str(cik_file),

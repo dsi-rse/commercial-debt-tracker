@@ -1,17 +1,19 @@
 """Acquire Form 6-K filings directly from EDGAR.
 
-The 8-K path reads filings an upstream scraper has already deposited in S3. That
-scraper carries no 6-K — its whole-corpus index holds 8-K, 10-K, 10-Q, 13F-HR
-and 20-F and not one 6-K row — so until it does, the 6-K path fetches complete
-submission text files from EDGAR itself.
+No longer the default. The scraper now carries 6-K over its whole history, so
+:mod:`cdt.sixk.scraper` reads them the way the 8-K path reads its forms, and
+this module is the opt-in source (``ingest-sixk --source edgar``) for the cases
+the scraper cannot serve: a filing it has not scraped yet, or a range predating
+its coverage.
 
 What it produces is deliberately indistinguishable downstream from what the
-scraper would have produced: each filing's submission is mirrored under CDT's
-own prefix and the document row points at the mirror through ``resource_uri``,
+scraper path produces: each filing's submission is mirrored under CDT's own
+prefix and the document row points at the mirror through ``resource_uri``,
 exactly as an 8-K row points at the scraper's copy. Bodies stay out of the
 parquet partitions, so a partition read costs the same as it does for 8-K, and
-the cutover needs no migration — ingest dedups on accession, so filings already
-acquired here are skipped once the scraper carries them.
+switching sources needs no migration — ingest dedups on accession and both
+sources write one mirror, so a filing acquired here is neither re-fetched nor
+re-ingested by the scraper path.
 
 SEC's fair-access policy requires a declared contact in the User-Agent; without
 one sec.gov answers 403 with an "Undeclared Automated Tool" page rather than the
@@ -38,6 +40,7 @@ import pandas as pd
 
 from cdt import settings
 from cdt.ingest import (
+    SIXK_FORM_TYPES,
     DocumentCandidate,
     DocumentSource,
     IngestConfig,
@@ -48,17 +51,27 @@ from cdt.ingest import (
     run_ingest_pipeline,
 )
 from cdt.shared import FailureRegistry, get_logger
-from cdt.storage import (
-    ArtifactPath,
-    artifact_exists,
-    join_artifact_path,
-    normalize_artifact_path,
-    write_bytes_artifact,
-)
+from cdt.sixk.mirror import mirror_path, mirror_root
+from cdt.storage import artifact_exists, write_bytes_artifact
 
 LOGGER = get_logger(__name__)
 
-SIXK_FORM_TYPES: tuple[str, ...] = ("6-K", "6-K/A")
+__all__ = [
+    "EdgarDocumentSource",
+    "SIXK_FORM_TYPES",
+    "SecFetcher",
+    "SecNotFoundError",
+    "UndeclaredUserAgentError",
+    "acquire_sixk_documents",
+    "daily_index_url",
+    "mirror_path",
+    "mirror_root",
+    "parse_form_index",
+    "quarterly_index_url",
+    "read_index_file",
+    "submission_url",
+]
+
 # ~4.5 requests/second, inside SEC's published 10/s ceiling for all traffic from
 # one source. The ceiling is per requester, not per process, so leave headroom.
 REQUEST_INTERVAL_SECONDS = 0.22
@@ -85,8 +98,6 @@ FILING_RE = re.compile(
     r"(?P<file_name>\S+)\s*$"
 )
 COMPACT_DATE_LENGTH = 8
-MIRROR_DATASET_NAME = "raw-documents"
-MIRROR_GENRE = "sixk"
 MONTHS_PER_QUARTER = 3
 
 
@@ -257,31 +268,6 @@ def submission_url(cik: str, accession_number: str) -> str:
     return (
         f"https://www.sec.gov/Archives/edgar/data/{cik.lstrip('0')}/"
         f"{accession_number.replace('-', '')}/{accession_number}.txt"
-    )
-
-
-def mirror_root(artifact_root: ArtifactPath) -> str:
-    """Return the root of CDT's own copies of fetched submissions."""
-    return join_artifact_path(
-        normalize_artifact_path(artifact_root), MIRROR_DATASET_NAME, MIRROR_GENRE
-    )
-
-
-def mirror_path(
-    artifact_root: ArtifactPath, *, filing_date: str, accession_number: str
-) -> str:
-    """Return the mirror path for one fetched submission.
-
-    Gzipped, and read back through ``ingest.decode_document_bytes``, which
-    sniffs the gzip magic — so the stage that resolves this URI needs to know
-    nothing about the compression, and the scraper's copies are stored the same
-    way. Date-prefixed for navigability and so a storage lifecycle rule can
-    address the old ones.
-    """
-    return join_artifact_path(
-        mirror_root(artifact_root),
-        f"date={filing_date}",
-        f"{accession_number}.txt.gz",
     )
 
 

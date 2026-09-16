@@ -64,6 +64,10 @@ CDT_FORM_TYPE = "8-K"
 # Ingest itself is form-agnostic; this default keeps every existing caller,
 # CLI flag and deployed schedule on 8-K until one asks for another form.
 DEFAULT_FORM_TYPES: tuple[str, ...] = (CDT_FORM_TYPE,)
+# The 6-K genre's forms. Here rather than in either 6-K source, because both
+# acquire the same two forms and the CLI defaults to them before it knows which
+# source will run.
+SIXK_FORM_TYPES: tuple[str, ...] = ("6-K", "6-K/A")
 CDT_DOCUMENT_TYPE = "COMPLETE SUBMISSION TEXT FILE"
 CDT_DOCUMENT_DESCRIPTION = "COMPLETE SUBMISSION TEXT FILE"
 DEFAULT_BATCH_SIZE = 100
@@ -91,6 +95,7 @@ class IngestFailureType(StrEnum):
     INVALID_MANIFEST = "invalid_manifest"
     DOCUMENT_NOT_FOUND = "document_not_found"
     DOCUMENT_DOWNLOAD_FAILED = "document_download_failed"
+    MALFORMED_DOCUMENT = "malformed_document"
 
 
 class IngestFailureClassifier(FailureClassifier):
@@ -103,6 +108,10 @@ class IngestFailureClassifier(FailureClassifier):
             {
                 IngestFailureType.INVALID_MANIFEST,
                 IngestFailureType.DOCUMENT_NOT_FOUND,
+                # Re-reading the same object returns the same bytes, so a
+                # document that is not in dissemination format never becomes
+                # one by retrying.
+                IngestFailureType.MALFORMED_DOCUMENT,
             }
         )
 
@@ -757,6 +766,33 @@ def iter_manifest_keys(
     )
 
 
+def iter_manifest_keys_for_date_range(
+    s3_client: S3Client,
+    bucket: str,
+    form_types: str | Sequence[str],
+    start_date: date,
+    end_date: date,
+    *,
+    ciks: set[str] | None = None,
+    s3_prefix: str = DEFAULT_S3_PREFIX,
+) -> Iterator[str]:
+    """Yield manifest keys for the given forms over an inclusive date range.
+
+    The scan itself, without the 8-K path's document selection: a source that
+    needs every document of a filing rather than one named one (the 6-K genre)
+    reads the same keys and builds its own candidates from them.
+    """
+    return _iter_manifest_keys(
+        s3_client,
+        bucket,
+        form_types,
+        start_date,
+        end_date,
+        ciks=_normalize_ciks(ciks),
+        s3_prefix=s3_prefix,
+    )
+
+
 def iter_filings(
     s3_client: S3Client,
     bucket: str,
@@ -834,13 +870,20 @@ def _candidate_from_filing(
     )
 
 
-def _candidate_from_manifest_key(
+def filing_from_manifest_key(
     s3_client: S3Client,
     bucket: str,
     manifest_key: str,
     *,
     failure_registry: FailureRegistry | None = None,
-) -> DocumentCandidate | None:
+) -> ScrapedFiling | None:
+    """Read one manifest into a filing, or None with the failure recorded.
+
+    Shared by both genres: an unreadable manifest, an unparseable one and one
+    the scraper itself marked failed mean the same thing whichever form is
+    being ingested, and a single implementation keeps them classified the same
+    way in ``failures.json``.
+    """
     try:
         manifest = _read_json_object(s3_client, bucket, manifest_key)
     except Exception:
@@ -865,6 +908,21 @@ def _candidate_from_manifest_key(
 
     if filing.failure_reason:
         LOGGER.info("Skipping failed upstream manifest %s", manifest_key)
+        return None
+    return filing
+
+
+def _candidate_from_manifest_key(
+    s3_client: S3Client,
+    bucket: str,
+    manifest_key: str,
+    *,
+    failure_registry: FailureRegistry | None = None,
+) -> DocumentCandidate | None:
+    filing = filing_from_manifest_key(
+        s3_client, bucket, manifest_key, failure_registry=failure_registry
+    )
+    if filing is None:
         return None
 
     candidate = _candidate_from_filing(filing, bucket=bucket)

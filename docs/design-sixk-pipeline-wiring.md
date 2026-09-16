@@ -49,7 +49,7 @@ Two genre paths that converge at `extract`:
                                      │                                                                      ├── extract ── mentions ── match ── debt-instruments
   scraper S3 (6-K)  ─┐               │                                                                      │
                      ├─ ingest ──────┴─ documents-sixk ─── sixk ──────────────── sixk-snippets ──────────────┘
-  EDGAR (6-K)       ─┘                                     (window → stage 1 → stage 2)
+  EDGAR (6-K, opt-in)┘                                     (window → stage 1 → stage 2)
 ```
 
 Everything downstream of `extract` is untouched: mentions carry `item_id`, the
@@ -233,6 +233,45 @@ Ask the scraper team for: `sec/<date>/6-K/` and `sec/<date>/6-K_A/` prefixes,
 per-filing `manifest.json` in the existing shape, a complete-submission text
 file document entry, and `6-K` rows in `sec/manifest.parquet`.
 
+### What arrived (2026-09-16)
+
+The prefixes and manifests arrived; the complete-submission entry did not. 6-K
+landed **20-F-shaped**, as the precedent warned: every one of the 2,676
+filing-date partitions from 2016-01-04 onward now carries `6-K/` (and `6-K_A/`
+where amendments exist) at 50-130 filers a day, and a filing is stored as one
+gzipped object *per document* with no whole-submission object and no
+complete-submission manifest entry (0 `.txt` objects under any 6-K prefix).
+
+Neither contingency above was needed, because of what the per-document objects
+turned out to be: each is the document's **dissemination-format `<DOCUMENT>`
+block**, header lines (`<TYPE>`, `<SEQUENCE>`, `<FILENAME>`, `<DESCRIPTION>`)
+included — the scraper splits EDGAR's submission without rewriting it. So
+concatenating a filing's objects in `seq` order *reconstructs* the submission,
+differing from EDGAR's only in the `<SEC-HEADER>` preamble that
+`prose_documents` discards anyway.
+
+`cdt.sixk.scraper` therefore assembles the submission at ingest and mirrors it
+under the same `raw-documents/sixk/` path the EDGAR source writes. That keeps
+the row shape (one `resource_uri`), the stage (one submission per row, split
+into prose documents whose index is part of a snippet's identity) and the
+measured triage behaviour all unchanged — verified byte-for-byte on 23 real
+filings spanning 2016 to 2026, including a 6-K/A: every flattened prose
+document came out identical to EDGAR's.
+
+Two things this path does *not* inherit from the EDGAR one:
+
+- **No dissemination-feed problem (#90).** The scraper lists by filing date, so
+  a range means filing dates and late-listed filings land in their own
+  partition by construction rather than by the EDGAR path's write-where-it-
+  belongs rule.
+- **A deposit lag instead.** The scraper writes a filing's manifest 1-2 days
+  after the filing date for 8-K (measured over 75 filings across five dates),
+  inside `pipeline.DAILY_LOOKBACK_DAYS = 5`. The 6-K lags measured 7-14 days,
+  but every 6-K sampled was scraped on 2026-09-15/16 — that is the backfill
+  timestamp, not a cadence. Worth re-measuring once the 6-K job has run daily
+  for a week: if its steady-state lag exceeds the lookback, the window needs
+  widening for both genres.
+
 ## Source B: the EDGAR fallback
 
 Until then, acquire 6-Ks straight from EDGAR. The prototype already exists and
@@ -292,12 +331,15 @@ is unchanged, and `source=edgar` lands on the rows.
 ### Cutover
 
 No migration step. Ingest already dedups on accession
-(`_existing_accessions`, `ingest.py:959`), so once the scraper carries 6-K, flip
-`--source` to `s3-manifest` and filings already acquired from EDGAR are skipped
-rather than re-fetched. The mirror prefix stays as the resource for those rows.
-Run both sources over one overlapping week first and diff accession sets — that
-is also the cheapest possible check on whether the scraper's 6-K coverage is
-complete.
+(`_existing_accessions`), so filings already acquired from EDGAR are skipped
+rather than re-fetched, and both sources write one mirror path — so a filing
+EDGAR mirrored is not even re-assembled. The mirror prefix stays as the resource
+for those rows.
+
+Done as of 2026-09-16: `--source s3-manifest` is the default and `--source
+edgar` is the opt-in fallback for what the scraper has not scraped. The flag's
+values are `DocumentSource`'s own, so a row's `source` column spells the flag
+that produced it.
 
 ## Change list
 
