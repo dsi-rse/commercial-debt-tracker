@@ -234,11 +234,32 @@ labelled windows (231 positive) with the 500 evaluation windows held out.
   determines an answer; it does not say the answer improved. 6-K rerun
   stability, the other half of the check in issue #172, needs a pipeline run.
 
+## Where expansion runs
+
+Inside `cdt.sixk.stage`, between `stage1_admit` and `triage_filing` — the only
+place it can run, since stage 1's threshold was calibrated on the crop and the
+extractor needs the expanded text. Admitted windows are grouped by document
+first: offsets mean nothing outside the text they index into, so expanding
+across two documents would splice unrelated prose together.
+
+One consequence for `sixk-snippets`: **a row is a snippet stage 2 judged, not a
+window stage 1 admitted.** Merging makes those differ, and the alternative —
+one row per member — would carry the merged text on each of them, so the
+extractor would read rows and pay for the same text twice, which is the cost
+merging exists to avoid. `sixk_member_windows` holds the comma-separated window
+indices a row answers for, so every admission remains auditable: with the row's
+accession and document index (both in `item`), it names each window stage 1
+admitted and the verdict that window's text received.
+
+Replaying the generalization window's 6-K set through the wired stage
+reproduces the acceptance numbers measured before it was wired: 27 filings,
+392 admitted windows, 219 snippets sent, 147,654 → 193,304 stage-2 input
+tokens (1.31x), 88 of the 219 being merged groups.
+
 ## What is not in this change
 
-Orchestrator wiring. This adds the stage as a library with its own tests; making
-it a pipeline stage alongside ingest → itemize → classify → extract needs
-decisions about partitioning and dataset registration that are better taken
-separately. Cross-row deduplication after extraction is also still open — that is
-where duplicate *mentions* should be resolved, by comparing extracted values
-rather than inferring from prose.
+The scheduled pipeline. `cdt sixk` drives the stage, with its own dataset and
+completion registry (#179), but `pipeline.py` and the orchestrator have no 6-K
+phase yet, so the deployed daily run does not call it. Cross-row deduplication
+after extraction is also still open — that is where duplicate *mentions* should
+be resolved, by comparing extracted values rather than inferring from prose.

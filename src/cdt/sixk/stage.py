@@ -12,8 +12,20 @@ so a second writer there would need merge-on-write with genre-scoped row
 replacement and an ordering hazard between two completion registries. One
 writer per dataset is the invariant the file-native design leans on.
 
-Every window stage 1 admits is persisted, kept or dropped, with the stage-2
-verdict on the row. Dropped windows are the mechanism rather than a side
+Between the two stages, an admitted window is expanded backwards into the
+context the 400-token crop cut off (#172), and windows whose expansions run
+into each other merge. Expansion happens *after* stage 1 and never before:
+``WINDOW_TOKENS`` is what the stage-1 model was fitted on and what its
+threshold was calibrated against, so widening the text it scores would
+invalidate both.
+
+Every window stage 1 admits is accounted for, kept or dropped, with the
+stage-2 verdict on the row. The unit of a row is the snippet stage 2 judged,
+not the window stage 1 admitted, because merging makes those differ: a merged
+snippet is one row listing its members in ``sixk_member_windows``. One row per
+member instead would carry the merged text more than once, and the extractor
+reads rows — it would pay for the same text twice, which is the cost merging
+exists to avoid. Dropped snippets are the mechanism rather than a side
 effect — stage 2 exists to consolidate siblings — and it is a non-deterministic
 LLM, so its decisions have to be auditable after the fact. Windows stage 1
 rejected are not persisted: it admits 5.8% of them, and storing the rest would
@@ -57,7 +69,7 @@ from cdt.sixk.triage import (
     stage1_admit,
     triage_filing,
 )
-from cdt.sixk.windows import TextWindow, prepare_filing
+from cdt.sixk.windows import TextWindow, expand_admitted_windows, prepare_filing
 from cdt.storage import read_table, write_json_artifact, write_partition_table
 
 LOGGER = get_logger(__name__)
@@ -82,6 +94,12 @@ SIXK_EXTRA_COLUMNS = [
     "sixk_token_count",
     "sixk_verdict",
     "sixk_duplicate_of",
+    # Comma-separated window indices this row's text answers for: several when
+    # adjacent admitted windows merged, one otherwise. With the row's own
+    # accession and document index (both in `item`), it names every window
+    # stage 1 admitted, which is what keeps admissions auditable now that a row
+    # is a stage-2 snippet rather than a window.
+    "sixk_member_windows",
 ]
 SIXK_SNIPPET_COLUMNS = [*CLASSIFIED_ITEM_COLUMNS, *SIXK_EXTRA_COLUMNS]
 SIXK_SNIPPET_INTEGER_COLUMNS = [
@@ -216,6 +234,22 @@ class _Candidate:
 
 
 @dataclass(frozen=True)
+class _SentSnippet:
+    """One snippet as stage 2 receives it: an admitted window plus context.
+
+    ``candidate`` is the first member's, which is what gives the row its
+    identity — ``expand_admitted_windows`` indexes a merged window by its first
+    member, so a group is named by the earliest window in it and no two groups
+    can claim the same name.
+    """
+
+    snippet: Snippet
+    candidate: _Candidate
+    window: TextWindow
+    member_indices: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class _FilingPlan:
     """A filing's document row and the windows the gate left of it."""
 
@@ -268,6 +302,11 @@ def triage_documents(
         for plan in plans
     ]
     admitted_total = sum(len(admitted) for admitted in admitted_by_filing)
+    sent_by_filing = [
+        _expand_admitted(plan, admitted)
+        for plan, admitted in zip(plans, admitted_by_filing, strict=True)
+    ]
+    sent_total = sum(len(sent) for sent in sent_by_filing)
     if admitted_total == 0:
         LOGGER.info(
             "6-K triage: filings=%s gated_windows=%s stage1_admitted=0 (no stage-2 call)",
@@ -278,28 +317,27 @@ def triage_documents(
 
     verdicts = _judge_filings(
         plans,
-        admitted_by_filing,
+        sent_by_filing,
         client=client,
         concurrency=concurrency,
         max_attempts=max_attempts,
     )
     rows = [
         row
-        for plan, admitted, verdict in zip(
-            plans, admitted_by_filing, verdicts, strict=True
-        )
-        for row in _snippet_rows(plan, admitted, verdict)
+        for plan, sent, verdict in zip(plans, sent_by_filing, verdicts, strict=True)
+        for row in _snippet_rows(plan, sent, verdict)
     ]
     table = _normalize_snippets(pd.DataFrame(rows, columns=SIXK_SNIPPET_COLUMNS))
     degraded = sum(1 for verdict in verdicts if verdict is not None and verdict.error)
     LOGGER.info(
-        "6-K triage: filings=%s gated_windows=%s stage1_admitted=%s kept=%s "
-        "dropped=%s degraded_filings=%s",
+        "6-K triage: filings=%s gated_windows=%s stage1_admitted=%s "
+        "snippets_sent=%s kept=%s dropped=%s degraded_filings=%s",
         len(plans),
         windowed,
         admitted_total,
+        sent_total,
         int(table["relevance"].fillna(False).sum()),
-        admitted_total - int(table["relevance"].fillna(False).sum()),
+        sent_total - int(table["relevance"].fillna(False).sum()),
         degraded,
     )
     return table
@@ -334,9 +372,54 @@ def _candidates_for_filing(
     return candidates
 
 
+def _expand_admitted(plan: _FilingPlan, admitted: list[Snippet]) -> list[_SentSnippet]:
+    """Give each admitted window back the context its crop cut off (#172).
+
+    Grouped by document before expanding, because offsets only mean anything
+    within the text they index into: expanding across two documents would
+    splice unrelated text together, and `expand_admitted_windows` rejects it.
+    """
+    by_snippet_id = {candidate.snippet_id: candidate for candidate in plan.candidates}
+    scores = {snippet.snippet_id: snippet.score for snippet in admitted}
+    by_document: dict[int, list[_Candidate]] = {}
+    for snippet in admitted:
+        candidate = by_snippet_id[snippet.snippet_id]
+        by_document.setdefault(candidate.document_index, []).append(candidate)
+
+    sent: list[_SentSnippet] = []
+    for _, candidates in sorted(by_document.items()):
+        by_window_index = {
+            candidate.window.index: candidate for candidate in candidates
+        }
+        for expanded in expand_admitted_windows(
+            [candidate.window for candidate in candidates]
+        ):
+            first = by_window_index[expanded.member_indices[0]]
+            sent.append(
+                _SentSnippet(
+                    snippet=Snippet(
+                        snippet_id=first.snippet_id,
+                        text=expanded.window.text,
+                        # The strongest admission in the group. Stage 2 never
+                        # reads it; it is persisted as the row's
+                        # classification_score, where the weakest member's
+                        # would understate why the text was sent at all.
+                        score=max(
+                            scores[by_window_index[index].snippet_id]
+                            for index in expanded.member_indices
+                        ),
+                    ),
+                    candidate=first,
+                    window=expanded.window,
+                    member_indices=expanded.member_indices,
+                )
+            )
+    return sent
+
+
 def _judge_filings(
     plans: Sequence[_FilingPlan],
-    admitted_by_filing: Sequence[list[Snippet]],
+    sent_by_filing: Sequence[list[_SentSnippet]],
     *,
     client: SupportsChatCompletion | None,
     concurrency: int,
@@ -354,14 +437,16 @@ def _judge_filings(
     semaphore = asyncio.Semaphore(concurrency)
     kwargs = {} if max_attempts is None else {"max_attempts": max_attempts}
 
-    async def judge(plan: _FilingPlan, admitted: list[Snippet]) -> FilingVerdict | None:
-        if not admitted:
+    async def judge(
+        plan: _FilingPlan, sent: list[_SentSnippet]
+    ) -> FilingVerdict | None:
+        if not sent:
             return None
         async with semaphore:
             return await triage_filing(
                 resolved_client,
                 str(plan.document["accession_number"]),
-                admitted,
+                [item.snippet for item in sent],
                 **kwargs,  # type: ignore[arg-type]
             )
 
@@ -369,8 +454,8 @@ def _judge_filings(
         return list(
             await asyncio.gather(
                 *(
-                    judge(plan, admitted)
-                    for plan, admitted in zip(plans, admitted_by_filing, strict=True)
+                    judge(plan, sent)
+                    for plan, sent in zip(plans, sent_by_filing, strict=True)
                 )
             )
         )
@@ -380,19 +465,18 @@ def _judge_filings(
 
 def _snippet_rows(
     plan: _FilingPlan,
-    admitted: list[Snippet],
+    sent: list[_SentSnippet],
     verdict: FilingVerdict | None,
 ) -> list[dict[str, object]]:
-    """Build one persisted row per admitted window."""
-    if not admitted or verdict is None:
+    """Build one persisted row per snippet stage 2 judged."""
+    if not sent or verdict is None:
         return []
-    by_snippet_id = {candidate.snippet_id: candidate for candidate in plan.candidates}
     kept = set(verdict.kept)
     no_details = set(verdict.dropped_no_details)
     duplicates = dict(verdict.dropped_duplicate)
     rows: list[dict[str, object]] = []
-    for snippet in admitted:
-        candidate = by_snippet_id[snippet.snippet_id]
+    for item in sent:
+        snippet = item.snippet
         if snippet.snippet_id in kept:
             resolved = VERDICT_KEPT_DEGRADED if verdict.error else VERDICT_KEPT
         elif snippet.snippet_id in duplicates:
@@ -404,32 +488,32 @@ def _snippet_rows(
             # this is unreachable through triage_filing; be explicit rather
             # than silently mark an unjudged window relevant.
             resolved = VERDICT_DROPPED_NO_DETAILS
-        rows.append(
-            _snippet_row(plan.document, candidate, snippet, resolved, duplicates)
-        )
+        rows.append(_snippet_row(plan.document, item, resolved, duplicates))
     return rows
 
 
 def _snippet_row(
     document: dict[str, object],
-    candidate: _Candidate,
-    snippet: Snippet,
+    item: _SentSnippet,
     resolved_verdict: str,
     duplicates: dict[str, str],
 ) -> dict[str, object]:
+    candidate = item.candidate
+    snippet = item.snippet
     relevant = resolved_verdict in KEPT_VERDICTS
     accession_number = str(document["accession_number"])
     return {
         "item_id": item_id_for(
-            accession_number, candidate.document_index, candidate.window.index
+            accession_number, candidate.document_index, item.window.index
         ),
         "item": candidate.snippet_id,
         "accession_number": accession_number,
         "cik": document.get("cik"),
         "company_name": document.get("company_name"),
         "url": document.get("url"),
-        # What the extractor reads.
-        "text": candidate.window.text,
+        # What the extractor reads: the expanded, possibly merged text, not
+        # the crop stage 1 scored.
+        "text": item.window.text,
         "date": document.get("date"),
         # Kept so a snippet can be traced to the submission it came from.
         "resource_uri": document.get("resource_uri"),
@@ -445,17 +529,20 @@ def _snippet_row(
         # stay null and the span goes in the sixk_* columns below.
         "start_line": None,
         "end_line": None,
-        "section_char_count": len(candidate.window.text),
+        "section_char_count": len(item.window.text),
         # Same vocabulary as the 8-K classifier, so one consumer reading
         # `label` across both genres sees one set of values.
         "label": "relevant" if relevant else "irrelevant",
         "relevance": relevant,
         "classification_score": snippet.score,
-        "sixk_window_start": candidate.window.start,
-        "sixk_window_end": candidate.window.end,
-        "sixk_token_count": candidate.window.token_count,
+        # The expanded span, so the row's offsets and its text agree; the
+        # admitted crops inside it are named by sixk_member_windows.
+        "sixk_window_start": item.window.start,
+        "sixk_window_end": item.window.end,
+        "sixk_token_count": item.window.token_count,
         "sixk_verdict": resolved_verdict,
         "sixk_duplicate_of": duplicates.get(snippet.snippet_id),
+        "sixk_member_windows": ",".join(str(index) for index in item.member_indices),
     }
 
 
