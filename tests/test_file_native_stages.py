@@ -6106,6 +6106,65 @@ def test_decimal_coercion_quantizes_legacy_float_error_but_refuses_junk() -> Non
         decimal_column_values(["$100 million"], money, column="principal_amount")
 
 
+def test_status_does_not_depend_on_which_shard_an_issuer_hashes_into(
+    tmp_path: Path,
+) -> None:
+    """One "now" per run, not one per `cik_shard` (#188).
+
+    `cik_shard` is a hash bucket with no semantic meaning. The rollup used to
+    derive its reference date from whatever mentions `match_tables` was handed,
+    which is one shard's worth — so a quiet issuer sharing a bucket with quiet
+    issuers was judged against a "now" months behind the corpus, and its passed
+    maturity still read `active`. Which bucket an issuer lands in decided its
+    published status.
+
+    CIK 320193 hashes to shard 0044 and 789019 to 0048. The quiet issuer's only
+    filing is from 2020 and its note matured in 2023; the corpus runs to 2026.
+    """
+    rows = pd.DataFrame(
+        [
+            build_mention_row(
+                mention_id="m-quiet",
+                item_id="item-quiet",
+                accession_number="0001",
+                cik="320193",
+                date="2020-01-02",
+                name="6.0% Senior Notes due 2023",
+                start_date="2020-01-01",
+                amount="$100 million",
+                maturity_date="2023-01-01",
+            ),
+            build_mention_row(
+                mention_id="m-recent",
+                item_id="item-recent",
+                accession_number="0002",
+                cik="789019",
+                date="2026-06-01",
+                name="Revolving Credit Facility",
+                start_date="2026-05-01",
+                amount="$250 million",
+            ),
+        ]
+    )
+    write_partition_table(
+        tmp_path / "mentions",
+        partition={"date": "2026-06-01", "shard": "0001"},
+        table=rows,
+    )
+    match_pending_mentions(artifact_root=tmp_path, batch_size=5)
+
+    published = {
+        str(row["debt_instrument_id"]): row
+        for row in read_dataset(debt_instruments_root(tmp_path)).to_dict("records")
+    }
+    quiet = published["m-quiet"]
+    # The corpus has reached 2026, so a 2023 maturity is behind it — even though
+    # the only filing in this instrument's own shard is from 2020.
+    assert quiet["status"] == "expected_closed"
+    assert quiet["status_date"] == "2023-01-01"
+    assert published["m-recent"]["status"] == "active"
+
+
 def test_matcher_schema_version_is_pinned() -> None:
     """The version is how a downstream reader learns a rebuild is required."""
     assert MATCHER_SCHEMA_VERSION == 5

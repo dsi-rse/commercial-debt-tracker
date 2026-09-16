@@ -296,6 +296,14 @@ def match_pending_mentions(
         }
     mention_rows = mention_rows.copy()
     company_names = company_names_by_cik(mention_rows)
+    # One "now" for the whole run, resolved before sharding. The rollup used to
+    # derive this per `match_tables` call, i.e. per `cik_shard` — and a shard is
+    # a hash bucket, so a published status depended on which unrelated issuers
+    # shared a bucket, and a shard of quiet filers stayed frozen behind the
+    # corpus (#188).
+    reference_date = coerce_optional_text(
+        max((str(value) for value in mention_rows["date"].dropna()), default=None)
+    )
     mention_rows["cik_shard"] = (
         mention_rows["cik"].fillna("").map(lambda value: shard_for_cik(str(value)))
     )
@@ -332,6 +340,7 @@ def match_pending_mentions(
                 loose_match_threshold=loose_match_threshold,
                 ambiguity_margin=ambiguity_margin,
                 company_names=company_names,
+                reference_date=reference_date,
             )
             mention_cluster_edges = tables["debt_instrument_mentions"].reindex(
                 columns=MENTION_CLUSTER_EDGE_COLUMNS
@@ -411,6 +420,7 @@ def match_tables(
     loose_match_threshold: float = DEFAULT_RELATED_THRESHOLD,
     ambiguity_margin: float = DEFAULT_AMBIGUITY_MARGIN,
     company_names: dict[str, str] | None = None,
+    reference_date: str | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Match in-memory debt instrument mentions into stable debt instrument clusters.
 
@@ -418,6 +428,11 @@ def match_tables(
     per shard batch and sees only the clusters that batch touched, so no rule can
     ever see both states of one facility. ``apply_lineage_inference_pass`` runs it
     as a post-pass over the complete dataset instead.
+
+    ``reference_date`` is what the derived status treats as "now". Because this
+    is called per shard, a caller spanning several shards has to compute it once
+    over all of them and pass it in, or each shard publishes statuses against a
+    different date (#188).
     """
     if strong_match_threshold < loose_match_threshold:
         raise ValueError("strong_match_threshold must be >= loose_match_threshold")
@@ -532,6 +547,7 @@ def match_tables(
         debt_instrument_rows,
         member_groups=normalized_members,
         mention_index=mention_index,
+        reference_date=reference_date,
     )
     return {
         "debt_instrument_mentions": combined_edges.reindex(
@@ -583,21 +599,49 @@ class RetirementExpectation:
         return any(date > reference_date for date in self.dates)
 
 
+def corpus_reference_date(
+    mention_index: dict[str, PreparedMention],
+) -> str | None:
+    """Return what the derived status should treat as "now".
+
+    The newest filing date among the mentions supplied, rather than the wall
+    clock: a rerun over the same inputs has to publish the same statuses, and a
+    clock would make every rerun differ. Callers that see the whole corpus use
+    this; `match_pending_mentions` computes the same value from its mention
+    frame before sharding, because it must not be resolved per shard (#188).
+    """
+    return max(
+        (mention.date for mention in mention_index.values() if mention.date),
+        default=None,
+    )
+
+
 def apply_lifecycle_rollup(
     rows: list[dict[str, object]],
     *,
     member_groups: dict[str, list[str]],
     mention_index: dict[str, PreparedMention],
+    reference_date: str | None = None,
 ) -> None:
     """Fill lineage-head, derived status, and observation columns in place (#155).
 
     The browse index needs one row per live obligation: `superseded_by` marks a
     state that a later amendment replaced, `lineage_family_id` groups every
     state of one obligation history, and `status` answers "is this borrowing
-    still alive as far as the filings say". The maturity comparison uses the
-    newest filing date in this run's mentions as its reference so a rerun over
-    the same inputs reproduces the same rows exactly.
+    still alive as far as the filings say".
+
+    ``reference_date`` stands in for "now", which the date legs of the status
+    cascade compare against. It must be supplied by the caller and computed once
+    per run over the whole corpus (#188). Deriving it here from `mention_index`
+    made it a function of the caller's batch instead: `match_tables` is called
+    once per `cik_shard`, so a shard of quiet issuers got an earlier "now" than
+    the corpus had reached, and an instrument's published status depended on
+    which unrelated companies happened to hash into its bucket. The fallback
+    below keeps direct callers working, and is right for them because they pass
+    every mention they have.
     """
+    if reference_date is None:
+        reference_date = corpus_reference_date(mention_index)
     rows_by_id = {str(row["debt_instrument_id"]): row for row in rows}
     superseded_by: dict[str, set[str]] = {}
     for row in rows:
@@ -638,10 +682,6 @@ def apply_lifecycle_rollup(
         for member in component:
             family_by_id[member] = family_id
 
-    reference_date = max(
-        (mention.date for mention in mention_index.values() if mention.date),
-        default=None,
-    )
     for row in rows:
         row_id = str(row["debt_instrument_id"])
         children = superseded_by.get(row_id, set())
@@ -2477,7 +2517,10 @@ def apply_lineage_inference_pass(artifact_root: str) -> dict[str, int]:
         by_id[child_id]["amendment_inferred_by"] = rule
 
     apply_lifecycle_rollup(
-        rows, member_groups=member_groups, mention_index=mention_index
+        rows,
+        member_groups=member_groups,
+        mention_index=mention_index,
+        reference_date=corpus_reference_date(mention_index),
     )
     heads_after = sum(1 for row in rows if row.get("is_lineage_head"))
     frame = pd.DataFrame(rows, columns=DEBT_INSTRUMENT_COLUMNS)
