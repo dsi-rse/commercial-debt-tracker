@@ -141,9 +141,17 @@ venv.bak/
 # data files
 *.avro
 
-# CIK universes and ad hoc CIK tables
-data/ciks/
-data/important-8K-filers.csv
+# Pipeline artifacts and ad hoc data tables. `data/` is where every run root,
+# eval window and CIK table lands — 22 GB locally at the time of writing — so a
+# bare `git add -A` would try to stage all of it and appear to hang.
+#
+# `data/*` rather than `data/`: git cannot re-include anything under an excluded
+# directory, because it never descends into one. Excluding the contents instead
+# keeps the negation below working for the committed classifier pickles, which
+# are deliberately tracked and version-pinned against their training sklearn
+# minor (#109).
+data/*
+!data/models/
 
 scripts/*
 !scripts/local-pipeline.sh
