@@ -7,6 +7,7 @@ import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 from pathlib import Path
 from time import perf_counter
@@ -29,6 +30,7 @@ from cdt.extractor.core import (
     LENDER_DISCLOSURE_PRECEDENCE,
     LENDER_DISCLOSURE_VALUES,
     MENTIONS_DATASET_NAME,
+    normalize_numeric_string,
 )
 from cdt.matcher.lineage_inference import infer_amendment_parents
 from cdt.storage import (
@@ -2281,14 +2283,31 @@ def end_dates_are_compatible(left: str | None, right: str | None) -> bool:
     return len(shorter) == MONTH_TEXT_LENGTH and longer[:MONTH_TEXT_LENGTH] == shorter
 
 
-NAME_RATE_PATTERN = re.compile(r"\d+(?:\.\d+)?%")
+# `normalize_name_fingerprint` turns the decimal point into a token break, so a
+# coupon arrives here as `4 375%` rather than `4.375%`; the separator is
+# therefore optional. `(?<!\d)` keeps a maturity year out of the whole-number
+# part, so `notes due 2028 5%` yields the rate and not `2028 5%`.
+NAME_RATE_PATTERN = re.compile(r"(?<!\d)(\d{1,3})(?:[ .](\d{1,4}))?%")
 
 
 def name_rate_tokens(fingerprint: str | None) -> frozenset[str]:
-    """Return the coupon-rate tokens embedded in one name fingerprint."""
+    """Return the coupon rates in one name fingerprint, as canonical numbers.
+
+    Returns the rate's canonical numeric string rather than the matched text.
+    Comparing the raw token compared only the fractional digits, because the
+    pattern could not see past the token break: `4.375%` and `3.375%` both
+    reduced to `375%`, so `name_rates_are_compatible` called two different
+    coupons compatible and declined to refuse the merge it exists to refuse.
+    """
     if not fingerprint:
         return frozenset()
-    return frozenset(NAME_RATE_PATTERN.findall(fingerprint))
+    rates: set[str] = set()
+    for whole, fraction in NAME_RATE_PATTERN.findall(fingerprint):
+        try:
+            rates.add(normalize_numeric_string(Decimal(f"{whole}.{fraction or 0}")))
+        except InvalidOperation:
+            continue
+    return frozenset(rates)
 
 
 NAME_STOPWORDS = frozenset({"the", "of", "and", "its", "new", "existing", "certain"})

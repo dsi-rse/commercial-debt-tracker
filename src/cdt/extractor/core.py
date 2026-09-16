@@ -3283,7 +3283,13 @@ def standardized_interest_rate_payload(
         for candidate in evidence_rates:
             try:
                 if Decimal(candidate) == Decimal(model_rate):
-                    verified_rate = model_rate
+                    # Publish the canonical form, not the model's spelling.
+                    # Verification is numeric but the value used to persist
+                    # verbatim, so one rate arrived as `5`, `5.00` and `5.000`
+                    # — 141 distinct strings for 115 distinct rates on the
+                    # generalization window, which splits any group-by and
+                    # makes an equality filter miss rows.
+                    verified_rate = normalize_numeric_string(Decimal(model_rate))
                     break
             except InvalidOperation:
                 continue

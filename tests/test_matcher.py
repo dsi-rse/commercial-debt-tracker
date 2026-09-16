@@ -11,7 +11,9 @@ from cdt.matcher.core import (
     build_empty_profile,
     derive_parent_links,
     end_dates_are_compatible,
+    name_rate_tokens,
     name_rates_are_compatible,
+    normalize_name_fingerprint,
     prepare_mention,
     score_candidates_for_mention,
 )
@@ -187,6 +189,40 @@ def test_name_rates_are_compatible_requires_rates_on_both_sides() -> None:
     assert not name_rates_are_compatible(
         "5.25% senior notes due 2028", "6.75% senior notes due 2031"
     )
+
+
+def test_name_rate_tokens_reads_the_whole_coupon_not_its_fraction() -> None:
+    """Read the whole coupon across the fingerprint's token break, canonicalized.
+
+    `normalize_name_fingerprint` turns the decimal point into a space. Reading the raw token compared only the fractional digits: `4.375%` and
+    `3.375%` both reduced to `375%`, so the compatibility guard could not tell
+    two different coupons apart.
+    """
+    fp = normalize_name_fingerprint
+    assert name_rate_tokens(fp("4.375% Senior Notes")) == frozenset({"4.375"})
+    assert name_rate_tokens(fp("0.625% Notes")) == frozenset({"0.625"})
+    assert name_rate_tokens(fp("10.25% Notes")) == frozenset({"10.25"})
+    assert name_rate_tokens(fp("12.125% Notes")) == frozenset({"12.125"})
+    # equivalent spellings collapse to one canonical rate
+    assert name_rate_tokens(fp("5% Notes")) == name_rate_tokens(fp("5.00% Notes"))
+    assert name_rate_tokens(fp("4.375% Notes")) == name_rate_tokens(fp("4.3750% Notes"))
+    # a maturity year is not a coupon, and neither is a principal figure
+    assert name_rate_tokens(fp("Notes due 2028 5% coupon")) == frozenset({"5"})
+    assert name_rate_tokens(fp("$500 million 5% notes")) == frozenset({"5"})
+    assert name_rate_tokens(fp("term loan")) == frozenset()
+
+
+def test_name_rates_refuse_two_coupons_sharing_a_fractional_part() -> None:
+    """The guard exists to refuse; a shared fraction must not read as a match."""
+    fp = normalize_name_fingerprint
+    for left, right in (
+        ("4.375% Senior Notes", "3.375% Senior Notes"),
+        ("10.25% Notes", "5.25% Notes"),
+        ("0.625% Notes", "4.625% Notes"),
+    ):
+        assert not name_rates_are_compatible(fp(left), fp(right)), (left, right)
+    # and equivalent spellings of one coupon still match
+    assert name_rates_are_compatible(fp("5.00% Notes"), fp("5% Notes"))
 
 
 def test_keyless_mention_matches_on_identifying_fingerprint() -> None:

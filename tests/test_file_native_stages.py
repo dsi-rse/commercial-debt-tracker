@@ -5775,6 +5775,18 @@ def test_table_cells_publish_coupon_and_document_currency() -> None:
         name_text=None,
     )
     assert rate["rate_pct"] == "4.125" and rate["derived_from"] == "stated"
+    # The published rate is canonical, not the model's spelling: verification is
+    # numeric, so `5`, `5.00` and `5.000` all verified and all persisted
+    # verbatim, splitting one rate across three distinct published strings.
+    for spelling in ("4.1250", "4.12500"):
+        assert (
+            standardized_interest_rate_payload(
+                {"kind": "fixed", "rate_pct": spelling, "evidence": ["tag-51"]},
+                tags,
+                name_text=None,
+            )["rate_pct"]
+            == "4.125"
+        )
     assert (
         standardized_interest_rate_payload(
             {"kind": "fixed", "rate_pct": "4.125", "evidence": ["tag-53"]},
