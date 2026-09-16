@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -79,11 +80,13 @@ from cdt.pipeline import normalize_snapshot_text
 from cdt.storage import (
     artifact_exists,
     coerce_dataset_text,
+    decimal_column_values,
     get_object_bytes,
     read_dataset,
     read_json_artifact,
     read_table,
     write_partition_table,
+    write_table,
 )
 
 
@@ -233,7 +236,10 @@ def build_mention_row(
             "raw_id": "i-1",
             "name": name,
             "start_date": start_date,
-            "principal_amount": amount,
+            # Production writes the parsed, canonical figure here, never the
+            # display text a filing used, so fixtures normalize the same way:
+            # `principal_amount` publishes as an exact decimal (#185).
+            "principal_amount": normalized_amount_from_text(amount) or amount,
             "retired_by_json": "[]",
             "parties_json": parties_json,
             "lender_disclosure": lender_disclosure,
@@ -3170,8 +3176,8 @@ def test_match_tables_keeps_same_day_siblings_apart() -> None:
         row["debt_instrument_id"]: row["principal_amount"]
         for row in tables["debt_instrument"].to_dict("records")
     }
-    assert amounts[assignment["m-initial"]] == "$1,250,000"
-    assert amounts[assignment["m-additional"]] == "$1,100,000"
+    assert amounts[assignment["m-initial"]] == "1250000"
+    assert amounts[assignment["m-additional"]] == "1100000"
 
 
 def test_match_tables_still_attaches_an_add_on_to_its_series() -> None:
@@ -5952,9 +5958,84 @@ def test_published_instrument_columns_are_pinned() -> None:
     ]
 
 
+def test_declared_decimal_columns_publish_as_exact_decimals(tmp_path: Path) -> None:
+    """Money and rates publish as `decimal128`, pinned at the single write path.
+
+    Text sorted `962500000` before `2000000000`, and float cannot hold
+    `372246148.11` — the failure behind #119 (#185).
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    frame = pd.DataFrame(
+        {
+            "principal_amount": ["2000000000", "14881621.34", None],
+            "outstanding_balance": [None, "402131.51", None],
+            "interest_rate_pct": ["5", "4.375", None],
+            "name": ["a", "b", "c"],
+        }
+    )
+    written = Path(write_table(tmp_path / "t.parquet", frame))
+    schema = pq.read_schema(written)
+    assert schema.field("principal_amount").type == pa.decimal128(38, 2)
+    assert schema.field("outstanding_balance").type == pa.decimal128(38, 2)
+    assert schema.field("interest_rate_pct").type == pa.decimal128(9, 4)
+
+    # cents survive, and the pipeline's own reader hands back one spelling
+    # rather than the scale-padded form a decimal column round-trips as
+    back = read_table(written)
+    assert [coerce_dataset_text(v) for v in back["principal_amount"]] == [
+        "2000000000",
+        "14881621.34",
+        None,
+    ]
+    assert [coerce_dataset_text(v) for v in back["interest_rate_pct"]] == [
+        "5",
+        "4.375",
+        None,
+    ]
+
+
+def test_all_null_decimal_partition_keeps_its_declared_type(tmp_path: Path) -> None:
+    """Pin the type for an all-null partition too.
+
+    Otherwise the column's physical type varies from partition to partition and
+    a strict reader breaks on the union.
+    """
+    frame = pd.DataFrame({"principal_amount": [None, None], "name": ["x", "y"]})
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    written = Path(write_table(tmp_path / "empty.parquet", frame))
+    assert pq.read_schema(written).field("principal_amount").type == pa.decimal128(
+        38, 2
+    )
+
+
+def test_decimal_coercion_quantizes_legacy_float_error_but_refuses_junk() -> None:
+    """Quantize legacy float error, but refuse text that is not a number.
+
+    A pre-#119 partition carries float error in its text and a replay of it must
+    not fail: the extra digits are the error, not the value.
+    """
+    import pyarrow as pa
+
+    money = pa.decimal128(38, 2)
+    assert decimal_column_values(
+        ["372246148.110000014305"], money, column="principal_amount"
+    ) == [Decimal("372246148.11")]
+    # placeholders become null rather than an Arrow error
+    assert decimal_column_values(
+        ["", "nan", None], money, column="principal_amount"
+    ) == [None, None, None]
+    # but text that is not a number at all is an upstream bug, not drift
+    with pytest.raises(ValueError, match="principal_amount is not a number"):
+        decimal_column_values(["$100 million"], money, column="principal_amount")
+
+
 def test_matcher_schema_version_is_pinned() -> None:
     """The version is how a downstream reader learns a rebuild is required."""
-    assert MATCHER_SCHEMA_VERSION == 4
+    assert MATCHER_SCHEMA_VERSION == 5
 
 
 def test_match_tables_publishes_exactly_the_declared_columns() -> None:

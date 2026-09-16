@@ -8,6 +8,7 @@ import io
 import json
 import re
 from collections.abc import Iterable, Iterator, Sequence
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from time import sleep
@@ -16,6 +17,7 @@ from urllib.parse import urlparse
 
 import boto3
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet
 from botocore.config import Config
 from botocore.exceptions import ConnectionError as BotocoreConnectionError
@@ -413,6 +415,84 @@ def write_bytes_artifact(path: ArtifactPath, body: bytes) -> str:
 
 MISSING_TEXT_VALUES = frozenset({"nan", "none", "null", "<na>", "n/a"})
 
+# Money and rates publish as exact decimals rather than text or floats (#185).
+# Float is not an option: `float("372246148.11")` is not that number, and
+# rendering it at fixed precision leaks the difference, which is what made every
+# amount carrying cents publish as null (#119). Declaring the type here rather
+# than at each write site also pins it for a partition whose values are all
+# null, which otherwise serialised as parquet `null` and made the column's
+# physical type vary across partitions.
+DECLARED_COLUMN_TYPES: dict[str, pa.DataType] = {
+    "principal_amount": pa.decimal128(38, 2),
+    "outstanding_balance": pa.decimal128(38, 2),
+    # Four places carries basis points with room to spare; the corpus uses at
+    # most three.
+    "interest_rate_pct": pa.decimal128(9, 4),
+}
+
+
+def canonical_numeric_text(value: Decimal) -> str:
+    """Return one deterministic numeric string for a decimal value.
+
+    Trailing zeros are dropped so a value has exactly one spelling: a decimal
+    column round-trips scale-padded (`Decimal("5.0000")` for a rate stored at
+    scale four), and every internal comparison in the pipeline is textual.
+    """
+    quantized = value.normalize()
+    if quantized == quantized.to_integral_value():
+        quantized = quantized.to_integral_value()
+    return f"{quantized:f}"
+
+
+def decimal_column_values(
+    values: Iterable[object], dtype: pa.Decimal128Type, *, column: str
+) -> list[Decimal | None]:
+    """Return one column's values as decimals at the declared scale.
+
+    Quantizes rather than casting straight through Arrow, for two reasons. A
+    partition written before #119 carries float error in its text
+    (`372246148.110000014305`), and Arrow refuses that as a rescale that would
+    lose data — but the extra digits are the error, not the value, so dropping
+    them is correct and a replay must not fail on them. And placeholder text
+    (`nan`, an empty string) has to become null rather than an Arrow error.
+
+    Text that is not a number at all raises: every stage writes these columns
+    from a parsed, verified amount, so anything else is a bug upstream rather
+    than drift worth tolerating.
+    """
+    exponent = Decimal(1).scaleb(-dtype.scale)
+    coerced: list[Decimal | None] = []
+    for value in values:
+        if isinstance(value, Decimal):
+            coerced.append(value.quantize(exponent, rounding=ROUND_HALF_UP))
+            continue
+        text = coerce_dataset_text(value)
+        if text is None:
+            coerced.append(None)
+            continue
+        try:
+            coerced.append(Decimal(text).quantize(exponent, rounding=ROUND_HALF_UP))
+        except InvalidOperation as error:
+            message = f"{column} is not a number: {text!r}"
+            raise ValueError(message) from error
+    return coerced
+
+
+def apply_declared_column_types(table: pd.DataFrame) -> pa.Table:
+    """Return one Arrow table with the declared physical types applied."""
+    arrow = pa.Table.from_pandas(table, preserve_index=False)
+    for name, dtype in DECLARED_COLUMN_TYPES.items():
+        if name not in arrow.column_names:
+            continue
+        values = decimal_column_values(
+            arrow.column(name).to_pylist(), dtype, column=name
+        )
+        index = arrow.schema.get_field_index(name)
+        arrow = arrow.set_column(
+            index, pa.field(name, dtype), pa.array(values, type=dtype)
+        )
+    return arrow
+
 
 def coerce_dataset_text(value: object) -> str | None:
     """Return one trimmed dataset text value, or None when it carries no name.
@@ -422,6 +502,11 @@ def coerce_dataset_text(value: object) -> str | None:
     """
     if value is None:
         return None
+    if isinstance(value, Decimal):
+        # A decimal column round-trips scale-padded, so `str()` would hand the
+        # pipeline `2000000000.00` where it wrote `2000000000` and every textual
+        # comparison — match keys, prior-amount equality — would miss.
+        return canonical_numeric_text(value)
     try:
         if pd.isna(value):
             return None
@@ -527,9 +612,10 @@ def read_dataset(
 def write_table(path: ArtifactPath, table: pd.DataFrame) -> str:
     """Atomically write a Parquet table to local storage or S3."""
     normalized = normalize_artifact_path(path)
+    arrow_table = apply_declared_column_types(table)
     if is_s3_uri(normalized):
         buffer = io.BytesIO()
-        table.to_parquet(buffer, index=False)
+        pyarrow.parquet.write_table(arrow_table, buffer)
         bucket, key = parse_s3_uri(normalized)
         _s3_client().put_object(Bucket=bucket, Key=key, Body=buffer.getvalue())
         return normalized
@@ -543,7 +629,7 @@ def write_table(path: ArtifactPath, table: pd.DataFrame) -> str:
     ) as temp_file:
         temp_path = Path(temp_file.name)
     try:
-        table.to_parquet(temp_path, index=False)
+        pyarrow.parquet.write_table(arrow_table, temp_path)
         temp_path.replace(local_path)
     finally:
         if temp_path.exists():

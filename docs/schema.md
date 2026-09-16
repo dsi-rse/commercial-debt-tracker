@@ -143,6 +143,36 @@ Examples:
 
 ## Dataset Schemas
 
+### Column types
+
+Every column is **nullable text** unless it appears below. A missing value is
+null, and the readers treat the placeholder strings `nan`, `none`, `null`,
+`<na>` and `n/a` as missing too, because parquet round-trips a missing value as
+NaN and `str(float("nan"))` is the literal text `nan`.
+
+| column | physical type | notes |
+|---|---|---|
+| `principal_amount`, `outstanding_balance` | `decimal128(38, 2)` | Exact money. Not a float: `float("372246148.11")` is not that number, and rendering it at fixed precision leaked the difference, which is what made every amount carrying cents publish as null (#119). Not text either: a text column sorts `962500000` before `2000000000` (#185). |
+| `interest_rate_pct` | `decimal128(9, 4)` | Exact percentage. Four places carries basis points; the corpus uses at most three. Published canonical, so one rate has one spelling — it previously persisted the model's own text, giving 141 distinct strings for 115 distinct rates. |
+| `mention_count`, `document_count` | `int64` | |
+| `is_lineage_head`, `relevance` | `bool` | |
+| `classification_score` | `double` | A model decision score, not a measured quantity. |
+| `match_score` | `double` | |
+| `start_line`, `end_line`, `section_char_count`, `candidate_rank` | `int64` | |
+
+Decimal columns read back scale-padded (`Decimal("5.0000")` for a rate stored at
+scale four). The pipeline's own readers canonicalise that to one spelling, since
+every internal comparison — match keys, prior-amount equality — is textual.
+
+Types are declared once, at the single parquet write path, so they hold for
+every dataset and every partition. That also pins the type of a partition whose
+values are all null, which otherwise serialised as parquet `null` and made a
+column's physical type vary from partition to partition.
+
+Dates are text in `YYYY-MM-DD`, not a date type: a year-only maturity normalizes
+to `YYYY-12-31` carrying `derived_from: "name"`, and the distinction between a
+stated and a derived date lives in the fact payload rather than the column.
+
 ### `documents`
 
 Columns:

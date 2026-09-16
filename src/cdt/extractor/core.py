@@ -44,6 +44,7 @@ from cdt.datasets import (
 from cdt.shared import get_logger
 from cdt.storage import (
     artifact_exists,
+    canonical_numeric_text,
     coerce_dataset_text,
     list_artifacts_with_versions,
     read_table,
@@ -3531,10 +3532,7 @@ def normalize_numeric_string(value: Decimal) -> str:
     every amount carrying cents failed the agreement check in
     `standardized_amount_payload` and published as null (#119).
     """
-    quantized = value.normalize()
-    if quantized == quantized.to_integral_value():
-        quantized = quantized.to_integral_value()
-    return f"{quantized:f}"
+    return canonical_numeric_text(value)
 
 
 def decimal_from_amount_string(value: str | None) -> Decimal | None:
