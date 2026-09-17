@@ -6136,65 +6136,6 @@ def test_two_amendment_children_publish_no_superseded_pointer() -> None:
     assert parent["is_lineage_head"] is False
 
 
-# --- Expected date facts: planned starts vs planned retirements (#183) -------
-
-
-def _expected_closing_dates_json(normalized_date: str | None) -> str:
-    """Return a dates_json holding one planned closing and nothing else."""
-    return json.dumps(
-        [
-            {
-                "kind": "closing",
-                "normalized_date": normalized_date,
-                "expected": True,
-                "prior": False,
-                "spans": [],
-            }
-        ]
-    )
-
-
-def test_expected_dates_reads_planned_starts_and_retirements_apart() -> None:
-    """The two kinds of expectation answer different legs, so they cannot merge."""
-    from cdt.matcher.core import expected_dates_from_dates_json
-
-    expected = expected_dates_from_dates_json(
-        json.dumps(
-            [
-                # The planned start.
-                {"kind": "closing", "normalized_date": "2026-04-01", "expected": True},
-                # A prior term is what the instrument used to say, not a plan.
-                {
-                    "kind": "closing",
-                    "normalized_date": "2019-01-01",
-                    "expected": True,
-                    "prior": True,
-                },
-                # An occurred closing is not a plan either.
-                {"kind": "closing", "normalized_date": "2020-01-01", "expected": False},
-                {
-                    "kind": "retirement",
-                    "normalized_date": "2026-09-30",
-                    "expected": True,
-                },
-                # An event the filing states without a date is still a plan.
-                {"kind": "termination", "normalized_date": None, "expected": True},
-            ]
-        )
-    )
-    assert expected.start_date == "2026-04-01"
-    assert expected.retirement_dates == ("2026-09-30",)
-    assert expected.undated_retirement is True
-    # Malformed and absent payloads say nothing rather than raising.
-    for value in (None, "", "{not json", "[]"):
-        empty = expected_dates_from_dates_json(value)
-        assert (empty.start_date, empty.retirement_dates, empty.undated_retirement) == (
-            None,
-            (),
-            False,
-        )
-
-
 def test_first_and_last_seen_span_distinct_filing_dates() -> None:
     """Both fixture mentions shared a date, so a swap was invisible."""
     from cdt.matcher.core import apply_lifecycle_rollup, prepare_mention

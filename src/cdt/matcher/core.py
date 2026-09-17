@@ -178,13 +178,6 @@ class PreparedMention:
     interest_rate_pct: str | None
     status: str | None
     status_date: str | None
-    # Stage 2: the extractor records a planned start or a planned retirement as
-    # an `expected` date fact rather than a status. The planned start is what
-    # `expected_active` is measured against; a planned retirement the corpus
-    # has not reached yet keeps the obligation alive (#183).
-    expected_start_date: str | None
-    expected_retirement_dates: tuple[str, ...]
-    undated_expected_retirement: bool
     amendment_of: str | None
     retired_by: tuple[str, ...]
     split_of: str | None
@@ -1660,7 +1653,6 @@ def cluster_canonical_key(cluster: dict[str, object]) -> str:
 
 def prepare_mention(row: dict[str, object]) -> PreparedMention:
     """Normalize one mention row for matching."""
-    expected = expected_dates_from_dates_json(row.get("dates_json"))
     return PreparedMention(
         debt_instrument_mention_id=str(row["debt_instrument_mention_id"]),
         item_id=str(row["item_id"]),
@@ -1688,9 +1680,6 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
         interest_rate_pct=coerce_optional_text(row.get("interest_rate_pct")),
         status=coerce_optional_text(row.get("status")),
         status_date=coerce_optional_text(row.get("status_date")),
-        expected_start_date=expected.start_date,
-        expected_retirement_dates=expected.retirement_dates,
-        undated_expected_retirement=expected.undated_retirement,
         amendment_of=coerce_optional_text(row.get("amendment_of")),
         retired_by=tuple(json.loads(str(row.get("retired_by_json") or "[]"))),
         split_of=coerce_optional_text(row.get("split_of")),
@@ -1717,58 +1706,6 @@ def mention_sort_key(mention: PreparedMention) -> tuple[str, str, str, str]:
         mention.accession_number or "",
         mention.item_id,
         mention.debt_instrument_mention_id,
-    )
-
-
-EXPECTED_RETIREMENT_KINDS = {"retirement", "termination", "exchange", "default"}
-
-
-@dataclass(frozen=True)
-class ExpectedDates:
-    """What one mention says the filing plans, as opposed to what happened."""
-
-    start_date: str | None
-    retirement_dates: tuple[str, ...]
-    undated_retirement: bool
-
-
-def expected_dates_from_dates_json(value: object) -> ExpectedDates:
-    """Read a mention's planned start and planned retirements from its date facts.
-
-    A planned date is a fact marked `expected`: an expected closing is when the
-    instrument will start, a noticed redemption is when it is meant to end. The
-    stage-1 `expected_closing` kind is already rewritten to `closing` with
-    `expected: true` before it reaches here, so only that shape is read. An
-    expected event the filing states without a date is still an expectation, but
-    it can never be compared against a reference date, so it is kept apart.
-    """
-    if not isinstance(value, str) or not value:
-        return ExpectedDates(None, (), False)
-    try:
-        facts = json.loads(value)
-    except json.JSONDecodeError:
-        return ExpectedDates(None, (), False)
-    start_date: str | None = None
-    retirement_dates: set[str] = set()
-    undated_retirement = False
-    for fact in facts:
-        if not isinstance(fact, dict) or fact.get("expected") is not True:
-            continue
-        kind = fact.get("kind")
-        normalized = coerce_optional_text(fact.get("normalized_date"))
-        if kind == "closing" and normalized and not fact.get("prior"):
-            # At most one current closing per mention, so the earliest of any
-            # duplicates is the conservative read of when it starts.
-            start_date = (
-                normalized if start_date is None else min(start_date, normalized)
-            )
-        elif kind in EXPECTED_RETIREMENT_KINDS:
-            if normalized:
-                retirement_dates.add(normalized)
-            else:
-                undated_retirement = True
-    return ExpectedDates(
-        start_date, tuple(sorted(retirement_dates)), undated_retirement
     )
 
 
