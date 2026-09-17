@@ -5933,7 +5933,7 @@ def test_decimal_coercion_quantizes_legacy_float_error_but_refuses_junk() -> Non
 
 def test_matcher_schema_version_is_pinned() -> None:
     """The version is how a downstream reader learns a rebuild is required."""
-    assert MATCHER_SCHEMA_VERSION == 5
+    assert MATCHER_SCHEMA_VERSION == 6
 
 
 def test_match_tables_publishes_exactly_the_declared_columns() -> None:

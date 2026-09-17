@@ -45,7 +45,10 @@ DEFAULT_RELATED_THRESHOLD = 0.75
 DEFAULT_MEMBERSHIP_THRESHOLD = 0.90
 DEFAULT_AMBIGUITY_MARGIN = 0.05
 DEFAULT_LENDER_SUPPORT_THRESHOLD = 0.5
-MATCHER_SCHEMA_VERSION = 5
+# Bumped 5 -> 6 for the four status columns this stage no longer publishes
+# (#196). A reader holding rows written at 5 has columns that no longer
+# exist, so it needs to know a rebuild happened.
+MATCHER_SCHEMA_VERSION = 6
 EDGE_TYPES = ("member", "related", "ambiguous_candidate")
 GENERIC_LENDER_TERMS = frozenset(
     {

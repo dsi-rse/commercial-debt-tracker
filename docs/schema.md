@@ -452,7 +452,8 @@ Columns:
 - `is_lineage_head`: True when no amendment child supersedes this row; the browse index should show heads and collapse the rest of the family beneath them.
 - `first_seen_filing_date` / `last_seen_filing_date`: Filing-date range of the instrument's direct mentions.
 - `mention_count` / `document_count`: Direct mentions, and distinct filings containing them.
-- `name`, `instrument_type`, `start_date`, `maturity_date`, `commitment_termination_date`: Matcher-selected canonical values (newest non-null across direct mentions).
+- `name`, `instrument_type`, `start_date`, `commitment_termination_date`: Matcher-selected canonical values — the newest non-null across direct mentions, falling back to the value already on the row when no mention carries one.
+- `maturity_date`: Selected on a different rule from the fields above. The newest **stated** maturity wins; a derived one — read out of the instrument's own name, or computed from a tenor (#166) — publishes only when no mention in the cluster states any. Recency alone was not enough, because every post-closing `due 2030` mention re-introduces the synthesized year-end, which let a name-derived `2030-12-31` outrank the closing 8-K's stated `2030-07-01` (#162). Extending the same preference to the other canonical fields is still open under #162.
 - `principal_amount`, `principal_currency`, `principal_amount_kind`: Canonical headline amount, taken together from the newest mention that carries one so the currency can never detach from its figure (#140).
 - `outstanding_balance`, `outstanding_balance_currency`, `outstanding_balance_as_of`: The newest balance observation, kept apart from principal so it never double-counts (#140). `as_of` falls back to the observing mention's filing date.
 - `interest_rate_kind`, `interest_rate_pct`: Canonical interest rate (#157).
