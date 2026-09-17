@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import json
 import logging
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.dataset
 import pytest
 from botocore.exceptions import ClientError, ReadTimeoutError
 
 from cdt import storage as cdt_storage
 from cdt.classifier import classifications_root, classify_pending_items
 from cdt.classifier import core as classifier_core
+from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
 from cdt.datasets import (
     completion_registry_path,
     existing_date_shard_partition_ids,
@@ -60,6 +64,7 @@ from cdt.extractor.core import (
 from cdt.ingest import DOCUMENT_COLUMNS
 from cdt.itemizer import core as itemizer_core
 from cdt.itemizer import itemize_pending_documents, items_root
+from cdt.itemizer.core import ITEM_COLUMNS
 from cdt.matcher import (
     debt_instruments_root,
     match_pending_mentions,
@@ -77,13 +82,16 @@ from cdt.matcher.core import (
 )
 from cdt.pipeline import normalize_snapshot_text
 from cdt.storage import (
+    apply_declared_column_types,
     artifact_exists,
     coerce_dataset_text,
+    decimal_column_values,
     get_object_bytes,
     read_dataset,
     read_json_artifact,
     read_table,
     write_partition_table,
+    write_table,
 )
 
 
@@ -233,7 +241,10 @@ def build_mention_row(
             "raw_id": "i-1",
             "name": name,
             "start_date": start_date,
-            "principal_amount": amount,
+            # Production writes the parsed, canonical figure here, never the
+            # display text a filing used, so fixtures normalize the same way:
+            # `principal_amount` publishes as an exact decimal (#185).
+            "principal_amount": normalized_amount_from_text(amount) or amount,
             "retired_by_json": "[]",
             "parties_json": parties_json,
             "lender_disclosure": lender_disclosure,
@@ -3170,8 +3181,8 @@ def test_match_tables_keeps_same_day_siblings_apart() -> None:
         row["debt_instrument_id"]: row["principal_amount"]
         for row in tables["debt_instrument"].to_dict("records")
     }
-    assert amounts[assignment["m-initial"]] == "$1,250,000"
-    assert amounts[assignment["m-additional"]] == "$1,100,000"
+    assert amounts[assignment["m-initial"]] == "1250000"
+    assert amounts[assignment["m-additional"]] == "1100000"
 
 
 def test_match_tables_still_attaches_an_add_on_to_its_series() -> None:
@@ -5775,6 +5786,18 @@ def test_table_cells_publish_coupon_and_document_currency() -> None:
         name_text=None,
     )
     assert rate["rate_pct"] == "4.125" and rate["derived_from"] == "stated"
+    # The published rate is canonical, not the model's spelling: verification is
+    # numeric, so `5`, `5.00` and `5.000` all verified and all persisted
+    # verbatim, splitting one rate across three distinct published strings.
+    for spelling in ("4.1250", "4.12500"):
+        assert (
+            standardized_interest_rate_payload(
+                {"kind": "fixed", "rate_pct": spelling, "evidence": ["tag-51"]},
+                tags,
+                name_text=None,
+            )["rate_pct"]
+            == "4.125"
+        )
     assert (
         standardized_interest_rate_payload(
             {"kind": "fixed", "rate_pct": "4.125", "evidence": ["tag-53"]},
@@ -5940,9 +5963,211 @@ def test_published_instrument_columns_are_pinned() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    "columns",
+    [
+        pytest.param(DOCUMENT_COLUMNS, id="documents"),
+        pytest.param(ITEM_COLUMNS, id="items"),
+        pytest.param(CLASSIFIED_ITEM_COLUMNS, id="classifications"),
+        pytest.param(DEBT_INSTRUMENT_MENTION_COLUMNS, id="mentions"),
+        pytest.param(MENTION_CLUSTER_EDGE_COLUMNS, id="mention-cluster-edges"),
+        pytest.param(DEBT_INSTRUMENT_COLUMNS, id="debt-instruments"),
+    ],
+)
+def test_a_columns_physical_type_does_not_depend_on_the_data(
+    columns: list[str],
+) -> None:
+    """One column publishes one type, whatever a given partition happens to hold.
+
+    Arrow infers an object column's type from its values, so a column with no
+    value in this partition serialised as `null` and as `string` in the next.
+    That made 23 of 42 `debt-instruments` columns vary, and every standard
+    reader — `pyarrow.dataset`, `pq.read_table`, `ParquetDataset`,
+    `pandas.read_parquet` — failed on the directory with "Unsupported cast from
+    string to null" (#187). An empty frame was worse: it inferred `null` for
+    every column, counts and flags included.
+    """
+    empty = apply_declared_column_types(pd.DataFrame(columns=columns))
+    populated = apply_declared_column_types(pd.DataFrame([dict.fromkeys(columns)]))
+    assert empty.schema == populated.schema
+    assert not [
+        field.name for field in empty.schema if pa.types.is_null(field.type)
+    ], "a null-typed column has no stable physical type"
+
+
+def test_a_multi_partition_dataset_reads_with_a_standard_reader(
+    tmp_path: Path,
+) -> None:
+    """The consumer promise: point any parquet reader at the directory.
+
+    The first partition read must be the one with no value: Arrow takes the
+    unified type from the first fragment, and casting `null` data up to `string`
+    succeeds while casting `string` data down to `null` is what fails. A test
+    with the partitions the other way round passes even when the fix is removed.
+    """
+    root = tmp_path / "debt-instruments"
+    for shard, subtype in (("0001", None), ("0002", "repaid")):
+        frame = pd.DataFrame(
+            [
+                dict.fromkeys(DEBT_INSTRUMENT_COLUMNS)
+                | {
+                    "debt_instrument_id": f"d-{shard}",
+                    "cik": "320193",
+                    "status": "closed",
+                    "status_subtype": subtype,
+                    "mention_count": 1,
+                    "document_count": 1,
+                    "is_lineage_head": True,
+                }
+            ]
+        )
+        write_partition_table(root, partition={"cik_shard": shard}, table=frame)
+
+    table = pyarrow.dataset.dataset(
+        root, format="parquet", partitioning="hive"
+    ).to_table()
+    assert table.num_rows == 2
+    assert len(pd.read_parquet(root)) == 2
+    assert len(read_dataset(root)) == 2
+
+
+def test_declared_decimal_columns_publish_as_exact_decimals(tmp_path: Path) -> None:
+    """Money and rates publish as `decimal128`, pinned at the single write path.
+
+    Text sorted `962500000` before `2000000000`, and float cannot hold
+    `372246148.11` — the failure behind #119 (#185).
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    frame = pd.DataFrame(
+        {
+            "principal_amount": ["2000000000", "14881621.34", None],
+            "outstanding_balance": [None, "402131.51", None],
+            "interest_rate_pct": ["5", "4.375", None],
+            "name": ["a", "b", "c"],
+        }
+    )
+    written = Path(write_table(tmp_path / "t.parquet", frame))
+    schema = pq.read_schema(written)
+    assert schema.field("principal_amount").type == pa.decimal128(38, 2)
+    assert schema.field("outstanding_balance").type == pa.decimal128(38, 2)
+    assert schema.field("interest_rate_pct").type == pa.decimal128(9, 4)
+
+    # cents survive, and the pipeline's own reader hands back one spelling
+    # rather than the scale-padded form a decimal column round-trips as
+    back = read_table(written)
+    assert [coerce_dataset_text(v) for v in back["principal_amount"]] == [
+        "2000000000",
+        "14881621.34",
+        None,
+    ]
+    assert [coerce_dataset_text(v) for v in back["interest_rate_pct"]] == [
+        "5",
+        "4.375",
+        None,
+    ]
+
+
+def test_all_null_decimal_partition_keeps_its_declared_type(tmp_path: Path) -> None:
+    """Pin the type for an all-null partition too.
+
+    Otherwise the column's physical type varies from partition to partition and
+    a strict reader breaks on the union.
+    """
+    frame = pd.DataFrame({"principal_amount": [None, None], "name": ["x", "y"]})
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    written = Path(write_table(tmp_path / "empty.parquet", frame))
+    assert pq.read_schema(written).field("principal_amount").type == pa.decimal128(
+        38, 2
+    )
+
+
+def test_decimal_coercion_quantizes_legacy_float_error_but_refuses_junk() -> None:
+    """Quantize legacy float error, but refuse text that is not a number.
+
+    A pre-#119 partition carries float error in its text and a replay of it must
+    not fail: the extra digits are the error, not the value.
+    """
+    import pyarrow as pa
+
+    money = pa.decimal128(38, 2)
+    assert decimal_column_values(
+        ["372246148.110000014305"], money, column="principal_amount"
+    ) == [Decimal("372246148.11")]
+    # placeholders become null rather than an Arrow error
+    assert decimal_column_values(
+        ["", "nan", None], money, column="principal_amount"
+    ) == [None, None, None]
+    # but text that is not a number at all is an upstream bug, not drift
+    with pytest.raises(ValueError, match="principal_amount is not a number"):
+        decimal_column_values(["$100 million"], money, column="principal_amount")
+
+
+def test_status_does_not_depend_on_which_shard_an_issuer_hashes_into(
+    tmp_path: Path,
+) -> None:
+    """One "now" per run, not one per `cik_shard` (#188).
+
+    `cik_shard` is a hash bucket with no semantic meaning. The rollup used to
+    derive its reference date from whatever mentions `match_tables` was handed,
+    which is one shard's worth — so a quiet issuer sharing a bucket with quiet
+    issuers was judged against a "now" months behind the corpus, and its passed
+    maturity still read `active`. Which bucket an issuer lands in decided its
+    published status.
+
+    CIK 320193 hashes to shard 0044 and 789019 to 0048. The quiet issuer's only
+    filing is from 2020 and its note matured in 2023; the corpus runs to 2026.
+    """
+    rows = pd.DataFrame(
+        [
+            build_mention_row(
+                mention_id="m-quiet",
+                item_id="item-quiet",
+                accession_number="0001",
+                cik="320193",
+                date="2020-01-02",
+                name="6.0% Senior Notes due 2023",
+                start_date="2020-01-01",
+                amount="$100 million",
+                maturity_date="2023-01-01",
+            ),
+            build_mention_row(
+                mention_id="m-recent",
+                item_id="item-recent",
+                accession_number="0002",
+                cik="789019",
+                date="2026-06-01",
+                name="Revolving Credit Facility",
+                start_date="2026-05-01",
+                amount="$250 million",
+            ),
+        ]
+    )
+    write_partition_table(
+        tmp_path / "mentions",
+        partition={"date": "2026-06-01", "shard": "0001"},
+        table=rows,
+    )
+    match_pending_mentions(artifact_root=tmp_path, batch_size=5)
+
+    published = {
+        str(row["debt_instrument_id"]): row
+        for row in read_dataset(debt_instruments_root(tmp_path)).to_dict("records")
+    }
+    quiet = published["m-quiet"]
+    # The corpus has reached 2026, so a 2023 maturity is behind it — even though
+    # the only filing in this instrument's own shard is from 2020.
+    assert quiet["status"] == "expected_closed"
+    assert quiet["status_date"] == "2023-01-01"
+    assert published["m-recent"]["status"] == "active"
+
+
 def test_matcher_schema_version_is_pinned() -> None:
     """The version is how a downstream reader learns a rebuild is required."""
-    assert MATCHER_SCHEMA_VERSION == 4
+    assert MATCHER_SCHEMA_VERSION == 5
 
 
 def test_match_tables_publishes_exactly_the_declared_columns() -> None:

@@ -44,6 +44,7 @@ from cdt.datasets import (
 from cdt.shared import get_logger
 from cdt.storage import (
     artifact_exists,
+    canonical_numeric_text,
     coerce_dataset_text,
     list_artifacts_with_versions,
     read_table,
@@ -3283,7 +3284,13 @@ def standardized_interest_rate_payload(
         for candidate in evidence_rates:
             try:
                 if Decimal(candidate) == Decimal(model_rate):
-                    verified_rate = model_rate
+                    # Publish the canonical form, not the model's spelling.
+                    # Verification is numeric but the value used to persist
+                    # verbatim, so one rate arrived as `5`, `5.00` and `5.000`
+                    # — 141 distinct strings for 115 distinct rates on the
+                    # generalization window, which splits any group-by and
+                    # makes an equality filter miss rows.
+                    verified_rate = normalize_numeric_string(Decimal(model_rate))
                     break
             except InvalidOperation:
                 continue
@@ -3525,10 +3532,7 @@ def normalize_numeric_string(value: Decimal) -> str:
     every amount carrying cents failed the agreement check in
     `standardized_amount_payload` and published as null (#119).
     """
-    quantized = value.normalize()
-    if quantized == quantized.to_integral_value():
-        quantized = quantized.to_integral_value()
-    return f"{quantized:f}"
+    return canonical_numeric_text(value)
 
 
 def decimal_from_amount_string(value: str | None) -> Decimal | None:

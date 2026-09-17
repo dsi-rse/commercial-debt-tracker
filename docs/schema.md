@@ -65,21 +65,21 @@ Canonical path shape:
 
 Notes:
 
-- `documents` shards currently use Python's process-level `hash(accession_number)` modulo 64
+- `documents` shards by `crc32(accession_number) % 64`, computed by `datasets.shard_label` — the single source of the shard contract (crc32, modulo, four-digit label). Changing it strands every existing partition, so it is defined nowhere else (#61).
 - `items`, `classifications`, and `mentions` preserve their source document `date` and `shard`
-- CIK shards are derived from CIK hashes
+- CIK shards are `crc32 % 64` of the **unpadded** CIK, so the padded and unpadded spellings of one CIK always land in the same shard (#153)
 - `documents` currently use 64 date shards
 - downstream date-partitioned datasets currently preserve whichever document shards they read
 - CIK-sharded datasets currently use 64 shards
-- Changing `documents` to stable accession hashing would require migration or forced reruns of existing document partitions.
+- Shard assignment is stable across runs and processes. It was not always: before #61, `documents` used Python's builtin `hash`, which is salted per process, so one accession landed in a different shard on every run and a forced re-ingest wrote a second copy that per-partition dedup could not see. That is fixed, not pending. `ingest.repair_document_shards` sweeps any surviving pre-#61 stray into its canonical shard on `--force`, dropping the stray copy when the canonical one was just refreshed.
 
 ### What "Partition", "Shard", and "Batch" Mean
 
 - A `partition` is one physical parquet file at a canonical path such as `documents/date=2026-05-31/shard=0017/part-0000.parquet`.
 - A `shard` is the hash bucket inside a dataset's partitioning scheme. `documents` currently use 64 shards, rendered as `0000` through `0063`. Downstream date-partitioned datasets preserve source document shard values. CIK-sharded datasets also use 64 shards, rendered as `0000` through `0063`.
-- For `documents`, all rows for the same filing date are split across 64 shard files by Python `hash(accession_number)`.
+- For `documents`, all rows for the same filing date are split across 64 shard files by `crc32(accession_number) % 64`.
 - For `items`, `classifications`, and `mentions`, rows keep the `date` and `shard` partition of their upstream source partition.
-- For CIK-sharded datasets, rows are split across 64 shard files by hashed CIK, regardless of filing date.
+- For CIK-sharded datasets, rows are split across 64 shard files by `crc32` of the unpadded CIK, regardless of filing date.
 - A `batch` is not a second storage layer. It is just the internal chunk size one pipeline invocation uses while draining all work in scope.
 
 ### Date-Partitioned Stages
@@ -92,7 +92,7 @@ Notes:
 
 How rows land there:
 
-- `documents`: rows are grouped by filing `date`, then by Python `hash(accession_number) % 64`.
+- `documents`: rows are grouped by filing `date`, then by `crc32(accession_number) % 64`.
 - `items`: each item row is written to the same `date` and `shard` partition as its parent document partition.
 - `classifications`: each classified row is written to the same `date` and `shard` partition as its source item partition.
 - `mentions`: each extracted mention row is written to the same `date` and `shard` partition as its source classification partition.
@@ -115,7 +115,7 @@ Practical implication:
 How rows land there:
 
 - the matcher reads all `mentions`
-- each mention is assigned to `shard_for_cik(cik)`
+- each mention is assigned to `shard_for_cik(cik)`, which is `crc32` of the unpadded CIK modulo 64
 - all mentions for companies whose CIK hashes to the same shard are processed together
 - the matcher writes one `mention-cluster-edges` parquet and one `debt-instruments` parquet for that `cik_shard`
 
@@ -142,6 +142,52 @@ Examples:
 - if `ingest_batch_size=100`, ingest flushes after accumulating roughly 100 document rows, and those rows may be written into multiple `date/shard` partition files
 
 ## Dataset Schemas
+
+### Column types
+
+Every column is **nullable text** unless it appears below. A missing value is
+null, and the readers treat the placeholder strings `nan`, `none`, `null`,
+`<na>` and `n/a` as missing too, because parquet round-trips a missing value as
+NaN and `str(float("nan"))` is the literal text `nan`.
+
+| column | physical type | notes |
+|---|---|---|
+| `principal_amount`, `outstanding_balance` | `decimal128(38, 2)` | Exact money. Not a float: `float("372246148.11")` is not that number, and rendering it at fixed precision leaked the difference, which is what made every amount carrying cents publish as null (#119). Not text either: a text column sorts `962500000` before `2000000000` (#185). |
+| `interest_rate_pct` | `decimal128(9, 4)` | Exact percentage. Four places carries basis points; the corpus uses at most three. Published canonical, so one rate has one spelling — it previously persisted the model's own text, giving 141 distinct strings for 115 distinct rates. |
+| `mention_count`, `document_count` | `int64` | |
+| `is_lineage_head`, `relevance` | `bool` | |
+| `classification_score` | `double` | A model decision score, not a measured quantity. |
+| `match_score` | `double` | |
+| `start_line`, `end_line`, `section_char_count`, `candidate_rank` | `int64` | |
+
+Decimal columns read back scale-padded (`Decimal("5.0000")` for a rate stored at
+scale four). The pipeline's own readers canonicalise that to one spelling, since
+every internal comparison — match keys, prior-amount equality — is textual.
+
+Types are declared once, at the single parquet write path, so they hold for
+every dataset and every partition — including a partition whose values are all
+null, and an empty one. Inferring them per write made the physical type a
+function of the data: a column with no value in one partition serialised as
+parquet `null` and as `string` in the next, which is why 23 of 42
+`debt-instruments` columns disagreed across partitions and `pyarrow.dataset`,
+`pq.read_table`, `ParquetDataset` and `pandas.read_parquet` all failed on the
+directory with "Unsupported cast from string to null" (#187).
+
+So any standard parquet reader can be pointed at a dataset directory:
+
+```python
+import pandas as pd
+pd.read_parquet("<artifact-root>/debt-instruments")
+```
+
+Partitions written before that fix keep the types they were written with, and a
+dataset that mixes the two is readable only in the order that happens to put a
+typed partition first. A root carried over from an earlier run therefore needs
+rebuilding once (#107).
+
+Dates are text in `YYYY-MM-DD`, not a date type: a year-only maturity normalizes
+to `YYYY-12-31` carrying `derived_from: "name"`, and the distinction between a
+stated and a derived date lives in the fact payload rather than the column.
 
 ### `documents`
 
@@ -170,12 +216,23 @@ Columns:
 - `text`: Extracted text for the item section only.
 - `date`: Filing date copied from the parent document.
 - `resource_uri`: Reserved pointer for externally stored item text; currently written as `null` by the itemizer.
-- `item_information`: Free-text item label parsed from the filing, such as the descriptive name that follows an item number.
-- `extraction_status`: Itemizer status describing how confidently the section boundary was extracted.
-- `duplicate_resolution`: Notes how duplicate or repeated item sections were resolved.
-- `section_heading`: Raw heading text associated with the extracted section.
-- `start_line`: 1-based line number where the item section starts in the filing text.
-- `end_line`: 1-based line number where the item section ends in the filing text.
+- `item_information`: Canonical SEC caption for the item this row covers, read from an `ITEM INFORMATION:` line in the filing's `<SEC-HEADER>` block and normalized to lowercase, such as `entry into a material definitive agreement`. This column drives the table: the itemizer reads the header's captions, maps each one to the item number in `item`, then searches the document body for the matching section. A caption the itemizer does not recognize still produces a row, with an empty `item`. Captions that repeat, or that map to an item number another caption already claimed, are dropped so that `item_id` stays unique (#74).
+- `extraction_status`: Whether the itemizer located this item's section in the document body, and whether the headings it found were ambiguous. Not a confidence score. One of:
+  - `ok`: A body heading for `item` was found and the section boundaries resolved, either from a single heading or from several the itemizer judged benign. `duplicate_resolution` records which case applied.
+  - `duplicate_heading`: Several body headings carried `item` and their sections differ materially, so the itemizer could not tell which one the header caption meant. The first is used; treat `text` as one of several possible readings of the filing.
+  - `missing_heading`: The header declared the item but no body heading matches it. No section was extracted, so `text` and `section_heading` are empty and `start_line`, `end_line` are null.
+  - `unmapped_item_information`: `item_information` is not a caption the itemizer maps to an item number, so no extraction was attempted. `item` is empty, as are the section fields listed above.
+
+  No stage downstream filters on this column, so the classifier and the extractor both see the empty-text rows produced by the last two statuses.
+- `duplicate_resolution`: How the itemizer chose between body headings carrying this item number. Populated for every row that reached extraction, not only for rows with more than one heading. Comparisons use a normalized form of each candidate section: casefolded, punctuation collapsed, and the item-number heading line itself dropped. One of:
+  - `single_heading`: Exactly one body heading carried the item number.
+  - `benign_equivalent`: Several headings, and one candidate section is equivalent to every other, meaning either that one contains the other or that their token sets overlap by at least 0.95. That candidate is kept.
+  - `benign_contained`: Several headings, and one candidate section contains every other. Rare, because the equivalence check above already covers containment for non-empty sections; this value effectively marks the case where a competing heading's section normalizes to nothing.
+  - `unresolved_duplicate`: Several headings whose sections differ materially. This is the value that sets `extraction_status` to `duplicate_heading`.
+  - Empty string: no extraction was attempted, so the row is `missing_heading` or `unmapped_item_information`.
+- `section_heading`: The body heading line the itemizer selected as the start of the section, verbatim from the filing and not normalized, such as `Item 1.01. Entry into a Material Definitive Agreement.`. Distinct from `item_information`, which carries SEC's own caption from the filing header rather than the text the filer wrote. Empty when no heading matched.
+- `start_line`: 1-based inclusive line number where the section in `text` begins, which is the line holding `section_heading`. Line numbers index the normalized lines of the filing's primary 8-K document block, not `documents.text`, so they cannot be used to slice that column directly. Null when no section was extracted. Recorded for provenance and for debugging section boundaries; nothing downstream reads it.
+- `end_line`: 1-based inclusive line number of the last line in `text`. The section ends at whichever comes first: the line before the next body heading carrying a different item number, the line before a `SIGNATURES` or `EXHIBIT INDEX` line, or the end of the body. Indexed and nulled the same way as `start_line`.
 - `section_char_count`: Character count for the extracted section text.
 
 Primary key: `item_id`
@@ -230,6 +287,142 @@ Primary key: `debt_instrument_mention_id`
 
 Rows publish from extractor states `SUCCESS` and `PARTIAL` (#152). A `PARTIAL` row salvaged what a terminal failure left intact — individually valid entries after a final `instrument_ie` validation failure, or mentions without lineage after a terminal `instrument_relation` failure — and also carries a failure-registry entry recording what was lost.
 
+#### Evidence payload shapes
+
+Every `_json` column on `mentions` holds a JSON document serialized into a text
+column, not a nested parquet type. The column descriptions above give each
+one's meaning; this section gives their structure, which is shared.
+
+Three container shapes:
+
+- **One fact object** — `name_json`, `start_date_json`, `maturity_date_json`,
+  `commitment_termination_date_json`, `status_json`, `interest_rate_json`.
+  Always written, even when the fact carries no value: a payload whose value
+  key is null while `spans` is populated is how "the filing discusses this, and
+  here is where, but states no resolvable value" is recorded. That is a
+  different claim from an empty payload, and both are different from the flat
+  column being null.
+- **An array of fact objects** — `amounts_json`, `dates_json`, `parties_json`.
+  One element per fact the filing states; `[]` when it states none. Element
+  order is the extractor's and carries no meaning, so consumers must key on the
+  attributes rather than on position.
+- **An array of identifiers** — `retired_by_json` holds
+  `debt_instrument_mention_id` strings and no evidence.
+
+##### `spans`
+
+Fact objects carry a `spans` list, and its element shape is the same
+everywhere:
+
+```json
+{"tag_id": "tag-6", "char_start": 186, "char_end": 219,
+ "text": "Convertible Senior Notes due 2031"}
+```
+
+- `char_start`, `char_end`: a half-open offset pair indexing the **parent
+  item's own `text`** exactly (#154) — not the filing, and not
+  `documents.text`. The extractor realigns model output whose whitespace
+  drifted so this holds. `items.text[char_start:char_end] == text`, which makes
+  `text` redundant and recoverable; it is stored anyway so a consumer can
+  render evidence without joining back to `items`.
+- `tag_id`: the NER tag this span came from, stable within one item. It is how
+  two facts are known to cite the same piece of text.
+- An empty `spans` list means the value was not cited. That is legitimate for a
+  name-derived value — a `notes due 2028` maturity has no separate evidence
+  span — and those payloads carry `derived_from: "name"`.
+- `status_json` is the one exception to the placement: it has no top-level
+  `spans` at all. Its evidence sits one level down, in
+  `status_json.status_date.spans`, and `status_date` is itself null when the
+  filing states the event without a date. A consumer that walks `spans` at the
+  top level of every payload silently collects nothing for status.
+
+##### Fact attributes
+
+| attribute | appears on | meaning |
+|---|---|---|
+| `kind` | `dates_json`, `amounts_json`, the three date payloads, `interest_rate_json`, `parties_json` | Which fact this is. Per-column vocabularies are listed in the column descriptions above. |
+| `normalized_date` | date payloads, `dates_json` | `YYYY-MM-DD`, or null when no date resolves. |
+| `normalized_amount` | `amounts_json` | Digits with at most one decimal point. |
+| `rate_pct` | `interest_rate_json` | Numeric string; null for floating rates. |
+| `derived_from` | every value-bearing payload | `"stated"` when parsed from cited evidence, `"name"` when read out of the instrument's own name, null when there is no value (#128). |
+| `precision` | date payloads, `dates_json` | `day`, `month`, or `year` — how precisely the cited text states the date, not how precisely `normalized_date` is written. |
+| `prior` | `dates_json`, `amounts_json` | True for a term stated as it stood *before* an amendment (`from $25,000,000 to $50,000,000`). Prior facts never supply a flat column. |
+| `expected` | date payloads, `dates_json` | True for a date the filing states as planned rather than occurred — an expected closing, a noticed redemption. |
+| `as_of_date` | `amounts_json` | Normally present only on balances. |
+| `currency` | `amounts_json` | ISO 4217. |
+| `role`, `kind`, `canonical_name` | `parties_json` | Role in the instrument, `named` or `collective`, and the longest span's text as the cluster's key (#150). |
+| `status`, `status_date`, `derived_from_kind` | `status_json` | `status_date` is itself a full evidence payload, nested one level deeper. `derived_from_kind` names the `dates_json` event kind that decided the status. |
+
+##### Worked examples
+
+A value-bearing single payload, `start_date_json`:
+
+```json
+{"kind": "agreement", "normalized_date": "2022-09-20", "precision": "day",
+ "derived_from": "stated", "prior": false, "expected": false,
+ "spans": [{"tag_id": "tag-27", "char_start": 6709, "char_end": 6727,
+            "text": "September 20, 2022"}]}
+```
+
+An array payload where one fact is a pre-amendment figure, `amounts_json`:
+
+```json
+[{"kind": "commitment", "normalized_amount": "1500000000", "currency": "USD",
+  "as_of_date": null, "derived_from": "stated", "prior": true,
+  "spans": [{"tag_id": "tag-6", "char_start": 448, "char_end": 462,
+             "text": "$1,500,000,000"}]},
+ {"kind": "commitment", "normalized_amount": "2500000000", "currency": "USD",
+  "as_of_date": null, "derived_from": "stated", "prior": false,
+  "spans": [{"tag_id": "tag-7", "char_start": 466, "char_end": 480,
+             "text": "$2,500,000,000"}]}]
+```
+
+A payload that found evidence but no resolvable value, `maturity_date_json` —
+the filing says "fifth anniversary of the Initial Secured Loan Closing Date":
+
+```json
+{"kind": "maturity", "normalized_date": null, "precision": null,
+ "derived_from": null, "prior": false, "expected": false,
+ "spans": [{"tag_id": "tag-24", "char_start": 907, "char_end": 924,
+            "text": "fifth anniversary"},
+           {"tag_id": "tag-25", "char_start": 932, "char_end": 965,
+            "text": "Initial Secured Loan Closing Date"}]}
+```
+
+The nested `status_date` payload inside `status_json`:
+
+```json
+{"status": "entered_into", "derived_from_kind": "agreement",
+ "status_date": {"normalized_date": "2022-09-20", "derived_from": "stated",
+                 "spans": [{"tag_id": "tag-27", "char_start": 6709,
+                            "char_end": 6727, "text": "September 20, 2022"}]}}
+```
+
+##### Reading them safely
+
+- **Older partitions key spans as `mentions`, not `spans`.** Partitions written
+  before the evidence-shape change (#128) use the old key with the same element
+  shape. `matcher.cluster_canonical_key` carries the fallback; any new consumer
+  needs it too. This is schema versioning living inside an opaque string, where
+  neither the column types declared above nor a parquet reader can see it.
+- **A missing column does not read as a missing value.** `read_table` reindexes
+  an absent column to `NaN`, and `NaN` is truthy, so the common
+  `json.loads(str(value or "[]"))` idiom passes it the literal text `nan` and
+  raises `JSONDecodeError` (#193). Test for `pd.isna` before the `or`.
+- **Do not assume a payload's presence implies a value**, or a value implies
+  evidence. The three cases — no payload, payload without a value, value
+  without spans — are distinct and all occur.
+
+##### Observed multiplicity
+
+Measured over a 669-mention window, for anyone sizing a consumer or a rewrite:
+**11.1 fact objects and 18.5 spans per mention**, 1.7 spans per fact. The
+distribution is skewed: `parties_json` accounts for 8.4 spans per mention and
+`name_json` for 5.1, because a defined term like `the Company` or `Notes` is
+tagged at every recurrence. Serialized, the payloads are ~2.7 KB per mention
+uncompressed against ~200 bytes for all the flat columns together, so the
+evidence is effectively the whole row.
+
 ### `mention-cluster-edges`
 
 Columns:
@@ -269,7 +462,7 @@ Columns:
 
   The legs are tried in order: an extracted terminal event; then `closed`/`superseded` when any amendment child replaced this state; then `closed`/`repaid` when only the retirement lineage says the obligation ended; then the date legs. An explicit `start_date` the reference date has passed outranks a later announcement, so re-announcing an instrument that already closed does not revert it (#169). An instrument with no dates and no events stays `active`: the filing describes an obligation it treats as outstanding, and there is no evidence against that.
 
-  The reference date is the newest filing date among this run's mentions, so a rerun over the same inputs reproduces the same statuses. End dates are `maturity_date`, `commitment_termination_date`, and any planned retirement the mentions record (an `expected` terminal date fact, or a terminal status dated after the filing that carries it — a redemption notice). The *latest* of them governs: a lapsed commitment does not close a facility whose principal is still owed to a later maturity. A planned retirement stated with no date can never be shown to have come due, so it blocks `expected_closed` indefinitely.
+  The reference date is what the date legs treat as "now": the newest filing date among **every** mention in the run, resolved once before the matcher shards its work and passed into the rollup, so a rerun over the same inputs reproduces the same statuses. It is deliberately not the wall clock, which would make every rerun differ. It is also not per `cik_shard` — a shard is a hash bucket, so deriving it there made a published status depend on which unrelated issuers happened to share a bucket, and left a shard of quiet filers judged against a date months behind the corpus (#188). End dates are `maturity_date`, `commitment_termination_date`, and any planned retirement the mentions record (an `expected` terminal date fact, or a terminal status dated after the filing that carries it — a redemption notice). The *latest* of them governs: a lapsed commitment does not close a facility whose principal is still owed to a later maturity. A planned retirement stated with no date can never be shown to have come due, so it blocks `expected_closed` indefinitely.
 - `status_subtype`: The cause of a `closed` status, null for every other status: `repaid`, `terminated`, `exchanged` or `defaulted` from the extracted terminal event, or `superseded` when a later amendment replaced this state. The display form joins the two with a dash — `closed - repaid` — so a reader sees the state and its cause together.
 - `status_date`: The date that decided `status`: the winning event's date, the `start_date` behind `active`, the planned start behind `expected_active`, or the end date behind `expected_closed`. Null for a `closed` status derived from lineage rather than an event. An `announced` status is dated no later than the filing that announced it.
 - `status_source_mention_id`: The mention whose extracted event decided `status`, when one did. Null on the inferred statuses, because no mention states them.
