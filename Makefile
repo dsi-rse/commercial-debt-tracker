@@ -39,7 +39,7 @@ PULUMI_WITH_AWS = cd pulumi && $(PULUMI_AWS_ENV) pulumi
 export PULUMI_CONFIG_PASSPHRASE
 
 # Build Docker image
-.PHONY: build-only run-interactive run-notebook local-run local-pipeline
+.PHONY: build-only run-interactive local-run local-pipeline
 
 # Build Docker image 
 build-only: 
@@ -47,11 +47,6 @@ build-only:
 
 run-interactive: build-only	
 	docker compose run -it --rm $(project_name) /bin/bash
-
-run-notebooks: build-only	
-	docker compose run --rm -p 8888:8888 -t $(project_name) \
-	jupyter lab --port=8888 --ip='*' --NotebookApp.token='' --NotebookApp.password='' \
-	--no-browser --allow-root
 
 local-run:
 	mkdir -p "$(LOCAL_ARTIFACT_ROOT)"

@@ -35,8 +35,6 @@ dev = [
   "coverage~=7.3",
   "pytest>=9.0.3",
   "pytest-cov~=7.0",
-  "jupyterlab>=4.5.10,<5",
-  "ipykernel~=6.16",
 ]
 pulumi = [
   "pip>=26.1.2",
