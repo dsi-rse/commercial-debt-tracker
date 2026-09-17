@@ -258,8 +258,13 @@ tokens (1.31x), 88 of the 219 being merged groups.
 
 ## What is not in this change
 
-The scheduled pipeline. `cdt sixk` drives the stage, with its own dataset and
-completion registry (#179), but `pipeline.py` and the orchestrator have no 6-K
-phase yet, so the deployed daily run does not call it. Cross-row deduplication
-after extraction is also still open — that is where duplicate *mentions* should
-be resolved, by comparing extracted values rather than inferring from prose.
+Cross-row deduplication after extraction — that is where duplicate *mentions*
+should be resolved, by comparing extracted values rather than inferring from
+prose. Publishing 6-K snippets into `items/latest.parquet` is also still open:
+it needs a dashboard-side change first, so 6-K reaches consumers through the
+instrument and mention tables rather than the snippet-level one.
+
+The scheduled pipeline does now run this stage: `pipeline.py` prepares both
+genres by default and the orchestrator takes `--genres` / `GENRES` to narrow a
+run. Worth knowing before enabling it on a wide CIK list: unlike the 8-K
+prepare chain, this stage costs an LLM call per filing with admitted windows.

@@ -63,7 +63,13 @@ from cdt.matcher.core import apply_lineage_inference_pass
 from cdt.pipeline import (
     ALL_TIME_START_DATE as PIPELINE_ALL_TIME_START_DATE,
 )
-from cdt.pipeline import PipelineConfig, resolve_mode_dates, run_pipeline
+from cdt.pipeline import (
+    DEFAULT_GENRES,
+    PipelineConfig,
+    normalize_genres,
+    resolve_mode_dates,
+    run_pipeline,
+)
 from cdt.sixk.mirror import mirror_root
 from cdt.sixk.scraper import acquire_scraped_sixk_documents
 from cdt.sixk.stage import DEFAULT_CONCURRENCY as SIXK_DEFAULT_CONCURRENCY
@@ -400,6 +406,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--match-batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
     )
     pipeline_parser.add_argument(
+        "--genres",
+        type=normalize_genres,
+        default=DEFAULT_GENRES,
+        help=(
+            "comma-separated filing genres to prepare (default "
+            f"{','.join(DEFAULT_GENRES)}). A run acquires every genre unless "
+            "narrowed; extract, match and finalize run once over whichever "
+            "genres produced rows."
+        ),
+    )
+    pipeline_parser.add_argument(
+        "--sixk-cik-file",
+        default=None,
+        help=(
+            "CIKs for the 6-K genre, if they differ from the run's. Exists "
+            "because a list chosen for 8-K coverage can contain no foreign "
+            "private issuers, which makes the 6-K chain a no-op."
+        ),
+    )
+    pipeline_parser.add_argument(
+        "--sixk-batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
+    )
+    pipeline_parser.add_argument(
+        "--sixk-concurrency", type=positive_int, default=SIXK_DEFAULT_CONCURRENCY
+    )
+    pipeline_parser.add_argument(
         "--item-numbers",
         type=parse_item_numbers,
         default=POTENTIALLY_RELEVANT_ITEM_NUMBERS,
@@ -629,6 +661,10 @@ def run_pipeline_command(args: argparse.Namespace) -> int:
                 strong_match_threshold=args.strong_match_threshold,
                 loose_match_threshold=args.loose_match_threshold,
                 ambiguity_margin=args.ambiguity_margin,
+                genres=args.genres,
+                sixk_cik_file=args.sixk_cik_file,
+                sixk_batch_size=args.sixk_batch_size,
+                sixk_concurrency=args.sixk_concurrency,
             )
         )
     except ValueError as exc:
@@ -640,16 +676,30 @@ def run_pipeline_command(args: argparse.Namespace) -> int:
     finally:
         release_lease(lease)
 
-    print(f"Ran pipeline from {result.start_date} through {result.end_date}.")
     print(
-        f"Ingest indexed {result.ingest.total_rows} rows, itemized {result.itemized_rows}, "
-        f"classified {result.classified_rows}, extracted {result.extracted_rows}, and matched {result.matched_rows} mentions."
+        f"Ran pipeline from {result.start_date} through {result.end_date} "
+        f"over genres {','.join(result.genres)}."
+    )
+    if result.ingest is not None:
+        print(
+            f"8-K: ingest indexed {result.ingest.total_rows} rows, itemized "
+            f"{result.itemized_rows}, classified {result.classified_rows}."
+        )
+    if result.sixk_ingest is not None:
+        print(
+            f"6-K: ingest acquired {result.sixk_ingest.total_rows} rows, "
+            f"triaged {result.sixk_snippet_rows} snippets."
+        )
+    print(
+        f"Extracted {result.extracted_rows} and matched {result.matched_rows} mentions."
     )
     print(
         f"Artifact root: {result.artifact_root}. Debt instruments: {debt_instruments_root(result.artifact_root)}."
     )
     print(f"Extractor runs: {result.extractor_run_path}.")
-    print(f"Failure registry: {result.ingest.failure_file}.")
+    registry = result.ingest or result.sixk_ingest
+    if registry is not None:
+        print(f"Failure registry: {registry.failure_file}.")
     return 0
 
 
