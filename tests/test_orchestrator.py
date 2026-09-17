@@ -12,6 +12,7 @@ import pytest
 import cdt.orchestrator as orch
 from cdt.extractor import ExtractTickResult
 from cdt.lease import acquire_lease
+from cdt.pipeline import DEFAULT_GENRES, GENRE_6K, GENRE_8K
 
 
 def test_poll_finalizes_on_completion(
@@ -441,6 +442,135 @@ def test_historical_batch_does_not_run_while_lease_held(
         )
         == 1
     )
+
+
+def test_scheduled_runs_prepare_both_genres_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The deployed daily run acquires whatever the CIKs filed, not just 8-K."""
+    captured: list[object] = []
+    monkeypatch.setattr(
+        orch,
+        "run_prepare_stages",
+        lambda config, **kwargs: (captured.append(config), str(tmp_path))[1],
+    )
+    monkeypatch.setattr(orch, "run_match_and_finalize", lambda **kwargs: None)
+
+    assert (
+        orch.main(
+            [
+                "--artifact-root",
+                str(tmp_path),
+                "daily",
+                "--cik-file",
+                "c.txt",
+                "--start-date",
+                "2026-09-08",
+                "--end-date",
+                "2026-09-08",
+            ]
+        )
+        == 0
+    )
+    assert captured[0].genres == DEFAULT_GENRES
+    # Unset means "the run's CIKs", so one list covers both genres.
+    assert captured[0].sixk_cik_file is None
+
+
+def test_genres_can_be_narrowed_on_a_scheduled_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run deliberately about one genre says so, and the config carries it."""
+    captured: list[object] = []
+    monkeypatch.setattr(
+        orch,
+        "run_prepare_stages",
+        lambda config, **kwargs: (captured.append(config), str(tmp_path))[1],
+    )
+    monkeypatch.setattr(orch, "run_match_and_finalize", lambda **kwargs: None)
+
+    assert (
+        orch.main(
+            [
+                "--artifact-root",
+                str(tmp_path),
+                "--genres",
+                "6-K",
+                "--sixk-cik-file",
+                "fpi.txt",
+                "historical",
+                "--cik-file",
+                "c.txt",
+                "--start-date",
+                "2026-09-01",
+                "--end-date",
+                "2026-09-08",
+            ]
+        )
+        == 0
+    )
+    assert captured[0].genres == (GENRE_6K,)
+    assert captured[0].sixk_cik_file == "fpi.txt"
+
+
+def test_genres_come_from_the_environment_when_not_passed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Task definitions set env, not argv, so GENRES has to reach the config."""
+    monkeypatch.setenv("GENRES", "8-K")
+    captured: list[object] = []
+    monkeypatch.setattr(
+        orch,
+        "run_prepare_stages",
+        lambda config, **kwargs: (captured.append(config), str(tmp_path))[1],
+    )
+    monkeypatch.setattr(orch, "run_match_and_finalize", lambda **kwargs: None)
+
+    assert (
+        orch.main(
+            [
+                "--artifact-root",
+                str(tmp_path),
+                "daily",
+                "--cik-file",
+                "c.txt",
+                "--start-date",
+                "2026-09-08",
+                "--end-date",
+                "2026-09-08",
+            ]
+        )
+        == 0
+    )
+    assert captured[0].genres == (GENRE_8K,)
+
+
+def test_an_unknown_genre_fails_before_any_stage_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Argparse rejects it, so a typo cannot silently narrow a scheduled run."""
+    monkeypatch.setattr(
+        orch,
+        "run_prepare_stages",
+        lambda config, **kwargs: pytest.fail("prepare must not run"),
+    )
+
+    with pytest.raises(SystemExit):
+        orch.main(
+            [
+                "--artifact-root",
+                str(tmp_path),
+                "--genres",
+                "10-K",
+                "daily",
+                "--cik-file",
+                "c.txt",
+                "--start-date",
+                "2026-09-08",
+                "--end-date",
+                "2026-09-08",
+            ]
+        )
 
 
 def test_placeholder_secret_fails_fast(

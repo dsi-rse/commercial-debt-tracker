@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import date
 from pathlib import Path
 
@@ -14,11 +15,17 @@ from cdt.ingest import IngestRunResult
 from cdt.matcher import debt_instruments_root, mention_matches_root
 from cdt.pipeline import (
     ALL_TIME_START_DATE,
+    DEFAULT_GENRES,
+    GENRE_6K,
+    GENRE_8K,
     PipelineConfig,
+    normalize_genres,
     resolve_mode_dates,
     run_pipeline,
 )
 from cdt.storage import read_dataset, read_table, write_partition_table
+
+EXPECTED_SIXK_SNIPPETS = 2
 
 
 class FakeModel:
@@ -87,6 +94,36 @@ def test_run_pipeline_uses_stage_backed_functions(
         calls.append(("classify", kwargs["batch_size"]))
         return pd.DataFrame([{"item_id": "item-1", "relevance": True}])
 
+    def fake_acquire_scraped_sixk_documents(
+        config: object,
+        *,
+        ciks: set[str] | None = None,
+        s3_client: object | None = None,
+    ) -> tuple[pd.DataFrame, IngestRunResult]:
+        del s3_client
+        calls.append(("ingest-sixk", ciks))
+        return pd.DataFrame([{"accession_number": "2"}]), IngestRunResult(
+            mode="historical",
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 1, 31),
+            ciks_count=len(ciks or set()),
+            candidates_seen=2,
+            skipped_existing=0,
+            downloaded=0,
+            failures=0,
+            total_rows=2,
+            output_root=str(tmp_path),
+            documents_root=str(tmp_path / "documents-sixk"),
+            document_partitions=(),
+            failure_file=str(tmp_path / "failures" / "ingest_failures.json"),
+            run_manifest=str(tmp_path / "runs" / "ingest" / "run_id=2.json"),
+            dataset_name="documents-sixk",
+        )
+
+    def fake_triage_pending_documents(**kwargs: object) -> pd.DataFrame:
+        calls.append(("sixk", kwargs["batch_size"]))
+        return pd.DataFrame([{"item_id": "snippet-1"}, {"item_id": "snippet-2"}])
+
     def fake_extract_pending_items(**kwargs: object) -> pd.DataFrame:
         calls.append(("extract", kwargs["batch_size"]))
         return pd.DataFrame([{"debt_instrument_mention_id": "mention-1"}])
@@ -108,6 +145,13 @@ def test_run_pipeline_uses_stage_backed_functions(
         "cdt.pipeline.classify_pending_items", fake_classify_pending_items
     )
     monkeypatch.setattr(
+        "cdt.pipeline.acquire_scraped_sixk_documents",
+        fake_acquire_scraped_sixk_documents,
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.triage_pending_documents", fake_triage_pending_documents
+    )
+    monkeypatch.setattr(
         "cdt.pipeline.extract_pending_items", fake_extract_pending_items
     )
     monkeypatch.setattr(
@@ -125,29 +169,228 @@ def test_run_pipeline_uses_stage_backed_functions(
             classify_batch_size=12,
             extract_batch_size=13,
             match_batch_size=14,
+            sixk_batch_size=15,
         )
     )
 
+    assert result.ingest is not None
     assert result.ingest.total_rows == 1
     assert result.itemized_rows == 1
     assert result.classified_rows == 1
+    assert result.sixk_ingest is not None
+    assert result.sixk_ingest.total_rows == 2
+    assert result.sixk_snippet_rows == EXPECTED_SIXK_SNIPPETS
     assert result.extracted_rows == 1
     assert result.matched_rows == 1
     assert result.debt_instrument_rows == 1
+    # Both genres by default, and the same CIKs asked of each: the caller says
+    # which issuers and which dates, not which forms those issuers filed.
+    assert result.genres == DEFAULT_GENRES
     assert calls == [
         ("ingest", {"320193"}),
         ("itemize", 11),
         ("classify", 12),
+        ("ingest-sixk", {"320193"}),
+        ("sixk", 15),
         ("extract", 13),
         ("match", 14),
     ]
+
+
+def test_genres_narrow_the_run_to_one_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--genres 6-K` runs the 6-K chain and not one 8-K stage.
+
+    The chains read different documents datasets and write different
+    classification sources, so narrowing leaves the other genre's partitions
+    exactly as they were — pending, for a later run — rather than half-done.
+    """
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("1023514\n", encoding="utf-8")
+    calls: list[str] = []
+
+    def unexpected(name: str) -> Callable[..., object]:
+        def fail(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            msg = f"{name} must not run when the 8-K genre is excluded"
+            raise AssertionError(msg)
+
+        return fail
+
+    monkeypatch.setattr("cdt.pipeline.run_ingest_pipeline", unexpected("ingest"))
+    monkeypatch.setattr("cdt.pipeline.itemize_pending_documents", unexpected("itemize"))
+    monkeypatch.setattr("cdt.pipeline.classify_pending_items", unexpected("classify"))
+    monkeypatch.setattr(
+        "cdt.pipeline.acquire_scraped_sixk_documents",
+        lambda config, **kwargs: (
+            calls.append("ingest-sixk"),
+            (pd.DataFrame(), _sixk_ingest_result(tmp_path, kwargs.get("ciks"))),
+        )[1],
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.triage_pending_documents",
+        lambda **kwargs: (calls.append("sixk"), pd.DataFrame())[1],
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.extract_pending_items",
+        lambda **kwargs: (calls.append("extract"), pd.DataFrame())[1],
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.match_pending_mentions",
+        lambda **kwargs: (
+            calls.append("match"),
+            {
+                "debt_instrument_mentions": pd.DataFrame(),
+                "debt_instrument": pd.DataFrame(),
+            },
+        )[1],
+    )
+
+    result = run_pipeline(
+        PipelineConfig(
+            mode="historical",
+            cik_file=str(cik_file),
+            start_date=date(2026, 9, 8),
+            end_date=date(2026, 9, 8),
+            artifact_root=str(tmp_path),
+            genres=(GENRE_6K,),
+        )
+    )
+
+    assert calls == ["ingest-sixk", "sixk", "extract", "match"]
+    assert result.genres == (GENRE_6K,)
+    # Absent, not empty: the 8-K chain did not run, which a zero-row result
+    # would not distinguish from a run that found no filings.
+    assert result.ingest is None
+    assert result.sixk_ingest is not None
+
+
+def test_the_sixk_chain_can_take_its_own_cik_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A list chosen for 8-K coverage may contain no foreign private issuers."""
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("320193\n", encoding="utf-8")
+    sixk_cik_file = tmp_path / "fpi-ciks.txt"
+    sixk_cik_file.write_text("1023514\n", encoding="utf-8")
+    asked: dict[str, set[str] | None] = {}
+
+    monkeypatch.setattr(
+        "cdt.pipeline.run_ingest_pipeline",
+        lambda config, **kwargs: (
+            asked.__setitem__("8-K", kwargs.get("ciks")),
+            (pd.DataFrame(), _sixk_ingest_result(tmp_path, kwargs.get("ciks"))),
+        )[1],
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.itemize_pending_documents", lambda **kwargs: pd.DataFrame()
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.classify_pending_items", lambda **kwargs: pd.DataFrame()
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.acquire_scraped_sixk_documents",
+        lambda config, **kwargs: (
+            asked.__setitem__("6-K", kwargs.get("ciks")),
+            (pd.DataFrame(), _sixk_ingest_result(tmp_path, kwargs.get("ciks"))),
+        )[1],
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.triage_pending_documents", lambda **kwargs: pd.DataFrame()
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.extract_pending_items", lambda **kwargs: pd.DataFrame()
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.match_pending_mentions",
+        lambda **kwargs: {
+            "debt_instrument_mentions": pd.DataFrame(),
+            "debt_instrument": pd.DataFrame(),
+        },
+    )
+
+    run_pipeline(
+        PipelineConfig(
+            mode="historical",
+            cik_file=str(cik_file),
+            sixk_cik_file=str(sixk_cik_file),
+            start_date=date(2026, 9, 8),
+            end_date=date(2026, 9, 8),
+            artifact_root=str(tmp_path),
+        )
+    )
+
+    assert asked == {"8-K": {"320193"}, "6-K": {"1023514"}}
+
+
+def test_normalize_genres_parses_validates_and_orders() -> None:
+    """A genre list is parsed once, in pipeline order, or rejected."""
+    assert normalize_genres("8-K,6-K") == DEFAULT_GENRES
+    # Order is the pipeline's, not the caller's, and duplicates collapse.
+    assert normalize_genres("6-K,8-K") == DEFAULT_GENRES
+    assert normalize_genres("6-k,6-K") == (GENRE_6K,)
+    assert normalize_genres([GENRE_8K]) == (GENRE_8K,)
+    # A typo must not read as "prepare less than asked": a run that quietly
+    # prepared nothing looks exactly like a corpus with no filings.
+    with pytest.raises(ValueError, match="unknown genre"):
+        normalize_genres("8-K,10-K")
+    with pytest.raises(ValueError, match="no genres selected"):
+        normalize_genres("")
+    with pytest.raises(ValueError, match="no genres selected"):
+        normalize_genres([])
+
+
+def test_a_run_refuses_a_genre_selection_that_prepares_nothing(
+    tmp_path: Path,
+) -> None:
+    """Validated in the run, not only in the CLI that usually builds the config."""
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("320193\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="no genres selected"):
+        run_pipeline(
+            PipelineConfig(
+                mode="historical",
+                cik_file=str(cik_file),
+                start_date=date(2024, 1, 1),
+                end_date=date(2024, 1, 31),
+                artifact_root=str(tmp_path),
+                genres=(),
+            )
+        )
+
+
+def _sixk_ingest_result(tmp_path: Path, ciks: set[str] | None) -> IngestRunResult:
+    return IngestRunResult(
+        mode="historical",
+        start_date=date(2026, 9, 8),
+        end_date=date(2026, 9, 8),
+        ciks_count=len(ciks or set()),
+        candidates_seen=0,
+        skipped_existing=0,
+        downloaded=0,
+        failures=0,
+        total_rows=0,
+        output_root=str(tmp_path),
+        documents_root=str(tmp_path / "documents-sixk"),
+        document_partitions=(),
+        failure_file=str(tmp_path / "failures" / "ingest_failures.json"),
+        run_manifest=str(tmp_path / "runs" / "ingest" / "run_id=1.json"),
+        dataset_name="documents-sixk",
+    )
 
 
 def test_run_pipeline_processes_small_seeded_batch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The full pipeline should complete on one seeded document batch."""
+    """The full pipeline should complete on one seeded document batch.
+
+    Scoped to the 8-K genre: the seeded batch is an 8-K submission, and the
+    6-K chain would go looking for filings in a bucket this test does not
+    stand up. Genre narrowing is covered on its own below.
+    """
     cik_file = tmp_path / "ciks.txt"
     cik_file.write_text("320193\n", encoding="utf-8")
 
@@ -260,6 +503,7 @@ This is the extracted event text.
             match_batch_size=1,
             artifact_root=str(tmp_path),
             final_database_root=str(tmp_path / "database" / "cdt"),
+            genres=(GENRE_8K,),
         )
     )
 
