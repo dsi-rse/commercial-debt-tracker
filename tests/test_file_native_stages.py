@@ -2528,8 +2528,6 @@ def test_lineage_inference_pass_writes_pointers_and_rederives_the_rollup(
     # the rollup must be re-derived from the new pointer, not left stale
     assert parent["is_lineage_head"] is False
     assert parent["superseded_by_debt_instrument_id"] == "m-2"
-    assert parent["status"] == "closed"
-    assert parent["status_subtype"] == "superseded"
     assert child["lineage_family_id"] == parent["lineage_family_id"]
 
     # An ordinary rematch keeps the pointer, so it must keep the provenance too:
@@ -2541,7 +2539,7 @@ def test_lineage_inference_pass_writes_pointers_and_rederives_the_rollup(
     }
     assert after["m-2"]["amendment_of_debt_instrument_id"] == "m-1"
     assert after["m-2"]["amendment_inferred_by"] == "ordinal_chain"
-    assert after["m-1"]["status"] == "closed"
+    assert after["m-1"]["is_lineage_head"] is False
 
     # --force drops both together: no pointer, no stale provenance.
     match_pending_mentions(artifact_root=tmp_path, batch_size=5, force=True)
@@ -4423,8 +4421,8 @@ def test_canonical_fields_record_their_source_mention() -> None:
     assert row["principal_source_mention_id"] == "m-old"
 
 
-def test_lifecycle_rollup_marks_heads_families_and_status() -> None:
-    """Amendment chains get superseded/head markers, families, and status (#155)."""
+def test_lifecycle_rollup_marks_heads_and_families() -> None:
+    """Amendment chains get superseded/head markers and families (#155)."""
     from cdt.matcher.core import apply_lifecycle_rollup, prepare_mention
 
     predecessor = prepare_mention(
@@ -4475,75 +4473,11 @@ def test_lifecycle_rollup_marks_heads_families_and_status() -> None:
     old_row, new_row = rows
     assert old_row["superseded_by_debt_instrument_id"] == "inst-new"
     assert old_row["is_lineage_head"] is False
-    assert (old_row["status"], old_row["status_subtype"]) == ("closed", "superseded")
     assert new_row["is_lineage_head"] is True
-    assert new_row["status"] == "active"
     assert old_row["lineage_family_id"] == new_row["lineage_family_id"]
     assert new_row["first_seen_filing_date"] == "2024-01-02"
     assert new_row["mention_count"] == 1
     assert new_row["document_count"] == 1
-
-
-def test_lifecycle_status_prefers_terminal_events_and_derives_expected_closed() -> None:
-    """A terminated event closes the row; a past maturity is only expected_closed (#183)."""
-    from cdt.matcher.core import apply_lifecycle_rollup, prepare_mention
-
-    terminated = prepare_mention(
-        build_mention_row(
-            mention_id="m-term",
-            item_id="item-1",
-            accession_number="0001",
-            cik="320193",
-            date="2026-06-03",
-            name="Old Facility",
-            start_date="2023-10-11",
-            amount=None,
-        )
-        | {"status": "terminated", "status_date": "2026-06-02"}
-    )
-    stale = prepare_mention(
-        build_mention_row(
-            mention_id="m-stale",
-            item_id="item-2",
-            accession_number="0002",
-            cik="320193",
-            date="2026-06-03",
-            name="4.875% Senior Notes due 2024",
-            start_date="2017-12-19",
-            amount=None,
-        )
-    )
-    rows = [
-        {
-            "debt_instrument_id": "inst-term",
-            "amendment_of_debt_instrument_id": None,
-            "split_of_debt_instrument_id": None,
-            "retired_by_debt_instrument_ids": None,
-            "maturity_date": None,
-        },
-        {
-            "debt_instrument_id": "inst-stale",
-            "amendment_of_debt_instrument_id": None,
-            "split_of_debt_instrument_id": None,
-            "retired_by_debt_instrument_ids": None,
-            "maturity_date": "2024-01-15",
-        },
-    ]
-    apply_lifecycle_rollup(
-        rows,
-        member_groups={"inst-term": ["m-term"], "inst-stale": ["m-stale"]},
-        mention_index={"m-term": terminated, "m-stale": stale},
-    )
-    term_row, stale_row = rows
-    # An extracted terminal event is a closure with its cause in the subtype.
-    assert (term_row["status"], term_row["status_subtype"]) == ("closed", "terminated")
-    assert term_row["status_date"] == "2026-06-02"
-    assert term_row["status_source_mention_id"] == "m-term"
-    # A passed maturity is a schedule, not an observed repayment, so the row is
-    # only *expected* closed and carries no cause.
-    assert stale_row["status"] == "expected_closed"
-    assert stale_row["status_subtype"] is None
-    assert stale_row["status_date"] == "2024-01-15"
 
 
 def test_canonical_maturity_prefers_stated_over_name_derived() -> None:
@@ -4768,66 +4702,6 @@ def test_tenor_parsing_and_date_arithmetic() -> None:
     assert date_plus_tenor("2026-06-24", (5, "year")) == "2031-06-24"
     assert date_plus_tenor("2026-01-02", (364, "day")) == "2027-01-01"
     assert date_plus_tenor("2026-08-31", (18, "month")) == "2028-02-29"
-
-
-def test_lifecycle_status_treats_future_dated_retirement_as_pending() -> None:
-    """A `repaid` event dated after its filing is an intent; the row stays active."""
-    from cdt.matcher.core import apply_lifecycle_rollup, prepare_mention
-
-    target = prepare_mention(
-        build_mention_row(
-            mention_id="m-target",
-            item_id="item-1",
-            accession_number="0001",
-            cik="320193",
-            date="2026-03-04",
-            name="5.25% Senior Notes due 2027",
-            start_date=None,
-            amount=None,
-        )
-        | {"status": "repaid", "status_date": "2026-04-03"}
-    )
-    new_notes = prepare_mention(
-        build_mention_row(
-            mention_id="m-new",
-            item_id="item-1",
-            accession_number="0001",
-            cik="320193",
-            date="2026-03-04",
-            name="6.00% Senior Notes due 2031",
-            start_date=None,
-            amount=None,
-        )
-        | {"status": "announced", "status_date": "2026-03-18"}
-    )
-    rows = [
-        {
-            "debt_instrument_id": "inst-target",
-            "amendment_of_debt_instrument_id": None,
-            "split_of_debt_instrument_id": None,
-            "retired_by_debt_instrument_ids": '["inst-new"]',
-            "maturity_date": "2027-12-31",
-        },
-        {
-            "debt_instrument_id": "inst-new",
-            "amendment_of_debt_instrument_id": None,
-            "split_of_debt_instrument_id": None,
-            "retired_by_debt_instrument_ids": None,
-            "maturity_date": "2031-12-31",
-        },
-    ]
-    apply_lifecycle_rollup(
-        rows,
-        member_groups={"inst-target": ["m-target"], "inst-new": ["m-new"]},
-        mention_index={"m-target": target, "m-new": new_notes},
-    )
-    target_row, new_row = rows
-    # The redemption has not happened, and the retiring notes have not closed.
-    assert target_row["status"] == "active"
-    assert target_row["status_source_mention_id"] is None
-    # An announcement is dated no later than the filing that announced it.
-    assert new_row["status"] == "announced"
-    assert new_row["status_date"] == "2026-03-04"
 
 
 def test_resolve_candidates_attaches_on_name_only_tie_instead_of_seeding() -> None:
@@ -5404,51 +5278,6 @@ def test_aggregate_lender_disclosure_precedence() -> None:
     assert aggregate_lender_disclosure([None, "junk"]) == "none_named"
 
 
-def test_lifecycle_treats_expected_retirement_fact_as_pending() -> None:
-    """A planned redemption recorded as an expected date fact keeps the row active."""
-    from cdt.matcher.core import apply_lifecycle_rollup, prepare_mention
-
-    target = prepare_mention(
-        build_mention_row(
-            mention_id="m-t",
-            item_id="item-1",
-            accession_number="0001",
-            cik="320193",
-            date="2026-03-04",
-            name="5.25% Senior Notes due 2027",
-            start_date=None,
-            amount=None,
-        )
-        | {
-            "status": None,
-            "dates_json": json.dumps(
-                [
-                    {
-                        "kind": "retirement",
-                        "normalized_date": None,
-                        "expected": True,
-                        "prior": False,
-                        "spans": [],
-                    }
-                ]
-            ),
-        }
-    )
-    rows = [
-        {
-            "debt_instrument_id": "inst-t",
-            "amendment_of_debt_instrument_id": None,
-            "split_of_debt_instrument_id": None,
-            "retired_by_debt_instrument_ids": '["inst-new"]',
-            "maturity_date": "2027-12-31",
-        }
-    ]
-    apply_lifecycle_rollup(
-        rows, member_groups={"inst-t": ["m-t"]}, mention_index={"m-t": target}
-    )
-    assert rows[0]["status"] == "active"
-
-
 def test_post_filing_closing_is_expected_and_agreement_supplies_start() -> None:
     """Pilot fixes: a closing dated after the filing is planned; a lone agreement date is the start."""
     from cdt.extractor.core import (
@@ -5928,10 +5757,6 @@ def test_published_instrument_columns_are_pinned() -> None:
         "superseded_by_debt_instrument_id",
         "lineage_family_id",
         "is_lineage_head",
-        "status",
-        "status_subtype",
-        "status_date",
-        "status_source_mention_id",
         "first_seen_filing_date",
         "last_seen_filing_date",
         "mention_count",
@@ -6104,65 +5929,6 @@ def test_decimal_coercion_quantizes_legacy_float_error_but_refuses_junk() -> Non
     # but text that is not a number at all is an upstream bug, not drift
     with pytest.raises(ValueError, match="principal_amount is not a number"):
         decimal_column_values(["$100 million"], money, column="principal_amount")
-
-
-def test_status_does_not_depend_on_which_shard_an_issuer_hashes_into(
-    tmp_path: Path,
-) -> None:
-    """One "now" per run, not one per `cik_shard` (#188).
-
-    `cik_shard` is a hash bucket with no semantic meaning. The rollup used to
-    derive its reference date from whatever mentions `match_tables` was handed,
-    which is one shard's worth — so a quiet issuer sharing a bucket with quiet
-    issuers was judged against a "now" months behind the corpus, and its passed
-    maturity still read `active`. Which bucket an issuer lands in decided its
-    published status.
-
-    CIK 320193 hashes to shard 0044 and 789019 to 0048. The quiet issuer's only
-    filing is from 2020 and its note matured in 2023; the corpus runs to 2026.
-    """
-    rows = pd.DataFrame(
-        [
-            build_mention_row(
-                mention_id="m-quiet",
-                item_id="item-quiet",
-                accession_number="0001",
-                cik="320193",
-                date="2020-01-02",
-                name="6.0% Senior Notes due 2023",
-                start_date="2020-01-01",
-                amount="$100 million",
-                maturity_date="2023-01-01",
-            ),
-            build_mention_row(
-                mention_id="m-recent",
-                item_id="item-recent",
-                accession_number="0002",
-                cik="789019",
-                date="2026-06-01",
-                name="Revolving Credit Facility",
-                start_date="2026-05-01",
-                amount="$250 million",
-            ),
-        ]
-    )
-    write_partition_table(
-        tmp_path / "mentions",
-        partition={"date": "2026-06-01", "shard": "0001"},
-        table=rows,
-    )
-    match_pending_mentions(artifact_root=tmp_path, batch_size=5)
-
-    published = {
-        str(row["debt_instrument_id"]): row
-        for row in read_dataset(debt_instruments_root(tmp_path)).to_dict("records")
-    }
-    quiet = published["m-quiet"]
-    # The corpus has reached 2026, so a 2023 maturity is behind it — even though
-    # the only filing in this instrument's own shard is from 2020.
-    assert quiet["status"] == "expected_closed"
-    assert quiet["status_date"] == "2023-01-01"
-    assert published["m-recent"]["status"] == "active"
 
 
 def test_matcher_schema_version_is_pinned() -> None:
@@ -6370,7 +6136,7 @@ def test_two_amendment_children_publish_no_superseded_pointer() -> None:
     assert parent["is_lineage_head"] is False
 
 
-# --- The announced / expected_active split (#183) -----------------------------
+# --- Expected date facts: planned starts vs planned retirements (#183) -------
 
 
 def _expected_closing_dates_json(normalized_date: str | None) -> str:
@@ -6429,284 +6195,6 @@ def test_expected_dates_reads_planned_starts_and_retirements_apart() -> None:
         )
 
 
-def test_an_announcement_whose_planned_start_has_not_arrived_is_announced() -> None:
-    """Rule 1: announced holds while the planned start is still ahead (#183)."""
-    from cdt.matcher.core import apply_lifecycle_rollup, prepare_mention
-
-    announced = prepare_mention(
-        build_mention_row(
-            mention_id="m-a",
-            item_id="item-1",
-            accession_number="0001",
-            cik="320193",
-            date="2026-03-04",
-            name="6.0% Senior Notes due 2034",
-            start_date=None,
-            amount="500000000",
-        )
-        | {
-            "status": "announced",
-            "status_date": "2026-03-04",
-            "dates_json": _expected_closing_dates_json("2026-03-20"),
-        }
-    )
-    rows = [_rollup_row("inst-a")]
-    apply_lifecycle_rollup(
-        rows, member_groups={"inst-a": ["m-a"]}, mention_index={"m-a": announced}
-    )
-
-    assert rows[0]["status"] == "announced"
-    assert rows[0]["status_subtype"] is None
-    assert rows[0]["status_date"] == "2026-03-04"
-    assert rows[0]["status_source_mention_id"] == "m-a"
-
-
-def test_an_announcement_with_no_planned_start_stays_announced() -> None:
-    """Rule 1's other half: nothing to measure against means nothing to infer."""
-    from cdt.matcher.core import apply_lifecycle_rollup, prepare_mention
-
-    announced = prepare_mention(
-        build_mention_row(
-            mention_id="m-a",
-            item_id="item-1",
-            accession_number="0001",
-            cik="320193",
-            date="2020-03-04",
-            name="Commitment Letter Facility",
-            start_date=None,
-            amount="500000000",
-        )
-        | {"status": "announced", "status_date": "2020-03-04"}
-    )
-    # A corpus that has moved six years on still cannot say this one started.
-    other = prepare_mention(
-        build_mention_row(
-            mention_id="m-o",
-            item_id="item-2",
-            accession_number="0002",
-            cik="320193",
-            date="2026-06-01",
-            name="Unrelated Revolver",
-            start_date="2026-06-01",
-            amount="100000000",
-        )
-    )
-    rows = [_rollup_row("inst-a"), _rollup_row("inst-o")]
-    apply_lifecycle_rollup(
-        rows,
-        member_groups={"inst-a": ["m-a"], "inst-o": ["m-o"]},
-        mention_index={"m-a": announced, "m-o": other},
-    )
-
-    assert rows[0]["status"] == "announced"
-
-
-def test_a_planned_start_the_corpus_has_passed_is_expected_active() -> None:
-    """Rule 3: past the planned start with no confirming filing (#183).
-
-    Under #155 this row published `announced` forever, which reads as "has not
-    happened yet" about an instrument that by its own schedule closed months
-    ago.
-    """
-    from cdt.matcher.core import apply_lifecycle_rollup, prepare_mention
-
-    announced = prepare_mention(
-        build_mention_row(
-            mention_id="m-a",
-            item_id="item-1",
-            accession_number="0001",
-            cik="320193",
-            date="2026-01-05",
-            name="6.0% Senior Notes due 2034",
-            start_date=None,
-            amount="500000000",
-        )
-        | {
-            "status": "announced",
-            "status_date": "2026-01-05",
-            "dates_json": _expected_closing_dates_json("2026-02-01"),
-        }
-    )
-    other = prepare_mention(
-        build_mention_row(
-            mention_id="m-o",
-            item_id="item-2",
-            accession_number="0002",
-            cik="320193",
-            date="2026-06-01",
-            name="Unrelated Revolver",
-            start_date="2026-06-01",
-            amount="100000000",
-        )
-    )
-    rows = [_rollup_row("inst-a"), _rollup_row("inst-o")]
-    apply_lifecycle_rollup(
-        rows,
-        member_groups={"inst-a": ["m-a"], "inst-o": ["m-o"]},
-        mention_index={"m-a": announced, "m-o": other},
-    )
-
-    assert rows[0]["status"] == "expected_active"
-    assert rows[0]["status_date"] == "2026-02-01"
-    # An inferred state cites no mention, because no mention states it.
-    assert rows[0]["status_source_mention_id"] is None
-
-
-def test_an_observed_start_outranks_a_later_announcement() -> None:
-    """#169: an announcement must not revert an instrument that already closed.
-
-    The newest decisive event is the announcement, but the instrument has a
-    recorded start date behind the corpus, so it is `active`.
-    """
-    from cdt.matcher.core import apply_lifecycle_rollup, prepare_mention
-
-    def mention(mention_id: str, accession: str, date: str, **extra: object) -> object:
-        return prepare_mention(
-            build_mention_row(
-                mention_id=mention_id,
-                item_id=f"item-{accession}",
-                accession_number=accession,
-                cik="320193",
-                date=date,
-                name="6.0% Senior Notes due 2034",
-                start_date="2026-01-20",
-                amount="500000000",
-            )
-            | extra
-        )
-
-    closed = mention("m-close", "0001", "2026-01-22", status="entered_into")
-    reannounced = mention("m-again", "0002", "2026-03-01", status="announced")
-    rows = [_rollup_row("inst-a", start_date="2026-01-20")]
-    apply_lifecycle_rollup(
-        rows,
-        member_groups={"inst-a": ["m-close", "m-again"]},
-        mention_index={"m-close": closed, "m-again": reannounced},
-    )
-
-    assert rows[0]["status"] == "active"
-    assert rows[0]["status_date"] == "2026-01-20"
-
-
-def test_an_unstarted_announcement_still_blocks_a_retirement_it_funds() -> None:
-    """The announced-retirer guard tracks the *derived* state, not the raw event.
-
-    `announced_instrument_ids` exists so a use-of-proceeds retirement is not
-    asserted before the financing closes. Once the financing's own planned
-    start is behind the corpus it reads `expected_active`, so it must stop
-    blocking — otherwise a row could be held open by an instrument that no
-    longer reads `announced` itself.
-    """
-    from cdt.matcher.core import apply_lifecycle_rollup, prepare_mention
-
-    def announcement(date: str, expected_closing: str) -> object:
-        return prepare_mention(
-            build_mention_row(
-                mention_id="m-new",
-                item_id="item-2",
-                accession_number="0002",
-                cik="320193",
-                date=date,
-                name="New Notes",
-                start_date=None,
-                amount="500000000",
-            )
-            | {
-                "status": "announced",
-                "status_date": date,
-                "dates_json": _expected_closing_dates_json(expected_closing),
-            }
-        )
-
-    old = prepare_mention(
-        build_mention_row(
-            mention_id="m-old",
-            item_id="item-1",
-            accession_number="0001",
-            cik="320193",
-            date="2026-06-01",
-            name="5.25% Senior Notes due 2027",
-            start_date="2017-01-01",
-            amount="500000000",
-        )
-    )
-
-    def rollup(expected_closing: str) -> str:
-        rows = [
-            _rollup_row(
-                "inst-old",
-                retired_by_debt_instrument_ids=json.dumps(["inst-new"]),
-                start_date="2017-01-01",
-            ),
-            _rollup_row("inst-new"),
-        ]
-        apply_lifecycle_rollup(
-            rows,
-            member_groups={"inst-old": ["m-old"], "inst-new": ["m-new"]},
-            mention_index={
-                "m-old": old,
-                "m-new": announcement("2026-06-01", expected_closing),
-            },
-        )
-        return str(rows[0]["status"])
-
-    # The financing has not closed: the old notes are still outstanding.
-    assert rollup("2026-07-15") == "active"
-    # Its planned close is behind the corpus, so the repayment it funds stands.
-    assert rollup("2026-05-15") == "closed"
-
-
-def test_every_derived_status_is_in_the_published_vocabulary() -> None:
-    """A typo in one leg would otherwise publish a value no consumer can filter."""
-    import inspect
-    import re
-
-    from cdt.matcher.core import (
-        CLOSED_STATUS_SUBTYPES,
-        INSTRUMENT_STATUS_VALUES,
-        derive_instrument_status,
-    )
-
-    source = inspect.getsource(derive_instrument_status)
-    returned = re.findall(r'return "([a-z_]+)", ("[a-z_]+"|None)', source)
-    assert returned, "the legs stopped returning literal statuses; update this test"
-    for status, subtype in returned:
-        assert status in INSTRUMENT_STATUS_VALUES
-        if subtype == "None":
-            continue
-        assert status == "closed"
-        assert subtype.strip('"') in CLOSED_STATUS_SUBTYPES
-    # Only `closed` carries a cause, and `superseded` is the one non-event cause.
-    assert CLOSED_STATUS_SUBTYPES == {
-        "repaid",
-        "terminated",
-        "exchanged",
-        "defaulted",
-        "superseded",
-    }
-
-
-def test_two_amendment_children_leave_no_unreachable_parent() -> None:
-    """A row replaced by two amendments must not read as a live obligation.
-
-    The ambiguous inverse publishes no `superseded_by` pointer, so a status leg
-    reading only that pointer left the parent `active` while every
-    `is_lineage_head` view excluded it — unreachable and alive at once (#183).
-    """
-    from cdt.matcher.core import apply_lifecycle_rollup
-
-    parent = _rollup_row("p")
-    rows = [
-        parent,
-        _rollup_row("c1", amendment_of_debt_instrument_id="p"),
-        _rollup_row("c2", amendment_of_debt_instrument_id="p"),
-    ]
-    apply_lifecycle_rollup(rows, member_groups={}, mention_index={})
-
-    assert parent["superseded_by_debt_instrument_id"] is None
-    assert (parent["status"], parent["status_subtype"]) == ("closed", "superseded")
-
-
 def test_first_and_last_seen_span_distinct_filing_dates() -> None:
     """Both fixture mentions shared a date, so a swap was invisible."""
     from cdt.matcher.core import apply_lifecycle_rollup, prepare_mention
@@ -6741,128 +6229,6 @@ def test_first_and_last_seen_span_distinct_filing_dates() -> None:
     assert row["mention_count"] == 3
     # Three mentions, two filings.
     assert row["document_count"] == 2
-
-
-def test_superseded_wins_over_a_retirement_pointer() -> None:
-    """Leg order: no fixture had both, so reordering them passed."""
-    from cdt.matcher.core import derive_instrument_status
-
-    row = {
-        "debt_instrument_id": "p",
-        "superseded_by_debt_instrument_id": "c",
-        "retired_by_debt_instrument_ids": json.dumps(["r"]),
-        "maturity_date": None,
-    }
-    status, subtype, _, _ = derive_instrument_status(
-        row,
-        reference_date="2026-01-01",
-        event_result=None,
-        announced_instrument_ids=set(),
-    )
-    assert (status, subtype) == ("closed", "superseded")
-
-
-def test_a_retirement_by_an_announced_instrument_is_not_yet_repaid() -> None:
-    """The announced-retirer guard, reached without `retirement_pending` masking it.
-
-    The existing test's row was already pending, so `retired_by and not
-    retirement_pending` short-circuited and this guard never ran.
-    """
-    from cdt.matcher.core import derive_instrument_status
-
-    row = {
-        "debt_instrument_id": "old",
-        "superseded_by_debt_instrument_id": None,
-        "retired_by_debt_instrument_ids": json.dumps(["new"]),
-        "maturity_date": None,
-    }
-    kwargs = {"reference_date": "2026-01-01", "event_result": None}
-    unclosed, _, _, _ = derive_instrument_status(
-        row, announced_instrument_ids={"new"}, **kwargs
-    )
-    assert unclosed == "active"
-    closed, subtype, _, _ = derive_instrument_status(
-        row, announced_instrument_ids=set(), **kwargs
-    )
-    assert (closed, subtype) == ("closed", "repaid")
-
-
-def test_an_undated_planned_retirement_blocks_the_expected_closed_leg() -> None:
-    """A plan that can never be shown to have come due keeps the row alive (#183)."""
-    from cdt.matcher.core import RetirementExpectation, derive_instrument_status
-
-    row = {
-        "debt_instrument_id": "x",
-        "superseded_by_debt_instrument_id": None,
-        "retired_by_debt_instrument_ids": None,
-        "maturity_date": "2020-01-01",
-    }
-    kwargs = {
-        "reference_date": "2026-01-01",
-        "event_result": None,
-        "announced_instrument_ids": set(),
-    }
-    assert (
-        derive_instrument_status(row, expectation=RetirementExpectation(), **kwargs)[0]
-        == "expected_closed"
-    )
-    assert (
-        derive_instrument_status(
-            row, expectation=RetirementExpectation(undated=True), **kwargs
-        )[0]
-        == "active"
-    )
-
-
-def test_a_planned_retirement_stops_blocking_once_the_corpus_passes_it() -> None:
-    """The whole point of `expected_closed`: a notice that came due is not `active`.
-
-    Under #155 a dated redemption notice blocked the terminal legs forever, so
-    an instrument noticed for redemption in 2024 still published `active` in
-    2026. The date has to be re-checked against the reference date, not merely
-    latched as a pending flag.
-    """
-    from cdt.matcher.core import RetirementExpectation, derive_instrument_status
-
-    row = {
-        "debt_instrument_id": "x",
-        "superseded_by_debt_instrument_id": None,
-        "retired_by_debt_instrument_ids": None,
-        "maturity_date": None,
-    }
-    kwargs = {"reference_date": "2026-01-01", "event_result": None}
-    ahead = derive_instrument_status(
-        row, expectation=RetirementExpectation(dates=("2027-05-01",)), **kwargs
-    )
-    assert ahead[0] == "active"
-    behind = derive_instrument_status(
-        row, expectation=RetirementExpectation(dates=("2024-05-01",)), **kwargs
-    )
-    assert behind[0] == "expected_closed"
-    assert behind[2] == "2024-05-01"
-
-
-def test_the_latest_end_date_governs_expected_closed() -> None:
-    """A lapsed commitment does not close a facility still owed to a later maturity."""
-    from cdt.matcher.core import RetirementExpectation, derive_instrument_status
-
-    row = {
-        "debt_instrument_id": "x",
-        "superseded_by_debt_instrument_id": None,
-        "retired_by_debt_instrument_ids": None,
-        "commitment_termination_date": "2024-06-30",
-        "maturity_date": "2029-06-30",
-    }
-    kwargs = {
-        "reference_date": "2026-01-01",
-        "event_result": None,
-        "expectation": RetirementExpectation(),
-    }
-    assert derive_instrument_status(row, **kwargs)[0] == "active"
-    # With no later maturity, the lapsed commitment is the end date we are past.
-    lapsed = dict(row) | {"maturity_date": None}
-    status, _, status_date, _ = derive_instrument_status(lapsed, **kwargs)
-    assert (status, status_date) == ("expected_closed", "2024-06-30")
 
 
 @pytest.mark.xfail(

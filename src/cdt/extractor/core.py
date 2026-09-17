@@ -248,8 +248,8 @@ LEGACY_DATE_PROPERTY_KINDS = {
 DATE_PRECISIONS = ("day", "month", "year")
 AMOUNT_EVIDENCE_TAG_TYPES = {"amount", "debt_instrument"}
 # What one mention says happened to its instrument (#141). `matured` is
-# deliberately absent: filings almost never say it, and the matcher derives it
-# from maturity_date instead.
+# deliberately absent: filings almost never say it, and no stage here derives a
+# lifecycle status at all (#196).
 INTEREST_RATE_KINDS = {"fixed", "floating"}
 INTEREST_RATE_EVIDENCE_TAG_TYPES = {"interest_rate", "debt_instrument"}
 # `6.5 percent senior notes` spells the marker out; it is still a rate, not an amount.

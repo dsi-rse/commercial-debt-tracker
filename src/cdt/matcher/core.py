@@ -85,10 +85,6 @@ DEBT_INSTRUMENT_COLUMNS = [
     "superseded_by_debt_instrument_id",
     "lineage_family_id",
     "is_lineage_head",
-    "status",
-    "status_subtype",
-    "status_date",
-    "status_source_mention_id",
     "first_seen_filing_date",
     "last_seen_filing_date",
     "mention_count",
@@ -296,14 +292,6 @@ def match_pending_mentions(
         }
     mention_rows = mention_rows.copy()
     company_names = company_names_by_cik(mention_rows)
-    # One "now" for the whole run, resolved before sharding. The rollup used to
-    # derive this per `match_tables` call, i.e. per `cik_shard` — and a shard is
-    # a hash bucket, so a published status depended on which unrelated issuers
-    # shared a bucket, and a shard of quiet filers stayed frozen behind the
-    # corpus (#188).
-    reference_date = coerce_optional_text(
-        max((str(value) for value in mention_rows["date"].dropna()), default=None)
-    )
     mention_rows["cik_shard"] = (
         mention_rows["cik"].fillna("").map(lambda value: shard_for_cik(str(value)))
     )
@@ -340,7 +328,6 @@ def match_pending_mentions(
                 loose_match_threshold=loose_match_threshold,
                 ambiguity_margin=ambiguity_margin,
                 company_names=company_names,
-                reference_date=reference_date,
             )
             mention_cluster_edges = tables["debt_instrument_mentions"].reindex(
                 columns=MENTION_CLUSTER_EDGE_COLUMNS
@@ -420,7 +407,6 @@ def match_tables(
     loose_match_threshold: float = DEFAULT_RELATED_THRESHOLD,
     ambiguity_margin: float = DEFAULT_AMBIGUITY_MARGIN,
     company_names: dict[str, str] | None = None,
-    reference_date: str | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Match in-memory debt instrument mentions into stable debt instrument clusters.
 
@@ -428,11 +414,6 @@ def match_tables(
     per shard batch and sees only the clusters that batch touched, so no rule can
     ever see both states of one facility. ``apply_lineage_inference_pass`` runs it
     as a post-pass over the complete dataset instead.
-
-    ``reference_date`` is what the derived status treats as "now". Because this
-    is called per shard, a caller spanning several shards has to compute it once
-    over all of them and pass it in, or each shard publishes statuses against a
-    different date (#188).
     """
     if strong_match_threshold < loose_match_threshold:
         raise ValueError("strong_match_threshold must be >= loose_match_threshold")
@@ -547,7 +528,6 @@ def match_tables(
         debt_instrument_rows,
         member_groups=normalized_members,
         mention_index=mention_index,
-        reference_date=reference_date,
     )
     return {
         "debt_instrument_mentions": combined_edges.reindex(
@@ -559,61 +539,12 @@ def match_tables(
     }
 
 
+# An extracted terminal event. The matcher reads these off the *mentions* to
+# decide whether a cluster is retired, which breaks a name-only tie towards the
+# live obligation (`ClusterProfile.retired`). It derives no status of its own:
+# "is this borrowing still alive" needs a notion of now, and now is not an
+# input this repository has (#196).
 TERMINAL_STATUS_EVENTS = {"terminated", "repaid", "exchanged", "defaulted"}
-# The five lifecycle answers (#183). The split keeps what the filings confirm
-# apart from what they only imply: `active` and `closed` are observed, while
-# `expected_active` and `expected_closed` are read off a date the corpus has
-# passed with nothing recorded against it.
-INSTRUMENT_STATUS_VALUES = {
-    "announced",
-    "active",
-    "expected_active",
-    "closed",
-    "expected_closed",
-}
-# `closed` always names its cause. The four terminal events are extracted;
-# `superseded` is the lineage answer, for a state a later amendment replaced.
-# The display form joins the two: `closed - repaid`.
-CLOSED_STATUS_SUBTYPES = TERMINAL_STATUS_EVENTS | {"superseded"}
-
-
-@dataclass(frozen=True)
-class RetirementExpectation:
-    """A retirement the filings plan but never record as having happened."""
-
-    dates: tuple[str, ...] = ()
-    undated: bool = False
-
-    def unfulfilled_at(self: RetirementExpectation, reference_date: str | None) -> bool:
-        """Return whether the planned retirement still lies ahead of the corpus.
-
-        An undated plan can never be shown to have come due, so it keeps the
-        obligation alive indefinitely. A dated one stops blocking once the
-        reference date passes it — which is the moment `expected_closed` starts
-        being the honest answer instead.
-        """
-        if self.undated:
-            return True
-        if reference_date is None:
-            return bool(self.dates)
-        return any(date > reference_date for date in self.dates)
-
-
-def corpus_reference_date(
-    mention_index: dict[str, PreparedMention],
-) -> str | None:
-    """Return what the derived status should treat as "now".
-
-    The newest filing date among the mentions supplied, rather than the wall
-    clock: a rerun over the same inputs has to publish the same statuses, and a
-    clock would make every rerun differ. Callers that see the whole corpus use
-    this; `match_pending_mentions` computes the same value from its mention
-    frame before sharding, because it must not be resolved per shard (#188).
-    """
-    return max(
-        (mention.date for mention in mention_index.values() if mention.date),
-        default=None,
-    )
 
 
 def apply_lifecycle_rollup(
@@ -621,27 +552,18 @@ def apply_lifecycle_rollup(
     *,
     member_groups: dict[str, list[str]],
     mention_index: dict[str, PreparedMention],
-    reference_date: str | None = None,
 ) -> None:
-    """Fill lineage-head, derived status, and observation columns in place (#155).
+    """Fill lineage-head and observation columns in place (#155).
 
-    The browse index needs one row per live obligation: `superseded_by` marks a
-    state that a later amendment replaced, `lineage_family_id` groups every
-    state of one obligation history, and `status` answers "is this borrowing
-    still alive as far as the filings say".
+    `superseded_by` marks a state that a later amendment replaced,
+    `lineage_family_id` groups every state of one obligation history, and the
+    observation columns count what the corpus has seen of each cluster.
 
-    ``reference_date`` stands in for "now", which the date legs of the status
-    cascade compare against. It must be supplied by the caller and computed once
-    per run over the whole corpus (#188). Deriving it here from `mention_index`
-    made it a function of the caller's batch instead: `match_tables` is called
-    once per `cik_shard`, so a shard of quiet issuers got an earlier "now" than
-    the corpus had reached, and an instrument's published status depended on
-    which unrelated companies happened to hash into its bucket. The fallback
-    below keeps direct callers working, and is right for them because they pass
-    every mention they have.
+    Deliberately no lifecycle `status`. Deriving one requires a notion of "now",
+    which this repository cannot obtain without making its output a function of
+    the run's scope rather than of the filings; the publisher derives it at
+    publish time against an explicit `asOf` instead (#196).
     """
-    if reference_date is None:
-        reference_date = corpus_reference_date(mention_index)
     rows_by_id = {str(row["debt_instrument_id"]): row for row in rows}
     superseded_by: dict[str, set[str]] = {}
     for row in rows:
@@ -711,252 +633,6 @@ def apply_lifecycle_rollup(
                 if mention_index[member_id].accession_number
             }
         )
-        row["_member_ids"] = member_ids
-    # Event-based statuses first, so the derived legs below can ask whether the
-    # instrument that retired this one exists yet or has not started either.
-    event_status: dict[str, tuple[str, str | None, str | None] | None] = {}
-    expectations: dict[str, RetirementExpectation] = {}
-    expected_starts: dict[str, str | None] = {}
-    for row in rows:
-        row_id = str(row["debt_instrument_id"])
-        member_ids = row["_member_ids"]
-        event_status[row_id] = event_status_for_instrument(member_ids, mention_index)
-        expectations[row_id] = retirement_expectation_for_instrument(
-            member_ids, mention_index
-        )
-        expected_starts[row_id] = expected_start_for_instrument(
-            member_ids, mention_index
-        )
-    # Only an announcement the corpus has not caught up with blocks a
-    # retirement: once the announced instrument's own start date has passed it
-    # funds the repayment, and it no longer reads `announced` itself either.
-    announced_ids = {
-        row_id
-        for row_id, result in event_status.items()
-        if result is not None
-        and result[0] == "announced"
-        and not instrument_has_started(
-            rows_by_id[row_id],
-            expected_starts[row_id],
-            reference_date=reference_date,
-        )
-    }
-    for row in rows:
-        row_id = str(row["debt_instrument_id"])
-        member_ids = row.pop("_member_ids")
-        status, subtype, status_date, status_source = derive_instrument_status(
-            row,
-            reference_date=reference_date,
-            event_result=event_status[row_id],
-            expectation=expectations[row_id],
-            expected_start_date=expected_starts[row_id],
-            announced_instrument_ids=announced_ids,
-        )
-        row["status"] = status
-        row["status_subtype"] = subtype
-        row["status_date"] = status_date
-        row["status_source_mention_id"] = status_source
-
-
-# The default for an instrument whose mentions record no plan at all.
-NO_RETIREMENT_EXPECTATION = RetirementExpectation()
-
-
-def instrument_has_started(
-    row: dict[str, object],
-    expected_start_date: str | None,
-    *,
-    reference_date: str | None,
-) -> bool:
-    """Return whether the corpus is past a start date this instrument records.
-
-    An expected start counts: once it is behind the reference date the
-    instrument reads `expected_active`, which is the answer that says the money
-    has most likely moved.
-    """
-    for candidate in (coerce_optional_text(row.get("start_date")), expected_start_date):
-        if candidate and (reference_date is None or candidate <= reference_date):
-            return True
-    return False
-
-
-def derive_instrument_status(
-    row: dict[str, object],
-    *,
-    reference_date: str | None,
-    event_result: tuple[str, str | None, str | None] | None = None,
-    expectation: RetirementExpectation = NO_RETIREMENT_EXPECTATION,
-    expected_start_date: str | None = None,
-    announced_instrument_ids: set[str] | None = None,
-) -> tuple[str, str | None, str | None, str | None]:
-    """Return (status, subtype, status_date, source_mention_id) for one instrument.
-
-    Five answers (#183). An explicit terminal event, a replacing amendment or a
-    retirement the lineage records all close the instrument, with the cause in
-    the subtype. Failing those the dates decide: past an explicit start it is
-    `active` until every explicit and planned end date is behind the corpus, at
-    which point it is `expected_closed`; before an explicit start it is
-    `announced` while the planned start is still ahead, and `expected_active`
-    once that planned start has passed.
-
-    Every mention-derived signal is passed in rather than read here, so the
-    whole cascade is a function of the row plus those signals.
-    """
-    if event_result is not None and event_result[0] in TERMINAL_STATUS_EVENTS:
-        cause, status_date, source = event_result
-        return "closed", cause, status_date, source
-    # Any amendment child makes this row a superseded state, including the
-    # two-child case where the ambiguous inverse pointer publishes nothing —
-    # otherwise that parent read `active` while every head-filtered view
-    # excluded it, so it was unreachable and alive at once.
-    head = row.get("is_lineage_head")
-    if row.get("superseded_by_debt_instrument_id") or (head is not None and not head):
-        return "closed", "superseded", None, None
-    retirement_unfulfilled = expectation.unfulfilled_at(reference_date)
-    retired_by = coerce_optional_text(row.get("retired_by_debt_instrument_ids"))
-    if retired_by and not retirement_unfulfilled:
-        # A retired_by pointer without a mention-level event still means the
-        # obligation ended — unless the retiring instrument has not started
-        # (a use-of-proceeds financing that has not closed), in which case the
-        # retirement has not happened yet either.
-        retiring_ids = [str(value) for value in json.loads(retired_by)]
-        if not any(
-            retiring_id in (announced_instrument_ids or set())
-            for retiring_id in retiring_ids
-        ):
-            return "closed", "repaid", None, None
-    # Every date the instrument could end on, scheduled or merely planned. The
-    # latest one governs: a passed commitment termination does not close a
-    # facility whose principal is still outstanding to a later maturity.
-    terminal_dates = sorted(
-        {
-            date
-            for date in (
-                coerce_optional_text(row.get("maturity_date")),
-                coerce_optional_text(row.get("commitment_termination_date")),
-                *expectation.dates,
-            )
-            if date
-        }
-    )
-    past_every_end = (
-        bool(terminal_dates)
-        and not retirement_unfulfilled
-        and reference_date is not None
-        and terminal_dates[-1] < reference_date
-    )
-    explicit_start = coerce_optional_text(row.get("start_date"))
-    if explicit_start and (reference_date is None or explicit_start <= reference_date):
-        # An observed closing outranks a later announcement (#169): the
-        # instrument demonstrably started, whatever a subsequent filing
-        # re-announces about it.
-        if past_every_end:
-            return "expected_closed", None, terminal_dates[-1], None
-        return "active", None, explicit_start, None
-    if expected_start_date and reference_date and expected_start_date <= reference_date:
-        return "expected_active", None, expected_start_date, None
-    if event_result is not None and event_result[0] == "announced":
-        _, status_date, source = event_result
-        return "announced", None, status_date, source
-    if past_every_end:
-        return "expected_closed", None, terminal_dates[-1], None
-    if explicit_start and reference_date and explicit_start > reference_date:
-        # A start the corpus has not reached, with no announcement event to
-        # date the status from.
-        return "announced", None, explicit_start, None
-    # Nothing dated and no event: the filing describes an obligation it treats
-    # as outstanding, and there is no evidence against that.
-    return "active", None, None, None
-
-
-def planned_retirement_date(mention: PreparedMention) -> str | None:
-    """Return the date a terminal event is stated for when it has not happened.
-
-    A terminal status dated after the filing that carries it is a notice — a
-    redemption call, a use-of-proceeds target — so it names a planned date
-    rather than deciding the status.
-    """
-    if mention.status not in TERMINAL_STATUS_EVENTS:
-        return None
-    if not (
-        mention.status_date and mention.date and mention.status_date > mention.date
-    ):
-        return None
-    return mention.status_date
-
-
-def retirement_expectation_for_instrument(
-    member_ids: list[str],
-    mention_index: dict[str, PreparedMention],
-) -> RetirementExpectation:
-    """Collect every retirement the instrument's mentions plan but do not record.
-
-    Every member is read, not just the newest: a plan stated once stands until
-    some filing records the event, and the decisive-event scan answers that
-    question separately.
-    """
-    dates: set[str] = set()
-    undated = False
-    for member_id in member_ids:
-        mention = mention_index[member_id]
-        dates.update(mention.expected_retirement_dates)
-        undated = undated or mention.undated_expected_retirement
-        planned = planned_retirement_date(mention)
-        if planned:
-            dates.add(planned)
-    return RetirementExpectation(dates=tuple(sorted(dates)), undated=undated)
-
-
-def expected_start_for_instrument(
-    member_ids: list[str],
-    mention_index: dict[str, PreparedMention],
-) -> str | None:
-    """Return the planned start the newest mention stating one records."""
-    ordered = sorted(
-        member_ids,
-        key=lambda member_id: mention_recency_key(mention_index[member_id]),
-        reverse=True,
-    )
-    for member_id in ordered:
-        expected = mention_index[member_id].expected_start_date
-        if expected:
-            return expected
-    return None
-
-
-def event_status_for_instrument(
-    member_ids: list[str],
-    mention_index: dict[str, PreparedMention],
-) -> tuple[str, str | None, str | None] | None:
-    """Return the newest extracted event that decides a status, if any.
-
-    `entered_into` and `amended` say the instrument existed, not how it ended,
-    so they decide nothing here and the date legs answer instead. A terminal
-    event that has only been noticed decides nothing either; it is read by
-    `retirement_expectation_for_instrument` as a planned date. An `announced`
-    event is dated no later than the filing that announced it — the expected
-    closing date is when the instrument will start, not when it was announced.
-    """
-    ordered = sorted(
-        member_ids,
-        key=lambda member_id: mention_recency_key(mention_index[member_id]),
-        reverse=True,
-    )
-    for member_id in ordered:
-        mention = mention_index[member_id]
-        if mention.status is None:
-            continue
-        if mention.status in TERMINAL_STATUS_EVENTS:
-            if planned_retirement_date(mention):
-                continue
-            return mention.status, mention.status_date or mention.date, member_id
-        if mention.status == "announced":
-            status_date = mention.status_date or mention.date
-            if status_date and mention.date and status_date > mention.date:
-                status_date = mention.date
-            return "announced", status_date, member_id
-        break
-    return None
 
 
 def build_cluster_profiles(
@@ -2520,7 +2196,6 @@ def apply_lineage_inference_pass(artifact_root: str) -> dict[str, int]:
         rows,
         member_groups=member_groups,
         mention_index=mention_index,
-        reference_date=corpus_reference_date(mention_index),
     )
     heads_after = sum(1 for row in rows if row.get("is_lineage_head"))
     frame = pd.DataFrame(rows, columns=DEBT_INSTRUMENT_COLUMNS)
