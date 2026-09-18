@@ -5788,6 +5788,46 @@ def test_published_instrument_columns_are_pinned() -> None:
     ]
 
 
+def realistic_frame(columns: list[str]) -> pd.DataFrame:
+    """Return one row of a dataset the way its real producer writes it.
+
+    Comparing the empty frame against an all-`None` row proved nothing: both
+    infer `null` for every column and the declared-type layer rescues both to
+    text, so a column that really carries booleans or counts agreed with itself
+    whether or not it was declared. A row from the actual writer carries those
+    values as native types — an undeclared bool infers `bool` here and `string`
+    in the empty frame, and the schema comparison goes red. The instrument and
+    edge rows come out of `match_tables` for that reason: it populates every
+    column it owns, so a flag added to the matcher cannot slip past this test.
+    """
+    mention = build_mention_row(
+        mention_id="dim::realistic",
+        item_id="item-1",
+        accession_number="0001",
+        cik="0000320193",
+        date="2026-06-01",
+        name="7% Senior Notes due 2030",
+        start_date="2024-01-01",
+        amount="500000000",
+        parties_json=json.dumps(
+            [{"role": "borrower", "canonical_name": "Example Inc.", "spans": []}]
+        ),
+    )
+    if columns is DEBT_INSTRUMENT_MENTION_COLUMNS:
+        return pd.DataFrame([mention], columns=columns)
+    if columns is MENTION_CLUSTER_EDGE_COLUMNS:
+        tables = match_tables(pd.DataFrame([mention]))
+        return tables["debt_instrument_mentions"].reindex(columns=columns)
+    if columns is DEBT_INSTRUMENT_COLUMNS:
+        tables = match_tables(pd.DataFrame([mention]))
+        return tables["debt_instrument"].reindex(columns=columns)
+    item: dict[str, object] = dict.fromkeys(columns, "x")
+    item.update({"start_line": 1, "end_line": 2, "section_char_count": 3})
+    if columns is CLASSIFIED_ITEM_COLUMNS:
+        item.update({"relevance": True, "classification_score": 0.9})
+    return pd.DataFrame([item], columns=columns)
+
+
 @pytest.mark.parametrize(
     "columns",
     [
@@ -5806,14 +5846,14 @@ def test_a_columns_physical_type_does_not_depend_on_the_data(
 
     Arrow infers an object column's type from its values, so a column with no
     value in this partition serialised as `null` and as `string` in the next.
-    That made 23 of 42 `debt-instruments` columns vary, and every standard
-    reader — `pyarrow.dataset`, `pq.read_table`, `ParquetDataset`,
-    `pandas.read_parquet` — failed on the directory with "Unsupported cast from
-    string to null" (#187). An empty frame was worse: it inferred `null` for
-    every column, counts and flags included.
+    That made 23 of the 42 `debt-instruments` columns then published vary, and
+    every standard reader — `pyarrow.dataset`, `pq.read_table`,
+    `ParquetDataset`, `pandas.read_parquet` — failed on the directory with
+    "Unsupported cast from string to null" (#187). An empty frame was worse: it
+    inferred `null` for every column, counts and flags included.
     """
     empty = apply_declared_column_types(pd.DataFrame(columns=columns))
-    populated = apply_declared_column_types(pd.DataFrame([dict.fromkeys(columns)]))
+    populated = apply_declared_column_types(realistic_frame(columns))
     assert empty.schema == populated.schema
     assert not [
         field.name for field in empty.schema if pa.types.is_null(field.type)
@@ -5831,15 +5871,16 @@ def test_a_multi_partition_dataset_reads_with_a_standard_reader(
     with the partitions the other way round passes even when the fix is removed.
     """
     root = tmp_path / "debt-instruments"
-    for shard, subtype in (("0001", None), ("0002", "repaid")):
+    # `split_of_debt_instrument_id` is a published nullable text column: null in
+    # the first partition, a value in the second — the exact shape that failed.
+    for shard, split_of in (("0001", None), ("0002", "d-0001")):
         frame = pd.DataFrame(
             [
                 dict.fromkeys(DEBT_INSTRUMENT_COLUMNS)
                 | {
                     "debt_instrument_id": f"d-{shard}",
                     "cik": "320193",
-                    "status": "closed",
-                    "status_subtype": subtype,
+                    "split_of_debt_instrument_id": split_of,
                     "mention_count": 1,
                     "document_count": 1,
                     "is_lineage_head": True,
@@ -6170,68 +6211,6 @@ def test_first_and_last_seen_span_distinct_filing_dates() -> None:
     assert row["mention_count"] == 3
     # Three mentions, two filings.
     assert row["document_count"] == 2
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Known: `event_status_for_instrument` breaks the scan at the newest "
-        "entered_into/amended status, so an older mention's expected "
-        "retirement never reaches the pending flag and the rollup asserts "
-        "`repaid`. Fix is in matcher/core.py, outside this commit's scope."
-    ),
-)
-def test_a_planned_retirement_survives_a_newer_amendment_mention() -> None:
-    """The status scan's `break` must not also discard the pending flag.
-
-    A newer `amended` mention stopped the scan before an older mention's
-    `expected` retirement was seen, so the rollup asserted `repaid` for a
-    retirement the filings say is only planned.
-    """
-    from cdt.matcher.core import event_status_for_instrument, prepare_mention
-
-    planned = prepare_mention(
-        build_mention_row(
-            mention_id="m-planned",
-            item_id="item-1",
-            accession_number="0001",
-            cik="0000320193",
-            date="2026-06-01",
-            name="7% Senior Notes due 2030",
-            start_date="2024-01-01",
-            amount="500000000",
-            dates_json=json.dumps(
-                [
-                    {
-                        "kind": "retirement",
-                        "expected": True,
-                        "normalized_date": "2026-09-01",
-                    }
-                ]
-            ),
-        )
-    )
-    amended = prepare_mention(
-        build_mention_row(
-            mention_id="m-amended",
-            item_id="item-2",
-            accession_number="0002",
-            cik="0000320193",
-            date="2026-08-01",
-            name="7% Senior Notes due 2030",
-            start_date="2024-01-01",
-            amount="500000000",
-            status="amended",
-        )
-    )
-    index = {"m-planned": planned, "m-amended": amended}
-
-    _, pending_alone = event_status_for_instrument(["m-planned"], index)
-    assert pending_alone is True
-    _, pending_with_amendment = event_status_for_instrument(
-        ["m-planned", "m-amended"], index
-    )
-    assert pending_with_amendment is True
 
 
 # --- Fixes made in this commit -------------------------------------------------

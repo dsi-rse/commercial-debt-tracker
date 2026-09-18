@@ -402,19 +402,25 @@ def test_a_different_borrower_refuses_the_ordinal_link() -> None:
 
 
 def test_a_legal_form_suffix_is_not_a_different_borrower() -> None:
-    """`EQT` and `EQT Corporation` are one party, so the chain still links."""
+    """`EQT Corporation` and `EQT Company` are one party, so the chain links.
+
+    Two suffixes that differ from each other, not a bare stem against a
+    suffixed one: `EQT` versus `EQT Corporation` also passed by prefix, so the
+    suffix list could be deleted outright with this test still green (#205).
+    Only `BORROWER_SUFFIXES` can make these two names equal.
+    """
     rows = [
         instrument(
             "i1",
             "Second Amended and Restated Credit Agreement",
             first_seen_filing_date="2022-01-01",
-            parties_json=borrower("EQT"),
+            parties_json=borrower("EQT Corporation"),
         ),
         instrument(
             "i2",
             "Third Amended and Restated Credit Agreement",
             first_seen_filing_date="2024-01-01",
-            parties_json=borrower("EQT Corporation"),
+            parties_json=borrower("EQT Company"),
         ),
     ]
     result = infer_amendment_parents(rows, member_groups={}, mention_index={})
