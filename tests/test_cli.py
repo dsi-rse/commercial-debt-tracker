@@ -719,6 +719,26 @@ def test_match_cli_calls_pending_matcher(
 
     monkeypatch.setattr(cli, "match_pending_mentions", fake_match_pending_mentions)
 
+    # `cdt match` runs the lineage pass after matching — an amend-and-restate
+    # chain spans filings, so its links exist only once every shard has matched
+    # (#170, #204). Replacing the call with canned zero stats left the suite
+    # green; `run_match_and_finalize`'s half was covered and the CLI's was not,
+    # though it is the half named in the commit that added it (#211).
+    lineage_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        cli,
+        "apply_lineage_inference_pass",
+        lambda artifact_root, **kwargs: (
+            lineage_calls.append(
+                {
+                    "artifact_root": str(artifact_root),
+                    "renews": callable(kwargs.get("renew")),
+                }
+            ),
+            {"links": 1, "reopened": 0, "heads_before": 2, "heads_after": 1},
+        )[1],
+    )
+
     status = cli.main(["match", "--batch-size", "25", "--force", "--quiet"])
 
     assert status == 0
@@ -732,6 +752,8 @@ def test_match_cli_calls_pending_matcher(
             "ambiguity": 0.05,
         }
     ]
+    assert len(lineage_calls) == 1
+    assert lineage_calls[0]["renews"] is True
 
 
 def test_parse_date_rejects_non_iso_date() -> None:

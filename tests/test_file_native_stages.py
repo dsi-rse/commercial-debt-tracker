@@ -8100,3 +8100,129 @@ def test_extract_tables_publishes_through_the_mint_seam(
 
     rows = tables["debt_instrument_mentions"]
     assert (rows["synthesized_by"] == "prior_state").sum() == 1
+
+
+def test_a_prior_commitment_termination_mints_and_is_not_inherited_over() -> None:
+    """`commitment_termination` is in both date frozensets, and both halves matter.
+
+    Every mint test used `maturity` and `agreement` only, so dropping
+    `commitment_termination` from `PRIOR_TERM_DATE_KINDS` or from
+    `INHERITED_DATE_KINDS` left the suite green (#211). The two sets answer
+    different questions: the first is which prior dates can trigger and carry
+    onto the predecessor, the second is which current dates are carried forward
+    as unchanged when the filing states no before-value for them.
+    """
+    from cdt.extractor.core import mint_prior_state_rows
+
+    counters: dict[str, int] = {}
+    minted = [
+        row
+        for row in mint_prior_state_rows(
+            [
+                amended_row(
+                    dates=[
+                        _fact(
+                            kind="agreement", normalized_date="2020-02-03", prior=False
+                        ),
+                        _fact(
+                            kind="commitment_termination",
+                            normalized_date="2026-02-03",
+                            prior=True,
+                        ),
+                        _fact(
+                            kind="commitment_termination",
+                            normalized_date="2029-02-03",
+                            prior=False,
+                        ),
+                        _fact(
+                            kind="maturity", normalized_date="2030-02-03", prior=False
+                        ),
+                    ]
+                )
+            ],
+            counters,
+        )
+        if row.get("synthesized_by") == "prior_state"
+    ]
+
+    assert counters == {"minted": 1}
+    dates = {entry["kind"]: entry for entry in json.loads(minted[0]["dates_json"])}
+    # the prior value triggers and lands on the predecessor as its own, stated
+    assert dates["commitment_termination"]["normalized_date"] == "2026-02-03"
+    assert dates["commitment_termination"]["derived_from"] == "stated"
+    # the current maturity has no prior sibling, so it carries forward marked
+    assert dates["maturity"]["normalized_date"] == "2030-02-03"
+    assert dates["maturity"]["derived_from"] == "inherited"
+
+    # And the mirror case, which is the other frozenset: with the prior value on
+    # `maturity` instead, the current `commitment_termination` has no prior
+    # sibling and is the one carried forward. Without `commitment_termination`
+    # in `INHERITED_DATE_KINDS` the predecessor simply loses that term.
+    mirrored = [
+        row
+        for row in mint_prior_state_rows(
+            [
+                amended_row(
+                    dates=[
+                        _fact(
+                            kind="agreement", normalized_date="2020-02-03", prior=False
+                        ),
+                        _fact(
+                            kind="maturity", normalized_date="2027-02-03", prior=True
+                        ),
+                        _fact(
+                            kind="maturity", normalized_date="2030-02-03", prior=False
+                        ),
+                        _fact(
+                            kind="commitment_termination",
+                            normalized_date="2029-02-03",
+                            prior=False,
+                        ),
+                    ]
+                )
+            ]
+        )
+        if row.get("synthesized_by") == "prior_state"
+    ]
+    mirrored_dates = {
+        entry["kind"]: entry for entry in json.loads(mirrored[0]["dates_json"])
+    }
+    assert mirrored_dates["maturity"]["normalized_date"] == "2027-02-03"
+    assert mirrored_dates["maturity"]["derived_from"] == "stated"
+    assert mirrored_dates["commitment_termination"]["normalized_date"] == "2029-02-03"
+    assert mirrored_dates["commitment_termination"]["derived_from"] == "inherited"
+
+
+def test_an_expected_date_is_never_inherited_onto_the_predecessor() -> None:
+    """A date the filing only projects cannot be a term the earlier state had.
+
+    No fixture carried `expected: True`, so deleting the
+    `and not entry.get("expected")` guard left the suite green (#211).
+    """
+    from cdt.extractor.core import mint_prior_state_rows
+
+    minted = [
+        row
+        for row in mint_prior_state_rows(
+            [
+                amended_row(
+                    dates=[
+                        _fact(
+                            kind="agreement", normalized_date="2020-02-03", prior=True
+                        ),
+                        _fact(
+                            kind="maturity",
+                            normalized_date="2030-02-03",
+                            prior=False,
+                            expected=True,
+                        ),
+                    ]
+                )
+            ]
+        )
+        if row.get("synthesized_by") == "prior_state"
+    ]
+
+    kinds = {entry["kind"] for entry in json.loads(minted[0]["dates_json"])}
+    assert "maturity" not in kinds
+    assert minted[0]["maturity_date"] is None
