@@ -227,7 +227,7 @@ Practical consequences when extending the matcher:
 - If a needed fact is not in the extractor's output, the fix belongs in the extractor — add the property there, bound to an object and cited with spans — not in a matcher heuristic that reconstructs it from text.
 - A new published column that records a matcher inference, rather than an extractor fact, needs a provenance column that survives an incremental rematch, and it needs saying so in `docs/schema.md`.
 
-`prior_fact` and `ordinal_chain` in `cdt.matcher.lineage_inference` illustrate the right side of the line: they reason over the `prior` marks in `amounts_json` and over the `name` column, both of which the extractor bound to an object and cited.
+`ordinal_chain` in `cdt.matcher.lineage_inference` illustrates the right side of the line: it reasons over the `name` column, the filing dates, and the borrower the extractor bound to each row in `parties_json` — all extractor facts, all cited. Its predecessor rule, `prior_fact`, illustrates the other direction. It inferred an `amendment_of` link from a `prior`-marked amount, and could see only prior *amounts*, because the matcher's working set carries no `dates_json`. The extractor now mints that predecessor itself, from the same `prior` marks and the prior dates too (#203): a new object with its own terms is a **fact**, and facts are made in the IE stage. The rule of thumb, sharpened: **IE owns facts; the matcher decides identity and may build views over extractor facts, but it neither creates objects nor asserts facts.**
 
 ## Dashboard Handoff
 
@@ -238,4 +238,4 @@ After matching succeeds, CDT can write final parquet snapshots for dashboard and
 - `debt-instrument-mentions/latest.parquet`
 - `mention-cluster-edges/latest.parquet`
 
-The processor does not publish Cloudflare R2 JSON directly. The `../commercial-debt-tracker-dashboard` repository owns the publisher that reads these final parquet snapshots and writes `generated/*` JSON to R2.
+The processor does not publish Cloudflare R2 JSON directly. The website publisher — `dsi-rse/commercial-debt-tracker-website` — reads these final parquet snapshots and writes `generated/*` JSON to R2. (The older `commercial-debt-tracker-dashboard` repository is archived; older documents that name it mean this one.) Anything that needs a notion of *now* — the lifecycle status cascade #196 removed from this repository — is derived there against an explicit `asOf` (website#15). A synthesized prior state (#203) reaches the publisher as an ordinary instrument row with `is_lineage_head` false and `superseded_by_debt_instrument_id` set, and `synthesized_only` true when no filing describes it on its own; the publisher collapses it beneath its head like any other superseded state.

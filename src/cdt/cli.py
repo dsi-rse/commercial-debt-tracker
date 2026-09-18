@@ -33,7 +33,7 @@ from cdt.extractor import (
     mentions_root,
     reset_active_job,
 )
-from cdt.extractor.core import CLASSIFICATION_SOURCES
+from cdt.extractor.core import CLASSIFICATION_SOURCES, backfill_mentions
 from cdt.ingest import (
     DEFAULT_AWS_PROFILE,
     DEFAULT_BUCKET,
@@ -330,6 +330,23 @@ def build_parser() -> argparse.ArgumentParser:
     add_logging_arguments(reset_job_parser, noun="reset")
     reset_job_parser.set_defaults(func=run_reset_extract_job)
 
+    backfill_parser = subparsers.add_parser(
+        "backfill-mentions",
+        help=(
+            "Re-derive the extractor's synthesized rows over every existing "
+            "mentions partition: mint each amended instrument's prior state "
+            "(#203). No model calls; running it twice is a no-op."
+        ),
+    )
+    add_artifact_root_argument(backfill_parser)
+    backfill_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would be minted and skipped without rewriting anything.",
+    )
+    add_logging_arguments(backfill_parser, noun="backfill")
+    backfill_parser.set_defaults(func=run_backfill_mentions)
+
     match_parser = subparsers.add_parser(
         "match", help="Group extracted instrument mentions into debt instruments."
     )
@@ -352,15 +369,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--ambiguity-margin",
         type=float,
         default=DEFAULT_AMBIGUITY_MARGIN,
-    )
-    match_parser.add_argument(
-        "--infer-lineage",
-        action="store_true",
-        help=(
-            "fill amendment pointers the item-scoped relation stage cannot "
-            "express, from prior-marked amounts and amend-and-restate ordinals; "
-            "off by default, and not part of `cdt pipeline` (#170)"
-        ),
     )
     add_logging_arguments(match_parser, noun="matching")
     match_parser.set_defaults(func=run_matcher)
@@ -863,6 +871,30 @@ def run_reset_extract_job(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_backfill_mentions(args: argparse.Namespace) -> int:
+    """Mint prior states over existing mentions partitions, or count them."""
+    configure_logging(quiet=args.quiet, log_file=args.log_file)
+    logger = logging.getLogger(__name__)
+    artifact_root = args.artifact_root or default_output_root()
+    lease = None
+    if not args.dry_run:
+        lease = acquire_stage_lease(artifact_root, logger, "backfill")
+        if lease is None:
+            return 1
+    try:
+        counts = backfill_mentions(artifact_root, dry_run=args.dry_run)
+    except Exception:
+        logger.exception("Mentions backfill failed")
+        return 1
+    finally:
+        if lease is not None:
+            release_lease(lease)
+    print("Mentions backfill" + (" (dry run):" if args.dry_run else ":"))
+    for key in sorted(counts):
+        print(f"  {key + ':':<32}{counts[key]}")
+    return 0
+
+
 def run_matcher(args: argparse.Namespace) -> int:
     """Run the matcher subcommand."""
     configure_logging(quiet=args.quiet, log_file=args.log_file)
@@ -888,14 +920,17 @@ def run_matcher(args: argparse.Namespace) -> int:
             loose_match_threshold=args.loose_match_threshold,
             ambiguity_margin=args.ambiguity_margin,
         )
-        if args.infer_lineage:
-            stats = apply_lineage_inference_pass(str(artifact_root))
-            logger.info(
-                "Lineage inference: %s links, lineage heads %s -> %s",
-                stats["links"],
-                stats["heads_before"],
-                stats["heads_after"],
-            )
+        # Always, as the pipeline does: an amend-and-restate chain spans
+        # filings, so its links exist only once every shard has matched (#170,
+        # #204). Every inferred pointer is re-derived here, never carried.
+        stats = apply_lineage_inference_pass(artifact_root)
+        logger.info(
+            "Lineage inference: %s links (%s re-opened), lineage heads %s -> %s",
+            stats["links"],
+            stats["reopened"],
+            stats["heads_before"],
+            stats["heads_after"],
+        )
     except Exception:
         logger.exception("Matcher failed")
         return 1

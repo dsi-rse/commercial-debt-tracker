@@ -6,6 +6,7 @@ import inspect
 import json
 
 import pandas as pd
+import pytest
 
 from cdt.matcher import core, lineage_inference
 from cdt.matcher.core import prepare_mention
@@ -76,43 +77,6 @@ def test_ordinal_chain_links_each_state_to_its_predecessor() -> None:
     assert result["i2"][0] == "i1"
 
 
-def test_prior_marked_amount_links_to_the_instrument_stating_it() -> None:
-    """A `prior` commitment equal to another cluster's principal is a predecessor."""
-    mentions = [
-        mention(
-            "m2",
-            amounts_json=json.dumps(
-                [
-                    {
-                        "kind": "commitment",
-                        "normalized_amount": "2000000000",
-                        "prior": True,
-                    },
-                    {"kind": "commitment", "normalized_amount": "3000000000"},
-                ]
-            ),
-        )
-    ]
-    rows = [
-        instrument(
-            "i1",
-            "2022 Credit Agreement",
-            principal_amount="2000000000",
-            first_seen_filing_date="2022-07-07",
-        ),
-        instrument(
-            "i2",
-            "2026 Credit Agreement",
-            principal_amount="3000000000",
-            first_seen_filing_date="2026-04-13",
-        ),
-    ]
-    result = infer_amendment_parents(
-        rows, member_groups={"i2": ["m2"]}, mention_index=index(mentions)
-    )
-    assert result == {"i2": ("i1", "prior_fact")}
-
-
 def test_the_matcher_never_reads_filing_text(monkeypatch: object) -> None:
     """The stage boundary (#184): no lineage rule may derive a fact from item text.
 
@@ -145,6 +109,39 @@ def test_the_matcher_never_reads_filing_text(monkeypatch: object) -> None:
         assert "infer_lineage" not in parameters, name
 
 
+def test_a_replaced_state_of_one_rank_steps_aside_for_the_state_that_replaced_it() -> (
+    None
+):
+    """Two states of the Second A&R, linked to each other, are not a tie.
+
+    The extractor mints an amended instrument's prior state as its own row
+    (#203), so a restatement amended once publishes two rank-2 rows with the
+    later pointing at the earlier. The Third A&R follows the *latest* state of
+    the Second, not neither of them.
+    """
+    rows = [
+        instrument(
+            "second-original",
+            "Second Amended and Restated Credit Agreement",
+            first_seen_filing_date="2017-11-14",
+        ),
+        instrument(
+            "second-amended",
+            "Second Amended and Restated Credit Agreement",
+            first_seen_filing_date="2017-11-14",
+            amendment_of_debt_instrument_id="second-original",
+        ),
+        instrument(
+            "third",
+            "Third Amended and Restated Credit Agreement",
+            first_seen_filing_date="2022-06-28",
+        ),
+    ]
+    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+
+    assert result["third"] == ("second-amended", "ordinal_chain")
+
+
 def test_a_same_rank_tie_is_refused_rather_than_decided_by_id_order() -> None:
     """Two equally-ranked predecessors are ambiguity, not a sort-order question."""
     rows = [
@@ -168,72 +165,6 @@ def test_a_same_rank_tie_is_refused_rather_than_decided_by_id_order() -> None:
     assert result == {}
 
 
-def test_both_directions_of_a_mutual_pair_are_dropped() -> None:
-    """When the rules offer A->B and B->A the evidence has not settled direction."""
-    mentions = [
-        mention(
-            "m1",
-            name="Note",
-            amounts_json=json.dumps(
-                [{"normalized_amount": "2000000000", "prior": True}]
-            ),
-        ),
-        mention(
-            "m2",
-            name="Note",
-            amounts_json=json.dumps(
-                [{"normalized_amount": "3000000000", "prior": True}]
-            ),
-        ),
-    ]
-    rows = [
-        instrument(
-            "i1",
-            "Note",
-            principal_amount="3000000000",
-            first_seen_filing_date="2024-01-01",
-        ),
-        instrument(
-            "i2",
-            "Note",
-            principal_amount="2000000000",
-            first_seen_filing_date="2024-01-01",
-        ),
-    ]
-    result = infer_amendment_parents(
-        rows,
-        member_groups={"i1": ["m1"], "i2": ["m2"]},
-        mention_index=index(mentions),
-    )
-    assert result == {}
-
-
-def test_an_unmarked_amount_does_not_link() -> None:
-    """`prior_fact` rests on the `prior` mark, not on amount equality alone."""
-    mentions = [
-        mention(
-            "m2",
-            name="New Note",
-            amounts_json=json.dumps([{"normalized_amount": "2000000000"}]),
-        ),
-    ]
-    rows = [
-        instrument(
-            "i1",
-            "Old Note",
-            principal_amount="2000000000",
-            first_seen_filing_date="2020-01-01",
-        ),
-        instrument("i2", "New Note", first_seen_filing_date="2024-01-01"),
-    ]
-    result = infer_amendment_parents(
-        rows,
-        member_groups={"i2": ["m2"]},
-        mention_index=index(mentions),
-    )
-    assert result == {}
-
-
 def test_a_parent_dated_after_its_child_is_rejected() -> None:
     """Own start dates outrank filing dates, which cannot separate one filing."""
     rows = [
@@ -252,27 +183,6 @@ def test_a_parent_dated_after_its_child_is_rejected() -> None:
     ]
     result = infer_amendment_parents(rows, member_groups={}, mention_index={})
     assert result == {}
-
-
-def test_an_ambiguous_predecessor_is_left_alone() -> None:
-    """Two equally-qualified parents produce no link: a wrong pointer is worse."""
-    mentions = [
-        mention(
-            "m3",
-            amounts_json=json.dumps(
-                [{"kind": "commitment", "normalized_amount": "500", "prior": True}]
-            ),
-        )
-    ]
-    rows = [
-        instrument("i1", "Facility A", principal_amount="500"),
-        instrument("i2", "Facility B", principal_amount="500"),
-        instrument("i3", "Facility C", principal_amount="900"),
-    ]
-    result = infer_amendment_parents(
-        rows, member_groups={"i3": ["m3"]}, mention_index=index(mentions)
-    )
-    assert "i3" not in result
 
 
 def test_an_extracted_pointer_is_never_overwritten() -> None:
@@ -338,8 +248,13 @@ def test_instruments_of_different_issuers_are_never_linked() -> None:
     assert result == {}
 
 
-def test_match_tables_is_unchanged_without_the_flag() -> None:
-    """The published contract only moves when a caller opts in."""
+def test_match_tables_itself_never_infers_a_pointer() -> None:
+    """Inference is the post-pass's job; the per-shard matcher publishes none.
+
+    `match_tables` sees only the clusters its batch touched, so a rule there
+    could never see both states of one facility. The pass runs after every
+    match (`run_match_and_finalize`, `cdt match`), not behind a flag.
+    """
     from cdt.matcher.core import match_tables
 
     mentions = pd.DataFrame(
@@ -402,21 +317,124 @@ def test_a_different_borrower_refuses_the_ordinal_link() -> None:
 
 
 def test_a_legal_form_suffix_is_not_a_different_borrower() -> None:
-    """`EQT` and `EQT Corporation` are one party, so the chain still links."""
+    """`EQT Corporation` and `EQT Company` are one party, so the chain links.
+
+    Two suffixes that differ from each other, not a bare stem against a
+    suffixed one: `EQT` versus `EQT Corporation` also passed by prefix, so the
+    suffix list could be deleted outright with this test still green (#205).
+    Only `BORROWER_SUFFIXES` can make these two names equal.
+    """
     rows = [
         instrument(
             "i1",
             "Second Amended and Restated Credit Agreement",
             first_seen_filing_date="2022-01-01",
-            parties_json=borrower("EQT"),
+            parties_json=borrower("EQT Corporation"),
         ),
         instrument(
             "i2",
             "Third Amended and Restated Credit Agreement",
             first_seen_filing_date="2024-01-01",
-            parties_json=borrower("EQT Corporation"),
+            parties_json=borrower("EQT Company"),
         ),
     ]
+    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+
+    assert result["i2"] == ("i1", "ordinal_chain")
+
+
+def ordinal_pair(
+    parent_parties: str | None, child_parties: str | None
+) -> list[dict[str, object]]:
+    """Return a Second/Third A&R pair carrying the given `parties_json` values."""
+    parent = instrument(
+        "i1",
+        "Second Amended and Restated Credit Agreement",
+        first_seen_filing_date="2022-01-01",
+    )
+    child = instrument(
+        "i2",
+        "Third Amended and Restated Credit Agreement",
+        first_seen_filing_date="2024-01-01",
+    )
+    if parent_parties is not None:
+        parent["parties_json"] = parent_parties
+    if child_parties is not None:
+        child["parties_json"] = child_parties
+    return [parent, child]
+
+
+@pytest.mark.parametrize(
+    "placeholder",
+    ["Issuer", "the Borrowers", "Buyer Parent", "other Borrowers party thereto"],
+)
+def test_a_placeholder_borrower_is_silence_not_a_different_company(
+    placeholder: str,
+) -> None:
+    """A borrower recorded only by its role or defined term constrains nothing.
+
+    The extractor keeps the longest span, so a filing that never names the
+    company records `Issuer`; read as a name, `HSBC Holdings plc` against
+    `Issuer` refused the link on 17 rows of one corpus (#205).
+    """
+    rows = ordinal_pair(borrower("HSBC Holdings plc"), borrower(placeholder))
+    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+
+    assert result["i2"] == ("i1", "ordinal_chain")
+
+
+@pytest.mark.parametrize(
+    ("parent", "child"),
+    [
+        ("EQT Corporation", "EQT Midstream Partners, LP"),
+        ("Ford Motor Company", "Ford Motor Credit Company LLC"),
+    ],
+)
+def test_a_subsidiary_named_after_its_parent_is_a_different_borrower(
+    parent: str, child: str
+) -> None:
+    """A finance subsidiary is not its parent, however the name begins (#205)."""
+    rows = ordinal_pair(borrower(parent), borrower(child))
+    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+
+    assert "i2" not in result
+
+
+def test_one_shared_borrower_among_several_is_agreement() -> None:
+    """A cluster's borrowers are a union; one match among many is enough."""
+    both = json.dumps(
+        [
+            {"role": "borrower", "canonical_name": "MPLX LP", "spans": []},
+            {"role": "borrower", "canonical_name": "Andeavor Logistics", "spans": []},
+        ]
+    )
+    rows = ordinal_pair(both, borrower("Andeavor Logistics LP"))
+    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+
+    assert result["i2"] == ("i1", "ordinal_chain")
+
+
+def test_a_borrower_that_is_all_noise_does_not_switch_the_guard_off() -> None:
+    """`The` reduces to an empty key, which must not match every other key."""
+    noise_and_eqm = json.dumps(
+        [
+            {"role": "borrower", "canonical_name": "The", "spans": []},
+            {
+                "role": "borrower",
+                "canonical_name": "EQM Midstream Partners",
+                "spans": [],
+            },
+        ]
+    )
+    rows = ordinal_pair(borrower("EQT Corporation"), noise_and_eqm)
+    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+
+    assert "i2" not in result
+
+
+def test_a_parties_payload_that_is_not_a_list_reads_as_no_borrower() -> None:
+    """Valid JSON that is not a list is silence, not an aborted pass."""
+    rows = ordinal_pair(borrower("EQT Corporation"), "null")
     result = infer_amendment_parents(rows, member_groups={}, mention_index={})
 
     assert result["i2"] == ("i1", "ordinal_chain")

@@ -34,8 +34,10 @@ from cdt.extractor.core import (
 )
 from cdt.matcher.lineage_inference import infer_amendment_parents
 from cdt.storage import (
+    artifact_exists,
     coerce_dataset_text,
     read_dataset,
+    read_json_artifact,
     write_json_artifact,
     write_partition_table,
 )
@@ -46,9 +48,11 @@ DEFAULT_MEMBERSHIP_THRESHOLD = 0.90
 DEFAULT_AMBIGUITY_MARGIN = 0.05
 DEFAULT_LENDER_SUPPORT_THRESHOLD = 0.5
 # Bumped 5 -> 6 for the four status columns this stage no longer publishes
-# (#196). A reader holding rows written at 5 has columns that no longer
-# exist, so it needs to know a rebuild happened.
-MATCHER_SCHEMA_VERSION = 6
+# (#196), and 6 -> 7 for the two it gained: `synthesized_only` and
+# `outstanding_balance_as_of_is_filing_date` (#203). A reader holding rows
+# written at an older version is missing columns or holding removed ones, so it
+# needs to know a rebuild happened.
+MATCHER_SCHEMA_VERSION = 7
 EDGE_TYPES = ("member", "related", "ambiguous_candidate")
 GENERIC_LENDER_TERMS = frozenset(
     {
@@ -109,6 +113,10 @@ DEBT_INSTRUMENT_COLUMNS = [
     "outstanding_balance",
     "outstanding_balance_currency",
     "outstanding_balance_as_of",
+    # True when `outstanding_balance_as_of` is the filing date substituted for
+    # a balance the filing dated no other way, so a consumer can tell a stated
+    # as-of from a derived one (#203).
+    "outstanding_balance_as_of_is_filing_date",
     "outstanding_balance_source_mention_id",
     "interest_rate_kind",
     "interest_rate_pct",
@@ -116,6 +124,13 @@ DEBT_INSTRUMENT_COLUMNS = [
     "parties_json",
     "lender_disclosure",
     "amendment_inferred_by",
+    # True when every member mention was synthesized by the extractor rather
+    # than returned by the model — a minted prior state that never merged with
+    # a mention of the instrument it describes (#203). The row is a real prior
+    # state, cited from its successor's filing, but no filing describes it on
+    # its own, and a reader summing capacity or counting live obligations needs
+    # to know that.
+    "synthesized_only",
 ]
 MENTION_CLUSTER_EDGE_DATASET_NAME = "mention-cluster-edges"
 DEBT_INSTRUMENT_DATASET_NAME = "debt-instruments"
@@ -180,7 +195,6 @@ class PreparedMention:
     interest_rate_kind: str | None
     interest_rate_pct: str | None
     status: str | None
-    status_date: str | None
     amendment_of: str | None
     retired_by: tuple[str, ...]
     split_of: str | None
@@ -191,6 +205,11 @@ class PreparedMention:
     normalized_end_date: str | None
     normalized_name_fingerprint: str | None
     lender_signature: str
+    # Set only on a row the extractor synthesized (#203): the rule that minted
+    # it and the model-emitted mention it was minted from. Read by the
+    # canonical-field, profile and scoring rules; never a match key itself.
+    synthesized_by: str | None = None
+    synthesized_from_mention_id: str | None = None
 
 
 @dataclass
@@ -224,7 +243,11 @@ class ClusterProfile:
             self.normalized_start_dates.add(mention.normalized_start_date)
         if mention.normalized_end_date:
             self.normalized_end_dates.add(mention.normalized_end_date)
-        if mention.normalized_name_fingerprint:
+        # A synthesized prior state carries its successor's name. It scores its
+        # own way in on that name, but must not widen the cluster's name class
+        # afterward: the next mention would then be judged against the
+        # amendment's name as well as the instrument's own (#203).
+        if mention.normalized_name_fingerprint and mention.synthesized_by is None:
             self.normalized_name_fingerprints.add(mention.normalized_name_fingerprint)
         if mention.lender_signature:
             self.lender_signatures.add(mention.lender_signature)
@@ -253,6 +276,57 @@ class CandidateScore:
         return f"amount_start+{self.support_family}"
 
 
+def _stale_schema_forces_rematch(
+    resolved_root: str,
+    *,
+    data_dir: Path | None = None,
+) -> bool:
+    """Return True when the root was matched under an older matcher schema.
+
+    ``MATCHER_SCHEMA_VERSION`` was written into the match manifest and read by
+    nothing, which made an incremental match over an older root publish rows
+    that are wrong rather than merely stale. Mention ids are content hashes, so
+    a schema change that alters the hashed payload changes every id: the
+    surviving clusters are then keyed on ids the mentions dataset no longer
+    contains, and the rollup recomputes lifecycle columns from a member list
+    that filtered to empty.
+
+    It also silently degraded #203. Minting an amended instrument's prior state
+    adds mentions, so on a root at an older version the pre-existing clusters
+    hold the slots the mints would take on a clean build, and a cluster can end
+    up with two members naming two different amendment parents — which
+    ``derive_parent_links`` correctly refuses. Measured on ``lineage-verify``
+    (recorded at version 4, code at 7): backfill plus one plain match published
+    19 amendment pointers and 539 heads against a forced match's 22 and 536,
+    and further plain matches never recovered it. EQT's Second Amended and
+    Restated agreement was one of the rows that lost its pointer.
+
+    A rematch is deterministic local compute, so promoting the run is cheaper
+    than refusing it and safer than proceeding: refusing would wedge the
+    scheduled daily run behind an operator, and proceeding publishes the wrong
+    answer with a successful-looking log line (#208).
+    """
+    manifest_path = run_manifest_path(
+        "match",
+        "latest",
+        artifact_root=resolved_root,
+        data_dir=data_dir,
+    )
+    if not artifact_exists(manifest_path):
+        return False
+    recorded = read_json_artifact(manifest_path).get("schema_version")
+    if not isinstance(recorded, int) or recorded >= MATCHER_SCHEMA_VERSION:
+        return False
+    LOGGER.warning(
+        "Matcher schema is %s but %s was matched at %s; forcing a full rematch "
+        "so clusters are not keyed on mention ids that have since changed",
+        MATCHER_SCHEMA_VERSION,
+        resolved_root,
+        recorded,
+    )
+    return True
+
+
 def match_pending_mentions(
     *,
     artifact_root: str | Path | None = None,
@@ -273,6 +347,8 @@ def match_pending_mentions(
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    if not force:
+        force = _stale_schema_forces_rematch(resolved_root, data_dir=data_dir)
     mention_rows = read_dataset(
         dataset_root(
             MENTIONS_DATASET_NAME, artifact_root=resolved_root, data_dir=data_dir
@@ -473,6 +549,7 @@ def match_tables(
             strong_match_threshold=strong_match_threshold,
             loose_match_threshold=loose_match_threshold,
             name_class_size=class_sizes.get(mention_id, 1),
+            lender_signature=borrowed_lender_signature(mention, mention_index),
         )
         chosen_cluster_id, chosen_edge_rows = resolve_candidates(
             mention,
@@ -802,9 +879,20 @@ def score_candidates_for_mention(
     strong_match_threshold: float,
     loose_match_threshold: float,
     name_class_size: int = 1,
+    lender_signature: str | None = None,
 ) -> list[CandidateScore]:
-    """Return scored candidate clusters for one mention."""
+    """Return scored candidate clusters for one mention.
+
+    ``lender_signature`` overrides the mention's own for scoring only. A
+    synthesized prior state publishes no lenders — a joinder adds and removes
+    them, so the filing never states who lent under the earlier terms — but
+    may borrow its successor's signature to vouch for a membership (#203).
+    Nothing borrowed reaches the cluster profile or a published row.
+    """
     del loose_match_threshold
+    scoring_lender_signature = (
+        lender_signature if lender_signature is not None else mention.lender_signature
+    )
     if mention.cik is None:
         return []
     has_match_keys = (
@@ -907,9 +995,9 @@ def score_candidates_for_mention(
             continue
         lender_similarity = max(
             (
-                lender_similarity_score(mention.lender_signature, candidate_signature)
+                lender_similarity_score(scoring_lender_signature, candidate_signature)
                 for candidate_signature in profile.lender_signatures
-                if mention.lender_signature and candidate_signature
+                if scoring_lender_signature and candidate_signature
             ),
             default=0.0,
         )
@@ -1176,8 +1264,6 @@ def derive_parent_links(
         existing_amendment = coerce_optional_text(
             existing_row.get("amendment_of_debt_instrument_id")
         )
-        if existing_amendment:
-            amendment_parents.add(existing_amendment)
         existing_retired = coerce_optional_text(
             existing_row.get("retired_by_debt_instrument_ids")
         )
@@ -1217,10 +1303,25 @@ def derive_parent_links(
         # unambiguous (#130). Retirers are exempt: several instruments jointly
         # retiring one obligation is a legitimate state of the world, so the
         # column is a list and keeps them all.
-        if len(amendment_parents) > 1:
+        amendment_is_ambiguous = len(amendment_parents) > 1
+        if amendment_is_ambiguous:
             amendment_parents.clear()
         if len(split_parents) > 1:
             split_parents.clear()
+        # The existing row's amendment pointer is a *fallback*, not a candidate.
+        # Seeding it alongside the extracted ones put a guess and a fact in the
+        # same set, and the guard above then threw both away: a row carrying a
+        # stale inferred pointer lost the #203 pointer its own mention now
+        # states, the pass re-inferred its guess on the next run, and the
+        # extracted link never came back. Measured on `data/lineage-verify`,
+        # backfill plus one plain match published 19 pointers and 539 heads
+        # against a clean rebuild's 22 and 536, and three further matches did
+        # not recover it. What the mentions state wins; the carried pointer is
+        # what keeps an inferred link alive across an ordinary rematch, since
+        # no mention names it (#184, #204). An ambiguous extracted set is a
+        # refusal, so it does not fall back — a guess is worse than no pointer.
+        if not amendment_parents and not amendment_is_ambiguous and existing_amendment:
+            amendment_parents.add(existing_amendment)
         amendment_parent = next(iter(amendment_parents), None)
         # Provenance travels with the pointer it describes. The amendment pointer
         # is carried forward from the existing row above, so without this an
@@ -1273,6 +1374,18 @@ def build_debt_instrument_rows(
             key=lambda mention_id: mention_recency_key(mention_index[mention_id]),
             reverse=True,
         )
+        # A synthesized prior state carries its successor's filing date, so by
+        # recency it is the newest member and would supply every canonical
+        # field — renaming a predecessor cluster after the amendment that
+        # replaced it, which in turn hands `ordinal_chain` two rows of one rank
+        # and makes it refuse the link (#203). Model-emitted members decide the
+        # canonical values whenever there is one; a synthesized member does only
+        # when it is all the cluster has.
+        canonical_member_ids = [
+            mention_id
+            for mention_id in ordered_member_ids
+            if mention_index[mention_id].synthesized_by is None
+        ] or ordered_member_ids
         if present_member_ids:
             seed_mention = mention_index[
                 min(
@@ -1323,7 +1436,7 @@ def build_debt_instrument_rows(
                 # Fall back to the filer name any mention for this CIK carries, so
                 # one member mention without display metadata cannot blank the page.
                 "company_name": first_non_null(
-                    ordered_member_ids, mention_index, "company_name"
+                    canonical_member_ids, mention_index, "company_name"
                 )
                 or coerce_optional_text(existing_row.get("company_name"))
                 or (company_names or {}).get(cik),
@@ -1341,45 +1454,58 @@ def build_debt_instrument_rows(
                     debt_instrument_id, {}
                 ).get("split_of_debt_instrument_id"),
                 **canonical_scalar_fields(
-                    ordered_member_ids,
+                    canonical_member_ids,
                     mention_index,
                     existing_row,
                     field_name="name",
                     source_column="name_source_mention_id",
                 ),
                 **canonical_scalar_fields(
-                    ordered_member_ids,
+                    canonical_member_ids,
                     mention_index,
                     existing_row,
                     field_name="instrument_type",
                     source_column="instrument_type_source_mention_id",
                 ),
                 **canonical_scalar_fields(
-                    ordered_member_ids,
+                    canonical_member_ids,
                     mention_index,
                     existing_row,
                     field_name="start_date",
                     source_column="start_date_source_mention_id",
                 ),
                 **canonical_maturity_fields(
-                    ordered_member_ids, mention_index, existing_row
+                    canonical_member_ids, mention_index, existing_row
                 ),
                 **canonical_scalar_fields(
-                    ordered_member_ids,
+                    canonical_member_ids,
                     mention_index,
                     existing_row,
                     field_name="commitment_termination_date",
                     source_column="commitment_termination_source_mention_id",
                 ),
                 **principal_amount_fields(
-                    ordered_member_ids, mention_index, existing_row
+                    canonical_member_ids, mention_index, existing_row
                 ),
                 **outstanding_balance_fields(
-                    ordered_member_ids, mention_index, existing_row
+                    canonical_member_ids, mention_index, existing_row
                 ),
-                **interest_rate_fields(ordered_member_ids, mention_index, existing_row),
+                **interest_rate_fields(
+                    canonical_member_ids, mention_index, existing_row
+                ),
                 "parties_json": parties_json,
                 "lender_disclosure": lender_disclosure,
+                # Every member synthesized: a minted prior state no filing
+                # describes on its own. Carried forward when this run loaded no
+                # member for the row, like every other canonical field.
+                "synthesized_only": (
+                    all(
+                        mention_index[mention_id].synthesized_by is not None
+                        for mention_id in present_member_ids
+                    )
+                    if present_member_ids
+                    else coerce_optional_bool(existing_row.get("synthesized_only"))
+                ),
             }
         )
     return rows
@@ -1529,11 +1655,14 @@ def outstanding_balance_fields(
     ordered_member_ids: list[str],
     mention_index: dict[str, PreparedMention],
     existing_row: dict[str, object],
-) -> dict[str, str | None]:
+) -> dict[str, str | bool | None]:
     """Return the newest outstanding-balance observation.
 
     Kept apart from principal so a balance can never double-count as the
-    headline amount (#140).
+    headline amount (#140). An undated balance is bounded by the filing that
+    observed it, and `outstanding_balance_as_of_is_filing_date` records that
+    the date was substituted rather than stated: a view may derive a value, but
+    it may not publish a derived value as if the filing had said it (#203).
     """
     for mention_id in ordered_member_ids:
         mention = mention_index[mention_id]
@@ -1554,6 +1683,7 @@ def outstanding_balance_fields(
                     "outstanding_balance_as_of": (
                         str(as_of) if as_of is not None else mention.date
                     ),
+                    "outstanding_balance_as_of_is_filing_date": as_of is None,
                     "outstanding_balance_source_mention_id": mention_id,
                 }
     return {
@@ -1565,6 +1695,9 @@ def outstanding_balance_fields(
         ),
         "outstanding_balance_as_of": coerce_optional_text(
             existing_row.get("outstanding_balance_as_of")
+        ),
+        "outstanding_balance_as_of_is_filing_date": coerce_optional_bool(
+            existing_row.get("outstanding_balance_as_of_is_filing_date")
         ),
         "outstanding_balance_source_mention_id": coerce_optional_text(
             existing_row.get("outstanding_balance_source_mention_id")
@@ -1610,13 +1743,33 @@ def dedupe_party_clusters(payloads: list[str]) -> list[dict[str, object]]:
     deduped: dict[str, dict[str, object]] = {}
     for payload in payloads:
         for cluster in parse_cluster_list(payload):
-            canonical = cluster_canonical_key(cluster)
+            canonical = party_dedupe_key(cluster)
             if not canonical:
                 continue
             key = f"{cluster.get('role', 'lender')}::{canonical}"
             if key not in deduped:
                 deduped[key] = cluster
     return [deduped[key] for key in sorted(deduped)]
+
+
+def party_dedupe_key(cluster: dict[str, object]) -> str:
+    """Return the key one party cluster dedupes on: its extractor-chosen name.
+
+    The extractor already picked the cluster's `canonical_name` (#150), and
+    re-deriving it here from the spans was worse: `normalize_party_text` strips
+    legal-form words before the longest span is chosen, so `NCL Corporation
+    Ltd.` shrank to `ncl` and lost to its own `NCLC` alias, and `EQT
+    Corporation` lost to `Buyer Parent`. Measured over the 1,632 party clusters
+    of one eval window, the two agreed on 1,595 and the matcher's choice was the
+    worse one in the differences (#203). Payloads written before #150 carry no
+    `canonical_name`, so those still take the span-derived key. `lender_keys`
+    deliberately keeps the span-derived key: it is a match-scoring surface, and
+    changing it re-scores clusters, which a dedupe fix must not do.
+    """
+    canonical_name = cluster.get("canonical_name")
+    if isinstance(canonical_name, str) and canonical_name.strip():
+        return normalize_party_text(canonical_name)
+    return cluster_canonical_key(cluster)
 
 
 def parse_cluster_list(value: str) -> list[dict[str, object]]:
@@ -1682,7 +1835,6 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
         interest_rate_kind=coerce_optional_text(row.get("interest_rate_kind")),
         interest_rate_pct=coerce_optional_text(row.get("interest_rate_pct")),
         status=coerce_optional_text(row.get("status")),
-        status_date=coerce_optional_text(row.get("status_date")),
         amendment_of=coerce_optional_text(row.get("amendment_of")),
         retired_by=tuple(json.loads(str(row.get("retired_by_json") or "[]"))),
         split_of=coerce_optional_text(row.get("split_of")),
@@ -1699,15 +1851,28 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
             coerce_optional_text(row.get("name"))
         ),
         lender_signature=lender_signature(row.get("parties_json")),
+        synthesized_by=coerce_optional_text(row.get("synthesized_by")),
+        synthesized_from_mention_id=coerce_optional_text(
+            row.get("synthesized_from_mention_id")
+        ),
     )
 
 
-def mention_sort_key(mention: PreparedMention) -> tuple[str, str, str, str]:
-    """Return deterministic processing order for cluster assignment."""
+def mention_sort_key(mention: PreparedMention) -> tuple[str, str, str, int, str]:
+    """Return deterministic processing order for cluster assignment.
+
+    Within one item a synthesized prior state is placed before the amended
+    object it was minted from: it is the earlier state, and it must be the one
+    that joins the instrument's existing cluster. Left to id order, the amended
+    object joined first and the same-item guard then refused its own prior
+    state, which stranded that state as a head and — where the cluster held two
+    amended objects — gave the cluster two amendment parents and so none (#203).
+    """
     return (
         mention.date or "",
         mention.accession_number or "",
         mention.item_id,
+        0 if mention.synthesized_by is not None else 1,
         mention.debt_instrument_mention_id,
     )
 
@@ -1750,6 +1915,28 @@ def aggregate_lender_disclosure(values: list[str | None]) -> str:
     if not known:
         return LENDER_DISCLOSURE_NONE_NAMED
     return max(known, key=lambda value: LENDER_DISCLOSURE_PRECEDENCE[value])
+
+
+def coerce_optional_bool(value: object) -> bool | None:
+    """Return one nullable flag read back from a published row.
+
+    A declared `bool` column round-trips as Python or numpy bools with nulls
+    read as None or NaN; a row that predates the column has nothing at all.
+    Text spellings are accepted so a hand-built frame reads the same way.
+    """
+    if value is None or isinstance(value, bool):
+        return value
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip().lower()
+    if text in {"true", "1"}:
+        return True
+    if text in {"false", "0"}:
+        return False
+    return None
 
 
 def coerce_optional_cik(value: object) -> str | None:
@@ -1862,6 +2049,26 @@ def normalize_party_text(value: str) -> str:
         text,
     )
     return re.sub(r"\s+", " ", text).strip()
+
+
+def borrowed_lender_signature(
+    mention: PreparedMention, mention_index: dict[str, PreparedMention]
+) -> str | None:
+    """Return the successor's lender signature for a synthesized prior state.
+
+    Only when the mention is synthesized, names no lender of its own, and its
+    successor is in this run's index; None otherwise, which leaves the scorer
+    on the mention's own signature. Scoring-only by construction: the caller
+    still adds the *original* mention to the profile it joins (#203).
+    """
+    if mention.synthesized_by is None or mention.lender_signature:
+        return None
+    if mention.synthesized_from_mention_id is None:
+        return None
+    successor = mention_index.get(mention.synthesized_from_mention_id)
+    if successor is None or not successor.lender_signature:
+        return None
+    return successor.lender_signature
 
 
 def lender_similarity_score(left: str, right: str) -> float:
@@ -2049,16 +2256,24 @@ def name_class_sizes(
 
     A name shared by many of one issuer's mentions is a template rather than an
     identifier, so the relaxed key rule stands down for it.
+
+    A synthesized prior state carries its successor's name verbatim, so it is
+    not another instrument bearing that name: counting it widened the class past
+    the gate and split a mention out of the cluster it had always joined (#203).
+    Neither synthesized mentions nor a row whose members are all synthesized
+    count here — the same exclusion `ClusterProfile.add_member` applies.
     """
     by_cik: dict[str, list[str | None]] = {}
     for mention in mention_index.values():
-        if mention.cik is None:
+        if mention.cik is None or mention.synthesized_by is not None:
             continue
         by_cik.setdefault(mention.cik, []).append(mention.normalized_name_fingerprint)
     if existing_instruments is not None and not existing_instruments.empty:
         for row in existing_instruments.to_dict("records"):
             cik = coerce_optional_text(row.get("cik"))
             if cik is None or cik not in by_cik:
+                continue
+            if coerce_optional_bool(row.get("synthesized_only")):
                 continue
             by_cik[cik].append(
                 normalize_name_fingerprint(coerce_optional_text(row.get("name")))
@@ -2071,7 +2286,7 @@ def name_class_sizes(
         fingerprint = mention.normalized_name_fingerprint
         sizes[mention_id] = sum(
             1
-            for other in by_cik[mention.cik]
+            for other in by_cik.get(mention.cik, [])
             if other == fingerprint
             or name_fingerprints_are_compatible(fingerprint, other)
         )
@@ -2087,7 +2302,12 @@ def name_rates_are_compatible(left: str | None, right: str | None) -> bool:
     return True
 
 
-def apply_lineage_inference_pass(artifact_root: str) -> dict[str, int]:
+def apply_lineage_inference_pass(
+    artifact_root: str | Path,
+    *,
+    data_dir: Path | None = None,
+    renew: Callable[[], None] | None = None,
+) -> dict[str, int]:
     """Infer amendment lineage across the whole corpus, after all shards match.
 
     This cannot run inside `match_tables`: that is called once per shard batch
@@ -2096,18 +2316,37 @@ def apply_lineage_inference_pass(artifact_root: str) -> dict[str, int]:
     rules need every cluster for a CIK at once, which only exists after the shard
     loop has written them all.
 
-    Rewrites `amendment_of_debt_instrument_id` where it was null and re-derives
-    the rollup columns from the updated pointers, so `superseded_by`,
-    `lineage_family_id`, `is_lineage_head` and `status` stay consistent.
+    Every pointer this pass wrote before is re-opened and re-derived, so the
+    published lineage is a function of the current rules and the current rows,
+    not of which run happened to write first. `infer_amendment_parents` only
+    considers rows whose pointer is null, and an ordinary rematch carries an
+    existing pointer forward from disk — so without this, a link a tightened
+    rule now refuses (the EQT/EQM cross-borrower link #197's guard was written
+    to remove) survived on every already-matched root and was republished by the
+    next plain `cdt match`; 14 of 542 pointers differed from a clean rebuild
+    (#204). `amendment_inferred_by` is what distinguishes those rows: it is set
+    only by this pass and cleared whenever an extracted pointer takes over, so
+    an extracted relation is never re-opened.
+
+    Rewrites `amendment_of_debt_instrument_id` and re-derives the rollup columns
+    from the updated pointers, so `superseded_by`, `lineage_family_id` and
+    `is_lineage_head` stay consistent. ``renew`` extends the caller's writer
+    lease: this pass reads three whole datasets and rewrites every shard, which
+    can outlast a lease TTL between two phases that renew it (#89).
     """
-    instruments = read_dataset(debt_instruments_root(artifact_root))
-    edges = read_dataset(mention_cluster_edges_root(artifact_root))
+    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    instruments = read_dataset(debt_instruments_root(resolved_root, data_dir=data_dir))
+    edges = read_dataset(mention_cluster_edges_root(resolved_root, data_dir=data_dir))
     mentions = read_dataset(
-        dataset_root(MENTIONS_DATASET_NAME, artifact_root=artifact_root),
+        dataset_root(
+            MENTIONS_DATASET_NAME, artifact_root=resolved_root, data_dir=data_dir
+        ),
         columns=EXTRACTED_MENTION_COLUMNS,
     )
     if instruments.empty or edges.empty or mentions.empty:
-        return {"links": 0, "heads_before": 0, "heads_after": 0}
+        return {"links": 0, "reopened": 0, "heads_before": 0, "heads_after": 0}
+    if renew is not None:
+        renew()
 
     member_edges = edges[edges["edge_type"] == "member"]
     member_groups: dict[str, list[str]] = {}
@@ -2121,6 +2360,14 @@ def apply_lineage_inference_pass(artifact_root: str) -> dict[str, int]:
     }
     rows = instruments.to_dict("records")
     heads_before = sum(1 for row in rows if row.get("is_lineage_head"))
+
+    reopened = 0
+    for row in rows:
+        if coerce_optional_text(row.get("amendment_inferred_by")) is None:
+            continue
+        row["amendment_of_debt_instrument_id"] = None
+        row["amendment_inferred_by"] = None
+        reopened += 1
 
     inferred = infer_amendment_parents(
         rows,
@@ -2139,23 +2386,32 @@ def apply_lineage_inference_pass(artifact_root: str) -> dict[str, int]:
     )
     heads_after = sum(1 for row in rows if row.get("is_lineage_head"))
     frame = pd.DataFrame(rows, columns=DEBT_INSTRUMENT_COLUMNS)
-    frame["_shard"] = frame["cik"].map(lambda value: shard_for_cik(str(value)))
+    # Same shard assignment as `match_pending_mentions`: a null cik must map to
+    # the shard the matcher put it in, or the rewrite lands the row in a second
+    # shard and the original copy is never removed (#204).
+    frame["_shard"] = (
+        frame["cik"].fillna("").map(lambda value: shard_for_cik(str(value)))
+    )
     for cik_shard, shard_rows in frame.groupby("_shard"):
+        if renew is not None:
+            renew()
         write_partition_table(
-            debt_instruments_root(artifact_root),
+            debt_instruments_root(resolved_root, data_dir=data_dir),
             partition={"cik_shard": str(cik_shard)},
             table=shard_rows.drop(columns=["_shard"]).reindex(
                 columns=DEBT_INSTRUMENT_COLUMNS
             ),
         )
     LOGGER.info(
-        "Lineage inference pass: %s links, heads %s -> %s",
+        "Lineage inference pass: %s links (%s inferred pointers re-opened), heads %s -> %s",
         len(inferred),
+        reopened,
         heads_before,
         heads_after,
     )
     return {
         "links": len(inferred),
+        "reopened": reopened,
         "heads_before": heads_before,
         "heads_after": heads_after,
     }

@@ -4,13 +4,20 @@ from __future__ import annotations
 
 import json
 
+import pandas as pd
+
 from cdt.extractor.core import DEBT_INSTRUMENT_MENTION_COLUMNS
 from cdt.matcher.core import (
     NAME_CLASS_GATE,
     PreparedMention,
+    borrowed_lender_signature,
+    build_debt_instrument_rows,
     build_empty_profile,
     derive_parent_links,
     end_dates_are_compatible,
+    lender_signature,
+    match_tables,
+    mention_sort_key,
     name_rate_tokens,
     name_rates_are_compatible,
     normalize_name_fingerprint,
@@ -74,6 +81,324 @@ def score(
         loose_match_threshold=0.75,
         name_class_size=name_class_size,
     )
+
+
+LENDERS = json.dumps(
+    [
+        {
+            "role": "lender",
+            "canonical_name": "Bank of America, N.A.",
+            "spans": [{"text": "Bank of America, N.A."}],
+        }
+    ]
+)
+BORROWER_ONLY = json.dumps(
+    [{"role": "borrower", "canonical_name": "Example Co", "spans": []}]
+)
+
+
+def predecessor_pair() -> tuple[PreparedMention, PreparedMention, PreparedMention]:
+    """Return (R, M, P): the original filing's mention, the amendment, its mint.
+
+    R: filing A, `Credit Agreement`, $300M dated 2020-02-03, lenders named.
+    M: filing B, `Amendment No. 2 to Credit Agreement`, $250M, same agreement date.
+    P: minted from M — the $300M prior state, same item as M, borrower only,
+    no name of its own here so the lender path can be exercised alone.
+    """
+    original = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="m-original",
+            item_id="item-a",
+            accession_number="0001",
+            date="2020-02-05",
+            name="Credit Agreement",
+            start_date="2020-02-03",
+            maturity_date=None,
+            principal_amount="300000000",
+            parties_json=LENDERS,
+        )
+    )
+    amendment = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="m-amendment",
+            item_id="item-b",
+            accession_number="0002",
+            date="2024-06-01",
+            name="Amendment No. 2 to Credit Agreement",
+            start_date="2020-02-03",
+            maturity_date=None,
+            principal_amount="250000000",
+            parties_json=LENDERS,
+        )
+    )
+    minted = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="m-prior",
+            item_id="item-b",
+            accession_number="0002",
+            date="2024-06-01",
+            name=None,
+            start_date="2020-02-03",
+            maturity_date=None,
+            principal_amount="300000000",
+            parties_json=BORROWER_ONLY,
+            lender_disclosure="none_named",
+            synthesized_by="prior_state",
+            synthesized_from_mention_id="m-amendment",
+        )
+    )
+    return original, amendment, minted
+
+
+def test_a_borrower_only_mint_reaches_membership_only_with_borrowed_lenders() -> None:
+    """Keys alone score 0.75 — a `related` edge, never a member (#203).
+
+    A synthesized prior state names no lender, so its own signature is empty
+    and lender support is zero. Borrowing its successor's signature, scoring
+    only, is what lets it join the original filing's cluster.
+    """
+    original, amendment, minted = predecessor_pair()
+    profiles = profile_from(original)
+
+    on_its_own = score(minted, profiles)
+    assert [candidate.match_score for candidate in on_its_own] == [0.75]
+
+    borrowed = borrowed_lender_signature(
+        minted, {"m-amendment": amendment, "m-prior": minted}
+    )
+    assert borrowed == lender_signature(LENDERS)
+    with_lenders = score_candidates_for_mention(
+        minted,
+        profiles,
+        strong_match_threshold=0.90,
+        loose_match_threshold=0.75,
+        lender_signature=borrowed,
+    )
+    assert [candidate.match_score for candidate in with_lenders] == [1.0]
+    assert with_lenders[0].support_family == "lenders"
+
+    # Nothing is borrowed for a model-emitted mention, or for a mint that
+    # names lenders itself, or when the successor is not in the index.
+    assert borrowed_lender_signature(original, {"m-amendment": amendment}) is None
+    assert borrowed_lender_signature(minted, {}) is None
+
+
+def test_a_mint_never_joins_its_own_successors_cluster() -> None:
+    """Same item, so two instruments by construction (#161): P scores nothing."""
+    _, amendment, minted = predecessor_pair()
+
+    assert score(minted, profile_from(amendment)) == []
+
+
+def test_a_synthesized_members_name_does_not_widen_the_cluster_profile() -> None:
+    """P scores in on its name but must not add that name to the profile."""
+    original, _, _ = predecessor_pair()
+    named_mint = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="m-prior",
+            item_id="item-b",
+            accession_number="0002",
+            date="2024-06-01",
+            name="Fifth Amended and Restated Credit Agreement",
+            start_date="2020-02-03",
+            maturity_date=None,
+            principal_amount="300000000",
+            parties_json=BORROWER_ONLY,
+            synthesized_by="prior_state",
+            synthesized_from_mention_id="m-amendment",
+        )
+    )
+    profiles = profile_from(original)
+    profile = profiles["m-original"]
+    profile.add_member(named_mint)
+
+    assert normalize_name_fingerprint("Credit Agreement") in (
+        profile.normalized_name_fingerprints
+    )
+    assert named_mint.normalized_name_fingerprint not in (
+        profile.normalized_name_fingerprints
+    )
+    assert "m-prior" in profile.member_ids
+
+
+def test_synthesized_mentions_do_not_widen_the_name_class() -> None:
+    """A mint carries its successor's name verbatim; it is not another instrument.
+
+    Counting mints pushed one issuer's `Second Amended and Restated Credit
+    Agreement` class past `NAME_CLASS_GATE`, and a later mention that had
+    always joined that cluster through the name path split off on its own
+    (measured on the EQT chain, #203).
+    """
+    from cdt.matcher.core import name_class_sizes
+
+    original, amendment, _ = predecessor_pair()
+    mints = [
+        prepare_mention(
+            mention_row(
+                debt_instrument_mention_id=f"m-mint-{index}",
+                item_id=f"item-mint-{index}",
+                name="Credit Agreement",
+                synthesized_by="prior_state",
+                synthesized_from_mention_id="m-amendment",
+            )
+        )
+        for index in range(3)
+    ]
+    index = {m.debt_instrument_mention_id: m for m in (original, amendment, *mints)}
+
+    sizes = name_class_sizes(index)
+    # `Credit Agreement` and `Amendment No. 2 to Credit Agreement` are
+    # compatible, so the class is those two — and not the three mints.
+    assert sizes["m-original"] == 2
+    assert sizes["m-amendment"] == 2
+
+    published_mint = pd.DataFrame(
+        [{"cik": "0000320193", "name": "Credit Agreement", "synthesized_only": True}]
+    )
+    assert name_class_sizes(index, published_mint)["m-original"] == 2
+
+
+def test_a_prior_state_is_placed_before_the_object_it_was_minted_from() -> None:
+    """Two amendments of one restatement chain through their minted prior states.
+
+    EQT's Second Amended and Restated Credit Agreement: increased $1.5B -> $2.5B
+    in November 2017, extended in April 2021 with no amount stated. Each
+    amendment mints its prior state. The 2021 prior state *is* the November
+    2017 state, so it must join that cluster — which only happens if it is
+    scored before its own successor, or the same-item guard refuses it. Placed
+    first, the history publishes as three states: 1.5B <- 2.5B <- extended.
+    """
+    nov_2017 = mention_row(
+        debt_instrument_mention_id="m-nov-2017",
+        item_id="item-nov-2017",
+        accession_number="0001",
+        date="2017-11-14",
+        name="Company's Second Amended and Restated Credit Agreement",
+        start_date="2017-07-31",
+        maturity_date=None,
+        principal_amount="2500000000",
+        amendment_of="m-nov-2017-prior",
+    )
+    nov_2017_prior = mention_row(
+        debt_instrument_mention_id="m-nov-2017-prior",
+        item_id="item-nov-2017",
+        accession_number="0001",
+        date="2017-11-14",
+        name="Company's Second Amended and Restated Credit Agreement",
+        start_date="2017-07-31",
+        maturity_date=None,
+        principal_amount="1500000000",
+        synthesized_by="prior_state",
+        synthesized_from_mention_id="m-nov-2017",
+    )
+    apr_2021 = mention_row(
+        debt_instrument_mention_id="m-apr-2021",
+        item_id="item-apr-2021",
+        accession_number="0002",
+        date="2021-04-26",
+        name="Second Amended and Restated Credit Agreement",
+        start_date="2017-07-31",
+        maturity_date=None,
+        principal_amount=None,
+        amendment_of="m-apr-2021-prior",
+    )
+    apr_2021_prior = mention_row(
+        debt_instrument_mention_id="m-apr-2021-prior",
+        item_id="item-apr-2021",
+        accession_number="0002",
+        date="2021-04-26",
+        name="Second Amended and Restated Credit Agreement",
+        start_date="2017-07-31",
+        maturity_date=None,
+        principal_amount=None,
+        synthesized_by="prior_state",
+        synthesized_from_mention_id="m-apr-2021",
+    )
+    assert mention_sort_key(prepare_mention(apr_2021_prior)) < mention_sort_key(
+        prepare_mention(apr_2021)
+    )
+
+    tables = match_tables(
+        pd.DataFrame([nov_2017, nov_2017_prior, apr_2021, apr_2021_prior])
+    )
+    members = (
+        tables["debt_instrument_mentions"]
+        .query("edge_type == 'member'")
+        .set_index("debt_instrument_mention_id")["debt_instrument_id"]
+    )
+    # The 2021 prior state joins the November-2017 state's cluster.
+    assert members["m-apr-2021-prior"] == members["m-nov-2017"]
+    assert members["m-nov-2017-prior"] != members["m-nov-2017"]
+    assert members["m-apr-2021"] not in {
+        members["m-nov-2017"],
+        members["m-nov-2017-prior"],
+    }
+
+    rows = tables["debt_instrument"].set_index("debt_instrument_id")
+    assert (
+        rows.loc[members["m-nov-2017"], "amendment_of_debt_instrument_id"]
+        == (members["m-nov-2017-prior"])
+    )
+    assert (
+        rows.loc[members["m-apr-2021"], "amendment_of_debt_instrument_id"]
+        == (members["m-nov-2017"])
+    )
+    assert rows["is_lineage_head"].sum() == 1
+    assert rows.loc[members["m-apr-2021"], "is_lineage_head"]
+    assert not bool(rows.loc[members["m-nov-2017"], "synthesized_only"])
+    assert bool(rows.loc[members["m-nov-2017-prior"], "synthesized_only"])
+
+
+def test_a_synthesized_member_never_supplies_canonical_fields() -> None:
+    """The newest member is the mint, but the instrument keeps its own name.
+
+    By recency the mint — stamped with the amendment's filing date — would win
+    every canonical field and rename the predecessor cluster after the
+    amendment that replaced it, which also ties `ordinal_chain`'s ranks. A
+    model-emitted member decides whenever there is one; the mint decides only
+    when it is all the cluster has, and the row then says so (#203).
+    """
+    original, _, _ = predecessor_pair()
+    named_mint = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="m-prior",
+            item_id="item-b",
+            accession_number="0002",
+            date="2024-06-01",
+            company_name="Example Co (as amended)",
+            name="Fifth Amended and Restated Credit Agreement",
+            start_date="2020-02-03",
+            maturity_date=None,
+            principal_amount="300000000",
+            parties_json=BORROWER_ONLY,
+            synthesized_by="prior_state",
+            synthesized_from_mention_id="m-amendment",
+        )
+    )
+    index = {"m-original": original, "m-prior": named_mint}
+
+    merged = build_debt_instrument_rows(
+        {"inst": ["m-original", "m-prior"]},
+        index,
+        {},
+        existing_instruments=pd.DataFrame(),
+        company_names={},
+    )[0]
+    assert merged["name"] == "Credit Agreement"
+    assert merged["name_source_mention_id"] == "m-original"
+    assert merged["company_name"] == "Example Co"
+    assert merged["principal_source_mention_id"] == "m-original"
+    assert merged["synthesized_only"] is False
+
+    alone = build_debt_instrument_rows(
+        {"inst": ["m-prior"]},
+        index,
+        {},
+        existing_instruments=pd.DataFrame(),
+        company_names={},
+    )[0]
+    assert alone["name"] == "Fifth Amended and Restated Credit Agreement"
+    assert alone["synthesized_only"] is True
 
 
 def test_conflicting_end_dates_block_membership() -> None:
@@ -846,3 +1171,104 @@ def test_lender_keys_reads_only_lender_clusters() -> None:
     # and is still read as a lender.
     legacy = json.dumps([{"spans": [{"text": "Acme Bank, N.A."}]}])
     assert lender_keys(legacy) == ["acme bank"]
+
+
+def test_an_extracted_amendment_pointer_beats_a_carried_inferred_one() -> None:
+    """A guess and a fact must not cancel each other out (#203, #204).
+
+    `derive_parent_links` used to seed `amendment_parents` with the existing
+    row's pointer whatever its provenance, so a row carrying an inferred
+    pointer to one instrument, whose mention now states an extracted pointer to
+    another, held two candidates and the ambiguity guard threw both away. The
+    pass then re-inferred its guess on the next run and the extracted link
+    never came back. What the mentions state wins; the carried pointer is only
+    a fallback, and it is what keeps an inferred link alive across an ordinary
+    rematch since no mention names it.
+    """
+    child = prepare_mention(
+        mention_row(debt_instrument_mention_id="m-child", amendment_of="m-real-parent")
+    )
+    existing = pd.DataFrame(
+        [
+            {
+                "debt_instrument_id": "m-child",
+                "amendment_of_debt_instrument_id": "m-guessed-parent",
+                "amendment_inferred_by": "ordinal_chain",
+                "retired_by_debt_instrument_ids": None,
+                "split_of_debt_instrument_id": None,
+            }
+        ]
+    )
+
+    links = derive_parent_links(
+        {"m-child": ["m-child"]},
+        {"m-child": child},
+        {"m-child": "m-child", "m-real-parent": "m-real-parent"},
+        existing_instruments=existing,
+    )
+
+    assert links["m-child"]["amendment_of_debt_instrument_id"] == "m-real-parent"
+    # provenance travels with the pointer: this one is extracted, not inferred
+    assert links["m-child"]["amendment_inferred_by"] is None
+
+
+def test_a_carried_pointer_survives_when_no_mention_names_a_parent() -> None:
+    """The fallback is the whole reason an inferred pointer outlives a rematch (#184)."""
+    child = prepare_mention(mention_row(debt_instrument_mention_id="m-child"))
+    existing = pd.DataFrame(
+        [
+            {
+                "debt_instrument_id": "m-child",
+                "amendment_of_debt_instrument_id": "m-guessed-parent",
+                "amendment_inferred_by": "ordinal_chain",
+                "retired_by_debt_instrument_ids": None,
+                "split_of_debt_instrument_id": None,
+            }
+        ]
+    )
+
+    links = derive_parent_links(
+        {"m-child": ["m-child"]},
+        {"m-child": child},
+        {"m-child": "m-child"},
+        existing_instruments=existing,
+    )
+
+    assert links["m-child"]["amendment_of_debt_instrument_id"] == "m-guessed-parent"
+    assert links["m-child"]["amendment_inferred_by"] == "ordinal_chain"
+
+
+def test_two_extracted_parents_refuse_rather_than_fall_back_to_a_guess() -> None:
+    """An ambiguous extracted set is a refusal; falling back would publish a guess."""
+    first = prepare_mention(
+        mention_row(debt_instrument_mention_id="m-a", amendment_of="m-parent-1")
+    )
+    second = prepare_mention(
+        mention_row(debt_instrument_mention_id="m-b", amendment_of="m-parent-2")
+    )
+    existing = pd.DataFrame(
+        [
+            {
+                "debt_instrument_id": "m-a",
+                "amendment_of_debt_instrument_id": "m-guessed-parent",
+                "amendment_inferred_by": "ordinal_chain",
+                "retired_by_debt_instrument_ids": None,
+                "split_of_debt_instrument_id": None,
+            }
+        ]
+    )
+
+    links = derive_parent_links(
+        {"m-a": ["m-a", "m-b"]},
+        {"m-a": first, "m-b": second},
+        {
+            "m-a": "m-a",
+            "m-b": "m-a",
+            "m-parent-1": "m-parent-1",
+            "m-parent-2": "m-parent-2",
+        },
+        existing_instruments=existing,
+    )
+
+    assert links["m-a"]["amendment_of_debt_instrument_id"] is None
+    assert links["m-a"]["amendment_inferred_by"] is None

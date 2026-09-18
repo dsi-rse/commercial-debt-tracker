@@ -33,6 +33,7 @@ from cdt.datasets import (
     date_shard_partition_path,
     existing_date_shard_partition_ids,
     extractor_run_path,
+    iter_date_shard_partitions,
     load_completion_registry,
     load_row_failures,
     parse_date_shard_partition,
@@ -493,6 +494,12 @@ DEBT_INSTRUMENT_MENTION_COLUMNS = [
     "interest_rate_json",
     "dates_json",
     "lender_disclosure",
+    # Set only on a row the extractor synthesized rather than the model
+    # returned: the rule that minted it, and the mention it was minted from
+    # (#203). Null on every model-emitted row. Neither is hashed into the
+    # mention id, so adding them re-keys nothing.
+    "synthesized_by",
+    "synthesized_from_mention_id",
 ]
 
 
@@ -675,7 +682,9 @@ class ExtractionRowState:
             "accession_number": self.item_row.get("accession_number"),
             "item": self.item_row.get("item"),
             "stage_responses": self.stage_responses,
-            "debt_instrument_mentions": self.debt_instrument_mentions,
+            # What the item publishes, not only what the model returned, so the
+            # audit log shows every row a reader will find in `mentions`.
+            "debt_instrument_mentions": published_mention_rows(self),
             "state": self.state,
             "salvage_notes": self.salvage_notes,
             "attempts": attempts,
@@ -1651,6 +1660,377 @@ def pending_extract_partitions(
     return pending, registry
 
 
+# The rule name a synthesized prior state carries in `synthesized_by` (#203).
+SYNTHESIZED_PRIOR_STATE = "prior_state"
+# The term kinds a filing can mark `prior` — the list the dates validator names.
+# `SINGLE_CURRENT_DATE_KINDS - EVENT_DATE_KINDS` would also admit the legacy
+# `expected_closing` replay kind, which is not a term.
+PRIOR_TERM_DATE_KINDS = frozenset({"agreement", "maturity", "commitment_termination"})
+# Current terms a prior state inherits when the filing marks no `prior` value
+# for the kind. Balances, draws, repayments and proceeds are dated observations
+# of the filing's own moment, not terms of the instrument, so they stay with the
+# state the filing describes.
+INHERITED_DATE_KINDS = frozenset({"maturity", "commitment_termination"})
+
+
+def _json_list(row: dict[str, object], column: str) -> list[dict[str, object]]:
+    """Return one JSON-array column as fresh dicts; junk and NaN read as empty."""
+    text = coerce_dataset_text(row.get(column))
+    if text is None:
+        return []
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, list):
+        return []
+    return [dict(entry) for entry in payload if isinstance(entry, dict)]
+
+
+def _json_dict(row: dict[str, object], column: str) -> dict[str, object]:
+    """Return one JSON-object column as a fresh dict; junk and NaN read as empty."""
+    text = coerce_dataset_text(row.get(column))
+    if text is None:
+        return {}
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def _inherited(payload: dict[str, object]) -> dict[str, object]:
+    """Return a copy of a term carried onto a prior state unchanged, marked so."""
+    copy = dict(payload)
+    if (
+        copy.get("normalized_amount") is not None
+        or copy.get("normalized_date") is not None
+    ):
+        copy["derived_from"] = DERIVED_FROM_INHERITED
+    return copy
+
+
+def mint_prior_state_rows(
+    rows: list[dict[str, object]], counters: dict[str, int] | None = None
+) -> list[dict[str, object]]:
+    """Return one item's rows with a synthesized predecessor for each amended object.
+
+    An amendment 8-K extracts as **one** object: its terms as amended, plus every
+    old term the filing states marked `prior` (`instrument_ie.md`). That is the
+    shape the model gets right — asking it to emit the predecessor as its own
+    object (#81) pointed at the wrong instrument in three of five spot-checks
+    (#125). But one object leaves nothing for `amendment_of` to name, so the
+    pipeline published no amendment lineage: 537 of 542 instruments were lineage
+    heads (#170). This expands the shape in code (#203). Nothing here *chooses* a
+    predecessor; it is constructed from the object's own cited `prior` facts, so
+    #125's failure class cannot occur.
+
+    The predecessor P shares every property of its successor M except the terms
+    marked `prior`, which replace their kind: a `prior` mark means "this term
+    changed", and a current term with no prior sibling of its kind is, on the
+    filing's evidence, unchanged and carried onto P marked
+    `derived_from: "inherited"`. The one failure that rule cannot see — a filing
+    stating a *new* value with no before-figure ("increased commitments **to**
+    $250M") alongside some other `prior` term — is why the marker exists.
+    Parties carry the borrower only: a joinder adds and removes lenders, so the
+    filing never states who lent under the earlier terms. The successor's
+    `amendment_of` then names P. M's own row is otherwise untouched, and
+    `amendment_of` is not hashed into its id, so no existing row re-keys.
+
+    Trigger: any `prior`-marked commitment/principal or agreement/maturity/
+    commitment-termination, plus an origin date — a `prior` agreement (the
+    predecessor's own dated-as-of, the best evidence), else the current
+    `closing` or `agreement`. Measured on one 364-item window: 22 objects carry
+    a prior term, 17 mint. An origin equal to an `amendment` date is the
+    restatement's own dated-as-of (MPLX: agreement 2019-07-31 == amendment
+    2019-07-31), not the predecessor's; P is still minted, with no start date,
+    rather than carry a date the filing did not state for that state. Every
+    refusal increments a named counter so the rate is measurable before anyone
+    loosens the rule. Runs at write time (`published_mention_rows`) and over
+    existing partitions (`backfill_mentions`): a pure function of one item's
+    rows, no clock, no model call. Rows read back from parquet carry NaN where
+    the writer had None, so every copied field is coerced, or a mint built here
+    and one built by the backfill would hash differently.
+    """
+    counts = counters if counters is not None else {}
+
+    def bump(key: str) -> None:
+        counts[key] = counts.get(key, 0) + 1
+
+    text = coerce_dataset_text
+    real_rows = [row for row in rows if text(row.get("synthesized_by")) is None]
+    published = list(rows)
+    known_ids = {text(row.get("debt_instrument_mention_id")) for row in rows}
+    for row in real_rows:
+        amounts = _json_list(row, "amounts_json")
+        dates = _json_list(row, "dates_json")
+        prior_amounts = [
+            entry
+            for entry in amounts
+            if entry.get("prior") is True
+            and entry.get("normalized_amount") is not None
+            and entry.get("kind") in PRINCIPAL_AMOUNT_KINDS
+        ]
+        prior_dates = [
+            entry
+            for entry in dates
+            if entry.get("prior") is True
+            and entry.get("normalized_date") is not None
+            and entry.get("kind") in PRIOR_TERM_DATE_KINDS
+        ]
+        if not prior_amounts and not prior_dates:
+            continue
+        prior_kinds = [entry.get("kind") for entry in [*prior_amounts, *prior_dates]]
+        if len(prior_kinds) != len(set(prior_kinds)):
+            # Two before-values of one kind is two prior states, or a model
+            # error; either way the evidence does not describe one predecessor.
+            bump("skipped_ambiguous_prior")
+            continue
+        if text(row.get("amendment_of")) is not None:
+            # The relation stage already paired this object with a predecessor
+            # the model returned; minting a second one would duplicate it.
+            bump("skipped_model_paired")
+            continue
+
+        amendment_dates = {
+            entry.get("normalized_date")
+            for entry in dates
+            if entry.get("kind") == "amendment" and entry.get("normalized_date")
+        }
+        prior_agreement = next(
+            (entry for entry in prior_dates if entry.get("kind") == "agreement"), None
+        )
+        origin_payloads: list[dict[str, object]]
+        if prior_agreement is not None:
+            # "amends and restates the Credit Agreement dated as of X": X is the
+            # predecessor's own date. The current closing and agreement are the
+            # restated instrument's and would put the wrong start date on P.
+            origin_payloads = []
+            origin_date = text(prior_agreement.get("normalized_date"))
+        else:
+            candidates = [
+                payload
+                for payload in (
+                    select_date_payload(dates, "closing"),
+                    select_date_payload(dates, "agreement"),
+                )
+                if payload.get("normalized_date") is not None
+            ]
+            if not candidates:
+                bump("skipped_no_origin")
+                continue
+            origin_payloads = [
+                payload
+                for payload in candidates
+                if payload.get("normalized_date") not in amendment_dates
+            ]
+            if not origin_payloads:
+                bump("minted_no_origin")
+            origin_date = (
+                text(origin_payloads[0].get("normalized_date"))
+                if origin_payloads
+                else None
+            )
+
+        prior_values = {str(entry["normalized_amount"]) for entry in prior_amounts}
+        if prior_values and any(
+            sibling is not row
+            and text(sibling.get("principal_amount")) in prior_values
+            and text(sibling.get("start_date")) in (None, origin_date)
+            for sibling in real_rows
+        ):
+            # The model returned the predecessor as its own object but the
+            # relation stage did not link them; the sibling *is* P.
+            bump("skipped_sibling_is_predecessor")
+            continue
+
+        prior_amount_kinds = {entry.get("kind") for entry in prior_amounts}
+        prior_date_kinds = {entry.get("kind") for entry in prior_dates}
+        minted_amounts: list[dict[str, object]] = []
+        for entry in amounts:
+            kind = entry.get("kind")
+            if kind not in PRINCIPAL_AMOUNT_KINDS:
+                continue
+            if entry.get("prior") is True:
+                if entry.get("normalized_amount") is None:
+                    continue
+                flipped = dict(entry)
+                flipped["prior"] = False
+                minted_amounts.append(flipped)
+            elif kind not in prior_amount_kinds:
+                minted_amounts.append(_inherited(entry))
+        minted_dates: list[dict[str, object]] = []
+        for entry in dates:
+            kind = entry.get("kind")
+            if entry.get("prior") is True:
+                if kind in PRIOR_TERM_DATE_KINDS and entry.get("normalized_date"):
+                    flipped = dict(entry)
+                    flipped["prior"] = False
+                    minted_dates.append(flipped)
+                continue
+            if (
+                kind in INHERITED_DATE_KINDS
+                and kind not in prior_date_kinds
+                and not entry.get("expected")
+            ):
+                minted_dates.append(_inherited(entry))
+        minted_dates.extend(dict(payload) for payload in origin_payloads)
+
+        start_payload = select_date_payload(minted_dates, "closing")
+        if start_payload.get("normalized_date") is None:
+            start_payload = select_date_payload(minted_dates, "agreement")
+        maturity_payload = select_date_payload(minted_dates, "maturity")
+        termination_payload = select_date_payload(
+            minted_dates, "commitment_termination"
+        )
+        principal = select_principal_amount(minted_amounts)
+        status_payload = derived_status_payload(minted_dates)
+        rate_payload = _json_dict(row, "interest_rate_json") or {
+            "kind": None,
+            "rate_pct": None,
+            "spans": [],
+            "derived_from": None,
+        }
+        if rate_payload.get("rate_pct") is not None:
+            rate_payload["derived_from"] = DERIVED_FROM_INHERITED
+        borrowers = [
+            cluster
+            for cluster in _json_list(row, "parties_json")
+            if cluster.get("role") == BORROWER_PARTY_ROLE
+        ]
+        item_id = text(row.get("item_id")) or ""
+        successor_id = text(row.get("debt_instrument_mention_id"))
+        status_date = status_payload.get("status_date")
+        minted: dict[str, object] = {
+            "item_id": item_id,
+            "accession_number": text(row.get("accession_number")),
+            "cik": text(row.get("cik")),
+            "company_name": text(row.get("company_name")),
+            "date": text(row.get("date")),
+            "raw_id": f"{text(row.get('raw_id')) or 'i'}-prior",
+            "name": text(row.get("name")),
+            "instrument_type": text(row.get("instrument_type")),
+            "start_date": start_payload.get("normalized_date"),
+            "maturity_date": maturity_payload.get("normalized_date"),
+            "commitment_termination_date": termination_payload.get("normalized_date"),
+            "principal_amount": principal.get("normalized_amount"),
+            "principal_currency": principal.get("currency"),
+            "principal_amount_kind": principal.get("kind"),
+            "interest_rate_kind": rate_payload.get("kind"),
+            "interest_rate_pct": rate_payload.get("rate_pct"),
+            "status": status_payload.get("status"),
+            "status_date": (
+                status_date.get("normalized_date")
+                if isinstance(status_date, dict)
+                else None
+            ),
+            "amendment_of": None,
+            "retired_by_json": "[]",
+            "split_of": None,
+            "parties_json": json.dumps(borrowers, sort_keys=True),
+            "lender_disclosure": LENDER_DISCLOSURE_NONE_NAMED,
+            "name_json": text(row.get("name_json")) or "{}",
+            "start_date_json": json.dumps(start_payload, sort_keys=True),
+            "maturity_date_json": json.dumps(maturity_payload, sort_keys=True),
+            "commitment_termination_date_json": json.dumps(
+                termination_payload, sort_keys=True
+            ),
+            "amounts_json": json.dumps(minted_amounts, sort_keys=True),
+            "status_json": json.dumps(status_payload, sort_keys=True),
+            "interest_rate_json": json.dumps(rate_payload, sort_keys=True),
+            "dates_json": json.dumps(minted_dates, sort_keys=True),
+            "synthesized_by": SYNTHESIZED_PRIOR_STATE,
+            "synthesized_from_mention_id": successor_id,
+        }
+        minted_id = debt_instrument_mention_id_for(item_id, minted)
+        minted["debt_instrument_mention_id"] = minted_id
+        # The pointer is assigned before, and independently of, appending P: two
+        # sibling successors that differ only in a term P does not carry mint
+        # byte-identical rows, and the second must still point at the one row.
+        row["amendment_of"] = minted_id
+        if minted_id in known_ids:
+            bump("minted_shared")
+            continue
+        known_ids.add(minted_id)
+        published.append(minted)
+        bump("minted")
+    return published
+
+
+def published_mention_rows(
+    row_state: ExtractionRowState, counters: dict[str, int] | None = None
+) -> list[dict[str, object]]:
+    """Return the mention rows one row state publishes.
+
+    The one seam between what the model returned for an item and what the
+    pipeline writes for it. Every publish path — the live loop, the batch
+    job's finalize, the in-memory `extract_tables`, and the `full.jsonl` audit
+    record — goes through here, so `mint_prior_state_rows` (#203) is applied
+    once and identically on every backend, including rows of an in-flight batch
+    job whose IE postprocess ran under older code, while `state.jsonl` keeps
+    carrying only what the model returned. Works on copies: the successor's
+    `amendment_of` is set on the published row, never on the persisted state.
+    """
+    rows = [dict(row) for row in row_state.debt_instrument_mentions]
+    return mint_prior_state_rows(rows, counters)
+
+
+def backfill_mentions(
+    artifact_root: str | Path | None = None,
+    *,
+    data_dir: Path | None = None,
+    dry_run: bool = False,
+) -> dict[str, int]:
+    """Re-derive the synthesized rows over every existing `mentions` partition.
+
+    Drops the rows an earlier run synthesized, clears the pointers that named
+    them, and mints again from the model-emitted rows — so partitions written
+    before #203 gain their prior states with no re-extraction and no model
+    call, and running it twice is a no-op (the mint is a pure function of the
+    model-emitted rows). Returns the mint counters plus partition counts;
+    `dry_run` counts without rewriting, which is the pre-registered yield for
+    an eval.
+    """
+    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    counts: dict[str, int] = {"partitions": 0, "partitions_rewritten": 0}
+    for path in iter_date_shard_partitions(
+        MENTIONS_DATASET_NAME, artifact_root=resolved_root, data_dir=data_dir
+    ):
+        table = read_table(path)
+        if table.empty:
+            continue
+        counts["partitions"] += 1
+        records = table.to_dict("records")
+        synthesized_ids = {
+            coerce_dataset_text(record.get("debt_instrument_mention_id"))
+            for record in records
+            if coerce_dataset_text(record.get("synthesized_by")) is not None
+        }
+        real: dict[str, list[dict[str, object]]] = {}
+        for record in records:
+            if coerce_dataset_text(record.get("synthesized_by")) is not None:
+                continue
+            if coerce_dataset_text(record.get("amendment_of")) in synthesized_ids:
+                record["amendment_of"] = None
+            real.setdefault(
+                coerce_dataset_text(record.get("item_id")) or "", []
+            ).append(record)
+        published: list[dict[str, object]] = []
+        for item_rows in real.values():
+            published.extend(mint_prior_state_rows(item_rows, counts))
+        if dry_run:
+            continue
+        partition = parse_date_shard_partition(path)
+        write_partition_table(
+            mentions_root(resolved_root, data_dir=data_dir),
+            partition={"date": partition["date"], "shard": partition["shard"]},
+            table=pd.DataFrame(published, columns=DEBT_INSTRUMENT_MENTION_COLUMNS),
+        )
+        counts["partitions_rewritten"] += 1
+    LOGGER.info("Mentions backfill%s: %s", " (dry run)" if dry_run else "", counts)
+    return counts
+
+
 def _merge_mentions_partition(
     resolved_root: str,
     *,
@@ -1846,7 +2226,7 @@ def extract_pending_items(
             terminal_ids.add(row_state.item_id)
             replaced_item_ids.add(row_state.item_id)
             if row_state.state in PUBLISHABLE_ROW_STATES:
-                mention_rows.extend(row_state.debt_instrument_mentions)
+                mention_rows.extend(published_mention_rows(row_state))
             if row_state.state == "SUCCESS":
                 succeeded_item_ids.add(row_state.item_id)
             else:
@@ -1960,8 +2340,8 @@ def extract_pending_items(
         raise InfrastructureError(aborted)
 
     LOGGER.info(
-        "Extractor complete: successes=%s failures=%s mentions=%s run_dir=%s "
-        "failure_registry=%s (%s total)",
+        "Extractor complete: successes=%s failures=%s mentions=%s synthesized=%s "
+        "run_dir=%s failure_registry=%s (%s total)",
         sum(
             len(frame["item_id"].unique())
             for frame in processed_frames
@@ -1969,6 +2349,11 @@ def extract_pending_items(
         ),
         len(failed_rows),
         sum(len(frame) for frame in processed_frames),
+        sum(
+            int(frame["synthesized_by"].notna().sum())
+            for frame in processed_frames
+            if not frame.empty
+        ),
         full_jsonl_path,
         failure_registry,
         total_known_failures,
@@ -2009,7 +2394,7 @@ def finalize_extract_outputs(
         audit_records.append(json.dumps(row_state.to_audit_dict(), sort_keys=True))
         if row_state.state in PUBLISHABLE_ROW_STATES:
             mentions_by_partition.setdefault((partition_date, shard), []).extend(
-                row_state.debt_instrument_mentions
+                published_mention_rows(row_state)
             )
         if row_state.state == "SUCCESS":
             succeeded_item_ids.add(row_state.item_id)
@@ -2120,11 +2505,16 @@ def finalize_extract_outputs(
     )
     LOGGER.info(
         "Batch extractor finalize complete: rows=%s successes=%s failures=%s "
-        "mentions=%s audit=%s failure_registry=%s (%s total)",
+        "mentions=%s synthesized=%s audit=%s failure_registry=%s (%s total)",
         len(row_entries),
         len(row_entries) - len(failed_rows),
         len(failed_rows),
         sum(len(frame) for frame in processed_frames),
+        sum(
+            int(frame["synthesized_by"].notna().sum())
+            for frame in processed_frames
+            if not frame.empty
+        ),
         full_jsonl_path,
         failure_registry,
         total_known_failures,
@@ -2187,7 +2577,7 @@ def extract_tables(
         )
         audit_records.append(json.dumps(row_state.to_audit_dict(), sort_keys=True))
         if row_state.state in PUBLISHABLE_ROW_STATES:
-            rows.extend(row_state.debt_instrument_mentions)
+            rows.extend(published_mention_rows(row_state))
         else:
             LOGGER.warning(
                 "In-memory extractor failed for item %s: %s",
@@ -4083,7 +4473,21 @@ def standardized_amounts_payloads(
         payloads.append(payload)
     if not select_principal_amount(payloads):
         synthesized = name_derived_principal_payload(name_text)
-        if synthesized is not None:
+        # When every stated commitment or principal is `prior`, the head's
+        # current figure is unstated — and the figure in the name is the prior
+        # one. Reading it back off the name would publish the pre-amendment
+        # figure as current, #165's stale head by a second route (#206). The
+        # honest answer is null; the minted prior state carries that figure.
+        prior_values = {
+            str(payload["normalized_amount"])
+            for payload in payloads
+            if payload.get("prior") is True
+            and payload.get("normalized_amount") is not None
+        }
+        if (
+            synthesized is not None
+            and str(synthesized.get("normalized_amount")) not in prior_values
+        ):
             payloads.append(synthesized)
     return payloads
 
@@ -4453,6 +4857,12 @@ def standardized_end_date_payload(
 DERIVED_FROM_STATED = "stated"
 DERIVED_FROM_NAME = "name"
 DERIVED_FROM_COMPUTED = "computed"
+# A term carried onto a synthesized predecessor row from the amended object it
+# was minted from, because the filing marked no `prior` value for that kind and
+# so states it unchanged (#203). The spans are the successor's; the marker is
+# what lets a reader tell an inherited term from one the filing stated for this
+# state of the instrument.
+DERIVED_FROM_INHERITED = "inherited"
 # A sum needs at least two addends; one parsed span is agreement, not arithmetic.
 MINIMUM_COMPUTED_SUM_SPANS = 2
 

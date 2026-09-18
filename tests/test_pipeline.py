@@ -304,6 +304,84 @@ def _seed_final_tables(artifact_root: Path, *, rows: int = 2) -> None:
         )
 
 
+def _mention_frame(*names: str) -> pd.DataFrame:
+    """Return one mention per name, all for one issuer, as the extractor publishes."""
+    from cdt.extractor.core import DEBT_INSTRUMENT_MENTION_COLUMNS
+
+    rows = []
+    for index, name in enumerate(names, start=1):
+        row = dict.fromkeys(DEBT_INSTRUMENT_MENTION_COLUMNS)
+        row.update(
+            {
+                "debt_instrument_mention_id": f"m-{index}",
+                "item_id": f"item-{index}",
+                "raw_id": "i-1",
+                "accession_number": f"000{index}",
+                "cik": "320193",
+                "company_name": "Example Inc.",
+                "date": f"202{index}-01-02",
+                "name": name,
+                "start_date": f"202{index}-01-01",
+                "principal_amount": "100000000",
+                "retired_by_json": "[]",
+                "parties_json": "[]",
+                "lender_disclosure": "complete",
+                "name_json": "{}",
+                "start_date_json": "{}",
+                "maturity_date_json": "{}",
+                "amounts_json": "[]",
+                "dates_json": "[]",
+            }
+        )
+        rows.append(row)
+    return pd.DataFrame(rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
+
+
+def test_match_and_finalize_runs_the_lineage_pass_after_every_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pass is part of the pipeline, renews the lease, and skips an empty corpus.
+
+    Behind `cdt match --infer-lineage` it never ran in production, which is why
+    537 of 542 instruments published as lineage heads (#170). It reads three
+    whole datasets and rewrites every shard, so it must renew the writer lease
+    like the phases around it (#89).
+    """
+    from cdt import pipeline as pipeline_module
+
+    calls: list[dict[str, object]] = []
+    renewals: list[int] = []
+
+    def fake_pass(artifact_root: object, **kwargs: object) -> dict[str, int]:
+        calls.append({"artifact_root": str(artifact_root), **kwargs})
+        return {"links": 0, "reopened": 0, "heads_before": 0, "heads_after": 0}
+
+    monkeypatch.setattr(pipeline_module, "apply_lineage_inference_pass", fake_pass)
+
+    empty_root = tmp_path / "empty"
+    pipeline_module.run_match_and_finalize(
+        artifact_root=empty_root, renew=lambda: renewals.append(1)
+    )
+    assert calls == []
+
+    root = tmp_path / "artifacts"
+    write_partition_table(
+        root / "mentions",
+        partition={"date": "2022-01-02", "shard": "0001"},
+        table=_mention_frame(
+            "Credit Agreement", "Second Amended and Restated Credit Agreement"
+        ),
+    )
+    pipeline_module.run_match_and_finalize(
+        artifact_root=root, renew=lambda: renewals.append(1)
+    )
+    assert len(calls) == 1
+    assert calls[0]["artifact_root"] == str(root)
+    assert calls[0]["data_dir"] is None
+    assert callable(calls[0]["renew"])
+    assert renewals  # the lease was renewed around the pass
+
+
 def test_final_snapshots_publish_atomically_with_pointer(tmp_path: Path) -> None:
     """Finalize writes immutable snapshots and one atomic latest.json pointer (#91)."""
     from cdt.pipeline import write_final_output_tables
@@ -394,3 +472,115 @@ def test_resolve_mode_dates_daily_uses_lookback_window() -> None:
     today = date.today()
     assert end == today.fromordinal(today.toordinal() - 1)
     assert start == today.fromordinal(today.toordinal() - DAILY_LOOKBACK_DAYS)
+
+
+def _stage_stubs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    instruments: pd.DataFrame,
+) -> None:
+    """Stub ingest through match so a run reaches the lineage pass cheaply."""
+
+    def fake_run_ingest_pipeline(
+        config: object,
+        *,
+        ciks: set[str] | None = None,
+        s3_client: object | None = None,
+    ) -> tuple[pd.DataFrame, IngestRunResult]:
+        del config, s3_client
+        return pd.DataFrame([{"accession_number": "1"}]), IngestRunResult(
+            mode="historical",
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 1, 31),
+            ciks_count=len(ciks or set()),
+            candidates_seen=1,
+            skipped_existing=0,
+            downloaded=1,
+            failures=0,
+            total_rows=1,
+            output_root=str(tmp_path),
+            documents_root=str(tmp_path / "documents"),
+            document_partitions=(),
+            failure_file=str(tmp_path / "failures" / "ingest_failures.json"),
+            run_manifest=str(tmp_path / "runs" / "ingest" / "run_id=1.json"),
+        )
+
+    monkeypatch.setattr("cdt.pipeline.run_ingest_pipeline", fake_run_ingest_pipeline)
+    monkeypatch.setattr(
+        "cdt.pipeline.itemize_pending_documents",
+        lambda **_: pd.DataFrame([{"item_id": "item-1"}]),
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.classify_pending_items",
+        lambda **_: pd.DataFrame([{"item_id": "item-1", "relevance": True}]),
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.extract_pending_items",
+        lambda **_: pd.DataFrame([{"debt_instrument_mention_id": "mention-1"}]),
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.match_pending_mentions",
+        lambda **_: {
+            "debt_instrument_mentions": pd.DataFrame(
+                [{"debt_instrument_mention_id": "mention-1", "edge_type": "member"}]
+            ),
+            "debt_instrument": instruments,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("instruments", "expected_calls"),
+    [
+        (pd.DataFrame([{"debt_instrument_id": "instrument-1"}]), 1),
+        (pd.DataFrame(columns=["debt_instrument_id"]), 0),
+    ],
+    ids=["matched-something", "matched-nothing"],
+)
+def test_run_pipeline_runs_the_lineage_pass_between_match_and_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    instruments: pd.DataFrame,
+    expected_calls: int,
+) -> None:
+    """`cdt pipeline` and the live backend must infer lineage before publishing.
+
+    The pass was wired into `run_match_and_finalize` and `cdt match` only, so
+    `cdt pipeline` and `cdt-orchestrator --extractor-backend live` still
+    published the un-inferred lineage #170 describes, on a root the batch
+    backend would have fixed. The guard matches `run_match_and_finalize`'s:
+    nothing matched means three empty datasets read to write none.
+    """
+    from cdt import pipeline as pipeline_module
+
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("320193\n", encoding="utf-8")
+    calls: list[dict[str, object]] = []
+    _stage_stubs(monkeypatch, tmp_path, instruments=instruments)
+    monkeypatch.setattr(
+        pipeline_module,
+        "apply_lineage_inference_pass",
+        lambda artifact_root, **kwargs: (
+            calls.append({"artifact_root": str(artifact_root), **kwargs}),
+            {"links": 0, "reopened": 0, "heads_before": 0, "heads_after": 0},
+        )[1],
+    )
+
+    renewals: list[int] = []
+    run_pipeline(
+        PipelineConfig(
+            mode="historical",
+            cik_file=str(cik_file),
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 1, 31),
+            artifact_root=str(tmp_path / "artifacts"),
+        ),
+        renew=lambda: renewals.append(1),
+    )
+
+    assert len(calls) == expected_calls
+    if expected_calls:
+        assert calls[0]["artifact_root"] == str(tmp_path / "artifacts")
+        assert callable(calls[0]["renew"])
+        assert renewals

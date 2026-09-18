@@ -43,7 +43,7 @@ from cdt.matcher import (
     match_pending_mentions,
     mention_cluster_edges_root,
 )
-from cdt.matcher.core import MATCHER_SCHEMA_VERSION
+from cdt.matcher.core import MATCHER_SCHEMA_VERSION, apply_lineage_inference_pass
 from cdt.shared import get_logger
 from cdt.storage import (
     ArtifactPath,
@@ -324,6 +324,21 @@ class PipelineOrchestrator:
             edge_rows=len(matched["debt_instrument_mentions"]),
             debt_instruments=len(matched["debt_instrument"]),
         )
+        # Same post-pass, same guard, as run_match_and_finalize: amendment
+        # lineage spans filings, so it can only be derived once every shard has
+        # matched. This path is `cdt pipeline` and the live extractor backend;
+        # omitting it here published un-inferred lineage on both while the batch
+        # backend had it, which is #170 surviving on two of three entry points.
+        if not matched["debt_instrument"].empty:
+            self._renew(renew)
+            self._log_stage_start("infer-lineage")
+            lineage_stats = apply_lineage_inference_pass(
+                resolved_artifact_root,
+                data_dir=self.config.data_dir,
+                renew=renew,
+            )
+            self._log_stage_complete("infer-lineage", **lineage_stats)
+
         member_edge_rows = matched["debt_instrument_mentions"]
         matched_mentions = (
             int((member_edge_rows["edge_type"] == "member").sum())
@@ -406,7 +421,7 @@ def run_match_and_finalize(
     not keep publishing on a lease another run has stolen (#89).
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
-    match_pending_mentions(
+    tables = match_pending_mentions(
         artifact_root=resolved_root,
         data_dir=data_dir,
         batch_size=batch_size,
@@ -416,6 +431,17 @@ def run_match_and_finalize(
         ambiguity_margin=ambiguity_margin,
         renew=renew,
     )
+    # Amendment lineage across filings exists only once every shard has
+    # matched, so it is a post-pass over the whole corpus (#170). It used to
+    # run only behind `cdt match --infer-lineage`, which is why production
+    # published 537 of 542 instruments as lineage heads. It re-derives every
+    # pointer it ever inferred (#204) and renews the lease as it goes; it is
+    # skipped only when match produced nothing at all, since it would read three
+    # empty datasets to write none.
+    if not tables["debt_instrument"].empty:
+        if renew is not None:
+            renew()
+        apply_lineage_inference_pass(resolved_root, data_dir=data_dir, renew=renew)
     if renew is not None:
         renew()
     return write_final_output_tables(

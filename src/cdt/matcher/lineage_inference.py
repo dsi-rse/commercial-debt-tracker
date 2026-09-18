@@ -10,23 +10,34 @@ instruments came out as lineage heads, with EQT publishing three simultaneously
 active revolvers (#170).
 
 The matcher, unlike the relation stage, already works across filings within a
-CIK, so the missing links can be inferred here. Two rules, both reasoning only
-over facts the extractor bound to an object and cited:
+CIK, so a link the filings encode across filings can be inferred here. One rule,
+reasoning only over facts the extractor bound to an object and cited:
 
-* **prior_fact** — an instrument carrying a `prior`-marked amount whose value
-  equals an earlier instrument's canonical principal. The `prior` mark *is* the
-  predecessor's term, so an exact match on it is strong evidence.
 * **ordinal_chain** — "Fifth Amended and Restated X" follows "Fourth Amended and
   Restated X" follows "X". The ordinal in the name literally encodes chain
   position within one issuer and name stem.
 
-Both only ever fill an `amendment_of_debt_instrument_id` that is already null,
-never overwrite an extracted pointer, and refuse a candidate whenever the
-evidence does not single out one parent — an ambiguous guess is worse than the
-status quo, because a wrong pointer silently rewrites a published history.
+A second rule, `prior_fact`, linked an instrument carrying a `prior`-marked
+amount to the earlier instrument whose principal it equalled. It is gone
+because the extractor now mints that predecessor itself, as its own mention,
+from the same `prior` marks (#203): the successor's `amendment_of` names it
+directly, so the link is an extracted pointer, not an inference — and the
+extractor sees the prior *dates* this module never could, since
+`PreparedMention` carries no `dates_json`. On the corpus it was measured on,
+`prior_fact` produced 1 link in 542.
 
-Stage boundary (#184). Every input here is extractor output: the `prior` marks in
-`amounts_json`, the canonical `name`, `principal_amount`, and `start_date`. This
+The rule only ever fills an `amendment_of_debt_instrument_id` that is null or
+that this module inferred on an earlier run — never an extracted pointer — and
+refuses a candidate whenever the evidence does not single out one parent: an
+ambiguous guess is worse than the status quo, because a wrong pointer silently
+rewrites a published history. Every inferred pointer is re-opened and
+re-derived on each run (`apply_lineage_inference_pass`, #204), so a link the
+rule would now refuse does not survive because it was written first.
+
+Stage boundary (#184). Every input here is extractor output: the canonical
+`name`, `first_seen_filing_date` and `start_date`, and the borrower the
+extractor bound to each row in `parties_json`, which refuses a link between two
+issuers' agreements filed under one CIK (#197, #205). This
 module does **not** read filing text, and must not: a value derived from text in
 the matcher carries no evidence span (#154) and cannot acquire one, and item text
 is scoped to a document rather than to an object, so a text rule attributes a
@@ -85,6 +96,35 @@ BORROWER_SUFFIXES = frozenset(
         "na",
     }
 )
+# A borrower "named" only by its role or defined term. The extractor records a
+# party as the longest span it saw, so a filing that never uses the company's
+# name records the borrower as literally `Issuer` — and read as a name, that
+# made `HSBC Holdings plc` against `Issuer` positive evidence of two different
+# companies (#205). It is silence: the filing did not say who the borrower is.
+# Keys are compared after `NAME_NOISE` and `BORROWER_SUFFIXES` are stripped, so
+# `the Borrowers` and `Co-Borrower` both land on `borrower(s)` here.
+GENERIC_BORROWER_PHRASES = frozenset(
+    {
+        "borrower",
+        "borrowers",
+        "subsidiary borrower",
+        "subsidiary borrowers",
+        "parent borrower",
+        "other borrowers party thereto",
+        "issuer",
+        "issuers",
+        "obligor",
+        "obligors",
+        "buyer",
+        "buyers",
+        "buyer parent",
+        "parent",
+        "loan party",
+        "loan parties",
+        "credit party",
+        "credit parties",
+    }
+)
 
 
 def _borrower_key(name: object) -> tuple[str, ...]:
@@ -97,17 +137,27 @@ def _borrower_key(name: object) -> tuple[str, ...]:
 
 
 def _borrowers(row: dict[str, object]) -> set[tuple[str, ...]]:
-    """Return the borrower keys the extractor bound to this instrument."""
+    """Return the borrower keys the extractor bound to this instrument.
+
+    A placeholder (`Issuer`, `the Borrowers`) is dropped rather than compared:
+    it names a role, not a company, so the row reads as naming no borrower and
+    takes the silence path below. Valid JSON that is not a list reads the same
+    way instead of raising, as `parse_cluster_list` does for every other payload.
+    """
     try:
         parties = json.loads(str(row.get("parties_json") or "[]"))
     except json.JSONDecodeError:
+        return set()
+    if not isinstance(parties, list):
         return set()
     keys = {
         _borrower_key(party.get("canonical_name"))
         for party in parties
         if isinstance(party, dict) and party.get("role") == "borrower"
     }
-    return {key for key in keys if key}
+    return {
+        key for key in keys if key and " ".join(key) not in GENERIC_BORROWER_PHRASES
+    }
 
 
 def _borrowers_disagree(child: dict[str, object], parent: dict[str, object]) -> bool:
@@ -117,13 +167,21 @@ def _borrowers_disagree(child: dict[str, object], parent: dict[str, object]) -> 
     unconstrained, because refusing on a missing party would drop ordinary
     links to the many mentions that never name one — so this only ever fires on
     positive evidence of a different borrower.
+
+    Two rows agree when they share one borrower key exactly. A prefix rule used
+    to count `EQT Corporation` and `EQT Midstream Partners, LP` as one party —
+    finance subsidiaries are almost always named after their parent, and the
+    EQT/EQM case this guard was written for only worked because `eqt` and `eqm`
+    differ in the first token (#205). `BORROWER_SUFFIXES` already makes `EQT` and
+    `EQT Corporation` equal, so the prefix bought nothing but that hole. A
+    cluster's borrowers are the union across its member mentions, so one shared
+    key among several is enough — the guard is deliberately looser on a row
+    that names many borrowers than on one that names one.
     """
     child_keys, parent_keys = _borrowers(child), _borrowers(parent)
     if not child_keys or not parent_keys:
         return False
-    return not any(
-        a[: len(b)] == b or b[: len(a)] == a for a in child_keys for b in parent_keys
-    )
+    return not (child_keys & parent_keys)
 
 
 def _name_rank_and_stem(name: object) -> tuple[int, str]:
@@ -137,30 +195,6 @@ def _name_rank_and_stem(name: object) -> tuple[int, str]:
     else:
         rank, stripped = 0, text
     return rank, " ".join(w for w in stripped.split() if w not in NAME_NOISE)
-
-
-def _prior_amounts(member_ids: list[str], mention_index: dict) -> set[str]:
-    """Return every `prior`-marked amount across a cluster's mentions.
-
-    Reads `amounts_json` by direct attribute access rather than `getattr` with a
-    default: if `PreparedMention` ever stops carrying the field, that should be a
-    loud `AttributeError` and not a silently empty set. `PreparedMention` carries
-    no `dates_json`, so prior *dates* are not available here — adding the field
-    would let this rule match a predecessor's maturity as well (#170).
-    """
-    values: set[str] = set()
-    for member_id in member_ids:
-        mention = mention_index.get(member_id)
-        if mention is None:
-            continue
-        try:
-            payloads = json.loads(mention.amounts_json or "[]")
-        except (TypeError, ValueError):
-            continue
-        for payload in payloads:
-            if payload.get("prior") and payload.get("normalized_amount"):
-                values.add(str(payload["normalized_amount"]))
-    return values
 
 
 def _canonical_date(row: dict[str, object]) -> str | None:
@@ -183,6 +217,10 @@ def infer_amendment_parents(
     considered, and a child is left alone whenever the evidence does not single
     out one parent.
     """
+    # The ordinal rule reads instrument rows only. The mention-level inputs
+    # served `prior_fact`, now the extractor's job (#203); the parameters stay
+    # so the pass and a future mention-reading rule keep one call shape.
+    del member_groups, mention_index
     by_id = {str(row["debt_instrument_id"]): row for row in rows}
     by_cik: dict[str, list[str]] = {}
     for row_id, row in by_id.items():
@@ -233,19 +271,7 @@ def infer_amendment_parents(
             return
         candidates[child_id].setdefault(parent_id, rule)
 
-    # Rule 1: a prior-marked amount equals an earlier instrument's principal.
-    for child_id in open_children:
-        priors = _prior_amounts(member_groups.get(child_id, []), mention_index)
-        if not priors:
-            continue
-        for other_id in by_cik.get(str(by_id[child_id].get("cik") or ""), []):
-            principal = by_id[other_id].get("principal_amount")
-            if principal in (None, "", "None") or str(principal) == "nan":
-                continue
-            if str(principal) in priors:
-                offer(child_id, other_id, "prior_fact")
-
-    # Rule 2: the ordinal chain within one issuer and name stem.
+    # The ordinal chain within one issuer and name stem.
     stems: dict[tuple[str, str], list[tuple[int, str, str]]] = {}
     for row_id, row in by_id.items():
         rank, stem = _name_rank_and_stem(row.get("name"))
@@ -266,6 +292,19 @@ def infer_amendment_parents(
             # it through the per-child guard below refuses the link instead of
             # letting instrument-id order decide a published history.
             parents = [row_id for r, _, row_id in members if r == previous_rank]
+            # One restatement can have several published states — the extractor
+            # mints an amended instrument's prior state as its own row (#203),
+            # and an amendment within a restatement keeps the ordinal. Those
+            # states already point at each other, so the one another same-rank
+            # state names as its `amendment_of` has been replaced: it steps
+            # aside, and the chain lands on the state that replaced it. Two
+            # unlinked rows of one rank are still a tie.
+            replaced = {
+                str(by_id[row_id].get("amendment_of_debt_instrument_id"))
+                for row_id in parents
+                if by_id[row_id].get("amendment_of_debt_instrument_id")
+            }
+            parents = [row_id for row_id in parents if row_id not in replaced]
             for _, _, child_id in [m for m in members if m[0] == rank]:
                 for parent_id in parents:
                     offer(child_id, parent_id, "ordinal_chain")
@@ -326,12 +365,8 @@ def infer_amendment_parents(
             node = parent_of(node)
 
     LOGGER.info(
-        "Lineage inference: %s links (%s), %s children left alone as ambiguous",
+        "Lineage inference: %s ordinal_chain links, %s children left alone as ambiguous",
         len(resolved),
-        ", ".join(
-            f"{rule}={sum(1 for _, r in resolved.values() if r == rule)}"
-            for rule in ("prior_fact", "ordinal_chain")
-        ),
         ambiguous,
     )
     return resolved
