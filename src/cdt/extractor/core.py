@@ -1744,9 +1744,16 @@ def mint_prior_state_rows(
     a prior term, 17 mint. An origin equal to an `amendment` date is the
     restatement's own dated-as-of (MPLX: agreement 2019-07-31 == amendment
     2019-07-31), not the predecessor's; P is still minted, with no start date,
-    rather than carry a date the filing did not state for that state. Every
-    refusal increments a named counter so the rate is measurable before anyone
-    loosens the rule. Runs at write time (`published_mention_rows`) and over
+    rather than carry a date the filing did not state for that state.
+
+    Every refusal increments a named counter so the rate is measurable before
+    anyone loosens the rule, and the counters partition: each object carrying a
+    `prior` claim increments exactly one of `minted`, `minted_shared`, or a
+    `skipped_*`, so those sum to the population that reached this rule.
+    `minted_no_origin` is a tag on a subset of `minted`, not a fourth outcome —
+    it records that P was minted with no start date — so it is the one counter
+    that must not be added to the others (#211). Runs at write time
+    (`published_mention_rows`) and over
     existing partitions (`backfill_mentions`): a pure function of one item's
     rows, no clock, no model call. Rows read back from parquet carry NaN where
     the writer had None, so every copied field is coerced, or a mint built here
@@ -1758,33 +1765,67 @@ def mint_prior_state_rows(
         counts[key] = counts.get(key, 0) + 1
 
     text = coerce_dataset_text
-    real_rows = [row for row in rows if text(row.get("synthesized_by")) is None]
-    published = list(rows)
-    known_ids = {text(row.get("debt_instrument_mention_id")) for row in rows}
+    # Copy before touching anything: this function writes `amendment_of` onto
+    # the successor, and the docstring's "pure function of one item's rows" has
+    # to be true of the argument too. Both current callers happened to be safe
+    # — `published_mention_rows` copies, `backfill_mentions` owns its records —
+    # but a future caller passing `row_state.debt_instrument_mentions` directly
+    # would have persisted a minted pointer into `state.jsonl` (#211).
+    published = [dict(row) for row in rows]
+    real_rows = [row for row in published if text(row.get("synthesized_by")) is None]
+    known_ids = {text(row.get("debt_instrument_mention_id")) for row in published}
     for row in real_rows:
         amounts = _json_list(row, "amounts_json")
         dates = _json_list(row, "dates_json")
-        prior_amounts = [
+        # Which kinds the filing states a before-value for, and which of those
+        # this repo could parse, are two different questions, and conflating
+        # them inverted the inheritance rule. A `prior` term whose value the
+        # parser could not resolve was invisible to the "did this kind change?"
+        # test below, so the *current* value of that kind was copied onto the
+        # predecessor marked `inherited` — asserting the post-amendment figure
+        # as the prior state's own term, which is the one thing this rule must
+        # never do. The kind sets therefore come from the claims, and only the
+        # values come from what parsed (#211).
+        prior_amount_claims = [
             entry
             for entry in amounts
             if entry.get("prior") is True
-            and entry.get("normalized_amount") is not None
             and entry.get("kind") in PRINCIPAL_AMOUNT_KINDS
+        ]
+        prior_date_claims = [
+            entry
+            for entry in dates
+            if entry.get("prior") is True and entry.get("kind") in PRIOR_TERM_DATE_KINDS
+        ]
+        prior_amounts = [
+            entry
+            for entry in prior_amount_claims
+            if entry.get("normalized_amount") is not None
         ]
         prior_dates = [
             entry
-            for entry in dates
-            if entry.get("prior") is True
-            and entry.get("normalized_date") is not None
-            and entry.get("kind") in PRIOR_TERM_DATE_KINDS
+            for entry in prior_date_claims
+            if entry.get("normalized_date") is not None
         ]
-        if not prior_amounts and not prior_dates:
+        if not prior_amount_claims and not prior_date_claims:
             continue
-        prior_kinds = [entry.get("kind") for entry in [*prior_amounts, *prior_dates]]
+        prior_kinds = [
+            entry.get("kind") for entry in [*prior_amount_claims, *prior_date_claims]
+        ]
         if len(prior_kinds) != len(set(prior_kinds)):
             # Two before-values of one kind is two prior states, or a model
             # error; either way the evidence does not describe one predecessor.
+            # Judged on the claims: two stated before-figures are ambiguous
+            # whether or not both of them parsed.
             bump("skipped_ambiguous_prior")
+            continue
+        if not prior_amounts and not prior_dates:
+            # The filing does state a before-value, but none of them parsed, so
+            # there is nothing to build a predecessor's terms out of. This used
+            # to fall through the combined guard above with no counter, which is
+            # why the window's "22 objects carry a prior term" did not match the
+            # counters, which summed to 21 (#211).
+            bump("skipped_unparsed_prior")
             continue
         if text(row.get("amendment_of")) is not None:
             # The relation stage already paired this object with a predecessor
@@ -1795,7 +1836,17 @@ def mint_prior_state_rows(
         amendment_dates = {
             entry.get("normalized_date")
             for entry in dates
-            if entry.get("kind") == "amendment" and entry.get("normalized_date")
+            # `isinstance` and not just truthiness: a list or dict here raises
+            # `TypeError: cannot use 'list' as a set element` and kills the
+            # whole extract or backfill run rather than one item. No model
+            # output can reach it — `standardized_date_payload` overwrites
+            # `normalized_date` with this repo's own parser output, always
+            # `str | None` — so this is hardening against a tampered or
+            # hand-edited partition, and it is the same failure class the
+            # `_borrowers` guard was just written for (#211).
+            if entry.get("kind") == "amendment"
+            and isinstance(entry.get("normalized_date"), str)
+            and entry.get("normalized_date")
         }
         prior_agreement = next(
             (entry for entry in prior_dates if entry.get("kind") == "agreement"), None
@@ -1844,8 +1895,11 @@ def mint_prior_state_rows(
             bump("skipped_sibling_is_predecessor")
             continue
 
-        prior_amount_kinds = {entry.get("kind") for entry in prior_amounts}
-        prior_date_kinds = {entry.get("kind") for entry in prior_dates}
+        # From the claims, not the parsed subset: an unresolvable before-figure
+        # still says this term changed, so the current one must not be
+        # inherited onto the predecessor as though it had not (#211).
+        prior_amount_kinds = {entry.get("kind") for entry in prior_amount_claims}
+        prior_date_kinds = {entry.get("kind") for entry in prior_date_claims}
         minted_amounts: list[dict[str, object]] = []
         for entry in amounts:
             kind = entry.get("kind")
@@ -1980,6 +2034,7 @@ def backfill_mentions(
     *,
     data_dir: Path | None = None,
     dry_run: bool = False,
+    renew: Callable[[], None] | None = None,
 ) -> dict[str, int]:
     """Re-derive the synthesized rows over every existing `mentions` partition.
 
@@ -1990,6 +2045,12 @@ def backfill_mentions(
     model-emitted rows). Returns the mint counters plus partition counts;
     `dry_run` counts without rewriting, which is the pre-registered yield for
     an eval.
+
+    ``renew`` extends the caller's writer lease per rewritten partition. This
+    rewrites the whole canonical mentions dataset, so on a corpus large enough
+    to outlast the lease TTL the next orchestrator tick would legitimately
+    steal the lease and start extract/match into the same objects (#89, #211).
+    A dry run writes nothing and needs no lease.
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     counts: dict[str, int] = {"partitions": 0, "partitions_rewritten": 0}
@@ -2020,6 +2081,8 @@ def backfill_mentions(
             published.extend(mint_prior_state_rows(item_rows, counts))
         if dry_run:
             continue
+        if renew is not None:
+            renew()
         partition = parse_date_shard_partition(path)
         write_partition_table(
             mentions_root(resolved_root, data_dir=data_dir),

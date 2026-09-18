@@ -686,6 +686,34 @@ def apply_lifecycle_rollup(
         )
         row["lineage_family_id"] = family_by_id.get(row_id, row_id)
         row["is_lineage_head"] = not children
+
+    apply_observation_columns(
+        rows, member_groups=member_groups, mention_index=mention_index
+    )
+
+
+def apply_observation_columns(
+    rows: list[dict[str, object]],
+    *,
+    member_groups: dict[str, list[str]],
+    mention_index: dict[str, PreparedMention],
+) -> None:
+    """Recompute what the corpus has seen of each cluster, in place.
+
+    Split out of `apply_lifecycle_rollup` because the lineage rules *read*
+    `first_seen_filing_date` — `infer_amendment_parents` uses it as both the
+    predecessor-ordering guard and the chain sort key — while the rollup
+    rewrites it from the member edges. Running the rollup only afterwards meant
+    a pass could infer against a value it then overwrote, so pass N+1 saw a
+    different corpus than pass N: on a row whose members are gone, pass 1
+    yields one link and nulls the column, and pass 2 then adds a link pass 1
+    refused. That row shape arises on its own, because mention ids are content
+    hashes — re-extracting an item mints a new id, the old member edge is never
+    deleted, and the old instrument survives with `mention_count` 0. The pass
+    now recomputes these columns before inferring as well as after (#211).
+    """
+    for row in rows:
+        row_id = str(row["debt_instrument_id"])
         member_ids = [
             member_id
             for member_id in member_groups.get(row_id, [])
@@ -2361,6 +2389,13 @@ def apply_lineage_inference_pass(
     rows = instruments.to_dict("records")
     heads_before = sum(1 for row in rows if row.get("is_lineage_head"))
 
+    # Before inferring, not only after: the rules read `first_seen_filing_date`
+    # and the rollup below rewrites it, so inferring against the on-disk value
+    # made this pass a function of how many times it had already run (#211).
+    apply_observation_columns(
+        rows, member_groups=member_groups, mention_index=mention_index
+    )
+
     reopened = 0
     for row in rows:
         if coerce_optional_text(row.get("amendment_inferred_by")) is None:
@@ -2369,11 +2404,7 @@ def apply_lineage_inference_pass(
         row["amendment_inferred_by"] = None
         reopened += 1
 
-    inferred = infer_amendment_parents(
-        rows,
-        member_groups=member_groups,
-        mention_index=mention_index,
-    )
+    inferred = infer_amendment_parents(rows)
     by_id = {str(row["debt_instrument_id"]): row for row in rows}
     for child_id, (parent_id, rule) in inferred.items():
         by_id[child_id]["amendment_of_debt_instrument_id"] = parent_id
@@ -2392,16 +2423,45 @@ def apply_lineage_inference_pass(
     frame["_shard"] = (
         frame["cik"].fillna("").map(lambda value: shard_for_cik(str(value)))
     )
+    partitions_written: list[str] = []
     for cik_shard, shard_rows in frame.groupby("_shard"):
         if renew is not None:
             renew()
-        write_partition_table(
-            debt_instruments_root(resolved_root, data_dir=data_dir),
-            partition={"cik_shard": str(cik_shard)},
-            table=shard_rows.drop(columns=["_shard"]).reindex(
-                columns=DEBT_INSTRUMENT_COLUMNS
-            ),
+        partitions_written.append(
+            write_partition_table(
+                debt_instruments_root(resolved_root, data_dir=data_dir),
+                partition={"cik_shard": str(cik_shard)},
+                table=shard_rows.drop(columns=["_shard"]).reindex(
+                    columns=DEBT_INSTRUMENT_COLUMNS
+                ),
+            )
         )
+    # Every writing stage in this repo records a run manifest, and
+    # `docs/architecture.md` names stage manifests as a design property. The
+    # match manifest is written with its own `partitions_written`, and then
+    # this pass rewrites every one of those partitions — so without a manifest
+    # of its own, the last record of the `debt-instruments` dataset describes a
+    # state something else changed afterwards. That was tolerable while the
+    # pass was opt-in behind `--infer-lineage`; #203 made it the unconditional
+    # default (#211).
+    write_json_artifact(
+        run_manifest_path(
+            "infer-lineage",
+            "latest",
+            artifact_root=resolved_root,
+            data_dir=data_dir,
+        ),
+        {
+            "artifact_root": resolved_root,
+            "stage": "infer-lineage",
+            "partitions_written": partitions_written,
+            "links": len(inferred),
+            "reopened": reopened,
+            "heads_before": heads_before,
+            "heads_after": heads_after,
+            "schema_version": MATCHER_SCHEMA_VERSION,
+        },
+    )
     LOGGER.info(
         "Lineage inference pass: %s links (%s inferred pointers re-opened), heads %s -> %s",
         len(inferred),

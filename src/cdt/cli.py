@@ -50,7 +50,13 @@ from cdt.itemizer import (
     itemize_pending_documents,
     items_root,
 )
-from cdt.lease import PIPELINE_WRITER_LEASE, Lease, acquire_lease, release_lease
+from cdt.lease import (
+    PIPELINE_WRITER_LEASE,
+    Lease,
+    acquire_lease,
+    release_lease,
+    renewer,
+)
 from cdt.matcher import (
     DEFAULT_AMBIGUITY_MARGIN,
     DEFAULT_MEMBERSHIP_THRESHOLD,
@@ -882,7 +888,20 @@ def run_backfill_mentions(args: argparse.Namespace) -> int:
         if lease is None:
             return 1
     try:
-        counts = backfill_mentions(artifact_root, dry_run=args.dry_run)
+        # A whole-dataset rewrite on a lease it never renewed: the default TTL
+        # is 2h, and once it elapses the next orchestrator tick legitimately
+        # steals the lease and starts extract/match while this is still
+        # overwriting one partition file at a time. Both writers full-overwrite
+        # the same object, so rows are lost silently and `release_lease`
+        # no-ops after a steal. This is the #89 class, and the tell was that
+        # #203 added `renew` to the lineage pass for exactly this reason and
+        # omitted it here (#211). At reference-corpus scale 236 partitions take
+        # ~10s, so the window was never close; the wiring is the point.
+        counts = backfill_mentions(
+            artifact_root,
+            dry_run=args.dry_run,
+            renew=renewer(lease) if lease is not None else None,
+        )
     except Exception:
         logger.exception("Mentions backfill failed")
         return 1
@@ -916,6 +935,7 @@ def run_matcher(args: argparse.Namespace) -> int:
             artifact_root=artifact_root,
             batch_size=args.batch_size,
             force=args.force,
+            renew=renewer(lease),
             strong_match_threshold=args.strong_match_threshold,
             loose_match_threshold=args.loose_match_threshold,
             ambiguity_margin=args.ambiguity_margin,
@@ -923,7 +943,7 @@ def run_matcher(args: argparse.Namespace) -> int:
         # Always, as the pipeline does: an amend-and-restate chain spans
         # filings, so its links exist only once every shard has matched (#170,
         # #204). Every inferred pointer is re-derived here, never carried.
-        stats = apply_lineage_inference_pass(artifact_root)
+        stats = apply_lineage_inference_pass(artifact_root, renew=renewer(lease))
         logger.info(
             "Lineage inference: %s links (%s re-opened), lineage heads %s -> %s",
             stats["links"],
