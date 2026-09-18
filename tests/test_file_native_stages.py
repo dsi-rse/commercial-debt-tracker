@@ -1192,6 +1192,35 @@ def test_lender_signature_uses_stored_lender_clusters() -> None:
     assert lender_signature(payload) == "acme bank"
 
 
+def test_party_dedupe_trusts_the_extractors_canonical_name() -> None:
+    """Two clusters the extractor named alike are one party, whatever they span.
+
+    Re-deriving the key from the spans normalized `EQT Corporation` down to
+    `eqt` before choosing the longest text, so its own `Buyer Parent` alias won
+    and the two clusters below stayed apart as two lenders (#203). A payload
+    written before `canonical_name` existed still keys on its spans.
+    """
+    from cdt.matcher.core import dedupe_party_clusters
+
+    named_with_alias = {
+        "role": "lender",
+        "canonical_name": "EQT Corporation",
+        "spans": [{"text": "EQT Corporation"}, {"text": "Buyer Parent"}],
+    }
+    named_alone = {
+        "role": "lender",
+        "canonical_name": "EQT Corporation",
+        "spans": [{"text": "EQT Corporation"}],
+    }
+    deduped = dedupe_party_clusters(
+        [json.dumps([named_with_alias]), json.dumps([named_alone])]
+    )
+    assert len(deduped) == 1
+
+    legacy = [{"role": "lender", "mentions": [{"text": "Acme Bank"}]}]
+    assert len(dedupe_party_clusters([json.dumps(legacy), json.dumps(legacy)])) == 1
+
+
 def test_match_pending_mentions_carries_lender_disclosure(tmp_path: Path) -> None:
     """Matcher output should carry mention-level lender incompleteness forward."""
     mention_rows = pd.DataFrame(
@@ -6103,14 +6132,99 @@ def test_instrument_rollup_publishes_balance_and_rate_columns() -> None:
     row = rows[0]
     assert row["outstanding_balance"] == "270500000"
     assert row["outstanding_balance_currency"] == "USD"
-    # An undated balance is bounded by the filing that observed it.
+    # An undated balance is bounded by the filing that observed it — and says so,
+    # so the substituted date is never mistaken for a stated one (#203).
     assert row["outstanding_balance_as_of"] == "2026-01-01"
+    assert row["outstanding_balance_as_of_is_filing_date"] is True
     assert row["outstanding_balance_source_mention_id"] == "m-old"
     assert row["interest_rate_kind"] == "fixed"
     assert row["interest_rate_pct"] == "7.000"
     assert row["interest_rate_source_mention_id"] == "m-old"
     # A balance is never the headline amount (#140).
     assert row["principal_amount"] == "300000000"
+
+
+def test_outstanding_balance_as_of_flag_tells_stated_from_substituted() -> None:
+    """A stated as-of reads false; a substituted one carried forward stays true.
+
+    The flag is what lets a consumer trust `outstanding_balance_as_of` (#203):
+    without it a filing date the matcher filled in looked exactly like a date
+    the filing stated. It has to survive an incremental rematch too, or the
+    first run to see no new balance would silently drop it.
+    """
+    from cdt.matcher.core import build_debt_instrument_rows, prepare_mention
+
+    def balance_mention(mention_id: str, as_of_date: str | None) -> object:
+        return prepare_mention(
+            build_mention_row(
+                mention_id=mention_id,
+                item_id=f"item-{mention_id}",
+                accession_number="0001",
+                cik="0000320193",
+                date="2026-01-01",
+                name="Revolving Credit Facility",
+                start_date="2024-01-01",
+                amount="300000000",
+                amounts_json=json.dumps(
+                    [
+                        {
+                            "kind": "outstanding_balance",
+                            "normalized_amount": "270500000",
+                            "currency": "USD",
+                            "as_of_date": as_of_date,
+                        }
+                    ]
+                ),
+            )
+        )
+
+    stated = build_debt_instrument_rows(
+        {"inst-1": ["m-stated"]},
+        {"m-stated": balance_mention("m-stated", "2025-12-31")},
+        {},
+        existing_instruments=pd.DataFrame(),
+        company_names={},
+    )[0]
+    assert stated["outstanding_balance_as_of"] == "2025-12-31"
+    assert stated["outstanding_balance_as_of_is_filing_date"] is False
+
+    # No member carries a balance, so every balance field comes off the row
+    # written last time — including the flag, as a bool, not the text "True".
+    no_balance = prepare_mention(
+        build_mention_row(
+            mention_id="m-later",
+            item_id="item-later",
+            accession_number="0002",
+            cik="0000320193",
+            date="2026-03-01",
+            name="Revolving Credit Facility",
+            start_date="2024-01-01",
+            amount="300000000",
+        )
+    )
+    existing = pd.DataFrame(
+        [
+            dict.fromkeys(DEBT_INSTRUMENT_COLUMNS)
+            | {
+                "debt_instrument_id": "inst-1",
+                "seed_debt_instrument_mention_id": "m-stated",
+                "cik": "0000320193",
+                "outstanding_balance": "270500000",
+                "outstanding_balance_as_of": "2026-01-01",
+                "outstanding_balance_as_of_is_filing_date": True,
+                "outstanding_balance_source_mention_id": "m-stated",
+            }
+        ]
+    )
+    carried = build_debt_instrument_rows(
+        {"inst-1": ["m-later"]},
+        {"m-later": no_balance},
+        {},
+        existing_instruments=existing,
+        company_names={},
+    )[0]
+    assert carried["outstanding_balance_as_of"] == "2026-01-01"
+    assert carried["outstanding_balance_as_of_is_filing_date"] is True
 
 
 # --- Lifecycle rollup: the branches the hand-built fixtures never reached ------

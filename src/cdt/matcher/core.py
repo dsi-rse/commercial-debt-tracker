@@ -193,7 +193,6 @@ class PreparedMention:
     interest_rate_kind: str | None
     interest_rate_pct: str | None
     status: str | None
-    status_date: str | None
     amendment_of: str | None
     retired_by: tuple[str, ...]
     split_of: str | None
@@ -1542,11 +1541,14 @@ def outstanding_balance_fields(
     ordered_member_ids: list[str],
     mention_index: dict[str, PreparedMention],
     existing_row: dict[str, object],
-) -> dict[str, str | None]:
+) -> dict[str, str | bool | None]:
     """Return the newest outstanding-balance observation.
 
     Kept apart from principal so a balance can never double-count as the
-    headline amount (#140).
+    headline amount (#140). An undated balance is bounded by the filing that
+    observed it, and `outstanding_balance_as_of_is_filing_date` records that
+    the date was substituted rather than stated: a view may derive a value, but
+    it may not publish a derived value as if the filing had said it (#203).
     """
     for mention_id in ordered_member_ids:
         mention = mention_index[mention_id]
@@ -1567,6 +1569,7 @@ def outstanding_balance_fields(
                     "outstanding_balance_as_of": (
                         str(as_of) if as_of is not None else mention.date
                     ),
+                    "outstanding_balance_as_of_is_filing_date": as_of is None,
                     "outstanding_balance_source_mention_id": mention_id,
                 }
     return {
@@ -1578,6 +1581,9 @@ def outstanding_balance_fields(
         ),
         "outstanding_balance_as_of": coerce_optional_text(
             existing_row.get("outstanding_balance_as_of")
+        ),
+        "outstanding_balance_as_of_is_filing_date": coerce_optional_bool(
+            existing_row.get("outstanding_balance_as_of_is_filing_date")
         ),
         "outstanding_balance_source_mention_id": coerce_optional_text(
             existing_row.get("outstanding_balance_source_mention_id")
@@ -1623,13 +1629,33 @@ def dedupe_party_clusters(payloads: list[str]) -> list[dict[str, object]]:
     deduped: dict[str, dict[str, object]] = {}
     for payload in payloads:
         for cluster in parse_cluster_list(payload):
-            canonical = cluster_canonical_key(cluster)
+            canonical = party_dedupe_key(cluster)
             if not canonical:
                 continue
             key = f"{cluster.get('role', 'lender')}::{canonical}"
             if key not in deduped:
                 deduped[key] = cluster
     return [deduped[key] for key in sorted(deduped)]
+
+
+def party_dedupe_key(cluster: dict[str, object]) -> str:
+    """Return the key one party cluster dedupes on: its extractor-chosen name.
+
+    The extractor already picked the cluster's `canonical_name` (#150), and
+    re-deriving it here from the spans was worse: `normalize_party_text` strips
+    legal-form words before the longest span is chosen, so `NCL Corporation
+    Ltd.` shrank to `ncl` and lost to its own `NCLC` alias, and `EQT
+    Corporation` lost to `Buyer Parent`. Measured over the 1,632 party clusters
+    of one eval window, the two agreed on 1,595 and the matcher's choice was the
+    worse one in the differences (#203). Payloads written before #150 carry no
+    `canonical_name`, so those still take the span-derived key. `lender_keys`
+    deliberately keeps the span-derived key: it is a match-scoring surface, and
+    changing it re-scores clusters, which a dedupe fix must not do.
+    """
+    canonical_name = cluster.get("canonical_name")
+    if isinstance(canonical_name, str) and canonical_name.strip():
+        return normalize_party_text(canonical_name)
+    return cluster_canonical_key(cluster)
 
 
 def parse_cluster_list(value: str) -> list[dict[str, object]]:
@@ -1695,7 +1721,6 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
         interest_rate_kind=coerce_optional_text(row.get("interest_rate_kind")),
         interest_rate_pct=coerce_optional_text(row.get("interest_rate_pct")),
         status=coerce_optional_text(row.get("status")),
-        status_date=coerce_optional_text(row.get("status_date")),
         amendment_of=coerce_optional_text(row.get("amendment_of")),
         retired_by=tuple(json.loads(str(row.get("retired_by_json") or "[]"))),
         split_of=coerce_optional_text(row.get("split_of")),
@@ -1763,6 +1788,28 @@ def aggregate_lender_disclosure(values: list[str | None]) -> str:
     if not known:
         return LENDER_DISCLOSURE_NONE_NAMED
     return max(known, key=lambda value: LENDER_DISCLOSURE_PRECEDENCE[value])
+
+
+def coerce_optional_bool(value: object) -> bool | None:
+    """Return one nullable flag read back from a published row.
+
+    A declared `bool` column round-trips as Python or numpy bools with nulls
+    read as None or NaN; a row that predates the column has nothing at all.
+    Text spellings are accepted so a hand-built frame reads the same way.
+    """
+    if value is None or isinstance(value, bool):
+        return value
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip().lower()
+    if text in {"true", "1"}:
+        return True
+    if text in {"false", "0"}:
+        return False
+    return None
 
 
 def coerce_optional_cik(value: object) -> str | None:
