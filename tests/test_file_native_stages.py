@@ -696,7 +696,15 @@ def test_extract_pending_items_writes_mentions_and_audit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Extraction should consume classifications and write mentions plus audit log."""
+    """Extraction consumes classifications and writes mentions plus the audit log.
+
+    The mention carries a `prior`-marked commitment, so the mint fires and this
+    covers the publish seam end to end (#211). Every publish path goes through
+    `published_mention_rows`, but the seam test called the helper on a mention
+    with no `prior` facts — the mint was a no-op there, so the seam was
+    indistinguishable from the raw list and all four call sites could be
+    swapped back to `row_state.debt_instrument_mentions` with a green suite.
+    """
     seed_document_partition(tmp_path)
     itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
     monkeypatch.setattr(
@@ -731,7 +739,29 @@ def test_extract_pending_items_writes_mentions_and_audit(
                 "name_json": "{}",
                 "start_date_json": "{}",
                 "maturity_date_json": "{}",
-                "amounts_json": "[]",
+                "amounts_json": json.dumps(
+                    [
+                        _fact(
+                            kind="commitment",
+                            normalized_amount="300000000",
+                            prior=True,
+                        ),
+                        _fact(
+                            kind="commitment",
+                            normalized_amount="250000000",
+                            prior=False,
+                        ),
+                    ]
+                ),
+                "dates_json": json.dumps(
+                    [
+                        _fact(
+                            kind="agreement",
+                            normalized_date="2020-02-03",
+                            prior=False,
+                        )
+                    ]
+                ),
             }
         ]
         row_state.finish("SUCCESS")
@@ -749,10 +779,39 @@ def test_extract_pending_items_writes_mentions_and_audit(
     )
 
     written = read_dataset(mentions_root(tmp_path))
-    assert len(mentions) == 1
+    assert len(mentions) == 2
     assert written["debt_instrument_mention_id"].to_list()
     audit_files = list((tmp_path / "extractor-runs").glob("run_id=*/full.jsonl"))
     assert len(audit_files) == 1
+
+    # The minted prior state reaches the written partition, not just the
+    # in-memory return value, and the successor points at it.
+    minted = written[written["synthesized_by"] == "prior_state"]
+    assert len(minted) == 1
+    assert minted.iloc[0]["principal_amount"] == Decimal("300000000.00")
+    successor = written[written["debt_instrument_mention_id"] == "m-1"].iloc[0]
+    assert successor["amendment_of"] == minted.iloc[0]["debt_instrument_mention_id"]
+
+    # and the audit record publishes the same rows the partition did
+    audit = [json.loads(line) for line in audit_files[0].read_text().splitlines()]
+    audited = [
+        mention
+        for record in audit
+        for mention in record.get("debt_instrument_mentions", [])
+    ]
+    assert sorted(str(mention.get("synthesized_by")) for mention in audited) == [
+        "None",
+        "prior_state",
+    ]
+
+    # `state.jsonl` keeps only what the model returned: the pointer the mint
+    # writes onto the successor must not be persisted there.
+    state_files = list((tmp_path / "extractor-runs").glob("run_id=*/state.jsonl"))
+    for state_file in state_files:
+        for line in state_file.read_text().splitlines():
+            for mention in json.loads(line).get("debt_instrument_mentions", []):
+                assert mention.get("synthesized_by") is None
+                assert mention.get("amendment_of") is None
 
 
 def test_extract_pending_items_drains_all_partitions(
@@ -7960,3 +8019,84 @@ def test_an_unhashable_date_value_does_not_kill_the_whole_mint_pass() -> None:
 
     assert counters == {"minted": 1}
     assert len(rows) == 2
+
+
+def _row_state_with_a_prior_term(item_id: str = "item-1") -> ExtractionRowState:
+    """Return a terminal row state whose single mention triggers the mint."""
+    row_state = ExtractionRowState(
+        item_row={
+            "item_id": item_id,
+            "accession_number": "0001",
+            "cik": "0000320193",
+            "company_name": "Example Inc.",
+            "date": "2024-06-01",
+            "text": "amended",
+        },
+        stage_name="instrument_ie",
+    )
+    row_state.debt_instrument_mentions = [amended_row(item_id=item_id)]
+    row_state.finish("SUCCESS")
+    return row_state
+
+
+def test_the_batch_finalize_publishes_through_the_mint_seam(tmp_path: Path) -> None:
+    """`finalize_extract_outputs` must mint, not just the live loop (#211).
+
+    The seam exists so one derivation reaches every backend at once, and the
+    batch backend is the deployed default. Swapping this call site back to
+    `row_state.debt_instrument_mentions` left the whole suite green, because no
+    test drove this function with a mention carrying a `prior` term.
+    """
+    from cdt.extractor.core import finalize_extract_outputs
+
+    finalize_extract_outputs(
+        [(_row_state_with_a_prior_term(), "2024-06-01", "0001")],
+        claimed={},
+        run_id="20240601T000000000000Z",
+        model="test-model",
+        reasoning_effort="none",
+        max_attempts=3,
+        artifact_root=tmp_path,
+    )
+
+    written = read_dataset(mentions_root(tmp_path))
+    minted = written[written["synthesized_by"] == "prior_state"]
+    assert len(minted) == 1
+    successor = written[written["synthesized_by"].isna()].iloc[0]
+    assert successor["amendment_of"] == minted.iloc[0]["debt_instrument_mention_id"]
+
+
+def test_extract_tables_publishes_through_the_mint_seam(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The in-memory path mints too, so a notebook sees what the pipeline writes."""
+    from cdt.extractor.core import extract_tables
+
+    async def fake_run_extraction_workflow(**kwargs: object) -> ExtractionRowState:
+        item_row = kwargs["item_row"]
+        return _row_state_with_a_prior_term(str(item_row["item_id"]))
+
+    monkeypatch.setattr(
+        "cdt.extractor.core.run_extraction_workflow", fake_run_extraction_workflow
+    )
+
+    tables = extract_tables(
+        pd.DataFrame(
+            [
+                {
+                    "item_id": "item-1",
+                    "accession_number": "0001",
+                    "cik": "0000320193",
+                    "company_name": "Example Inc.",
+                    "date": "2024-06-01",
+                    "text": "amended",
+                    "relevance": True,
+                }
+            ]
+        ),
+        artifact_root=tmp_path,
+        client=None,
+    )
+
+    rows = tables["debt_instrument_mentions"]
+    assert (rows["synthesized_by"] == "prior_state").sum() == 1
