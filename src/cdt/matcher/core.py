@@ -2147,7 +2147,12 @@ def name_rates_are_compatible(left: str | None, right: str | None) -> bool:
     return True
 
 
-def apply_lineage_inference_pass(artifact_root: str) -> dict[str, int]:
+def apply_lineage_inference_pass(
+    artifact_root: str | Path,
+    *,
+    data_dir: Path | None = None,
+    renew: Callable[[], None] | None = None,
+) -> dict[str, int]:
     """Infer amendment lineage across the whole corpus, after all shards match.
 
     This cannot run inside `match_tables`: that is called once per shard batch
@@ -2156,18 +2161,37 @@ def apply_lineage_inference_pass(artifact_root: str) -> dict[str, int]:
     rules need every cluster for a CIK at once, which only exists after the shard
     loop has written them all.
 
-    Rewrites `amendment_of_debt_instrument_id` where it was null and re-derives
-    the rollup columns from the updated pointers, so `superseded_by`,
-    `lineage_family_id`, `is_lineage_head` and `status` stay consistent.
+    Every pointer this pass wrote before is re-opened and re-derived, so the
+    published lineage is a function of the current rules and the current rows,
+    not of which run happened to write first. `infer_amendment_parents` only
+    considers rows whose pointer is null, and an ordinary rematch carries an
+    existing pointer forward from disk — so without this, a link a tightened
+    rule now refuses (the EQT/EQM cross-borrower link #197's guard was written
+    to remove) survived on every already-matched root and was republished by the
+    next plain `cdt match`; 14 of 542 pointers differed from a clean rebuild
+    (#204). `amendment_inferred_by` is what distinguishes those rows: it is set
+    only by this pass and cleared whenever an extracted pointer takes over, so
+    an extracted relation is never re-opened.
+
+    Rewrites `amendment_of_debt_instrument_id` and re-derives the rollup columns
+    from the updated pointers, so `superseded_by`, `lineage_family_id` and
+    `is_lineage_head` stay consistent. ``renew`` extends the caller's writer
+    lease: this pass reads three whole datasets and rewrites every shard, which
+    can outlast a lease TTL between two phases that renew it (#89).
     """
-    instruments = read_dataset(debt_instruments_root(artifact_root))
-    edges = read_dataset(mention_cluster_edges_root(artifact_root))
+    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    instruments = read_dataset(debt_instruments_root(resolved_root, data_dir=data_dir))
+    edges = read_dataset(mention_cluster_edges_root(resolved_root, data_dir=data_dir))
     mentions = read_dataset(
-        dataset_root(MENTIONS_DATASET_NAME, artifact_root=artifact_root),
+        dataset_root(
+            MENTIONS_DATASET_NAME, artifact_root=resolved_root, data_dir=data_dir
+        ),
         columns=EXTRACTED_MENTION_COLUMNS,
     )
     if instruments.empty or edges.empty or mentions.empty:
-        return {"links": 0, "heads_before": 0, "heads_after": 0}
+        return {"links": 0, "reopened": 0, "heads_before": 0, "heads_after": 0}
+    if renew is not None:
+        renew()
 
     member_edges = edges[edges["edge_type"] == "member"]
     member_groups: dict[str, list[str]] = {}
@@ -2181,6 +2205,14 @@ def apply_lineage_inference_pass(artifact_root: str) -> dict[str, int]:
     }
     rows = instruments.to_dict("records")
     heads_before = sum(1 for row in rows if row.get("is_lineage_head"))
+
+    reopened = 0
+    for row in rows:
+        if coerce_optional_text(row.get("amendment_inferred_by")) is None:
+            continue
+        row["amendment_of_debt_instrument_id"] = None
+        row["amendment_inferred_by"] = None
+        reopened += 1
 
     inferred = infer_amendment_parents(
         rows,
@@ -2199,23 +2231,32 @@ def apply_lineage_inference_pass(artifact_root: str) -> dict[str, int]:
     )
     heads_after = sum(1 for row in rows if row.get("is_lineage_head"))
     frame = pd.DataFrame(rows, columns=DEBT_INSTRUMENT_COLUMNS)
-    frame["_shard"] = frame["cik"].map(lambda value: shard_for_cik(str(value)))
+    # Same shard assignment as `match_pending_mentions`: a null cik must map to
+    # the shard the matcher put it in, or the rewrite lands the row in a second
+    # shard and the original copy is never removed (#204).
+    frame["_shard"] = (
+        frame["cik"].fillna("").map(lambda value: shard_for_cik(str(value)))
+    )
     for cik_shard, shard_rows in frame.groupby("_shard"):
+        if renew is not None:
+            renew()
         write_partition_table(
-            debt_instruments_root(artifact_root),
+            debt_instruments_root(resolved_root, data_dir=data_dir),
             partition={"cik_shard": str(cik_shard)},
             table=shard_rows.drop(columns=["_shard"]).reindex(
                 columns=DEBT_INSTRUMENT_COLUMNS
             ),
         )
     LOGGER.info(
-        "Lineage inference pass: %s links, heads %s -> %s",
+        "Lineage inference pass: %s links (%s inferred pointers re-opened), heads %s -> %s",
         len(inferred),
+        reopened,
         heads_before,
         heads_after,
     )
     return {
         "links": len(inferred),
+        "reopened": reopened,
         "heads_before": heads_before,
         "heads_after": heads_after,
     }

@@ -2503,6 +2503,186 @@ def test_coerce_optional_text_treats_nan_like_text_as_missing() -> None:
     assert coerce_optional_text("Nantucket Bank") == "Nantucket Bank"
 
 
+def _ordinal_chain_root(tmp_path: Path, **mention_overrides: object) -> Path:
+    """Write two mentions the pass links by ordinal, and match them."""
+    rows = pd.DataFrame(
+        [
+            build_mention_row(
+                mention_id="m-1",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2020-01-02",
+                name="Credit Agreement",
+                start_date="2020-01-01",
+                amount="$100 million",
+                **mention_overrides,
+            ),
+            build_mention_row(
+                mention_id="m-2",
+                item_id="item-2",
+                accession_number="0002",
+                cik="320193",
+                date="2024-01-02",
+                name="Second Amended and Restated Credit Agreement",
+                start_date="2024-01-01",
+                amount="$250 million",
+                **mention_overrides,
+            ),
+        ]
+    )
+    write_partition_table(
+        tmp_path / "mentions",
+        partition={"date": "2024-01-02", "shard": "0001"},
+        table=rows,
+    )
+    match_pending_mentions(artifact_root=tmp_path, batch_size=5)
+    return tmp_path
+
+
+def _published_instruments(root: Path) -> dict[str, dict[str, object]]:
+    return {
+        str(row["debt_instrument_id"]): row
+        for row in read_dataset(debt_instruments_root(root)).to_dict("records")
+    }
+
+
+def test_lineage_pass_reopens_a_pointer_the_rules_would_now_refuse(
+    tmp_path: Path,
+) -> None:
+    """A link an earlier run inferred does not outlive the evidence against it.
+
+    `infer_amendment_parents` only considers rows whose pointer is null and the
+    matcher carries an existing pointer forward, so the EQT/EQM cross-borrower
+    link #197's guard was written to remove survived on every already-matched
+    root and was republished by the next plain match (#204). Here the first
+    pass links the chain; the published rows then acquire disagreeing
+    borrowers, as a tightened rule or a later filing would give them, and a
+    plain second pass must take the link back.
+    """
+    root = _ordinal_chain_root(tmp_path)
+    first = apply_lineage_inference_pass(root)
+    assert first["links"] == 1
+    assert (
+        _published_instruments(root)["m-2"]["amendment_inferred_by"] == "ordinal_chain"
+    )
+
+    from cdt.datasets import shard_for_cik
+
+    published = read_dataset(debt_instruments_root(root))
+    borrowers = {
+        "m-1": [{"role": "borrower", "canonical_name": "EQT Corporation"}],
+        "m-2": [{"role": "borrower", "canonical_name": "EQM Midstream Partners, LP"}],
+    }
+    published["parties_json"] = published["debt_instrument_id"].map(
+        lambda value: json.dumps(borrowers[str(value)])
+    )
+    write_partition_table(
+        debt_instruments_root(root),
+        partition={"cik_shard": shard_for_cik("320193")},
+        table=published,
+    )
+
+    second = apply_lineage_inference_pass(root)
+    after = _published_instruments(root)
+    assert second["reopened"] == 1
+    assert second["links"] == 0
+    assert after["m-2"]["amendment_of_debt_instrument_id"] is None
+    assert after["m-2"]["amendment_inferred_by"] is None
+    # and the rollup follows the pointer back out
+    assert after["m-1"]["is_lineage_head"] is True
+    assert after["m-1"]["superseded_by_debt_instrument_id"] is None
+
+
+def test_lineage_pass_never_reopens_an_extracted_pointer(tmp_path: Path) -> None:
+    """An extracted relation is a cited fact; only inferred pointers re-derive."""
+    rows = pd.DataFrame(
+        [
+            build_mention_row(
+                mention_id="m-old",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2024-01-02",
+                name="Credit Agreement",
+                start_date="2020-01-01",
+                amount="$100 million",
+            ),
+            build_mention_row(
+                mention_id="m-new",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2024-01-02",
+                name="Credit Agreement",
+                start_date="2024-01-01",
+                amount="$250 million",
+                amendment_of="m-old",
+            ),
+        ]
+    )
+    write_partition_table(
+        tmp_path / "mentions",
+        partition={"date": "2024-01-02", "shard": "0001"},
+        table=rows,
+    )
+    match_pending_mentions(artifact_root=tmp_path, batch_size=5)
+    before = _published_instruments(tmp_path)
+    assert before["m-new"]["amendment_of_debt_instrument_id"] == "m-old"
+    assert before["m-new"]["amendment_inferred_by"] is None
+
+    stats = apply_lineage_inference_pass(tmp_path)
+    after = _published_instruments(tmp_path)
+    assert stats["reopened"] == 0
+    assert after["m-new"]["amendment_of_debt_instrument_id"] == "m-old"
+    assert after["m-new"]["amendment_inferred_by"] is None
+
+
+def test_lineage_pass_keeps_a_null_cik_row_in_one_shard(tmp_path: Path) -> None:
+    """The rewrite must shard a null cik the way the matcher did, not twice.
+
+    `match_pending_mentions` maps `cik.fillna("")`; the pass mapped `str(cik)`,
+    so a null cik went to `shard_for_cik("nan")` while its original copy stayed
+    under `shard_for_cik("")` — a permanently duplicated instrument (#204).
+    """
+    from cdt.datasets import shard_for_cik
+
+    root = _ordinal_chain_root(tmp_path)
+    published = read_dataset(debt_instruments_root(root))
+    orphan = published.iloc[[0]].copy()
+    orphan["debt_instrument_id"] = "orphan"
+    orphan["cik"] = None
+    write_partition_table(
+        debt_instruments_root(root),
+        partition={"cik_shard": shard_for_cik("")},
+        table=orphan,
+    )
+
+    apply_lineage_inference_pass(root)
+
+    after = read_dataset(debt_instruments_root(root))
+    assert (after["debt_instrument_id"] == "orphan").sum() == 1
+    orphan_files = [
+        path
+        for path in (tmp_path / "debt-instruments").rglob("*.parquet")
+        if "orphan" in set(pd.read_parquet(path)["debt_instrument_id"])
+    ]
+    assert [path.parent.name for path in orphan_files] == [
+        f"cik_shard={shard_for_cik('')}"
+    ]
+
+
+def test_lineage_pass_renews_the_writer_lease(tmp_path: Path) -> None:
+    """A full-corpus read and rewrite must keep renewing, or it outlives its lease."""
+    root = _ordinal_chain_root(tmp_path)
+    renewals: list[int] = []
+
+    apply_lineage_inference_pass(root, renew=lambda: renewals.append(1))
+
+    # once after the reads, once per shard written
+    assert len(renewals) >= 2
+
+
 def test_lineage_inference_pass_writes_pointers_and_rederives_the_rollup(
     tmp_path: Path,
 ) -> None:
@@ -2548,7 +2728,7 @@ def test_lineage_inference_pass_writes_pointers_and_rederives_the_rollup(
         str(row["debt_instrument_id"]): row
         for row in read_dataset(debt_instruments_root(tmp_path)).to_dict("records")
     }
-    assert stats == {"links": 1, "heads_before": 2, "heads_after": 1}
+    assert stats == {"links": 1, "reopened": 0, "heads_before": 2, "heads_after": 1}
     child = published["m-2"]
     parent = published["m-1"]
     assert child["amendment_of_debt_instrument_id"] == "m-1"
