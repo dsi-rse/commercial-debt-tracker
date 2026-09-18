@@ -1790,12 +1790,21 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
     )
 
 
-def mention_sort_key(mention: PreparedMention) -> tuple[str, str, str, str]:
-    """Return deterministic processing order for cluster assignment."""
+def mention_sort_key(mention: PreparedMention) -> tuple[str, str, str, int, str]:
+    """Return deterministic processing order for cluster assignment.
+
+    Within one item a synthesized prior state is placed before the amended
+    object it was minted from: it is the earlier state, and it must be the one
+    that joins the instrument's existing cluster. Left to id order, the amended
+    object joined first and the same-item guard then refused its own prior
+    state, which stranded that state as a head and — where the cluster held two
+    amended objects — gave the cluster two amendment parents and so none (#203).
+    """
     return (
         mention.date or "",
         mention.accession_number or "",
         mention.item_id,
+        0 if mention.synthesized_by is not None else 1,
         mention.debt_instrument_mention_id,
     )
 
@@ -2179,16 +2188,24 @@ def name_class_sizes(
 
     A name shared by many of one issuer's mentions is a template rather than an
     identifier, so the relaxed key rule stands down for it.
+
+    A synthesized prior state carries its successor's name verbatim, so it is
+    not another instrument bearing that name: counting it widened the class past
+    the gate and split a mention out of the cluster it had always joined (#203).
+    Neither synthesized mentions nor a row whose members are all synthesized
+    count here — the same exclusion `ClusterProfile.add_member` applies.
     """
     by_cik: dict[str, list[str | None]] = {}
     for mention in mention_index.values():
-        if mention.cik is None:
+        if mention.cik is None or mention.synthesized_by is not None:
             continue
         by_cik.setdefault(mention.cik, []).append(mention.normalized_name_fingerprint)
     if existing_instruments is not None and not existing_instruments.empty:
         for row in existing_instruments.to_dict("records"):
             cik = coerce_optional_text(row.get("cik"))
             if cik is None or cik not in by_cik:
+                continue
+            if coerce_optional_bool(row.get("synthesized_only")):
                 continue
             by_cik[cik].append(
                 normalize_name_fingerprint(coerce_optional_text(row.get("name")))
@@ -2201,7 +2218,7 @@ def name_class_sizes(
         fingerprint = mention.normalized_name_fingerprint
         sizes[mention_id] = sum(
             1
-            for other in by_cik[mention.cik]
+            for other in by_cik.get(mention.cik, [])
             if other == fingerprint
             or name_fingerprints_are_compatible(fingerprint, other)
         )

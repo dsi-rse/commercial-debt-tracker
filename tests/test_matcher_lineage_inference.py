@@ -109,6 +109,39 @@ def test_the_matcher_never_reads_filing_text(monkeypatch: object) -> None:
         assert "infer_lineage" not in parameters, name
 
 
+def test_a_replaced_state_of_one_rank_steps_aside_for_the_state_that_replaced_it() -> (
+    None
+):
+    """Two states of the Second A&R, linked to each other, are not a tie.
+
+    The extractor mints an amended instrument's prior state as its own row
+    (#203), so a restatement amended once publishes two rank-2 rows with the
+    later pointing at the earlier. The Third A&R follows the *latest* state of
+    the Second, not neither of them.
+    """
+    rows = [
+        instrument(
+            "second-original",
+            "Second Amended and Restated Credit Agreement",
+            first_seen_filing_date="2017-11-14",
+        ),
+        instrument(
+            "second-amended",
+            "Second Amended and Restated Credit Agreement",
+            first_seen_filing_date="2017-11-14",
+            amendment_of_debt_instrument_id="second-original",
+        ),
+        instrument(
+            "third",
+            "Third Amended and Restated Credit Agreement",
+            first_seen_filing_date="2022-06-28",
+        ),
+    ]
+    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+
+    assert result["third"] == ("second-amended", "ordinal_chain")
+
+
 def test_a_same_rank_tie_is_refused_rather_than_decided_by_id_order() -> None:
     """Two equally-ranked predecessors are ambiguity, not a sort-order question."""
     rows = [

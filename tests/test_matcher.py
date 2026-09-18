@@ -16,6 +16,8 @@ from cdt.matcher.core import (
     derive_parent_links,
     end_dates_are_compatible,
     lender_signature,
+    match_tables,
+    mention_sort_key,
     name_rate_tokens,
     name_rates_are_compatible,
     normalize_name_fingerprint,
@@ -217,6 +219,134 @@ def test_a_synthesized_members_name_does_not_widen_the_cluster_profile() -> None
         profile.normalized_name_fingerprints
     )
     assert "m-prior" in profile.member_ids
+
+
+def test_synthesized_mentions_do_not_widen_the_name_class() -> None:
+    """A mint carries its successor's name verbatim; it is not another instrument.
+
+    Counting mints pushed one issuer's `Second Amended and Restated Credit
+    Agreement` class past `NAME_CLASS_GATE`, and a later mention that had
+    always joined that cluster through the name path split off on its own
+    (measured on the EQT chain, #203).
+    """
+    from cdt.matcher.core import name_class_sizes
+
+    original, amendment, _ = predecessor_pair()
+    mints = [
+        prepare_mention(
+            mention_row(
+                debt_instrument_mention_id=f"m-mint-{index}",
+                item_id=f"item-mint-{index}",
+                name="Credit Agreement",
+                synthesized_by="prior_state",
+                synthesized_from_mention_id="m-amendment",
+            )
+        )
+        for index in range(3)
+    ]
+    index = {m.debt_instrument_mention_id: m for m in (original, amendment, *mints)}
+
+    sizes = name_class_sizes(index)
+    # `Credit Agreement` and `Amendment No. 2 to Credit Agreement` are
+    # compatible, so the class is those two — and not the three mints.
+    assert sizes["m-original"] == 2
+    assert sizes["m-amendment"] == 2
+
+    published_mint = pd.DataFrame(
+        [{"cik": "0000320193", "name": "Credit Agreement", "synthesized_only": True}]
+    )
+    assert name_class_sizes(index, published_mint)["m-original"] == 2
+
+
+def test_a_prior_state_is_placed_before_the_object_it_was_minted_from() -> None:
+    """Two amendments of one restatement chain through their minted prior states.
+
+    EQT's Second Amended and Restated Credit Agreement: increased $1.5B -> $2.5B
+    in November 2017, extended in April 2021 with no amount stated. Each
+    amendment mints its prior state. The 2021 prior state *is* the November
+    2017 state, so it must join that cluster — which only happens if it is
+    scored before its own successor, or the same-item guard refuses it. Placed
+    first, the history publishes as three states: 1.5B <- 2.5B <- extended.
+    """
+    nov_2017 = mention_row(
+        debt_instrument_mention_id="m-nov-2017",
+        item_id="item-nov-2017",
+        accession_number="0001",
+        date="2017-11-14",
+        name="Company's Second Amended and Restated Credit Agreement",
+        start_date="2017-07-31",
+        maturity_date=None,
+        principal_amount="2500000000",
+        amendment_of="m-nov-2017-prior",
+    )
+    nov_2017_prior = mention_row(
+        debt_instrument_mention_id="m-nov-2017-prior",
+        item_id="item-nov-2017",
+        accession_number="0001",
+        date="2017-11-14",
+        name="Company's Second Amended and Restated Credit Agreement",
+        start_date="2017-07-31",
+        maturity_date=None,
+        principal_amount="1500000000",
+        synthesized_by="prior_state",
+        synthesized_from_mention_id="m-nov-2017",
+    )
+    apr_2021 = mention_row(
+        debt_instrument_mention_id="m-apr-2021",
+        item_id="item-apr-2021",
+        accession_number="0002",
+        date="2021-04-26",
+        name="Second Amended and Restated Credit Agreement",
+        start_date="2017-07-31",
+        maturity_date=None,
+        principal_amount=None,
+        amendment_of="m-apr-2021-prior",
+    )
+    apr_2021_prior = mention_row(
+        debt_instrument_mention_id="m-apr-2021-prior",
+        item_id="item-apr-2021",
+        accession_number="0002",
+        date="2021-04-26",
+        name="Second Amended and Restated Credit Agreement",
+        start_date="2017-07-31",
+        maturity_date=None,
+        principal_amount=None,
+        synthesized_by="prior_state",
+        synthesized_from_mention_id="m-apr-2021",
+    )
+    assert mention_sort_key(prepare_mention(apr_2021_prior)) < mention_sort_key(
+        prepare_mention(apr_2021)
+    )
+
+    tables = match_tables(
+        pd.DataFrame([nov_2017, nov_2017_prior, apr_2021, apr_2021_prior])
+    )
+    members = (
+        tables["debt_instrument_mentions"]
+        .query("edge_type == 'member'")
+        .set_index("debt_instrument_mention_id")["debt_instrument_id"]
+    )
+    # The 2021 prior state joins the November-2017 state's cluster.
+    assert members["m-apr-2021-prior"] == members["m-nov-2017"]
+    assert members["m-nov-2017-prior"] != members["m-nov-2017"]
+    assert members["m-apr-2021"] not in {
+        members["m-nov-2017"],
+        members["m-nov-2017-prior"],
+    }
+
+    rows = tables["debt_instrument"].set_index("debt_instrument_id")
+    assert (
+        rows.loc[members["m-nov-2017"], "amendment_of_debt_instrument_id"]
+        == (members["m-nov-2017-prior"])
+    )
+    assert (
+        rows.loc[members["m-apr-2021"], "amendment_of_debt_instrument_id"]
+        == (members["m-nov-2017"])
+    )
+    assert rows["is_lineage_head"].sum() == 1
+    assert rows.loc[members["m-apr-2021"], "is_lineage_head"]
+    assert not bool(rows.loc[members["m-nov-2017"], "synthesized_only"])
+    assert bool(rows.loc[members["m-nov-2017-prior"], "synthesized_only"])
 
 
 def test_a_synthesized_member_never_supplies_canonical_fields() -> None:

@@ -292,6 +292,19 @@ def infer_amendment_parents(
             # it through the per-child guard below refuses the link instead of
             # letting instrument-id order decide a published history.
             parents = [row_id for r, _, row_id in members if r == previous_rank]
+            # One restatement can have several published states — the extractor
+            # mints an amended instrument's prior state as its own row (#203),
+            # and an amendment within a restatement keeps the ordinal. Those
+            # states already point at each other, so the one another same-rank
+            # state names as its `amendment_of` has been replaced: it steps
+            # aside, and the chain lands on the state that replaced it. Two
+            # unlinked rows of one rank are still a tie.
+            replaced = {
+                str(by_id[row_id].get("amendment_of_debt_instrument_id"))
+                for row_id in parents
+                if by_id[row_id].get("amendment_of_debt_instrument_id")
+            }
+            parents = [row_id for row_id in parents if row_id not in replaced]
             for _, _, child_id in [m for m in members if m[0] == rank]:
                 for parent_id in parents:
                     offer(child_id, parent_id, "ordinal_chain")
