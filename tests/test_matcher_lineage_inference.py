@@ -77,43 +77,6 @@ def test_ordinal_chain_links_each_state_to_its_predecessor() -> None:
     assert result["i2"][0] == "i1"
 
 
-def test_prior_marked_amount_links_to_the_instrument_stating_it() -> None:
-    """A `prior` commitment equal to another cluster's principal is a predecessor."""
-    mentions = [
-        mention(
-            "m2",
-            amounts_json=json.dumps(
-                [
-                    {
-                        "kind": "commitment",
-                        "normalized_amount": "2000000000",
-                        "prior": True,
-                    },
-                    {"kind": "commitment", "normalized_amount": "3000000000"},
-                ]
-            ),
-        )
-    ]
-    rows = [
-        instrument(
-            "i1",
-            "2022 Credit Agreement",
-            principal_amount="2000000000",
-            first_seen_filing_date="2022-07-07",
-        ),
-        instrument(
-            "i2",
-            "2026 Credit Agreement",
-            principal_amount="3000000000",
-            first_seen_filing_date="2026-04-13",
-        ),
-    ]
-    result = infer_amendment_parents(
-        rows, member_groups={"i2": ["m2"]}, mention_index=index(mentions)
-    )
-    assert result == {"i2": ("i1", "prior_fact")}
-
-
 def test_the_matcher_never_reads_filing_text(monkeypatch: object) -> None:
     """The stage boundary (#184): no lineage rule may derive a fact from item text.
 
@@ -169,72 +132,6 @@ def test_a_same_rank_tie_is_refused_rather_than_decided_by_id_order() -> None:
     assert result == {}
 
 
-def test_both_directions_of_a_mutual_pair_are_dropped() -> None:
-    """When the rules offer A->B and B->A the evidence has not settled direction."""
-    mentions = [
-        mention(
-            "m1",
-            name="Note",
-            amounts_json=json.dumps(
-                [{"normalized_amount": "2000000000", "prior": True}]
-            ),
-        ),
-        mention(
-            "m2",
-            name="Note",
-            amounts_json=json.dumps(
-                [{"normalized_amount": "3000000000", "prior": True}]
-            ),
-        ),
-    ]
-    rows = [
-        instrument(
-            "i1",
-            "Note",
-            principal_amount="3000000000",
-            first_seen_filing_date="2024-01-01",
-        ),
-        instrument(
-            "i2",
-            "Note",
-            principal_amount="2000000000",
-            first_seen_filing_date="2024-01-01",
-        ),
-    ]
-    result = infer_amendment_parents(
-        rows,
-        member_groups={"i1": ["m1"], "i2": ["m2"]},
-        mention_index=index(mentions),
-    )
-    assert result == {}
-
-
-def test_an_unmarked_amount_does_not_link() -> None:
-    """`prior_fact` rests on the `prior` mark, not on amount equality alone."""
-    mentions = [
-        mention(
-            "m2",
-            name="New Note",
-            amounts_json=json.dumps([{"normalized_amount": "2000000000"}]),
-        ),
-    ]
-    rows = [
-        instrument(
-            "i1",
-            "Old Note",
-            principal_amount="2000000000",
-            first_seen_filing_date="2020-01-01",
-        ),
-        instrument("i2", "New Note", first_seen_filing_date="2024-01-01"),
-    ]
-    result = infer_amendment_parents(
-        rows,
-        member_groups={"i2": ["m2"]},
-        mention_index=index(mentions),
-    )
-    assert result == {}
-
-
 def test_a_parent_dated_after_its_child_is_rejected() -> None:
     """Own start dates outrank filing dates, which cannot separate one filing."""
     rows = [
@@ -253,27 +150,6 @@ def test_a_parent_dated_after_its_child_is_rejected() -> None:
     ]
     result = infer_amendment_parents(rows, member_groups={}, mention_index={})
     assert result == {}
-
-
-def test_an_ambiguous_predecessor_is_left_alone() -> None:
-    """Two equally-qualified parents produce no link: a wrong pointer is worse."""
-    mentions = [
-        mention(
-            "m3",
-            amounts_json=json.dumps(
-                [{"kind": "commitment", "normalized_amount": "500", "prior": True}]
-            ),
-        )
-    ]
-    rows = [
-        instrument("i1", "Facility A", principal_amount="500"),
-        instrument("i2", "Facility B", principal_amount="500"),
-        instrument("i3", "Facility C", principal_amount="900"),
-    ]
-    result = infer_amendment_parents(
-        rows, member_groups={"i3": ["m3"]}, mention_index=index(mentions)
-    )
-    assert "i3" not in result
 
 
 def test_an_extracted_pointer_is_never_overwritten() -> None:

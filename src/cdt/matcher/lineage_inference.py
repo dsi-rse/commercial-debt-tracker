@@ -10,23 +10,34 @@ instruments came out as lineage heads, with EQT publishing three simultaneously
 active revolvers (#170).
 
 The matcher, unlike the relation stage, already works across filings within a
-CIK, so the missing links can be inferred here. Two rules, both reasoning only
-over facts the extractor bound to an object and cited:
+CIK, so a link the filings encode across filings can be inferred here. One rule,
+reasoning only over facts the extractor bound to an object and cited:
 
-* **prior_fact** — an instrument carrying a `prior`-marked amount whose value
-  equals an earlier instrument's canonical principal. The `prior` mark *is* the
-  predecessor's term, so an exact match on it is strong evidence.
 * **ordinal_chain** — "Fifth Amended and Restated X" follows "Fourth Amended and
   Restated X" follows "X". The ordinal in the name literally encodes chain
   position within one issuer and name stem.
 
-Both only ever fill an `amendment_of_debt_instrument_id` that is already null,
-never overwrite an extracted pointer, and refuse a candidate whenever the
-evidence does not single out one parent — an ambiguous guess is worse than the
-status quo, because a wrong pointer silently rewrites a published history.
+A second rule, `prior_fact`, linked an instrument carrying a `prior`-marked
+amount to the earlier instrument whose principal it equalled. It is gone
+because the extractor now mints that predecessor itself, as its own mention,
+from the same `prior` marks (#203): the successor's `amendment_of` names it
+directly, so the link is an extracted pointer, not an inference — and the
+extractor sees the prior *dates* this module never could, since
+`PreparedMention` carries no `dates_json`. On the corpus it was measured on,
+`prior_fact` produced 1 link in 542.
 
-Stage boundary (#184). Every input here is extractor output: the `prior` marks in
-`amounts_json`, the canonical `name`, `principal_amount`, and `start_date`. This
+The rule only ever fills an `amendment_of_debt_instrument_id` that is null or
+that this module inferred on an earlier run — never an extracted pointer — and
+refuses a candidate whenever the evidence does not single out one parent: an
+ambiguous guess is worse than the status quo, because a wrong pointer silently
+rewrites a published history. Every inferred pointer is re-opened and
+re-derived on each run (`apply_lineage_inference_pass`, #204), so a link the
+rule would now refuse does not survive because it was written first.
+
+Stage boundary (#184). Every input here is extractor output: the canonical
+`name`, `first_seen_filing_date` and `start_date`, and the borrower the
+extractor bound to each row in `parties_json`, which refuses a link between two
+issuers' agreements filed under one CIK (#197, #205). This
 module does **not** read filing text, and must not: a value derived from text in
 the matcher carries no evidence span (#154) and cannot acquire one, and item text
 is scoped to a document rather than to an object, so a text rule attributes a
@@ -186,30 +197,6 @@ def _name_rank_and_stem(name: object) -> tuple[int, str]:
     return rank, " ".join(w for w in stripped.split() if w not in NAME_NOISE)
 
 
-def _prior_amounts(member_ids: list[str], mention_index: dict) -> set[str]:
-    """Return every `prior`-marked amount across a cluster's mentions.
-
-    Reads `amounts_json` by direct attribute access rather than `getattr` with a
-    default: if `PreparedMention` ever stops carrying the field, that should be a
-    loud `AttributeError` and not a silently empty set. `PreparedMention` carries
-    no `dates_json`, so prior *dates* are not available here — adding the field
-    would let this rule match a predecessor's maturity as well (#170).
-    """
-    values: set[str] = set()
-    for member_id in member_ids:
-        mention = mention_index.get(member_id)
-        if mention is None:
-            continue
-        try:
-            payloads = json.loads(mention.amounts_json or "[]")
-        except (TypeError, ValueError):
-            continue
-        for payload in payloads:
-            if payload.get("prior") and payload.get("normalized_amount"):
-                values.add(str(payload["normalized_amount"]))
-    return values
-
-
 def _canonical_date(row: dict[str, object]) -> str | None:
     """Return the date a row's own evidence says it started, when it has one."""
     value = row.get("start_date")
@@ -230,6 +217,10 @@ def infer_amendment_parents(
     considered, and a child is left alone whenever the evidence does not single
     out one parent.
     """
+    # The ordinal rule reads instrument rows only. The mention-level inputs
+    # served `prior_fact`, now the extractor's job (#203); the parameters stay
+    # so the pass and a future mention-reading rule keep one call shape.
+    del member_groups, mention_index
     by_id = {str(row["debt_instrument_id"]): row for row in rows}
     by_cik: dict[str, list[str]] = {}
     for row_id, row in by_id.items():
@@ -280,19 +271,7 @@ def infer_amendment_parents(
             return
         candidates[child_id].setdefault(parent_id, rule)
 
-    # Rule 1: a prior-marked amount equals an earlier instrument's principal.
-    for child_id in open_children:
-        priors = _prior_amounts(member_groups.get(child_id, []), mention_index)
-        if not priors:
-            continue
-        for other_id in by_cik.get(str(by_id[child_id].get("cik") or ""), []):
-            principal = by_id[other_id].get("principal_amount")
-            if principal in (None, "", "None") or str(principal) == "nan":
-                continue
-            if str(principal) in priors:
-                offer(child_id, other_id, "prior_fact")
-
-    # Rule 2: the ordinal chain within one issuer and name stem.
+    # The ordinal chain within one issuer and name stem.
     stems: dict[tuple[str, str], list[tuple[int, str, str]]] = {}
     for row_id, row in by_id.items():
         rank, stem = _name_rank_and_stem(row.get("name"))
@@ -373,12 +352,8 @@ def infer_amendment_parents(
             node = parent_of(node)
 
     LOGGER.info(
-        "Lineage inference: %s links (%s), %s children left alone as ambiguous",
+        "Lineage inference: %s ordinal_chain links, %s children left alone as ambiguous",
         len(resolved),
-        ", ".join(
-            f"{rule}={sum(1 for _, r in resolved.values() if r == rule)}"
-            for rule in ("prior_fact", "ordinal_chain")
-        ),
         ambiguous,
     )
     return resolved
