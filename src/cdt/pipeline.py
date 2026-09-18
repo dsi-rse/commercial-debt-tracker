@@ -324,6 +324,21 @@ class PipelineOrchestrator:
             edge_rows=len(matched["debt_instrument_mentions"]),
             debt_instruments=len(matched["debt_instrument"]),
         )
+        # Same post-pass, same guard, as run_match_and_finalize: amendment
+        # lineage spans filings, so it can only be derived once every shard has
+        # matched. This path is `cdt pipeline` and the live extractor backend;
+        # omitting it here published un-inferred lineage on both while the batch
+        # backend had it, which is #170 surviving on two of three entry points.
+        if not matched["debt_instrument"].empty:
+            self._renew(renew)
+            self._log_stage_start("infer-lineage")
+            lineage_stats = apply_lineage_inference_pass(
+                resolved_artifact_root,
+                data_dir=self.config.data_dir,
+                renew=renew,
+            )
+            self._log_stage_complete("infer-lineage", **lineage_stats)
+
         member_edge_rows = matched["debt_instrument_mentions"]
         matched_mentions = (
             int((member_edge_rows["edge_type"] == "member").sum())

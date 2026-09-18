@@ -472,3 +472,115 @@ def test_resolve_mode_dates_daily_uses_lookback_window() -> None:
     today = date.today()
     assert end == today.fromordinal(today.toordinal() - 1)
     assert start == today.fromordinal(today.toordinal() - DAILY_LOOKBACK_DAYS)
+
+
+def _stage_stubs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    instruments: pd.DataFrame,
+) -> None:
+    """Stub ingest through match so a run reaches the lineage pass cheaply."""
+
+    def fake_run_ingest_pipeline(
+        config: object,
+        *,
+        ciks: set[str] | None = None,
+        s3_client: object | None = None,
+    ) -> tuple[pd.DataFrame, IngestRunResult]:
+        del config, s3_client
+        return pd.DataFrame([{"accession_number": "1"}]), IngestRunResult(
+            mode="historical",
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 1, 31),
+            ciks_count=len(ciks or set()),
+            candidates_seen=1,
+            skipped_existing=0,
+            downloaded=1,
+            failures=0,
+            total_rows=1,
+            output_root=str(tmp_path),
+            documents_root=str(tmp_path / "documents"),
+            document_partitions=(),
+            failure_file=str(tmp_path / "failures" / "ingest_failures.json"),
+            run_manifest=str(tmp_path / "runs" / "ingest" / "run_id=1.json"),
+        )
+
+    monkeypatch.setattr("cdt.pipeline.run_ingest_pipeline", fake_run_ingest_pipeline)
+    monkeypatch.setattr(
+        "cdt.pipeline.itemize_pending_documents",
+        lambda **_: pd.DataFrame([{"item_id": "item-1"}]),
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.classify_pending_items",
+        lambda **_: pd.DataFrame([{"item_id": "item-1", "relevance": True}]),
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.extract_pending_items",
+        lambda **_: pd.DataFrame([{"debt_instrument_mention_id": "mention-1"}]),
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.match_pending_mentions",
+        lambda **_: {
+            "debt_instrument_mentions": pd.DataFrame(
+                [{"debt_instrument_mention_id": "mention-1", "edge_type": "member"}]
+            ),
+            "debt_instrument": instruments,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("instruments", "expected_calls"),
+    [
+        (pd.DataFrame([{"debt_instrument_id": "instrument-1"}]), 1),
+        (pd.DataFrame(columns=["debt_instrument_id"]), 0),
+    ],
+    ids=["matched-something", "matched-nothing"],
+)
+def test_run_pipeline_runs_the_lineage_pass_between_match_and_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    instruments: pd.DataFrame,
+    expected_calls: int,
+) -> None:
+    """`cdt pipeline` and the live backend must infer lineage before publishing.
+
+    The pass was wired into `run_match_and_finalize` and `cdt match` only, so
+    `cdt pipeline` and `cdt-orchestrator --extractor-backend live` still
+    published the un-inferred lineage #170 describes, on a root the batch
+    backend would have fixed. The guard matches `run_match_and_finalize`'s:
+    nothing matched means three empty datasets read to write none.
+    """
+    from cdt import pipeline as pipeline_module
+
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("320193\n", encoding="utf-8")
+    calls: list[dict[str, object]] = []
+    _stage_stubs(monkeypatch, tmp_path, instruments=instruments)
+    monkeypatch.setattr(
+        pipeline_module,
+        "apply_lineage_inference_pass",
+        lambda artifact_root, **kwargs: (
+            calls.append({"artifact_root": str(artifact_root), **kwargs}),
+            {"links": 0, "reopened": 0, "heads_before": 0, "heads_after": 0},
+        )[1],
+    )
+
+    renewals: list[int] = []
+    run_pipeline(
+        PipelineConfig(
+            mode="historical",
+            cik_file=str(cik_file),
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 1, 31),
+            artifact_root=str(tmp_path / "artifacts"),
+        ),
+        renew=lambda: renewals.append(1),
+    )
+
+    assert len(calls) == expected_calls
+    if expected_calls:
+        assert calls[0]["artifact_root"] == str(tmp_path / "artifacts")
+        assert callable(calls[0]["renew"])
+        assert renewals
