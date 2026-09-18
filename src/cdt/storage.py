@@ -525,8 +525,24 @@ def declared_column_type(name: str, inferred: pa.DataType) -> pa.DataType:
 
 
 def apply_declared_column_types(table: pd.DataFrame) -> pa.Table:
-    """Return one Arrow table with the declared physical types applied."""
-    arrow = pa.Table.from_pandas(table, preserve_index=False)
+    """Return one Arrow table with the declared physical types applied.
+
+    Declared decimal columns are canonicalised to text before Arrow sees them.
+    A frame that mixes rows read back from parquet (which carry `Decimal`) with
+    rows built in memory (which carry the parser's text) is one object column
+    of two Python types, and `Table.from_pandas` refuses it outright — before
+    the decimal path below could quantize either. Every rewrite of an existing
+    partition is that mix (#203).
+    """
+    prepared = table.copy()
+    for name, dtype in DECLARED_COLUMN_TYPES.items():
+        if name in prepared.columns and pa.types.is_decimal(dtype):
+            prepared[name] = pd.Series(
+                [coerce_dataset_text(value) for value in prepared[name]],
+                index=prepared.index,
+                dtype=object,
+            )
+    arrow = pa.Table.from_pandas(prepared, preserve_index=False)
     for index, field in enumerate(arrow.schema):
         dtype = declared_column_type(field.name, field.type)
         if dtype == field.type:

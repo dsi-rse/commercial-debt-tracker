@@ -33,7 +33,7 @@ from cdt.extractor import (
     mentions_root,
     reset_active_job,
 )
-from cdt.extractor.core import CLASSIFICATION_SOURCES
+from cdt.extractor.core import CLASSIFICATION_SOURCES, backfill_mentions
 from cdt.ingest import (
     DEFAULT_AWS_PROFILE,
     DEFAULT_BUCKET,
@@ -329,6 +329,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_logging_arguments(reset_job_parser, noun="reset")
     reset_job_parser.set_defaults(func=run_reset_extract_job)
+
+    backfill_parser = subparsers.add_parser(
+        "backfill-mentions",
+        help=(
+            "Re-derive the extractor's synthesized rows over every existing "
+            "mentions partition: mint each amended instrument's prior state "
+            "(#203). No model calls; running it twice is a no-op."
+        ),
+    )
+    add_artifact_root_argument(backfill_parser)
+    backfill_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would be minted and skipped without rewriting anything.",
+    )
+    add_logging_arguments(backfill_parser, noun="backfill")
+    backfill_parser.set_defaults(func=run_backfill_mentions)
 
     match_parser = subparsers.add_parser(
         "match", help="Group extracted instrument mentions into debt instruments."
@@ -860,6 +877,30 @@ def run_reset_extract_job(args: argparse.Namespace) -> int:
         return 1
     print(f"Cleared the active extract job marker for {job_id}.")
     print("The next poll tick starts a fresh job from unclaimed partitions.")
+    return 0
+
+
+def run_backfill_mentions(args: argparse.Namespace) -> int:
+    """Mint prior states over existing mentions partitions, or count them."""
+    configure_logging(quiet=args.quiet, log_file=args.log_file)
+    logger = logging.getLogger(__name__)
+    artifact_root = args.artifact_root or default_output_root()
+    lease = None
+    if not args.dry_run:
+        lease = acquire_stage_lease(artifact_root, logger, "backfill")
+        if lease is None:
+            return 1
+    try:
+        counts = backfill_mentions(artifact_root, dry_run=args.dry_run)
+    except Exception:
+        logger.exception("Mentions backfill failed")
+        return 1
+    finally:
+        if lease is not None:
+            release_lease(lease)
+    print("Mentions backfill" + (" (dry run):" if args.dry_run else ":"))
+    for key in sorted(counts):
+        print(f"  {key + ':':<32}{counts[key]}")
     return 0
 
 

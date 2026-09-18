@@ -752,6 +752,40 @@ def test_parse_item_numbers_rejects_empty_list() -> None:
         raise AssertionError("expected argparse to reject an empty item-number list")
 
 
+def test_backfill_mentions_cli_reports_counts_and_skips_the_lease_on_dry_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`backfill-mentions --dry-run` counts without a lease; without it, it writes."""
+    calls: list[dict[str, object]] = []
+
+    def fake_backfill_mentions(
+        artifact_root: object, *, dry_run: bool = False
+    ) -> dict[str, int]:
+        calls.append({"artifact_root": str(artifact_root), "dry_run": dry_run})
+        return {"partitions": 3, "partitions_rewritten": 0, "minted": 2}
+
+    monkeypatch.setattr(cli, "backfill_mentions", fake_backfill_mentions)
+
+    status = cli.main(
+        ["backfill-mentions", "--dry-run", "--quiet", "--artifact-root", str(tmp_path)]
+    )
+
+    assert status == 0
+    assert calls == [{"artifact_root": str(tmp_path), "dry_run": True}]
+    out = capsys.readouterr().out
+    assert "Mentions backfill (dry run):" in out
+    assert "minted:" in out and "2" in out
+    assert not (tmp_path / "locks").exists()
+
+    status = cli.main(
+        ["backfill-mentions", "--quiet", "--artifact-root", str(tmp_path)]
+    )
+    assert status == 0
+    assert calls[-1] == {"artifact_root": str(tmp_path), "dry_run": False}
+
+
 def test_show_extract_job_reports_idle(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

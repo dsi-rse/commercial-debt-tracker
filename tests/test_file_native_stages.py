@@ -1021,6 +1021,460 @@ def test_published_mention_rows_is_the_single_publish_seam() -> None:
     assert row_state.to_audit_dict()["debt_instrument_mentions"] == published[:1]
 
 
+# --- Synthesized prior states (#203) ------------------------------------------
+
+
+def _fact(**fields: object) -> dict[str, object]:
+    base: dict[str, object] = {"spans": [], "derived_from": "stated"}
+    base.update(fields)
+    return base
+
+
+def amended_row(
+    mention_id: str = "m-amend",
+    *,
+    item_id: str = "item-1",
+    amounts: list[dict[str, object]] | None = None,
+    dates: list[dict[str, object]] | None = None,
+    **overrides: object,
+) -> dict[str, object]:
+    """Return one amended instrument the way the IE stage publishes it.
+
+    Default: `reduced commitments from $300,000,000 to $250,000,000` under a
+    `Credit Agreement dated as of 2020-02-03`, amended 2024-06-01, maturing
+    2029-02-03, 5.25% fixed, borrower and lender named.
+    """
+    amounts = (
+        amounts
+        if amounts is not None
+        else [
+            _fact(
+                kind="commitment",
+                normalized_amount="300000000",
+                currency="USD",
+                prior=True,
+            ),
+            _fact(
+                kind="commitment",
+                normalized_amount="250000000",
+                currency="USD",
+                prior=False,
+            ),
+            _fact(
+                kind="outstanding_balance", normalized_amount="100000000", prior=False
+            ),
+        ]
+    )
+    dates = (
+        dates
+        if dates is not None
+        else [
+            _fact(
+                kind="agreement",
+                normalized_date="2020-02-03",
+                prior=False,
+                expected=False,
+            ),
+            _fact(
+                kind="amendment",
+                normalized_date="2024-06-01",
+                prior=False,
+                expected=False,
+            ),
+            _fact(
+                kind="maturity",
+                normalized_date="2029-02-03",
+                prior=False,
+                expected=False,
+            ),
+        ]
+    )
+    principal = next(
+        (
+            a
+            for a in amounts
+            if not a.get("prior") and a.get("kind") in ("commitment", "principal")
+        ),
+        {},
+    )
+    row = build_mention_row(
+        mention_id=mention_id,
+        item_id=item_id,
+        accession_number="0002",
+        cik="0000320193",
+        date="2024-06-01",
+        name="Credit Agreement",
+        start_date="2020-02-03",
+        amount=str(principal.get("normalized_amount") or ""),
+        parties_json=json.dumps(
+            [
+                {"role": "borrower", "canonical_name": "Example Inc.", "spans": []},
+                {
+                    "role": "lender",
+                    "canonical_name": "Bank of America, N.A.",
+                    "spans": [],
+                },
+            ]
+        ),
+        raw_id="i-1",
+        instrument_type="revolving_credit",
+        maturity_date="2029-02-03",
+        interest_rate_kind="fixed",
+        interest_rate_pct="5.25",
+        interest_rate_json=json.dumps(_fact(kind="fixed", rate_pct="5.25")),
+        amounts_json=json.dumps(amounts, sort_keys=True),
+        dates_json=json.dumps(dates, sort_keys=True),
+        name_json=json.dumps({"spans": [{"text": "Credit Agreement"}]}),
+    )
+    if not principal:
+        row["principal_amount"] = None
+    row.update(overrides)
+    return row
+
+
+def test_mint_builds_the_prior_state_from_the_prior_marked_terms() -> None:
+    """The amended object's `prior` terms become the predecessor's current ones.
+
+    The predecessor keeps the agreement's dated-as-of (the same agreement), its
+    unchanged maturity and rate marked `inherited`, the borrower and nothing
+    the joinder may have changed; the successor is untouched apart from the
+    pointer, and its id — which never hashed `amendment_of` — is unchanged.
+    """
+    from cdt.extractor.core import mint_prior_state_rows
+
+    successor = amended_row()
+    counters: dict[str, int] = {}
+    published = mint_prior_state_rows([dict(successor)], counters)
+
+    assert counters == {"minted": 1}
+    assert len(published) == 2
+    after, minted = published
+    assert (
+        after["debt_instrument_mention_id"] == successor["debt_instrument_mention_id"]
+    )
+    assert after["amendment_of"] == minted["debt_instrument_mention_id"]
+    assert json.loads(str(after["amounts_json"]))[0]["prior"] is True  # no aliasing
+
+    assert minted["synthesized_by"] == "prior_state"
+    assert (
+        minted["synthesized_from_mention_id"] == successor["debt_instrument_mention_id"]
+    )
+    assert minted["item_id"] == "item-1"
+    assert minted["raw_id"] == "i-1-prior"
+    assert minted["name"] == "Credit Agreement"
+    assert minted["instrument_type"] == "revolving_credit"
+    assert minted["principal_amount"] == "300000000"
+    assert minted["principal_amount_kind"] == "commitment"
+    assert minted["start_date"] == "2020-02-03"
+    assert minted["maturity_date"] == "2029-02-03"
+    assert minted["status"] == "entered_into"
+    assert minted["amendment_of"] is None
+    assert minted["lender_disclosure"] == "none_named"
+    assert [p["role"] for p in json.loads(str(minted["parties_json"]))] == ["borrower"]
+
+    amounts = json.loads(str(minted["amounts_json"]))
+    assert [
+        (a["kind"], a["normalized_amount"], a["prior"], a["derived_from"])
+        for a in amounts
+    ] == [
+        ("commitment", "300000000", False, "stated")
+    ]  # the new $250M is gone; the balance observation stays with the successor
+    dates = {d["kind"]: d for d in json.loads(str(minted["dates_json"]))}
+    assert set(dates) == {"maturity", "agreement"}  # no event kinds
+    assert dates["maturity"]["derived_from"] == "inherited"
+    assert dates["agreement"]["derived_from"] == "stated"
+    assert json.loads(str(minted["interest_rate_json"]))["derived_from"] == "inherited"
+
+
+def test_mint_refusals_are_counted_and_leave_the_rows_alone() -> None:
+    """Each way the trigger can fail is named, and nothing is minted."""
+    from cdt.extractor.core import mint_prior_state_rows
+
+    def run(
+        rows: list[dict[str, object]],
+    ) -> tuple[list[dict[str, object]], dict[str, int]]:
+        counters: dict[str, int] = {}
+        return mint_prior_state_rows([dict(r) for r in rows], counters), counters
+
+    # no prior term at all: not an amendment with a before-figure
+    plain, counts = run(
+        [
+            amended_row(
+                amounts=[
+                    _fact(kind="commitment", normalized_amount="250000000", prior=False)
+                ]
+            )
+        ]
+    )
+    assert len(plain) == 1 and counts == {}
+
+    # amendment date only: no origin to place the predecessor at
+    rows, counts = run(
+        [
+            amended_row(
+                dates=[
+                    _fact(kind="amendment", normalized_date="2024-06-01", prior=False)
+                ]
+            )
+        ]
+    )
+    assert len(rows) == 1 and counts == {"skipped_no_origin": 1}
+
+    # the relation stage already paired it with a model-emitted predecessor
+    rows, counts = run([amended_row(amendment_of="m-model-predecessor")])
+    assert len(rows) == 1 and counts == {"skipped_model_paired": 1}
+
+    # a sibling in the item already *is* the predecessor
+    sibling = build_mention_row(
+        mention_id="m-sibling",
+        item_id="item-1",
+        accession_number="0002",
+        cik="0000320193",
+        date="2024-06-01",
+        name="Credit Agreement",
+        start_date="2020-02-03",
+        amount="300000000",
+    )
+    rows, counts = run([amended_row(), sibling])
+    assert len(rows) == 2 and counts == {"skipped_sibling_is_predecessor": 1}
+
+    # two before-values of one kind
+    rows, counts = run(
+        [
+            amended_row(
+                amounts=[
+                    _fact(kind="commitment", normalized_amount="300000000", prior=True),
+                    _fact(kind="commitment", normalized_amount="200000000", prior=True),
+                    _fact(
+                        kind="commitment", normalized_amount="250000000", prior=False
+                    ),
+                ]
+            )
+        ]
+    )
+    assert len(rows) == 1 and counts == {"skipped_ambiguous_prior": 1}
+
+
+def test_mint_places_the_predecessor_at_the_right_origin() -> None:
+    """A prior agreement is the predecessor's own date and wins outright.
+
+    An origin equal to the amendment date is the restatement's own dated-as-of
+    (MPLX: agreement 2019-07-31 == amendment 2019-07-31), so the predecessor
+    is minted with no start date rather than a date the filing did not state
+    for that state of the facility.
+    """
+    from cdt.extractor.core import mint_prior_state_rows
+
+    restated = amended_row(
+        dates=[
+            _fact(
+                kind="agreement",
+                normalized_date="2024-06-01",
+                prior=False,
+                expected=False,
+            ),
+            _fact(
+                kind="closing",
+                normalized_date="2024-06-01",
+                prior=False,
+                expected=False,
+            ),
+            _fact(
+                kind="amendment",
+                normalized_date="2024-06-01",
+                prior=False,
+                expected=False,
+            ),
+            _fact(
+                kind="agreement",
+                normalized_date="2020-02-03",
+                prior=True,
+                expected=False,
+            ),
+        ]
+    )
+    counters: dict[str, int] = {}
+    _, minted = mint_prior_state_rows([restated], counters)
+    assert counters == {"minted": 1}
+    assert minted["start_date"] == "2020-02-03"
+    kinds = [d["kind"] for d in json.loads(str(minted["dates_json"]))]
+    assert kinds == ["agreement"]  # the restatement's closing/agreement were not copied
+
+    mplx = amended_row(
+        dates=[
+            _fact(
+                kind="agreement",
+                normalized_date="2019-07-31",
+                prior=False,
+                expected=False,
+            ),
+            _fact(
+                kind="amendment",
+                normalized_date="2019-07-31",
+                prior=False,
+                expected=False,
+            ),
+            _fact(
+                kind="maturity",
+                normalized_date="2024-07-31",
+                prior=False,
+                expected=False,
+            ),
+            _fact(
+                kind="maturity",
+                normalized_date="2020-12-04",
+                prior=True,
+                expected=False,
+            ),
+        ]
+    )
+    counters = {}
+    _, minted = mint_prior_state_rows([mplx], counters)
+    assert counters == {"minted": 1, "minted_no_origin": 1}
+    assert minted["start_date"] is None
+    assert minted["maturity_date"] == "2020-12-04"
+    assert minted["principal_amount"] == "300000000"
+
+
+def test_mint_from_a_prior_maturity_alone_inherits_the_amount() -> None:
+    """`extended the maturity from 2029 to 2031`: the commitment is unchanged."""
+    from cdt.extractor.core import mint_prior_state_rows
+
+    extended = amended_row(
+        amounts=[
+            _fact(
+                kind="commitment",
+                normalized_amount="250000000",
+                currency="USD",
+                prior=False,
+            )
+        ],
+        dates=[
+            _fact(
+                kind="agreement",
+                normalized_date="2020-02-03",
+                prior=False,
+                expected=False,
+            ),
+            _fact(
+                kind="amendment",
+                normalized_date="2024-06-01",
+                prior=False,
+                expected=False,
+            ),
+            _fact(
+                kind="maturity",
+                normalized_date="2031-02-03",
+                prior=False,
+                expected=False,
+            ),
+            _fact(
+                kind="maturity",
+                normalized_date="2029-02-03",
+                prior=True,
+                expected=False,
+            ),
+        ],
+    )
+    _, minted = mint_prior_state_rows([extended])
+    assert minted["maturity_date"] == "2029-02-03"
+    assert minted["principal_amount"] == "250000000"
+    amounts = json.loads(str(minted["amounts_json"]))
+    assert amounts[0]["derived_from"] == "inherited"
+
+
+def test_two_successors_sharing_one_prior_state_point_at_one_mint() -> None:
+    """Byte-identical mints collapse to one row; both pointers still land."""
+    from cdt.extractor.core import mint_prior_state_rows
+
+    first = amended_row("m-a", raw_id="i-1")
+    second = amended_row("m-b", raw_id="i-1", interest_rate_pct="5.25")
+    counters: dict[str, int] = {}
+    published = mint_prior_state_rows([first, second], counters)
+    assert counters == {"minted": 1, "minted_shared": 1}
+    assert len(published) == 3
+    assert (
+        published[0]["amendment_of"]
+        == published[1]["amendment_of"]
+        == published[2]["debt_instrument_mention_id"]
+    )
+
+
+def test_mint_is_id_stable_and_idempotent() -> None:
+    """Model-emitted ids never change, and minting its own output adds nothing."""
+    from cdt.extractor.core import mint_prior_state_rows
+
+    rows = [
+        amended_row(),
+        amended_row(
+            "m-plain",
+            amounts=[_fact(kind="commitment", normalized_amount="1", prior=False)],
+        ),
+    ]
+    before = {r["debt_instrument_mention_id"] for r in rows}
+    published = mint_prior_state_rows([dict(r) for r in rows])
+    real_after = {
+        r["debt_instrument_mention_id"]
+        for r in published
+        if r.get("synthesized_by") is None
+    }
+    assert real_after == before
+
+    again = mint_prior_state_rows([dict(r) for r in published])
+    assert again == published
+
+
+def test_backfill_mints_over_existing_partitions_and_is_a_no_op_twice(
+    tmp_path: Path,
+) -> None:
+    """A partition written before #203 gains its prior states, once."""
+    from cdt.extractor.core import (
+        ExtractionRowState,
+        backfill_mentions,
+        published_mention_rows,
+    )
+
+    successor = amended_row()
+    write_partition_table(
+        tmp_path / "mentions",
+        partition={"date": "2024-06-01", "shard": "0001"},
+        table=pd.DataFrame([successor], columns=DEBT_INSTRUMENT_MENTION_COLUMNS),
+    )
+
+    dry = backfill_mentions(tmp_path, dry_run=True)
+    assert dry == {"partitions": 1, "partitions_rewritten": 0, "minted": 1}
+    assert len(read_dataset(tmp_path / "mentions")) == 1
+
+    first = backfill_mentions(tmp_path)
+    assert first == {"partitions": 1, "partitions_rewritten": 1, "minted": 1}
+    published = read_dataset(tmp_path / "mentions").sort_values(
+        "debt_instrument_mention_id"
+    )
+    assert len(published) == 2
+    assert published["synthesized_by"].notna().sum() == 1
+
+    second = backfill_mentions(tmp_path)
+    assert second["minted"] == 1
+    again = read_dataset(tmp_path / "mentions").sort_values(
+        "debt_instrument_mention_id"
+    )
+    pd.testing.assert_frame_equal(
+        published.reset_index(drop=True), again.reset_index(drop=True)
+    )
+
+    # A mint built at write time and one built from the parquet round trip
+    # must be the same row: parquet reads None back as NaN, and every copied
+    # field is coerced so the hash does not notice.
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"}, stage_name="instrument_ie"
+    )
+    row_state.debt_instrument_mentions = [successor]
+    write_time = {
+        r["debt_instrument_mention_id"] for r in published_mention_rows(row_state)
+    }
+    assert write_time == set(published["debt_instrument_mention_id"])
+
+
 def test_instrument_ie_validate_accepts_party_kinds_and_roles() -> None:
     """Annotated lender and other-party clusters should validate."""
     response = json.dumps(
@@ -6130,6 +6584,44 @@ def test_a_multi_partition_dataset_reads_with_a_standard_reader(
     assert table.num_rows == 2
     assert len(pd.read_parquet(root)) == 2
     assert len(read_dataset(root)) == 2
+
+
+def test_a_rewrite_may_mix_read_back_decimals_with_fresh_text(tmp_path: Path) -> None:
+    """A partition rewrite holds `Decimal` and text in one money column.
+
+    Rows read back from parquet carry `Decimal`; a row built in memory carries
+    the parser's text. `Table.from_pandas` refused the mixed object column
+    before the declared-type layer could quantize either, which stopped the
+    first backfill that appended a minted row to an existing partition (#203).
+    """
+    from decimal import Decimal
+
+    frame = pd.DataFrame(
+        [
+            dict.fromkeys(DEBT_INSTRUMENT_MENTION_COLUMNS)
+            | {
+                "debt_instrument_mention_id": "m-read-back",
+                "item_id": "item-1",
+                "principal_amount": Decimal("300000000.00"),
+            },
+            dict.fromkeys(DEBT_INSTRUMENT_MENTION_COLUMNS)
+            | {
+                "debt_instrument_mention_id": "m-fresh",
+                "item_id": "item-1",
+                "principal_amount": "250000000",
+            },
+        ]
+    )
+    write_partition_table(
+        tmp_path / "mentions",
+        partition={"date": "2024-06-01", "shard": "0001"},
+        table=frame,
+    )
+    published = read_dataset(tmp_path / "mentions").set_index(
+        "debt_instrument_mention_id"
+    )
+    assert published.loc["m-read-back", "principal_amount"] == Decimal("300000000.00")
+    assert published.loc["m-fresh", "principal_amount"] == Decimal("250000000.00")
 
 
 def test_declared_decimal_columns_publish_as_exact_decimals(tmp_path: Path) -> None:
