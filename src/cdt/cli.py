@@ -370,15 +370,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_AMBIGUITY_MARGIN,
     )
-    match_parser.add_argument(
-        "--infer-lineage",
-        action="store_true",
-        help=(
-            "fill amendment pointers the item-scoped relation stage cannot "
-            "express, from prior-marked amounts and amend-and-restate ordinals; "
-            "off by default, and not part of `cdt pipeline` (#170)"
-        ),
-    )
     add_logging_arguments(match_parser, noun="matching")
     match_parser.set_defaults(func=run_matcher)
 
@@ -929,14 +920,17 @@ def run_matcher(args: argparse.Namespace) -> int:
             loose_match_threshold=args.loose_match_threshold,
             ambiguity_margin=args.ambiguity_margin,
         )
-        if args.infer_lineage:
-            stats = apply_lineage_inference_pass(str(artifact_root))
-            logger.info(
-                "Lineage inference: %s links, lineage heads %s -> %s",
-                stats["links"],
-                stats["heads_before"],
-                stats["heads_after"],
-            )
+        # Always, as the pipeline does: an amend-and-restate chain spans
+        # filings, so its links exist only once every shard has matched (#170,
+        # #204). Every inferred pointer is re-derived here, never carried.
+        stats = apply_lineage_inference_pass(artifact_root)
+        logger.info(
+            "Lineage inference: %s links (%s re-opened), lineage heads %s -> %s",
+            stats["links"],
+            stats["reopened"],
+            stats["heads_before"],
+            stats["heads_after"],
+        )
     except Exception:
         logger.exception("Matcher failed")
         return 1

@@ -215,8 +215,13 @@ def test_instruments_of_different_issuers_are_never_linked() -> None:
     assert result == {}
 
 
-def test_match_tables_is_unchanged_without_the_flag() -> None:
-    """The published contract only moves when a caller opts in."""
+def test_match_tables_itself_never_infers_a_pointer() -> None:
+    """Inference is the post-pass's job; the per-shard matcher publishes none.
+
+    `match_tables` sees only the clusters its batch touched, so a rule there
+    could never see both states of one facility. The pass runs after every
+    match (`run_match_and_finalize`, `cdt match`), not behind a flag.
+    """
     from cdt.matcher.core import match_tables
 
     mentions = pd.DataFrame(
