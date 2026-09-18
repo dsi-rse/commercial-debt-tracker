@@ -8226,3 +8226,32 @@ def test_an_expected_date_is_never_inherited_onto_the_predecessor() -> None:
     kinds = {entry["kind"] for entry in json.loads(minted[0]["dates_json"])}
     assert "maturity" not in kinds
     assert minted[0]["maturity_date"] is None
+
+
+def test_the_lineage_pass_records_a_run_manifest(tmp_path: Path) -> None:
+    """The pass rewrites every published shard, so it must say so (#211).
+
+    Every writing stage in this repo records a run manifest, and
+    `docs/architecture.md` names stage manifests as a design property. The match
+    manifest lists its own `partitions_written`, and then this pass rewrites
+    every one of them — so without a manifest of its own, the last record of the
+    `debt-instruments` dataset described a state something else had changed
+    afterwards. Tolerable while the pass was opt-in behind `--infer-lineage`;
+    #203 made it the unconditional default.
+    """
+    root = _ordinal_chain_root(tmp_path)
+    stats = apply_lineage_inference_pass(root)
+
+    manifest = read_json_artifact(
+        run_manifest_path("infer-lineage", "latest", artifact_root=str(root))
+    )
+    assert isinstance(manifest, dict)
+    assert manifest["stage"] == "infer-lineage"
+    assert manifest["schema_version"] == MATCHER_SCHEMA_VERSION
+    assert manifest["links"] == stats["links"]
+    assert manifest["heads_after"] == stats["heads_after"]
+    # the partitions it names are the ones it actually rewrote
+    assert manifest["partitions_written"]
+    for path in manifest["partitions_written"]:
+        assert artifact_exists(path)
+        assert "debt-instruments" in path

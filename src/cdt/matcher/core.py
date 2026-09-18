@@ -2423,16 +2423,45 @@ def apply_lineage_inference_pass(
     frame["_shard"] = (
         frame["cik"].fillna("").map(lambda value: shard_for_cik(str(value)))
     )
+    partitions_written: list[str] = []
     for cik_shard, shard_rows in frame.groupby("_shard"):
         if renew is not None:
             renew()
-        write_partition_table(
-            debt_instruments_root(resolved_root, data_dir=data_dir),
-            partition={"cik_shard": str(cik_shard)},
-            table=shard_rows.drop(columns=["_shard"]).reindex(
-                columns=DEBT_INSTRUMENT_COLUMNS
-            ),
+        partitions_written.append(
+            write_partition_table(
+                debt_instruments_root(resolved_root, data_dir=data_dir),
+                partition={"cik_shard": str(cik_shard)},
+                table=shard_rows.drop(columns=["_shard"]).reindex(
+                    columns=DEBT_INSTRUMENT_COLUMNS
+                ),
+            )
         )
+    # Every writing stage in this repo records a run manifest, and
+    # `docs/architecture.md` names stage manifests as a design property. The
+    # match manifest is written with its own `partitions_written`, and then
+    # this pass rewrites every one of those partitions — so without a manifest
+    # of its own, the last record of the `debt-instruments` dataset describes a
+    # state something else changed afterwards. That was tolerable while the
+    # pass was opt-in behind `--infer-lineage`; #203 made it the unconditional
+    # default (#211).
+    write_json_artifact(
+        run_manifest_path(
+            "infer-lineage",
+            "latest",
+            artifact_root=resolved_root,
+            data_dir=data_dir,
+        ),
+        {
+            "artifact_root": resolved_root,
+            "stage": "infer-lineage",
+            "partitions_written": partitions_written,
+            "links": len(inferred),
+            "reopened": reopened,
+            "heads_before": heads_before,
+            "heads_after": heads_after,
+            "schema_version": MATCHER_SCHEMA_VERSION,
+        },
+    )
     LOGGER.info(
         "Lineage inference pass: %s links (%s inferred pointers re-opened), heads %s -> %s",
         len(inferred),
