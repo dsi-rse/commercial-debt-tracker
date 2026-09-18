@@ -493,6 +493,12 @@ DEBT_INSTRUMENT_MENTION_COLUMNS = [
     "interest_rate_json",
     "dates_json",
     "lender_disclosure",
+    # Set only on a row the extractor synthesized rather than the model
+    # returned: the rule that minted it, and the mention it was minted from
+    # (#203). Null on every model-emitted row. Neither is hashed into the
+    # mention id, so adding them re-keys nothing.
+    "synthesized_by",
+    "synthesized_from_mention_id",
 ]
 
 
@@ -4453,6 +4459,12 @@ def standardized_end_date_payload(
 DERIVED_FROM_STATED = "stated"
 DERIVED_FROM_NAME = "name"
 DERIVED_FROM_COMPUTED = "computed"
+# A term carried onto a synthesized predecessor row from the amended object it
+# was minted from, because the filing marked no `prior` value for that kind and
+# so states it unchanged (#203). The spans are the successor's; the marker is
+# what lets a reader tell an inherited term from one the filing stated for this
+# state of the instrument.
+DERIVED_FROM_INHERITED = "inherited"
 # A sum needs at least two addends; one parsed span is agreement, not arithmetic.
 MINIMUM_COMPUTED_SUM_SPANS = 2
 

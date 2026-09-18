@@ -5741,6 +5741,8 @@ def test_published_mention_columns_are_pinned() -> None:
         "interest_rate_json",
         "dates_json",
         "lender_disclosure",
+        "synthesized_by",
+        "synthesized_from_mention_id",
     ]
 
 
@@ -5778,6 +5780,7 @@ def test_published_instrument_columns_are_pinned() -> None:
         "outstanding_balance",
         "outstanding_balance_currency",
         "outstanding_balance_as_of",
+        "outstanding_balance_as_of_is_filing_date",
         "outstanding_balance_source_mention_id",
         "interest_rate_kind",
         "interest_rate_pct",
@@ -5785,6 +5788,7 @@ def test_published_instrument_columns_are_pinned() -> None:
         "parties_json",
         "lender_disclosure",
         "amendment_inferred_by",
+        "synthesized_only",
     ]
 
 
@@ -5974,7 +5978,7 @@ def test_decimal_coercion_quantizes_legacy_float_error_but_refuses_junk() -> Non
 
 def test_matcher_schema_version_is_pinned() -> None:
     """The version is how a downstream reader learns a rebuild is required."""
-    assert MATCHER_SCHEMA_VERSION == 6
+    assert MATCHER_SCHEMA_VERSION == 7
 
 
 def test_match_tables_publishes_exactly_the_declared_columns() -> None:

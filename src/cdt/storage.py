@@ -449,6 +449,8 @@ DECLARED_COLUMN_TYPES: dict[str, pa.DataType] = {
     "section_char_count": pa.int64(),
     "is_lineage_head": pa.bool_(),
     "relevance": pa.bool_(),
+    "synthesized_only": pa.bool_(),
+    "outstanding_balance_as_of_is_filing_date": pa.bool_(),
     # Model scores, not measured quantities, so a float is the honest type.
     "classification_score": pa.float64(),
     "match_score": pa.float64(),

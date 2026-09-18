@@ -46,9 +46,11 @@ DEFAULT_MEMBERSHIP_THRESHOLD = 0.90
 DEFAULT_AMBIGUITY_MARGIN = 0.05
 DEFAULT_LENDER_SUPPORT_THRESHOLD = 0.5
 # Bumped 5 -> 6 for the four status columns this stage no longer publishes
-# (#196). A reader holding rows written at 5 has columns that no longer
-# exist, so it needs to know a rebuild happened.
-MATCHER_SCHEMA_VERSION = 6
+# (#196), and 6 -> 7 for the two it gained: `synthesized_only` and
+# `outstanding_balance_as_of_is_filing_date` (#203). A reader holding rows
+# written at an older version is missing columns or holding removed ones, so it
+# needs to know a rebuild happened.
+MATCHER_SCHEMA_VERSION = 7
 EDGE_TYPES = ("member", "related", "ambiguous_candidate")
 GENERIC_LENDER_TERMS = frozenset(
     {
@@ -109,6 +111,10 @@ DEBT_INSTRUMENT_COLUMNS = [
     "outstanding_balance",
     "outstanding_balance_currency",
     "outstanding_balance_as_of",
+    # True when `outstanding_balance_as_of` is the filing date substituted for
+    # a balance the filing dated no other way, so a consumer can tell a stated
+    # as-of from a derived one (#203).
+    "outstanding_balance_as_of_is_filing_date",
     "outstanding_balance_source_mention_id",
     "interest_rate_kind",
     "interest_rate_pct",
@@ -116,6 +122,13 @@ DEBT_INSTRUMENT_COLUMNS = [
     "parties_json",
     "lender_disclosure",
     "amendment_inferred_by",
+    # True when every member mention was synthesized by the extractor rather
+    # than returned by the model — a minted prior state that never merged with
+    # a mention of the instrument it describes (#203). The row is a real prior
+    # state, cited from its successor's filing, but no filing describes it on
+    # its own, and a reader summing capacity or counting live obligations needs
+    # to know that.
+    "synthesized_only",
 ]
 MENTION_CLUSTER_EDGE_DATASET_NAME = "mention-cluster-edges"
 DEBT_INSTRUMENT_DATASET_NAME = "debt-instruments"

@@ -9,7 +9,7 @@ Text columns are normalized on the way into a snapshot: a cell whose whole value
 Two schema-wide contracts:
 
 - `cik` columns carry SEC's canonical 10-digit zero-padded form (#153). Snapshots pad legacy unpadded partitions on the way out, and `shard_for_cik` hashes the unpadded form so existing `cik_shard` partitions stay where they are.
-- Every evidence payload records `spans`: a list of `{tag_id, char_start, char_end, text}` whose offsets index the source item's `text` **exactly** (#154) — the extractor realigns model output whose whitespace drifted. Value-bearing payloads also record `derived_from`: `"stated"` when the value was parsed from cited evidence, `"name"` when it was derived from the instrument's own name (a `due 2028` maturity, a `$183.36 million term loan` principal, a coupon in the name), and null when there is no value (#128).
+- Every evidence payload records `spans`: a list of `{tag_id, char_start, char_end, text}` whose offsets index the source item's `text` **exactly** (#154) — the extractor realigns model output whose whitespace drifted. Value-bearing payloads also record `derived_from`: `"stated"` when the value was parsed from cited evidence, `"name"` when it was derived from the instrument's own name (a `due 2028` maturity, a `$183.36 million term loan` principal, a coupon in the name), `"computed"` for arithmetic over cited spans, `"inherited"` for a term a synthesized row carries unchanged from the row it was minted from (#203), and null when there is no value (#128).
 
 ## Root Layout
 
@@ -155,7 +155,7 @@ NaN and `str(float("nan"))` is the literal text `nan`.
 | `principal_amount`, `outstanding_balance` | `decimal128(38, 2)` | Exact money. Not a float: `float("372246148.11")` is not that number, and rendering it at fixed precision leaked the difference, which is what made every amount carrying cents publish as null (#119). Not text either: a text column sorts `962500000` before `2000000000` (#185). |
 | `interest_rate_pct` | `decimal128(9, 4)` | Exact percentage. Four places carries basis points; the corpus uses at most three. Published canonical, so one rate has one spelling — it previously persisted the model's own text, giving 141 distinct strings for 115 distinct rates. |
 | `mention_count`, `document_count` | `int64` | |
-| `is_lineage_head`, `relevance` | `bool` | |
+| `is_lineage_head`, `relevance`, `synthesized_only`, `outstanding_balance_as_of_is_filing_date` | `bool` | |
 | `classification_score` | `double` | A model decision score, not a measured quantity. |
 | `match_score` | `double` | |
 | `start_line`, `end_line`, `section_char_count`, `candidate_rank` | `int64` | |
@@ -261,13 +261,13 @@ Columns:
 - `raw_id`: Row-local extractor identifier used inside a single item during relation extraction.
 - `name`: Canonicalized debt instrument name text extracted from the item.
 - `instrument_type`: One of `term_loan`, `revolving_credit`, `credit_line`, `note_bond`, or null when none fits or the document does not say (#156).
-- `start_date`: Normalized instrument start or issuance date when present — the current `closing` fact in `dates_json`. An instrument whose status is `announced` has not started and carries none; its projected close lives in `dates_json` as a `closing` fact marked `expected` (the stage-1 `expected_closing` kind is rewritten to that shape on the way in). The publisher's `expected_active` leg is measured against it.
+- `start_date`: Normalized instrument start or issuance date when present — the current `closing` fact in `dates_json`. An instrument whose status is `announced` has not started and carries none; its projected close lives in `dates_json` as a `closing` fact marked `expected` (the stage-1 `expected_closing` kind is rewritten to that shape on the way in). The publisher's expected-start leg (`dsi-rse/commercial-debt-tracker-website#15`) is measured against it.
 - `maturity_date`: Normalized final maturity or expiration of the obligation — when the borrowed money must be repaid (#158). Year-only maturities normalize to `YYYY-12-31` with `derived_from: "name"`.
 - `commitment_termination_date`: When the lender's obligation to lend ends — the close of a draw, availability, or revolving period — when the document states one distinct from the maturity (#158). Null for notes and bonds.
 - `principal_amount`: The single commitment or principal figure, as digits with at most one decimal point. Balances, draws, repayments, and proceeds never populate this column (#140).
 - `principal_currency`: ISO 4217 code for `principal_amount` when stated.
 - `principal_amount_kind`: `commitment` or `principal`; null on rows replayed from the pre-#140 single-amount shape.
-- `status`: What this mention says happened to the instrument, derived from its event facts in `dates_json`: the newest completed event wins (`retirement`→`repaid`, `termination`→`terminated`, `exchange`→`exchanged`, `default`→`defaulted`, `amendment`→`amended`, `closing`→`entered_into`, `announcement`→`announced`); an instrument whose only closing is `expected` is `announced`; a planned retirement decides nothing here and is read by the matcher as pending. Null when the mention states no event. Pre-stage-2 responses that carried a `status_event` replay it verbatim.
+- `status`: What this mention says happened to the instrument, derived from its event facts in `dates_json`: the newest completed event wins (`retirement`→`repaid`, `termination`→`terminated`, `exchange`→`exchanged`, `default`→`defaulted`, `amendment`→`amended`, `closing`→`entered_into`, `announcement`→`announced`); an instrument whose only closing is `expected` is `announced`; a planned retirement — a `retirement` fact marked `expected` — decides nothing here and stays in `dates_json` for the publisher's cascade. Null when the mention states no event. Pre-stage-2 responses that carried a `status_event` replay it verbatim.
 - `status_date`: The date of the event that decided `status`, when stated.
 - `interest_rate_kind`: `fixed` or `floating` (#157).
 - `interest_rate_pct`: The stated fixed or all-in rate as a numeric string, parser-verified against the cited evidence or the instrument's name. Null for floating rates; benchmarks and margins are not recorded.
@@ -282,6 +282,8 @@ Columns:
 - `status_json`: `{status, status_date}` where `status_date` is a full evidence payload (#141).
 - `interest_rate_json`: `{kind, rate_pct, spans, derived_from}` (#157).
 - `lender_disclosure`: How completely this mention identifies who holds the debt, derived from the party clusters: `complete` when every `lender` cluster is `named`; `collective_present` when any is `collective` (`the other lenders party thereto`); `none_named` when the mention names no lender at all (a public-market series, a redemption notice, a syndicate where only the agent is named). Replaces the `lenders_known_incomplete` boolean, which was true for the second and third cases alike and so could not distinguish "something is undisclosed" from "nothing was disclosed here". Pre-stage-2 responses replay the flag the model declared, mapped onto these values.
+- `synthesized_by`: The rule that minted this row, when the extractor synthesized it rather than the model returning it (#203); null on every model-emitted row. The only value today is `prior_state`: the state of an amended instrument before the amendment, built from the `prior`-marked terms on the object that describes the amendment.
+- `synthesized_from_mention_id`: The `debt_instrument_mention_id` of the model-emitted row a synthesized row was minted from — always in the same item. Neither column is hashed into the mention id.
 
 Primary key: `debt_instrument_mention_id`
 
@@ -344,7 +346,7 @@ everywhere:
 | `normalized_date` | date payloads, `dates_json` | `YYYY-MM-DD`, or null when no date resolves. |
 | `normalized_amount` | `amounts_json` | Digits with at most one decimal point. |
 | `rate_pct` | `interest_rate_json` | Numeric string; null for floating rates. |
-| `derived_from` | every value-bearing payload | `"stated"` when parsed from cited evidence, `"name"` when read out of the instrument's own name, null when there is no value (#128). |
+| `derived_from` | every value-bearing payload | `"stated"` when parsed from cited evidence, `"name"` when read out of the instrument's own name, `"computed"` when arithmetic over cited spans produced it (a summed increase, a tenor added to a closing date), `"inherited"` when a synthesized row carries a term unchanged from the row it was minted from (#203), null when there is no value (#128). |
 | `precision` | date payloads, `dates_json` | `day`, `month`, or `year` — how precisely the cited text states the date, not how precisely `normalized_date` is written. |
 | `prior` | `dates_json`, `amounts_json` | True for a term stated as it stood *before* an amendment (`from $25,000,000 to $50,000,000`). Prior facts never supply a flat column. |
 | `expected` | date payloads, `dates_json` | True for a date the filing states as planned rather than occurred — an expected closing, a noticed redemption. |
@@ -455,7 +457,8 @@ Columns:
 - `name`, `instrument_type`, `start_date`, `commitment_termination_date`: Matcher-selected canonical values — the newest non-null across direct mentions, falling back to the value already on the row when no mention carries one.
 - `maturity_date`: Selected on a different rule from the fields above. The newest **stated** maturity wins; a derived one — read out of the instrument's own name, or computed from a tenor (#166) — publishes only when no mention in the cluster states any. Recency alone was not enough, because every post-closing `due 2030` mention re-introduces the synthesized year-end, which let a name-derived `2030-12-31` outrank the closing 8-K's stated `2030-07-01` (#162). Extending the same preference to the other canonical fields is still open under #162.
 - `principal_amount`, `principal_currency`, `principal_amount_kind`: Canonical headline amount, taken together from the newest mention that carries one so the currency can never detach from its figure (#140).
-- `outstanding_balance`, `outstanding_balance_currency`, `outstanding_balance_as_of`: The newest balance observation, kept apart from principal so it never double-counts (#140). `as_of` falls back to the observing mention's filing date.
+- `outstanding_balance`, `outstanding_balance_currency`, `outstanding_balance_as_of`, `outstanding_balance_as_of_is_filing_date`: The newest balance observation, kept apart from principal so it never double-counts (#140). When the filing dates the balance no other way, `as_of` falls back to the observing mention's filing date and `outstanding_balance_as_of_is_filing_date` is true, so a substituted date is never mistaken for a stated one (#203).
+- `synthesized_only`: True when every member mention was synthesized by the extractor (`mentions.synthesized_by` set) rather than returned by the model — a minted prior state that never merged with a mention describing that state on its own (#203). The row is a real, cited prior state of its successor, but no filing describes it independently; a reader summing capacity or counting obligations needs to know that.
 - `interest_rate_kind`, `interest_rate_pct`: Canonical interest rate (#157).
 - `*_source_mention_id` (name, instrument_type, start_date, maturity, commitment_termination, principal, outstanding_balance, interest_rate): The mention each canonical value actually came from (#151), so evidence attribution never has to be guessed.
 - `parties_json`: JSON aggregation of party clusters from direct mentions, deduped by role plus normalized canonical name (#150).
@@ -499,6 +502,14 @@ These stages currently overwrite a `latest` manifest:
 <artifact-root>/runs/classify/run_id=latest.json
 <artifact-root>/runs/match/run_id=latest.json
 ```
+
+The match manifest and the `final-snapshots/latest.json` pointer carry
+`schema_version` (`MATCHER_SCHEMA_VERSION`, currently 7). It is bumped whenever a
+`debt-instruments` or `mention-cluster-edges` column is added or removed — 5 → 6
+for the four `status_*` columns #196 removed, 6 → 7 for `synthesized_only` and
+`outstanding_balance_as_of_is_filing_date` (#203) — so a reader of an older root
+knows its columns differ from the current contract. Nothing in this repository
+compares it; it is written for the publisher.
 
 ### Extractor manifests and audit logs
 
