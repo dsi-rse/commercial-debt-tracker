@@ -7695,3 +7695,149 @@ def test_a_root_matched_under_an_older_schema_forces_a_full_rematch(
         MATCHER_SCHEMA_VERSION
     )
     assert _stale_schema_forces_rematch(str(tmp_path)) is False
+
+
+def test_an_unparsed_prior_term_suppresses_inheritance_rather_than_licensing_it() -> (
+    None
+):
+    """A stated before-figure the parser could not resolve still says this changed.
+
+    The kind sets that answer "did this term change?" were built from the
+    *parsed* prior entries, so a `prior: true` term whose value did not resolve
+    was invisible to them, and the current value of that kind was copied onto
+    the predecessor marked `derived_from: "inherited"` — asserting the
+    post-amendment figure as the prior state's own term, the one thing the rule
+    must never do. The claims decide the kinds; only the values come from what
+    parsed (#211).
+
+    Incidence of this shape on the reference corpus is 0, so no published row
+    was ever wrong because of it.
+    """
+    from cdt.extractor.core import mint_prior_state_rows
+
+    counters: dict[str, int] = {}
+    minted = [
+        row
+        for row in mint_prior_state_rows(
+            [
+                amended_row(
+                    amounts=[
+                        _fact(
+                            kind="commitment",
+                            normalized_amount="250000000",
+                            prior=False,
+                        ),
+                        # stated, but the parser could not resolve it
+                        _fact(kind="commitment", normalized_amount=None, prior=True),
+                    ],
+                    dates=[
+                        _fact(
+                            kind="agreement", normalized_date="2021-03-01", prior=True
+                        ),
+                        _fact(
+                            kind="maturity", normalized_date="2029-05-01", prior=False
+                        ),
+                        _fact(kind="maturity", normalized_date=None, prior=True),
+                    ],
+                )
+            ],
+            counters,
+        )
+        if row.get("synthesized_by") == "prior_state"
+    ]
+
+    assert counters == {"minted": 1}
+    assert len(minted) == 1
+    # neither post-amendment value is laundered onto the predecessor
+    assert minted[0]["principal_amount"] is None
+    assert minted[0]["maturity_date"] is None
+    assert json.loads(minted[0]["amounts_json"]) == []
+    inherited = [
+        entry
+        for entry in json.loads(minted[0]["dates_json"])
+        if entry.get("derived_from") == "inherited"
+    ]
+    assert inherited == []
+
+
+def test_a_prior_claim_that_never_parsed_is_counted_not_silently_dropped() -> None:
+    """The counters are the pre-registered yield, so a refusal cannot be silent.
+
+    An object whose *only* prior term failed to parse fell through the combined
+    "no prior amounts and no prior dates" guard with no counter at all, which
+    is why the window's 22 objects carrying a prior term summed to 21 across
+    the counters. On `data/genwindow-run-branch` the swallowed object is
+    `dim::5542bb4c…`, a Loan and Security Agreement whose prior commitment has
+    a null amount; the counters now sum to 22 (#211).
+    """
+    from cdt.extractor.core import mint_prior_state_rows
+
+    counters: dict[str, int] = {}
+    rows = mint_prior_state_rows(
+        [
+            amended_row(
+                amounts=[
+                    _fact(
+                        kind="commitment", normalized_amount="250000000", prior=False
+                    ),
+                    _fact(kind="commitment", normalized_amount=None, prior=True),
+                ],
+                dates=[
+                    _fact(kind="agreement", normalized_date="2020-02-03", prior=False),
+                ],
+            )
+        ],
+        counters,
+    )
+
+    assert len(rows) == 1
+    assert counters == {"skipped_unparsed_prior": 1}
+
+
+def test_two_before_figures_are_ambiguous_even_when_one_did_not_parse() -> None:
+    """Ambiguity is judged on the claims: two stated before-values are two states."""
+    from cdt.extractor.core import mint_prior_state_rows
+
+    counters: dict[str, int] = {}
+    rows = mint_prior_state_rows(
+        [
+            amended_row(
+                amounts=[
+                    _fact(kind="commitment", normalized_amount="300000000", prior=True),
+                    _fact(kind="commitment", normalized_amount=None, prior=True),
+                    _fact(
+                        kind="commitment", normalized_amount="250000000", prior=False
+                    ),
+                ]
+            )
+        ],
+        counters,
+    )
+
+    assert len(rows) == 1
+    assert counters == {"skipped_ambiguous_prior": 1}
+
+
+def test_mint_does_not_write_the_pointer_onto_the_rows_it_was_handed() -> None:
+    """`amendment_of` belongs on the published row, never on the persisted state.
+
+    Both callers happened to be safe — `published_mention_rows` copies and
+    `backfill_mentions` owns its records — so this was latent rather than live.
+    A future caller passing `row_state.debt_instrument_mentions` straight in
+    would have persisted a minted pointer into `state.jsonl` (#211).
+    """
+    from cdt.extractor.core import mint_prior_state_rows
+
+    caller_rows = [amended_row()]
+
+    published = mint_prior_state_rows(caller_rows)
+
+    assert caller_rows[0]["amendment_of"] is None
+    successor = next(
+        row
+        for row in published
+        if row["debt_instrument_mention_id"]
+        == caller_rows[0]["debt_instrument_mention_id"]
+    )
+    assert successor["amendment_of"] is not None
+    assert successor is not caller_rows[0]
