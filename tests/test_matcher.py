@@ -1171,3 +1171,104 @@ def test_lender_keys_reads_only_lender_clusters() -> None:
     # and is still read as a lender.
     legacy = json.dumps([{"spans": [{"text": "Acme Bank, N.A."}]}])
     assert lender_keys(legacy) == ["acme bank"]
+
+
+def test_an_extracted_amendment_pointer_beats_a_carried_inferred_one() -> None:
+    """A guess and a fact must not cancel each other out (#203, #204).
+
+    `derive_parent_links` used to seed `amendment_parents` with the existing
+    row's pointer whatever its provenance, so a row carrying an inferred
+    pointer to one instrument, whose mention now states an extracted pointer to
+    another, held two candidates and the ambiguity guard threw both away. The
+    pass then re-inferred its guess on the next run and the extracted link
+    never came back. What the mentions state wins; the carried pointer is only
+    a fallback, and it is what keeps an inferred link alive across an ordinary
+    rematch since no mention names it.
+    """
+    child = prepare_mention(
+        mention_row(debt_instrument_mention_id="m-child", amendment_of="m-real-parent")
+    )
+    existing = pd.DataFrame(
+        [
+            {
+                "debt_instrument_id": "m-child",
+                "amendment_of_debt_instrument_id": "m-guessed-parent",
+                "amendment_inferred_by": "ordinal_chain",
+                "retired_by_debt_instrument_ids": None,
+                "split_of_debt_instrument_id": None,
+            }
+        ]
+    )
+
+    links = derive_parent_links(
+        {"m-child": ["m-child"]},
+        {"m-child": child},
+        {"m-child": "m-child", "m-real-parent": "m-real-parent"},
+        existing_instruments=existing,
+    )
+
+    assert links["m-child"]["amendment_of_debt_instrument_id"] == "m-real-parent"
+    # provenance travels with the pointer: this one is extracted, not inferred
+    assert links["m-child"]["amendment_inferred_by"] is None
+
+
+def test_a_carried_pointer_survives_when_no_mention_names_a_parent() -> None:
+    """The fallback is the whole reason an inferred pointer outlives a rematch (#184)."""
+    child = prepare_mention(mention_row(debt_instrument_mention_id="m-child"))
+    existing = pd.DataFrame(
+        [
+            {
+                "debt_instrument_id": "m-child",
+                "amendment_of_debt_instrument_id": "m-guessed-parent",
+                "amendment_inferred_by": "ordinal_chain",
+                "retired_by_debt_instrument_ids": None,
+                "split_of_debt_instrument_id": None,
+            }
+        ]
+    )
+
+    links = derive_parent_links(
+        {"m-child": ["m-child"]},
+        {"m-child": child},
+        {"m-child": "m-child"},
+        existing_instruments=existing,
+    )
+
+    assert links["m-child"]["amendment_of_debt_instrument_id"] == "m-guessed-parent"
+    assert links["m-child"]["amendment_inferred_by"] == "ordinal_chain"
+
+
+def test_two_extracted_parents_refuse_rather_than_fall_back_to_a_guess() -> None:
+    """An ambiguous extracted set is a refusal; falling back would publish a guess."""
+    first = prepare_mention(
+        mention_row(debt_instrument_mention_id="m-a", amendment_of="m-parent-1")
+    )
+    second = prepare_mention(
+        mention_row(debt_instrument_mention_id="m-b", amendment_of="m-parent-2")
+    )
+    existing = pd.DataFrame(
+        [
+            {
+                "debt_instrument_id": "m-a",
+                "amendment_of_debt_instrument_id": "m-guessed-parent",
+                "amendment_inferred_by": "ordinal_chain",
+                "retired_by_debt_instrument_ids": None,
+                "split_of_debt_instrument_id": None,
+            }
+        ]
+    )
+
+    links = derive_parent_links(
+        {"m-a": ["m-a", "m-b"]},
+        {"m-a": first, "m-b": second},
+        {
+            "m-a": "m-a",
+            "m-b": "m-a",
+            "m-parent-1": "m-parent-1",
+            "m-parent-2": "m-parent-2",
+        },
+        existing_instruments=existing,
+    )
+
+    assert links["m-a"]["amendment_of_debt_instrument_id"] is None
+    assert links["m-a"]["amendment_inferred_by"] is None

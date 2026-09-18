@@ -1209,8 +1209,6 @@ def derive_parent_links(
         existing_amendment = coerce_optional_text(
             existing_row.get("amendment_of_debt_instrument_id")
         )
-        if existing_amendment:
-            amendment_parents.add(existing_amendment)
         existing_retired = coerce_optional_text(
             existing_row.get("retired_by_debt_instrument_ids")
         )
@@ -1250,10 +1248,25 @@ def derive_parent_links(
         # unambiguous (#130). Retirers are exempt: several instruments jointly
         # retiring one obligation is a legitimate state of the world, so the
         # column is a list and keeps them all.
-        if len(amendment_parents) > 1:
+        amendment_is_ambiguous = len(amendment_parents) > 1
+        if amendment_is_ambiguous:
             amendment_parents.clear()
         if len(split_parents) > 1:
             split_parents.clear()
+        # The existing row's amendment pointer is a *fallback*, not a candidate.
+        # Seeding it alongside the extracted ones put a guess and a fact in the
+        # same set, and the guard above then threw both away: a row carrying a
+        # stale inferred pointer lost the #203 pointer its own mention now
+        # states, the pass re-inferred its guess on the next run, and the
+        # extracted link never came back. Measured on `data/lineage-verify`,
+        # backfill plus one plain match published 19 pointers and 539 heads
+        # against a clean rebuild's 22 and 536, and three further matches did
+        # not recover it. What the mentions state wins; the carried pointer is
+        # what keeps an inferred link alive across an ordinary rematch, since
+        # no mention names it (#184, #204). An ambiguous extracted set is a
+        # refusal, so it does not fall back — a guess is worse than no pointer.
+        if not amendment_parents and not amendment_is_ambiguous and existing_amendment:
+            amendment_parents.add(existing_amendment)
         amendment_parent = next(iter(amendment_parents), None)
         # Provenance travels with the pointer it describes. The amendment pointer
         # is carried forward from the existing row above, so without this an
