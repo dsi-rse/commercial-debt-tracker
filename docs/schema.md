@@ -348,7 +348,7 @@ everywhere:
 | `rate_pct` | `interest_rate_json` | Numeric string; null for floating rates. |
 | `derived_from` | every value-bearing payload | `"stated"` when parsed from cited evidence, `"name"` when read out of the instrument's own name, `"computed"` when arithmetic over cited spans produced it (a summed increase, a tenor added to a closing date), `"inherited"` when a synthesized row carries a term unchanged from the row it was minted from (#203), null when there is no value (#128). |
 | `precision` | date payloads, `dates_json` | `day`, `month`, or `year` — how precisely the cited text states the date, not how precisely `normalized_date` is written. |
-| `prior` | `dates_json`, `amounts_json` | True for a term stated as it stood *before* an amendment (`from $25,000,000 to $50,000,000`). Prior facts never supply a flat column. |
+| `prior` | `dates_json`, `amounts_json` | True for a term stated as it stood *before* an amendment (`from $25,000,000 to $50,000,000`). Prior facts never supply a flat column on the row that states them; a synthesized prior state (below) carries them flipped, as its own current terms. |
 | `expected` | date payloads, `dates_json` | True for a date the filing states as planned rather than occurred — an expected closing, a noticed redemption. |
 | `as_of_date` | `amounts_json` | Normally present only on balances. |
 | `currency` | `amounts_json` | ISO 4217. |
@@ -400,6 +400,50 @@ The nested `status_date` payload inside `status_json`:
                             "char_end": 6727, "text": "September 20, 2022"}]}}
 ```
 
+##### Synthesized rows
+
+An amendment 8-K extracts as **one** object — the terms as amended, plus every
+old term the filing states marked `prior`. That leaves nothing for
+`amendment_of` to name, so the extractor mints the instrument's prior state as
+its own mention row (#203): `synthesized_by = "prior_state"`,
+`synthesized_from_mention_id` naming the amended object, and the amended
+object's `amendment_of` naming the minted row. Nothing chooses a predecessor;
+the row is constructed from the amended object's own cited `prior` facts.
+
+What a minted row carries, and how to read it:
+
+- The `prior`-marked commitment/principal, agreement, maturity or
+  commitment-termination facts, **flipped to `prior: false`** — on this row
+  they are the current terms. Their spans are the successor's; the text they
+  cite is the same before-figure.
+- Every other commitment/principal, maturity or commitment-termination fact of
+  a kind the filing marked no `prior` value for, copied with
+  `derived_from: "inherited"`: the filing gives no evidence the term changed.
+  This is the one assertion the rule makes that a filing cannot confirm — a
+  filing stating a *new* value with no before-figure looks identical — and the
+  marker is what lets a reader tell an inherited term from a stated one.
+- The origin: a `prior`-marked `agreement` when there is one (the
+  predecessor's own dated-as-of), else the current `closing` and `agreement` —
+  the same agreement's dates — unless they equal an `amendment` date, in which
+  case they are the restatement's own and the row has **no** `start_date`.
+- No event facts (`amendment`, `repayment`, `retirement`, …): events belong to
+  the filing's own moment. No balances, draws, repayments or proceeds, for the
+  same reason.
+- `parties_json` holds the borrower only, and `lender_disclosure` is
+  `none_named`: a joinder adds and removes lenders, so the filing never states
+  who lent under the earlier terms.
+- `name`, `name_json`, `instrument_type`, `interest_rate_*` and the filing
+  metadata are the successor's. `raw_id` is the successor's with `-prior`.
+
+A minted row's id comes from the same hash as any other; the successor's id
+does not change (`amendment_of` and the `synthesized_*` columns are not
+hashed). Downstream, the matcher never lets a synthesized member supply a
+cluster's canonical fields or widen its name class, may borrow the successor's
+lender signature for scoring only, and publishes `synthesized_only` on an
+instrument whose every member is synthesized. `cdt backfill-mentions` mints
+over partitions written before #203; it is a pure function of the model-emitted
+rows and a no-op when run twice.
+
 ##### Reading them safely
 
 - **Older partitions key spans as `mentions`, not `spans`.** Partitions written
@@ -448,7 +492,7 @@ Columns:
 - `amendment_of_debt_instrument_id`: Parent instrument ID when this instrument is an amendment lineage child. Every lineage pointer on this table carries a relation the **extractor** asserted and cited; the matcher resolves the `raw_id` to an instrument ID but never invents the relation. A pointer that records a matcher inference rather than an extracted fact needs a provenance column alongside it, documented here, and that column has to survive an incremental rematch — see the stage boundary in `docs/architecture.md` (#184).
 - `retired_by_debt_instrument_ids`: JSON array of IDs of the instruments that retired this one, set on the retired instrument's own row (null when none).
 - `split_of_debt_instrument_id`: Parent instrument ID when this instrument is a split lineage child.
-- `amendment_inferred_by`: Which rule inferred `amendment_of_debt_instrument_id`, when the matcher filled it rather than the extractor: `ordinal_chain` (the amend-and-restate ordinal in the name). Null means the pointer came from an extracted, cited relation — including the pointer from an amended instrument to the prior state the extractor minted for it (#203) — so an inferred pointer is never mistaken for an extracted one (#170, #184). Rows written before #203 may carry `prior_fact`; the lineage pass re-opens every inferred pointer on each run and re-derives it, so such a row is re-linked by `ordinal_chain` or cleared (#204). Only set behind `cdt match --infer-lineage`.
+- `amendment_inferred_by`: Which rule inferred `amendment_of_debt_instrument_id`, when the matcher filled it rather than the extractor: `ordinal_chain` (the amend-and-restate ordinal in the name). Null means the pointer came from an extracted, cited relation — including the pointer from an amended instrument to the prior state the extractor minted for it (#203) — so an inferred pointer is never mistaken for an extracted one (#170, #184). Rows written before #203 may carry `prior_fact`; the lineage pass re-opens every inferred pointer on each run and re-derives it, so such a row is re-linked by `ordinal_chain` or cleared (#204). Set by the lineage pass, which runs after every match — in `cdt match` and in the pipeline's match-and-finalize step alike.
 - `superseded_by_debt_instrument_id`: The amendment child that replaced this state, when exactly one exists (#155). A row with this set is a superseded state, not a live obligation.
 - `lineage_family_id`: One ID per connected lineage component over amendment, split, and retirement pointers — every state of one obligation history shares it (#155). Singleton instruments use their own ID.
 - `is_lineage_head`: True when no amendment child supersedes this row; the browse index should show heads and collapse the rest of the family beneath them.

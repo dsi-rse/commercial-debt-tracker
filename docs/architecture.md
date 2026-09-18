@@ -238,4 +238,4 @@ After matching succeeds, CDT can write final parquet snapshots for dashboard and
 - `debt-instrument-mentions/latest.parquet`
 - `mention-cluster-edges/latest.parquet`
 
-The processor does not publish Cloudflare R2 JSON directly. The `../commercial-debt-tracker-dashboard` repository owns the publisher that reads these final parquet snapshots and writes `generated/*` JSON to R2.
+The processor does not publish Cloudflare R2 JSON directly. The website publisher — `dsi-rse/commercial-debt-tracker-website` — reads these final parquet snapshots and writes `generated/*` JSON to R2. (The older `commercial-debt-tracker-dashboard` repository is archived; older documents that name it mean this one.) Anything that needs a notion of *now* — the lifecycle status cascade #196 removed from this repository — is derived there against an explicit `asOf` (website#15). A synthesized prior state (#203) reaches the publisher as an ordinary instrument row with `is_lineage_head` false and `superseded_by_debt_instrument_id` set, and `synthesized_only` true when no filing describes it on its own; the publisher collapses it beneath its head like any other superseded state.
