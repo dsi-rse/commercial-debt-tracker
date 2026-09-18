@@ -85,6 +85,35 @@ BORROWER_SUFFIXES = frozenset(
         "na",
     }
 )
+# A borrower "named" only by its role or defined term. The extractor records a
+# party as the longest span it saw, so a filing that never uses the company's
+# name records the borrower as literally `Issuer` — and read as a name, that
+# made `HSBC Holdings plc` against `Issuer` positive evidence of two different
+# companies (#205). It is silence: the filing did not say who the borrower is.
+# Keys are compared after `NAME_NOISE` and `BORROWER_SUFFIXES` are stripped, so
+# `the Borrowers` and `Co-Borrower` both land on `borrower(s)` here.
+GENERIC_BORROWER_PHRASES = frozenset(
+    {
+        "borrower",
+        "borrowers",
+        "subsidiary borrower",
+        "subsidiary borrowers",
+        "parent borrower",
+        "other borrowers party thereto",
+        "issuer",
+        "issuers",
+        "obligor",
+        "obligors",
+        "buyer",
+        "buyers",
+        "buyer parent",
+        "parent",
+        "loan party",
+        "loan parties",
+        "credit party",
+        "credit parties",
+    }
+)
 
 
 def _borrower_key(name: object) -> tuple[str, ...]:
@@ -97,17 +126,27 @@ def _borrower_key(name: object) -> tuple[str, ...]:
 
 
 def _borrowers(row: dict[str, object]) -> set[tuple[str, ...]]:
-    """Return the borrower keys the extractor bound to this instrument."""
+    """Return the borrower keys the extractor bound to this instrument.
+
+    A placeholder (`Issuer`, `the Borrowers`) is dropped rather than compared:
+    it names a role, not a company, so the row reads as naming no borrower and
+    takes the silence path below. Valid JSON that is not a list reads the same
+    way instead of raising, as `parse_cluster_list` does for every other payload.
+    """
     try:
         parties = json.loads(str(row.get("parties_json") or "[]"))
     except json.JSONDecodeError:
+        return set()
+    if not isinstance(parties, list):
         return set()
     keys = {
         _borrower_key(party.get("canonical_name"))
         for party in parties
         if isinstance(party, dict) and party.get("role") == "borrower"
     }
-    return {key for key in keys if key}
+    return {
+        key for key in keys if key and " ".join(key) not in GENERIC_BORROWER_PHRASES
+    }
 
 
 def _borrowers_disagree(child: dict[str, object], parent: dict[str, object]) -> bool:
@@ -117,13 +156,21 @@ def _borrowers_disagree(child: dict[str, object], parent: dict[str, object]) -> 
     unconstrained, because refusing on a missing party would drop ordinary
     links to the many mentions that never name one — so this only ever fires on
     positive evidence of a different borrower.
+
+    Two rows agree when they share one borrower key exactly. A prefix rule used
+    to count `EQT Corporation` and `EQT Midstream Partners, LP` as one party —
+    finance subsidiaries are almost always named after their parent, and the
+    EQT/EQM case this guard was written for only worked because `eqt` and `eqm`
+    differ in the first token (#205). `BORROWER_SUFFIXES` already makes `EQT` and
+    `EQT Corporation` equal, so the prefix bought nothing but that hole. A
+    cluster's borrowers are the union across its member mentions, so one shared
+    key among several is enough — the guard is deliberately looser on a row
+    that names many borrowers than on one that names one.
     """
     child_keys, parent_keys = _borrowers(child), _borrowers(parent)
     if not child_keys or not parent_keys:
         return False
-    return not any(
-        a[: len(b)] == b or b[: len(a)] == a for a in child_keys for b in parent_keys
-    )
+    return not (child_keys & parent_keys)
 
 
 def _name_rank_and_stem(name: object) -> tuple[int, str]:

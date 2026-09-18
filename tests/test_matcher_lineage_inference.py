@@ -6,6 +6,7 @@ import inspect
 import json
 
 import pandas as pd
+import pytest
 
 from cdt.matcher import core, lineage_inference
 from cdt.matcher.core import prepare_mention
@@ -423,6 +424,103 @@ def test_a_legal_form_suffix_is_not_a_different_borrower() -> None:
             parties_json=borrower("EQT Company"),
         ),
     ]
+    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+
+    assert result["i2"] == ("i1", "ordinal_chain")
+
+
+def ordinal_pair(
+    parent_parties: str | None, child_parties: str | None
+) -> list[dict[str, object]]:
+    """Return a Second/Third A&R pair carrying the given `parties_json` values."""
+    parent = instrument(
+        "i1",
+        "Second Amended and Restated Credit Agreement",
+        first_seen_filing_date="2022-01-01",
+    )
+    child = instrument(
+        "i2",
+        "Third Amended and Restated Credit Agreement",
+        first_seen_filing_date="2024-01-01",
+    )
+    if parent_parties is not None:
+        parent["parties_json"] = parent_parties
+    if child_parties is not None:
+        child["parties_json"] = child_parties
+    return [parent, child]
+
+
+@pytest.mark.parametrize(
+    "placeholder",
+    ["Issuer", "the Borrowers", "Buyer Parent", "other Borrowers party thereto"],
+)
+def test_a_placeholder_borrower_is_silence_not_a_different_company(
+    placeholder: str,
+) -> None:
+    """A borrower recorded only by its role or defined term constrains nothing.
+
+    The extractor keeps the longest span, so a filing that never names the
+    company records `Issuer`; read as a name, `HSBC Holdings plc` against
+    `Issuer` refused the link on 17 rows of one corpus (#205).
+    """
+    rows = ordinal_pair(borrower("HSBC Holdings plc"), borrower(placeholder))
+    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+
+    assert result["i2"] == ("i1", "ordinal_chain")
+
+
+@pytest.mark.parametrize(
+    ("parent", "child"),
+    [
+        ("EQT Corporation", "EQT Midstream Partners, LP"),
+        ("Ford Motor Company", "Ford Motor Credit Company LLC"),
+    ],
+)
+def test_a_subsidiary_named_after_its_parent_is_a_different_borrower(
+    parent: str, child: str
+) -> None:
+    """A finance subsidiary is not its parent, however the name begins (#205)."""
+    rows = ordinal_pair(borrower(parent), borrower(child))
+    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+
+    assert "i2" not in result
+
+
+def test_one_shared_borrower_among_several_is_agreement() -> None:
+    """A cluster's borrowers are a union; one match among many is enough."""
+    both = json.dumps(
+        [
+            {"role": "borrower", "canonical_name": "MPLX LP", "spans": []},
+            {"role": "borrower", "canonical_name": "Andeavor Logistics", "spans": []},
+        ]
+    )
+    rows = ordinal_pair(both, borrower("Andeavor Logistics LP"))
+    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+
+    assert result["i2"] == ("i1", "ordinal_chain")
+
+
+def test_a_borrower_that_is_all_noise_does_not_switch_the_guard_off() -> None:
+    """`The` reduces to an empty key, which must not match every other key."""
+    noise_and_eqm = json.dumps(
+        [
+            {"role": "borrower", "canonical_name": "The", "spans": []},
+            {
+                "role": "borrower",
+                "canonical_name": "EQM Midstream Partners",
+                "spans": [],
+            },
+        ]
+    )
+    rows = ordinal_pair(borrower("EQT Corporation"), noise_and_eqm)
+    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+
+    assert "i2" not in result
+
+
+def test_a_parties_payload_that_is_not_a_list_reads_as_no_borrower() -> None:
+    """Valid JSON that is not a list is silence, not an aborted pass."""
+    rows = ordinal_pair(borrower("EQT Corporation"), "null")
     result = infer_amendment_parents(rows, member_groups={}, mention_index={})
 
     assert result["i2"] == ("i1", "ordinal_chain")
