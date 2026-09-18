@@ -299,6 +299,28 @@ it could serve a filing the scraper has not scraped. Source A's mitigation for
 that is the 8-K path's — `DAILY_LOOKBACK_DAYS`, a re-runnable range, and the
 failure registry — not a second source.
 
+### Turning it on
+
+Both genres run by default, so nothing needs enabling — but three things are
+worth knowing before a wide run:
+
+- **The 6-K chain costs LLM calls in prepare.** The 8-K prepare stages are
+  local (itemize is parsing, classify is a local SVC); 6-K triage calls stage 2
+  once per filing with admitted windows. A daily run over a list with many
+  foreign private issuers spends money in `prepare`, not only in `extract`.
+- **A CIK list chosen for 8-K coverage may contain no FPIs at all**, in which
+  case the 6-K chain runs and finds nothing. `--sixk-cik-file` / `SIXK_CIK_FILE`
+  exists for that: point it at a list that includes 6-K filers without
+  disturbing the 8-K run.
+- **Narrowing is `--genres`**, on both `cdt pipeline` and `cdt-orchestrator`
+  (env `GENRES`). An unknown genre is rejected by argparse rather than silently
+  narrowing a scheduled run.
+
+The chains are independent up to extract — different documents datasets,
+different classification sources, per-dataset fingerprint selection (#62) — so
+a genre that fails leaves its own partitions pending and does not corrupt the
+other's state.
+
 ### Cutover
 
 Done as of 2026-09-16, and it needed no migration step. Both sources wrote the
@@ -333,9 +355,9 @@ Modified:
 |---|---|
 | `ingest.py` | `form_types` + `dataset_name` on `IngestConfig`; `form_type`/`source` on `DocumentCandidate` and `DOCUMENT_COLUMNS`; drop the `CDT_FORM_TYPE` hardcode |
 | `extractor/core.py` | `CLASSIFICATION_SOURCES` loop in `pending_extract_partitions`; scope the mentions-backfill heuristic to the 8-K source |
-| `pipeline.py` | `sixk_enabled` / `sixk_form_types` / `sixk_cik_file` on `PipelineConfig`; a `_sixk` phase in `_ingest_itemize_classify` (renamed `_prepare`), with a lease renew at its boundary; counts on `PipelineRunResult`; `FINAL_OUTPUT_TABLES["items"]` becomes a union of `items` and `sixk-snippets` |
+| `pipeline.py` | `genres` / `sixk_form_types` / `sixk_cik_file` / `sixk_batch_size` / `sixk_concurrency` on `PipelineConfig`; `normalize_genres`; a `_sixk` phase in `_ingest_itemize_classify` (renamed `_prepare`), with a lease renew at its boundary; counts on `PipelineRunResult`; `FINAL_OUTPUT_TABLES["items"]` becomes a union of `items` and `sixk-snippets` |
 | `cli.py` | `cdt sixk` stage command; `cdt ingest-sixk` with the scraper flags `cdt ingest` takes; `--form-types` and `--sixk-cik-file` on `cdt ingest` |
-| `orchestrator.py` | `--sixk` / `SIXK_ENABLED` and `--sixk-cik-file` / `SIXK_CIK_FILE` (defaulting to `CDT_DEFAULT_CIK_FILE`), threaded into `PipelineConfig` |
+| `orchestrator.py` | `--genres` / `GENRES` and `--sixk-cik-file` / `SIXK_CIK_FILE`, threaded into `PipelineConfig` |
 | `settings.py` | `SIXK_TRIAGE_PROVIDER`, `SIXK_CIK_FILE` |
 | `sixk/__init__.py` | re-export the new modules |
 | `docs/architecture.md` | the second genre path; the 6-K stage between ingest and extract |
@@ -382,8 +404,12 @@ following their fake-client pattern:
    pipeline change; drive it with `cdt sixk`.
 4. **Extractor source list.** Including the backfill-heuristic fix and its test.
    This is the phase to review hardest — it touches the production 8-K path.
-5. **Pipeline and orchestrator.** `--sixk` off by default, so the deployed daily
-   run is unchanged until it is turned on deliberately. Also the `items`
+5. **Pipeline and orchestrator.** Shipped **on** by default instead, as
+   `--genres` (default `8-K,6-K`) rather than an off-by-default `--sixk`: a run
+   is asked for CIKs and a date range, and which forms those issuers filed in
+   it is not something the caller should have to know or keep in sync with the
+   scraper's coverage. The deployed daily run therefore does change — see
+   "Turning it on" below. Also the `items`
    snapshot union, and the issue on `commercial-debt-tracker-dashboard` for the
    `item`-column change it implies.
 6. **Docs.**

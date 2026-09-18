@@ -12,7 +12,7 @@ from typing import Self
 import pandas as pd
 import pytest
 
-from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
+from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS, score_model
 from cdt.datasets import load_completion_registry, run_manifest_path
 from cdt.ingest import DOCUMENT_COLUMNS, SIXK_DOCUMENT_DATASET_NAME
 from cdt.ingest import documents_root as ingest_documents_root
@@ -50,6 +50,38 @@ OTHER_PROSE = (
 )
 
 
+# One paragraph per line, because an expansion walks back to a line boundary:
+# a single unbroken paragraph has none within reach and cannot expand at all.
+_FILLER_LINE = (
+    "The board declared a quarterly dividend of $0.10 per ordinary share "
+    "payable on April 15, 2026."
+)
+_LOAN_LINE = (
+    "On March 3, 2026 the Company entered into a credit agreement with Example "
+    "Bank plc for a term loan of $250,000,000."
+)
+_NOTES_LINE = (
+    "The notes due 2031 bear interest at 5.25% per annum and were issued at par."
+)
+# Windows 0-3 are dividend prose the stand-in rejects; the debt lands last, so
+# the admitted window has context above it that its crop cut off.
+LONG_BODY_ONE_ADMITTED = (
+    "OPERATING REVIEW\n"
+    + "\n".join(f"{_FILLER_LINE} Paragraph {index}." for index in range(60))
+    + "\n"
+    + _LOAN_LINE
+)
+# Same, with enough debt prose to fill two adjacent windows, which merge.
+LONG_BODY_TWO_ADMITTED = (
+    "OPERATING REVIEW\n"
+    + "\n".join(f"{_FILLER_LINE} Paragraph {index}." for index in range(60))
+    + "\n"
+    + "\n".join(f"{_LOAN_LINE} Tranche {index}." for index in range(6))
+    + "\n"
+    + "\n".join(f"{_NOTES_LINE} Series {index}." for index in range(6))
+)
+
+
 def _submission(*documents: tuple[str, str]) -> str:
     """Build a complete submission text file from (type, body) pairs."""
     return "".join(
@@ -58,15 +90,45 @@ def _submission(*documents: tuple[str, str]) -> str:
     )
 
 
+#: Margins the stage-1 stand-in answers with. Signed and well clear of the
+#: threshold in both directions; see FakeStage1.
+ADMITTED_MARGIN = 5.0
+REJECTED_MARGIN = -5.0
+
+
 class FakeStage1:
-    """A stage-1 stand-in scoring by whether a window mentions debt."""
+    """A stage-1 stand-in admitting windows that mention debt, rejecting others.
+
+    Margins, not probabilities, and signed: `stage1_admit` scores through
+    `classifier.core.score_model`, which puts a logistic transform over
+    whatever `decision_function` returns. A stand-in answering 0.9 and 0.1
+    therefore produces 0.71 and 0.52 — both above any threshold the real
+    artifact carries (0.332), so *every* window would be admitted and no test
+    could observe a stage-1 rejection. ±5 maps to 0.993 and 0.0067, which
+    straddle it the way the fitted model's margins do.
+    """
 
     def decision_function(self: Self, texts: list[str]) -> list[float]:
-        """Score debt-mentioning windows above the threshold."""
+        """Return a positive margin for debt text and a negative one for rest."""
         return [
-            0.9 if "credit agreement" in text or "notes due" in text else 0.1
+            ADMITTED_MARGIN
+            if "credit agreement" in text or "notes due" in text
+            else REJECTED_MARGIN
             for text in texts
         ]
+
+
+class RecordingStage1(FakeStage1):
+    """FakeStage1, remembering every text it was asked to score."""
+
+    def __init__(self: Self) -> None:
+        """Start with nothing scored."""
+        self.scored: list[str] = []
+
+    def decision_function(self: Self, texts: list[str]) -> list[float]:
+        """Record the texts, then score them as FakeStage1 does."""
+        self.scored.extend(texts)
+        return super().decision_function(texts)
 
 
 class FakeChatClient:
@@ -257,7 +319,9 @@ def test_triage_rows_satisfy_the_extractor_s_input_contract(tmp_path: Path) -> N
     assert row["relevance"]
     # classification_score is the logistic-transformed margin, the same
     # transformation the 8-K classifier's score goes through.
-    assert row["classification_score"] == pytest.approx(1 / (1 + math.exp(-0.9)))
+    assert row["classification_score"] == pytest.approx(
+        1 / (1 + math.exp(-ADMITTED_MARGIN))
+    )
     # 6-K item ids cannot collide with 8-K ones, which lets both genres merge
     # mentions into one partition.
     assert row["item_id"] != "000000000026000001-8-01"
@@ -295,6 +359,60 @@ def test_triage_judges_a_whole_filing_in_one_call(tmp_path: Path) -> None:
         True,
         True,
     ]
+
+
+def test_a_window_stage_one_rejects_is_neither_sent_nor_persisted(
+    tmp_path: Path,
+) -> None:
+    """Stage 1 admits 5.8% of windows; the rest leave no row behind.
+
+    Distinct from the vocabulary gate, which rejects a whole *document* for
+    mentioning no debt. Here the document passes the gate — it discusses a
+    credit agreement — and stage 1 still rejects the windows of it that do not,
+    which is the 17x the dataset would grow by if they were persisted to record
+    that nothing happened.
+    """
+    submission = _submission(("6-K", f"<p>{LONG_BODY_ONE_ADMITTED}</p>"))
+    documents = pd.DataFrame(
+        [_document_row(tmp_path, submission=submission)], columns=DOCUMENT_COLUMNS
+    )
+    windows = prepare_filing(prose_documents(submission)[0].text)
+    admitted = [window for window in windows if "credit agreement" in window.text]
+    rejected = [window for window in windows if "credit agreement" not in window.text]
+    assert admitted and rejected
+    client = FakeChatClient(keep_all=True)
+
+    snippets = triage_documents(
+        documents, artifacts=(FakeStage1(), 0.332), client=client
+    )
+
+    # One row for the one admission, and none for the rejections.
+    assert snippets["sixk_member_windows"].to_list() == [str(admitted[0].index)]
+    assert snippets["item"].to_list() == [
+        snippet_id_for("000000000026000001", 0, admitted[0].index)
+    ]
+    # Stage 2 was asked about the admission only: a rejected window's text is
+    # absent from the prompt, so it cost neither a row nor a token.
+    prompt = "".join(message["content"] for message in client.calls[0])
+    assert len(re.findall(r"^--- snippet \d+ \[", prompt, re.MULTILINE)) == 1
+    assert rejected[0].text not in prompt
+
+
+def test_stage_one_scores_every_gated_window_and_admits_some(
+    tmp_path: Path,
+) -> None:
+    """The stand-in must be able to reject, or nothing above proves anything.
+
+    Pinned because the failure is silent and was real: `score_model` puts a
+    logistic transform over the margin, so a stand-in answering 0.1 for
+    "reject" produces 0.52 and every window is admitted. Every assertion about
+    admission in this file would then hold vacuously.
+    """
+    texts = ["a credit agreement dated March 3", "a quarterly dividend of $0.10"]
+    scores = score_model(FakeStage1(), texts)
+
+    assert scores[0] > 0.332
+    assert scores[1] < 0.332
 
 
 def test_triage_makes_no_call_for_a_filing_the_gate_rejects(tmp_path: Path) -> None:
@@ -407,6 +525,142 @@ def test_triage_records_the_window_span_and_document_type(tmp_path: Path) -> Non
     # Line columns mean lines of an 8-K body; a window is a character span.
     assert pd.isna(row["start_line"])
     assert pd.isna(row["end_line"])
+
+
+def test_an_admitted_window_is_sent_with_the_context_its_crop_cut_off(
+    tmp_path: Path,
+) -> None:
+    """The row's text is the expanded window, and stage 2 reads it (#172).
+
+    A 400-token crop can keep an instrument's amounts and dates while cutting
+    away the noun naming it, which leaves extraction nothing to anchor on.
+    """
+    submission = _submission(("6-K", f"<p>{LONG_BODY_ONE_ADMITTED}</p>"))
+    documents = pd.DataFrame(
+        [_document_row(tmp_path, submission=submission)], columns=DOCUMENT_COLUMNS
+    )
+    crop = next(
+        window
+        for window in prepare_filing(prose_documents(submission)[0].text)
+        if "credit agreement" in window.text
+    )
+    client = FakeChatClient(keep_all=True)
+
+    snippets = triage_documents(
+        documents, artifacts=(FakeStage1(), 0.332), client=client
+    )
+
+    row = snippets.iloc[0]
+    assert row["sixk_window_start"] < crop.start
+    assert row["sixk_window_end"] == crop.end
+    assert row["text"].endswith(crop.text)
+    assert len(row["text"]) > len(crop.text)
+    # Span, text and the count the row reports all describe the same window.
+    assert row["section_char_count"] == len(row["text"])
+    assert row["sixk_token_count"] > crop.token_count
+    # What stage 2 actually received, not merely what was persisted.
+    prompt = "".join(message["content"] for message in client.calls[0])
+    assert row["text"] in prompt
+
+
+def test_stage_one_scores_the_crop_and_never_the_expansion(tmp_path: Path) -> None:
+    """Expansion runs after stage 1, because its threshold assumes the crop.
+
+    `WINDOW_TOKENS` is what the shipped model was fitted on and what the
+    threshold in its metadata was calibrated against, so widening the text
+    stage 1 scores would invalidate both at once — silently, since a threshold
+    cannot report that its input changed shape.
+    """
+    submission = _submission(("6-K", f"<p>{LONG_BODY_ONE_ADMITTED}</p>"))
+    documents = pd.DataFrame(
+        [_document_row(tmp_path, submission=submission)], columns=DOCUMENT_COLUMNS
+    )
+    windows = prepare_filing(prose_documents(submission)[0].text)
+    stage1 = RecordingStage1()
+
+    triage_documents(
+        documents, artifacts=(stage1, 0.332), client=FakeChatClient(keep_all=True)
+    )
+
+    assert stage1.scored == [window.text for window in windows]
+
+
+def test_adjacent_admitted_windows_become_one_row(tmp_path: Path) -> None:
+    """Merged windows are one snippet and one row, naming their members.
+
+    Two admitted windows whose expansions run into each other share text. Sent
+    separately they would send it twice and, persisted separately, be extracted
+    twice — so they merge, and the row records which admitted windows it
+    answers for.
+    """
+    submission = _submission(("6-K", f"<p>{LONG_BODY_TWO_ADMITTED}</p>"))
+    documents = pd.DataFrame(
+        [_document_row(tmp_path, submission=submission)], columns=DOCUMENT_COLUMNS
+    )
+    admitted = [
+        window
+        for window in prepare_filing(prose_documents(submission)[0].text)
+        if "credit agreement" in window.text or "notes due" in window.text
+    ]
+    assert len(admitted) > 1
+    client = FakeChatClient(keep_all=True)
+
+    snippets = triage_documents(
+        documents, artifacts=(FakeStage1(), 0.332), client=client
+    )
+
+    assert len(snippets) == 1
+    row = snippets.iloc[0]
+    assert row["sixk_member_windows"] == ",".join(
+        str(window.index) for window in admitted
+    )
+    # The merged text carries both members, and was sent once.
+    assert "Tranche 0." in row["text"]
+    assert "Series 5." in row["text"]
+    prompt = "".join(message["content"] for message in client.calls[0])
+    # Line-anchored, because the system prompt quotes the fence format inline.
+    assert len(re.findall(r"^--- snippet \d+ \[", prompt, re.MULTILINE)) == 1
+    # Identity comes from the earliest member, so no two groups can claim it.
+    assert row["item"] == snippet_id_for("000000000026000001", 0, admitted[0].index)
+    assert row["item_id"] == item_id_for("000000000026000001", 0, admitted[0].index)
+
+
+def test_an_unmerged_snippet_still_names_its_one_window(tmp_path: Path) -> None:
+    """The member column is populated for every row, not only merged ones."""
+    submission = _submission(("6-K", f"<p>{DEBT_PROSE}</p>"))
+    documents = pd.DataFrame(
+        [_document_row(tmp_path, submission=submission)], columns=DOCUMENT_COLUMNS
+    )
+
+    snippets = triage_documents(
+        documents, artifacts=(FakeStage1(), 0.332), client=FakeChatClient(keep_all=True)
+    )
+
+    assert snippets.iloc[0]["sixk_member_windows"] == "0"
+
+
+def test_windows_of_two_documents_are_never_merged_together(tmp_path: Path) -> None:
+    """Offsets only mean anything inside the document they index into.
+
+    Merging across documents would splice unrelated text into one snippet, and
+    the two documents' windows are numbered from zero independently, so the
+    members of a merged window would not even identify themselves.
+    """
+    submission = _submission(
+        ("6-K", f"<p>{DEBT_PROSE}</p>"),
+        ("EX-99.1", f"<p>{DEBT_PROSE}</p>"),
+    )
+    documents = pd.DataFrame(
+        [_document_row(tmp_path, submission=submission)], columns=DOCUMENT_COLUMNS
+    )
+
+    snippets = triage_documents(
+        documents, artifacts=(FakeStage1(), 0.332), client=FakeChatClient(keep_all=True)
+    )
+
+    assert len(snippets) == 2
+    assert snippets["sixk_member_windows"].to_list() == ["0", "0"]
+    assert snippets["section_heading"].to_list() == ["6-K", "EX-99.1"]
 
 
 def _write_documents(tmp_path: Path, rows: list[dict[str, object]]) -> None:

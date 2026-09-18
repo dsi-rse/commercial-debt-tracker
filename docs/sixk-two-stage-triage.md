@@ -20,7 +20,10 @@ this is the runtime implementation.
    cut extraction tokens to 0.34x while still matching 146 of 154 known mentions.
 4. **Stage 1: TF-IDF linear SVM, threshold 0.332.** Tuned for recall, not
    precision.
-5. **Stage 2: LLM over a whole filing's admitted windows at once.**
+5. **Expand each admitted window backwards.** 200 tokens of context at least,
+   400 at most, stopping early at a section header. A 400-token crop can keep
+   an instrument's amounts and dates while cutting away the noun that names it.
+6. **Stage 2: LLM over a whole filing's expanded windows at once.**
 
 Steps 1-3 are composed by `cdt.sixk.prepare_filing`, so the order is code
 rather than prose. It matters in both directions: the gate applies to the whole
@@ -47,6 +50,74 @@ false-positive families — aggregates, blank templates, mechanics — moved
 precision by +1.2pp with a 90% interval of [-2.7, +3.3], i.e. not at all. The
 distinctions are semantic and a bag of n-grams cannot represent them, which is
 what stage 2 is for.
+
+## Why expansion comes after stage 1, not before
+
+A window cut at a fixed 400-token boundary can hold every number belonging to an
+instrument and none of the words naming it. Measured on the generalization
+window, a fifth of admitted 6-K snippets carried money, a rate or a date with no
+instrument noun anywhere in the text. The extractor then has nothing to anchor
+on and answers erratically — not because the model is wrong, but because the
+input no longer determines an answer. It also made the 6-K stratum unreviewable:
+an empty result could not be told from a miss. 6-K was the least reproducible
+stratum on a same-arm rerun, 4 of 10 sampled units changing object count against
+15% overall.
+
+The fix has to run *after* admission. `WINDOW_TOKENS` is what the shipped stage-1
+model was fitted on and what its threshold in `metadata.json` was calibrated
+against, so widening the text stage 1 scores invalidates both. Widening the text
+only stage 2 and extraction see costs nothing upstream, and is paid on the 5.8%
+of windows stage 1 admits rather than on all of them.
+
+`expand_admitted_windows` walks backwards from an admitted window and stops at
+the first of: a section header, a blank line once 200 tokens are taken, or the
+line boundary where the 200 tokens were met. Nothing crosses 400 tokens.
+
+Two details are load-bearing, and both were found by replaying the
+generalization window's 392 admitted windows:
+
+- **A capitalised short line is usually a table cell, not a header.** Extracted
+  6-K exhibits put one cell per line, so `Currency`, `Book Value` and `I` all
+  read like headings, as do the page-break artefacts inside a table — `GRUPO
+  SUPERVIELLE S.A.`, `NOTES TO THE CONSOLIDATED FINANCIAL STATEMENTS`. Treating
+  any of them as a header stops the walk inside the table it was meant to climb
+  out of; on the Grupo Supervielle table the walk halted 32 tokens up, at a
+  class letter. So a casing-based header must also stand alone in its own
+  paragraph. Only an explicitly numbered heading (`Item 5.02`, `Note 12`) is
+  taken on wording alone.
+- **Adjacent admitted windows merge.** An expansion reaching into the window
+  before it would otherwise send the same text twice. Merging also cuts the
+  snippet count, 392 admitted windows becoming 219. A run of them stops merging
+  at roughly 2,000 tokens, the largest snippet the 8-K path already sends the
+  same extractor; the generalization window has a run of 21 that would otherwise
+  reach 8,191.
+
+### What it fixes, and what it costs
+
+Replaying the 27 filings of the generalization window's 6-K set:
+
+| | before | after |
+|---|---|---|
+| kept snippets carrying numbers with no instrument noun | 7 | 0 |
+| snippets sent to stage 2 | 392 | 219 |
+| stage-2 input tokens | 147,654 | 193,304 (1.31x) |
+| median context added per snippet | — | 206 tokens |
+
+The 200-token minimum is where the last of those snippets recovers a noun; 100
+recovers 4 of 7, and 150 recovers 6. Grupo Supervielle
+(`000151739926000013-6K-0-147`), the case reviewers could not read at all, now
+opens with `Global Program for the issuance of simple Negotiable Debt
+securities` and the `Date of ISSUE / Currency / Class No. / Amount` header row.
+
+Two figures in this document were measured on unexpanded windows and are
+**not** re-measured here, because no model was refitted but both stages' inputs
+changed:
+
+- **Stage 2's precision (35.4% → 70.9%).** It now judges expanded windows, and
+  the labelled 500-window set describes the unexpanded ones.
+- **Extraction cost per 6-K filing.** Stage 2 decides what reaches extraction,
+  and its verdicts on expanded text are what would have to be re-run. The
+  stage-2 input figure above, 1.31x, is the part measurable without an LLM run.
 
 ## Why stage 2 sees a whole filing
 
@@ -117,6 +188,7 @@ Following the two patterns already in the repo rather than inventing a third:
 | stage-1 **threshold** | the artifact's `metadata.json` | 0.332 | retrain and recalibrate |
 | stage-2 **model id** | `settings.SIXK_TRIAGE_MODEL` | `openai/gpt-5.6-luna` | `SIXK_TRIAGE_MODEL` env |
 | stage-2 **reasoning effort** | `settings.SIXK_TRIAGE_REASONING` | `none` | `SIXK_TRIAGE_REASONING` env |
+| **expansion** minimum / cap / merge budget | `cdt.sixk.windows` constants | 200 / 400 / 2,000 tokens | pass `min_tokens`, `max_tokens`, `max_merged_tokens` |
 
 Paths follow the 8-K classifier, which derives from `DATA_DIR` via
 `classifier.core.default_model_dir` rather than taking a settings entry, so one
@@ -156,12 +228,43 @@ labelled windows (231 positive) with the 500 evaluation windows held out.
 - **Retraining means recalibrating.** The threshold in `metadata.json` belongs to
   the fitted pipeline beside it; a new fit needs a new threshold measured against
   a labelled sample, not the old number carried over.
+- **Expansion is not measured against labels.** Its acceptance check counts
+  snippets that carry numbers with no instrument noun, which is a property of
+  the text rather than a judgement of relevance. It says the input now
+  determines an answer; it does not say the answer improved. 6-K rerun
+  stability, the other half of the check in issue #172, needs a pipeline run.
+
+## Where expansion runs
+
+Inside `cdt.sixk.stage`, between `stage1_admit` and `triage_filing` — the only
+place it can run, since stage 1's threshold was calibrated on the crop and the
+extractor needs the expanded text. Admitted windows are grouped by document
+first: offsets mean nothing outside the text they index into, so expanding
+across two documents would splice unrelated prose together.
+
+One consequence for `sixk-snippets`: **a row is a snippet stage 2 judged, not a
+window stage 1 admitted.** Merging makes those differ, and the alternative —
+one row per member — would carry the merged text on each of them, so the
+extractor would read rows and pay for the same text twice, which is the cost
+merging exists to avoid. `sixk_member_windows` holds the comma-separated window
+indices a row answers for, so every admission remains auditable: with the row's
+accession and document index (both in `item`), it names each window stage 1
+admitted and the verdict that window's text received.
+
+Replaying the generalization window's 6-K set through the wired stage
+reproduces the acceptance numbers measured before it was wired: 27 filings,
+392 admitted windows, 219 snippets sent, 147,654 → 193,304 stage-2 input
+tokens (1.31x), 88 of the 219 being merged groups.
 
 ## What is not in this change
 
-Orchestrator wiring. This adds the stage as a library with its own tests; making
-it a pipeline stage alongside ingest → itemize → classify → extract needs
-decisions about partitioning and dataset registration that are better taken
-separately. Cross-row deduplication after extraction is also still open — that is
-where duplicate *mentions* should be resolved, by comparing extracted values
-rather than inferring from prose.
+Cross-row deduplication after extraction — that is where duplicate *mentions*
+should be resolved, by comparing extracted values rather than inferring from
+prose. Publishing 6-K snippets into `items/latest.parquet` is also still open:
+it needs a dashboard-side change first, so 6-K reaches consumers through the
+instrument and mention tables rather than the snippet-level one.
+
+The scheduled pipeline does now run this stage: `pipeline.py` prepares both
+genres by default and the orchestrator takes `--genres` / `GENRES` to narrow a
+run. Worth knowing before enabling it on a wide CIK list: unlike the 8-K
+prepare chain, this stage costs an LLM call per filing with admitted windows.
