@@ -24,6 +24,7 @@ from cdt.datasets import (
     load_completed_partitions,
     load_row_failures,
     normalize_cik,
+    run_manifest_path,
     shard_for_accession,
     shard_for_cik,
 )
@@ -74,6 +75,7 @@ from cdt.matcher.core import (
     DEBT_INSTRUMENT_COLUMNS,
     MATCHER_SCHEMA_VERSION,
     MENTION_CLUSTER_EDGE_COLUMNS,
+    _stale_schema_forces_rematch,
     apply_lineage_inference_pass,
     coerce_optional_text,
     company_names_by_cik,
@@ -90,6 +92,7 @@ from cdt.storage import (
     read_dataset,
     read_json_artifact,
     read_table,
+    write_json_artifact,
     write_partition_table,
     write_table,
 )
@@ -7608,3 +7611,87 @@ def test_abbreviated_magnitudes_parse_to_full_amounts() -> None:
     assert normalized_amount_from_text("$472,934,000") == "472934000"
     # A magnitude abbreviation cannot match inside a longer word.
     assert normalized_amount_from_text("$5 millions") == "5000000"
+
+
+def test_a_root_matched_under_an_older_schema_forces_a_full_rematch(
+    tmp_path: Path,
+) -> None:
+    """An incremental match over an older root publishes wrong rows, so promote it.
+
+    `MATCHER_SCHEMA_VERSION` was written into the match manifest and read by
+    nothing. Mention ids are content hashes, so a schema change that alters the
+    hashed payload changes every id, and the surviving clusters are then keyed
+    on ids the mentions dataset no longer holds.
+
+    It also degraded #203 in a way that looked like success. Minting an amended
+    instrument's prior state adds mentions, so on a root at an older version
+    the pre-existing clusters keep the slots the mints would take on a clean
+    build, and a cluster can end up holding two members that name two different
+    amendment parents — which `derive_parent_links` then correctly refuses.
+    Measured on `data/lineage-verify` (recorded at 4, code at 7): backfill plus
+    one plain match gave 19 amendment pointers and 539 heads against a forced
+    match's 22 and 536, and further plain matches never recovered it.
+    """
+    rows = pd.DataFrame(
+        [
+            build_mention_row(
+                mention_id="m-1",
+                item_id="item-1",
+                accession_number="0001",
+                cik="320193",
+                date="2020-01-02",
+                name="Credit Agreement",
+                start_date="2020-01-01",
+                amount="$100 million",
+            ),
+            build_mention_row(
+                mention_id="m-2",
+                item_id="item-2",
+                accession_number="0002",
+                cik="320193",
+                date="2024-01-02",
+                name="Second Amended and Restated Credit Agreement",
+                start_date="2024-01-01",
+                amount="$250 million",
+            ),
+        ]
+    )
+    write_partition_table(
+        tmp_path / "mentions",
+        partition={"date": "2024-01-02", "shard": "0001"},
+        table=rows,
+    )
+    match_pending_mentions(artifact_root=tmp_path, batch_size=5)
+    apply_lineage_inference_pass(str(tmp_path))
+
+    manifest_path = run_manifest_path("match", "latest", artifact_root=str(tmp_path))
+    assert read_json_artifact(manifest_path)["schema_version"] == (
+        MATCHER_SCHEMA_VERSION
+    )
+    # A root at the current version is left alone: forcing every run would turn
+    # an incremental match into a full-corpus rewrite on every tick.
+    assert _stale_schema_forces_rematch(str(tmp_path)) is False
+    # A fresh root has no manifest and must not be forced either.
+    assert _stale_schema_forces_rematch(str(tmp_path / "unwritten")) is False
+
+    stale = read_json_artifact(manifest_path)
+    stale["schema_version"] = MATCHER_SCHEMA_VERSION - 1
+    write_json_artifact(manifest_path, stale)
+    assert _stale_schema_forces_rematch(str(tmp_path)) is True
+
+    # The plain call now behaves as `--force` does: the guessed pointer and its
+    # provenance are dropped together rather than surviving into a corpus whose
+    # identity has moved underneath them.
+    match_pending_mentions(artifact_root=tmp_path, batch_size=5)
+    published = {
+        str(row["debt_instrument_id"]): row
+        for row in read_dataset(debt_instruments_root(tmp_path)).to_dict("records")
+    }
+    assert published["m-2"]["amendment_of_debt_instrument_id"] is None
+    assert pd.isna(published["m-2"]["amendment_inferred_by"])
+    # and the manifest now records the current version, so the next plain run
+    # is an ordinary incremental match again
+    assert read_json_artifact(manifest_path)["schema_version"] == (
+        MATCHER_SCHEMA_VERSION
+    )
+    assert _stale_schema_forces_rematch(str(tmp_path)) is False

@@ -552,8 +552,23 @@ The match manifest and the `final-snapshots/latest.json` pointer carry
 `debt-instruments` or `mention-cluster-edges` column is added or removed — 5 → 6
 for the four `status_*` columns #196 removed, 6 → 7 for `synthesized_only` and
 `outstanding_balance_as_of_is_filing_date` (#203) — so a reader of an older root
-knows its columns differ from the current contract. Nothing in this repository
-compares it; it is written for the publisher.
+knows its columns differ from the current contract.
+
+`match_pending_mentions` reads the recorded value back and **promotes a plain
+run to a full rematch when it is lower than the running version**. It has to:
+mention ids are content hashes, so a schema change that alters the hashed
+payload changes every id, and the clusters carried over from the older root are
+then keyed on ids the mentions dataset no longer contains. It also silently
+degraded #203 — minting an amended instrument's prior state adds mentions, so
+the carried-over clusters hold slots the mints would take on a clean build, and
+a cluster can end up with two members naming two different amendment parents,
+which `derive_parent_links` correctly refuses. Measured on a 542-instrument
+root recorded at version 4: `cdt backfill-mentions` plus one plain `cdt match`
+published 19 amendment pointers and 539 lineage heads against a forced match's
+22 and 536, and further plain matches never recovered it. Promoting rather than
+refusing keeps the scheduled run self-healing; a rematch is deterministic local
+compute, and the manifest it writes records the current version, so the next run
+is an ordinary incremental match again (#208).
 
 ### Extractor manifests and audit logs
 

@@ -34,8 +34,10 @@ from cdt.extractor.core import (
 )
 from cdt.matcher.lineage_inference import infer_amendment_parents
 from cdt.storage import (
+    artifact_exists,
     coerce_dataset_text,
     read_dataset,
+    read_json_artifact,
     write_json_artifact,
     write_partition_table,
 )
@@ -274,6 +276,57 @@ class CandidateScore:
         return f"amount_start+{self.support_family}"
 
 
+def _stale_schema_forces_rematch(
+    resolved_root: str,
+    *,
+    data_dir: Path | None = None,
+) -> bool:
+    """Return True when the root was matched under an older matcher schema.
+
+    ``MATCHER_SCHEMA_VERSION`` was written into the match manifest and read by
+    nothing, which made an incremental match over an older root publish rows
+    that are wrong rather than merely stale. Mention ids are content hashes, so
+    a schema change that alters the hashed payload changes every id: the
+    surviving clusters are then keyed on ids the mentions dataset no longer
+    contains, and the rollup recomputes lifecycle columns from a member list
+    that filtered to empty.
+
+    It also silently degraded #203. Minting an amended instrument's prior state
+    adds mentions, so on a root at an older version the pre-existing clusters
+    hold the slots the mints would take on a clean build, and a cluster can end
+    up with two members naming two different amendment parents — which
+    ``derive_parent_links`` correctly refuses. Measured on ``lineage-verify``
+    (recorded at version 4, code at 7): backfill plus one plain match published
+    19 amendment pointers and 539 heads against a forced match's 22 and 536,
+    and further plain matches never recovered it. EQT's Second Amended and
+    Restated agreement was one of the rows that lost its pointer.
+
+    A rematch is deterministic local compute, so promoting the run is cheaper
+    than refusing it and safer than proceeding: refusing would wedge the
+    scheduled daily run behind an operator, and proceeding publishes the wrong
+    answer with a successful-looking log line (#208).
+    """
+    manifest_path = run_manifest_path(
+        "match",
+        "latest",
+        artifact_root=resolved_root,
+        data_dir=data_dir,
+    )
+    if not artifact_exists(manifest_path):
+        return False
+    recorded = read_json_artifact(manifest_path).get("schema_version")
+    if not isinstance(recorded, int) or recorded >= MATCHER_SCHEMA_VERSION:
+        return False
+    LOGGER.warning(
+        "Matcher schema is %s but %s was matched at %s; forcing a full rematch "
+        "so clusters are not keyed on mention ids that have since changed",
+        MATCHER_SCHEMA_VERSION,
+        resolved_root,
+        recorded,
+    )
+    return True
+
+
 def match_pending_mentions(
     *,
     artifact_root: str | Path | None = None,
@@ -294,6 +347,8 @@ def match_pending_mentions(
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    if not force:
+        force = _stale_schema_forces_rematch(resolved_root, data_dir=data_dir)
     mention_rows = read_dataset(
         dataset_root(
             MENTIONS_DATASET_NAME, artifact_root=resolved_root, data_dir=data_dir
