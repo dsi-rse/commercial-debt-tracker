@@ -7930,3 +7930,33 @@ def test_lineage_pass_does_not_infer_against_a_column_it_then_overwrites(
     assert pointers_first["m-2"] == "m-stranded"
     assert after_first["m-stranded"]["first_seen_filing_date"] is None
     assert after_first["m-stranded"]["mention_count"] == 0
+
+
+def test_an_unhashable_date_value_does_not_kill_the_whole_mint_pass() -> None:
+    """One malformed partition row must not abort an extract or a backfill (#211).
+
+    `{"kind": "amendment", "normalized_date": ["2020-01-01"]}` raised
+    `TypeError: cannot use 'list' as a set element` out of the amendment-date
+    set, taking down every remaining item in the run. No model output can reach
+    it — `standardized_date_payload` overwrites `normalized_date` with this
+    repo's own parser output, always `str | None` — so this is hardening for a
+    tampered or hand-edited partition, and it is the failure class the
+    `_borrowers` guard was written for.
+    """
+    from cdt.extractor.core import mint_prior_state_rows
+
+    counters: dict[str, int] = {}
+    rows = mint_prior_state_rows(
+        [
+            amended_row(
+                dates=[
+                    _fact(kind="agreement", normalized_date="2020-02-03", prior=True),
+                    _fact(kind="amendment", normalized_date=["2024-06-01"]),
+                ]
+            )
+        ],
+        counters,
+    )
+
+    assert counters == {"minted": 1}
+    assert len(rows) == 2

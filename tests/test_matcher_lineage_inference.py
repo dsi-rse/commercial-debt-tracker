@@ -72,7 +72,7 @@ def test_ordinal_chain_links_each_state_to_its_predecessor() -> None:
             first_seen_filing_date="2024-01-01",
         ),
     ]
-    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+    result = infer_amendment_parents(rows)
     assert result["i3"] == ("i2", "ordinal_chain")
     assert result["i2"][0] == "i1"
 
@@ -85,24 +85,22 @@ def test_the_matcher_never_reads_filing_text(monkeypatch: object) -> None:
     (#154). Two tranches of one new agreement named in one filing must therefore
     produce nothing, however suggestive the prose.
     """
-    mentions = [
-        mention("m1", item_id="item-1", name="term loan A facility"),
-        mention("m2", item_id="item-1", name="revolving facility"),
-    ]
     rows = [
         instrument("i1", "term loan A facility", first_seen_filing_date="2026-05-28"),
         instrument("i2", "revolving facility", first_seen_filing_date="2026-05-28"),
     ]
-    result = infer_amendment_parents(
-        rows,
-        member_groups={"i1": ["m1"], "i2": ["m2"]},
-        mention_index=index(mentions),
-    )
+    result = infer_amendment_parents(rows)
     assert result == {}
     assert not hasattr(lineage_inference, "DATED_REFERENCE")
     assert not hasattr(core, "read_item_texts")
+    # Instrument rows are the whole input. `member_groups` and `mention_index`
+    # were required and immediately `del`-ed once #203 moved `prior_fact` to the
+    # extractor, kept "so a future mention-reading rule keeps one call shape" —
+    # which is the pattern the next two assertions have forbidden here since the
+    # #177 review. A rule that needs mentions takes them when it exists (#211).
     signature = inspect.signature(infer_amendment_parents)
-    assert "item_texts" not in signature.parameters
+    for parameter in ("item_texts", "member_groups", "mention_index"):
+        assert parameter not in signature.parameters, parameter
     for name in ("match_tables", "match_pending_mentions"):
         parameters = inspect.signature(getattr(core, name)).parameters
         assert "item_texts" not in parameters, name
@@ -137,7 +135,7 @@ def test_a_replaced_state_of_one_rank_steps_aside_for_the_state_that_replaced_it
             first_seen_filing_date="2022-06-28",
         ),
     ]
-    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+    result = infer_amendment_parents(rows)
 
     assert result["third"] == ("second-amended", "ordinal_chain")
 
@@ -161,7 +159,7 @@ def test_a_same_rank_tie_is_refused_rather_than_decided_by_id_order() -> None:
             first_seen_filing_date="2023-01-01",
         ),
     ]
-    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+    result = infer_amendment_parents(rows)
     assert result == {}
 
 
@@ -181,7 +179,7 @@ def test_a_parent_dated_after_its_child_is_rejected() -> None:
             first_seen_filing_date="2026-05-28",
         ),
     ]
-    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+    result = infer_amendment_parents(rows)
     assert result == {}
 
 
@@ -196,7 +194,7 @@ def test_an_extracted_pointer_is_never_overwritten() -> None:
             amendment_of_debt_instrument_id="i9",
         ),
     ]
-    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+    result = infer_amendment_parents(rows)
     assert "i2" not in result
 
 
@@ -210,7 +208,7 @@ def test_a_predecessor_first_seen_later_is_rejected() -> None:
             first_seen_filing_date="2020-01-01",
         ),
     ]
-    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+    result = infer_amendment_parents(rows)
     assert result == {}
 
 
@@ -229,7 +227,7 @@ def test_a_link_that_would_close_a_cycle_is_dropped() -> None:
             first_seen_filing_date="2022-01-01",
         ),
     ]
-    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+    result = infer_amendment_parents(rows)
     assert "i2" not in result or result["i2"][0] != "i1"
 
 
@@ -244,7 +242,7 @@ def test_instruments_of_different_issuers_are_never_linked() -> None:
             first_seen_filing_date="2022-01-01",
         ),
     ]
-    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+    result = infer_amendment_parents(rows)
     assert result == {}
 
 
@@ -310,7 +308,7 @@ def test_a_different_borrower_refuses_the_ordinal_link() -> None:
             parties_json=borrower("EQM Midstream Partners, LP"),
         ),
     ]
-    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+    result = infer_amendment_parents(rows)
 
     assert result["eqt-third"] == ("eqt-second", "ordinal_chain")
     assert "eqm-third" not in result
@@ -338,7 +336,7 @@ def test_a_legal_form_suffix_is_not_a_different_borrower() -> None:
             parties_json=borrower("EQT Company"),
         ),
     ]
-    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+    result = infer_amendment_parents(rows)
 
     assert result["i2"] == ("i1", "ordinal_chain")
 
@@ -378,7 +376,7 @@ def test_a_placeholder_borrower_is_silence_not_a_different_company(
     `Issuer` refused the link on 17 rows of one corpus (#205).
     """
     rows = ordinal_pair(borrower("HSBC Holdings plc"), borrower(placeholder))
-    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+    result = infer_amendment_parents(rows)
 
     assert result["i2"] == ("i1", "ordinal_chain")
 
@@ -395,7 +393,7 @@ def test_a_subsidiary_named_after_its_parent_is_a_different_borrower(
 ) -> None:
     """A finance subsidiary is not its parent, however the name begins (#205)."""
     rows = ordinal_pair(borrower(parent), borrower(child))
-    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+    result = infer_amendment_parents(rows)
 
     assert "i2" not in result
 
@@ -409,7 +407,7 @@ def test_one_shared_borrower_among_several_is_agreement() -> None:
         ]
     )
     rows = ordinal_pair(both, borrower("Andeavor Logistics LP"))
-    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+    result = infer_amendment_parents(rows)
 
     assert result["i2"] == ("i1", "ordinal_chain")
 
@@ -427,7 +425,7 @@ def test_a_borrower_that_is_all_noise_does_not_switch_the_guard_off() -> None:
         ]
     )
     rows = ordinal_pair(borrower("EQT Corporation"), noise_and_eqm)
-    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+    result = infer_amendment_parents(rows)
 
     assert "i2" not in result
 
@@ -435,7 +433,7 @@ def test_a_borrower_that_is_all_noise_does_not_switch_the_guard_off() -> None:
 def test_a_parties_payload_that_is_not_a_list_reads_as_no_borrower() -> None:
     """Valid JSON that is not a list is silence, not an aborted pass."""
     rows = ordinal_pair(borrower("EQT Corporation"), "null")
-    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+    result = infer_amendment_parents(rows)
 
     assert result["i2"] == ("i1", "ordinal_chain")
 
@@ -455,6 +453,6 @@ def test_a_missing_borrower_does_not_refuse_the_link() -> None:
             first_seen_filing_date="2024-01-01",
         ),
     ]
-    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+    result = infer_amendment_parents(rows)
 
     assert result["i2"] == ("i1", "ordinal_chain")

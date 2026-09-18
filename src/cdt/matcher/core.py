@@ -2404,11 +2404,7 @@ def apply_lineage_inference_pass(
         row["amendment_inferred_by"] = None
         reopened += 1
 
-    inferred = infer_amendment_parents(
-        rows,
-        member_groups=member_groups,
-        mention_index=mention_index,
-    )
+    inferred = infer_amendment_parents(rows)
     by_id = {str(row["debt_instrument_id"]): row for row in rows}
     for child_id, (parent_id, rule) in inferred.items():
         by_id[child_id]["amendment_of_debt_instrument_id"] = parent_id

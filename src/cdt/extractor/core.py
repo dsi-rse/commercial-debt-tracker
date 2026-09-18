@@ -1836,7 +1836,17 @@ def mint_prior_state_rows(
         amendment_dates = {
             entry.get("normalized_date")
             for entry in dates
-            if entry.get("kind") == "amendment" and entry.get("normalized_date")
+            # `isinstance` and not just truthiness: a list or dict here raises
+            # `TypeError: cannot use 'list' as a set element` and kills the
+            # whole extract or backfill run rather than one item. No model
+            # output can reach it — `standardized_date_payload` overwrites
+            # `normalized_date` with this repo's own parser output, always
+            # `str | None` — so this is hardening against a tampered or
+            # hand-edited partition, and it is the same failure class the
+            # `_borrowers` guard was just written for (#211).
+            if entry.get("kind") == "amendment"
+            and isinstance(entry.get("normalized_date"), str)
+            and entry.get("normalized_date")
         }
         prior_agreement = next(
             (entry for entry in prior_dates if entry.get("kind") == "agreement"), None
@@ -2024,6 +2034,7 @@ def backfill_mentions(
     *,
     data_dir: Path | None = None,
     dry_run: bool = False,
+    renew: Callable[[], None] | None = None,
 ) -> dict[str, int]:
     """Re-derive the synthesized rows over every existing `mentions` partition.
 
@@ -2034,6 +2045,12 @@ def backfill_mentions(
     model-emitted rows). Returns the mint counters plus partition counts;
     `dry_run` counts without rewriting, which is the pre-registered yield for
     an eval.
+
+    ``renew`` extends the caller's writer lease per rewritten partition. This
+    rewrites the whole canonical mentions dataset, so on a corpus large enough
+    to outlast the lease TTL the next orchestrator tick would legitimately
+    steal the lease and start extract/match into the same objects (#89, #211).
+    A dry run writes nothing and needs no lease.
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     counts: dict[str, int] = {"partitions": 0, "partitions_rewritten": 0}
@@ -2064,6 +2081,8 @@ def backfill_mentions(
             published.extend(mint_prior_state_rows(item_rows, counts))
         if dry_run:
             continue
+        if renew is not None:
+            renew()
         partition = parse_date_shard_partition(path)
         write_partition_table(
             mentions_root(resolved_root, data_dir=data_dir),

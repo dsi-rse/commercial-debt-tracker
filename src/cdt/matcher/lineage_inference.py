@@ -207,20 +207,21 @@ def _canonical_date(row: dict[str, object]) -> str | None:
 
 def infer_amendment_parents(
     rows: list[dict[str, object]],
-    *,
-    member_groups: dict[str, list[str]],
-    mention_index: dict,
 ) -> dict[str, tuple[str, str]]:
-    """Return {child_id: (parent_id, rule)} for links the two rules support.
+    """Return {child_id: (parent_id, rule)} for links the ordinal rule supports.
 
     Only instruments whose `amendment_of_debt_instrument_id` is null are
     considered, and a child is left alone whenever the evidence does not single
     out one parent.
+
+    Instrument rows are the whole input. `member_groups` and `mention_index`
+    used to be required and immediately `del`-ed: they served `prior_fact`,
+    which #203 moved to the extractor. Keeping them "so a future mention-reading
+    rule keeps one call shape" reintroduced the pattern
+    `tests/test_matcher_lineage_inference.py` asserts against by
+    `inspect.signature` one function above — a convention this module earned
+    from the #177 review (#211). A rule that needs mentions can take them then.
     """
-    # The ordinal rule reads instrument rows only. The mention-level inputs
-    # served `prior_fact`, now the extractor's job (#203); the parameters stay
-    # so the pass and a future mention-reading rule keep one call shape.
-    del member_groups, mention_index
     by_id = {str(row["debt_instrument_id"]): row for row in rows}
     by_cik: dict[str, list[str]] = {}
     for row_id, row in by_id.items():
