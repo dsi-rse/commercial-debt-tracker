@@ -999,6 +999,28 @@ def instrument_ie_mention(response: str) -> dict[str, object]:
     return row_state.debt_instrument_mentions[0]
 
 
+def test_published_mention_rows_is_the_single_publish_seam() -> None:
+    """Every publish path reads through one helper, which hands out a copy.
+
+    The live loop, batch finalize, `extract_tables` and the audit record all
+    call `published_mention_rows`; a derivation attached there (#203) reaches
+    every backend at once. The helper returns a fresh list so a caller that
+    extends its result cannot mutate the state persisted to `state.jsonl`.
+    """
+    from cdt.extractor.core import ExtractionRowState, published_mention_rows
+
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"}, stage_name="instrument_ie"
+    )
+    row_state.debt_instrument_mentions = [{"debt_instrument_mention_id": "m-1"}]
+
+    published = published_mention_rows(row_state)
+    assert published == [{"debt_instrument_mention_id": "m-1"}]
+    published.append({"debt_instrument_mention_id": "m-2"})
+    assert row_state.debt_instrument_mentions == [{"debt_instrument_mention_id": "m-1"}]
+    assert row_state.to_audit_dict()["debt_instrument_mentions"] == published[:1]
+
+
 def test_instrument_ie_validate_accepts_party_kinds_and_roles() -> None:
     """Annotated lender and other-party clusters should validate."""
     response = json.dumps(

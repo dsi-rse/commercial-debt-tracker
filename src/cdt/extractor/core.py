@@ -681,7 +681,9 @@ class ExtractionRowState:
             "accession_number": self.item_row.get("accession_number"),
             "item": self.item_row.get("item"),
             "stage_responses": self.stage_responses,
-            "debt_instrument_mentions": self.debt_instrument_mentions,
+            # What the item publishes, not only what the model returned, so the
+            # audit log shows every row a reader will find in `mentions`.
+            "debt_instrument_mentions": published_mention_rows(self),
             "state": self.state,
             "salvage_notes": self.salvage_notes,
             "attempts": attempts,
@@ -1657,6 +1659,20 @@ def pending_extract_partitions(
     return pending, registry
 
 
+def published_mention_rows(row_state: ExtractionRowState) -> list[dict[str, object]]:
+    """Return the mention rows one row state publishes.
+
+    The one seam between what the model returned for an item and what the
+    pipeline writes for it. Every publish path — the live loop, the batch
+    job's finalize, the in-memory `extract_tables`, and the `full.jsonl` audit
+    record — goes through here, so a derivation the extractor performs over an
+    item's rows (#203) is applied once and identically on every backend, and
+    `state.jsonl` keeps carrying only what the model returned. Today it is the
+    identity; a fresh list, so a caller extending it never mutates the state.
+    """
+    return list(row_state.debt_instrument_mentions)
+
+
 def _merge_mentions_partition(
     resolved_root: str,
     *,
@@ -1852,7 +1868,7 @@ def extract_pending_items(
             terminal_ids.add(row_state.item_id)
             replaced_item_ids.add(row_state.item_id)
             if row_state.state in PUBLISHABLE_ROW_STATES:
-                mention_rows.extend(row_state.debt_instrument_mentions)
+                mention_rows.extend(published_mention_rows(row_state))
             if row_state.state == "SUCCESS":
                 succeeded_item_ids.add(row_state.item_id)
             else:
@@ -2015,7 +2031,7 @@ def finalize_extract_outputs(
         audit_records.append(json.dumps(row_state.to_audit_dict(), sort_keys=True))
         if row_state.state in PUBLISHABLE_ROW_STATES:
             mentions_by_partition.setdefault((partition_date, shard), []).extend(
-                row_state.debt_instrument_mentions
+                published_mention_rows(row_state)
             )
         if row_state.state == "SUCCESS":
             succeeded_item_ids.add(row_state.item_id)
@@ -2193,7 +2209,7 @@ def extract_tables(
         )
         audit_records.append(json.dumps(row_state.to_audit_dict(), sort_keys=True))
         if row_state.state in PUBLISHABLE_ROW_STATES:
-            rows.extend(row_state.debt_instrument_mentions)
+            rows.extend(published_mention_rows(row_state))
         else:
             LOGGER.warning(
                 "In-memory extractor failed for item %s: %s",
