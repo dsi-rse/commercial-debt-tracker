@@ -686,6 +686,34 @@ def apply_lifecycle_rollup(
         )
         row["lineage_family_id"] = family_by_id.get(row_id, row_id)
         row["is_lineage_head"] = not children
+
+    apply_observation_columns(
+        rows, member_groups=member_groups, mention_index=mention_index
+    )
+
+
+def apply_observation_columns(
+    rows: list[dict[str, object]],
+    *,
+    member_groups: dict[str, list[str]],
+    mention_index: dict[str, PreparedMention],
+) -> None:
+    """Recompute what the corpus has seen of each cluster, in place.
+
+    Split out of `apply_lifecycle_rollup` because the lineage rules *read*
+    `first_seen_filing_date` — `infer_amendment_parents` uses it as both the
+    predecessor-ordering guard and the chain sort key — while the rollup
+    rewrites it from the member edges. Running the rollup only afterwards meant
+    a pass could infer against a value it then overwrote, so pass N+1 saw a
+    different corpus than pass N: on a row whose members are gone, pass 1
+    yields one link and nulls the column, and pass 2 then adds a link pass 1
+    refused. That row shape arises on its own, because mention ids are content
+    hashes — re-extracting an item mints a new id, the old member edge is never
+    deleted, and the old instrument survives with `mention_count` 0. The pass
+    now recomputes these columns before inferring as well as after (#211).
+    """
+    for row in rows:
+        row_id = str(row["debt_instrument_id"])
         member_ids = [
             member_id
             for member_id in member_groups.get(row_id, [])
@@ -2360,6 +2388,13 @@ def apply_lineage_inference_pass(
     }
     rows = instruments.to_dict("records")
     heads_before = sum(1 for row in rows if row.get("is_lineage_head"))
+
+    # Before inferring, not only after: the rules read `first_seen_filing_date`
+    # and the rollup below rewrites it, so inferring against the on-disk value
+    # made this pass a function of how many times it had already run (#211).
+    apply_observation_columns(
+        rows, member_groups=member_groups, mention_index=mention_index
+    )
 
     reopened = 0
     for row in rows:

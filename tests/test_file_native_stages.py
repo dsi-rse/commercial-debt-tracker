@@ -69,6 +69,7 @@ from cdt.itemizer.core import ITEM_COLUMNS
 from cdt.matcher import (
     debt_instruments_root,
     match_pending_mentions,
+    mention_cluster_edges_root,
     mention_matches_root,
 )
 from cdt.matcher.core import (
@@ -7841,3 +7842,91 @@ def test_mint_does_not_write_the_pointer_onto_the_rows_it_was_handed() -> None:
     )
     assert successor["amendment_of"] is not None
     assert successor is not caller_rows[0]
+
+
+def test_lineage_pass_does_not_infer_against_a_column_it_then_overwrites(
+    tmp_path: Path,
+) -> None:
+    """Two passes over one unchanged corpus must agree (#211).
+
+    `infer_amendment_parents` reads `first_seen_filing_date` as both the
+    predecessor-ordering guard and the chain sort key, and the rollup rewrites
+    that column from the member edges *after* the inference. So when the
+    recomputed value differed from what was on disk, pass N+1 inferred against
+    a different corpus than pass N.
+
+    A row whose member edges point at mentions that no longer exist is the
+    reachable case, and it arises on its own: mention ids are content hashes,
+    so re-extracting an item mints a new id, the old member edge is never
+    deleted, and the old instrument survives with `mention_count` 0. Its stored
+    `first_seen_filing_date` is then a date no surviving mention supports.
+    """
+    root = _ordinal_chain_root(tmp_path)
+    apply_lineage_inference_pass(root)
+
+    # Strand a third instrument on a member edge whose mention is gone, while
+    # leaving a stored observation date the surviving members cannot support.
+    instruments = read_dataset(debt_instruments_root(root))
+    stranded = dict(instruments.iloc[0])
+    stranded.update(
+        {
+            "debt_instrument_id": "m-stranded",
+            "seed_debt_instrument_mention_id": "m-gone",
+            "name": "Amended and Restated Credit Agreement",
+            "amendment_of_debt_instrument_id": None,
+            "amendment_inferred_by": None,
+            "superseded_by_debt_instrument_id": None,
+            # Later than the successor's, so the predecessor-ordering guard
+            # refuses the link while this value is believed. The rollup nulls
+            # it, because no surviving mention supports it.
+            "first_seen_filing_date": "2099-01-01",
+            "last_seen_filing_date": "2099-01-01",
+            "mention_count": 1,
+        }
+    )
+    write_partition_table(
+        debt_instruments_root(root),
+        partition={"cik_shard": shard_for_cik("320193")},
+        table=pd.DataFrame(
+            [*instruments.to_dict("records"), stranded],
+            columns=DEBT_INSTRUMENT_COLUMNS,
+        ),
+    )
+    edges = read_dataset(mention_cluster_edges_root(root))
+    stranded_edge = dict(edges.iloc[0])
+    stranded_edge.update(
+        {
+            "debt_instrument_id": "m-stranded",
+            "debt_instrument_mention_id": "m-gone",
+            "edge_type": "member",
+        }
+    )
+    write_partition_table(
+        mention_cluster_edges_root(root),
+        partition={"cik_shard": shard_for_cik("320193")},
+        table=pd.DataFrame(
+            [*edges.to_dict("records"), stranded_edge],
+            columns=MENTION_CLUSTER_EDGE_COLUMNS,
+        ),
+    )
+
+    first = apply_lineage_inference_pass(root)
+    after_first = _published_instruments(root)
+    second = apply_lineage_inference_pass(root)
+    after_second = _published_instruments(root)
+
+    pointers_first = {
+        instrument_id: row["amendment_of_debt_instrument_id"]
+        for instrument_id, row in after_first.items()
+    }
+    pointers_second = {
+        instrument_id: row["amendment_of_debt_instrument_id"]
+        for instrument_id, row in after_second.items()
+    }
+    assert first["links"] == second["links"]
+    assert pointers_first == pointers_second
+    # Not vacuous: the rank-1 stranded row is the parent the chain lands on,
+    # and it is reachable only once its unsupported date has been recomputed.
+    assert pointers_first["m-2"] == "m-stranded"
+    assert after_first["m-stranded"]["first_seen_filing_date"] is None
+    assert after_first["m-stranded"]["mention_count"] == 0
