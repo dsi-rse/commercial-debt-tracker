@@ -4473,7 +4473,21 @@ def standardized_amounts_payloads(
         payloads.append(payload)
     if not select_principal_amount(payloads):
         synthesized = name_derived_principal_payload(name_text)
-        if synthesized is not None:
+        # When every stated commitment or principal is `prior`, the head's
+        # current figure is unstated — and the figure in the name is the prior
+        # one. Reading it back off the name would publish the pre-amendment
+        # figure as current, #165's stale head by a second route (#206). The
+        # honest answer is null; the minted prior state carries that figure.
+        prior_values = {
+            str(payload["normalized_amount"])
+            for payload in payloads
+            if payload.get("prior") is True
+            and payload.get("normalized_amount") is not None
+        }
+        if (
+            synthesized is not None
+            and str(synthesized.get("normalized_amount")) not in prior_values
+        ):
             payloads.append(synthesized)
     return payloads
 

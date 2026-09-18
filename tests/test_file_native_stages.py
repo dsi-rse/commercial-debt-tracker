@@ -2496,6 +2496,68 @@ def test_instrument_ie_postprocess_recovers_a_principal_from_the_name() -> None:
     assert payload["spans"] == []
 
 
+def test_an_only_prior_amount_publishes_no_current_principal() -> None:
+    """The figure in the name is the prior figure; it must not come back as current.
+
+    `Amendment No. 2 to the $100 million Credit Agreement ... from $100,000,000`
+    states only the before-figure. With every commitment `prior`, the head's
+    current capacity is unstated, and reading `$100 million` back off the name
+    published the pre-amendment figure as current — #165's stale head by a
+    second route (#206). The honest answer is null; the minted prior state is
+    where that figure belongs.
+    """
+    from cdt.extractor.core import mint_prior_state_rows
+
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1", "date": "2024-06-01"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = (
+        "<body>Amendment No. 2 to the "
+        '<debt_instrument id="tag-i-1">$100 million Credit Agreement</debt_instrument>, '
+        'dated as of <date id="tag-d-1">February 3, 2020</date>, reduced the '
+        'commitments from <amount id="tag-a-1">$100,000,000</amount>.</body>'
+    )
+    row_state.stage_responses["instrument_ie"] = json.dumps(
+        [
+            {
+                "name": ["tag-i-1"],
+                "amounts": [
+                    {
+                        "kind": "commitment",
+                        "evidence": ["tag-a-1"],
+                        "normalized_amount": "100000000",
+                        "currency": "USD",
+                        "prior": True,
+                    }
+                ],
+                "dates": [
+                    {
+                        "kind": "agreement",
+                        "evidence": ["tag-d-1"],
+                        "normalized_date": "2020-02-03",
+                    }
+                ],
+            }
+        ]
+    )
+
+    InstrumentIEStage().postprocess(row_state)
+
+    mention = row_state.debt_instrument_mentions[0]
+    assert mention["principal_amount"] is None
+    amounts = json.loads(str(mention["amounts_json"]))
+    assert [(a["normalized_amount"], a["prior"]) for a in amounts] == [
+        ("100000000", True)
+    ]
+
+    published = mint_prior_state_rows([dict(mention)])
+    assert len(published) == 2
+    assert published[1]["principal_amount"] == "100000000"
+    assert published[1]["start_date"] == "2020-02-03"
+    assert published[0]["amendment_of"] == published[1]["debt_instrument_mention_id"]
+
+
 def test_instrument_ie_validate_accepts_the_name_span_as_amount_evidence() -> None:
     """Citing the instrument's own name span for a name-embedded amount is valid (#129)."""
     row_state = ExtractionRowState(
