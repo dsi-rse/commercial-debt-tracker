@@ -66,6 +66,64 @@ BARE_AR = re.compile(r"\bamended\s+and\s+restated\b", re.IGNORECASE)
 NAME_NOISE = frozenset({"the", "a", "an", "that", "certain"})
 # A stem needs at least two states before an ordinal can order them into a chain.
 MIN_CHAIN_MEMBERS = 2
+# Legal-form suffixes carry no identity: "EQT" and "EQT Corporation" are one
+# borrower. Everything else in a name is part of who it is.
+BORROWER_SUFFIXES = frozenset(
+    {
+        "corporation",
+        "corp",
+        "incorporated",
+        "inc",
+        "company",
+        "co",
+        "llc",
+        "lp",
+        "llp",
+        "plc",
+        "ltd",
+        "limited",
+        "na",
+    }
+)
+
+
+def _borrower_key(name: object) -> tuple[str, ...]:
+    """Return one borrower's canonical name as comparable tokens."""
+    return tuple(
+        token
+        for token in re.sub(r"[^0-9a-z]+", " ", str(name or "").lower()).split()
+        if token not in BORROWER_SUFFIXES and token not in NAME_NOISE
+    )
+
+
+def _borrowers(row: dict[str, object]) -> set[tuple[str, ...]]:
+    """Return the borrower keys the extractor bound to this instrument."""
+    try:
+        parties = json.loads(str(row.get("parties_json") or "[]"))
+    except json.JSONDecodeError:
+        return set()
+    keys = {
+        _borrower_key(party.get("canonical_name"))
+        for party in parties
+        if isinstance(party, dict) and party.get("role") == "borrower"
+    }
+    return {key for key in keys if key}
+
+
+def _borrowers_disagree(child: dict[str, object], parent: dict[str, object]) -> bool:
+    """Return whether two rows name borrowers that cannot be the same party.
+
+    Silence is not disagreement. An instrument with no borrower recorded is
+    unconstrained, because refusing on a missing party would drop ordinary
+    links to the many mentions that never name one — so this only ever fires on
+    positive evidence of a different borrower.
+    """
+    child_keys, parent_keys = _borrowers(child), _borrowers(parent)
+    if not child_keys or not parent_keys:
+        return False
+    return not any(
+        a[: len(b)] == b or b[: len(a)] == a for a in child_keys for b in parent_keys
+    )
 
 
 def _name_rank_and_stem(name: object) -> tuple[int, str]:
@@ -142,6 +200,17 @@ def infer_amendment_parents(
             return
         child, parent = by_id[child_id], by_id[parent_id]
         if str(child.get("cik")) != str(parent.get("cik")):
+            return
+        # One amendment chain has one borrower. The CIK check above is the
+        # *filer's* CIK, which cannot separate two agreements named in one 8-K:
+        # EQT's own Third Amended and Restated Credit Agreement and EQM
+        # Midstream Partners' both appear in EQT's 2024-07-22 filing, share a
+        # name stem and an ordinal, and so were both offered as children of
+        # EQT's Second Amended and Restated Credit Agreement — welding an
+        # acquired subsidiary's terminated facility into the parent's chain and
+        # nulling the real predecessor's `superseded_by` under the two-child
+        # ambiguity rule. The extractor recorded both borrowers; this reads them.
+        if _borrowers_disagree(child, parent):
             return
         # The predecessor must not first appear after the state that replaces it.
         # Equality is allowed and must stay allowed: the predecessor objects the

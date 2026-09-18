@@ -201,7 +201,7 @@ The matcher uses deterministic surfaces, every one of them derived from extracto
 - normalized start dates, and normalized end dates (maturity or commitment termination)
 - lender signatures derived from the extracted `parties_json`
 - one-hop relation cues: `amendment_of`, `split_of`, `retired_by`
-- extracted status events, for the lifecycle rollup
+- extracted status events, which mark a cluster retired so a name-only tie breaks towards the live obligation (they decide no lifecycle status here; see `docs/schema.md`)
 - filing metadata: `cik` for sharding, filing date for recency and first/last-seen, `accession_number` for document counts, `item_id` to keep same-filing siblings apart
 
 This is a pragmatic middle ground: simpler than a graph database or long-lived entity service, but enough to build useful instrument histories from noisy filing text.

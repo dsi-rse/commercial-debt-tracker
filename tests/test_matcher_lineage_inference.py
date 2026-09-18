@@ -357,3 +357,86 @@ def test_match_tables_is_unchanged_without_the_flag() -> None:
     instruments = tables["debt_instrument"]
     assert instruments["amendment_of_debt_instrument_id"].isna().all()
     assert instruments["amendment_inferred_by"].isna().all()
+
+
+def borrower(name: str) -> str:
+    """Return a `parties_json` naming one borrower."""
+    return json.dumps([{"role": "borrower", "canonical_name": name, "spans": []}])
+
+
+def test_a_different_borrower_refuses_the_ordinal_link() -> None:
+    """Two issuers' agreements can share a filer CIK, a stem and an ordinal.
+
+    EQT's 2024-07-22 8-K names both its own `Third Amended and Restated Credit
+    Agreement` and EQM Midstream Partners' — the latter arriving through the
+    Equitrans merger and terminated the same week. Both carry EQT's filer CIK,
+    so the CIK check cannot separate them, and both were offered as children of
+    EQT's `Second Amended and Restated Credit Agreement`: an acquired
+    subsidiary's dead facility welded into the parent's chain, and the real
+    predecessor left with two children and so no published `superseded_by`.
+    """
+    rows = [
+        instrument(
+            "eqt-second",
+            "Second Amended and Restated Credit Agreement",
+            first_seen_filing_date="2017-11-14",
+            parties_json=borrower("EQT Corporation"),
+        ),
+        instrument(
+            "eqt-third",
+            "Third Amended and Restated Credit Agreement",
+            first_seen_filing_date="2022-06-28",
+            parties_json=borrower("EQT Corporation"),
+        ),
+        instrument(
+            "eqm-third",
+            "Third Amended and Restated Credit Agreement",
+            first_seen_filing_date="2024-07-22",
+            parties_json=borrower("EQM Midstream Partners, LP"),
+        ),
+    ]
+    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+
+    assert result["eqt-third"] == ("eqt-second", "ordinal_chain")
+    assert "eqm-third" not in result
+
+
+def test_a_legal_form_suffix_is_not_a_different_borrower() -> None:
+    """`EQT` and `EQT Corporation` are one party, so the chain still links."""
+    rows = [
+        instrument(
+            "i1",
+            "Second Amended and Restated Credit Agreement",
+            first_seen_filing_date="2022-01-01",
+            parties_json=borrower("EQT"),
+        ),
+        instrument(
+            "i2",
+            "Third Amended and Restated Credit Agreement",
+            first_seen_filing_date="2024-01-01",
+            parties_json=borrower("EQT Corporation"),
+        ),
+    ]
+    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+
+    assert result["i2"] == ("i1", "ordinal_chain")
+
+
+def test_a_missing_borrower_does_not_refuse_the_link() -> None:
+    """Silence is not disagreement: most mentions never name a borrower."""
+    rows = [
+        instrument(
+            "i1",
+            "Second Amended and Restated Credit Agreement",
+            first_seen_filing_date="2022-01-01",
+            parties_json=borrower("EQT Corporation"),
+        ),
+        instrument(
+            "i2",
+            "Third Amended and Restated Credit Agreement",
+            first_seen_filing_date="2024-01-01",
+        ),
+    ]
+    result = infer_amendment_parents(rows, member_groups={}, mention_index={})
+
+    assert result["i2"] == ("i1", "ordinal_chain")
