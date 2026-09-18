@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import json
 
+import pandas as pd
+
 from cdt.extractor.core import DEBT_INSTRUMENT_MENTION_COLUMNS
 from cdt.matcher.core import (
     NAME_CLASS_GATE,
     PreparedMention,
+    borrowed_lender_signature,
+    build_debt_instrument_rows,
     build_empty_profile,
     derive_parent_links,
     end_dates_are_compatible,
+    lender_signature,
     name_rate_tokens,
     name_rates_are_compatible,
     normalize_name_fingerprint,
@@ -74,6 +79,196 @@ def score(
         loose_match_threshold=0.75,
         name_class_size=name_class_size,
     )
+
+
+LENDERS = json.dumps(
+    [
+        {
+            "role": "lender",
+            "canonical_name": "Bank of America, N.A.",
+            "spans": [{"text": "Bank of America, N.A."}],
+        }
+    ]
+)
+BORROWER_ONLY = json.dumps(
+    [{"role": "borrower", "canonical_name": "Example Co", "spans": []}]
+)
+
+
+def predecessor_pair() -> tuple[PreparedMention, PreparedMention, PreparedMention]:
+    """Return (R, M, P): the original filing's mention, the amendment, its mint.
+
+    R: filing A, `Credit Agreement`, $300M dated 2020-02-03, lenders named.
+    M: filing B, `Amendment No. 2 to Credit Agreement`, $250M, same agreement date.
+    P: minted from M — the $300M prior state, same item as M, borrower only,
+    no name of its own here so the lender path can be exercised alone.
+    """
+    original = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="m-original",
+            item_id="item-a",
+            accession_number="0001",
+            date="2020-02-05",
+            name="Credit Agreement",
+            start_date="2020-02-03",
+            maturity_date=None,
+            principal_amount="300000000",
+            parties_json=LENDERS,
+        )
+    )
+    amendment = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="m-amendment",
+            item_id="item-b",
+            accession_number="0002",
+            date="2024-06-01",
+            name="Amendment No. 2 to Credit Agreement",
+            start_date="2020-02-03",
+            maturity_date=None,
+            principal_amount="250000000",
+            parties_json=LENDERS,
+        )
+    )
+    minted = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="m-prior",
+            item_id="item-b",
+            accession_number="0002",
+            date="2024-06-01",
+            name=None,
+            start_date="2020-02-03",
+            maturity_date=None,
+            principal_amount="300000000",
+            parties_json=BORROWER_ONLY,
+            lender_disclosure="none_named",
+            synthesized_by="prior_state",
+            synthesized_from_mention_id="m-amendment",
+        )
+    )
+    return original, amendment, minted
+
+
+def test_a_borrower_only_mint_reaches_membership_only_with_borrowed_lenders() -> None:
+    """Keys alone score 0.75 — a `related` edge, never a member (#203).
+
+    A synthesized prior state names no lender, so its own signature is empty
+    and lender support is zero. Borrowing its successor's signature, scoring
+    only, is what lets it join the original filing's cluster.
+    """
+    original, amendment, minted = predecessor_pair()
+    profiles = profile_from(original)
+
+    on_its_own = score(minted, profiles)
+    assert [candidate.match_score for candidate in on_its_own] == [0.75]
+
+    borrowed = borrowed_lender_signature(
+        minted, {"m-amendment": amendment, "m-prior": minted}
+    )
+    assert borrowed == lender_signature(LENDERS)
+    with_lenders = score_candidates_for_mention(
+        minted,
+        profiles,
+        strong_match_threshold=0.90,
+        loose_match_threshold=0.75,
+        lender_signature=borrowed,
+    )
+    assert [candidate.match_score for candidate in with_lenders] == [1.0]
+    assert with_lenders[0].support_family == "lenders"
+
+    # Nothing is borrowed for a model-emitted mention, or for a mint that
+    # names lenders itself, or when the successor is not in the index.
+    assert borrowed_lender_signature(original, {"m-amendment": amendment}) is None
+    assert borrowed_lender_signature(minted, {}) is None
+
+
+def test_a_mint_never_joins_its_own_successors_cluster() -> None:
+    """Same item, so two instruments by construction (#161): P scores nothing."""
+    _, amendment, minted = predecessor_pair()
+
+    assert score(minted, profile_from(amendment)) == []
+
+
+def test_a_synthesized_members_name_does_not_widen_the_cluster_profile() -> None:
+    """P scores in on its name but must not add that name to the profile."""
+    original, _, _ = predecessor_pair()
+    named_mint = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="m-prior",
+            item_id="item-b",
+            accession_number="0002",
+            date="2024-06-01",
+            name="Fifth Amended and Restated Credit Agreement",
+            start_date="2020-02-03",
+            maturity_date=None,
+            principal_amount="300000000",
+            parties_json=BORROWER_ONLY,
+            synthesized_by="prior_state",
+            synthesized_from_mention_id="m-amendment",
+        )
+    )
+    profiles = profile_from(original)
+    profile = profiles["m-original"]
+    profile.add_member(named_mint)
+
+    assert normalize_name_fingerprint("Credit Agreement") in (
+        profile.normalized_name_fingerprints
+    )
+    assert named_mint.normalized_name_fingerprint not in (
+        profile.normalized_name_fingerprints
+    )
+    assert "m-prior" in profile.member_ids
+
+
+def test_a_synthesized_member_never_supplies_canonical_fields() -> None:
+    """The newest member is the mint, but the instrument keeps its own name.
+
+    By recency the mint — stamped with the amendment's filing date — would win
+    every canonical field and rename the predecessor cluster after the
+    amendment that replaced it, which also ties `ordinal_chain`'s ranks. A
+    model-emitted member decides whenever there is one; the mint decides only
+    when it is all the cluster has, and the row then says so (#203).
+    """
+    original, _, _ = predecessor_pair()
+    named_mint = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="m-prior",
+            item_id="item-b",
+            accession_number="0002",
+            date="2024-06-01",
+            company_name="Example Co (as amended)",
+            name="Fifth Amended and Restated Credit Agreement",
+            start_date="2020-02-03",
+            maturity_date=None,
+            principal_amount="300000000",
+            parties_json=BORROWER_ONLY,
+            synthesized_by="prior_state",
+            synthesized_from_mention_id="m-amendment",
+        )
+    )
+    index = {"m-original": original, "m-prior": named_mint}
+
+    merged = build_debt_instrument_rows(
+        {"inst": ["m-original", "m-prior"]},
+        index,
+        {},
+        existing_instruments=pd.DataFrame(),
+        company_names={},
+    )[0]
+    assert merged["name"] == "Credit Agreement"
+    assert merged["name_source_mention_id"] == "m-original"
+    assert merged["company_name"] == "Example Co"
+    assert merged["principal_source_mention_id"] == "m-original"
+    assert merged["synthesized_only"] is False
+
+    alone = build_debt_instrument_rows(
+        {"inst": ["m-prior"]},
+        index,
+        {},
+        existing_instruments=pd.DataFrame(),
+        company_names={},
+    )[0]
+    assert alone["name"] == "Fifth Amended and Restated Credit Agreement"
+    assert alone["synthesized_only"] is True
 
 
 def test_conflicting_end_dates_block_membership() -> None:

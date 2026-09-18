@@ -203,6 +203,11 @@ class PreparedMention:
     normalized_end_date: str | None
     normalized_name_fingerprint: str | None
     lender_signature: str
+    # Set only on a row the extractor synthesized (#203): the rule that minted
+    # it and the model-emitted mention it was minted from. Read by the
+    # canonical-field, profile and scoring rules; never a match key itself.
+    synthesized_by: str | None = None
+    synthesized_from_mention_id: str | None = None
 
 
 @dataclass
@@ -236,7 +241,11 @@ class ClusterProfile:
             self.normalized_start_dates.add(mention.normalized_start_date)
         if mention.normalized_end_date:
             self.normalized_end_dates.add(mention.normalized_end_date)
-        if mention.normalized_name_fingerprint:
+        # A synthesized prior state carries its successor's name. It scores its
+        # own way in on that name, but must not widen the cluster's name class
+        # afterward: the next mention would then be judged against the
+        # amendment's name as well as the instrument's own (#203).
+        if mention.normalized_name_fingerprint and mention.synthesized_by is None:
             self.normalized_name_fingerprints.add(mention.normalized_name_fingerprint)
         if mention.lender_signature:
             self.lender_signatures.add(mention.lender_signature)
@@ -485,6 +494,7 @@ def match_tables(
             strong_match_threshold=strong_match_threshold,
             loose_match_threshold=loose_match_threshold,
             name_class_size=class_sizes.get(mention_id, 1),
+            lender_signature=borrowed_lender_signature(mention, mention_index),
         )
         chosen_cluster_id, chosen_edge_rows = resolve_candidates(
             mention,
@@ -814,9 +824,20 @@ def score_candidates_for_mention(
     strong_match_threshold: float,
     loose_match_threshold: float,
     name_class_size: int = 1,
+    lender_signature: str | None = None,
 ) -> list[CandidateScore]:
-    """Return scored candidate clusters for one mention."""
+    """Return scored candidate clusters for one mention.
+
+    ``lender_signature`` overrides the mention's own for scoring only. A
+    synthesized prior state publishes no lenders — a joinder adds and removes
+    them, so the filing never states who lent under the earlier terms — but
+    may borrow its successor's signature to vouch for a membership (#203).
+    Nothing borrowed reaches the cluster profile or a published row.
+    """
     del loose_match_threshold
+    scoring_lender_signature = (
+        lender_signature if lender_signature is not None else mention.lender_signature
+    )
     if mention.cik is None:
         return []
     has_match_keys = (
@@ -919,9 +940,9 @@ def score_candidates_for_mention(
             continue
         lender_similarity = max(
             (
-                lender_similarity_score(mention.lender_signature, candidate_signature)
+                lender_similarity_score(scoring_lender_signature, candidate_signature)
                 for candidate_signature in profile.lender_signatures
-                if mention.lender_signature and candidate_signature
+                if scoring_lender_signature and candidate_signature
             ),
             default=0.0,
         )
@@ -1285,6 +1306,18 @@ def build_debt_instrument_rows(
             key=lambda mention_id: mention_recency_key(mention_index[mention_id]),
             reverse=True,
         )
+        # A synthesized prior state carries its successor's filing date, so by
+        # recency it is the newest member and would supply every canonical
+        # field — renaming a predecessor cluster after the amendment that
+        # replaced it, which in turn hands `ordinal_chain` two rows of one rank
+        # and makes it refuse the link (#203). Model-emitted members decide the
+        # canonical values whenever there is one; a synthesized member does only
+        # when it is all the cluster has.
+        canonical_member_ids = [
+            mention_id
+            for mention_id in ordered_member_ids
+            if mention_index[mention_id].synthesized_by is None
+        ] or ordered_member_ids
         if present_member_ids:
             seed_mention = mention_index[
                 min(
@@ -1335,7 +1368,7 @@ def build_debt_instrument_rows(
                 # Fall back to the filer name any mention for this CIK carries, so
                 # one member mention without display metadata cannot blank the page.
                 "company_name": first_non_null(
-                    ordered_member_ids, mention_index, "company_name"
+                    canonical_member_ids, mention_index, "company_name"
                 )
                 or coerce_optional_text(existing_row.get("company_name"))
                 or (company_names or {}).get(cik),
@@ -1353,45 +1386,58 @@ def build_debt_instrument_rows(
                     debt_instrument_id, {}
                 ).get("split_of_debt_instrument_id"),
                 **canonical_scalar_fields(
-                    ordered_member_ids,
+                    canonical_member_ids,
                     mention_index,
                     existing_row,
                     field_name="name",
                     source_column="name_source_mention_id",
                 ),
                 **canonical_scalar_fields(
-                    ordered_member_ids,
+                    canonical_member_ids,
                     mention_index,
                     existing_row,
                     field_name="instrument_type",
                     source_column="instrument_type_source_mention_id",
                 ),
                 **canonical_scalar_fields(
-                    ordered_member_ids,
+                    canonical_member_ids,
                     mention_index,
                     existing_row,
                     field_name="start_date",
                     source_column="start_date_source_mention_id",
                 ),
                 **canonical_maturity_fields(
-                    ordered_member_ids, mention_index, existing_row
+                    canonical_member_ids, mention_index, existing_row
                 ),
                 **canonical_scalar_fields(
-                    ordered_member_ids,
+                    canonical_member_ids,
                     mention_index,
                     existing_row,
                     field_name="commitment_termination_date",
                     source_column="commitment_termination_source_mention_id",
                 ),
                 **principal_amount_fields(
-                    ordered_member_ids, mention_index, existing_row
+                    canonical_member_ids, mention_index, existing_row
                 ),
                 **outstanding_balance_fields(
-                    ordered_member_ids, mention_index, existing_row
+                    canonical_member_ids, mention_index, existing_row
                 ),
-                **interest_rate_fields(ordered_member_ids, mention_index, existing_row),
+                **interest_rate_fields(
+                    canonical_member_ids, mention_index, existing_row
+                ),
                 "parties_json": parties_json,
                 "lender_disclosure": lender_disclosure,
+                # Every member synthesized: a minted prior state no filing
+                # describes on its own. Carried forward when this run loaded no
+                # member for the row, like every other canonical field.
+                "synthesized_only": (
+                    all(
+                        mention_index[mention_id].synthesized_by is not None
+                        for mention_id in present_member_ids
+                    )
+                    if present_member_ids
+                    else coerce_optional_bool(existing_row.get("synthesized_only"))
+                ),
             }
         )
     return rows
@@ -1737,6 +1783,10 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
             coerce_optional_text(row.get("name"))
         ),
         lender_signature=lender_signature(row.get("parties_json")),
+        synthesized_by=coerce_optional_text(row.get("synthesized_by")),
+        synthesized_from_mention_id=coerce_optional_text(
+            row.get("synthesized_from_mention_id")
+        ),
     )
 
 
@@ -1922,6 +1972,26 @@ def normalize_party_text(value: str) -> str:
         text,
     )
     return re.sub(r"\s+", " ", text).strip()
+
+
+def borrowed_lender_signature(
+    mention: PreparedMention, mention_index: dict[str, PreparedMention]
+) -> str | None:
+    """Return the successor's lender signature for a synthesized prior state.
+
+    Only when the mention is synthesized, names no lender of its own, and its
+    successor is in this run's index; None otherwise, which leaves the scorer
+    on the mention's own signature. Scoring-only by construction: the caller
+    still adds the *original* mention to the profile it joins (#203).
+    """
+    if mention.synthesized_by is None or mention.lender_signature:
+        return None
+    if mention.synthesized_from_mention_id is None:
+        return None
+    successor = mention_index.get(mention.synthesized_from_mention_id)
+    if successor is None or not successor.lender_signature:
+        return None
+    return successor.lender_signature
 
 
 def lender_similarity_score(left: str, right: str) -> float:
