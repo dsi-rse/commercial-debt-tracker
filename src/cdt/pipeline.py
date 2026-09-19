@@ -369,11 +369,22 @@ class PipelineOrchestrator:
             "finalize",
             output_root=self.config.final_database_root,
         )
-        final_outputs = write_final_output_tables(
-            artifact_root=resolved_artifact_root,
-            final_database_root=self.config.final_database_root,
-            data_dir=self.config.data_dir,
-            force=self.config.force,
+        # Same gate, same value, as run_match_and_finalize: `cdt pipeline` and
+        # the live extractor backend pay the identical 25-minute publish, and
+        # they pay it on a run that matched nothing just as readily.
+        final_outputs = (
+            {}
+            if publish_would_republish_nothing(
+                matched["debt_instrument"],
+                final_database_root=self.config.final_database_root,
+                force=self.config.force,
+            )
+            else write_final_output_tables(
+                artifact_root=resolved_artifact_root,
+                final_database_root=self.config.final_database_root,
+                data_dir=self.config.data_dir,
+                force=self.config.force,
+            )
         )
         self._log_stage_complete(
             "finalize",
@@ -442,6 +453,12 @@ def run_match_and_finalize(
         if renew is not None:
             renew()
         apply_lineage_inference_pass(resolved_root, data_dir=data_dir, renew=renew)
+    if publish_would_republish_nothing(
+        tables["debt_instrument"],
+        final_database_root=final_database_root,
+        force=force,
+    ):
+        return {}
     if renew is not None:
         renew()
     return write_final_output_tables(
@@ -495,6 +512,58 @@ def resolve_mode_dates(
 # blocks the publish (unless forced): the likeliest causes are a bug or a
 # half-built artifact root, not a legitimate mass deletion of filings.
 FINAL_SNAPSHOT_GUARD_RATIO = 0.5
+
+
+def publish_would_republish_nothing(
+    matched_instruments: pd.DataFrame,
+    *,
+    final_database_root: ArtifactPath | None,
+    force: bool,
+) -> bool:
+    """Return whether a publish would re-read the whole corpus to change nothing.
+
+    The publish is the most expensive thing in the pipeline and it is bounded by
+    request count, not bytes: measured in production, publishing a delta of 14
+    documents took 25 minutes and 21,214 sequential GETs at ~70 ms each. It pays
+    that regardless of whether the run produced anything, and it pays it twice
+    per batch cycle, because both ``run_batch_backend`` and ``run_poll``
+    finalize.
+
+    The gate is the value one branch above already consults: when match produced
+    no instruments, the lineage pass is skipped precisely because "it would read
+    three empty datasets to write none", and then the publish went ahead and read
+    four full ones to write the same four tables it wrote last time. Nothing in
+    such a run changed the datasets the publish reads — match wrote nothing and
+    the lineage pass did not run — so the existing snapshot and pointer are
+    already the correct answer.
+
+    Two things stop this from being a way to never publish. ``force`` overrides
+    it, which covers a run that crashed between writing a dataset and publishing
+    it and so left the datasets ahead of the pointer. And a final database root
+    that is missing any of its four ``latest.parquet`` objects publishes
+    regardless: skipping there would mean a freshly pointed output root stayed
+    empty until someone happened to pass ``--force``. That check is four HEAD
+    requests against the four tables the publish would write anyway.
+    """
+    if force or not matched_instruments.empty:
+        return False
+    if final_database_root is not None and not all(
+        artifact_exists(
+            join_artifact_path(str(final_database_root), table_name, "latest.parquet")
+        )
+        for table_name in FINAL_OUTPUT_TABLES
+    ):
+        LOGGER.info(
+            "Publishing despite an empty match: %s has no complete published "
+            "generation yet.",
+            final_database_root,
+        )
+        return False
+    LOGGER.info(
+        "Skipping final publish: match produced no debt instruments, so the "
+        "published snapshot is already current. Use --force to publish anyway."
+    )
+    return True
 
 
 def final_snapshots_root(artifact_root: ArtifactPath) -> str:
