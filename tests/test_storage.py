@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Self
 
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from cdt import ingest, storage
@@ -29,6 +33,7 @@ class FakeSession:
 def _reset_s3_clients(monkeypatch: pytest.MonkeyPatch) -> None:
     """Give each test a clean client cache and a fake Session."""
     monkeypatch.setattr(storage, "_S3_CLIENTS", {})
+    monkeypatch.setattr(storage, "_BOTO3_SESSIONS", {})
     monkeypatch.setattr(storage, "_CONFIGURED_S3_PROFILE", "")
     monkeypatch.setattr(storage.boto3, "Session", FakeSession)
     FakeSession.created = []
@@ -136,3 +141,242 @@ def _parser_returning(*, exit_code: int = 0, **attrs: object):  # noqa: ANN202
             return namespace
 
     return lambda: _Parser()
+
+
+def _write(path: Path, rows: list[dict[str, object]]) -> None:
+    storage.write_table(str(path), pd.DataFrame(rows))
+
+
+def _write_raw(path: Path, table: pa.Table) -> None:
+    """Write a parquet file bypassing apply_declared_column_types.
+
+    That is exactly what every partition written before #187 is: the physical
+    type is whatever the frame inferred in that run, not the declared one.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, path)
+
+
+def test_read_dataset_unifies_schemas_instead_of_trusting_the_first_file(
+    tmp_path: Path,
+) -> None:
+    """A column absent from the first partition must not vanish from the read (#190).
+
+    ``pyarrow.dataset`` infers its schema from the *first* fragment alone, so
+    the obvious implementation silently drops every value of a column the first
+    file happens to predate — and this pipeline has that shape on purpose:
+    ``form_type`` and ``source`` were added to ``documents`` after the fact, and
+    ``read_table``'s reindex fallback exists for the same reason. Verified
+    against the real failure: with inferred schemas this dataset reads as
+    ``['k']``.
+    """
+    root = tmp_path / "items"
+    _write(root / "a.parquet", [{"k": "1"}])
+    _write(root / "b.parquet", [{"k": "2", "later": "kept"}])
+
+    table = storage.read_dataset(str(root)).sort_values("k").reset_index(drop=True)
+
+    assert sorted(table.columns) == ["k", "later"]
+    assert table["later"].to_list()[1] == "kept"
+
+
+def test_read_dataset_falls_back_when_partitions_cannot_be_unified(
+    tmp_path: Path,
+) -> None:
+    """A pre-#187 root still reads, through the per-file path (#190).
+
+    #187 is what makes an Arrow dataset scan possible at all: before it, a
+    column's physical type varied by partition. Partitions written *before* that
+    fix keep their old types and the production dev root has not been rebuilt
+    (#107), so the fallback is the live case. Reproduced here with the same
+    conflict the real root has — ``double`` in one partition and ``string`` in
+    another, which is what ``data/lineage-probe/debt-instruments`` carries for
+    ``amendment_inferred_by`` across 26 of its 41 columns.
+    """
+    root = tmp_path / "debt-instruments"
+    _write_raw(
+        root / "cik_shard=0001" / "part-0000.parquet",
+        pa.table({"debt_instrument_id": ["a"], "amendment_inferred_by": [1.0]}),
+    )
+    _write_raw(
+        root / "cik_shard=0002" / "part-0000.parquet",
+        pa.table(
+            {"debt_instrument_id": ["b"], "amendment_inferred_by": ["dated_reference"]}
+        ),
+    )
+
+    # The Arrow path must genuinely be unable to read this, or the test proves
+    # nothing about the fallback.
+    assert (
+        storage._read_dataset_with_arrow(
+            sorted(str(p) for p in root.rglob("*.parquet")), None
+        )
+        is None
+    )
+
+    table = (
+        storage.read_dataset(str(root))
+        .sort_values("debt_instrument_id")
+        .reset_index(drop=True)
+    )
+
+    assert table["debt_instrument_id"].to_list() == ["a", "b"]
+    assert [str(value) for value in table["amendment_inferred_by"]] == [
+        "1.0",
+        "dated_reference",
+    ]
+
+
+def test_read_dataset_uses_the_arrow_path_when_partitions_do_unify(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fast path is actually taken on a declared-type root (#190).
+
+    Pinned by making the per-file fallback raise: a root written through
+    ``write_table``, which applies the declared physical types, must never reach
+    it. Without this the fallback could quietly become the only path and the
+    measured 8.1x would be gone with every test still green.
+    """
+    root = tmp_path / "items"
+    _write(root / "a.parquet", [{"k": "1", "principal_amount": "100"}])
+    _write(root / "b.parquet", [{"k": "2", "principal_amount": "200"}])
+
+    def _explode(*args: object, **kwargs: object) -> pd.DataFrame:
+        raise AssertionError("fell back to the per-file path")
+
+    monkeypatch.setattr(storage, "read_table", _explode)
+
+    table = storage.read_dataset(str(root)).sort_values("k").reset_index(drop=True)
+
+    assert table["k"].to_list() == ["1", "2"]
+
+
+def test_read_dataset_projection_reindexes_a_column_absent_everywhere(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A column no partition has comes back null, *on the Arrow path* (#190).
+
+    Projecting a name Arrow does not have raises ``ArrowInvalid``, which the
+    fallback would swallow — so handing ``to_table`` the unprojectable name
+    still produces the right frame, just via the slow path, on every read that
+    names a not-yet-existing column. The fallback is made fatal here so this
+    pins the fast path rather than the answer.
+    """
+    root = tmp_path / "items"
+    _write(root / "a.parquet", [{"k": "1"}])
+
+    def _explode(*args: object, **kwargs: object) -> pd.DataFrame:
+        raise AssertionError("fell back to the per-file path")
+
+    monkeypatch.setattr(storage, "read_table", _explode)
+
+    table = storage.read_dataset(str(root), columns=["k", "nowhere"])
+
+    assert list(table.columns) == ["k", "nowhere"]
+    assert table["nowhere"].isna().all()
+
+
+def test_read_dataset_still_skips_orphaned_tempfiles(tmp_path: Path) -> None:
+    """The Arrow path reads the filtered path list, never the directory (#68).
+
+    A directory-backed dataset would pick up a crash-orphaned ``tmp*.parquet``
+    and die on it, which is the whole reason ``iter_partition_paths`` filters.
+    """
+    root = tmp_path / "items"
+    _write(root / "a.parquet", [{"k": "1"}])
+    (root / "tmpabc123.parquet").write_bytes(b"")
+
+    assert storage.read_dataset(str(root))["k"].to_list() == ["1"]
+
+
+def test_read_dataset_honors_the_partition_filter(tmp_path: Path) -> None:
+    """Partition selection happens before Arrow sees a path list."""
+    root = tmp_path / "items"
+    _write(root / "date=2026-01-01" / "part-0000.parquet", [{"k": "old"}])
+    _write(root / "date=2026-01-02" / "part-0000.parquet", [{"k": "new"}])
+
+    table = storage.read_dataset(str(root), partition_filter={"date": "2026-01-02"})
+
+    assert table["k"].to_list() == ["new"]
+
+
+def test_read_table_projects_without_reading_the_other_columns(
+    tmp_path: Path,
+) -> None:
+    """Projection is pushed into the parquet read, not applied after it (#190).
+
+    Measured on data/genwindow-eval-apr: ``documents`` is 12,206.6 MB and its
+    ``accession_number`` column is 0.2988 MB of compressed chunks, so the read
+    a dedup scan wants is 0.0024% of what the old path transferred.
+    """
+    path = tmp_path / "t.parquet"
+    _write(path, [{"k": "1", "text": "x" * 100}])
+
+    assert list(storage.read_table(path, ["k"]).columns) == ["k"]
+    # And a requested-but-absent column still comes back, null, rather than
+    # being silently dropped: ParquetFile.read does not raise on one.
+    tolerant = storage.read_table(path, ["k", "missing"])
+    assert list(tolerant.columns) == ["k", "missing"]
+    assert tolerant["missing"].isna().all()
+
+
+def test_count_table_rows_reads_only_the_footer(tmp_path: Path) -> None:
+    """The publish guard's row count must not download the object (#190)."""
+    path = tmp_path / "t.parquet"
+    _write(path, [{"k": "1"}, {"k": "2"}, {"k": "3"}])
+
+    assert storage.count_table_rows(path) == 3
+    assert storage.count_table_rows(tmp_path / "absent.parquet") is None
+
+
+def test_arrow_filesystem_leaves_local_paths_alone() -> None:
+    """Local reads need no filesystem object; only S3 gets one."""
+    filesystem, resolved = storage.arrow_filesystem("/artifacts/x/y.parquet")
+
+    assert filesystem is None
+    assert resolved == "/artifacts/x/y.parquet"
+
+
+def test_arrow_filesystem_builds_s3_on_the_configured_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The S3FileSystem is the second credentialed object #71 had to feed (#190).
+
+    It must resolve the same profile as the boto3 client, which is why the
+    Session is memoized separately and this reads through it rather than
+    building its own.
+    """
+    built: list[dict[str, object]] = []
+
+    class FakeCredentials:
+        def get_frozen_credentials(self) -> object:  # noqa: ANN101
+            from collections import namedtuple
+
+            frozen = namedtuple("Frozen", "access_key secret_key token")
+            return frozen("AK", "SK", "TOK")
+
+    class FakeProfiledSession:
+        region_name = "us-east-2"
+
+        def get_credentials(self) -> object:  # noqa: ANN101
+            return FakeCredentials()
+
+    monkeypatch.setattr(storage, "boto3_session", lambda *a, **k: FakeProfiledSession())
+    monkeypatch.setattr(
+        storage.pyarrow.fs,
+        "S3FileSystem",
+        lambda **kwargs: built.append(kwargs) or "FS",
+    )
+
+    filesystem, resolved = storage.arrow_filesystem("s3://bucket/a/b.parquet")
+
+    assert filesystem == "FS"
+    assert resolved == "bucket/a/b.parquet"
+    assert built == [
+        {
+            "access_key": "AK",
+            "secret_key": "SK",
+            "session_token": "TOK",
+            "region": "us-east-2",
+        }
+    ]
