@@ -4344,7 +4344,10 @@ def test_completion_registry_shards_entries_by_date_prefix(tmp_path: Path) -> No
             completion_registry_shard_path("itemize", "2024-01", artifact_root=tmp_path)
         ).read_text()
     )
-    assert sorted(january["partitions"]) == sorted(keys[:2])
+    assert sorted(january["partitions"]) == [
+        "documents/date=2024-01-02/shard=0001/part-0000.parquet",
+        "documents/date=2024-01-31/shard=0001/part-0000.parquet",
+    ]
     assert january["date_prefix"] == "2024-01"
 
     # And the loader reassembles every shard into one registry.
@@ -4542,15 +4545,24 @@ def test_completion_registry_keeps_undated_keys(tmp_path: Path) -> None:
         save_completion_registry,
     )
 
+    # Including one that lives *under* the artifact root: the root is stripped
+    # from canonical partition keys only, because the reader reattaches it to
+    # canonical keys only. Strip it here too and the key changes identity on
+    # the way back, stranding whatever it names.
+    under_root = str(tmp_path / "documents" / "legacy-flat-file.parquet")
     save_completion_registry(
         "itemize",
-        {"bookkeeping-key": CompletedPartition(fingerprint="f")},
+        {
+            "bookkeeping-key": CompletedPartition(fingerprint="f"),
+            under_root: CompletedPartition(fingerprint="g"),
+        },
         artifact_root=tmp_path,
     )
 
     assert (tmp_path / "runs" / "itemize" / "completed" / "date=unknown.json").exists()
     loaded = load_completion_registry("itemize", artifact_root=tmp_path)
     assert loaded["bookkeeping-key"].fingerprint == "f"
+    assert loaded[under_root].fingerprint == "g"
 
 
 def test_completion_registry_shard_saves_merge_a_real_race(tmp_path: Path) -> None:
@@ -4952,6 +4964,221 @@ def test_migration_does_not_reprocess_an_existing_corpus(tmp_path: Path) -> None
         "itemize", "documents", "items", artifact_root=tmp_path
     )
     assert pending == []
+
+
+def test_registry_keys_persist_without_the_artifact_root(tmp_path: Path) -> None:
+    """v3 stores the dataset-relative key, not the whole path (#191).
+
+    The root was repeated in all 440,000 entries: 129 B per entry with it,
+    105 B without, measured over a full-corpus-shaped registry. The in-memory
+    key is still the whole path, so none of the five call sites change.
+    """
+    from cdt.datasets import (
+        CompletedPartition,
+        completion_registry_shard_path,
+        load_completion_registry,
+        save_completion_registry,
+    )
+
+    key = document_keys(tmp_path, ["2024-01-02"])[0]
+    save_completion_registry(
+        "itemize", {key: CompletedPartition(fingerprint="f")}, artifact_root=tmp_path
+    )
+
+    payload = json.loads(
+        Path(
+            completion_registry_shard_path("itemize", "2024-01", artifact_root=tmp_path)
+        ).read_text()
+    )
+    assert payload["version"] == 3
+    assert list(payload["partitions"]) == [
+        "documents/date=2024-01-02/shard=0001/part-0000.parquet"
+    ]
+    assert load_completion_registry("itemize", artifact_root=tmp_path)[key].fingerprint
+
+
+def test_registry_size_no_longer_depends_on_how_deep_the_root_is(
+    tmp_path: Path,
+) -> None:
+    """The saving is measurable, so measure it rather than asserting it.
+
+    Two roots, one 60-odd characters deeper than the other, holding the same
+    partitions: the persisted shards must come out byte-identical in size. With
+    the root in the keys the deeper root paid its whole length 20 times over.
+    """
+    from cdt.datasets import (
+        CompletedPartition,
+        completion_registry_shard_path,
+        save_completion_registry,
+    )
+
+    days = [f"2024-01-{day:02d}" for day in range(1, 21)]
+
+    def shard_bytes(root: Path) -> int:
+        root.mkdir(parents=True, exist_ok=True)
+        save_completion_registry(
+            "itemize",
+            {
+                key: CompletedPartition(fingerprint="1111043-1788971943321871218")
+                for key in document_keys(root, days)
+            },
+            artifact_root=root,
+        )
+        return len(
+            Path(
+                completion_registry_shard_path("itemize", "2024-01", artifact_root=root)
+            ).read_bytes()
+        )
+
+    shallow = shard_bytes(tmp_path / "a")
+    deep = shard_bytes(tmp_path / ("b" * 40) / ("c" * 40))
+    assert shallow == deep
+    assert shallow / len(days) < 130
+
+
+def test_registry_follows_a_copied_artifact_root(tmp_path: Path) -> None:
+    """Dropping the root makes a registry portable, which it was not (#191).
+
+    Before this, copying an artifact root left every key prefixed with the
+    source root. Nothing in the copy matched, so the copy's corpus read as
+    entirely unprocessed -- #107's failure arriving by way of `cp -r`, and the
+    reason a scratch copy of an eval root could never be used to check
+    completion behaviour.
+    """
+    import shutil
+
+    from cdt.datasets import load_completed_partitions, pending_source_partitions
+
+    source = tmp_path / "source"
+    seed_document_partitions_across_months(
+        source, [("2024-01-02", "0000"), ("2024-02-05", "0001")]
+    )
+    itemize_pending_documents(artifact_root=source, batch_size=5)
+    assert len(load_completed_partitions("itemize", artifact_root=source)) == 2
+
+    copy = tmp_path / "copy"
+    shutil.copytree(source, copy)
+
+    completed = load_completed_partitions("itemize", artifact_root=copy)
+    assert completed == {
+        cdt_datasets.date_shard_partition_path(
+            "documents", partition_date=day, shard=shard, artifact_root=copy
+        )
+        for day, shard in (("2024-01-02", "0000"), ("2024-02-05", "0001"))
+    }
+    pending, _ = pending_source_partitions(
+        "itemize", "documents", "items", artifact_root=copy
+    )
+    assert pending == []
+
+
+def test_legacy_keys_do_not_get_a_second_root_bolted_on(tmp_path: Path) -> None:
+    """v2 keys carry a whole path already; the version, not the shape, decides.
+
+    The real registry on ``data/genwindow-eval-apr`` was written against a
+    *relative* root, so its keys look relative too. Reattaching a root by shape
+    would turn them into ``<root>/data/genwindow-eval-apr/documents/...`` and
+    match nothing -- re-doing the whole corpus.
+    """
+    from cdt.datasets import load_completion_registry
+
+    write_legacy_registry(
+        tmp_path,
+        "itemize",
+        {
+            "data/genwindow-eval-apr/documents/date=2026-04-15/shard=0000/part-0000.parquet": "fp"
+        },
+    )
+
+    assert set(load_completion_registry("itemize", artifact_root=tmp_path)) == {
+        "data/genwindow-eval-apr/documents/date=2026-04-15/shard=0000/part-0000.parquet"
+    }
+
+
+def test_a_v2_shard_is_normalized_on_its_next_write(tmp_path: Path) -> None:
+    """A shard at the old key convention gains no duplicate spelling of a key.
+
+    Both spellings surviving in one object would double-count the entry and,
+    worse, let the stale copy win a later merge.
+    """
+    from cdt.datasets import (
+        CompletedPartition,
+        completion_registry_shard_path,
+        load_completion_registry,
+        save_completion_registry,
+    )
+
+    keys = document_keys(tmp_path, ["2024-01-02", "2024-01-03"])
+    shard = Path(
+        completion_registry_shard_path("itemize", "2024-01", artifact_root=tmp_path)
+    )
+    shard.parent.mkdir(parents=True, exist_ok=True)
+    shard.write_text(
+        json.dumps(
+            {
+                "stage": "itemize",
+                "version": 2,
+                "date_prefix": "2024-01",
+                "partitions": {key: {"fingerprint": "old"} for key in keys},
+            }
+        )
+    )
+
+    save_completion_registry(
+        "itemize",
+        {keys[0]: CompletedPartition(fingerprint="new")},
+        artifact_root=tmp_path,
+    )
+
+    payload = json.loads(shard.read_text())
+    assert payload["version"] == 3
+    assert sorted(payload["partitions"]) == [
+        "documents/date=2024-01-02/shard=0001/part-0000.parquet",
+        "documents/date=2024-01-03/shard=0001/part-0000.parquet",
+    ]
+    loaded = load_completion_registry("itemize", artifact_root=tmp_path)
+    assert loaded[keys[0]].fingerprint == "new"
+    assert loaded[keys[1]].fingerprint == "old"
+
+
+def test_registry_key_relativizing_is_invertible(tmp_path: Path) -> None:
+    """Every in-memory key shape round-trips through the persisted form unchanged.
+
+    The pair is only safe if it is inverse: strip a root from a key the reader
+    would not reattach one to and the key silently changes identity, which
+    strands the partition it names. The shapes an in-memory registry can hold
+    are whole paths under the root (what the dataset listings produce), whole
+    paths that are not under it, S3 URIs, and non-partition bookkeeping keys.
+    """
+    root = str(tmp_path)
+    outside = str(tmp_path.parent / "elsewhere" / "documents")
+    for key in (
+        cdt_datasets.date_shard_partition_path(
+            "documents", partition_date="2024-01-02", shard="0001", artifact_root=root
+        ),
+        "s3://bucket/prefix/documents/date=2024-01-02/shard=0001/part-0000.parquet",
+        f"{outside}/date=2024-01-02/shard=0001/part-0000.parquet",
+        # Under the root but not a date/shard partition: a cik-sharded
+        # dataset, and a pre-migration flat file. Relativizing these would
+        # strip a prefix the reader will not put back, so the key changes
+        # identity and the partition it names is stranded.
+        cdt_datasets.cik_shard_partition_path(
+            "debt-instruments", cik_shard="0001", artifact_root=root
+        ),
+        str(tmp_path / "documents" / "legacy-flat-file.parquet"),
+        "bookkeeping-key",
+        "P",
+    ):
+        stored = cdt_datasets._relative_registry_key(key, root)  # noqa: SLF001
+        assert cdt_datasets._absolute_registry_key(stored, root) == key  # noqa: SLF001
+
+    # A bare relative canonical key is the *persisted* spelling, so it reads
+    # back as that partition under the current root -- which is exactly the
+    # portability the v3 keys buy.
+    bare = "documents/date=2024-01-02/shard=0001/part-0000.parquet"
+    assert cdt_datasets._absolute_registry_key(bare, root) == str(  # noqa: SLF001
+        tmp_path / bare
+    )
 
 
 def _seed_classifications(

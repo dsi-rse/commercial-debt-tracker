@@ -262,19 +262,77 @@ def load_completion_registry(
         stage_name, artifact_root=resolved_root, data_dir=data_dir
     )
     if artifact_exists(legacy_path):
-        entries.update(_parse_registry_payload(read_json_artifact(legacy_path)))
+        entries.update(
+            _registry_entries(read_json_artifact(legacy_path), resolved_root)
+        )
     for shard_path in list_artifacts(
         completion_registry_path(
             stage_name, artifact_root=resolved_root, data_dir=data_dir
         ),
         suffix=".json",
     ):
-        entries.update(_parse_registry_payload(read_json_artifact(shard_path)))
+        entries.update(_registry_entries(read_json_artifact(shard_path), resolved_root))
     return CompletionRegistry(entries)
 
 
+# v3 persists keys with the artifact root stripped off; v1 and v2 keys carry
+# whatever whole path the writing run resolved. Both forms are read by shape
+# rather than by version, which is safe because the shapes cannot collide: a
+# relativized key is a *bare* canonical partition path, and any whole path --
+# `/srv/cdt/documents/date=...`, `s3://bucket/documents/date=...`, or the
+# relative `data/genwindow-eval-apr/documents/date=...` the real registry on
+# that root holds -- has a dataset segment with a slash in it, which the
+# pattern's `[a-z\-]+` cannot match under `fullmatch`. So no v2 key is ever
+# mistaken for a v3 one and given a second root.
+_REGISTRY_VERSION = 3
+
+
+def _relative_registry_key(key: str, artifact_root: str) -> str:
+    """Return one registry key with the artifact root stripped off.
+
+    Keys used to carry the whole path, root included. That made the registry
+    larger than it needs to be -- 129 B per entry against 105 B, measured over
+    440,000 full-corpus-shaped entries -- and, less obviously, made an artifact
+    root non-portable: copy a root and every key keeps a prefix that no longer
+    exists, so the copy's registry matches nothing and the corpus reads as
+    entirely unprocessed. That is #107's shape arriving by way of `cp -r`.
+
+    Relativized only when the result reads back through
+    ``_absolute_registry_key``, so the two are exactly inverse and a key no
+    reader could reattach a root to is stored whole instead.
+    """
+    prefix = f"{normalize_artifact_path(artifact_root).rstrip('/')}/"
+    if not key.startswith(prefix):
+        return key
+    relative = key[len(prefix) :]
+    return relative if PARTITION_PATTERN.fullmatch(relative) else key
+
+
+def _absolute_registry_key(stored: str, artifact_root: str) -> str:
+    """Return one persisted key with the artifact root reattached.
+
+    A stored key is root-relative exactly when it is a bare canonical
+    date/shard partition path -- ``fullmatch``, not the suffix ``search`` the
+    parsers use, so a whole path or an S3 URI is not mistaken for one. Anything
+    else, v1 and v2 keys included, is returned as stored.
+    """
+    if not PARTITION_PATTERN.fullmatch(stored):
+        return stored
+    return join_artifact_path(artifact_root, stored)
+
+
+def _registry_entries(
+    payload: object, artifact_root: str
+) -> dict[str, CompletedPartition]:
+    """Parse one persisted registry object into whole-path-keyed entries."""
+    return {
+        _absolute_registry_key(key, artifact_root): entry
+        for key, entry in _parse_registry_payload(payload).items()
+    }
+
+
 def _parse_registry_payload(payload: object) -> dict[str, CompletedPartition]:
-    """Parse a persisted registry payload (v2 or v1); junk reads as empty."""
+    """Parse a persisted registry payload (v3, v2 or v1); junk reads as empty."""
     if not isinstance(payload, dict):
         return {}
     partitions = payload.get("partitions")
@@ -303,11 +361,13 @@ def _registry_payload(
     stage_name: str,
     shard_label: str,
     registry: dict[str, CompletedPartition],
+    *,
+    artifact_root: str,
 ) -> dict[str, object]:
-    """Build the persisted v2 payload for one date shard of a registry."""
+    """Build the persisted v3 payload for one date shard of a registry."""
     return {
         "stage": stage_name,
-        "version": 2,
+        "version": _REGISTRY_VERSION,
         "date_prefix": shard_label,
         "partitions": {
             path: {
@@ -315,7 +375,10 @@ def _registry_payload(
                 **({"item_ids": sorted(entry.item_ids)} if entry.item_ids else {}),
                 **({} if entry.complete else {"complete": False}),
             }
-            for path, entry in sorted(registry.items())
+            for path, entry in sorted(
+                (_relative_registry_key(key, artifact_root), entry)
+                for key, entry in registry.items()
+            )
         },
     }
 
@@ -401,7 +464,7 @@ def save_completion_registry(
 def _legacy_registry_to_migrate(
     stage_name: str,
     *,
-    artifact_root: ArtifactPath | None,
+    artifact_root: str,
     data_dir: Path | None,
 ) -> tuple[dict[str, CompletedPartition], str]:
     """Return the pre-#191 object's entries and the version token to retire it.
@@ -420,7 +483,7 @@ def _legacy_registry_to_migrate(
         payload, version = read_json_artifact_versioned(path)
     except FileNotFoundError:
         return {}, ""
-    return _parse_registry_payload(payload), version
+    return _registry_entries(payload, artifact_root), version
 
 
 def _retire_legacy_registry(
@@ -465,7 +528,7 @@ def _save_registry_shard(
     entries: dict[str, CompletedPartition],
     *,
     adopted: dict[str, CompletedPartition],
-    artifact_root: ArtifactPath | None,
+    artifact_root: str,
     data_dir: Path | None,
 ) -> str:
     """Compare-and-swap ``entries`` into one date shard of a stage's registry.
@@ -474,6 +537,10 @@ def _save_registry_shard(
     only where the shard has no entry for the key: anything already in the
     shard was written after the split and is therefore newer than the copy the
     legacy object still carries.
+
+    The merge runs on whole-path keys and the payload strips the root on the
+    way out, so a shard written at an older key convention is normalized on
+    its next write rather than accumulating both spellings of a key.
     """
     path = completion_registry_shard_path(
         stage_name, shard_label, artifact_root=artifact_root, data_dir=data_dir
@@ -482,7 +549,12 @@ def _save_registry_shard(
         if not artifact_exists(path):
             if write_json_artifact_if_absent(
                 path,
-                _registry_payload(stage_name, shard_label, {**adopted, **entries}),
+                _registry_payload(
+                    stage_name,
+                    shard_label,
+                    {**adopted, **entries},
+                    artifact_root=artifact_root,
+                ),
             ):
                 return path
             continue
@@ -490,12 +562,16 @@ def _save_registry_shard(
             payload, version = read_json_artifact_versioned(path)
         except FileNotFoundError:
             continue
-        merged = _parse_registry_payload(payload)
+        merged = _registry_entries(payload, artifact_root)
         for key, entry in adopted.items():
             merged.setdefault(key, entry)
         merged.update(entries)
         if replace_json_artifact_if_match(
-            path, _registry_payload(stage_name, shard_label, merged), version=version
+            path,
+            _registry_payload(
+                stage_name, shard_label, merged, artifact_root=artifact_root
+            ),
+            version=version,
         ):
             return path
     msg = (
