@@ -34,7 +34,7 @@ PARTITION = {"date": "2026-09-08", "shard": "0001"}
 EIGHTK_ACCESSION = "000114036126006577"
 SIXK_ACCESSION = "000165495426008172"
 EIGHTK_ITEM_ID = f"{EIGHTK_ACCESSION}-1-01"
-SIXK_ITEM_ID = item_id_for(SIXK_ACCESSION, 0, 0)
+SIXK_ITEM_ID = item_id_for(SIXK_ACCESSION, 0, 0, 512)
 
 
 def _classified_row(item_id: str, accession_number: str) -> dict[str, object]:
@@ -270,6 +270,99 @@ def test_extract_writes_both_genres_mentions_into_one_partition(
     assert len(list((tmp_path / "mentions").glob("**/*.parquet"))) == 1
 
 
+def test_a_regrouped_snippet_is_re_extracted_and_its_retired_mentions_pruned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Merging retires item ids, and both halves of that have to be handled (#172).
+
+    A re-triage can merge two admitted windows into one snippet. The row that
+    results covers a different span, so it is a different item id, and the two
+    ids it replaces no longer exist in the source. Two things then have to be
+    true at once: the merged row must be extracted rather than skipped as work
+    already done, and the mentions belonging to the ids that went away must be
+    removed. Neither happens on its own -- extract keys completion on the item
+    id, and the mentions merge only replaces ids it just extracted -- so a
+    published instrument would otherwise keep counting mentions from text the
+    pipeline has stopped sending.
+    """
+    _write_classifications(tmp_path)
+    first = item_id_for(SIXK_ACCESSION, 0, 0, 512)
+    second = item_id_for(SIXK_ACCESSION, 0, 512, 1024)
+    write_partition_table(
+        str(tmp_path / SIXK_SNIPPET_DATASET_NAME),
+        partition=PARTITION,
+        table=pd.DataFrame(
+            [
+                _snippet_row(first, SIXK_ACCESSION),
+                _snippet_row(second, SIXK_ACCESSION),
+            ],
+            columns=SIXK_SNIPPET_COLUMNS,
+        ),
+    )
+    _stub_workflow(monkeypatch)
+    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+
+    before = read_dataset(mentions_root(tmp_path))
+    assert sorted(before["item_id"].astype(str)) == sorted(
+        [EIGHTK_ITEM_ID, first, second]
+    )
+
+    # The stage re-runs and the two windows merge: one row, spanning both.
+    merged = item_id_for(SIXK_ACCESSION, 0, 0, 1024)
+    write_partition_table(
+        str(tmp_path / SIXK_SNIPPET_DATASET_NAME),
+        partition=PARTITION,
+        table=pd.DataFrame(
+            [_snippet_row(merged, SIXK_ACCESSION)],
+            columns=SIXK_SNIPPET_COLUMNS,
+        ),
+    )
+
+    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+
+    written = read_dataset(mentions_root(tmp_path))
+    item_ids = sorted(written["item_id"].astype(str))
+    # The merged row was extracted, not skipped.
+    assert merged in item_ids
+    # The ids it replaced are gone, not orphaned beside it.
+    assert first not in item_ids
+    assert second not in item_ids
+    # The other genre is untouched.
+    assert item_ids == sorted([EIGHTK_ITEM_ID, merged])
+
+
+def test_a_snippet_that_stops_being_relevant_loses_its_mentions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same pruning, for the simpler shape it also covers.
+
+    Stage 2 is a non-deterministic LLM, so a re-triage can drop a snippet it
+    previously kept. The row stays in the dataset marked irrelevant, so extract
+    never claims it again and nothing would otherwise remove what it already
+    produced.
+    """
+    _write_classifications(tmp_path)
+    _write_snippets(tmp_path)
+    _stub_workflow(monkeypatch)
+    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+    assert SIXK_ITEM_ID in set(read_dataset(mentions_root(tmp_path))["item_id"])
+
+    dropped = _snippet_row(SIXK_ITEM_ID, SIXK_ACCESSION)
+    dropped["relevance"] = False
+    dropped["label"] = "irrelevant"
+    dropped["sixk_verdict"] = "dropped_no_details"
+    write_partition_table(
+        str(tmp_path / SIXK_SNIPPET_DATASET_NAME),
+        partition=PARTITION,
+        table=pd.DataFrame([dropped], columns=SIXK_SNIPPET_COLUMNS),
+    )
+
+    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+
+    written = read_dataset(mentions_root(tmp_path))
+    assert sorted(written["item_id"].astype(str)) == [EIGHTK_ITEM_ID]
+
+
 def test_new_snippets_merge_without_dropping_the_other_genres_mentions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -288,7 +381,7 @@ def test_new_snippets_merge_without_dropping_the_other_genres_mentions(
     # Ingest merged another 6-K filing into the source documents partition, so
     # the triage stage rewrote this snippets partition with an extra row.
     second_accession = "000129281426002379"
-    second_item_id = item_id_for(second_accession, 0, 0)
+    second_item_id = item_id_for(second_accession, 0, 0, 512)
     write_partition_table(
         str(tmp_path / SIXK_SNIPPET_DATASET_NAME),
         partition=PARTITION,

@@ -355,7 +355,7 @@ Modified:
 |---|---|
 | `ingest.py` | `form_types` + `dataset_name` on `IngestConfig`; `form_type`/`source` on `DocumentCandidate` and `DOCUMENT_COLUMNS`; drop the `CDT_FORM_TYPE` hardcode |
 | `extractor/core.py` | `CLASSIFICATION_SOURCES` loop in `pending_extract_partitions`; scope the mentions-backfill heuristic to the 8-K source |
-| `pipeline.py` | `genres` / `sixk_form_types` / `sixk_cik_file` / `sixk_batch_size` / `sixk_concurrency` on `PipelineConfig`; `normalize_genres`; a `_sixk` phase in `_ingest_itemize_classify` (renamed `_prepare`), with a lease renew at its boundary; counts on `PipelineRunResult`; `FINAL_OUTPUT_TABLES["items"]` becomes a union of `items` and `sixk-snippets` |
+| `pipeline.py` | `genres` / `sixk_form_types` / `sixk_cik_file` / `sixk_batch_size` / `sixk_concurrency` on `PipelineConfig`; `normalize_genres`; a per-genre `_prepare_genres` dispatch with the 6-K chain in `_ingest_and_triage_sixk`, with a lease renew at its boundary; counts on `PipelineRunResult`; `FINAL_OUTPUT_TABLES["items"]` is a union of `items` and `sixk-snippets`, projected to the itemizer's columns |
 | `cli.py` | `cdt sixk` stage command; `cdt ingest-sixk` with the scraper flags `cdt ingest` takes; `--form-types` and `--sixk-cik-file` on `cdt ingest` |
 | `orchestrator.py` | `--genres` / `GENRES` and `--sixk-cik-file` / `SIXK_CIK_FILE`, threaded into `PipelineConfig` |
 | `settings.py` | `SIXK_TRIAGE_PROVIDER`, `SIXK_CIK_FILE` |
@@ -409,9 +409,13 @@ following their fake-client pattern:
    is asked for CIKs and a date range, and which forms those issuers filed in
    it is not something the caller should have to know or keep in sync with the
    scraper's coverage. The deployed daily run therefore does change — see
-   "Turning it on" below. Also the `items`
-   snapshot union, and the issue on `commercial-debt-tracker-dashboard` for the
-   `item`-column change it implies.
+   "Turning it on" below. The `items` snapshot union ships with it rather
+   than after it: extraction reads both genres, so publishing one genre's
+   units leaves the other's mentions joining to nothing, and the website reads
+   item text and the SEC link off that join. A 6-K row's `item` is a snippet
+   id rather than a dotted item number, which the website renders in its
+   "item" field — cosmetic, and strictly better than the null it showed
+   before.
 6. **Docs.**
 
 ### Phase-3 checkpoint result (2026-09-09)

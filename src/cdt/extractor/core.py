@@ -2038,11 +2038,21 @@ def _merge_mentions_partition(
     partition: dict[str, str],
     new_mentions: pd.DataFrame,
     replaced_item_ids: set[str],
+    retired_item_ids: set[str] | None = None,
 ) -> str:
     """Merge newly extracted mentions into a partition, replacing per item.
 
     Row-level re-processing means a target partition can already hold mentions
     from earlier passes; overwriting it wholesale would drop them.
+
+    ``retired_item_ids`` are ids a claimed source partition used to hold and
+    no longer does -- a row that stopped being relevant, or, on the 6-K path,
+    windows that merged into one snippet so their own ids ceased to exist
+    (#172). Keeping only what is absent from the source would be wrong: one
+    mentions partition holds both genres and several accessions, so anything
+    not named here must be left alone. Nothing else prunes these, and a mention
+    whose item no longer exists still publishes -- inflating the instrument's
+    counts and asserting facts from text the pipeline has stopped sending.
     """
     target_path = date_shard_partition_path(
         MENTIONS_DATASET_NAME,
@@ -2054,7 +2064,8 @@ def _merge_mentions_partition(
     table = new_mentions
     if artifact_exists(target_path):
         existing = read_table(target_path, DEBT_INSTRUMENT_MENTION_COLUMNS)
-        kept = existing.loc[~existing["item_id"].astype(str).isin(replaced_item_ids)]
+        dropped = replaced_item_ids | (retired_item_ids or set())
+        kept = existing.loc[~existing["item_id"].astype(str).isin(dropped)]
         table = pd.concat([kept, new_mentions], ignore_index=True)
     write_partition_table(
         mentions_root(resolved_root, data_dir=data_dir),
@@ -2255,9 +2266,15 @@ def extract_pending_items(
                 )
 
         mentions = pd.DataFrame(mention_rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
-        if mentions.empty and not replaced_item_ids:
+        # Rows this partition was extracted for last time and no longer has.
+        retired_item_ids = set(pending.done_item_ids) - relevant_item_ids
+        if mentions.empty and not replaced_item_ids and not retired_item_ids:
             empty_partitions += 1
-        elif not mentions.empty or replaced_item_ids & pending.done_item_ids:
+        elif (
+            not mentions.empty
+            or replaced_item_ids & pending.done_item_ids
+            or retired_item_ids
+        ):
             partitions_written.append(
                 _merge_mentions_partition(
                     resolved_root,
@@ -2265,6 +2282,7 @@ def extract_pending_items(
                     partition=partition,
                     new_mentions=mentions,
                     replaced_item_ids=replaced_item_ids,
+                    retired_item_ids=retired_item_ids,
                 )
             )
             if not mentions.empty:
@@ -2273,7 +2291,10 @@ def extract_pending_items(
             empty_partitions += 1
         registry[pending.classification_path] = CompletedPartition(
             fingerprint=pending.fingerprint,
-            item_ids=frozenset(terminal_ids),
+            # Scoped to rows the source still holds: an id whose row is gone
+            # just had its mentions pruned, and keeping it here would retire
+            # it again on every later pass.
+            item_ids=frozenset(terminal_ids & relevant_item_ids),
             complete=relevant_item_ids <= terminal_ids,
         )
         LOGGER.info(
@@ -2417,16 +2438,41 @@ def finalize_extract_outputs(
                 row_state.item_id
             )
 
+    # Read each claimed source once, before the merge loop needs it and before
+    # the registry loop below records it. A mentions partition is keyed by
+    # (date, shard) while a claim is keyed by path, and both genres can claim
+    # the same (date, shard) — so retired ids are accumulated per partition
+    # across every claim that lands there, never inferred from one source.
+    relevant_by_path: dict[str, set[str]] = {}
+    retired_by_partition: dict[tuple[str, str], set[str]] = {}
+    for classification_path, claim in claimed.items():
+        claim_partition = parse_date_shard_partition(classification_path)
+        claim_relevant = read_table(
+            classification_path, CLASSIFIED_ITEM_COLUMNS
+        ).reindex(columns=CLASSIFIED_ITEM_COLUMNS)
+        claim_relevant = claim_relevant.loc[claim_relevant["relevance"].fillna(False)]
+        relevant_ids = {str(value) for value in claim_relevant["item_id"].astype(str)}
+        relevant_by_path[classification_path] = relevant_ids
+        prior_ids = {
+            str(item) for item in cast(list[object], claim.get("prior_item_ids") or [])
+        }
+        retired_by_partition.setdefault(
+            (claim_partition["date"], claim_partition["shard"]), set()
+        ).update(prior_ids - relevant_ids)
+    # A partition whose rows were all done already contributes no mention rows,
+    # but may still have ids to prune.
+    for partition_key, retired_ids in retired_by_partition.items():
+        if retired_ids:
+            mentions_by_partition.setdefault(partition_key, [])
+
     processed_frames: list[pd.DataFrame] = []
     partitions_written: list[str] = []
     empty_partitions = 0
     for (partition_date, shard), mention_rows in sorted(mentions_by_partition.items()):
         mentions = pd.DataFrame(mention_rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
         replaced = terminal_by_partition.get((partition_date, shard), set())
-        if mentions.empty and not replaced:
-            empty_partitions += 1
-            continue
-        if mentions.empty:
+        retired = retired_by_partition.get((partition_date, shard), set())
+        if mentions.empty and not retired:
             empty_partitions += 1
             continue
         partitions_written.append(
@@ -2436,9 +2482,13 @@ def finalize_extract_outputs(
                 partition={"date": partition_date, "shard": shard},
                 new_mentions=mentions,
                 replaced_item_ids=replaced,
+                retired_item_ids=retired,
             )
         )
-        processed_frames.append(mentions)
+        if mentions.empty:
+            empty_partitions += 1
+        else:
+            processed_frames.append(mentions)
 
     registry = load_completion_registry(
         "extract", artifact_root=resolved_root, data_dir=data_dir
@@ -2451,15 +2501,14 @@ def finalize_extract_outputs(
         terminal = prior | terminal_by_partition.get(
             (partition["date"], partition["shard"]), set()
         )
-        relevant = read_table(classification_path, CLASSIFIED_ITEM_COLUMNS).reindex(
-            columns=CLASSIFIED_ITEM_COLUMNS
-        )
-        relevant = relevant.loc[relevant["relevance"].fillna(False)]
-        relevant_ids = {str(value) for value in relevant["item_id"].astype(str)}
+        relevant_ids = relevant_by_path[classification_path]
         fingerprint = claim.get("fingerprint")
         registry[classification_path] = CompletedPartition(
             fingerprint=str(fingerprint) if fingerprint else None,
-            item_ids=frozenset(terminal),
+            # As in the synchronous path: only ids the source still holds, and
+            # only this source's — one (date, shard) can be claimed by both
+            # genres, so `terminal_by_partition` mixes them.
+            item_ids=frozenset(terminal & relevant_ids),
             complete=relevant_ids <= terminal,
         )
     save_completion_registry(

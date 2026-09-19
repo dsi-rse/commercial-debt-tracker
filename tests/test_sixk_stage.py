@@ -310,7 +310,11 @@ def test_triage_rows_satisfy_the_extractor_s_input_contract(tmp_path: Path) -> N
     projected = snippets.reindex(columns=CLASSIFIED_ITEM_COLUMNS)
     assert list(projected.columns) == CLASSIFIED_ITEM_COLUMNS
     row = projected.iloc[0]
-    assert row["item_id"] == item_id_for("000000000026000001", 0, 0)
+    # The id names the span the row carries, so it moves whenever the text does.
+    span = snippets.iloc[0]
+    assert row["item_id"] == item_id_for(
+        "000000000026000001", 0, span["sixk_window_start"], span["sixk_window_end"]
+    )
     # The extractor reads `text` and nothing else about the source.
     assert "credit agreement" in row["text"]
     assert row["accession_number"] == "000000000026000001"
@@ -622,7 +626,14 @@ def test_adjacent_admitted_windows_become_one_row(tmp_path: Path) -> None:
     assert len(re.findall(r"^--- snippet \d+ \[", prompt, re.MULTILINE)) == 1
     # Identity comes from the earliest member, so no two groups can claim it.
     assert row["item"] == snippet_id_for("000000000026000001", 0, admitted[0].index)
-    assert row["item_id"] == item_id_for("000000000026000001", 0, admitted[0].index)
+    # The item id names the merged span, not the first member: a regrouping has
+    # to read as a different row, or the extractor skips it as already done.
+    assert row["item_id"] == item_id_for(
+        "000000000026000001", 0, row["sixk_window_start"], row["sixk_window_end"]
+    )
+    assert row["item_id"] != item_id_for(
+        "000000000026000001", 0, admitted[0].start, admitted[0].end
+    )
 
 
 def test_an_unmerged_snippet_still_names_its_one_window(tmp_path: Path) -> None:

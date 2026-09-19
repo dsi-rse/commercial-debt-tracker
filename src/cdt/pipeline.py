@@ -37,6 +37,7 @@ from cdt.itemizer import (
     itemize_pending_documents,
     items_root,
 )
+from cdt.itemizer.core import ITEM_COLUMNS
 from cdt.matcher import (
     DEFAULT_AMBIGUITY_MARGIN,
     DEFAULT_MEMBERSHIP_THRESHOLD,
@@ -49,7 +50,7 @@ from cdt.matcher.core import MATCHER_SCHEMA_VERSION, apply_lineage_inference_pas
 from cdt.shared import get_logger
 from cdt.sixk.scraper import acquire_scraped_sixk_documents
 from cdt.sixk.stage import DEFAULT_CONCURRENCY as SIXK_DEFAULT_CONCURRENCY
-from cdt.sixk.stage import triage_pending_documents
+from cdt.sixk.stage import sixk_snippets_root, triage_pending_documents
 from cdt.storage import (
     ArtifactPath,
     artifact_exists,
@@ -65,12 +66,28 @@ from cdt.storage import (
     write_table,
 )
 
-FINAL_OUTPUT_TABLES: dict[str, Callable[[str | Path | None], str]] = {
-    "items": items_root,
-    "debt-instruments": debt_instruments_root,
-    "debt-instrument-mentions": mentions_root,
-    "mention-cluster-edges": mention_cluster_edges_root,
+#: Published table -> the datasets it is built from, concatenated in order.
+#: ``items`` is a union because both genres produce one: an 8-K item section
+#: and a 6-K snippet are each "the unit of text a mention was extracted from",
+#: and every consumer joins a mention to its unit by ``item_id``. Publishing
+#: only the 8-K units leaves every 6-K mention with no row to join to, which
+#: is not a missing nicety — the website reads item text, the filing's SEC URL
+#: and its accession number off that row, so a 6-K instrument renders with
+#: none of them (#172).
+FINAL_OUTPUT_TABLES: dict[str, tuple[Callable[..., str], ...]] = {
+    "items": (items_root, sixk_snippets_root),
+    "debt-instruments": (debt_instruments_root,),
+    "debt-instrument-mentions": (mentions_root,),
+    "mention-cluster-edges": (mention_cluster_edges_root,),
 }
+
+#: Columns a published table keeps when the datasets it unions are not the
+#: same width. A 6-K snippet row carries the classifier's three columns and
+#: the stage's six on top of the itemizer's sixteen; the published ``items``
+#: table is the itemizer's shape, so those are projected away rather than
+#: widening a published table with columns that are null for every 8-K row.
+#: The snippet's own span and verdict stay queryable in ``sixk-snippets``.
+FINAL_OUTPUT_TABLE_COLUMNS: dict[str, list[str]] = {"items": ITEM_COLUMNS}
 
 #: The two filing genres the pipeline knows how to prepare. A genre is a form
 #: family plus the stages that turn it into rows the extractor can read: 8-K
@@ -753,9 +770,14 @@ def write_final_output_tables(
     # the parquet-only database root publish the same normalized values.
     tables = {
         table_name: normalize_snapshot_text(
-            read_dataset(dataset_root_fn(artifact_root, data_dir=data_dir))
+            _read_published_table(
+                table_name,
+                dataset_root_fns,
+                artifact_root=artifact_root,
+                data_dir=data_dir,
+            )
         )
-        for table_name, dataset_root_fn in FINAL_OUTPUT_TABLES.items()
+        for table_name, dataset_root_fns in FINAL_OUTPUT_TABLES.items()
     }
     # Guard against what is actually published, not the pointer: the pointer
     # lives with the artifact root, so a half-built or freshly-pointed artifact
@@ -810,6 +832,34 @@ def write_final_output_tables(
         keep_run_ids={run_id, str(previous.get("run_id", ""))},
     )
     return written_paths
+
+
+def _read_published_table(
+    table_name: str,
+    dataset_root_fns: Sequence[Callable[..., str]],
+    *,
+    artifact_root: ArtifactPath,
+    data_dir: Path | None,
+) -> pd.DataFrame:
+    """Read one published table, concatenating the datasets it unions.
+
+    Empty frames are dropped before the concat rather than passed through it.
+    A dataset with no partitions reads back as all-object columns, and pandas
+    would widen the integer columns of the frames beside it to float to make
+    room — silently changing a published table's types on any run where one
+    genre produced nothing.
+    """
+    columns = FINAL_OUTPUT_TABLE_COLUMNS.get(table_name)
+    frames = [
+        read_dataset(dataset_root_fn(artifact_root, data_dir=data_dir), columns=columns)
+        for dataset_root_fn in dataset_root_fns
+    ]
+    populated = [frame for frame in frames if not frame.empty]
+    if not populated:
+        return frames[0]
+    if len(populated) == 1:
+        return populated[0]
+    return pd.concat(populated, ignore_index=True)
 
 
 def normalize_snapshot_text(table: pd.DataFrame) -> pd.DataFrame:

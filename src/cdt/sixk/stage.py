@@ -132,14 +132,28 @@ def snippet_id_for(
     return f"{accession_number}:{document_index}:{window_index}"
 
 
-def item_id_for(accession_number: str, document_index: int, window_index: int) -> str:
-    """Build a snippet's extractor-facing item id.
+def item_id_for(
+    accession_number: str, document_index: int, start: int, end: int
+) -> str:
+    """Build a snippet's extractor-facing item id: the span its text covers.
 
     Disjoint from 8-K item ids by construction (those are
     ``{accession}-{item}`` with a dotted item number), which is what lets both
     genres write mentions into one partition, merged by item id.
+
+    The span rather than a window index, because a row is the snippet stage 2
+    judged and adjacent admitted windows merge into one. Naming a merged row
+    after its first member lets one id denote different text between runs, and
+    the extractor skips an id it has already finished (#49): the regrouped
+    snippet would keep the old id and never be re-extracted -- so the expanded
+    text this stage exists to produce would never reach the model -- while the
+    members that lost their own id leave mentions behind with nothing to prune
+    them. A span moves whenever the text does, and two groups of one document
+    cannot share one, so the id names exactly what the row carries. Two
+    groupings covering the same span carry the same text, so sharing an id is
+    correct there rather than a collision.
     """
-    return f"{accession_number}-6K-{document_index}-{window_index}"
+    return f"{accession_number}-6K-{document_index}-{start}-{end}"
 
 
 class OpenRouterTextClient:
@@ -237,10 +251,12 @@ class _Candidate:
 class _SentSnippet:
     """One snippet as stage 2 receives it: an admitted window plus context.
 
-    ``candidate`` is the first member's, which is what gives the row its
-    identity — ``expand_admitted_windows`` indexes a merged window by its first
-    member, so a group is named by the earliest window in it and no two groups
-    can claim the same name.
+    ``candidate`` is the first member's, so the ``item`` column — the snippet
+    id stage 2 answered about — names the earliest window in the group, and no
+    two groups can claim the same one. The extractor-facing ``item_id`` is not
+    taken from it: that names the merged span instead, so that a regrouping
+    reads as different work rather than as an id the extractor has already
+    finished. See :func:`item_id_for`.
     """
 
     snippet: Snippet
@@ -504,7 +520,10 @@ def _snippet_row(
     accession_number = str(document["accession_number"])
     return {
         "item_id": item_id_for(
-            accession_number, candidate.document_index, item.window.index
+            accession_number,
+            candidate.document_index,
+            item.window.start,
+            item.window.end,
         ),
         "item": candidate.snippet_id,
         "accession_number": accession_number,
