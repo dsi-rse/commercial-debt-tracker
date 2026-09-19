@@ -11,7 +11,6 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Protocol, Self, cast
 
-import boto3
 import pandas as pd
 
 from cdt import settings
@@ -23,7 +22,6 @@ from cdt.datasets import (
 )
 from cdt.shared import FailureClassifier, FailureRegistry, get_logger
 from cdt.storage import (
-    S3_CLIENT_CONFIG,
     delete_artifact,
     get_object_bytes,
     iter_partition_paths,
@@ -34,6 +32,9 @@ from cdt.storage import (
     write_json_artifact,
     write_partition_table,
     write_table,
+)
+from cdt.storage import (
+    s3_client as storage_s3_client,
 )
 
 LOGGER = get_logger(__name__)
@@ -830,12 +831,23 @@ def iter_filings(
         yield filing
 
 
-def default_s3_client(profile_name: str = DEFAULT_AWS_PROFILE) -> S3Client:
-    """Return the default S3 client for the analysis account profile."""
-    session = (
-        boto3.Session(profile_name=profile_name) if profile_name else boto3.Session()
-    )
-    return cast(S3Client, session.client("s3", config=S3_CLIENT_CONFIG))
+def default_s3_client(profile_name: str | None = None) -> S3Client:
+    """Return the S3 client for a profile, or for the one ``--aws-profile`` set.
+
+    Delegates to ``storage.s3_client`` rather than building its own Session.
+    Two things were wrong with doing it here. It was uncached, so every call
+    paid credential resolution and endpoint discovery afresh and callers had to
+    memoize by hand — which is all ``itemizer.core.ensure_s3_client`` is. And
+    its default was the *empty* profile rather than the configured one, so
+    ``ensure_s3_client``'s unqualified call silently dropped ``--aws-profile``:
+    itemize and extract resolved document bodies through the ambient
+    credentials no matter what the flag said (#71).
+
+    The default is now ``None``, meaning "the configured profile". An explicit
+    name still wins, so ingest and the 6-K scraper keep passing
+    ``config.aws_profile``.
+    """
+    return cast(S3Client, storage_s3_client(profile_name))
 
 
 def s3_uri(bucket: str, key: str) -> str:

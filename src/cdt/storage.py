@@ -35,10 +35,26 @@ ArtifactPath = str | Path
 # the empty file (#68).
 _ORPHANED_TEMP_RE = re.compile(r"(?:^|/)tmp[^/]*\.parquet$")
 
-# One client for every S3 call in this module: construction is expensive
-# (credential resolution, endpoint discovery), and the partition scans issue
-# thousands of calls per run (#83).
-_S3_CLIENT = None
+# One client per AWS profile for every S3 call in the process: construction is
+# expensive (credential resolution, endpoint discovery), and the partition scans
+# issue thousands of calls per run (#83).
+#
+# Keyed by profile because there used to be two unreconciled factories. This
+# module's was a singleton built with no profile at all, so `--aws-profile`
+# reached ingest's own client and nothing else — every read_table, every
+# list_objects_v2 behind a partition scan, and every artifact write resolved
+# credentials from the ambient environment instead (#71). The other,
+# `ingest.default_s3_client`, took a profile but was uncached, so it built a
+# fresh Session per call and callers had to memoize it by hand
+# (`itemizer.core.ensure_s3_client`) — and its own default was the empty
+# profile, which is why the itemize and extract stages dropped the flag too.
+# `ingest.default_s3_client` now delegates here, leaving one cache and one
+# place that knows how a profile becomes a client.
+_S3_CLIENTS: dict[str, object] = {}
+# The profile `--aws-profile` selected for this process. Empty means the
+# ambient credential chain, which is both the CLI default and what every
+# caller got before.
+_CONFIGURED_S3_PROFILE = ""
 
 # Explicit API-call retries and timeouts: nothing configured them before, so
 # every client ran botocore's legacy retry mode (2 attempts) with no bound on
@@ -51,11 +67,47 @@ S3_CLIENT_CONFIG = Config(
 )
 
 
+def configure_s3_profile(profile_name: str | None) -> None:
+    """Select the AWS profile every unqualified S3 client in this process uses.
+
+    Called once per entry point, from the parsed ``--aws-profile``. Before this
+    existed the flag was threaded by hand to the one factory ingest happened to
+    call, so a run against a non-default account read its manifests through the
+    right credentials and then wrote every artifact through the wrong ones —
+    or, more usually, failed on the first write with no hint that the flag had
+    not been honored (#71).
+
+    ``None`` and ``""`` both mean the ambient credential chain, which is the
+    CLI default and the historical behaviour.
+    """
+    global _CONFIGURED_S3_PROFILE  # noqa: PLW0603
+    _CONFIGURED_S3_PROFILE = profile_name or ""
+
+
+def configured_s3_profile() -> str:
+    """Return the AWS profile unqualified S3 clients resolve to."""
+    return _CONFIGURED_S3_PROFILE
+
+
+def s3_client(profile_name: str | None = None):  # noqa: ANN201
+    """Return the memoized S3 client for a profile, or the configured one.
+
+    ``profile_name=None`` means "whatever ``--aws-profile`` selected" — the
+    case that was broken. An explicit name still wins, so a caller holding a
+    config with its own profile (ingest, the 6-K scraper) keeps passing it and
+    gets the same object the generic helpers in this module use.
+    """
+    resolved = _CONFIGURED_S3_PROFILE if profile_name is None else profile_name
+    client = _S3_CLIENTS.get(resolved)
+    if client is None:
+        session = boto3.Session(profile_name=resolved) if resolved else boto3.Session()
+        client = session.client("s3", config=S3_CLIENT_CONFIG)
+        _S3_CLIENTS[resolved] = client
+    return client
+
+
 def _s3_client():  # noqa: ANN202
-    global _S3_CLIENT  # noqa: PLW0603
-    if _S3_CLIENT is None:
-        _S3_CLIENT = boto3.client("s3", config=S3_CLIENT_CONFIG)
-    return _S3_CLIENT
+    return s3_client()
 
 
 # Failures a streaming body read surfaces after get_object has returned, where
