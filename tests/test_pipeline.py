@@ -26,6 +26,8 @@ from cdt.pipeline import (
 from cdt.storage import read_dataset, read_table, write_partition_table
 
 EXPECTED_SIXK_SNIPPETS = 2
+#: Two seeded 8-K items plus the one 6-K snippet the union brings in.
+EXPECTED_UNIONED_ITEM_ROWS = 3
 
 
 class FakeModel:
@@ -538,14 +540,74 @@ def _seed_final_tables(artifact_root: Path, *, rows: int = 2) -> None:
     """Write minimal rows into every dataset finalize publishes."""
     from cdt.pipeline import FINAL_OUTPUT_TABLES
 
-    for table_name, dataset_root_fn in FINAL_OUTPUT_TABLES.items():
+    for table_name, dataset_root_fns in FINAL_OUTPUT_TABLES.items():
+        # The first dataset only. `items` unions a second one, and these tests
+        # are about the pointer, the guard and pruning — seeding both would
+        # double the row counts they assert on. The union has its own test.
         write_partition_table(
-            dataset_root_fn(str(artifact_root)),
+            dataset_root_fns[0](str(artifact_root)),
             partition={"date": "2024-01-02", "shard": "0001"},
             table=pd.DataFrame(
                 [{"id": f"{table_name}-{index}"} for index in range(rows)]
             ),
         )
+
+
+def test_published_items_union_both_genres_so_every_mention_can_join(
+    tmp_path: Path,
+) -> None:
+    """`items/latest.parquet` carries 6-K snippets beside 8-K items (#172).
+
+    Every consumer joins a mention to its source row by `item_id` -- the
+    website reads the item text, the filing's SEC URL and its accession number
+    off that row. Publishing only the 8-K units leaves a 6-K mention joining to
+    nothing, and the failure is silent: the schema is intact, the join is just
+    empty, so the instrument renders with no text and no link.
+    """
+    from cdt.itemizer.core import ITEM_COLUMNS
+    from cdt.pipeline import write_final_output_tables
+    from cdt.sixk.stage import SIXK_SNIPPET_COLUMNS, sixk_snippets_root
+
+    artifact_root = tmp_path / "artifacts"
+    final_root = tmp_path / "final"
+    _seed_final_tables(artifact_root)
+    write_partition_table(
+        sixk_snippets_root(str(artifact_root)),
+        partition={"date": "2024-01-02", "shard": "0001"},
+        table=pd.DataFrame(
+            [
+                {
+                    **dict.fromkeys(SIXK_SNIPPET_COLUMNS),
+                    "item_id": "000165495426008172-6K-0-0-512",
+                    "item": "000165495426008172:0:0",
+                    "accession_number": "000165495426008172",
+                    "url": "https://sec.example/6k.txt",
+                    "text": "Global Program for the issuance of Notes.",
+                    "date": "2024-01-02",
+                    "sixk_member_windows": "0,1",
+                }
+            ],
+            columns=SIXK_SNIPPET_COLUMNS,
+        ),
+    )
+
+    write_final_output_tables(
+        artifact_root=str(artifact_root), final_database_root=str(final_root)
+    )
+
+    published = read_table(str(final_root / "items" / "latest.parquet"))
+    # The 6-K row is there, and joinable by the id a mention carries.
+    by_id = {str(row["item_id"]): row for _, row in published.iterrows()}
+    assert "000165495426008172-6K-0-0-512" in by_id
+    joined = by_id["000165495426008172-6K-0-0-512"]
+    assert joined["url"] == "https://sec.example/6k.txt"
+    assert joined["text"] == "Global Program for the issuance of Notes."
+    assert joined["accession_number"] == "000165495426008172"
+    # The 8-K rows the table already published are still there.
+    assert len(published) == EXPECTED_UNIONED_ITEM_ROWS
+    # And the table keeps the itemizer's shape: the snippet's own span and
+    # verdict columns stay in `sixk-snippets` rather than widening this one.
+    assert list(published.columns) == ITEM_COLUMNS
 
 
 def test_final_snapshots_publish_atomically_with_pointer(tmp_path: Path) -> None:
