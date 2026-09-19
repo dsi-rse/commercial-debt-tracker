@@ -354,19 +354,42 @@ def save_completion_registry(
     per-batch save of #111 durable: a save interrupted after three of five
     shards leaves those three persisted, and every persisted entry is a
     partition whose output was already written.
+
+    A save is also where an existing root's pre-#191 single object is folded
+    into date shards, because a save is the only point that holds the writer
+    lease. Every stage saves unconditionally at the end of its run, so the
+    migration lands on the first run after the upgrade even when nothing was
+    pending.
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     changed = sorted(
         registry.dirty if isinstance(registry, CompletionRegistry) else registry
     )
+    adopted, legacy_version = _legacy_registry_to_migrate(
+        stage_name, artifact_root=resolved_root, data_dir=data_dir
+    )
     by_shard: dict[str, dict[str, CompletedPartition]] = {}
     for key in changed:
         by_shard.setdefault(_registry_shard_label(key), {})[key] = registry[key]
-    for shard_label in sorted(by_shard):
+    adopted_by_shard: dict[str, dict[str, CompletedPartition]] = {}
+    for key, entry in adopted.items():
+        adopted_by_shard.setdefault(_registry_shard_label(key), {})[key] = entry
+    for shard_label in sorted(by_shard.keys() | adopted_by_shard.keys()):
         _save_registry_shard(
             stage_name,
             shard_label,
-            by_shard[shard_label],
+            by_shard.get(shard_label, {}),
+            adopted=adopted_by_shard.get(shard_label, {}),
+            artifact_root=resolved_root,
+            data_dir=data_dir,
+        )
+    if adopted:
+        # Only after every shard's swap succeeded -- _save_registry_shard
+        # raises rather than returning on exhaustion, so the marker below can
+        # never be written over state that did not make it into a shard.
+        _retire_legacy_registry(
+            stage_name,
+            legacy_version,
             artifact_root=resolved_root,
             data_dir=data_dir,
         )
@@ -375,22 +398,91 @@ def save_completion_registry(
     )
 
 
+def _legacy_registry_to_migrate(
+    stage_name: str,
+    *,
+    artifact_root: ArtifactPath | None,
+    data_dir: Path | None,
+) -> tuple[dict[str, CompletedPartition], str]:
+    """Return the pre-#191 object's entries and the version token to retire it.
+
+    Read on every save, not once behind a flag, because there is nowhere to
+    keep a flag that a concurrent writer would also see (#88). The steady-state
+    cost after migration is one HeadObject plus one GET of a ~200-byte marker
+    per save, against the 56.8 MB this whole change is removing.
+    """
+    path = legacy_completion_registry_path(
+        stage_name, artifact_root=artifact_root, data_dir=data_dir
+    )
+    if not artifact_exists(path):
+        return {}, ""
+    try:
+        payload, version = read_json_artifact_versioned(path)
+    except FileNotFoundError:
+        return {}, ""
+    return _parse_registry_payload(payload), version
+
+
+def _retire_legacy_registry(
+    stage_name: str,
+    version: str,
+    *,
+    artifact_root: ArtifactPath | None,
+    data_dir: Path | None,
+) -> bool:
+    """Replace a migrated pre-#191 object with an empty forwarding marker.
+
+    Compare-and-swapped on the version the migration read, so a writer that
+    added entries to the object in the meantime is not clobbered. A lost swap
+    is harmless and needs no retry: the object stays as it was, every entry it
+    held is already in a shard, and the next save migrates it again --
+    idempotently, because an adopted entry never overwrites the shard's copy.
+
+    Cleared rather than deleted so the object survives as an operator-visible
+    record of where the state went. The migration is still one-way: code from
+    before #191 reads the marker as an empty registry, which is the #107
+    failure mode, so a rollback has to rebuild the object from the shards.
+    """
+    return replace_json_artifact_if_match(
+        legacy_completion_registry_path(
+            stage_name, artifact_root=artifact_root, data_dir=data_dir
+        ),
+        {
+            "stage": stage_name,
+            "version": 2,
+            "partitions": {},
+            "migrated_to": completion_registry_path(
+                stage_name, artifact_root=artifact_root, data_dir=data_dir
+            ),
+        },
+        version=version,
+    )
+
+
 def _save_registry_shard(
     stage_name: str,
     shard_label: str,
     entries: dict[str, CompletedPartition],
     *,
+    adopted: dict[str, CompletedPartition],
     artifact_root: ArtifactPath | None,
     data_dir: Path | None,
 ) -> str:
-    """Compare-and-swap ``entries`` into one date shard of a stage's registry."""
+    """Compare-and-swap ``entries`` into one date shard of a stage's registry.
+
+    ``adopted`` entries come from the pre-#191 single object and are inserted
+    only where the shard has no entry for the key: anything already in the
+    shard was written after the split and is therefore newer than the copy the
+    legacy object still carries.
+    """
     path = completion_registry_shard_path(
         stage_name, shard_label, artifact_root=artifact_root, data_dir=data_dir
     )
     for _ in range(_REGISTRY_CAS_ATTEMPTS):
         if not artifact_exists(path):
             if write_json_artifact_if_absent(
-                path, _registry_payload(stage_name, shard_label, entries)
+                path,
+                _registry_payload(stage_name, shard_label, {**adopted, **entries}),
             ):
                 return path
             continue
@@ -399,6 +491,8 @@ def _save_registry_shard(
         except FileNotFoundError:
             continue
         merged = _parse_registry_payload(payload)
+        for key, entry in adopted.items():
+            merged.setdefault(key, entry)
         merged.update(entries)
         if replace_json_artifact_if_match(
             path, _registry_payload(stage_name, shard_label, merged), version=version
