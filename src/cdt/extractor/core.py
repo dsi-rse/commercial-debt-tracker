@@ -807,6 +807,63 @@ class OpenRouterChatClient:
         return completion_result_from_response(response)
 
 
+# A bare opening tag: NER output carries no attributes, but the high-water
+# check below counts tags in *earlier* attempts too, and those are exactly the
+# responses that failed — truncated mid-document, or never well-formed XML at
+# all. So the count is a regex rather than a parse, and tolerates an attribute
+# it should never see.
+DEBT_INSTRUMENT_OPEN_TAG_RE = re.compile(r"<debt_instrument(?:\s[^>]*)?>")
+
+
+def ner_input_body(row_state: ExtractionRowState) -> str:
+    """Return the exact `<body>`-wrapped text the NER stage sends the model.
+
+    Shared by `NERStage.preprocess` and the byte-identical-echo check in
+    `NERStage.validate` (#176) so the two cannot drift: the check means "the
+    model returned precisely what it was handed", and it is only true of a
+    string built the same way the request was. The text is wrapped unescaped,
+    which is deliberate and load-bearing elsewhere -- an item containing a bare
+    `&` produces a response that only parses after
+    `repair_unescaped_ampersands`.
+    """
+    return f"<body>{row_state.text}</body>"
+
+
+def count_debt_instrument_tags(response: str | None) -> int:
+    """Count `<debt_instrument>` opening tags in one raw NER response.
+
+    Deliberately not `parse_tag_details`: the callers include failed attempts,
+    whose responses are the ones that did not parse (11 of 27 NER failures on
+    the PR #57 window were `Response is not valid XML`, #127). A truncated
+    response with an unclosed tag still tells us the model was tagging, which
+    is the only question the high-water mark asks.
+    """
+    if not response:
+        return 0
+    return len(DEBT_INSTRUMENT_OPEN_TAG_RE.findall(response))
+
+
+def prior_debt_instrument_high_water(
+    row_state: ExtractionRowState, stage_name: str
+) -> int:
+    """Most `debt_instrument` tags any earlier attempt on this row produced.
+
+    `all_attempts` holds the completed attempts -- `retry` appends the outgoing
+    one before building the next -- so this never sees the response being
+    validated. `to_state_dict`/`from_state_dict` already round-trip
+    `all_attempts` in full, so the batch backend resumes with the same
+    high-water mark and needed no schema change (#176).
+    """
+    return max(
+        (
+            count_debt_instrument_tags(attempt.response)
+            for attempt in row_state.all_attempts
+            if attempt.stage_name == stage_name
+        ),
+        default=0,
+    )
+
+
 class NERStage:
     """NER stage using XML-tagged output."""
 
@@ -816,13 +873,61 @@ class NERStage:
         prompt = load_prompt("ner")
         return [
             {"role": "system", "content": prompt},
-            {"role": "user", "content": f"<body>{row_state.text}</body>"},
+            {"role": "user", "content": ner_input_body(row_state)},
         ]
 
     def validate(self, row_state: ExtractionRowState, response: str) -> list[str]:
+        """Check one NER response, and what it lost against the row's earlier ones.
+
+        The six structural checks below are each correct alone, and together
+        they admit the response that motivated #176: a bare
+        `<body>{input}</body>` with zero tags is well-formed, correctly rooted,
+        uses no disallowed tag, carries no attributes, has no empty tag, and
+        strips to text identical to the input. `early_stop` then reads zero
+        `debt_instrument` tags as "this filing disclosed no debt" and the row
+        publishes SUCCESS with no mentions -- indistinguishable downstream from
+        a genuine zero, and its completion record makes a re-run skip it.
+
+        MPLX item 2.03 (`000119312519257376-2-03`) is the case: attempts 1 and 2
+        tagged 91 `debt_instrument` spans each and failed only the copy-fidelity
+        check, and attempt 3 returned the model's own input byte for byte,
+        passed, and published 0 mentions against six note series and a term
+        loan. `000121390026025721-1-01` is the same story at 15 spans.
+
+        Two cross-attempt checks close it, because the row already held the
+        evidence to tell a give-up from a genuine zero:
+
+        * a high-water mark -- zero `debt_instrument` tags is a failure when an
+          earlier attempt on this row found some. It cannot misfire on a
+          debt-free item, which found none on attempt 1 either.
+        * a byte-identical echo of the input, *on a retry only*. On attempt 1
+          an untagged echo is the honest answer for an item with nothing to
+          tag, and the `NODEBT_NER` fixture is exactly that. On a retry the
+          model has been shown its error and told to fix it, so returning the
+          raw input addresses nothing. Measured over the three stored corpora
+          that carry attempt logs (761 attempt-1 NER responses in
+          `genwindow-run-branch`, `genwindow-run-dev`, `genwindow-sol-retried`):
+          zero attempt-1 echoes, and the 63 responses with no `debt_instrument`
+          tag all carried some other tag. The single echo in the corpus is
+          MPLX's attempt 3.
+        """
         if not response or not isinstance(response, str):
             return [
                 "Model returned empty or non-text output. Even if no entities are present, return the input text."
+            ]
+
+        # Compared before the ampersand repair, and against a string built by
+        # the same helper that built the request: the give-up this names is a
+        # byte-for-byte echo of what the model was sent. `add_response` has
+        # already incremented the index, so > 1 means "this is a retry".
+        if (
+            row_state.current_attempt.attempt_index > 1
+            and response.strip() == ner_input_body(row_state).strip()
+        ):
+            return [
+                "Response is byte-identical to the input text you were given, so it "
+                "addresses none of the previous errors and adds no tags. Re-emit your "
+                "previous tagged output with the text corrected."
             ]
 
         response = repair_unescaped_ampersands(response)
@@ -858,6 +963,14 @@ class NERStage:
             failures.append(
                 "Response text with tags stripped must match the input text exactly."
             )
+
+        high_water = prior_debt_instrument_high_water(row_state, self.name)
+        if high_water and not count_debt_instrument_tags(response):
+            failures.append(
+                f"Response contains no <debt_instrument> tags, but an earlier attempt "
+                f"on this item tagged {high_water}. Keep every tag you found and "
+                f"correct only the text."
+            )
         return failures
 
     def postprocess(self, row_state: ExtractionRowState) -> None:
@@ -875,10 +988,23 @@ class NERStage:
         )
 
     def build_retry_message(self, failures: list[str]) -> str:
+        """Build the NER retry turn, asking for a repair rather than a redo.
+
+        The version this replaces listed only what the *text* had to satisfy --
+        "return the original input text exactly", "the stripped text must match
+        the original input exactly" -- and made tagging sound optional ("only
+        add the allowed bare tags"). The cheapest response satisfying every
+        bullet was to add nothing, and on MPLX item 2.03 that is what came back
+        (#176). The preserve clause goes first so the instruction the model is
+        most likely to follow is the one it was previously missing.
+        """
         return (
             "Your previous NER output failed validation.\n"
             f"Validation errors: {failures}\n"
             "Retry requirements:\n"
+            "- Keep every tag from your previous output. Fix only the text so it "
+            "matches the input exactly.\n"
+            "- Returning the input untagged is not a valid fix; it will be rejected.\n"
             "- Return the original input text exactly, wrapped in <body>...</body>.\n"
             "- Only add the allowed bare tags.\n"
             "- Do not add attributes, comments, or extra text.\n"
@@ -2657,6 +2783,19 @@ def handle_response(
     return list(row_state.current_attempt.messages)
 
 
+def _ner_needed_a_retry(row_state: ExtractionRowState) -> bool:
+    """Whether any earlier NER attempt on this row failed validation.
+
+    Read off `all_attempts`, which `retry` has already appended the failed
+    attempt to, and which the batch backend round-trips through
+    `to_state_dict`, so a resumed row is judged the same as a live one (#176).
+    """
+    return any(
+        attempt.stage_name == NERStage.name and attempt.status == "FAILED"
+        for attempt in row_state.all_attempts
+    )
+
+
 def _advance_after_stage(
     row_state: ExtractionRowState,
     stage: StageSpec,
@@ -2664,6 +2803,28 @@ def _advance_after_stage(
 ) -> list[dict[str, str]] | None:
     """Move one row past a completed stage: finish it or start the next stage."""
     if stage.early_stop(row_state):
+        if stage.name == NERStage.name and _ner_needed_a_retry(row_state):
+            # A zero-tag NER response is normally the honest "this filing
+            # disclosed no debt", and early-stopping it SUCCESS is right. It is
+            # not right when the row only got here by retrying: the model
+            # already failed once on this item, so zero tags is at least as
+            # likely to be a give-up as a finding, and #152's precedent applies
+            # -- publish what there is (nothing) but leave a failure-registry
+            # record so the loss is counted and a re-run picks the item up
+            # instead of skipping it on a completion record (#176).
+            #
+            # `validate`'s high-water and echo checks catch the give-ups the row
+            # holds direct evidence for. This is the residual: a first attempt
+            # that failed for some other reason while itself finding no tags
+            # leaves nothing to compare against, so the outcome is marked
+            # uncertain rather than asserted clean.
+            row_state.salvage_notes.append(
+                "ner recovered on retry with no debt_instrument tags; the item "
+                "publishes no mentions and is recorded as a possible loss rather "
+                "than a clean zero"
+            )
+            row_state.finish("PARTIAL")
+            return None
         row_state.finish("SUCCESS")
         return None
     if stage_index == len(EXTRACTOR_STAGES) - 1:
