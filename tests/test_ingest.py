@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Self
 
 import pandas as pd
+import pytest
 
 from cdt.datasets import parse_date_shard_partition
 from cdt.ingest import (
@@ -21,6 +22,7 @@ from cdt.ingest import (
     acquire_documents,
     acquire_documents_for_date_range,
     default_failure_file,
+    default_output_root,
     documents_root,
     iter_filings,
     normalize_accession_number,
@@ -1090,3 +1092,150 @@ def test_sixk_document_partitions_are_canonical_date_shard_partitions() -> None:
     )
     assert partition["date"] == "2024-01-02"
     assert partition["shard"] == "0001"
+
+
+def _document_row(accession: str, filing_date: str) -> dict[str, object]:
+    return {
+        "accession_number": accession,
+        "cik": "320193",
+        "company_name": "Example Inc.",
+        "url": "https://sec.example/full.txt",
+        "text": "stored",
+        "date": filing_date,
+        "resource_uri": None,
+        "form_type": "8-K",
+        "source": "s3-manifest",
+    }
+
+
+def _store_document(data_dir: Path, accession: str, filing_date: str) -> None:
+    from cdt.storage import write_partition_table
+
+    write_partition_table(
+        documents_root(data_dir=data_dir),
+        partition={"date": filing_date, "shard": _document_shard(accession)},
+        table=pd.DataFrame(
+            [_document_row(accession, filing_date)], columns=DOCUMENT_COLUMNS
+        ),
+    )
+
+
+def test_existing_accessions_reads_only_the_windowed_partitions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dedup scan must not move the whole corpus to build a set of strings (#190).
+
+    ``documents`` is ~100% the ``text`` column at 1.345 MB/row (measured on
+    data/genwindow-eval-apr: 12.2 GB over 1,640 partitions), so a whole-corpus
+    scan was the single most expensive thing an otherwise no-op ingest did. The
+    file count read is pinned, not only the returned set: a version that read
+    every partition and then filtered would return the same set and be exactly
+    the bug.
+    """
+    from cdt import ingest
+
+    for day, accession in (
+        ("2024-01-01", "000000000024000001"),
+        ("2024-01-05", "000000000024000005"),
+        ("2024-01-06", "000000000024000006"),
+        ("2024-01-09", "000000000024000009"),
+    ):
+        _store_document(tmp_path, accession, day)
+
+    read_paths: list[str] = []
+    original = ingest.read_table
+
+    def recording_read_table(path: object, columns: object = None) -> pd.DataFrame:
+        read_paths.append(str(path))
+        return original(path, columns)
+
+    monkeypatch.setattr(ingest, "read_table", recording_read_table)
+
+    accessions = ingest._existing_accessions(
+        "documents",
+        output_root=default_output_root(tmp_path),
+        start_date=date(2024, 1, 5),
+        end_date=date(2024, 1, 6),
+    )
+
+    assert accessions == {"000000000024000005", "000000000024000006"}
+    assert len(read_paths) == 2
+    assert all(
+        "date=2024-01-05" in path or "date=2024-01-06" in path for path in read_paths
+    )
+
+
+def test_existing_accessions_projects_away_the_document_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the key column is requested: the text column is the entire cost (#190)."""
+    from cdt import ingest
+
+    _store_document(tmp_path, "000000000024000005", "2024-01-05")
+    requested: list[object] = []
+    original = ingest.read_table
+
+    def recording_read_table(path: object, columns: object = None) -> pd.DataFrame:
+        requested.append(columns)
+        return original(path, columns)
+
+    monkeypatch.setattr(ingest, "read_table", recording_read_table)
+
+    ingest._existing_accessions(
+        "documents",
+        output_root=default_output_root(tmp_path),
+        start_date=date(2024, 1, 5),
+        end_date=date(2024, 1, 5),
+    )
+
+    assert requested == [["accession_number"]]
+
+
+def test_reingest_inside_the_window_still_skips_the_download(tmp_path: Path) -> None:
+    """Windowing the dedup scan must not cost a re-download (#190).
+
+    The window is drawn from the same dates the candidates come from — a
+    candidate's ``date`` is its manifest's ``filing_date``, which is the day
+    prefix the manifest was listed under — so an already-ingested accession is
+    inside it.
+    """
+    accession = "000114036126006577"
+    _store_document(tmp_path, accession, "2024-01-02")
+    client = FakeS3Client(
+        {
+            (
+                "sec-bucket",
+                "sec/2024-01-02/8-K/320193/000114036126006577/manifest.json",
+            ): _manifest_bytes(
+                "320193",
+                "0001140361-26-006577",
+                "8-K",
+                "2024-01-02",
+                "COMPLETE SUBMISSION TEXT FILE",
+            ),
+            (
+                "sec-bucket",
+                "sec/2024-01-02/8-K/320193/000114036126006577/document.htm",
+            ): b"body",
+        }
+    )
+
+    _, result = run_ingest_pipeline(
+        IngestConfig(
+            mode="historical",
+            bucket="sec-bucket",
+            cik_file=tmp_path / "ciks.txt",
+            start_date=date(2024, 1, 2),
+            end_date=date(2024, 1, 2),
+            data_dir=tmp_path,
+            download=True,
+        ),
+        ciks={"320193"},
+        s3_client=client,
+    )
+
+    assert result.skipped_existing == 1
+    assert client.downloads == []
+    documents = read_dataset(documents_root(data_dir=tmp_path))
+    assert documents["accession_number"].to_list() == [accession]
+    assert documents["text"].to_list() == ["stored"]

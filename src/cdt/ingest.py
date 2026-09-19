@@ -30,7 +30,6 @@ from cdt.storage import (
     join_artifact_path,
     normalize_artifact_path,
     parse_s3_uri,
-    read_dataset,
     read_table,
     write_json_artifact,
     write_partition_table,
@@ -478,7 +477,14 @@ def run_ingest_pipeline(
     )
 
     existing_accessions = (
-        set() if config.force else _existing_accessions(documents_dataset_root)
+        set()
+        if config.force
+        else _existing_accessions(
+            config.dataset_name,
+            output_root=output_root,
+            start_date=config.start_date,
+            end_date=config.end_date,
+        )
     )
     seen_accessions: set[str] = set()
     pending_rows: list[dict[str, str]] = []
@@ -1166,13 +1172,55 @@ def repair_document_shards(documents_dataset_root: str) -> int:
     return len(strays)
 
 
-def _existing_accessions(documents_dataset_root: str) -> set[str]:
-    # Only the key column: with projection pushdown this skips deserializing
-    # every stored 8-K body just to build a set of accession numbers (#69).
-    table = read_dataset(documents_dataset_root, columns=["accession_number"])
-    if table.empty or "accession_number" not in table:
-        return set()
-    return set(table["accession_number"].astype(str))
+def _existing_accessions(
+    dataset_name: str,
+    *,
+    output_root: str,
+    start_date: date,
+    end_date: date,
+) -> set[str]:
+    """Return already-ingested accessions filed inside this run's date window.
+
+    This used to read the *whole* ``documents`` dataset projected to
+    ``accession_number``, and a comment credited #69's projection pushdown with
+    making that cheap. On S3 that credit was misplaced: ``read_table`` GETs the
+    entire object and only then hands pandas a ``columns=`` list, so projection
+    saved deserialization and nothing else. Measured on
+    ``data/genwindow-eval-apr``, ``documents`` is 12.2 GB across 1,640
+    partitions at 1.345 MB/row — essentially all of it the ``text`` column —
+    while the accession numbers alone are 0.2988 MB of compressed column
+    chunks. Every ingest, including one that turns out to have nothing to do,
+    moved the whole corpus to build a set of 9,077 strings (#190).
+
+    Scoping to ``[start_date, end_date]`` rests on the same invariant the
+    read-back at the end of ``run_ingest`` already relies on: a row is written
+    to the partition for its own ``candidate.date``, and ``candidate.date`` is
+    the manifest's ``filing_date``, which is also the day prefix
+    ``_iter_manifest_keys`` found it under. So every accession this run could be
+    offered is stored under a date in this window, and the window is exact.
+
+    Where the two differ is a manifest whose ``filing_date`` moved between runs
+    (a scraper repair): the stored copy is then under the old date, outside the
+    window, and this set misses it. The consequence is bounded — the document is
+    re-downloaded and rewritten under its new date — because this set is an
+    optimization, not the uniqueness guarantee. Uniqueness inside a partition is
+    ``_write_document_partitions``, which merges and then
+    ``drop_duplicates(subset=["accession_number"], keep="last")``. A cross-date
+    copy is what ``repair_document_shards`` exists to reconcile.
+    """
+    paths = iter_date_shard_partitions(
+        dataset_name,
+        artifact_root=output_root,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    accessions: set[str] = set()
+    for path in paths:
+        table = read_table(path, columns=["accession_number"])
+        if table.empty or "accession_number" not in table:
+            continue
+        accessions.update(table["accession_number"].astype(str))
+    return accessions
 
 
 def _write_document_partitions(
