@@ -92,12 +92,86 @@ def completion_registry_path(
     artifact_root: ArtifactPath | None = None,
     data_dir: Path | None = None,
 ) -> str:
-    """Return the path for one stage completion registry."""
+    """Return the prefix holding one stage's completion registry shards.
+
+    A prefix, not a single object, since #191. The registry used to be one
+    ``runs/<stage>/completed-partitions.json`` that every batch boundary read
+    *and* rewrote whole, under compare-and-swap. Measured at full corpus scale
+    with this module's own functions -- 8,533 business days x ~52 occupied
+    shards = 440,000 entries -- that object serializes to 56.8 MB (129 B per
+    entry; the real registry on ``data/genwindow-eval-apr`` measures 146 B per
+    entry over 1,640 entries), one compare-and-swap cycle moves 113.5 MB and
+    costs 3.2 s of JSON, and a single itemize pass does 4,400 of them: 499 GB
+    moved and 3.9 h of pure JSON CPU before any work happens. Sharded by the
+    source partition's year-month, a cycle touches only the one or two months
+    its 100-partition chunk covers and moves half a megabyte.
+
+    Callers that want the pre-#191 object -- read-compat and migration -- want
+    ``legacy_completion_registry_path`` instead.
+    """
+    return join_artifact_path(
+        resolve_artifact_root(artifact_root, data_dir=data_dir),
+        "runs",
+        stage_name,
+        "completed",
+    )
+
+
+def legacy_completion_registry_path(
+    stage_name: str,
+    *,
+    artifact_root: ArtifactPath | None = None,
+    data_dir: Path | None = None,
+) -> str:
+    """Return the pre-#191 single-object registry path, for read-compat.
+
+    Still read on every load, because an artifact root written before #191 has
+    all of its completion state here and nowhere else. Reading it as empty is
+    not a slow path, it is the #107 failure mode: ``force=False`` reported 0
+    pending partitions and ``force=True`` reported 20,046, because the registry
+    the run consulted was not the registry the corpus had.
+    """
     return join_artifact_path(
         resolve_artifact_root(artifact_root, data_dir=data_dir),
         "runs",
         stage_name,
         "completed-partitions.json",
+    )
+
+
+# The registry is sharded by its source partition's year-month. Stages walk
+# pending partitions in sorted path order, which is date order, so one
+# 100-partition chunk covers one or two consecutive dates and therefore one or
+# two shards. That locality is the whole mechanism: it is what turns a 56.8 MB
+# rewrite per batch boundary into a ~0.2 MB one (#191).
+_REGISTRY_SHARD_DATE_CHARS = len("YYYY-MM")
+# A key with no parseable partition date still has to round-trip. Dropping it
+# would silently lose completion state -- the same class of bug as reading a
+# legacy registry as empty -- so it gets a named shard of its own.
+_UNDATED_REGISTRY_SHARD = "unknown"
+
+
+def _registry_shard_label(key: str) -> str:
+    """Return the registry shard one entry's key belongs in."""
+    partition = match_date_shard_partition(key)
+    if partition is None:
+        return _UNDATED_REGISTRY_SHARD
+    return partition["date"][:_REGISTRY_SHARD_DATE_CHARS]
+
+
+def completion_registry_shard_path(
+    stage_name: str,
+    shard_label: str,
+    *,
+    artifact_root: ArtifactPath | None = None,
+    data_dir: Path | None = None,
+) -> str:
+    """Return the path of one date-prefix shard of a stage's registry."""
+    return join_artifact_path(
+        completion_registry_path(
+            stage_name, artifact_root=artifact_root, data_dir=data_dir
+        ),
+        f"date={shard_label}.json",
     )
 
 
@@ -174,13 +248,29 @@ def load_completion_registry(
     artifact_root: ArtifactPath | None = None,
     data_dir: Path | None = None,
 ) -> CompletionRegistry:
-    """Load one stage's completion registry, migrating v1 path lists in memory."""
-    path = completion_registry_path(
-        stage_name, artifact_root=artifact_root, data_dir=data_dir
+    """Load one stage's registry from every date shard, plus the legacy object.
+
+    The pre-#191 single object is read first and the date shards overlay it, so
+    an entry a run re-wrote after the split wins over the copy the legacy object
+    still carries. Loading is the one place that reads everything; it happens
+    once or twice per run, against the 4,400 saves per itemize pass that #191
+    is about.
+    """
+    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    entries: dict[str, CompletedPartition] = {}
+    legacy_path = legacy_completion_registry_path(
+        stage_name, artifact_root=resolved_root, data_dir=data_dir
     )
-    if not artifact_exists(path):
-        return CompletionRegistry()
-    return CompletionRegistry(_parse_registry_payload(read_json_artifact(path)))
+    if artifact_exists(legacy_path):
+        entries.update(_parse_registry_payload(read_json_artifact(legacy_path)))
+    for shard_path in list_artifacts(
+        completion_registry_path(
+            stage_name, artifact_root=resolved_root, data_dir=data_dir
+        ),
+        suffix=".json",
+    ):
+        entries.update(_parse_registry_payload(read_json_artifact(shard_path)))
+    return CompletionRegistry(entries)
 
 
 def _parse_registry_payload(payload: object) -> dict[str, CompletedPartition]:
@@ -210,12 +300,15 @@ def _parse_registry_payload(payload: object) -> dict[str, CompletedPartition]:
 
 
 def _registry_payload(
-    stage_name: str, registry: dict[str, CompletedPartition]
+    stage_name: str,
+    shard_label: str,
+    registry: dict[str, CompletedPartition],
 ) -> dict[str, object]:
-    """Build the persisted v2 payload for one registry."""
+    """Build the persisted v2 payload for one date shard of a registry."""
     return {
         "stage": stage_name,
         "version": 2,
+        "date_prefix": shard_label,
         "partitions": {
             path: {
                 "fingerprint": entry.fingerprint,
@@ -248,18 +341,56 @@ def save_completion_registry(
     ``CompletionRegistry.dirty`` set; every entry for a plain dict, which force
     runs and tests pass) are overlaid on the freshest persisted state, and a
     lost race re-reads and retries.
+
+    Since #191 the changed entries are grouped by date shard and each shard is
+    compare-and-swapped on its own, so a save reads and rewrites only the
+    months it touched instead of the whole corpus. Nothing else moves: the
+    payload format, the merge rule and the dirty-set semantics are the ones
+    above, applied per object rather than to one object. Because the dirty set
+    already records the write set, this is path derivation, not new
+    bookkeeping.
+
+    Each shard's compare-and-swap is independent, which is what keeps the
+    per-batch save of #111 durable: a save interrupted after three of five
+    shards leaves those three persisted, and every persisted entry is a
+    partition whose output was already written.
     """
-    path = completion_registry_path(
-        stage_name, artifact_root=artifact_root, data_dir=data_dir
-    )
+    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     changed = sorted(
         registry.dirty if isinstance(registry, CompletionRegistry) else registry
     )
+    by_shard: dict[str, dict[str, CompletedPartition]] = {}
+    for key in changed:
+        by_shard.setdefault(_registry_shard_label(key), {})[key] = registry[key]
+    for shard_label in sorted(by_shard):
+        _save_registry_shard(
+            stage_name,
+            shard_label,
+            by_shard[shard_label],
+            artifact_root=resolved_root,
+            data_dir=data_dir,
+        )
+    return completion_registry_path(
+        stage_name, artifact_root=resolved_root, data_dir=data_dir
+    )
+
+
+def _save_registry_shard(
+    stage_name: str,
+    shard_label: str,
+    entries: dict[str, CompletedPartition],
+    *,
+    artifact_root: ArtifactPath | None,
+    data_dir: Path | None,
+) -> str:
+    """Compare-and-swap ``entries`` into one date shard of a stage's registry."""
+    path = completion_registry_shard_path(
+        stage_name, shard_label, artifact_root=artifact_root, data_dir=data_dir
+    )
     for _ in range(_REGISTRY_CAS_ATTEMPTS):
         if not artifact_exists(path):
-            merged = {key: registry[key] for key in changed}
             if write_json_artifact_if_absent(
-                path, _registry_payload(stage_name, merged)
+                path, _registry_payload(stage_name, shard_label, entries)
             ):
                 return path
             continue
@@ -268,15 +399,14 @@ def save_completion_registry(
         except FileNotFoundError:
             continue
         merged = _parse_registry_payload(payload)
-        for key in changed:
-            merged[key] = registry[key]
+        merged.update(entries)
         if replace_json_artifact_if_match(
-            path, _registry_payload(stage_name, merged), version=version
+            path, _registry_payload(stage_name, shard_label, merged), version=version
         ):
             return path
     msg = (
         f"Lost {_REGISTRY_CAS_ATTEMPTS} compare-and-swap races persisting the "
-        f"{stage_name!r} completion registry at {path}"
+        f"{stage_name!r} completion registry shard at {path}"
     )
     raise RuntimeError(msg)
 
