@@ -584,3 +584,257 @@ def test_run_pipeline_runs_the_lineage_pass_between_match_and_publish(
         assert calls[0]["artifact_root"] == str(tmp_path / "artifacts")
         assert callable(calls[0]["renew"])
         assert renewals
+
+
+def _publish_all_four(final_root: Path) -> None:
+    """Stand in for a complete published generation under the database root.
+
+    Written directly rather than by running a real publish: the gate inspects
+    exactly these four objects, and seeding the *artifact* datasets with
+    placeholder rows would hand the matcher mention rows it cannot parse.
+    """
+    from cdt.pipeline import FINAL_OUTPUT_TABLES
+    from cdt.storage import write_table
+
+    for table_name in FINAL_OUTPUT_TABLES:
+        write_table(
+            str(final_root / table_name / "latest.parquet"),
+            pd.DataFrame([{"id": f"{table_name}-0"}]),
+        )
+
+
+def test_match_and_finalize_skips_the_publish_when_match_produced_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A no-op run must not re-read the whole corpus to republish it (#110).
+
+    Measured in production: publishing a delta of 14 documents took 25 minutes
+    and 21,214 sequential GETs at ~70 ms — the cost is request count, not bytes,
+    and it was paid whether or not the run produced anything. Both
+    ``run_batch_backend`` and ``run_poll`` finalize, so one batch cycle paid it
+    at least twice. The gate is the value the lineage pass one branch above
+    already consults.
+    """
+    from cdt import pipeline as pipeline_module
+
+    artifact_root = tmp_path / "artifacts"
+    final_root = tmp_path / "final"
+    _publish_all_four(final_root)
+
+    published: list[object] = []
+    monkeypatch.setattr(
+        pipeline_module,
+        "write_final_output_tables",
+        lambda **kwargs: published.append(kwargs) or {},
+    )
+
+    written = pipeline_module.run_match_and_finalize(
+        artifact_root=artifact_root, final_database_root=str(final_root)
+    )
+
+    assert published == []
+    assert written == {}
+
+
+def test_match_and_finalize_still_publishes_when_match_produced_instruments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gate must not stop a run that actually matched something (#110)."""
+    from cdt import pipeline as pipeline_module
+
+    monkeypatch.setattr(
+        pipeline_module, "apply_lineage_inference_pass", lambda *a, **k: {}
+    )
+    artifact_root = tmp_path / "artifacts"
+    final_root = tmp_path / "final"
+    _publish_all_four(final_root)
+    write_partition_table(
+        artifact_root / "mentions",
+        partition={"date": "2022-01-02", "shard": "0001"},
+        table=_mention_frame("Credit Agreement"),
+    )
+
+    published: list[object] = []
+    monkeypatch.setattr(
+        pipeline_module,
+        "write_final_output_tables",
+        lambda **kwargs: published.append(kwargs) or {},
+    )
+
+    pipeline_module.run_match_and_finalize(
+        artifact_root=artifact_root, final_database_root=str(final_root)
+    )
+
+    assert len(published) == 1
+
+
+def test_force_publishes_even_when_match_produced_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--force is the escape hatch for datasets left ahead of the pointer (#110)."""
+    from cdt import pipeline as pipeline_module
+
+    artifact_root = tmp_path / "artifacts"
+    final_root = tmp_path / "final"
+    _publish_all_four(final_root)
+
+    published: list[object] = []
+    monkeypatch.setattr(
+        pipeline_module,
+        "write_final_output_tables",
+        lambda **kwargs: published.append(kwargs) or {},
+    )
+
+    pipeline_module.run_match_and_finalize(
+        artifact_root=artifact_root,
+        final_database_root=str(final_root),
+        force=True,
+    )
+
+    assert len(published) == 1
+
+
+def test_an_unpublished_database_root_publishes_despite_an_empty_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A freshly pointed output root must get its first generation (#110).
+
+    Otherwise redirecting --final-database-root at a corpus that is already
+    fully matched would leave the new root empty until someone happened to pass
+    --force.
+    """
+    from cdt import pipeline as pipeline_module
+
+    artifact_root = tmp_path / "artifacts"
+
+    published: list[object] = []
+    monkeypatch.setattr(
+        pipeline_module,
+        "write_final_output_tables",
+        lambda **kwargs: published.append(kwargs) or {},
+    )
+
+    pipeline_module.run_match_and_finalize(
+        artifact_root=artifact_root,
+        final_database_root=str(tmp_path / "brand-new"),
+    )
+
+    assert len(published) == 1
+
+
+def test_a_partially_published_database_root_publishes(tmp_path: Path) -> None:
+    """Three of four latest.parquet objects is not a complete generation (#110)."""
+    from cdt.pipeline import FINAL_OUTPUT_TABLES, publish_would_republish_nothing
+    from cdt.storage import write_table
+
+    final_root = tmp_path / "final"
+    for table_name in list(FINAL_OUTPUT_TABLES)[:-1]:
+        write_table(
+            str(final_root / table_name / "latest.parquet"),
+            pd.DataFrame([{"id": "x"}]),
+        )
+
+    assert not publish_would_republish_nothing(
+        pd.DataFrame(), final_database_root=str(final_root), force=False
+    )
+
+
+def test_the_publish_gate_leaves_the_live_tables_untouched(tmp_path: Path) -> None:
+    """End to end, unmocked: a skipped publish does not disturb what is live (#110).
+
+    Deliberately not mocking ``write_final_output_tables``: if the gate failed
+    to fire, the real publish would read four empty artifact datasets and
+    clobber these four objects (or trip the shrinkage guard). Unchanged bytes
+    are the only proof that nothing ran.
+    """
+    from cdt import pipeline as pipeline_module
+    from cdt.pipeline import FINAL_OUTPUT_TABLES
+
+    artifact_root = tmp_path / "artifacts"
+    final_root = tmp_path / "final"
+    _publish_all_four(final_root)
+    paths = [final_root / name / "latest.parquet" for name in FINAL_OUTPUT_TABLES]
+    before = [path.read_bytes() for path in paths]
+
+    written = pipeline_module.run_match_and_finalize(
+        artifact_root=artifact_root, final_database_root=str(final_root)
+    )
+
+    assert written == {}
+    assert [path.read_bytes() for path in paths] == before
+
+
+def test_normalize_snapshot_text_is_not_the_publish_cost(tmp_path: Path) -> None:
+    """Recorded, not optimized: it is 1.2% of read+normalize (#110).
+
+    ``normalize_snapshot_text`` maps a Python lambda over every object column of
+    every row, which looks like it should dominate. Measured on
+    data/genwindow-eval-apr's 5,794-row x 16-column ``items`` dataset it is
+    0.113s against an 8.9s read — 1.2% — so the 25 minutes is I/O, not this, and
+    it was deliberately left alone. This test pins only that it still nulls
+    placeholders, which is the behaviour the dashboard depends on.
+    """
+    del tmp_path
+    from cdt.pipeline import normalize_snapshot_text
+
+    normalized = normalize_snapshot_text(
+        pd.DataFrame([{"a": "nan", "b": "real", "c": True}])
+    )
+
+    assert normalized["a"].to_list() == [None]
+    assert normalized["b"].to_list() == ["real"]
+    assert normalized["c"].to_list() == [True]
+
+
+@pytest.mark.parametrize(
+    ("instruments", "expected_publishes"),
+    [
+        (pd.DataFrame([{"debt_instrument_id": "instrument-1"}]), 1),
+        (pd.DataFrame(columns=["debt_instrument_id"]), 0),
+    ],
+    ids=["matched-something", "matched-nothing"],
+)
+def test_run_pipeline_skips_the_publish_when_match_produced_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    instruments: pd.DataFrame,
+    expected_publishes: int,
+) -> None:
+    """`cdt pipeline` and the live backend pay the same publish, so same gate (#110).
+
+    ``run_match_and_finalize`` is the batch backend's path; this is the other
+    two entry points. Gating only one of them would leave the identical
+    25-minute no-op publish in place for `cdt pipeline` and
+    `cdt-orchestrator --extractor-backend live`, which is the shape #170 took
+    when the lineage pass was wired into one path and not the others.
+    """
+    from cdt import pipeline as pipeline_module
+
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("320193\n", encoding="utf-8")
+    _stage_stubs(monkeypatch, tmp_path, instruments=instruments)
+    monkeypatch.setattr(
+        pipeline_module, "apply_lineage_inference_pass", lambda *a, **k: {}
+    )
+    final_root = tmp_path / "final"
+    _publish_all_four(final_root)
+
+    published: list[object] = []
+    monkeypatch.setattr(
+        pipeline_module,
+        "write_final_output_tables",
+        lambda **kwargs: published.append(kwargs) or {},
+    )
+
+    run_pipeline(
+        PipelineConfig(
+            mode="historical",
+            cik_file=str(cik_file),
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 1, 31),
+            artifact_root=str(tmp_path / "artifacts"),
+            final_database_root=str(final_root),
+        )
+    )
+
+    assert len(published) == expected_publishes
