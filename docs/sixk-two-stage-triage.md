@@ -260,9 +260,11 @@ tokens (1.31x), 88 of the 219 being merged groups.
 
 Cross-row deduplication after extraction — that is where duplicate *mentions*
 should be resolved, by comparing extracted values rather than inferring from
-prose. Publishing 6-K snippets into `items/latest.parquet` is also still open:
-it needs a dashboard-side change first, so 6-K reaches consumers through the
-instrument and mention tables rather than the snippet-level one.
+prose. Publishing 6-K snippets into `items/latest.parquet` is no longer open:
+the table is a union over both genres, stamped with a `form_type` column, so a
+6-K mention joins to its own snippet row rather than to nothing. What the
+website makes of a 6-K row's `item` -- a snippet id where an 8-K row carries a
+dotted item number -- is still a dashboard-side question.
 
 The scheduled pipeline does now run this stage: `pipeline.py` prepares both
 genres by default and the orchestrator takes `--genres` / `GENRES` to narrow a

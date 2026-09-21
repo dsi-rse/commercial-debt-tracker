@@ -33,7 +33,7 @@ The stage-oriented CLI is `cdt`. The deployment-oriented entrypoint is `cdt-orch
 
 After matching, the pipeline can optionally materialize four final snapshot tables for downstream consumers:
 
-- `items/latest.parquet` — both genres: 8-K item sections and 6-K snippets, in the itemizer's column shape. Every mention joins to its source row here by `item_id`, and consumers read the item text, the filing's SEC URL and its accession number off it — so a genre missing from this table publishes mentions that join to nothing. A 6-K row's `item` is its snippet id (`{accession}:{document}:{window}`) where an 8-K row's is a dotted item number; the snippet's own span and stage-2 verdict stay in `sixk-snippets`
+- `items/latest.parquet` — both genres: 8-K item sections and 6-K snippets, in the itemizer's column shape. Every mention joins to its source row here by `item_id`, and consumers read the item text, the filing's SEC URL and its accession number off it — so a genre missing from this table publishes mentions that join to nothing. A 6-K row's `item` is its snippet id (`{accession}:{document}:{window}`) where an 8-K row's is a dotted item number; the snippet's own span and stage-2 verdict stay in `sixk-snippets`. A `form_type` column (`8-K` or `6-K`) is stamped on each row as the table is published, because nothing in the itemizer's sixteen columns records which kind of filing a row came out of and the `item` column is not a reliable substitute
 - `debt-instruments/latest.parquet`
 - `debt-instrument-mentions/latest.parquet`
 - `mention-cluster-edges/latest.parquet`
@@ -248,7 +248,7 @@ Practical consequences when extending the matcher:
 
 After matching succeeds, CDT can write final parquet snapshots for dashboard and database consumers:
 
-- `items/latest.parquet` — both genres: 8-K item sections and 6-K snippets, in the itemizer's column shape. Every mention joins to its source row here by `item_id`, and consumers read the item text, the filing's SEC URL and its accession number off it — so a genre missing from this table publishes mentions that join to nothing. A 6-K row's `item` is its snippet id (`{accession}:{document}:{window}`) where an 8-K row's is a dotted item number; the snippet's own span and stage-2 verdict stay in `sixk-snippets`
+- `items/latest.parquet` — both genres: 8-K item sections and 6-K snippets, in the itemizer's column shape. Every mention joins to its source row here by `item_id`, and consumers read the item text, the filing's SEC URL and its accession number off it — so a genre missing from this table publishes mentions that join to nothing. A 6-K row's `item` is its snippet id (`{accession}:{document}:{window}`) where an 8-K row's is a dotted item number; the snippet's own span and stage-2 verdict stay in `sixk-snippets`. A `form_type` column (`8-K` or `6-K`) is stamped on each row as the table is published, because nothing in the itemizer's sixteen columns records which kind of filing a row came out of and the `item` column is not a reliable substitute
 - `debt-instruments/latest.parquet`
 - `debt-instrument-mentions/latest.parquet`
 - `mention-cluster-edges/latest.parquet`

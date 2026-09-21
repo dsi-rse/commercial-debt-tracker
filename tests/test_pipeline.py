@@ -172,6 +172,7 @@ def test_run_pipeline_uses_stage_backed_functions(
             extract_batch_size=13,
             match_batch_size=14,
             sixk_batch_size=15,
+            genres=DEFAULT_GENRES,
         )
     )
 
@@ -185,8 +186,10 @@ def test_run_pipeline_uses_stage_backed_functions(
     assert result.extracted_rows == 1
     assert result.matched_rows == 1
     assert result.debt_instrument_rows == 1
-    # Both genres by default, and the same CIKs asked of each: the caller says
-    # which issuers and which dates, not which forms those issuers filed.
+    # Both genres when asked for both, and the same CIKs asked of each: the
+    # caller says which issuers and which dates, not which forms those issuers
+    # filed. What a scheduled run defaults to is pinned on the orchestrator, in
+    # `test_scheduled_runs_prepare_both_genres_by_default`.
     assert result.genres == DEFAULT_GENRES
     assert calls == [
         ("ingest", {"320193"}),
@@ -320,10 +323,40 @@ def test_the_sixk_chain_can_take_its_own_cik_list(
             start_date=date(2026, 9, 8),
             end_date=date(2026, 9, 8),
             artifact_root=str(tmp_path),
+            genres=DEFAULT_GENRES,
         )
     )
 
     assert asked == {"8-K": {"320193"}, "6-K": {"1023514"}}
+
+
+def test_a_config_that_names_no_genres_does_not_acquire_the_sixk_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Building a config in code is not asking to scrape and pay a model.
+
+    The 6-K chain starts with a network scrape and ends in a paid LLM call, so
+    a caller that never mentions genres must not get it: the chain would run
+    for real in any test or script that stubs only the 8-K stages, which is
+    every caller written before 6-K existed. The scheduled run still prepares
+    both -- both entry points default their flag to `DEFAULT_GENRES` and pass
+    it through, pinned by `test_scheduled_runs_prepare_both_genres_by_default`.
+    """
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("320193\n", encoding="utf-8")
+
+    def explode(**_kwargs: object) -> None:
+        raise AssertionError("the 6-K chain ran without being asked for")
+
+    monkeypatch.setattr("cdt.pipeline.acquire_scraped_sixk_documents", explode)
+    monkeypatch.setattr("cdt.pipeline.triage_pending_documents", explode)
+
+    assert PipelineConfig(mode="historical", cik_file=str(cik_file)).genres == (
+        GENRE_8K,
+    )
+    # And DEFAULT_GENRES stays the wider vocabulary the flags default to, so
+    # narrowing this field cannot quietly narrow what `--genres 6-K` accepts.
+    assert DEFAULT_GENRES == (GENRE_8K, GENRE_6K)
 
 
 def test_normalize_genres_parses_validates_and_orders() -> None:
@@ -683,9 +716,20 @@ def test_published_items_union_both_genres_so_every_mention_can_join(
     assert joined["accession_number"] == "000165495426008172"
     # The 8-K rows the table already published are still there.
     assert len(published) == EXPECTED_UNIONED_ITEM_ROWS
-    # And the table keeps the itemizer's shape: the snippet's own span and
-    # verdict columns stay in `sixk-snippets` rather than widening this one.
-    assert list(published.columns) == ITEM_COLUMNS
+    # And the table keeps the itemizer's shape plus the one column that says
+    # which genre a row came from: the snippet's own span and verdict columns
+    # stay in `sixk-snippets` rather than widening this one.
+    assert list(published.columns) == [*ITEM_COLUMNS, "form_type"]
+    # Nothing else in the row distinguishes an item section from a snippet, so
+    # a consumer that needs to branch reads this rather than pattern-matching
+    # the item id.
+    assert joined["form_type"] == "6-K"
+    eightk = [
+        row
+        for _, row in published.iterrows()
+        if str(row["item_id"]) != "000165495426008172-6K-0-0-512"
+    ]
+    assert {str(row["form_type"]) for row in eightk} == {"8-K"}
 
 
 def test_final_snapshots_publish_atomically_with_pointer(tmp_path: Path) -> None:

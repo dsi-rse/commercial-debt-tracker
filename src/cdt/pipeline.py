@@ -89,6 +89,10 @@ FINAL_OUTPUT_TABLES: dict[str, tuple[Callable[..., str], ...]] = {
 #: The snippet's own span and verdict stay queryable in ``sixk-snippets``.
 FINAL_OUTPUT_TABLE_COLUMNS: dict[str, list[str]] = {"items": ITEM_COLUMNS}
 
+#: The column stamped on a unioned table's rows to say which dataset they came
+#: from, appended after the projection above.
+FORM_TYPE_COLUMN = "form_type"
+
 #: The two filing genres the pipeline knows how to prepare. A genre is a form
 #: family plus the stages that turn it into rows the extractor can read: 8-K
 #: goes ingest → itemize → classify, 6-K goes ingest → triage. They converge at
@@ -101,6 +105,18 @@ GENRE_6K = "6-K"
 #: when a run is deliberately about one of them.
 DEFAULT_GENRES: tuple[str, ...] = (GENRE_8K, GENRE_6K)
 GENRES = DEFAULT_GENRES
+
+#: Published table -> the ``form_type`` stamped on each dataset it unions,
+#: positionally matching FINAL_OUTPUT_TABLES. Only ``items`` unions more than
+#: one dataset, and it is the one table where a consumer otherwise cannot tell
+#: the genres apart: an 8-K item section and a 6-K snippet are both "the unit
+#: of text a mention came from", and none of the itemizer's sixteen columns
+#: records which kind of filing it came out of. ``form_type`` rather than a
+#: new name because the documents dataset already calls it that and already
+#: carries these same two values, so one vocabulary covers both ends.
+FINAL_OUTPUT_TABLE_FORM_TYPES: dict[str, tuple[str, ...]] = {
+    "items": (GENRE_8K, GENRE_6K),
+}
 
 ALL_TIME_START_DATE = date(1994, 1, 1)
 # Daily mode re-scans this many days back (ending yesterday) so late-arriving
@@ -142,8 +158,15 @@ class PipelineConfig:
     strong_match_threshold: float = DEFAULT_MEMBERSHIP_THRESHOLD
     loose_match_threshold: float = DEFAULT_RELATED_THRESHOLD
     ambiguity_margin: float = DEFAULT_AMBIGUITY_MARGIN
-    #: Which genres to prepare; both unless narrowed. See DEFAULT_GENRES.
-    genres: tuple[str, ...] = DEFAULT_GENRES
+    #: Which genres to prepare. Deliberately narrower than DEFAULT_GENRES,
+    #: which is what both entry points default their `--genres` flag to and
+    #: pass through here — so a scheduled or hand-typed run still prepares
+    #: both, and `test_scheduled_runs_prepare_both_genres_by_default` pins
+    #: that. Building a config in code is not asking for a run, though, and
+    #: the 6-K chain scrapes the network and calls a paid model before it
+    #: does anything else. A caller that never mentions genres should get
+    #: the stages it named and nothing that spends money on its behalf.
+    genres: tuple[str, ...] = (GENRE_8K,)
     #: CIKs for the 6-K genre, when they differ from the run's. Defaults to
     #: `cik_file`: one list of issuers is the point, and a separate one exists
     #: only because a list chosen for 8-K coverage can contain no foreign
@@ -848,12 +871,24 @@ def _read_published_table(
     would widen the integer columns of the frames beside it to float to make
     room — silently changing a published table's types on any run where one
     genre produced nothing.
+
+    Where a table unions more than one dataset, each frame is stamped with the
+    ``form_type`` it came from before the concat, so the genres stay tellable
+    apart in the published table. Stamped here rather than read from the source
+    because neither dataset carries the column: the itemizer deliberately does
+    not copy it out of the documents dataset, to keep an ingest-side column
+    from reshaping four datasets at once.
     """
     columns = FINAL_OUTPUT_TABLE_COLUMNS.get(table_name)
-    frames = [
-        read_dataset(dataset_root_fn(artifact_root, data_dir=data_dir), columns=columns)
-        for dataset_root_fn in dataset_root_fns
-    ]
+    form_types = FINAL_OUTPUT_TABLE_FORM_TYPES.get(table_name)
+    frames: list[pd.DataFrame] = []
+    for index, dataset_root_fn in enumerate(dataset_root_fns):
+        frame = read_dataset(
+            dataset_root_fn(artifact_root, data_dir=data_dir), columns=columns
+        )
+        if form_types is not None:
+            frame[FORM_TYPE_COLUMN] = form_types[index]
+        frames.append(frame)
     populated = [frame for frame in frames if not frame.empty]
     if not populated:
         return frames[0]
