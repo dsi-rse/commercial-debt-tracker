@@ -1852,6 +1852,7 @@ def mint_prior_state_rows(
             (entry for entry in prior_dates if entry.get("kind") == "agreement"), None
         )
         origin_payloads: list[dict[str, object]]
+        minted_without_origin = False
         if prior_agreement is not None:
             # "amends and restates the Credit Agreement dated as of X": X is the
             # predecessor's own date. The current closing and agreement are the
@@ -1875,8 +1876,7 @@ def mint_prior_state_rows(
                 for payload in candidates
                 if payload.get("normalized_date") not in amendment_dates
             ]
-            if not origin_payloads:
-                bump("minted_no_origin")
+            minted_without_origin = not origin_payloads
             origin_date = (
                 text(origin_payloads[0].get("normalized_date"))
                 if origin_payloads
@@ -2007,6 +2007,14 @@ def mint_prior_state_rows(
             continue
         known_ids.add(minted_id)
         published.append(minted)
+        # Here and not where the origin was resolved, so the tag really is one
+        # on a subset of `minted`: two guards still stand between that point
+        # and the append, and a row that trips either of them had no P minted
+        # for it. Bumped early, `minted_no_origin: 1` could sit beside
+        # `skipped_sibling_is_predecessor: 1` and no synthesized row at all,
+        # which reads as a mint that never happened (#211).
+        if minted_without_origin:
+            bump("minted_no_origin")
         bump("minted")
     return published
 
