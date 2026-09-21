@@ -1399,6 +1399,44 @@ def test_mint_places_the_predecessor_at_the_right_origin() -> None:
     assert minted["principal_amount"] == "300000000"
 
 
+def test_minted_no_origin_is_not_counted_when_the_mint_is_then_refused() -> None:
+    """The tag names a subset of `minted`, so it cannot outlive a refusal.
+
+    Bumped where the origin was resolved, `minted_no_origin` fired ahead of the
+    two guards that still stand between that point and the append. A successor
+    whose only origin candidate is its own amendment date, sitting beside the
+    sibling that *is* its predecessor, then reported `minted_no_origin: 1` with
+    no synthesized row anywhere — a mint that never happened, inside the
+    counters this docstring calls the pre-registered yield (#211).
+    """
+    from cdt.extractor.core import mint_prior_state_rows
+
+    successor = amended_row(
+        "m-successor",
+        dates=[
+            # The only origin candidate is the restatement's own dated-as-of,
+            # which is what empties `origin_payloads`.
+            _fact(kind="agreement", normalized_date="2024-06-01", prior=False),
+            _fact(kind="amendment", normalized_date="2024-06-01", prior=False),
+        ],
+    )
+    # The model returned the predecessor as its own object: it carries the
+    # successor's prior commitment and states no start date of its own.
+    predecessor = amended_row(
+        "m-predecessor",
+        amounts=[],
+        dates=[],
+        principal_amount="300000000",
+        start_date=None,
+    )
+
+    counters: dict[str, int] = {}
+    published = mint_prior_state_rows([successor, predecessor], counters)
+
+    assert counters == {"skipped_sibling_is_predecessor": 1}
+    assert not [row for row in published if row.get("synthesized_by") == "prior_state"]
+
+
 def test_mint_from_a_prior_maturity_alone_inherits_the_amount() -> None:
     """`extended the maturity from 2029 to 2031`: the commitment is unchanged."""
     from cdt.extractor.core import mint_prior_state_rows
@@ -1536,6 +1574,40 @@ def test_backfill_mints_over_existing_partitions_and_is_a_no_op_twice(
         r["debt_instrument_mention_id"] for r in published_mention_rows(row_state)
     }
     assert write_time == set(published["debt_instrument_mention_id"])
+
+
+def test_backfill_renews_the_writer_lease_once_per_rewritten_partition(
+    tmp_path: Path,
+) -> None:
+    """A whole-dataset rewrite must keep renewing, or it outlives its lease.
+
+    The CLI hands `backfill_mentions` a renewal callback, and a test pins that
+    it does. Nothing pinned that the function ever calls it: deleting the
+    `renew()` block left the whole suite green, so the #89 guard could be
+    removed without a single failure. Same shape as the seams this branch
+    exists to close — both halves pinned, the connection not (#211).
+    """
+    from cdt.extractor.core import backfill_mentions
+
+    for date, mention_id in (("2024-06-01", "m-june"), ("2024-07-01", "m-july")):
+        write_partition_table(
+            tmp_path / "mentions",
+            partition={"date": date, "shard": "0001"},
+            table=pd.DataFrame(
+                [amended_row(mention_id)], columns=DEBT_INSTRUMENT_MENTION_COLUMNS
+            ),
+        )
+
+    # A dry run writes nothing, so it takes no lease and must not renew one.
+    renewals: list[int] = []
+    dry = backfill_mentions(tmp_path, dry_run=True, renew=lambda: renewals.append(1))
+    assert dry["partitions_rewritten"] == 0
+    assert renewals == []
+
+    counts = backfill_mentions(tmp_path, renew=lambda: renewals.append(1))
+
+    assert counts["partitions_rewritten"] == 2
+    assert len(renewals) == counts["partitions_rewritten"]
 
 
 def test_instrument_ie_validate_accepts_party_kinds_and_roles() -> None:
