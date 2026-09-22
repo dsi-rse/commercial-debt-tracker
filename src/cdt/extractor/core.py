@@ -2019,9 +2019,7 @@ def mint_prior_state_rows(
     return published
 
 
-def published_mention_rows(
-    row_state: ExtractionRowState, counters: dict[str, int] | None = None
-) -> list[dict[str, object]]:
+def published_mention_rows(row_state: ExtractionRowState) -> list[dict[str, object]]:
     """Return the mention rows one row state publishes.
 
     The one seam between what the model returned for an item and what the
@@ -2030,11 +2028,19 @@ def published_mention_rows(
     record — goes through here, so `mint_prior_state_rows` (#203) is applied
     once and identically on every backend, including rows of an in-flight batch
     job whose IE postprocess ran under older code, while `state.jsonl` keeps
-    carrying only what the model returned. Works on copies: the successor's
-    `amendment_of` is set on the published row, never on the persisted state.
+    carrying only what the model returned. The successor's `amendment_of` is
+    set on the published row and never on the persisted state, which
+    `mint_prior_state_rows` now guarantees of its own argument — so this no
+    longer copies ahead of it (#211).
+
+    No `counters`: nothing passed one, and keeping a parameter for a caller
+    that does not exist yet is the shape this module's tests forbid one
+    function over in `lineage_inference`. The mint counters are read off
+    `cdt backfill-mentions`, which is where the pre-registered yield is
+    measured; a live-path counter should arrive with the manifest field that
+    would carry it.
     """
-    rows = [dict(row) for row in row_state.debt_instrument_mentions]
-    return mint_prior_state_rows(rows, counters)
+    return mint_prior_state_rows(row_state.debt_instrument_mentions)
 
 
 def backfill_mentions(

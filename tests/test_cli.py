@@ -780,12 +780,18 @@ def test_parse_item_numbers_rejects_empty_list() -> None:
         raise AssertionError("expected argparse to reject an empty item-number list")
 
 
-def test_backfill_mentions_cli_reports_counts_and_skips_the_lease_on_dry_run(
+def test_backfill_mentions_cli_takes_and_renews_the_lease_only_when_it_writes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """`backfill-mentions --dry-run` counts without a lease; without it, it writes."""
+    """Three legs: a dry run, a writing run, and a run refused by a held lease.
+
+    `--dry-run` counts without taking a lease and so passes no renewal hook.
+    The writing leg takes the pipeline-writer lease and hands over a renewer,
+    because it rewrites the whole mentions dataset (#89). A third run, with the
+    lease already held, must not start at all.
+    """
     calls: list[dict[str, object]] = []
 
     def fake_backfill_mentions(
