@@ -2668,30 +2668,101 @@ def test_ner_high_water_survives_the_resumable_batch_state() -> None:
 # #127: a NER-specific attempt budget, and unbilled content_filter aborts
 # --------------------------------------------------------------------------- #
 
+# The debt-free item and its honest answer: an untagged echo is correct here,
+# which is what makes it the right probe for the echo guard's retry-only rule.
+NODEBT_TEXT = "This is the extracted event text."
+NODEBT_NER = f"<body>{NODEBT_TEXT}</body>"
+
+# As observed live: aborted upstream, nothing generated, nothing billed.
 CONTENT_FILTERED = CompletionResult(
     text="",
     finish_reason="content_filter",
-    # As observed live: aborted upstream, nothing generated, nothing billed.
     usage={"completion_tokens": 0, "prompt_tokens": 0, "cost": 0.0},
 )
+
+
+def _stopped(text: str) -> CompletionResult:
+    return CompletionResult(text=text, finish_reason="stop")
+
+
+class _ScriptedCompletionClient:
+    """Fake chat client replaying scripted `CompletionResult`s.
+
+    Unlike the text-only scripted client in `test_extractor_batch.py`, this one
+    scripts the whole completion, so a `content_filter` abort can be injected
+    where it really occurs -- at the provider boundary, above
+    `handle_response` -- rather than simulated by hand-feeding the scorer
+    (#127, #135).
+    """
+
+    def __init__(
+        self: _ScriptedCompletionClient, completions: list[CompletionResult]
+    ) -> None:
+        """Store the completions to hand back in order."""
+        self.completions = list(completions)
+        self.requests: list[list[dict[str, str]]] = []
+
+    async def complete(
+        self: _ScriptedCompletionClient,
+        *,
+        messages: list[dict[str, str]],
+        model: str,
+        reasoning_effort: str,
+    ) -> CompletionResult:
+        """Record the request and return the next scripted completion."""
+        del model, reasoning_effort
+        self.requests.append([dict(message) for message in messages])
+        return self.completions[len(self.requests) - 1]
+
+
+def _run_live(
+    text: str, completions: list[CompletionResult], max_attempts: int = 3
+) -> tuple[ExtractionRowState, _ScriptedCompletionClient]:
+    """Drive the real live loop, returning (row_state, client)."""
+    import asyncio
+
+    from cdt.extractor.core import run_extraction_workflow
+
+    client = _ScriptedCompletionClient(completions)
+    row_state = asyncio.run(
+        run_extraction_workflow(
+            item_row={"item_id": "item-1", "text": text},
+            model="m",
+            reasoning_effort="none",
+            max_attempts=max_attempts,
+            client=client,
+        )
+    )
+    return row_state, client
 
 
 def test_ner_gets_a_bigger_attempt_budget_than_the_other_stages() -> None:
     """`max_attempts` used to be one global budget for all three stages (#127)."""
     from cdt.extractor.core import NER_EXTRA_ATTEMPTS, stage_max_attempts
 
-    row_state = _ner_row(MPLX_TEXT)
-
     # Spelled as literals, not as `3 + NER_EXTRA_ATTEMPTS`: the budget is the
     # thing under test, so restating the constant would assert nothing.
     assert NER_EXTRA_ATTEMPTS == 3
-    assert stage_max_attempts(row_state, "ner", 3) == 6
-    assert stage_max_attempts(row_state, "instrument_ie", 3) == 3
-    assert stage_max_attempts(row_state, "instrument_relation", 3) == 3
+    assert stage_max_attempts("ner", 3) == 6
+    assert stage_max_attempts("instrument_ie", 3) == 3
+    assert stage_max_attempts("instrument_relation", 3) == 3
     # Added to the operator's knob rather than replacing it, so NER's budget is
     # never below the rest of the pipeline's and `--max-attempts` still moves it.
-    assert stage_max_attempts(row_state, "ner", 1) == 4
-    assert stage_max_attempts(row_state, "ner", 10) == 13
+    assert stage_max_attempts("ner", 1) == 4
+    assert stage_max_attempts("ner", 10) == 13
+
+
+def test_the_budget_counts_only_scored_attempts_not_provider_aborts() -> None:
+    """An abort is not an attempt, so it cannot shrink or grow the budget (#127).
+
+    The budget is a function of the stage and the operator's knob alone. Aborts
+    are classified above `handle_response` and never reach it, so there is no
+    forgiveness term to keep in step with a resend cap.
+    """
+    from cdt.extractor.core import stage_max_attempts
+
+    assert stage_max_attempts.__code__.co_argcount == 2
+    assert stage_max_attempts("ner", 3) == 6
 
 
 def test_a_content_filtered_attempt_is_resent_as_the_original_request() -> None:
@@ -2702,98 +2773,134 @@ def test_a_content_filtered_attempt_is_resent_as_the_original_request() -> None:
     in the row then pays prompt tokens for. A `content_filter` abort is not the
     model answering badly, so the same request goes back out unchanged.
     """
-    from cdt.extractor.core import handle_response
+    row_state, client = _run_live(NODEBT_TEXT, [CONTENT_FILTERED, _stopped(NODEBT_NER)])
 
-    row_state = _ner_row(MPLX_TEXT)
-    original = NERStage().preprocess(row_state)
-    row_state.current_attempt.messages = list(original)
+    assert len(client.requests) == 2
+    # Byte-identical resend: no assistant turn, no complaint, same request.
+    assert client.requests[1] == client.requests[0]
+    assert all(message["role"] != "assistant" for message in client.requests[1])
+    assert row_state.state == "SUCCESS"
 
-    next_messages = handle_response(
-        row_state, "", max_attempts=3, completion=CONTENT_FILTERED
-    )
 
-    assert next_messages == original
-    assert all(message["role"] != "assistant" for message in next_messages or [])
-    # The attempt still counts as a call made, for the audit log and #135's
-    # telemetry, even though the budget forgives it.
-    assert row_state.all_attempts[-1].attempt_index == 1
-    assert row_state.all_attempts[-1].finish_reason == "content_filter"
-    assert row_state.current_attempt.attempt_index == 1
+def test_a_provider_abort_is_recorded_but_not_scored() -> None:
+    """The audit log keeps the call; the scorer never sees it (#127, #135).
+
+    `attempt_index` stays a true count of *scored* attempts, so the model's
+    first real answer is attempt 1 even when the provider aborted first -- which
+    is what keeps #176's cross-attempt checks from reading an abort as a retry.
+    """
+    row_state, _ = _run_live(NODEBT_TEXT, [CONTENT_FILTERED, _stopped(NODEBT_NER)])
+
+    statuses = [
+        (a.stage_name, a.attempt_index, a.status) for a in row_state.all_attempts
+    ]
+    assert statuses == [("ner", 0, "ABORTED"), ("ner", 1, "SUCCESS")]
+    aborted = row_state.all_attempts[0]
+    assert aborted.finish_reason == "content_filter"
+    assert aborted.usage == {"completion_tokens": 0, "prompt_tokens": 0, "cost": 0.0}
+    # The request is identical to the scored attempt's, so it is not stored twice.
+    assert aborted.messages == []
 
 
 def test_content_filter_aborts_do_not_consume_the_stage_budget() -> None:
-    """Unbilled attempts that returned no verdict must not spend the row's budget.
+    """Unscored calls must not spend the row's attempts (#127, #135).
 
     Eleven of thirteen live NER calls came back `content_filter` with
     `completion_tokens=0` and `cost=0.0`, and the cut point is nondeterministic
     (1,163 / 280 / 1,375 characters on three repeats of one item), so resending
-    is both correct and free (#127, #135).
+    is both correct and free.
     """
-    from cdt.extractor.core import handle_response
+    # Three aborts, then NER's full budget of six real attempts, all rejected.
+    completions = [CONTENT_FILTERED] * 3 + [_stopped("not xml")] * 6
+    row_state, client = _run_live(MPLX_TEXT, completions)
 
-    row_state = _ner_row(MPLX_TEXT)
-    row_state.current_attempt.messages = NERStage().preprocess(row_state)
-
-    for _ in range(3):
-        assert (
-            handle_response(row_state, "", max_attempts=3, completion=CONTENT_FILTERED)
-            is not None
-        )
-
-    # The three aborts cost the row nothing: NER's full budget of 6 real
-    # attempts is still ahead of it, so the row terminates on call 9.
-    stopped = CompletionResult(text="not xml", finish_reason="stop")
-    calls = 3
-    result: list[dict[str, str]] | None = [{}]
-    while result is not None and calls < 40:
-        result = handle_response(
-            row_state, "not xml", max_attempts=3, completion=stopped
-        )
-        calls += 1
-
-    assert calls == 9
+    assert len(client.requests) == 9
     assert row_state.state == "FAILED"
+    scored = [a for a in row_state.all_attempts if a.status != "ABORTED"]
+    assert [a.attempt_index for a in scored] == [1, 2, 3, 4, 5, 6]
 
 
 def test_persistent_content_filtering_terminates_at_the_resend_cap() -> None:
     """Free retries still have to stop: the row cannot spin forever (#127)."""
-    from cdt.extractor.core import (
-        MAX_CONTENT_FILTER_RESENDS,
-        NER_EXTRA_ATTEMPTS,
-        handle_response,
-    )
+    from cdt.extractor.core import MAX_CONTENT_FILTER_RESENDS
 
-    row_state = _ner_row(MPLX_TEXT)
-    row_state.current_attempt.messages = NERStage().preprocess(row_state)
+    # Pinned as a literal: the cap bounds spend on a filtered row, so restating
+    # the constant here would assert nothing about its value.
+    assert MAX_CONTENT_FILTER_RESENDS == 6
 
-    calls = 0
-    result: list[dict[str, str]] | None = [{}]
-    while result is not None and calls < 100:
-        result = handle_response(
-            row_state, "", max_attempts=3, completion=CONTENT_FILTERED
-        )
-        calls += 1
+    row_state, client = _run_live(MPLX_TEXT, [CONTENT_FILTERED] * 40)
 
-    # Six forgiven aborts on top of NER's six real attempts, and no more: the
-    # forgiveness is capped, so the budget is too.
-    assert calls == 3 + NER_EXTRA_ATTEMPTS + MAX_CONTENT_FILTER_RESENDS
+    # Six unscored resends, then the aborts are scored like any other bad
+    # answer and burn NER's six real attempts: 12 calls, and no more.
+    assert len(client.requests) == 12
     assert row_state.state == "FAILED"
+    assert sum(1 for a in row_state.all_attempts if a.status == "ABORTED") == 6
 
 
-def test_content_filter_forgiveness_survives_the_resumable_batch_state() -> None:
-    """A batch row can cross a process exit between an abort and its resend (#127)."""
-    from cdt.extractor.core import count_content_filter_aborts, handle_response
+def test_content_filter_resend_cap_survives_the_resumable_batch_state() -> None:
+    """A batch row can cross a process exit between an abort and its resend (#127).
+
+    The cap is read off `all_attempts` rather than a counter held by the
+    caller, precisely because the batch backend folds one response per tick.
+    """
+    from cdt.extractor.core import count_content_filter_aborts
 
     row_state = _ner_row(MPLX_TEXT)
     row_state.current_attempt.messages = NERStage().preprocess(row_state)
     for _ in range(2):
-        handle_response(row_state, "", max_attempts=3, completion=CONTENT_FILTERED)
+        row_state.record_unbilled_abort("", CONTENT_FILTERED)
 
     assert count_content_filter_aborts(row_state, "ner") == 2
 
     restored = ExtractionRowState.from_state_dict(row_state.to_state_dict())
 
     assert count_content_filter_aborts(restored, "ner") == 2
+    # And the outstanding request is unchanged, so the resend is byte-identical.
+    assert restored.current_attempt.messages == NERStage().preprocess(row_state)
+    assert restored.current_attempt.attempt_index == 0
+
+
+# --------------------------------------------------------------------------- #
+# #176 and #127 together: an abort must not look like a retry
+# --------------------------------------------------------------------------- #
+
+
+def test_an_abort_does_not_make_an_honest_zero_tag_row_partial() -> None:
+    """A provider abort is not the model failing, so the row is a clean zero (#176, #127).
+
+    `_ner_needed_a_retry` keys off attempts the model actually answered badly.
+    An aborted call carries its own status, so a debt-free item whose first
+    call was aborted still publishes SUCCESS rather than a PARTIAL recorded as
+    a possible loss.
+    """
+    tagged_no_debt = (
+        "<body><organization>Acme Corp</organization> filed this report on "
+        "<date>January 1, 2024</date>.</body>"
+    )
+    row_state, _ = _run_live(
+        "Acme Corp filed this report on January 1, 2024.",
+        [CONTENT_FILTERED, _stopped(tagged_no_debt)],
+    )
+
+    assert row_state.state == "SUCCESS"
+    assert row_state.salvage_notes == []
+
+
+def test_after_a_resend_the_next_answer_is_still_a_first_attempt() -> None:
+    """The echo guard must not fire on an answer the model was never corrected on.
+
+    The model has been shown no error after a provider abort -- the pristine
+    request went back out -- so an untagged echo is still the honest answer for
+    an item with nothing to tag (#176, #127).
+    """
+    echo = f"<body>{NODEBT_TEXT}</body>"
+    row_state, client = _run_live(NODEBT_TEXT, [CONTENT_FILTERED, _stopped(echo)])
+
+    assert len(client.requests) == 2
+    scored = [a for a in row_state.all_attempts if a.status != "ABORTED"]
+    assert [a.validation_errors for a in scored] == [[]]
+    assert row_state.state == "SUCCESS"
+    assert row_state.debt_instrument_mentions == []
 
 
 def test_normalized_date_from_text_reads_every_filing_spelling() -> None:

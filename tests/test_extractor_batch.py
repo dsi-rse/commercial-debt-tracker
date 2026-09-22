@@ -33,8 +33,11 @@ from cdt.extractor.batch import (
     JobState,
     OpenAIBatchClient,
     RowEntry,
+    _awaiting_rows,
     _batch_error_messages,
+    _build_requests,
     _fold_completed_batches,
+    _fold_one_response,
     _load_state_jsonl,
     _reconcile_orphans,
     _serialize_state_jsonl,
@@ -45,9 +48,11 @@ from cdt.extractor.batch import (
 )
 from cdt.extractor.core import (
     EXTRACTOR_TEMPERATURE,
+    MAX_CONTENT_FILTER_RESENDS,
     REASONING_EFFORTS,
     CompletionResult,
     ExtractionRowState,
+    count_content_filter_aborts,
     extract_batch_response_text,
     handle_response,
     initial_messages,
@@ -1633,3 +1638,83 @@ def test_live_client_sends_request_timeout(monkeypatch: pytest.MonkeyPatch) -> N
         asyncio.run(client.complete(messages=[], model="m", reasoning_effort=""))
 
     assert captured["timeout_ms"] == LIVE_REQUEST_TIMEOUT_SECONDS * 1000
+
+
+# --------------------------------------------------------------------------- #
+# #127: the batch twin of the live loop's unbilled-abort resend
+# --------------------------------------------------------------------------- #
+
+BATCH_CONTENT_FILTERED = CompletionResult(
+    text="",
+    finish_reason="content_filter",
+    usage={"completion_tokens": 0, "prompt_tokens": 0, "cost": 0.0},
+)
+
+
+def _awaiting_entry(text: str) -> RowEntry:
+    """A row that has just had a batch result folded back into it."""
+    row_state = ExtractionRowState(item_row=_item_row("item-1", text), stage_name="ner")
+    row_state.current_attempt.messages = initial_messages(row_state) or []
+    # `_fold_completed_batches` clears `pending` before it folds.
+    return RowEntry(row_state=row_state, date="2024-01-02", shard="0001", pending=None)
+
+
+def test_batch_fold_resends_a_provider_abort_without_scoring_it() -> None:
+    """The abort branch must be live on the backend the project uses at scale (#127).
+
+    `_fold_one_response` is the only thing that activates it in batch mode, and
+    a resend there means the row stays awaiting with its request untouched so
+    the next tick re-submits the identical bytes.
+    """
+    entry = _awaiting_entry(NODEBT_TEXT)
+    original = [dict(message) for message in entry.row_state.current_attempt.messages]
+
+    _fold_one_response(entry, BATCH_CONTENT_FILTERED, 3)
+
+    # Not scored: no response recorded, no attempt consumed.
+    assert entry.row_state.current_attempt.response is None
+    assert entry.row_state.current_attempt.attempt_index == 0
+    assert entry.row_state.state is None
+    # Recorded for the audit log and for the resend cap across a process exit.
+    assert count_content_filter_aborts(entry.row_state, "ner") == 1
+    assert entry.row_state.all_attempts[-1].status == "ABORTED"
+    # The next tick re-submits the identical request.
+    assert entry.row_state.current_attempt.messages == original
+    job = JobState(
+        job_id="J",
+        model="gpt-5.4",
+        reasoning_effort="none",
+        max_attempts=3,
+        claimed_partitions=[],
+        rows={"item-1": entry},
+    )
+    assert _awaiting_rows(job) == [entry]
+    _, request, _ = _build_requests(job, [entry], max_batch_bytes=10_000_000)[0]
+    assert request["body"]["messages"] == original
+
+
+def test_batch_fold_scores_an_ordinary_bad_response() -> None:
+    """The abort branch must not swallow a real answer (#127)."""
+    entry = _awaiting_entry(NODEBT_TEXT)
+
+    _fold_one_response(entry, CompletionResult(text="not xml", finish_reason="stop"), 3)
+
+    assert entry.row_state.current_attempt.attempt_index == 1
+    assert count_content_filter_aborts(entry.row_state, "ner") == 0
+    assert entry.row_state.all_attempts[-1].status == "FAILED"
+
+
+def test_batch_fold_stops_resending_at_the_cap() -> None:
+    """A persistently filtered batch row terminates rather than occupying windows (#127)."""
+    entry = _awaiting_entry(NODEBT_TEXT)
+
+    for _ in range(MAX_CONTENT_FILTER_RESENDS):
+        _fold_one_response(entry, BATCH_CONTENT_FILTERED, 3)
+    assert count_content_filter_aborts(entry.row_state, "ner") == 6
+    assert entry.row_state.current_attempt.attempt_index == 0
+
+    # Past the cap the abort is scored like any other empty answer.
+    _fold_one_response(entry, BATCH_CONTENT_FILTERED, 3)
+
+    assert count_content_filter_aborts(entry.row_state, "ner") == 6
+    assert entry.row_state.current_attempt.attempt_index == 1
