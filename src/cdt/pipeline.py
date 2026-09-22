@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Self
@@ -24,6 +24,8 @@ from cdt.ingest import (
     DEFAULT_AWS_PROFILE,
     DEFAULT_BUCKET,
     DEFAULT_S3_PREFIX,
+    SIXK_DOCUMENT_DATASET_NAME,
+    SIXK_FORM_TYPES,
     IngestConfig,
     IngestRunResult,
     default_failure_file,
@@ -35,6 +37,7 @@ from cdt.itemizer import (
     itemize_pending_documents,
     items_root,
 )
+from cdt.itemizer.core import ITEM_COLUMNS
 from cdt.matcher import (
     DEFAULT_AMBIGUITY_MARGIN,
     DEFAULT_MEMBERSHIP_THRESHOLD,
@@ -45,6 +48,9 @@ from cdt.matcher import (
 )
 from cdt.matcher.core import MATCHER_SCHEMA_VERSION, apply_lineage_inference_pass
 from cdt.shared import get_logger
+from cdt.sixk.scraper import acquire_scraped_sixk_documents
+from cdt.sixk.stage import DEFAULT_CONCURRENCY as SIXK_DEFAULT_CONCURRENCY
+from cdt.sixk.stage import sixk_snippets_root, triage_pending_documents
 from cdt.storage import (
     ArtifactPath,
     artifact_exists,
@@ -60,11 +66,56 @@ from cdt.storage import (
     write_table,
 )
 
-FINAL_OUTPUT_TABLES: dict[str, Callable[[str | Path | None], str]] = {
-    "items": items_root,
-    "debt-instruments": debt_instruments_root,
-    "debt-instrument-mentions": mentions_root,
-    "mention-cluster-edges": mention_cluster_edges_root,
+#: Published table -> the datasets it is built from, concatenated in order.
+#: ``items`` is a union because both genres produce one: an 8-K item section
+#: and a 6-K snippet are each "the unit of text a mention was extracted from",
+#: and every consumer joins a mention to its unit by ``item_id``. Publishing
+#: only the 8-K units leaves every 6-K mention with no row to join to, which
+#: is not a missing nicety — the website reads item text, the filing's SEC URL
+#: and its accession number off that row, so a 6-K instrument renders with
+#: none of them (#172).
+FINAL_OUTPUT_TABLES: dict[str, tuple[Callable[..., str], ...]] = {
+    "items": (items_root, sixk_snippets_root),
+    "debt-instruments": (debt_instruments_root,),
+    "debt-instrument-mentions": (mentions_root,),
+    "mention-cluster-edges": (mention_cluster_edges_root,),
+}
+
+#: Columns a published table keeps when the datasets it unions are not the
+#: same width. A 6-K snippet row carries the classifier's three columns and
+#: the stage's six on top of the itemizer's sixteen; the published ``items``
+#: table is the itemizer's shape, so those are projected away rather than
+#: widening a published table with columns that are null for every 8-K row.
+#: The snippet's own span and verdict stay queryable in ``sixk-snippets``.
+FINAL_OUTPUT_TABLE_COLUMNS: dict[str, list[str]] = {"items": ITEM_COLUMNS}
+
+#: The column stamped on a unioned table's rows to say which dataset they came
+#: from, appended after the projection above.
+FORM_TYPE_COLUMN = "form_type"
+
+#: The two filing genres the pipeline knows how to prepare. A genre is a form
+#: family plus the stages that turn it into rows the extractor can read: 8-K
+#: goes ingest → itemize → classify, 6-K goes ingest → triage. They converge at
+#: extract, which reads both through one projection.
+GENRE_8K = "8-K"
+GENRE_6K = "6-K"
+#: Both, by default. A run is asked for CIKs and a date range, and which forms
+#: those filers happened to file in it is not something the caller should have
+#: to know or keep in sync with the scraper's coverage; `--genres` narrows it
+#: when a run is deliberately about one of them.
+DEFAULT_GENRES: tuple[str, ...] = (GENRE_8K, GENRE_6K)
+GENRES = DEFAULT_GENRES
+
+#: Published table -> the ``form_type`` stamped on each dataset it unions,
+#: positionally matching FINAL_OUTPUT_TABLES. Only ``items`` unions more than
+#: one dataset, and it is the one table where a consumer otherwise cannot tell
+#: the genres apart: an 8-K item section and a 6-K snippet are both "the unit
+#: of text a mention came from", and none of the itemizer's sixteen columns
+#: records which kind of filing it came out of. ``form_type`` rather than a
+#: new name because the documents dataset already calls it that and already
+#: carries these same two values, so one vocabulary covers both ends.
+FINAL_OUTPUT_TABLE_FORM_TYPES: dict[str, tuple[str, ...]] = {
+    "items": (GENRE_8K, GENRE_6K),
 }
 
 ALL_TIME_START_DATE = date(1994, 1, 1)
@@ -107,6 +158,23 @@ class PipelineConfig:
     strong_match_threshold: float = DEFAULT_MEMBERSHIP_THRESHOLD
     loose_match_threshold: float = DEFAULT_RELATED_THRESHOLD
     ambiguity_margin: float = DEFAULT_AMBIGUITY_MARGIN
+    #: Which genres to prepare. Deliberately narrower than DEFAULT_GENRES,
+    #: which is what both entry points default their `--genres` flag to and
+    #: pass through here — so a scheduled or hand-typed run still prepares
+    #: both, and `test_scheduled_runs_prepare_both_genres_by_default` pins
+    #: that. Building a config in code is not asking for a run, though, and
+    #: the 6-K chain scrapes the network and calls a paid model before it
+    #: does anything else. A caller that never mentions genres should get
+    #: the stages it named and nothing that spends money on its behalf.
+    genres: tuple[str, ...] = (GENRE_8K,)
+    #: CIKs for the 6-K genre, when they differ from the run's. Defaults to
+    #: `cik_file`: one list of issuers is the point, and a separate one exists
+    #: only because a list chosen for 8-K coverage can contain no foreign
+    #: private issuers at all, which would make the 6-K chain a no-op.
+    sixk_cik_file: ArtifactPath | None = None
+    sixk_form_types: tuple[str, ...] = SIXK_FORM_TYPES
+    sixk_batch_size: int = DEFAULT_STAGE_BATCH_SIZE
+    sixk_concurrency: int = SIXK_DEFAULT_CONCURRENCY
 
 
 @dataclass(frozen=True)
@@ -116,7 +184,9 @@ class PipelineRunResult:
     mode: str
     start_date: date
     end_date: date
-    ingest: IngestRunResult
+    #: None when the run did not prepare that genre, which is different from a
+    #: genre that ran and found nothing — the latter has a result with zeroes.
+    ingest: IngestRunResult | None
     itemized_rows: int
     classified_rows: int
     extracted_rows: int
@@ -125,6 +195,24 @@ class PipelineRunResult:
     classifier_model_dir: Path
     artifact_root: str
     extractor_run_path: str
+    genres: tuple[str, ...] = DEFAULT_GENRES
+    sixk_ingest: IngestRunResult | None = None
+    sixk_snippet_rows: int = 0
+
+
+@dataclass
+class _PrepareOutcome:
+    """What the prepare phases produced, per genre.
+
+    A dataclass rather than a widening tuple because either chain can be absent
+    and the caller has to be able to tell absent from empty.
+    """
+
+    ingest: IngestRunResult | None = None
+    items: pd.DataFrame = field(default_factory=pd.DataFrame)
+    classified: pd.DataFrame = field(default_factory=pd.DataFrame)
+    sixk_ingest: IngestRunResult | None = None
+    snippets: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 class PipelineOrchestrator:
@@ -165,6 +253,11 @@ class PipelineOrchestrator:
 
     def _setup(self: Self) -> tuple[date, date, set[str], str]:
         """Resolve dates, CIKs, and the artifact root and emit the run banner."""
+        # Validated here rather than trusted from the caller: a config built in
+        # code (a test, the orchestrator, a notebook) skips the CLI's parsing,
+        # and a genre list that matches nothing would run extract and finalize
+        # over whatever the last run left behind and report success.
+        normalize_genres(self.config.genres)
         resolved_start, resolved_end = resolve_mode_dates(
             self.config.mode,
             self.config.start_date,
@@ -190,6 +283,118 @@ class PipelineOrchestrator:
         """
         if renew is not None:
             renew()
+
+    def _prepare_genres(
+        self: Self,
+        resolved_start: date,
+        resolved_end: date,
+        ciks: set[str],
+        resolved_artifact_root: str,
+        renew: Callable[[], None] | None = None,
+    ) -> _PrepareOutcome:
+        """Prepare every genre this run asked for, in genre order.
+
+        The chains are independent up to extract: they read different documents
+        datasets and write different classification sources (#62 selects work
+        by source-partition fingerprint, per dataset). So a genre that fails
+        does not corrupt the other's state — it just leaves its own partitions
+        pending for the next run.
+        """
+        outcome = _PrepareOutcome()
+        if GENRE_8K in self.config.genres:
+            outcome.ingest, outcome.items, outcome.classified = (
+                self._ingest_itemize_classify(
+                    resolved_start,
+                    resolved_end,
+                    ciks,
+                    resolved_artifact_root,
+                    renew,
+                )
+            )
+            self._renew(renew)
+        else:
+            self.logger.info("Skipping the 8-K chain: genres=%s", self.config.genres)
+        if GENRE_6K in self.config.genres:
+            outcome.sixk_ingest, outcome.snippets = self._ingest_and_triage_sixk(
+                resolved_start,
+                resolved_end,
+                resolved_artifact_root,
+                renew,
+            )
+        else:
+            self.logger.info("Skipping the 6-K chain: genres=%s", self.config.genres)
+        return outcome
+
+    def _ingest_and_triage_sixk(
+        self: Self,
+        resolved_start: date,
+        resolved_end: date,
+        resolved_artifact_root: str,
+        renew: Callable[[], None] | None = None,
+    ) -> tuple[IngestRunResult, pd.DataFrame]:
+        """Run the 6-K chain: acquire filings, then triage them into snippets.
+
+        Two stages where 8-K has three: a 6-K has no items to itemize and so
+        nothing for the item classifier to classify, and the triage stage
+        writes rows in the same classified-item columns the classifier does.
+        """
+        sixk_ciks = read_cik_file(self.config.sixk_cik_file or self.config.cik_file)
+        self._log_stage_start(
+            "ingest-sixk",
+            batch_size=self.config.ingest_batch_size,
+            forms=",".join(self.config.sixk_form_types),
+            ciks=len(sixk_ciks),
+        )
+        _, sixk_ingest = acquire_scraped_sixk_documents(
+            IngestConfig(
+                mode=self.config.mode,
+                bucket=self.config.bucket,
+                cik_file=Path(str(self.config.sixk_cik_file or self.config.cik_file)),
+                start_date=resolved_start,
+                end_date=resolved_end,
+                data_dir=self.config.data_dir,
+                output_root=resolved_artifact_root,
+                force=self.config.force,
+                batch_size=self.config.ingest_batch_size,
+                # Never `download`: a 6-K row points at the assembled
+                # submission in the mirror, and inlining bodies into the
+                # partition would make every read pay for every body (#69).
+                failure_file=self.config.failure_file
+                or default_failure_file(
+                    resolved_artifact_root,
+                    data_dir=self.config.data_dir,
+                ),
+                aws_profile=self.config.aws_profile,
+                s3_prefix=self.config.s3_prefix,
+                form_types=self.config.sixk_form_types,
+                dataset_name=SIXK_DOCUMENT_DATASET_NAME,
+            ),
+            ciks=sixk_ciks,
+        )
+        self._log_stage_complete(
+            "ingest-sixk",
+            rows=sixk_ingest.total_rows,
+            candidates=sixk_ingest.candidates_seen,
+            partitions=len(sixk_ingest.document_partitions),
+            failures=sixk_ingest.failures,
+        )
+        self._renew(renew)
+
+        self._log_stage_start(
+            "sixk",
+            batch_size=self.config.sixk_batch_size,
+            concurrency=self.config.sixk_concurrency,
+        )
+        snippets = triage_pending_documents(
+            artifact_root=resolved_artifact_root,
+            data_dir=self.config.data_dir,
+            batch_size=self.config.sixk_batch_size,
+            force=self.config.force,
+            concurrency=self.config.sixk_concurrency,
+            renew=renew,
+        )
+        self._log_stage_complete("sixk", rows=len(snippets))
+        return sixk_ingest, snippets
 
     def _ingest_itemize_classify(
         self: Self,
@@ -274,7 +479,7 @@ class PipelineOrchestrator:
         extract stage to the asynchronous batch poller.
         """
         resolved_start, resolved_end, ciks, resolved_artifact_root = self._setup()
-        self._ingest_itemize_classify(
+        self._prepare_genres(
             resolved_start, resolved_end, ciks, resolved_artifact_root, renew
         )
         return resolved_artifact_root
@@ -283,7 +488,7 @@ class PipelineOrchestrator:
         """Execute the full CDT pipeline."""
         resolved_start, resolved_end, ciks, resolved_artifact_root = self._setup()
         start_time = datetime.now()
-        ingest_result, items, classified = self._ingest_itemize_classify(
+        prepared = self._prepare_genres(
             resolved_start, resolved_end, ciks, resolved_artifact_root, renew
         )
         self._renew(renew)
@@ -350,9 +555,9 @@ class PipelineOrchestrator:
             mode=self.config.mode,
             start_date=resolved_start,
             end_date=resolved_end,
-            ingest=ingest_result,
-            itemized_rows=len(items),
-            classified_rows=len(classified),
+            ingest=prepared.ingest,
+            itemized_rows=len(prepared.items),
+            classified_rows=len(prepared.classified),
             extracted_rows=len(extracted),
             matched_rows=matched_mentions,
             debt_instrument_rows=len(matched["debt_instrument"]),
@@ -363,6 +568,9 @@ class PipelineOrchestrator:
                 resolved_artifact_root,
                 data_dir=self.config.data_dir,
             ),
+            genres=self.config.genres,
+            sixk_ingest=prepared.sixk_ingest,
+            sixk_snippet_rows=len(prepared.snippets),
         )
         self._renew(renew)
         self._log_stage_start(
@@ -450,6 +658,36 @@ def run_match_and_finalize(
         data_dir=data_dir,
         force=force,
     )
+
+
+def normalize_genres(values: str | Sequence[str]) -> tuple[str, ...]:
+    """Parse and validate a genre selection, preserving pipeline order.
+
+    Accepts a comma-separated string (what a CLI flag or an env var carries)
+    or a sequence. Order is normalized to the pipeline's own, so 8-K prepares
+    first whichever way the caller spelled the list, and duplicates collapse.
+
+    Raises:
+        ValueError: If the selection is empty or names an unknown genre. An
+            unknown genre is a typo — a run that quietly prepared nothing, or
+            prepared less than asked, would look like a corpus with no filings.
+    """
+    if isinstance(values, str):
+        requested = [value.strip() for value in values.split(",")]
+    else:
+        requested = [str(value).strip() for value in values]
+    selected = {value.upper() for value in requested if value}
+    if not selected:
+        msg = f"no genres selected; expected one or more of {', '.join(GENRES)}"
+        raise ValueError(msg)
+    unknown = sorted(selected - {genre.upper() for genre in GENRES})
+    if unknown:
+        msg = (
+            f"unknown genre(s) {', '.join(unknown)}; "
+            f"expected one or more of {', '.join(GENRES)}"
+        )
+        raise ValueError(msg)
+    return tuple(genre for genre in GENRES if genre.upper() in selected)
 
 
 def read_cik_file(path: ArtifactPath) -> set[str]:
@@ -555,9 +793,14 @@ def write_final_output_tables(
     # the parquet-only database root publish the same normalized values.
     tables = {
         table_name: normalize_snapshot_text(
-            read_dataset(dataset_root_fn(artifact_root, data_dir=data_dir))
+            _read_published_table(
+                table_name,
+                dataset_root_fns,
+                artifact_root=artifact_root,
+                data_dir=data_dir,
+            )
         )
-        for table_name, dataset_root_fn in FINAL_OUTPUT_TABLES.items()
+        for table_name, dataset_root_fns in FINAL_OUTPUT_TABLES.items()
     }
     # Guard against what is actually published, not the pointer: the pointer
     # lives with the artifact root, so a half-built or freshly-pointed artifact
@@ -612,6 +855,46 @@ def write_final_output_tables(
         keep_run_ids={run_id, str(previous.get("run_id", ""))},
     )
     return written_paths
+
+
+def _read_published_table(
+    table_name: str,
+    dataset_root_fns: Sequence[Callable[..., str]],
+    *,
+    artifact_root: ArtifactPath,
+    data_dir: Path | None,
+) -> pd.DataFrame:
+    """Read one published table, concatenating the datasets it unions.
+
+    Empty frames are dropped before the concat rather than passed through it.
+    A dataset with no partitions reads back as all-object columns, and pandas
+    would widen the integer columns of the frames beside it to float to make
+    room — silently changing a published table's types on any run where one
+    genre produced nothing.
+
+    Where a table unions more than one dataset, each frame is stamped with the
+    ``form_type`` it came from before the concat, so the genres stay tellable
+    apart in the published table. Stamped here rather than read from the source
+    because neither dataset carries the column: the itemizer deliberately does
+    not copy it out of the documents dataset, to keep an ingest-side column
+    from reshaping four datasets at once.
+    """
+    columns = FINAL_OUTPUT_TABLE_COLUMNS.get(table_name)
+    form_types = FINAL_OUTPUT_TABLE_FORM_TYPES.get(table_name)
+    frames: list[pd.DataFrame] = []
+    for index, dataset_root_fn in enumerate(dataset_root_fns):
+        frame = read_dataset(
+            dataset_root_fn(artifact_root, data_dir=data_dir), columns=columns
+        )
+        if form_types is not None:
+            frame[FORM_TYPE_COLUMN] = form_types[index]
+        frames.append(frame)
+    populated = [frame for frame in frames if not frame.empty]
+    if not populated:
+        return frames[0]
+    if len(populated) == 1:
+        return populated[0]
+    return pd.concat(populated, ignore_index=True)
 
 
 def normalize_snapshot_text(table: pd.DataFrame) -> pd.DataFrame:

@@ -41,8 +41,10 @@ from cdt.lease import (
     renewer,
 )
 from cdt.pipeline import (
+    DEFAULT_GENRES,
     DEFAULT_STAGE_BATCH_SIZE,
     PipelineConfig,
+    normalize_genres,
     run_match_and_finalize,
     run_pipeline,
     run_prepare_stages,
@@ -194,6 +196,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--aws-profile", default=os.environ.get("AWS_PROFILE", ""))
     parser.add_argument(
+        "--genres",
+        type=normalize_genres,
+        default=os.environ.get("GENRES") or DEFAULT_GENRES,
+        help=(
+            "comma-separated filing genres to prepare (default "
+            f"{','.join(DEFAULT_GENRES)}; env GENRES). A scheduled run "
+            "acquires every genre unless narrowed."
+        ),
+    )
+    parser.add_argument(
+        "--sixk-cik-file",
+        default=os.environ.get("SIXK_CIK_FILE") or None,
+        help=(
+            "CIKs for the 6-K genre, if they differ from --cik-file (env "
+            "SIXK_CIK_FILE). A list chosen for 8-K coverage can contain no "
+            "foreign private issuers, which makes the 6-K chain a no-op."
+        ),
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help=(
@@ -268,6 +289,12 @@ def _pipeline_config(args: argparse.Namespace) -> PipelineConfig:
             else DEFAULT_STAGE_BATCH_SIZE
         ),
         match_batch_size=args.match_batch_size,
+        genres=(
+            args.genres
+            if isinstance(args.genres, tuple)
+            else normalize_genres(args.genres)
+        ),
+        sixk_cik_file=args.sixk_cik_file,
     )
 
 

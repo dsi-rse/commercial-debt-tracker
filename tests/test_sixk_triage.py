@@ -15,9 +15,12 @@ from cdt import settings
 from cdt.sixk import (
     DEFAULT_STAGE1_THRESHOLD,
     SYSTEM_PROMPT,
+    WINDOW_TOKENS,
     Snippet,
     build_retry_message,
+    count_tokens,
     default_model_dir,
+    expand_admitted_windows,
     load_stage1_model,
     matched_debt_keywords,
     prepare_filing,
@@ -530,3 +533,181 @@ def test_prepare_filing_strips_the_prologue_before_gating() -> None:
 def test_prepare_filing_rejects_a_filing_with_no_debt_vocabulary() -> None:
     """The gate is what keeps stage 1 off the great majority of filings."""
     assert prepare_filing("The board appointed a new auditor this quarter.") == []
+
+
+def _series(index: int) -> str:
+    """Return a series label, so a table can be any number of rows long."""
+    letters = "LMNOPQRSTUVWXYZ"
+    suffix = "" if index < len(letters) else str(index // len(letters) + 1)
+    return f"{letters[index % len(letters)]}{suffix}"
+
+
+def _table(rows: int, *, header: str = "LONG-TERM DEBT", cells: bool = False) -> str:
+    """Build a borrowings table under a header, in prose rows or in cells.
+
+    ``cells=True`` is the shape extracted 6-K exhibits actually take: one table
+    cell per line, so every capitalised cell reads like a heading.
+    """
+    if cells:
+        columns = ["Class", "Amount", "Maturity", "Rate"]
+        body = "\n".join(
+            "\n".join(
+                [_series(index), f"{index}0,820,459", f"2/7/203{index % 10}", "3.5%"]
+            )
+            for index in range(rows)
+        )
+        return f"{header}\n" + "\n".join(columns) + "\n" + body
+    return f"{header}\n\n" + "\n".join(
+        f"Series {_series(index)} pays 3.5% and matures 2/7/2031, principal 40,820,459"
+        for index in range(rows)
+    )
+
+
+def test_expansion_gives_back_the_noun_the_crop_cut_away() -> None:
+    """The failure #172 describes: numbers kept, the naming header lost.
+
+    A window deep in a borrowings table carries amounts, rates and dates with
+    nothing naming the instrument. Expansion walks back to the table's header.
+    """
+    body = _table(30)
+    windows = split_into_windows(body, target_tokens=WINDOW_TOKENS)
+    admitted = windows[1]
+    assert "LONG-TERM DEBT" not in admitted.text
+
+    expanded = expand_admitted_windows([admitted])
+
+    assert "LONG-TERM DEBT" in expanded[0].window.text
+    assert expanded[0].window.text.endswith(admitted.text)
+    assert expanded[0].member_indices == (admitted.index,)
+
+
+def test_expansion_stops_at_an_isolated_section_header() -> None:
+    """A header ends the walk where it is found, short of the minimum."""
+    body = "Unrelated narrative about the quarter.\n\nBORROWINGS\n\n" + _table(
+        3, header="Details of the facilities appear below."
+    )
+    windows = split_into_windows(body, target_tokens=30)
+    admitted = next(window for window in windows if "Series N" in window.text)
+
+    expanded = expand_admitted_windows([admitted], min_tokens=200, max_tokens=400)
+
+    assert expanded[0].window.text.startswith("BORROWINGS")
+    assert "Unrelated narrative" not in expanded[0].window.text
+
+
+def test_expansion_walks_past_capitalised_table_cells() -> None:
+    """A cell in a column of cells is not a header, however it is capitalised.
+
+    Extracted tables put one cell per line, so `Class`, `Amount` and `L` all
+    look like headings. Treating them as one stops the walk inside the table
+    and leaves the window as unanswerable as it started.
+    """
+    body = _table(12, cells=True)
+    windows = split_into_windows(body, target_tokens=60)
+    admitted = windows[-1]
+
+    expanded = expand_admitted_windows([admitted], min_tokens=200, max_tokens=400)
+
+    assert "LONG-TERM DEBT" in expanded[0].window.text
+    assert "Maturity" in expanded[0].window.text
+
+
+def test_expansion_honours_the_cap() -> None:
+    """Context added stays inside the cap when no stop is found sooner."""
+    body = _table(60, header="Series A pays 1% and matures 2/7/2030, principal 1")
+    windows = split_into_windows(body, target_tokens=WINDOW_TOKENS)
+    admitted = windows[-1]
+
+    expanded = expand_admitted_windows([admitted], min_tokens=100, max_tokens=150)
+
+    added = expanded[0].window.token_count - admitted.token_count
+    assert 100 <= added <= 150
+
+
+def test_expansion_reaches_the_document_start_rather_than_stopping_short() -> None:
+    """A window near the top takes everything above it."""
+    body = _table(3)
+    windows = split_into_windows(body, target_tokens=30)
+
+    expanded = expand_admitted_windows(windows[-1:], min_tokens=200, max_tokens=400)
+
+    assert expanded[0].window.start == 0
+
+
+def test_adjacent_admitted_windows_merge_instead_of_repeating_context() -> None:
+    """Two admitted neighbours become one window, and say which they were."""
+    body = _table(40)
+    windows = split_into_windows(body, target_tokens=WINDOW_TOKENS)
+    pair = windows[-2:]
+
+    expanded = expand_admitted_windows(pair)
+
+    assert len(expanded) == 1
+    assert expanded[0].member_indices == (pair[0].index, pair[1].index)
+    assert expanded[0].window.end == pair[1].end
+    # The shared context is present once, not once per member.
+    assert expanded[0].window.text.count(pair[0].text) == 1
+
+
+def test_merged_windows_stay_near_the_merge_budget() -> None:
+    """A long run of admitted windows is cut rather than merged without limit.
+
+    The generalization window has a run of 21 adjacent admitted windows, which
+    merges to 8,191 tokens -- four times the largest snippet the 8-K path sends
+    the same extractor.
+    """
+    body = _table(200)
+    windows = split_into_windows(body, target_tokens=WINDOW_TOKENS)
+
+    expanded = expand_admitted_windows(windows, max_merged_tokens=1_000)
+
+    assert len(expanded) > 1
+    assert all(window.window.token_count < 1_600 for window in expanded)
+    assert [index for window in expanded for index in window.member_indices] == [
+        window.index for window in windows
+    ]
+
+
+def test_expansion_leaves_the_windows_stage_1_scored_alone() -> None:
+    """Stage 1's input must stay the crop its threshold was calibrated on."""
+    body = _table(40)
+    windows = split_into_windows(body, target_tokens=WINDOW_TOKENS)
+    before = list(windows)
+
+    expanded = expand_admitted_windows(windows[-1:])
+
+    assert windows == before
+    assert expanded[0].window.token_count > windows[-1].token_count
+
+
+def test_expansion_windows_still_slice_their_source() -> None:
+    """The TextWindow invariant survives expansion and merging."""
+    body = _table(40)
+    windows = split_into_windows(body, target_tokens=WINDOW_TOKENS)
+
+    for expanded in expand_admitted_windows(windows):
+        window = expanded.window
+        assert window.text == window.source[window.start : window.end]
+        assert window.token_count == count_tokens(window.text)
+
+
+def test_expansion_refuses_windows_from_two_documents() -> None:
+    """Offsets only mean something inside the text they index into."""
+    first = split_into_windows(_table(3), target_tokens=30)
+    second = split_into_windows(_table(3, header="OTHER FILING"), target_tokens=30)
+
+    with pytest.raises(ValueError, match="same document"):
+        expand_admitted_windows([first[-1], second[-1]])
+
+
+def test_expansion_rejects_a_minimum_above_the_cap() -> None:
+    """A minimum the cap cannot satisfy is a configuration error."""
+    windows = split_into_windows(_table(3), target_tokens=30)
+
+    with pytest.raises(ValueError, match="exceeds max_tokens"):
+        expand_admitted_windows(windows, min_tokens=400, max_tokens=100)
+
+
+def test_expansion_of_nothing_is_nothing() -> None:
+    """Most filings have no admitted window at all."""
+    assert expand_admitted_windows([]) == []
