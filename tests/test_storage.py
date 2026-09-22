@@ -176,7 +176,8 @@ def test_read_dataset_unifies_schemas_instead_of_trusting_the_first_file(
 
     table = storage.read_dataset(str(root)).sort_values("k").reset_index(drop=True)
 
-    assert sorted(table.columns) == ["k", "later"]
+    assert list(table.columns) == ["k", "later"]
+    assert table["later"].isna().to_list() == [True, False]
     assert table["later"].to_list()[1] == "kept"
 
 
@@ -301,18 +302,29 @@ def test_read_dataset_honors_the_partition_filter(tmp_path: Path) -> None:
 
 
 def test_read_table_projects_without_reading_the_other_columns(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Projection is pushed into the parquet read, not applied after it (#190).
 
     Measured on data/genwindow-eval-apr: ``documents`` is 12,206.6 MB and its
     ``accession_number`` column is 0.2988 MB of compressed chunks, so the read
     a dedup scan wants is 0.0024% of what the old path transferred.
+
+    ``pd.read_parquet`` is made fatal because the *result* here is not evidence
+    of anything: the pre-#190 implementation handed pandas the whole object and
+    a ``columns=`` list, and it returned exactly these columns too. Without
+    this the entire rewrite could be reverted with the suite still green.
     """
+
+    def _explode(*args: object, **kwargs: object) -> pd.DataFrame:
+        raise AssertionError("read_table must not read through pandas (#190)")
+
     path = tmp_path / "t.parquet"
     _write(path, [{"k": "1", "text": "x" * 100}])
+    monkeypatch.setattr(storage.pd, "read_parquet", _explode)
 
     assert list(storage.read_table(path, ["k"]).columns) == ["k"]
+    assert list(storage.read_table(path, ["text", "k"]).columns) == ["text", "k"]
     # And a requested-but-absent column still comes back, null, rather than
     # being silently dropped: ParquetFile.read does not raise on one.
     tolerant = storage.read_table(path, ["k", "missing"])
@@ -320,10 +332,22 @@ def test_read_table_projects_without_reading_the_other_columns(
     assert tolerant["missing"].isna().all()
 
 
-def test_count_table_rows_reads_only_the_footer(tmp_path: Path) -> None:
-    """The publish guard's row count must not download the object (#190)."""
+def test_count_table_rows_reads_only_the_footer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The publish guard's row count must not download the object (#190).
+
+    Materialising the table would give the same 3, so reading any column group
+    is made fatal: the count has to come from footer metadata. This runs once
+    per final table on every publish, against objects measured at 12.2 GB.
+    """
+
+    def _explode(*args: object, **kwargs: object) -> object:
+        raise AssertionError("count_table_rows must read only the footer (#190)")
+
     path = tmp_path / "t.parquet"
     _write(path, [{"k": "1"}, {"k": "2"}, {"k": "3"}])
+    monkeypatch.setattr(pq.ParquetFile, "read", _explode)
 
     assert storage.count_table_rows(path) == 3
     assert storage.count_table_rows(tmp_path / "absent.parquet") is None
