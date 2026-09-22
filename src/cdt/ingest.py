@@ -28,6 +28,7 @@ from cdt.storage import (
     join_artifact_path,
     normalize_artifact_path,
     parse_s3_uri,
+    read_partitions,
     read_table,
     write_json_artifact,
     write_partition_table,
@@ -1220,19 +1221,24 @@ def _existing_accessions(
     ``drop_duplicates(subset=["accession_number"], keep="last")``. A cross-date
     copy is what ``repair_document_shards`` exists to reconcile.
     """
-    paths = iter_date_shard_partitions(
-        dataset_name,
-        artifact_root=output_root,
-        start_date=start_date,
-        end_date=end_date,
+    paths = list(
+        iter_date_shard_partitions(
+            dataset_name,
+            artifact_root=output_root,
+            start_date=start_date,
+            end_date=end_date,
+        )
     )
-    accessions: set[str] = set()
-    for path in paths:
-        table = read_table(path, columns=["accession_number"])
-        if table.empty or "accession_number" not in table:
-            continue
-        accessions.update(table["accession_number"].astype(str))
-    return accessions
+    # One parallel scan over the window, not a read per partition. Looping
+    # `read_table` here would forgo the very thing the other half of #190
+    # added: measured on data/genwindow-eval-apr/documents, 1,640 partitions
+    # take 26.45s one at a time against 1.75s as a single scan, for the same
+    # 9,077 accessions. Daily mode's five-day window bounds the loop, but
+    # `--mode historical` defaults to 1994-to-today, which is the whole corpus.
+    table = read_partitions(paths, columns=["accession_number"])
+    if table.empty or "accession_number" not in table:
+        return set()
+    return set(table["accession_number"].dropna().astype(str))
 
 
 def _write_document_partitions(

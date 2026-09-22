@@ -1143,13 +1143,13 @@ def test_existing_accessions_reads_only_the_windowed_partitions(
         _store_document(tmp_path, accession, day)
 
     read_paths: list[str] = []
-    original = ingest.read_table
+    original = ingest.read_partitions
 
-    def recording_read_table(path: object, columns: object = None) -> pd.DataFrame:
-        read_paths.append(str(path))
-        return original(path, columns)
+    def recording_read_partitions(paths: object, **kwargs: object) -> pd.DataFrame:
+        read_paths.extend(str(path) for path in paths)
+        return original(paths, **kwargs)
 
-    monkeypatch.setattr(ingest, "read_table", recording_read_table)
+    monkeypatch.setattr(ingest, "read_partitions", recording_read_partitions)
 
     accessions = ingest._existing_accessions(
         "documents",
@@ -1173,13 +1173,13 @@ def test_existing_accessions_projects_away_the_document_text(
 
     _store_document(tmp_path, "000000000024000005", "2024-01-05")
     requested: list[object] = []
-    original = ingest.read_table
+    original = ingest.read_partitions
 
-    def recording_read_table(path: object, columns: object = None) -> pd.DataFrame:
-        requested.append(columns)
-        return original(path, columns)
+    def recording_read_partitions(paths: object, **kwargs: object) -> pd.DataFrame:
+        requested.append(kwargs.get("columns"))
+        return original(paths, **kwargs)
 
-    monkeypatch.setattr(ingest, "read_table", recording_read_table)
+    monkeypatch.setattr(ingest, "read_partitions", recording_read_partitions)
 
     ingest._existing_accessions(
         "documents",
@@ -1189,6 +1189,37 @@ def test_existing_accessions_projects_away_the_document_text(
     )
 
     assert requested == [["accession_number"]]
+
+
+def test_existing_accessions_scans_the_window_in_one_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The window is one parallel scan, not a read per partition (#190).
+
+    Scoping to the window was only half the win. Looping ``read_table`` inside
+    it forgoes the parallel Arrow scan the same change added — measured on
+    data/genwindow-eval-apr/documents, 1,640 partitions are 26.45s one at a
+    time against 1.75s as a single scan. Daily mode's five-day lookback bounds
+    the loop; ``--mode historical`` defaults to 1994-to-today and does not.
+    """
+    from cdt import ingest
+
+    for day in ("2024-01-05", "2024-01-06", "2024-01-07"):
+        _store_document(tmp_path, f"00000000002400{day[-2:]}", day)
+
+    def _explode(*args: object, **kwargs: object) -> pd.DataFrame:
+        raise AssertionError("the window must be read as one scan, not per file")
+
+    monkeypatch.setattr(ingest, "read_table", _explode)
+
+    accessions = ingest._existing_accessions(
+        "documents",
+        output_root=default_output_root(tmp_path),
+        start_date=date(2024, 1, 5),
+        end_date=date(2024, 1, 7),
+    )
+
+    assert len(accessions) == 3
 
 
 def test_reingest_inside_the_window_still_skips_the_download(tmp_path: Path) -> None:
