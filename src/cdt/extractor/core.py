@@ -56,14 +56,23 @@ from cdt.storage import (
 
 LOGGER = get_logger(__name__)
 DEFAULT_MAX_ATTEMPTS = 3
-# Attempts NER gets on top of the run-wide budget, which until now was global
-# across all three stages (#127). NER is the stage that has to reproduce the
-# whole item verbatim, so it is the only one exposed to the two failure modes
-# that more attempts actually fix: a copy-fidelity slip, and a provider-side
-# `content_filter` abort whose cut point differs on every call. Added to the
-# operator's `--max-attempts` rather than replacing it, so the knob still means
-# something and NER's budget is never below the rest of the pipeline's.
-NER_EXTRA_ATTEMPTS = 3
+# One budget for every stage, `--max-attempts`. #127 proposed giving NER more
+# on the reasoning that it is the only stage that must reproduce the item
+# verbatim, so it is the only one whose failures more attempts fix. The stored
+# corpora do not support the number: the NER-calls-per-row histogram over all
+# 761 rows is {1: 756, 2: 3, 3: 2}, so only two rows ever reached the cap, and
+# one of those is MPLX, whose third call is the give-up #176 now rejects -- it
+# would run to the larger budget and still fail. That leaves a single row
+# (`000133146326000103-2-03`, FHLB Boston) as the whole case, and the evidence
+# for it is that it passed on a *rerun* of the same arm, which is cross-run
+# variance rather than a fourth attempt recovering anything within a run.
+#
+# Against that, a bigger NER budget is paid on the most expensive call in the
+# pipeline -- the one stage that echoes the whole item back -- by every row
+# that legitimately exhausts, and by every row #176's guards now correctly
+# reject. Raise it again only with a measurement of attempts 4-6 on a fresh
+# window, and only after re-reading #176's ordering note: each extra attempt
+# is another chance for the model to pass NER by returning the input untagged.
 # A `content_filter` abort is not a verdict on the row and is not billed:
 # eleven of thirteen live NER calls against `openai/gpt-5.6-terra` came back
 # `finish_reason=content_filter` with `completion_tokens=0`, `prompt_tokens=0`
@@ -2909,8 +2918,7 @@ def handle_response(
     -- the same place and for the same reason an infrastructure error is
     classified before it can become an attempt (#127, #135).
 
-    `max_attempts` is the run-wide budget; the budget actually applied is
-    ``stage_max_attempts``, which gives NER more (#127).
+    `max_attempts` is the budget, and it is the same for every stage.
     """
     stage = STAGE_BY_NAME[row_state.current_attempt.stage_name]
     stage_index = STAGE_INDEX[stage.name]
@@ -2921,9 +2929,8 @@ def handle_response(
         stage.postprocess(row_state)
         return _advance_after_stage(row_state, stage, stage_index)
 
-    budget = stage_max_attempts(stage.name, max_attempts)
-    if row_state.current_attempt.attempt_index >= budget:
-        return _salvage_or_fail(row_state, stage, stage_index, budget)
+    if row_state.current_attempt.attempt_index >= max_attempts:
+        return _salvage_or_fail(row_state, stage, stage_index, max_attempts)
     row_state.retry(stage.build_retry_message(failures))
     return list(row_state.current_attempt.messages)
 
@@ -3017,31 +3024,6 @@ def handle_provider_abort(
         return True
     terminate_on_provider_aborts(row_state, stage, aborts)
     return False
-
-
-def stage_max_attempts(stage_name: str, max_attempts: int) -> int:
-    """Resolve how many scored attempts this stage gets (#127).
-
-    One departure from the single global budget that `DEFAULT_MAX_ATTEMPTS`
-    used to be: NER gets `NER_EXTRA_ATTEMPTS` more than the other stages,
-    because it is the only one that must reproduce the item verbatim and so
-    the only one whose failures more attempts fix -- the same item that failed
-    copy-fidelity on every attempt of one run passed on a rerun of the same arm
-    with the same prompts and model, and 4 of 60 units flipped between empty
-    and non-empty on that rerun (#127).
-
-    Provider aborts do not appear here. They are not scored attempts at all, so
-    there is no budget to exempt them from; see `MAX_CONTENT_FILTER_RESENDS`.
-
-    Ordering note for anyone raising these numbers further: this is safe only
-    because #176 landed first. Each extra attempt is another chance for the
-    model to pass NER by returning the input untagged, so before that guard a
-    bigger budget converted visible whole-item losses into invisible clean
-    successes.
-    """
-    if stage_name == NERStage.name:
-        return max_attempts + NER_EXTRA_ATTEMPTS
-    return max_attempts
 
 
 def _ner_needed_a_retry(row_state: ExtractionRowState) -> bool:

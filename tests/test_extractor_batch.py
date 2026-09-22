@@ -378,19 +378,7 @@ def _drive_resumable(
     [
         (NODEBT_TEXT, [NODEBT_NER]),
         (MULTI_TEXT, [MULTI_NER, MULTI_IE]),
-        # Six responses, not three: NER's budget is the run-wide `max_attempts`
-        # plus `NER_EXTRA_ATTEMPTS` (#127).
-        (
-            "bad",
-            [
-                "not xml",
-                "still not xml",
-                "nope",
-                "still nope",
-                "not xml either",
-                "nope again",
-            ],
-        ),
+        ("bad", ["not xml", "still not xml", "nope"]),
     ],
 )
 def test_resumable_matches_sync_workflow(text: str, responses: list[str]) -> None:

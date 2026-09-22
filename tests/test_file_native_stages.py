@@ -2728,14 +2728,14 @@ def test_mplx_untagged_echo_no_longer_publishes_as_a_clean_success() -> None:
         calls += 1
 
     assert result is None
-    # The run-wide budget of 3, plus #127's `NER_EXTRA_ATTEMPTS`.
-    assert calls == 6
+    # One budget for every stage (#127).
+    assert calls == 3
     assert row_state.state == "FAILED"
     assert row_state.state != "SUCCESS"
     assert row_state.debt_instrument_mentions == []
     assert "byte-identical to the input" in summarize_failure(row_state)
     # No attempt on this row was ever accepted.
-    assert [a.status for a in row_state.all_attempts] == ["FAILED"] * 6
+    assert [a.status for a in row_state.all_attempts] == ["FAILED"] * 3
 
 
 def test_retry_recovered_zero_tag_row_finishes_partial_not_success() -> None:
@@ -2924,33 +2924,30 @@ def _run_live(
     return row_state, client
 
 
-def test_ner_gets_a_bigger_attempt_budget_than_the_other_stages() -> None:
-    """`max_attempts` used to be one global budget for all three stages (#127)."""
-    from cdt.extractor.core import NER_EXTRA_ATTEMPTS, stage_max_attempts
+def test_every_stage_gets_the_same_attempt_budget() -> None:
+    """`--max-attempts` means the same thing for every stage (#127).
 
-    # Spelled as literals, not as `3 + NER_EXTRA_ATTEMPTS`: the budget is the
-    # thing under test, so restating the constant would assert nothing.
-    assert NER_EXTRA_ATTEMPTS == 3
-    assert stage_max_attempts("ner", 3) == 6
-    assert stage_max_attempts("instrument_ie", 3) == 3
-    assert stage_max_attempts("instrument_relation", 3) == 3
-    # Added to the operator's knob rather than replacing it, so NER's budget is
-    # never below the rest of the pipeline's and `--max-attempts` still moves it.
-    assert stage_max_attempts("ner", 1) == 4
-    assert stage_max_attempts("ner", 10) == 13
-
-
-def test_the_budget_counts_only_scored_attempts_not_provider_aborts() -> None:
-    """An abort is not an attempt, so it cannot shrink or grow the budget (#127).
-
-    The budget is a function of the stage and the operator's knob alone. Aborts
-    are classified above `handle_response` and never reach it, so there is no
-    forgiveness term to keep in step with a resend cap.
+    #127 proposed a larger NER budget; the stored corpora do not support the
+    number (only two of 761 rows ever reached the cap, and one of those is the
+    give-up #176 now rejects), so NER is back in line with the rest. Driven
+    end to end rather than asserted against a helper, because the budget is
+    only real if the loop stops there.
     """
-    from cdt.extractor.core import stage_max_attempts
+    # NER: three scored attempts, then the row terminates.
+    row_state, client = _run_live(MPLX_TEXT, [_stopped("not xml")] * 10)
+    assert len(client.requests) == 3
+    assert row_state.state == "FAILED"
 
-    assert stage_max_attempts.__code__.co_argcount == 2
-    assert stage_max_attempts("ner", 3) == 6
+    # instrument_ie: the same three, after a NER pass.
+    row_state, client = _run_live(
+        MULTI_TEXT, [_stopped(MULTI_NER)] + [_stopped("not json")] * 10
+    )
+    assert len(client.requests) == 1 + 3
+    assert row_state.state == "FAILED"
+
+    # And the operator's knob still moves it.
+    row_state, client = _run_live(MPLX_TEXT, [_stopped("not xml")] * 10, max_attempts=5)
+    assert len(client.requests) == 5
 
 
 def test_a_content_filtered_attempt_is_resent_as_the_original_request() -> None:
@@ -2998,14 +2995,15 @@ def test_content_filter_aborts_do_not_consume_the_stage_budget() -> None:
     (1,163 / 280 / 1,375 characters on three repeats of one item), so resending
     is both correct and free.
     """
-    # Three aborts, then NER's full budget of six real attempts, all rejected.
-    completions = [CONTENT_FILTERED] * 3 + [_stopped("not xml")] * 6
+    # Three aborts, then the stage's full budget of three real attempts, all
+    # rejected. The aborts cost the row nothing: it still gets all three.
+    completions = [CONTENT_FILTERED] * 3 + [_stopped("not xml")] * 3
     row_state, client = _run_live(MPLX_TEXT, completions)
 
-    assert len(client.requests) == 9
+    assert len(client.requests) == 6
     assert row_state.state == "FAILED"
     scored = [a for a in row_state.all_attempts if a.status != "ABORTED"]
-    assert [a.attempt_index for a in scored] == [1, 2, 3, 4, 5, 6]
+    assert [a.attempt_index for a in scored] == [1, 2, 3]
 
 
 def test_persistent_content_filtering_terminates_at_the_resend_cap() -> None:
