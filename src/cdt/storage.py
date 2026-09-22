@@ -8,6 +8,7 @@ import io
 import json
 import re
 from collections.abc import Iterable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -698,6 +699,48 @@ def read_gzip_text_artifact(path: ArtifactPath) -> str:
 # cannot read these files as one table", and the answer is always the same.
 _ARROW_READ_ERRORS = (pyarrow.ArrowException,)
 
+# Footer reads for schema unification are I/O-bound round trips, one per
+# partition, and the dataset scanner's own threads do not cover them: they
+# happen before the scanner exists. Reading them serially is what #110's
+# option 1 ("parallelize the reads ... smallest change, biggest win") is
+# about, and it is the whole cost on a request-bound store -- the publish
+# reads 21,214 objects, so a serial pass is 21,214 sequential round trips at
+# ~70 ms before a single byte of data is read. 32 matches that issue's
+# sizing; Arrow releases the GIL for the read, so these really do overlap.
+_SCHEMA_WORKERS = 32
+
+
+def _unified_schema(dataset: pyarrow.dataset.Dataset) -> pa.Schema:
+    """Merge every fragment's physical schema, reading the footers in parallel.
+
+    ``ds.dataset`` infers its schema from the *first* fragment alone, so a
+    dataset whose first file predates a column reads as though the column never
+    existed — the later values are silently dropped rather than reported. This
+    pipeline has exactly that shape on purpose (``form_type`` and ``source``
+    were added to ``documents`` after the fact), so the merge is a correctness
+    requirement, not a tuning knob.
+
+    Each ``fragment.physical_schema`` opens the file and reads its footer, so
+    the merge costs one round trip per partition. Measured on
+    data/genwindow-eval-apr/items (1,554 files, warm, local): 0.523s serially
+    against 0.184s across threads, while the ``unify_schemas`` merge those
+    footers feed is 0.017s. Locally that gap hides in the noise, which is why
+    it went unnoticed; on S3 each of those reads is a sequential round trip and
+    the serial version alone outweighs the parallel scan it precedes.
+
+    An incompatible merge raises out of the pool exactly as it did out of the
+    comprehension, so ``_read_dataset_with_arrow``'s fallback still triggers.
+    """
+    fragments = list(dataset.get_fragments())
+    if len(fragments) <= 1:
+        # Nothing to overlap, and nothing to merge: skip the pool entirely
+        # rather than pay a thread for the matcher's per-shard single-file
+        # reads.
+        return dataset.schema if not fragments else fragments[0].physical_schema
+    with ThreadPoolExecutor(max_workers=min(_SCHEMA_WORKERS, len(fragments))) as pool:
+        schemas = list(pool.map(lambda fragment: fragment.physical_schema, fragments))
+    return pyarrow.unify_schemas(schemas)
+
 
 def arrow_filesystem(path: ArtifactPath) -> tuple[object | None, str]:
     """Return the pyarrow filesystem and stripped path Arrow should read through.
@@ -800,13 +843,11 @@ def _read_dataset_with_arrow(
     ``pq.read_table`` and concatenating, and 0.599s as one dataset — the win is
     the scanner's threads, not the Arrow decode.
 
-    The schema is unified explicitly, and that is not an optimization detail.
-    ``ds.dataset`` infers its schema from the *first* fragment alone, so a
-    dataset whose first file predates a column reads as though the column never
-    existed — the later values are silently dropped rather than reported. This
-    pipeline has exactly that shape on purpose (`form_type` and `source` were
-    added to `documents` after the fact). Unifying costs 0.166s over those
-    1,554 footers.
+    The schema is unified explicitly by ``_unified_schema``, and that is not an
+    optimization detail: ``ds.dataset`` infers from the *first* fragment alone,
+    so a dataset whose first file predates a column reads as though the column
+    never existed. See that function for why the footer reads it needs are
+    threaded rather than serial.
 
     Returning None means "these files are not one table". That happens on any
     root written before #187 gave every column a declared physical type: 26 of
@@ -822,9 +863,7 @@ def _read_dataset_with_arrow(
         dataset = pyarrow.dataset.dataset(
             resolved, format="parquet", filesystem=filesystem
         )
-        schema = pyarrow.unify_schemas(
-            [fragment.physical_schema for fragment in dataset.get_fragments()]
-        )
+        schema = _unified_schema(dataset)
         unified = pyarrow.dataset.dataset(
             resolved, format="parquet", filesystem=filesystem, schema=schema
         )

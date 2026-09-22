@@ -181,6 +181,40 @@ def test_read_dataset_unifies_schemas_instead_of_trusting_the_first_file(
     assert table["later"].to_list()[1] == "kept"
 
 
+def test_the_footer_reads_behind_schema_unification_are_parallel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unifying schemas must not serialise one round trip per partition (#110).
+
+    Every ``fragment.physical_schema`` opens the file and reads its footer, and
+    those reads happen before the dataset scanner exists, so its threads do not
+    cover them. Locally that is 0.523s against 0.184s threaded on 1,554 files —
+    small enough to hide — but on S3 each one is a sequential round trip, so a
+    serial pass over the publish's 21,214 objects is ~25 minutes before a byte
+    of data is read. That is the whole of #110's cost model, and #110's own
+    option 1 is to parallelise exactly this.
+    """
+    pools: list[int | None] = []
+    real_pool = storage.ThreadPoolExecutor
+
+    class RecordingPool(real_pool):  # type: ignore[misc, valid-type]
+        def __init__(
+            self: Self, max_workers: int | None = None, **kwargs: object
+        ) -> None:
+            pools.append(max_workers)
+            super().__init__(max_workers=max_workers, **kwargs)
+
+    monkeypatch.setattr(storage, "ThreadPoolExecutor", RecordingPool)
+    root = tmp_path / "items"
+    for index in range(5):
+        _write(root / f"p{index}.parquet", [{"k": str(index)}])
+
+    table = storage.read_dataset(str(root))
+
+    assert len(table) == 5
+    assert pools == [5], "footers were read one at a time"
+
+
 def test_read_dataset_falls_back_when_partitions_cannot_be_unified(
     tmp_path: Path,
 ) -> None:
