@@ -438,14 +438,25 @@ def save_completion_registry(
     for key, entry in adopted.items():
         adopted_by_shard.setdefault(_registry_shard_label(key), {})[key] = entry
     for shard_label in sorted(by_shard.keys() | adopted_by_shard.keys()):
+        shard_entries = by_shard.get(shard_label, {})
         _save_registry_shard(
             stage_name,
             shard_label,
-            by_shard.get(shard_label, {}),
+            shard_entries,
             adopted=adopted_by_shard.get(shard_label, {}),
             artifact_root=resolved_root,
             data_dir=data_dir,
         )
+        # The swap above committed these keys, so they are part of the
+        # freshest persisted state now and the next boundary must not re-send
+        # them. Without this the dirty set is the whole run's write set rather
+        # than the batch's, so batch k rewrites every shard batches 1..k-1
+        # touched and the cost is quadratic in the run's length again -- the
+        # thing #191 exists to remove. Cleared per shard rather than once at
+        # the end because an exhausted swap raises: the shards that did land
+        # stay clean and only the failed shard's keys are retried.
+        if isinstance(registry, CompletionRegistry):
+            registry.dirty -= shard_entries.keys()
     if adopted:
         # Only after every shard's swap succeeded -- _save_registry_shard
         # raises rather than returning on exhaustion, so the marker below can
@@ -624,7 +635,9 @@ def pending_source_partitions(
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     registry = (
-        {}
+        # Not a plain ``{}``: save_completion_registry treats every key of one
+        # as changed, which re-sends the whole run at every batch boundary.
+        CompletionRegistry()
         if force
         else load_completion_registry(
             stage_name, artifact_root=resolved_root, data_dir=data_dir

@@ -4421,6 +4421,59 @@ def test_completion_registry_save_rewrites_only_the_months_it_touched(
     assert january.read_bytes() == january_before
 
 
+def test_completion_registry_batch_saves_do_not_resend_earlier_batches(
+    tmp_path: Path,
+) -> None:
+    """A later batch boundary must not rewrite the months earlier ones wrote.
+
+    Stages save repeatedly against one registry object, at every batch
+    boundary, so an interruption does not discard the run's progress (#111).
+    The dirty set is what a save sends, so unless a committed key leaves it,
+    batch k re-sends every key from batches 1..k-1 and rewrites every shard
+    they span -- cost quadratic in the run's length, which is the thing #191
+    removes. The single-save test above cannot see this: it never saves the
+    same registry object twice, and no stage ever saves one only once.
+    """
+    from cdt.datasets import (
+        CompletedPartition,
+        CompletionRegistry,
+        date_shard_partition_path,
+        save_completion_registry,
+    )
+
+    def key(day: str) -> str:
+        return date_shard_partition_path(
+            "documents", partition_date=day, shard="0001", artifact_root=tmp_path
+        )
+
+    touched: list[str] = []
+
+    def record(function: object) -> object:
+        def wrapper(path: object, *args: object, **kwargs: object) -> object:
+            touched.append(Path(str(path)).name)
+            return function(path, *args, **kwargs)  # type: ignore[operator]
+
+        return wrapper
+
+    registry = CompletionRegistry()
+    with pytest.MonkeyPatch.context() as patch:
+        for attribute in (
+            "read_json_artifact_versioned",
+            "replace_json_artifact_if_match",
+            "write_json_artifact_if_absent",
+        ):
+            patch.setattr(
+                cdt_datasets, attribute, record(getattr(cdt_datasets, attribute))
+            )
+        for day in ("2024-01-15", "2024-02-15", "2024-03-15"):
+            registry[key(day)] = CompletedPartition(fingerprint="new")
+            touched.clear()
+            save_completion_registry("itemize", registry, artifact_root=tmp_path)
+            assert touched == [f"date={day[:7]}.json"], f"batch {day} touched {touched}"
+    # Every key is persisted, so nothing is owed to the next save.
+    assert not registry.dirty
+
+
 def test_completion_registry_reads_a_legacy_single_object(tmp_path: Path) -> None:
     """A pre-#191 root is read, not seen as empty (#107).
 
