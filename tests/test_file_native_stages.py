@@ -69,6 +69,7 @@ from cdt.itemizer.core import ITEM_COLUMNS
 from cdt.matcher import (
     debt_instruments_root,
     match_pending_mentions,
+    mention_cluster_edges_root,
     mention_matches_root,
 )
 from cdt.matcher.core import (
@@ -695,7 +696,15 @@ def test_extract_pending_items_writes_mentions_and_audit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Extraction should consume classifications and write mentions plus audit log."""
+    """Extraction consumes classifications and writes mentions plus the audit log.
+
+    The mention carries a `prior`-marked commitment, so the mint fires and this
+    covers the publish seam end to end (#211). Every publish path goes through
+    `published_mention_rows`, but the seam test called the helper on a mention
+    with no `prior` facts — the mint was a no-op there, so the seam was
+    indistinguishable from the raw list and all four call sites could be
+    swapped back to `row_state.debt_instrument_mentions` with a green suite.
+    """
     seed_document_partition(tmp_path)
     itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
     monkeypatch.setattr(
@@ -730,7 +739,29 @@ def test_extract_pending_items_writes_mentions_and_audit(
                 "name_json": "{}",
                 "start_date_json": "{}",
                 "maturity_date_json": "{}",
-                "amounts_json": "[]",
+                "amounts_json": json.dumps(
+                    [
+                        _fact(
+                            kind="commitment",
+                            normalized_amount="300000000",
+                            prior=True,
+                        ),
+                        _fact(
+                            kind="commitment",
+                            normalized_amount="250000000",
+                            prior=False,
+                        ),
+                    ]
+                ),
+                "dates_json": json.dumps(
+                    [
+                        _fact(
+                            kind="agreement",
+                            normalized_date="2020-02-03",
+                            prior=False,
+                        )
+                    ]
+                ),
             }
         ]
         row_state.finish("SUCCESS")
@@ -748,10 +779,39 @@ def test_extract_pending_items_writes_mentions_and_audit(
     )
 
     written = read_dataset(mentions_root(tmp_path))
-    assert len(mentions) == 1
+    assert len(mentions) == 2
     assert written["debt_instrument_mention_id"].to_list()
     audit_files = list((tmp_path / "extractor-runs").glob("run_id=*/full.jsonl"))
     assert len(audit_files) == 1
+
+    # The minted prior state reaches the written partition, not just the
+    # in-memory return value, and the successor points at it.
+    minted = written[written["synthesized_by"] == "prior_state"]
+    assert len(minted) == 1
+    assert minted.iloc[0]["principal_amount"] == Decimal("300000000.00")
+    successor = written[written["debt_instrument_mention_id"] == "m-1"].iloc[0]
+    assert successor["amendment_of"] == minted.iloc[0]["debt_instrument_mention_id"]
+
+    # and the audit record publishes the same rows the partition did
+    audit = [json.loads(line) for line in audit_files[0].read_text().splitlines()]
+    audited = [
+        mention
+        for record in audit
+        for mention in record.get("debt_instrument_mentions", [])
+    ]
+    assert sorted(str(mention.get("synthesized_by")) for mention in audited) == [
+        "None",
+        "prior_state",
+    ]
+
+    # `state.jsonl` keeps only what the model returned: the pointer the mint
+    # writes onto the successor must not be persisted there.
+    state_files = list((tmp_path / "extractor-runs").glob("run_id=*/state.jsonl"))
+    for state_file in state_files:
+        for line in state_file.read_text().splitlines():
+            for mention in json.loads(line).get("debt_instrument_mentions", []):
+                assert mention.get("synthesized_by") is None
+                assert mention.get("amendment_of") is None
 
 
 def test_extract_pending_items_drains_all_partitions(
@@ -1339,6 +1399,44 @@ def test_mint_places_the_predecessor_at_the_right_origin() -> None:
     assert minted["principal_amount"] == "300000000"
 
 
+def test_minted_no_origin_is_not_counted_when_the_mint_is_then_refused() -> None:
+    """The tag names a subset of `minted`, so it cannot outlive a refusal.
+
+    Bumped where the origin was resolved, `minted_no_origin` fired ahead of the
+    two guards that still stand between that point and the append. A successor
+    whose only origin candidate is its own amendment date, sitting beside the
+    sibling that *is* its predecessor, then reported `minted_no_origin: 1` with
+    no synthesized row anywhere — a mint that never happened, inside the
+    counters this docstring calls the pre-registered yield (#211).
+    """
+    from cdt.extractor.core import mint_prior_state_rows
+
+    successor = amended_row(
+        "m-successor",
+        dates=[
+            # The only origin candidate is the restatement's own dated-as-of,
+            # which is what empties `origin_payloads`.
+            _fact(kind="agreement", normalized_date="2024-06-01", prior=False),
+            _fact(kind="amendment", normalized_date="2024-06-01", prior=False),
+        ],
+    )
+    # The model returned the predecessor as its own object: it carries the
+    # successor's prior commitment and states no start date of its own.
+    predecessor = amended_row(
+        "m-predecessor",
+        amounts=[],
+        dates=[],
+        principal_amount="300000000",
+        start_date=None,
+    )
+
+    counters: dict[str, int] = {}
+    published = mint_prior_state_rows([successor, predecessor], counters)
+
+    assert counters == {"skipped_sibling_is_predecessor": 1}
+    assert not [row for row in published if row.get("synthesized_by") == "prior_state"]
+
+
 def test_mint_from_a_prior_maturity_alone_inherits_the_amount() -> None:
     """`extended the maturity from 2029 to 2031`: the commitment is unchanged."""
     from cdt.extractor.core import mint_prior_state_rows
@@ -1476,6 +1574,40 @@ def test_backfill_mints_over_existing_partitions_and_is_a_no_op_twice(
         r["debt_instrument_mention_id"] for r in published_mention_rows(row_state)
     }
     assert write_time == set(published["debt_instrument_mention_id"])
+
+
+def test_backfill_renews_the_writer_lease_once_per_rewritten_partition(
+    tmp_path: Path,
+) -> None:
+    """A whole-dataset rewrite must keep renewing, or it outlives its lease.
+
+    The CLI hands `backfill_mentions` a renewal callback, and a test pins that
+    it does. Nothing pinned that the function ever calls it: deleting the
+    `renew()` block left the whole suite green, so the #89 guard could be
+    removed without a single failure. Same shape as the seams this branch
+    exists to close — both halves pinned, the connection not (#211).
+    """
+    from cdt.extractor.core import backfill_mentions
+
+    for date, mention_id in (("2024-06-01", "m-june"), ("2024-07-01", "m-july")):
+        write_partition_table(
+            tmp_path / "mentions",
+            partition={"date": date, "shard": "0001"},
+            table=pd.DataFrame(
+                [amended_row(mention_id)], columns=DEBT_INSTRUMENT_MENTION_COLUMNS
+            ),
+        )
+
+    # A dry run writes nothing, so it takes no lease and must not renew one.
+    renewals: list[int] = []
+    dry = backfill_mentions(tmp_path, dry_run=True, renew=lambda: renewals.append(1))
+    assert dry["partitions_rewritten"] == 0
+    assert renewals == []
+
+    counts = backfill_mentions(tmp_path, renew=lambda: renewals.append(1))
+
+    assert counts["partitions_rewritten"] == 2
+    assert len(renewals) == counts["partitions_rewritten"]
 
 
 def test_instrument_ie_validate_accepts_party_kinds_and_roles() -> None:
@@ -7695,3 +7827,503 @@ def test_a_root_matched_under_an_older_schema_forces_a_full_rematch(
         MATCHER_SCHEMA_VERSION
     )
     assert _stale_schema_forces_rematch(str(tmp_path)) is False
+
+
+def test_an_unparsed_prior_term_suppresses_inheritance_rather_than_licensing_it() -> (
+    None
+):
+    """A stated before-figure the parser could not resolve still says this changed.
+
+    The kind sets that answer "did this term change?" were built from the
+    *parsed* prior entries, so a `prior: true` term whose value did not resolve
+    was invisible to them, and the current value of that kind was copied onto
+    the predecessor marked `derived_from: "inherited"` — asserting the
+    post-amendment figure as the prior state's own term, the one thing the rule
+    must never do. The claims decide the kinds; only the values come from what
+    parsed (#211).
+
+    Incidence of this shape on the reference corpus is 0, so no published row
+    was ever wrong because of it.
+    """
+    from cdt.extractor.core import mint_prior_state_rows
+
+    counters: dict[str, int] = {}
+    minted = [
+        row
+        for row in mint_prior_state_rows(
+            [
+                amended_row(
+                    amounts=[
+                        _fact(
+                            kind="commitment",
+                            normalized_amount="250000000",
+                            prior=False,
+                        ),
+                        # stated, but the parser could not resolve it
+                        _fact(kind="commitment", normalized_amount=None, prior=True),
+                    ],
+                    dates=[
+                        _fact(
+                            kind="agreement", normalized_date="2021-03-01", prior=True
+                        ),
+                        _fact(
+                            kind="maturity", normalized_date="2029-05-01", prior=False
+                        ),
+                        _fact(kind="maturity", normalized_date=None, prior=True),
+                    ],
+                )
+            ],
+            counters,
+        )
+        if row.get("synthesized_by") == "prior_state"
+    ]
+
+    assert counters == {"minted": 1}
+    assert len(minted) == 1
+    # neither post-amendment value is laundered onto the predecessor
+    assert minted[0]["principal_amount"] is None
+    assert minted[0]["maturity_date"] is None
+    assert json.loads(minted[0]["amounts_json"]) == []
+    inherited = [
+        entry
+        for entry in json.loads(minted[0]["dates_json"])
+        if entry.get("derived_from") == "inherited"
+    ]
+    assert inherited == []
+
+
+def test_a_prior_claim_that_never_parsed_is_counted_not_silently_dropped() -> None:
+    """The counters are the pre-registered yield, so a refusal cannot be silent.
+
+    An object whose *only* prior term failed to parse fell through the combined
+    "no prior amounts and no prior dates" guard with no counter at all, which
+    is why the window's 22 objects carrying a prior term summed to 21 across
+    the counters. On `data/genwindow-run-branch` the swallowed object is
+    `dim::5542bb4c…`, a Loan and Security Agreement whose prior commitment has
+    a null amount; the counters now sum to 22 (#211).
+    """
+    from cdt.extractor.core import mint_prior_state_rows
+
+    counters: dict[str, int] = {}
+    rows = mint_prior_state_rows(
+        [
+            amended_row(
+                amounts=[
+                    _fact(
+                        kind="commitment", normalized_amount="250000000", prior=False
+                    ),
+                    _fact(kind="commitment", normalized_amount=None, prior=True),
+                ],
+                dates=[
+                    _fact(kind="agreement", normalized_date="2020-02-03", prior=False),
+                ],
+            )
+        ],
+        counters,
+    )
+
+    assert len(rows) == 1
+    assert counters == {"skipped_unparsed_prior": 1}
+
+
+def test_two_before_figures_are_ambiguous_even_when_one_did_not_parse() -> None:
+    """Ambiguity is judged on the claims: two stated before-values are two states."""
+    from cdt.extractor.core import mint_prior_state_rows
+
+    counters: dict[str, int] = {}
+    rows = mint_prior_state_rows(
+        [
+            amended_row(
+                amounts=[
+                    _fact(kind="commitment", normalized_amount="300000000", prior=True),
+                    _fact(kind="commitment", normalized_amount=None, prior=True),
+                    _fact(
+                        kind="commitment", normalized_amount="250000000", prior=False
+                    ),
+                ]
+            )
+        ],
+        counters,
+    )
+
+    assert len(rows) == 1
+    assert counters == {"skipped_ambiguous_prior": 1}
+
+
+def test_mint_does_not_write_the_pointer_onto_the_rows_it_was_handed() -> None:
+    """`amendment_of` belongs on the published row, never on the persisted state.
+
+    Both callers happened to be safe — `published_mention_rows` copies and
+    `backfill_mentions` owns its records — so this was latent rather than live.
+    A future caller passing `row_state.debt_instrument_mentions` straight in
+    would have persisted a minted pointer into `state.jsonl` (#211).
+    """
+    from cdt.extractor.core import mint_prior_state_rows
+
+    caller_rows = [amended_row()]
+
+    published = mint_prior_state_rows(caller_rows)
+
+    assert caller_rows[0]["amendment_of"] is None
+    successor = next(
+        row
+        for row in published
+        if row["debt_instrument_mention_id"]
+        == caller_rows[0]["debt_instrument_mention_id"]
+    )
+    assert successor["amendment_of"] is not None
+    assert successor is not caller_rows[0]
+
+
+def test_lineage_pass_does_not_infer_against_a_column_it_then_overwrites(
+    tmp_path: Path,
+) -> None:
+    """Two passes over one unchanged corpus must agree (#211).
+
+    `infer_amendment_parents` reads `first_seen_filing_date` as both the
+    predecessor-ordering guard and the chain sort key, and the rollup rewrites
+    that column from the member edges *after* the inference. So when the
+    recomputed value differed from what was on disk, pass N+1 inferred against
+    a different corpus than pass N.
+
+    A row whose member edges point at mentions that no longer exist is the
+    reachable case, and it arises on its own: mention ids are content hashes,
+    so re-extracting an item mints a new id, the old member edge is never
+    deleted, and the old instrument survives with `mention_count` 0. Its stored
+    `first_seen_filing_date` is then a date no surviving mention supports.
+    """
+    root = _ordinal_chain_root(tmp_path)
+    apply_lineage_inference_pass(root)
+
+    # Strand a third instrument on a member edge whose mention is gone, while
+    # leaving a stored observation date the surviving members cannot support.
+    instruments = read_dataset(debt_instruments_root(root))
+    stranded = dict(instruments.iloc[0])
+    stranded.update(
+        {
+            "debt_instrument_id": "m-stranded",
+            "seed_debt_instrument_mention_id": "m-gone",
+            "name": "Amended and Restated Credit Agreement",
+            "amendment_of_debt_instrument_id": None,
+            "amendment_inferred_by": None,
+            "superseded_by_debt_instrument_id": None,
+            # Later than the successor's, so the predecessor-ordering guard
+            # refuses the link while this value is believed. The rollup nulls
+            # it, because no surviving mention supports it.
+            "first_seen_filing_date": "2099-01-01",
+            "last_seen_filing_date": "2099-01-01",
+            "mention_count": 1,
+        }
+    )
+    write_partition_table(
+        debt_instruments_root(root),
+        partition={"cik_shard": shard_for_cik("320193")},
+        table=pd.DataFrame(
+            [*instruments.to_dict("records"), stranded],
+            columns=DEBT_INSTRUMENT_COLUMNS,
+        ),
+    )
+    edges = read_dataset(mention_cluster_edges_root(root))
+    stranded_edge = dict(edges.iloc[0])
+    stranded_edge.update(
+        {
+            "debt_instrument_id": "m-stranded",
+            "debt_instrument_mention_id": "m-gone",
+            "edge_type": "member",
+        }
+    )
+    write_partition_table(
+        mention_cluster_edges_root(root),
+        partition={"cik_shard": shard_for_cik("320193")},
+        table=pd.DataFrame(
+            [*edges.to_dict("records"), stranded_edge],
+            columns=MENTION_CLUSTER_EDGE_COLUMNS,
+        ),
+    )
+
+    first = apply_lineage_inference_pass(root)
+    after_first = _published_instruments(root)
+    second = apply_lineage_inference_pass(root)
+    after_second = _published_instruments(root)
+
+    pointers_first = {
+        instrument_id: row["amendment_of_debt_instrument_id"]
+        for instrument_id, row in after_first.items()
+    }
+    pointers_second = {
+        instrument_id: row["amendment_of_debt_instrument_id"]
+        for instrument_id, row in after_second.items()
+    }
+    assert first["links"] == second["links"]
+    assert pointers_first == pointers_second
+    # Not vacuous: the rank-1 stranded row is the parent the chain lands on,
+    # and it is reachable only once its unsupported date has been recomputed.
+    assert pointers_first["m-2"] == "m-stranded"
+    assert after_first["m-stranded"]["first_seen_filing_date"] is None
+    assert after_first["m-stranded"]["mention_count"] == 0
+
+
+def test_an_unhashable_date_value_does_not_kill_the_whole_mint_pass() -> None:
+    """One malformed partition row must not abort an extract or a backfill (#211).
+
+    `{"kind": "amendment", "normalized_date": ["2020-01-01"]}` raised
+    `TypeError: cannot use 'list' as a set element` out of the amendment-date
+    set, taking down every remaining item in the run. No model output can reach
+    it — `standardized_date_payload` overwrites `normalized_date` with this
+    repo's own parser output, always `str | None` — so this is hardening for a
+    tampered or hand-edited partition, and it is the failure class the
+    `_borrowers` guard was written for.
+    """
+    from cdt.extractor.core import mint_prior_state_rows
+
+    counters: dict[str, int] = {}
+    rows = mint_prior_state_rows(
+        [
+            amended_row(
+                dates=[
+                    _fact(kind="agreement", normalized_date="2020-02-03", prior=True),
+                    _fact(kind="amendment", normalized_date=["2024-06-01"]),
+                ]
+            )
+        ],
+        counters,
+    )
+
+    assert counters == {"minted": 1}
+    assert len(rows) == 2
+
+
+def _row_state_with_a_prior_term(item_id: str = "item-1") -> ExtractionRowState:
+    """Return a terminal row state whose single mention triggers the mint."""
+    row_state = ExtractionRowState(
+        item_row={
+            "item_id": item_id,
+            "accession_number": "0001",
+            "cik": "0000320193",
+            "company_name": "Example Inc.",
+            "date": "2024-06-01",
+            "text": "amended",
+        },
+        stage_name="instrument_ie",
+    )
+    row_state.debt_instrument_mentions = [amended_row(item_id=item_id)]
+    row_state.finish("SUCCESS")
+    return row_state
+
+
+def test_the_batch_finalize_publishes_through_the_mint_seam(tmp_path: Path) -> None:
+    """`finalize_extract_outputs` must mint, not just the live loop (#211).
+
+    The seam exists so one derivation reaches every backend at once, and the
+    batch backend is the deployed default. Swapping this call site back to
+    `row_state.debt_instrument_mentions` left the whole suite green, because no
+    test drove this function with a mention carrying a `prior` term.
+    """
+    from cdt.extractor.core import finalize_extract_outputs
+
+    finalize_extract_outputs(
+        [(_row_state_with_a_prior_term(), "2024-06-01", "0001")],
+        claimed={},
+        run_id="20240601T000000000000Z",
+        model="test-model",
+        reasoning_effort="none",
+        max_attempts=3,
+        artifact_root=tmp_path,
+    )
+
+    written = read_dataset(mentions_root(tmp_path))
+    minted = written[written["synthesized_by"] == "prior_state"]
+    assert len(minted) == 1
+    successor = written[written["synthesized_by"].isna()].iloc[0]
+    assert successor["amendment_of"] == minted.iloc[0]["debt_instrument_mention_id"]
+
+
+def test_extract_tables_publishes_through_the_mint_seam(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The in-memory path mints too, so a notebook sees what the pipeline writes."""
+    from cdt.extractor.core import extract_tables
+
+    async def fake_run_extraction_workflow(**kwargs: object) -> ExtractionRowState:
+        item_row = kwargs["item_row"]
+        return _row_state_with_a_prior_term(str(item_row["item_id"]))
+
+    monkeypatch.setattr(
+        "cdt.extractor.core.run_extraction_workflow", fake_run_extraction_workflow
+    )
+
+    tables = extract_tables(
+        pd.DataFrame(
+            [
+                {
+                    "item_id": "item-1",
+                    "accession_number": "0001",
+                    "cik": "0000320193",
+                    "company_name": "Example Inc.",
+                    "date": "2024-06-01",
+                    "text": "amended",
+                    "relevance": True,
+                }
+            ]
+        ),
+        artifact_root=tmp_path,
+        client=None,
+    )
+
+    rows = tables["debt_instrument_mentions"]
+    assert (rows["synthesized_by"] == "prior_state").sum() == 1
+
+
+def test_a_prior_commitment_termination_mints_and_is_not_inherited_over() -> None:
+    """`commitment_termination` is in both date frozensets, and both halves matter.
+
+    Every mint test used `maturity` and `agreement` only, so dropping
+    `commitment_termination` from `PRIOR_TERM_DATE_KINDS` or from
+    `INHERITED_DATE_KINDS` left the suite green (#211). The two sets answer
+    different questions: the first is which prior dates can trigger and carry
+    onto the predecessor, the second is which current dates are carried forward
+    as unchanged when the filing states no before-value for them.
+    """
+    from cdt.extractor.core import mint_prior_state_rows
+
+    counters: dict[str, int] = {}
+    minted = [
+        row
+        for row in mint_prior_state_rows(
+            [
+                amended_row(
+                    dates=[
+                        _fact(
+                            kind="agreement", normalized_date="2020-02-03", prior=False
+                        ),
+                        _fact(
+                            kind="commitment_termination",
+                            normalized_date="2026-02-03",
+                            prior=True,
+                        ),
+                        _fact(
+                            kind="commitment_termination",
+                            normalized_date="2029-02-03",
+                            prior=False,
+                        ),
+                        _fact(
+                            kind="maturity", normalized_date="2030-02-03", prior=False
+                        ),
+                    ]
+                )
+            ],
+            counters,
+        )
+        if row.get("synthesized_by") == "prior_state"
+    ]
+
+    assert counters == {"minted": 1}
+    dates = {entry["kind"]: entry for entry in json.loads(minted[0]["dates_json"])}
+    # the prior value triggers and lands on the predecessor as its own, stated
+    assert dates["commitment_termination"]["normalized_date"] == "2026-02-03"
+    assert dates["commitment_termination"]["derived_from"] == "stated"
+    # the current maturity has no prior sibling, so it carries forward marked
+    assert dates["maturity"]["normalized_date"] == "2030-02-03"
+    assert dates["maturity"]["derived_from"] == "inherited"
+
+    # And the mirror case, which is the other frozenset: with the prior value on
+    # `maturity` instead, the current `commitment_termination` has no prior
+    # sibling and is the one carried forward. Without `commitment_termination`
+    # in `INHERITED_DATE_KINDS` the predecessor simply loses that term.
+    mirrored = [
+        row
+        for row in mint_prior_state_rows(
+            [
+                amended_row(
+                    dates=[
+                        _fact(
+                            kind="agreement", normalized_date="2020-02-03", prior=False
+                        ),
+                        _fact(
+                            kind="maturity", normalized_date="2027-02-03", prior=True
+                        ),
+                        _fact(
+                            kind="maturity", normalized_date="2030-02-03", prior=False
+                        ),
+                        _fact(
+                            kind="commitment_termination",
+                            normalized_date="2029-02-03",
+                            prior=False,
+                        ),
+                    ]
+                )
+            ]
+        )
+        if row.get("synthesized_by") == "prior_state"
+    ]
+    mirrored_dates = {
+        entry["kind"]: entry for entry in json.loads(mirrored[0]["dates_json"])
+    }
+    assert mirrored_dates["maturity"]["normalized_date"] == "2027-02-03"
+    assert mirrored_dates["maturity"]["derived_from"] == "stated"
+    assert mirrored_dates["commitment_termination"]["normalized_date"] == "2029-02-03"
+    assert mirrored_dates["commitment_termination"]["derived_from"] == "inherited"
+
+
+def test_an_expected_date_is_never_inherited_onto_the_predecessor() -> None:
+    """A date the filing only projects cannot be a term the earlier state had.
+
+    No fixture carried `expected: True`, so deleting the
+    `and not entry.get("expected")` guard left the suite green (#211).
+    """
+    from cdt.extractor.core import mint_prior_state_rows
+
+    minted = [
+        row
+        for row in mint_prior_state_rows(
+            [
+                amended_row(
+                    dates=[
+                        _fact(
+                            kind="agreement", normalized_date="2020-02-03", prior=True
+                        ),
+                        _fact(
+                            kind="maturity",
+                            normalized_date="2030-02-03",
+                            prior=False,
+                            expected=True,
+                        ),
+                    ]
+                )
+            ]
+        )
+        if row.get("synthesized_by") == "prior_state"
+    ]
+
+    kinds = {entry["kind"] for entry in json.loads(minted[0]["dates_json"])}
+    assert "maturity" not in kinds
+    assert minted[0]["maturity_date"] is None
+
+
+def test_the_lineage_pass_records_a_run_manifest(tmp_path: Path) -> None:
+    """The pass rewrites every published shard, so it must say so (#211).
+
+    Every writing stage in this repo records a run manifest, and
+    `docs/architecture.md` names stage manifests as a design property. The match
+    manifest lists its own `partitions_written`, and then this pass rewrites
+    every one of them — so without a manifest of its own, the last record of the
+    `debt-instruments` dataset described a state something else had changed
+    afterwards. Tolerable while the pass was opt-in behind `--infer-lineage`;
+    #203 made it the unconditional default.
+    """
+    root = _ordinal_chain_root(tmp_path)
+    stats = apply_lineage_inference_pass(root)
+
+    manifest = read_json_artifact(
+        run_manifest_path("infer-lineage", "latest", artifact_root=str(root))
+    )
+    assert isinstance(manifest, dict)
+    assert manifest["stage"] == "infer-lineage"
+    assert manifest["schema_version"] == MATCHER_SCHEMA_VERSION
+    assert manifest["links"] == stats["links"]
+    assert manifest["heads_after"] == stats["heads_after"]
+    # the partitions it names are the ones it actually rewrote
+    assert manifest["partitions_written"]
+    for path in manifest["partitions_written"]:
+        assert artifact_exists(path)
+        assert "debt-instruments" in path

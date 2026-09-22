@@ -545,7 +545,15 @@ These stages currently overwrite a `latest` manifest:
 <artifact-root>/runs/itemize/run_id=latest.json
 <artifact-root>/runs/classify/run_id=latest.json
 <artifact-root>/runs/match/run_id=latest.json
+<artifact-root>/runs/infer-lineage/run_id=latest.json
 ```
+
+`infer-lineage` is the amendment-lineage post-pass. It runs after every match
+and rewrites every `debt-instruments` partition the match manifest just listed,
+so it records its own — otherwise the last manifest of that dataset describes a
+state something else changed afterwards (#211). It carries the pass's counters
+(`links`, `reopened`, `heads_before`, `heads_after`) alongside the partitions it
+rewrote.
 
 The match manifest and the `final-snapshots/latest.json` pointer carry
 `schema_version` (`MATCHER_SCHEMA_VERSION`, currently 7). It is bumped whenever a

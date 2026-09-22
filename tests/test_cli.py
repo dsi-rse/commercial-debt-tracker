@@ -691,6 +691,7 @@ def test_match_cli_calls_pending_matcher(
         artifact_root: str | Path | None = None,
         batch_size: int,
         force: bool = False,
+        renew: object = None,
         strong_match_threshold: float = 0.9,
         loose_match_threshold: float = 0.75,
         ambiguity_margin: float = 0.05,
@@ -700,6 +701,10 @@ def test_match_cli_calls_pending_matcher(
             {
                 "batch_size": batch_size,
                 "force": force,
+                # `cdt match` now rewrites the whole corpus unconditionally —
+                # the lineage pass runs after it — so the hold must be renewed
+                # or a long run keeps writing on a stolen lease (#89, #211).
+                "renews": callable(renew),
                 "strong": strong_match_threshold,
                 "loose": loose_match_threshold,
                 "ambiguity": ambiguity_margin,
@@ -714,6 +719,26 @@ def test_match_cli_calls_pending_matcher(
 
     monkeypatch.setattr(cli, "match_pending_mentions", fake_match_pending_mentions)
 
+    # `cdt match` runs the lineage pass after matching — an amend-and-restate
+    # chain spans filings, so its links exist only once every shard has matched
+    # (#170, #204). Replacing the call with canned zero stats left the suite
+    # green; `run_match_and_finalize`'s half was covered and the CLI's was not,
+    # though it is the half named in the commit that added it (#211).
+    lineage_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        cli,
+        "apply_lineage_inference_pass",
+        lambda artifact_root, **kwargs: (
+            lineage_calls.append(
+                {
+                    "artifact_root": str(artifact_root),
+                    "renews": callable(kwargs.get("renew")),
+                }
+            ),
+            {"links": 1, "reopened": 0, "heads_before": 2, "heads_after": 1},
+        )[1],
+    )
+
     status = cli.main(["match", "--batch-size", "25", "--force", "--quiet"])
 
     assert status == 0
@@ -721,11 +746,14 @@ def test_match_cli_calls_pending_matcher(
         {
             "batch_size": 25,
             "force": True,
+            "renews": True,
             "strong": 0.9,
             "loose": 0.75,
             "ambiguity": 0.05,
         }
     ]
+    assert len(lineage_calls) == 1
+    assert lineage_calls[0]["renews"] is True
 
 
 def test_parse_date_rejects_non_iso_date() -> None:
@@ -752,18 +780,36 @@ def test_parse_item_numbers_rejects_empty_list() -> None:
         raise AssertionError("expected argparse to reject an empty item-number list")
 
 
-def test_backfill_mentions_cli_reports_counts_and_skips_the_lease_on_dry_run(
+def test_backfill_mentions_cli_takes_and_renews_the_lease_only_when_it_writes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """`backfill-mentions --dry-run` counts without a lease; without it, it writes."""
+    """Three legs: a dry run, a writing run, and a run refused by a held lease.
+
+    `--dry-run` counts without taking a lease and so passes no renewal hook.
+    The writing leg takes the pipeline-writer lease and hands over a renewer,
+    because it rewrites the whole mentions dataset (#89). A third run, with the
+    lease already held, must not start at all.
+    """
     calls: list[dict[str, object]] = []
 
     def fake_backfill_mentions(
-        artifact_root: object, *, dry_run: bool = False
+        artifact_root: object,
+        *,
+        dry_run: bool = False,
+        renew: object = None,
     ) -> dict[str, int]:
-        calls.append({"artifact_root": str(artifact_root), "dry_run": dry_run})
+        calls.append(
+            {
+                "artifact_root": str(artifact_root),
+                "dry_run": dry_run,
+                # A whole-dataset rewrite must renew, or the next orchestrator
+                # tick steals the lease mid-rewrite and both writers
+                # full-overwrite the same partition objects (#89, #211).
+                "renews": callable(renew),
+            }
+        )
         return {"partitions": 3, "partitions_rewritten": 0, "minted": 2}
 
     monkeypatch.setattr(cli, "backfill_mentions", fake_backfill_mentions)
@@ -773,7 +819,8 @@ def test_backfill_mentions_cli_reports_counts_and_skips_the_lease_on_dry_run(
     )
 
     assert status == 0
-    assert calls == [{"artifact_root": str(tmp_path), "dry_run": True}]
+    # A dry run writes nothing, so it takes no lease and needs no renewal.
+    assert calls == [{"artifact_root": str(tmp_path), "dry_run": True, "renews": False}]
     out = capsys.readouterr().out
     assert "Mentions backfill (dry run):" in out
     assert "minted:" in out and "2" in out
@@ -783,7 +830,27 @@ def test_backfill_mentions_cli_reports_counts_and_skips_the_lease_on_dry_run(
         ["backfill-mentions", "--quiet", "--artifact-root", str(tmp_path)]
     )
     assert status == 0
-    assert calls[-1] == {"artifact_root": str(tmp_path), "dry_run": False}
+    assert calls[-1] == {
+        "artifact_root": str(tmp_path),
+        "dry_run": False,
+        "renews": True,
+    }
+    # The real leg takes the pipeline-writer lease; deleting that block used to
+    # leave the suite green (#211).
+    assert (tmp_path / "locks").exists()
+
+    # And it refuses to start while another run holds it.
+    monkeypatch.setattr(
+        cli,
+        "backfill_mentions",
+        lambda *a, **k: pytest.fail("backfill must not run while the lease is held"),
+    )
+    held = acquire_lease(tmp_path, PIPELINE_WRITER_LEASE)
+    assert held is not None
+    assert (
+        cli.main(["backfill-mentions", "--quiet", "--artifact-root", str(tmp_path)])
+        == 1
+    )
 
 
 def test_show_extract_job_reports_idle(

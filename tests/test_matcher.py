@@ -18,6 +18,7 @@ from cdt.matcher.core import (
     lender_signature,
     match_tables,
     mention_sort_key,
+    name_class_sizes,
     name_rate_tokens,
     name_rates_are_compatible,
     normalize_name_fingerprint,
@@ -1272,3 +1273,135 @@ def test_two_extracted_parents_refuse_rather_than_fall_back_to_a_guess() -> None
 
     assert links["m-a"]["amendment_of_debt_instrument_id"] is None
     assert links["m-a"]["amendment_inferred_by"] is None
+
+
+def test_name_class_sizes_survives_a_cik_whose_mentions_are_all_synthesized() -> None:
+    """The `by_cik.get` default guards a reachable KeyError, not a hypothetical (#211).
+
+    Synthesized mentions are excluded from the per-CIK name lists, so a CIK
+    whose every mention is synthesized leaves no entry at all. Reverting the
+    lookup to `by_cik[cik]` raises inside `match_pending_mentions` for that
+    issuer. The fix shipped with #203; only the test was missing.
+    """
+    synthesized = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="m-prior",
+            cik="0000320193",
+            name="Second Amended and Restated Credit Agreement",
+            synthesized_by="prior_state",
+            synthesized_from_mention_id="m-successor",
+        )
+    )
+
+    sizes = name_class_sizes({"m-prior": synthesized})
+
+    assert sizes == {"m-prior": 0}
+
+
+def test_a_synthesized_row_borrows_its_successors_lenders_for_scoring() -> None:
+    """`match_tables` must actually consult `borrowed_lender_signature` (#211).
+
+    A minted prior state carries the borrower only — a joinder adds and removes
+    lenders, so the filing never states who lent under the earlier terms — and
+    that missing signature is what the borrowed one stands in for while
+    scoring. Both halves were tested alone and their connection was not:
+    deleting the `lender_signature=borrowed_lender_signature(...)` argument at
+    the `match_tables` call site left the whole suite green, because the one
+    end-to-end test through `match_tables` used `parties_json="[]"` and never
+    exercised the lender path at all.
+    """
+    lenders = json.dumps(
+        [
+            {
+                "role": "lender",
+                "kind": "organization",
+                "canonical_name": "Acme Bank, N.A.",
+                "mentions": [{"text": "Acme Bank, N.A."}],
+                "tag_ids": ["tag-l-1"],
+            }
+        ]
+    )
+    successor = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="m-successor",
+            cik="0000320193",
+            name="Second Amended and Restated Credit Agreement",
+            parties_json=lenders,
+        )
+    )
+    minted = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="m-prior",
+            cik="0000320193",
+            name="Second Amended and Restated Credit Agreement",
+            synthesized_by="prior_state",
+            synthesized_from_mention_id="m-successor",
+        )
+    )
+    index = {"m-successor": successor, "m-prior": minted}
+
+    # The mint states no lender of its own...
+    assert not minted.lender_signature
+    # ...and stands in its successor's signature while scoring.
+    assert borrowed_lender_signature(minted, index) == successor.lender_signature
+    # The successor, which names its own, borrows nothing.
+    assert borrowed_lender_signature(successor, index) is None
+
+    # And `match_tables` actually consults it: the published `match_via` names
+    # the lender support, which the minted row can only have borrowed. Deleting
+    # the `lender_signature=borrowed_lender_signature(...)` argument at the call
+    # site turns this into `amount_start+name`.
+    def published_via(successor_parties: str) -> str:
+        rows = pd.DataFrame(
+            [
+                mention_row(
+                    debt_instrument_mention_id="m-2017",
+                    item_id="item-2017",
+                    accession_number="0001",
+                    date="2017-11-14",
+                    name="Company's Second Amended and Restated Credit Agreement",
+                    start_date="2017-07-31",
+                    maturity_date=None,
+                    principal_amount="1500000000",
+                    parties_json=lenders,
+                ),
+                mention_row(
+                    debt_instrument_mention_id="m-2021",
+                    item_id="item-2021",
+                    accession_number="0002",
+                    date="2021-04-26",
+                    name="Second Amended and Restated Credit Agreement",
+                    start_date="2021-04-26",
+                    maturity_date=None,
+                    principal_amount="2500000000",
+                    amendment_of="m-2021-prior",
+                    parties_json=successor_parties,
+                ),
+                mention_row(
+                    debt_instrument_mention_id="m-2021-prior",
+                    item_id="item-2021",
+                    accession_number="0002",
+                    date="2021-04-26",
+                    name="Second Amended and Restated Credit Agreement",
+                    start_date="2017-07-31",
+                    maturity_date=None,
+                    principal_amount="1500000000",
+                    synthesized_by="prior_state",
+                    synthesized_from_mention_id="m-2021",
+                ),
+            ]
+        )
+        edges = (
+            match_tables(rows)["debt_instrument_mentions"]
+            .query("edge_type == 'member'")
+            .set_index("debt_instrument_mention_id")
+        )
+        assert (
+            edges.loc["m-2021-prior", "debt_instrument_id"]
+            == edges.loc["m-2017", "debt_instrument_id"]
+        )
+        return str(edges.loc["m-2021-prior", "match_via"])
+
+    assert published_via(lenders) == "member:amount_start+lenders"
+    # Nothing to borrow when the successor names no lender either.
+    assert published_via("[]") == "member:amount_start+name"
