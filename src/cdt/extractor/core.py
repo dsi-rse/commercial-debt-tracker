@@ -28,6 +28,7 @@ from cdt.datasets import (
     PARTITION_PATTERN,
     SIXK_SNIPPET_DATASET_NAME,
     CompletedPartition,
+    CompletionRegistry,
     completion_registry_path,
     dataset_root,
     date_shard_partition_path,
@@ -1571,7 +1572,9 @@ def pending_extract_partitions(
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     registry = (
-        {}
+        # Not a plain ``{}``: save_completion_registry treats every key of one
+        # as changed, which re-sends the whole run at every batch boundary.
+        CompletionRegistry()
         if force
         else load_completion_registry(
             "extract", artifact_root=resolved_root, data_dir=data_dir
