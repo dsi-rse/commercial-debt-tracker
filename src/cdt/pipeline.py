@@ -325,21 +325,6 @@ class PipelineOrchestrator:
             edge_rows=len(matched["debt_instrument_mentions"]),
             debt_instruments=len(matched["debt_instrument"]),
         )
-        # Same post-pass, same guard, as run_match_and_finalize: amendment
-        # lineage spans filings, so it can only be derived once every shard has
-        # matched. This path is `cdt pipeline` and the live extractor backend;
-        # omitting it here published un-inferred lineage on both while the batch
-        # backend had it, which is #170 surviving on two of three entry points.
-        if not matched["debt_instrument"].empty:
-            self._renew(renew)
-            self._log_stage_start("infer-lineage")
-            lineage_stats = apply_lineage_inference_pass(
-                resolved_artifact_root,
-                data_dir=self.config.data_dir,
-                renew=renew,
-            )
-            self._log_stage_complete("infer-lineage", **lineage_stats)
-
         member_edge_rows = matched["debt_instrument_mentions"]
         matched_mentions = (
             int((member_edge_rows["edge_type"] == "member").sum())
@@ -365,33 +350,16 @@ class PipelineOrchestrator:
                 data_dir=self.config.data_dir,
             ),
         )
-        self._renew(renew)
-        self._log_stage_start(
-            "finalize",
-            output_root=self.config.final_database_root,
-        )
-        # Same gate, same question, as run_match_and_finalize: `cdt pipeline`
-        # and the live extractor backend pay the identical 25-minute publish,
-        # and they pay it on a run that changed nothing just as readily.
-        final_outputs = (
-            {}
-            if publish_would_republish_nothing(
-                artifact_root=resolved_artifact_root,
-                final_database_root=self.config.final_database_root,
-                data_dir=self.config.data_dir,
-                force=self.config.force,
-            )
-            else write_final_output_tables(
-                artifact_root=resolved_artifact_root,
-                final_database_root=self.config.final_database_root,
-                data_dir=self.config.data_dir,
-                force=self.config.force,
-            )
-        )
-        self._log_stage_complete(
-            "finalize",
-            tables=len(final_outputs),
-            output_root=self.config.final_database_root,
+        # One shared tail rather than a second copy: see finalize_after_match.
+        finalize_after_match(
+            matched["debt_instrument"],
+            artifact_root=resolved_artifact_root,
+            final_database_root=self.config.final_database_root,
+            data_dir=self.config.data_dir,
+            force=self.config.force,
+            renew=renew,
+            log_stage_start=self._log_stage_start,
+            log_stage_complete=self._log_stage_complete,
         )
         elapsed = datetime.now() - start_time
         self._log_banner(f"Pipeline completed successfully in {elapsed}")
@@ -444,31 +412,13 @@ def run_match_and_finalize(
         ambiguity_margin=ambiguity_margin,
         renew=renew,
     )
-    # Amendment lineage across filings exists only once every shard has
-    # matched, so it is a post-pass over the whole corpus (#170). It used to
-    # run only behind `cdt match --infer-lineage`, which is why production
-    # published 537 of 542 instruments as lineage heads. It re-derives every
-    # pointer it ever inferred (#204) and renews the lease as it goes; it is
-    # skipped only when match produced nothing at all, since it would read three
-    # empty datasets to write none.
-    if not tables["debt_instrument"].empty:
-        if renew is not None:
-            renew()
-        apply_lineage_inference_pass(resolved_root, data_dir=data_dir, renew=renew)
-    if publish_would_republish_nothing(
+    return finalize_after_match(
+        tables["debt_instrument"],
         artifact_root=resolved_root,
         final_database_root=final_database_root,
         data_dir=data_dir,
         force=force,
-    ):
-        return {}
-    if renew is not None:
-        renew()
-    return write_final_output_tables(
-        artifact_root=resolved_root,
-        final_database_root=final_database_root,
-        data_dir=data_dir,
-        force=force,
+        renew=renew,
     )
 
 
@@ -644,6 +594,70 @@ def publish_would_republish_nothing(
         pointer.get("run_id", "unknown"),
     )
     return True
+
+
+def _ignore_stage(*args: object, **kwargs: object) -> None:
+    """Swallow a stage log line: only the orchestrator reports stages."""
+
+
+def finalize_after_match(
+    matched_instruments: pd.DataFrame,
+    *,
+    artifact_root: ArtifactPath,
+    final_database_root: ArtifactPath | None,
+    data_dir: Path | None = None,
+    force: bool = False,
+    renew: Callable[[], None] | None = None,
+    log_stage_start: Callable[..., None] = _ignore_stage,
+    log_stage_complete: Callable[..., None] = _ignore_stage,
+) -> dict[str, str]:
+    """Run the lineage post-pass and the publish: the tail every path shares.
+
+    One copy rather than two. #170 is what the second copy costs: the lineage
+    pass was wired into one of three entry points and production published 537
+    of 542 instruments as lineage heads, because `cdt pipeline` and the live
+    extractor backend silently skipped it. Both paths reach the same three
+    steps here, so a fix to any of them cannot land on only one again.
+
+    Amendment lineage spans filings, so it can only be derived once every shard
+    has matched, which makes it a post-pass over the whole corpus. It re-derives
+    every pointer it ever inferred (#204) and renews the lease as it goes; it is
+    skipped only when match produced nothing at all, since it would then read
+    three empty datasets to write none.
+
+    ``renew`` extends the caller's writer lease before each long step. This is
+    the longest phase of a run, and it must not keep publishing on a lease
+    another run has stolen (#89).
+    """
+    if not matched_instruments.empty:
+        if renew is not None:
+            renew()
+        log_stage_start("infer-lineage")
+        lineage_stats = apply_lineage_inference_pass(
+            artifact_root, data_dir=data_dir, renew=renew
+        )
+        log_stage_complete("infer-lineage", **lineage_stats)
+    log_stage_start("finalize", output_root=final_database_root)
+    if publish_would_republish_nothing(
+        artifact_root=artifact_root,
+        final_database_root=final_database_root,
+        data_dir=data_dir,
+        force=force,
+    ):
+        log_stage_complete("finalize", tables=0, output_root=final_database_root)
+        return {}
+    if renew is not None:
+        renew()
+    final_outputs = write_final_output_tables(
+        artifact_root=artifact_root,
+        final_database_root=final_database_root,
+        data_dir=data_dir,
+        force=force,
+    )
+    log_stage_complete(
+        "finalize", tables=len(final_outputs), output_root=final_database_root
+    )
+    return final_outputs
 
 
 def final_snapshots_root(artifact_root: ArtifactPath) -> str:
