@@ -2898,6 +2898,72 @@ def count_content_filter_aborts(row_state: ExtractionRowState, stage_name: str) 
     )
 
 
+def terminate_on_provider_aborts(
+    row_state: ExtractionRowState, stage: StageSpec, aborts: int
+) -> None:
+    """End a row the provider will not process, without blaming the model.
+
+    Reaching `MAX_CONTENT_FILTER_RESENDS` means "stop re-sending", not "the
+    model answered badly". Scoring the abort instead -- which is what falling
+    through to `handle_response` would do -- charges the row for a call it
+    never got an answer to, grows the retry conversation with an empty
+    assistant turn plus a complaint about it, and leaves a `FAILED` attempt
+    that every cross-attempt check in #176 reads as the model having failed.
+    One abort past the cap was enough to publish a debt-free item as a PARTIAL
+    "possible loss".
+
+    #152's rule still applies to what the row already earned: a relation stage
+    the provider will not run costs the item its lineage, not its instruments.
+    """
+    note = (
+        f"{stage.name} aborted by the provider on {aborts} consecutive calls "
+        f"(finish_reason=content_filter); no attempt was scored"
+    )
+    if (
+        stage.name == InstrumentRelationStage.name
+        and row_state.debt_instrument_mentions
+    ):
+        row_state.salvage_notes.append(
+            f"{note}; mentions published without lineage relations"
+        )
+        row_state.finish("PARTIAL")
+        return
+    row_state.salvage_notes.append(note)
+    row_state.finish("FAILED")
+
+
+def handle_provider_abort(
+    row_state: ExtractionRowState, completion: CompletionResult
+) -> bool:
+    """Record an unbilled provider abort. True if the request should go back out.
+
+    Shared by both backends so the live loop and the batch fold cannot drift on
+    a decision neither of them scores. Returns False when the resend cap is
+    reached and the row has been terminated (#127, #135).
+    """
+    stage = STAGE_BY_NAME[row_state.current_attempt.stage_name]
+    resend = (
+        count_content_filter_aborts(row_state, stage.name) < MAX_CONTENT_FILTER_RESENDS
+    )
+    row_state.record_unbilled_abort(completion.text, completion)
+    aborts = count_content_filter_aborts(row_state, stage.name)
+    LOGGER.warning(
+        "Provider aborted item=%s stage=%s abort=%s/%s (finish_reason=%s, "
+        "usage=%s); %s",
+        row_state.item_id,
+        stage.name,
+        aborts,
+        MAX_CONTENT_FILTER_RESENDS + 1,
+        completion.finish_reason,
+        completion.usage,
+        "re-sending unscored" if resend else "resend cap reached, terminating row",
+    )
+    if resend:
+        return True
+    terminate_on_provider_aborts(row_state, stage, aborts)
+    return False
+
+
 def stage_max_attempts(stage_name: str, max_attempts: int) -> int:
     """Resolve how many scored attempts this stage gets (#127).
 
@@ -3098,23 +3164,13 @@ async def run_extraction_workflow(
                 raise InfrastructureError(f"{type(exc).__name__}: {exc}") from exc
             record_stage_error(row_state, f"{type(exc).__name__}: {exc}")
             return row_state
-        if is_content_filter_abort(completion) and (
-            count_content_filter_aborts(row_state, row_state.current_attempt.stage_name)
-            < MAX_CONTENT_FILTER_RESENDS
-        ):
+        if is_content_filter_abort(completion):
             # Classified here, beside the infrastructure branch above, because
             # it is the same kind of event: the provider returned no answer, so
             # there is nothing to score and nothing for the model to correct.
             # `messages` is untouched, so the identical request goes back out.
-            LOGGER.warning(
-                "Provider aborted item=%s stage=%s (finish_reason=%s, usage=%s); "
-                "resending unscored",
-                row_state.item_id,
-                row_state.current_attempt.stage_name,
-                completion.finish_reason,
-                completion.usage,
-            )
-            row_state.record_unbilled_abort(completion.text, completion)
+            if not handle_provider_abort(row_state, completion):
+                return row_state
             continue
         messages = handle_response(
             row_state,

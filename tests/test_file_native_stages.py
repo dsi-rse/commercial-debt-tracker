@@ -2673,6 +2673,38 @@ def test_ner_high_water_survives_the_resumable_batch_state() -> None:
 NODEBT_TEXT = "This is the extracted event text."
 NODEBT_NER = f"<body>{NODEBT_TEXT}</body>"
 
+# A two-instrument item, so the relation stage actually runs on it.
+MULTI_TEXT = "Company entered into a Term Loan and a Revolver on January 1, 2024."
+MULTI_NER = (
+    "<body>Company entered into a <debt_instrument>Term Loan</debt_instrument> "
+    "and a <debt_instrument>Revolver</debt_instrument> on "
+    "<date>January 1, 2024</date>.</body>"
+)
+MULTI_IE = json.dumps(
+    [
+        {
+            "name": ["tag-1"],
+            "dates": [
+                {
+                    "kind": "closing",
+                    "evidence": ["tag-3"],
+                    "normalized_date": "2024-01-01",
+                }
+            ],
+        },
+        {
+            "name": ["tag-2"],
+            "dates": [
+                {
+                    "kind": "closing",
+                    "evidence": ["tag-3"],
+                    "normalized_date": "2024-01-01",
+                }
+            ],
+        },
+    ]
+)
+
 # As observed live: aborted upstream, nothing generated, nothing billed.
 CONTENT_FILTERED = CompletionResult(
     text="",
@@ -2821,8 +2853,15 @@ def test_content_filter_aborts_do_not_consume_the_stage_budget() -> None:
 
 
 def test_persistent_content_filtering_terminates_at_the_resend_cap() -> None:
-    """Free retries still have to stop: the row cannot spin forever (#127)."""
-    from cdt.extractor.core import MAX_CONTENT_FILTER_RESENDS
+    """Free retries still have to stop, and stopping must not blame the model (#127).
+
+    Past the cap the abort used to fall through to `handle_response` and be
+    scored as an ordinary bad answer: the row paid six more whole-item calls,
+    each one growing the retry conversation with an empty assistant turn, and
+    the resulting `FAILED` attempt made #176's checks read a provider abort as
+    a model failure. The row now terminates instead.
+    """
+    from cdt.extractor.core import MAX_CONTENT_FILTER_RESENDS, summarize_failure
 
     # Pinned as a literal: the cap bounds spend on a filtered row, so restating
     # the constant here would assert nothing about its value.
@@ -2830,11 +2869,55 @@ def test_persistent_content_filtering_terminates_at_the_resend_cap() -> None:
 
     row_state, client = _run_live(MPLX_TEXT, [CONTENT_FILTERED] * 40)
 
-    # Six unscored resends, then the aborts are scored like any other bad
-    # answer and burn NER's six real attempts: 12 calls, and no more.
-    assert len(client.requests) == 12
+    # Six re-sends plus the call that trips the cap, and no more.
+    assert len(client.requests) == 7
     assert row_state.state == "FAILED"
-    assert sum(1 for a in row_state.all_attempts if a.status == "ABORTED") == 6
+    # Not one call was scored, so the model is never blamed for the abort.
+    # The trailing "incomplete" is the unused outstanding attempt that
+    # `finish` always appends, not a call that was made.
+    assert [a.status for a in row_state.all_attempts] == ["ABORTED"] * 7 + [
+        "incomplete"
+    ]
+    assert row_state.current_attempt.attempt_index == 0
+    # Every request was the pristine one: no conversation growth past the cap.
+    assert all(request == client.requests[0] for request in client.requests)
+    assert "aborted by the provider on 7 consecutive calls" in summarize_failure(
+        row_state
+    )
+
+
+def test_a_filtered_row_is_registered_against_the_stage_that_was_aborted() -> None:
+    """An operator retrying the row needs the stage, not a generic failure (#127)."""
+    from cdt.extractor.core import failed_stage_name
+
+    row_state, _ = _run_live(MPLX_TEXT, [CONTENT_FILTERED] * 40)
+
+    assert failed_stage_name(row_state) == "ner"
+
+
+def test_aborts_at_the_relation_stage_still_publish_the_items_mentions() -> None:
+    """#152's rule holds: a stage the provider will not run costs lineage, not instruments.
+
+    The relation stage is the last one, and its output is only lineage. A row
+    whose instruments already validated must not lose them because the
+    provider refused to run the final call.
+    """
+    from cdt.extractor.core import PUBLISHABLE_ROW_STATES, summarize_failure
+
+    row_state, client = _run_live(
+        MULTI_TEXT,
+        [_stopped(MULTI_NER), _stopped(MULTI_IE)] + [CONTENT_FILTERED] * 40,
+    )
+
+    # Two scored calls for ner and instrument_ie, then the relation stage is
+    # aborted to its cap.
+    assert len(client.requests) == 2 + 7
+    assert row_state.state == "PARTIAL"
+    assert row_state.state in PUBLISHABLE_ROW_STATES
+    assert len(row_state.debt_instrument_mentions) == 2
+    assert "mentions published without lineage relations" in summarize_failure(
+        row_state
+    )
 
 
 def test_content_filter_resend_cap_survives_the_resumable_batch_state() -> None:

@@ -1705,16 +1705,34 @@ def test_batch_fold_scores_an_ordinary_bad_response() -> None:
 
 
 def test_batch_fold_stops_resending_at_the_cap() -> None:
-    """A persistently filtered batch row terminates rather than occupying windows (#127)."""
+    """A persistently filtered batch row terminates rather than occupying windows (#127).
+
+    Each re-send costs another batch window, so the cap is what stops a row the
+    provider will not process from cycling for days. Terminating beats scoring
+    the abort: nothing here is the model's fault.
+    """
     entry = _awaiting_entry(NODEBT_TEXT)
 
     for _ in range(MAX_CONTENT_FILTER_RESENDS):
         _fold_one_response(entry, BATCH_CONTENT_FILTERED, 3)
     assert count_content_filter_aborts(entry.row_state, "ner") == 6
-    assert entry.row_state.current_attempt.attempt_index == 0
+    assert entry.row_state.state is None
 
-    # Past the cap the abort is scored like any other empty answer.
     _fold_one_response(entry, BATCH_CONTENT_FILTERED, 3)
 
-    assert count_content_filter_aborts(entry.row_state, "ner") == 6
-    assert entry.row_state.current_attempt.attempt_index == 1
+    assert entry.row_state.state == "FAILED"
+    # Not scored: the row never gets a FAILED attempt blaming the model.
+    assert entry.row_state.current_attempt.attempt_index == 0
+    assert [a.status for a in entry.row_state.all_attempts] == ["ABORTED"] * 7 + [
+        "incomplete"
+    ]
+    # And it stops being submitted.
+    job = JobState(
+        job_id="J",
+        model="gpt-5.4",
+        reasoning_effort="none",
+        max_attempts=3,
+        claimed_partitions=[],
+        rows={"item-1": entry},
+    )
+    assert _awaiting_rows(job) == []

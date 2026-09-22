@@ -38,13 +38,12 @@ from cdt import settings
 from cdt.datasets import dataset_root, resolve_artifact_root
 from cdt.extractor.core import (
     DEFAULT_MAX_ATTEMPTS,
-    MAX_CONTENT_FILTER_RESENDS,
     CompletionResult,
     ExtractionRowState,
     collect_pending_extract_items,
     completion_result_from_batch_line,
-    count_content_filter_aborts,
     finalize_extract_outputs,
+    handle_provider_abort,
     handle_response,
     initial_messages,
     is_content_filter_abort,
@@ -767,23 +766,12 @@ def _fold_one_response(
     the provider returned no answer, so there is nothing to validate and
     nothing for the model to correct. ``pending`` has already been cleared and
     ``current_attempt.messages`` is untouched, so ``_build_requests`` re-submits
-    the identical request on the next tick (#127, #135).
+    the identical request on the next tick (#127, #135). At the resend cap
+    ``handle_provider_abort`` terminates the row instead, so a filtered row
+    stops occupying batch windows.
     """
-    if is_content_filter_abort(completion) and (
-        count_content_filter_aborts(
-            entry.row_state, entry.row_state.current_attempt.stage_name
-        )
-        < MAX_CONTENT_FILTER_RESENDS
-    ):
-        LOGGER.warning(
-            "Provider aborted item=%s stage=%s (finish_reason=%s, usage=%s); "
-            "resending unscored next tick",
-            entry.row_state.item_id,
-            entry.row_state.current_attempt.stage_name,
-            completion.finish_reason,
-            completion.usage,
-        )
-        entry.row_state.record_unbilled_abort(completion.text, completion)
+    if is_content_filter_abort(completion):
+        handle_provider_abort(entry.row_state, completion)
         return
     handle_response(
         entry.row_state,
