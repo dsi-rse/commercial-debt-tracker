@@ -2406,7 +2406,6 @@ def test_ner_validate_rejects_a_zero_tag_retry_after_an_earlier_attempt_tagged()
             status="FAILED",
         )
     )
-    row_state.current_attempt.attempt_index = 2
 
     # Valid, faithful, and carrying no `debt_instrument` -- it passes all six
     # structural checks. Tagged with a `date` so it is not also a byte echo,
@@ -2441,7 +2440,6 @@ def test_ner_validate_high_water_never_misfires_on_a_debt_free_item() -> None:
             status="FAILED",
         )
     )
-    row_state.current_attempt.attempt_index = 2
     response = (
         "<body><organization>Acme Corp</organization> filed this report on "
         "<date>January 1, 2024</date>.</body>"
@@ -2485,20 +2483,51 @@ def test_ner_high_water_counts_tags_in_attempts_that_never_parsed() -> None:
     assert prior_debt_instrument_high_water(row_state, "ner") == 2
 
 
-def test_ner_validate_rejects_a_byte_identical_echo_on_retry() -> None:
-    """Returning the input verbatim addresses nothing (#176).
+def test_ner_validate_rejects_a_byte_identical_echo_after_the_model_tagged() -> None:
+    """Returning the input verbatim is a regression against the model's own work (#176).
 
     MPLX attempt 3 was byte-identical to the model's own input, `<body>`
-    wrapper included, and passed.
+    wrapper included, and passed. Driven through `handle_response` rather than
+    hand-setting `attempt_index`: what makes the echo a give-up is that an
+    earlier attempt on this row tagged something, and only a driven row builds
+    that history the way production does.
     """
-    from cdt.extractor.core import ner_input_body
+    from cdt.extractor.core import handle_response, ner_input_body
 
     row_state = _ner_row(MPLX_TEXT)
-    row_state.current_attempt.attempt_index = 2
+    row_state.current_attempt.messages = NERStage().preprocess(row_state)
+    assert handle_response(row_state, MPLX_TAGGED_BUT_UNFAITHFUL, max_attempts=3)
+
     echo = ner_input_body(row_state)
     assert echo == f"<body>{MPLX_TEXT}</body>"
 
     failures = NERStage().validate(row_state, echo)
+
+    assert failures
+    assert any("byte-identical to the input" in failure for failure in failures)
+
+
+def test_ner_validate_rejects_an_echo_that_drops_non_debt_tags() -> None:
+    """Giving up is giving up even when the item has no debt (#176).
+
+    The high-water mark asks the narrower question that drives `early_stop`:
+    did an earlier attempt find a `debt_instrument`? A response that tagged an
+    organization and a date and then regressed to a bare echo reads zero there,
+    but the model has still discarded everything it found.
+    """
+    from cdt.extractor.core import handle_response
+
+    text = "Acme Corp filed this report on January 1, 2024."
+    row_state = _ner_row(text)
+    row_state.current_attempt.messages = NERStage().preprocess(row_state)
+    # Tags an organization and a date, and fails only copy fidelity.
+    unfaithful = (
+        "<body><organization>Acme Corp</organization> filed this report on "
+        "<date>January 1, 2024</date>!</body>"
+    )
+    assert handle_response(row_state, unfaithful, max_attempts=3)
+
+    failures = NERStage().validate(row_state, f"<body>{text}</body>")
 
     assert failures
     assert any("byte-identical to the input" in failure for failure in failures)
@@ -2533,6 +2562,128 @@ def test_ner_validate_accepts_an_untagged_first_attempt() -> None:
     # An item with nothing to tag is a clean zero, not a give-up.
     assert row_state.state == "SUCCESS"
     assert row_state.debt_instrument_mentions == []
+
+
+def test_an_untagged_echo_is_accepted_after_a_failure_that_found_nothing() -> None:
+    """The regression the old `attempt_index > 1` gate caused (#176).
+
+    A debt-free item whose first attempt failed for a reason unrelated to
+    tagging -- malformed XML here -- answers honestly with a bare echo on its
+    second. The old gate rejected that answer on every remaining attempt and
+    the row died FAILED after six whole-item calls, losing the item. Nothing
+    about the first attempt suggests the model can find anything here, so
+    there is no earlier work for the echo to regress against.
+
+    The row still finishes PARTIAL rather than SUCCESS, and that is fix 2 of
+    #176 doing its job, not the same defect: a first attempt that failed for
+    an unrelated reason while itself finding no tags leaves nothing to compare
+    against, so the zero is recorded as uncertain. PARTIAL publishes exactly
+    what SUCCESS would -- no mentions -- and additionally counts the row.
+    """
+    from cdt.extractor.core import (
+        PUBLISHABLE_ROW_STATES,
+        handle_response,
+        published_mention_rows,
+    )
+
+    text = "This is the extracted event text."
+    row_state = _ner_row(text)
+    row_state.current_attempt.messages = NERStage().preprocess(row_state)
+
+    assert handle_response(row_state, "not xml at all", max_attempts=3)
+    assert handle_response(row_state, f"<body>{text}</body>", max_attempts=3) is None
+
+    # Two calls, not six, and the echo itself was accepted.
+    assert len([a for a in row_state.all_attempts if a.response is not None]) == 2
+    assert row_state.all_attempts[0].status == "FAILED"
+    assert row_state.all_attempts[-1].validation_errors == []
+    assert row_state.all_attempts[-1].status == "SUCCESS"
+    assert row_state.state == "PARTIAL"
+    assert row_state.state in PUBLISHABLE_ROW_STATES
+    assert published_mention_rows(row_state) == []
+
+
+def test_prior_attempt_tagged_reads_the_row_the_way_the_echo_guard_needs() -> None:
+    """The three properties the echo gate rests on (#176).
+
+    Mirrors `test_ner_high_water_counts_tags_in_attempts_that_never_parsed`
+    for the wider any-tag question the echo check asks.
+    """
+    from cdt.extractor.core import (
+        AttemptRecord,
+        count_ner_entity_tags,
+        prior_attempt_tagged,
+    )
+
+    # 1. `<body>` is the wrapper this stage supplies, not something the model
+    #    found, so an untagged echo must not count as having tagged anything.
+    assert count_ner_entity_tags("<body>plain text</body>") == 0
+    # 2. A truncated attempt that never parsed still proves the model was
+    #    tagging, which is why this counts by regex rather than by parse.
+    assert count_ner_entity_tags("<body>x <debt_instrument>Term Loa") == 1
+    assert count_ner_entity_tags("not xml at all") == 0
+
+    row_state = _ner_row(MPLX_TEXT)
+    # An earlier attempt that wrapped the input and tagged nothing.
+    row_state.all_attempts.append(
+        AttemptRecord(
+            stage_name="ner", response="<body>wrong text</body>", status="FAILED"
+        )
+    )
+    assert prior_attempt_tagged(row_state, "ner") is False
+
+    # 3. Another stage's attempts are not this stage's history.
+    row_state.all_attempts.append(
+        AttemptRecord(
+            stage_name="instrument_ie",
+            response="<organization>A</organization>",
+            status="FAILED",
+        )
+    )
+    assert prior_attempt_tagged(row_state, "ner") is False
+
+    row_state.all_attempts.append(
+        AttemptRecord(stage_name="ner", response="<body>x <date>2022", status="FAILED")
+    )
+    assert prior_attempt_tagged(row_state, "ner") is True
+
+
+def test_an_echo_is_accepted_when_the_earlier_attempt_also_tagged_nothing() -> None:
+    """A wrapper is not a tag: the `<body>` the stage supplies proves nothing (#176).
+
+    Attempt 1 wraps the input and tags nothing, failing only copy fidelity. It
+    gives no evidence the model can find anything in this item, so attempt 2's
+    honest echo is still the honest answer.
+    """
+    from cdt.extractor.core import handle_response
+
+    text = "This is the extracted event text."
+    row_state = _ner_row(text)
+    row_state.current_attempt.messages = NERStage().preprocess(row_state)
+
+    assert handle_response(
+        row_state, "<body>wrong text entirely</body>", max_attempts=3
+    )
+    assert handle_response(row_state, f"<body>{text}</body>", max_attempts=3) is None
+
+    assert row_state.all_attempts[-1].validation_errors == []
+    assert row_state.state == "PARTIAL"
+
+
+def test_an_echo_after_a_truncated_tagged_attempt_is_still_rejected() -> None:
+    """A response cut mid-tag still proves the model was tagging (#176, #127)."""
+    from cdt.extractor.core import handle_response
+
+    row_state = _ner_row(MPLX_TEXT)
+    row_state.current_attempt.messages = NERStage().preprocess(row_state)
+    # Truncated mid-name, so it never parses -- a parse-based count reads zero.
+    truncated = "<body>The Company issued <debt_instrument>6.250% Senior No"
+    assert handle_response(row_state, truncated, max_attempts=3)
+
+    failures = NERStage().validate(row_state, f"<body>{MPLX_TEXT}</body>")
+
+    assert failures
+    assert any("byte-identical to the input" in failure for failure in failures)
 
 
 def test_ner_retry_message_tells_the_model_to_keep_its_tags() -> None:
@@ -2659,8 +2810,13 @@ def test_ner_high_water_survives_the_resumable_batch_state() -> None:
     restored = ExtractionRowState.from_state_dict(row_state.to_state_dict())
 
     assert prior_debt_instrument_high_water(restored, "ner") == 1
-    # And the restored row rejects the give-up just as the live one would.
-    failures = NERStage().validate(restored, f"<body>{MPLX_TEXT}</body>")
+    # And the restored row rejects the give-up just as the live one would. A
+    # zero-tag response that is not also a byte echo, so this exercises the
+    # high-water mark rather than the echo check, which returns first.
+    failures = NERStage().validate(
+        restored,
+        "<body>The Company issued 6.250% Senior Notes due <date>2022</date>.</body>",
+    )
     assert failures and any("no <debt_instrument> tags" in f for f in failures)
 
 

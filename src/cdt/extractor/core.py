@@ -894,6 +894,62 @@ class OpenRouterChatClient:
 DEBT_INSTRUMENT_OPEN_TAG_RE = re.compile(r"<debt_instrument(?:\s[^>]*)?>")
 
 
+# Every tag `NERStage.validate` accepts, and the entity subset of it. `body` is
+# the wrapper the stage supplies itself, so it is not evidence the model tagged
+# anything -- an untagged echo carries it.
+NER_ALLOWED_TAGS = frozenset(
+    {
+        "body",
+        "person",
+        "organization",
+        "debt_instrument",
+        "agreement",
+        "date",
+        "duration",
+        "amount",
+        "interest_rate",
+    }
+)
+NER_ENTITY_TAGS = NER_ALLOWED_TAGS - {"body"}
+NER_ENTITY_OPEN_TAG_RE = re.compile(
+    r"<(?:" + "|".join(sorted(NER_ENTITY_TAGS)) + r")(?:\s[^>]*)?>"
+)
+
+
+def count_ner_entity_tags(response: str | None) -> int:
+    """Count opening entity tags in one raw NER response.
+
+    A regex for the same reason `count_debt_instrument_tags` is one: the
+    callers include attempts that failed, and those are exactly the responses
+    that did not parse as XML.
+    """
+    if not response:
+        return 0
+    return len(NER_ENTITY_OPEN_TAG_RE.findall(response))
+
+
+def prior_attempt_tagged(row_state: ExtractionRowState, stage_name: str) -> bool:
+    """Whether any earlier attempt on this row tagged anything at all (#176).
+
+    The condition the byte-identical-echo check needs. "Returning the input
+    verbatim addresses nothing" is only true once the model has shown it can
+    find something in this item: dropping to a bare echo is then a regression
+    against its own work. On an item the model has never tagged, the same
+    response is the honest answer, and the `NODEBT_NER` fixture is exactly
+    that.
+
+    Deliberately any entity tag, not just `debt_instrument`. A response that
+    tagged an organization and a date and then regressed to a bare echo has
+    given up just as surely, and `prior_debt_instrument_high_water` -- which
+    asks the narrower question that drives `early_stop` -- reads zero for it.
+    """
+    return any(
+        count_ner_entity_tags(attempt.response)
+        for attempt in row_state.all_attempts
+        if attempt.stage_name == stage_name
+    )
+
+
 def ner_input_body(row_state: ExtractionRowState) -> str:
     """Return the exact `<body>`-wrapped text the NER stage sends the model.
 
@@ -997,10 +1053,20 @@ class NERStage:
 
         # Compared before the ampersand repair, and against a string built by
         # the same helper that built the request: the give-up this names is a
-        # byte-for-byte echo of what the model was sent. `add_response` has
-        # already incremented the index, so > 1 means "this is a retry".
+        # byte-for-byte echo of what the model was sent.
+        #
+        # Gated on the model having tagged something earlier on this row, not
+        # on the attempt number. `attempt_index > 1` was a proxy for "the model
+        # has been shown its error and told to fix it", and it is the wrong
+        # one: an item that genuinely has nothing to tag, whose first attempt
+        # failed for an unrelated reason -- malformed XML, a truncated response
+        # -- answers honestly with a bare echo, and that was being rejected on
+        # every remaining attempt until the row died FAILED. Measured against
+        # `dev`, such a row went from SUCCESS in 2 calls to FAILED in 6. What
+        # makes an echo a give-up is that the model found something here before
+        # and has now returned none of it.
         if (
-            row_state.current_attempt.attempt_index > 1
+            prior_attempt_tagged(row_state, self.name)
             and response.strip() == ner_input_body(row_state).strip()
         ):
             return [
@@ -1018,19 +1084,8 @@ class NERStage:
             return ["Response root must be <body>."]
 
         failures: list[str] = []
-        allowed_tags = {
-            "body",
-            "person",
-            "organization",
-            "debt_instrument",
-            "agreement",
-            "date",
-            "duration",
-            "amount",
-            "interest_rate",
-        }
         for element in root.iter():
-            if element.tag not in allowed_tags:
+            if element.tag not in NER_ALLOWED_TAGS:
                 failures.append(f"Disallowed tag found: {element.tag}")
             if element.tag != "body" and element.attrib:
                 failures.append("Tags contain attributes; only bare tags are allowed.")
