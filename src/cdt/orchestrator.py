@@ -50,6 +50,7 @@ from cdt.pipeline import (
     run_prepare_stages,
 )
 from cdt.shared import get_logger
+from cdt.storage import configure_s3_profile
 
 LOGGER = get_logger(__name__)
 
@@ -438,6 +439,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     configure_logging(quiet=args.quiet)
+    # Before every other credentialed thing this process does: --aws-profile
+    # (or AWS_PROFILE) previously reached only ingest's own client, so the
+    # orchestrator's artifact reads, writes and lease took the ambient
+    # credentials no matter what it was set to (#71).
+    configure_s3_profile(args.aws_profile)
     reject_placeholder_secrets()
     start_runtime_watchdog(args.mode, args.max_runtime_hours)
 

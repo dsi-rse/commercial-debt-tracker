@@ -80,6 +80,7 @@ from cdt.sixk.mirror import mirror_root
 from cdt.sixk.scraper import acquire_scraped_sixk_documents
 from cdt.sixk.stage import DEFAULT_CONCURRENCY as SIXK_DEFAULT_CONCURRENCY
 from cdt.sixk.stage import sixk_snippets_root, triage_pending_documents
+from cdt.storage import configure_s3_profile
 
 ALL_TIME_START_DATE = date(1994, 1, 1)
 DEFAULT_BATCH_SIZE = 100
@@ -89,6 +90,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the cdt command-line interface."""
     parser = build_parser()
     args = parser.parse_args(argv)
+    # Once, here, rather than threaded to each factory by hand: --aws-profile
+    # used to reach only the client ingest built for itself, so every artifact
+    # read and write went through the ambient credentials instead (#71). Doing
+    # it at the single point where the flag enters the process also covers the
+    # subcommands that never had a way to pass it on.
+    configure_s3_profile(getattr(args, "aws_profile", None))
     return int(args.func(args))
 
 
