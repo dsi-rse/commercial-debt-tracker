@@ -3,20 +3,47 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Self
+from typing import NamedTuple, Self
 
 import pandas as pd
 import pyarrow as pa
+import pyarrow.fs
 import pyarrow.parquet as pq
 import pytest
 
 from cdt import ingest, storage
 
 
+class FakeFrozenCredentials(NamedTuple):
+    """The three fields ``arrow_filesystem`` reads off a frozen credential."""
+
+    access_key: str
+    secret_key: str
+    token: str
+
+
+class FakeCredentials:
+    """Credentials whose values name the profile they came from.
+
+    Keyed on the profile so a test can tell *which* profile the S3 filesystem
+    resolved, not merely that it resolved one.
+    """
+
+    def __init__(self: Self, profile_name: str | None) -> None:
+        """Remember the profile these belong to."""
+        self.profile_name = profile_name or "default"
+
+    def get_frozen_credentials(self: Self) -> FakeFrozenCredentials:
+        """Return a key triple tagged with the profile."""
+        suffix = self.profile_name
+        return FakeFrozenCredentials(f"AK-{suffix}", f"SK-{suffix}", f"TOK-{suffix}")
+
+
 class FakeSession:
     """Records the profile it was constructed with and hands back a marker."""
 
     created: list[str | None] = []
+    region_name = "us-east-2"
 
     def __init__(self: Self, profile_name: str | None = None) -> None:
         """Record the requested profile."""
@@ -28,13 +55,21 @@ class FakeSession:
         del config
         return f"{name}:{self.profile_name!r}"
 
+    def get_credentials(self: Self) -> FakeCredentials:
+        """Return credentials tagged with this session's profile."""
+        return FakeCredentials(self.profile_name)
+
 
 @pytest.fixture(autouse=True)
-def _reset_s3_clients(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Give each test a clean client cache and a fake Session."""
-    monkeypatch.setattr(storage, "_S3_CLIENTS", {})
-    monkeypatch.setattr(storage, "_BOTO3_SESSIONS", {})
-    monkeypatch.setattr(storage, "_CONFIGURED_S3_PROFILE", "")
+def _fake_boto3_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub boto3 so this module structurally cannot reach a real account.
+
+    The client-cache and configured-profile resets live in the root
+    ``conftest.py`` instead: that state leaks *across* files, so resetting it
+    here protected only this one. Not duplicated back, deliberately — these
+    tests depend on the shared fixture, so if it ever stops resetting, the
+    memoization test fails rather than the leak going unnoticed.
+    """
     monkeypatch.setattr(storage.boto3, "Session", FakeSession)
     FakeSession.created = []
 
@@ -98,6 +133,32 @@ def test_clients_are_memoized_per_profile() -> None:
     assert first is second is third
     assert other != first
     assert FakeSession.created == ["analysis", "second-account"]
+
+
+def test_a_configured_profile_is_set_for_the_next_test_to_find() -> None:
+    """First half of a pair; see the test immediately below.
+
+    These two are deliberately order-coupled and must stay adjacent and in
+    this order. Nothing else in the suite would notice the leak they detect.
+    """
+    storage.configure_s3_profile("leaks-into-the-next-test")
+
+    assert storage.configured_s3_profile() == "leaks-into-the-next-test"
+
+
+def test_a_profile_set_by_an_earlier_test_does_not_leak_into_this_one() -> None:
+    """Process-global profile state must not survive a test (#71).
+
+    ``configure_s3_profile`` writes a module global and is called
+    unconditionally by ``cli.main`` and ``orchestrator.main``, which the suite
+    invokes for real dozens of times — and the orchestrator's flag defaults to
+    ``os.environ.get("AWS_PROFILE", "")``. Without the reset in the root
+    conftest, a developer or CI runner with AWS_PROFILE exported would hand
+    real credentials to every later test. The reset is infrastructure, so the
+    only way to test it is to pollute deliberately and check the next test is
+    clean.
+    """
+    assert storage.configured_s3_profile() == ""
 
 
 def test_cli_main_configures_the_profile_from_the_flag(
@@ -241,13 +302,13 @@ def test_read_dataset_falls_back_when_partitions_cannot_be_unified(
     )
 
     # The Arrow path must genuinely be unable to read this, or the test proves
-    # nothing about the fallback.
-    assert (
-        storage._read_dataset_with_arrow(
-            sorted(str(p) for p in root.rglob("*.parquet")), None
-        )
-        is None
+    # nothing about the fallback — and it must say why, since the log names the
+    # cause and a corrupt partition takes the same branch.
+    table, error = storage._read_dataset_with_arrow(
+        sorted(str(p) for p in root.rglob("*.parquet")), None
     )
+    assert table is None
+    assert isinstance(error, pa.ArrowException)
 
     table = (
         storage.read_dataset(str(root))
@@ -260,6 +321,55 @@ def test_read_dataset_falls_back_when_partitions_cannot_be_unified(
         "1.0",
         "dated_reference",
     ]
+
+
+def test_the_fallback_log_names_the_error_that_caused_it(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Every fallback used to be reported as "pre-#187 per-partition types".
+
+    That is a confident diagnosis the code has not made: a corrupt partition, a
+    truncated read or a vanished file take the same branch. Telling an operator
+    the wrong cause — after silently paying a full re-read — is how an hour
+    disappears, so the log carries the actual exception.
+    """
+    root = tmp_path / "items"
+    _write(root / "a.parquet", [{"k": "1"}])
+    (root / "b.parquet").write_bytes(b"not a parquet file at all")
+
+    with caplog.at_level("INFO"), pytest.raises(pa.ArrowInvalid):
+        storage.read_dataset(str(root))
+
+    assert "ArrowInvalid" in caplog.text
+    assert "Parquet magic bytes not found" in caplog.text
+
+
+def test_one_filesystem_is_built_for_a_whole_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resolving a path list must not build a client per partition (#190).
+
+    ``arrow_filesystem`` constructs an ``S3FileSystem`` — a full AWS SDK client
+    with its own connection pool — and freezes credentials. Calling it once per
+    path to get the stripped string built and discarded one per partition,
+    which on the publish's 21,214 objects is 21,213 wasted clients and, worse,
+    a fresh TLS handshake per file on the fallback path.
+    """
+    root = tmp_path / "items"
+    for index in range(6):
+        _write(root / f"p{index}.parquet", [{"k": str(index)}])
+
+    calls: list[object] = []
+    original = storage.arrow_filesystem
+
+    def counting_arrow_filesystem(path: object) -> tuple[object | None, str]:
+        calls.append(path)
+        return original(path)
+
+    monkeypatch.setattr(storage, "arrow_filesystem", counting_arrow_filesystem)
+
+    assert len(storage.read_dataset(str(root))) == 6
+    assert len(calls) == 1
 
 
 def test_read_dataset_uses_the_arrow_path_when_partitions_do_unify(
@@ -405,21 +515,7 @@ def test_arrow_filesystem_builds_s3_on_the_configured_profile(
     building its own.
     """
     built: list[dict[str, object]] = []
-
-    class FakeCredentials:
-        def get_frozen_credentials(self) -> object:  # noqa: ANN101
-            from collections import namedtuple
-
-            frozen = namedtuple("Frozen", "access_key secret_key token")
-            return frozen("AK", "SK", "TOK")
-
-    class FakeProfiledSession:
-        region_name = "us-east-2"
-
-        def get_credentials(self) -> object:  # noqa: ANN101
-            return FakeCredentials()
-
-    monkeypatch.setattr(storage, "boto3_session", lambda *a, **k: FakeProfiledSession())
+    storage.configure_s3_profile("analysis")
     monkeypatch.setattr(
         storage.pyarrow.fs,
         "S3FileSystem",
@@ -430,11 +526,133 @@ def test_arrow_filesystem_builds_s3_on_the_configured_profile(
 
     assert filesystem == "FS"
     assert resolved == "bucket/a/b.parquet"
+    # The profile is the point: the autouse fixture's FakeSession records what
+    # it was constructed with, so this fails if the filesystem resolves any
+    # other profile than the configured one. Stubbing boto3_session here
+    # instead — as this test used to — mocked away the only thing it claims.
+    assert FakeSession.created == ["analysis"]
     assert built == [
         {
-            "access_key": "AK",
-            "secret_key": "SK",
-            "session_token": "TOK",
+            "access_key": "AK-analysis",
+            "secret_key": "SK-analysis",
+            "session_token": "TOK-analysis",
+            "connect_timeout": storage.S3_CLIENT_CONFIG.connect_timeout,
+            "request_timeout": storage.S3_CLIENT_CONFIG.read_timeout,
+            "retry_strategy": built[0]["retry_strategy"],
             "region": "us-east-2",
         }
     ]
+    # Bounded rather than pyarrow's unbounded defaults, matching what boto3
+    # gets from S3_CLIENT_CONFIG: moving reads here would otherwise have
+    # dropped #112's timeout and retry mitigation on the main read path.
+    assert isinstance(
+        built[0]["retry_strategy"], storage.pyarrow.fs.AwsStandardS3RetryStrategy
+    )
+
+
+def test_the_s3_branch_of_every_reader_actually_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every read test is local, so the branch #190 is *about* never ran (#190).
+
+    On a local path ``arrow_filesystem`` returns ``None`` and the whole
+    credentialed branch short-circuits, which left
+    ``ParquetFile(resolved, filesystem=...)`` — the bucket/key handoff this
+    change turns on — unexecuted by the suite. A typo in the stripped path or a
+    dropped ``filesystem=`` would have shipped green.
+
+    Swapping in a LocalFileSystem keeps that branch honest with no network: the
+    readers are handed an ``s3://`` URI, take the S3 path through
+    ``strip_s3_scheme``, and read through a real pyarrow filesystem object.
+    """
+    root = tmp_path / "bucket-root"
+    _write(root / "items" / "a.parquet", [{"k": "1", "text": "x"}])
+    _write(root / "items" / "b.parquet", [{"k": "2", "text": "y"}])
+
+    def fake_filesystem(path: object) -> tuple[object, str]:
+        # Same shape arrow_filesystem returns for S3: a filesystem, and a path
+        # with the scheme stripped and rooted at the "bucket".
+        stripped = storage.strip_s3_scheme(path)
+        assert not str(stripped).startswith("s3://")
+        return pyarrow.fs.LocalFileSystem(), str(root / stripped.split("/", 1)[1])
+
+    monkeypatch.setattr(storage, "arrow_filesystem", fake_filesystem)
+    monkeypatch.setattr(
+        storage, "iter_partition_paths", lambda *a, **k: iter(_S3_ITEM_PATHS)
+    )
+
+    assert storage.read_table("s3://bucket/items/a.parquet", ["k"])["k"].to_list() == [
+        "1"
+    ]
+    assert storage.count_table_rows("s3://bucket/items/a.parquet") == 1
+    assert storage.count_table_rows("s3://bucket/items/absent.parquet") is None
+    table = storage.read_dataset("s3://bucket/items").sort_values("k")
+    assert table["k"].to_list() == ["1", "2"]
+
+
+#: The two partitions the S3-branch test's stubbed listing returns.
+_S3_ITEM_PATHS = ["s3://bucket/items/a.parquet", "s3://bucket/items/b.parquet"]
+
+
+def test_arrow_filesystem_refuses_a_session_with_no_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Falling through to pyarrow's own chain would re-open #71 (#190).
+
+    ``S3FileSystem()`` with no keys is not anonymous — it resolves its own
+    chain, and that chain disagrees with botocore's: botocore drops the
+    environment provider when a profile is set explicitly, while pyarrow checks
+    the environment first. So a profile that resolves nothing plus ambient
+    environment keys for another account would fail every write loudly and read
+    every partition silently from the wrong account.
+    """
+
+    class CredentiallessSession:
+        region_name = None
+
+        def get_credentials(self: Self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        storage, "boto3_session", lambda *a, **k: CredentiallessSession()
+    )
+
+    with pytest.raises(RuntimeError, match="No AWS credentials"):
+        storage.arrow_filesystem("s3://bucket/a/b.parquet")
+
+
+def test_arrow_filesystem_warns_when_credentials_expire_before_a_scan_could(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A static key triple means a long scan can outlive its credentials (#190).
+
+    ``get_frozen_credentials`` refreshes, so each filesystem starts fresh — but
+    ``S3FileSystem`` never re-signs, and botocore's advisory refresh window is
+    900s. A full-corpus read takes longer than that, and what the operator sees
+    is pyarrow's ``AWS Error UNKNOWN (HTTP status 400)``, which reads like
+    anything but an expiry. This does not widen the window; it names the cause.
+    """
+    from collections import namedtuple
+    from datetime import UTC, datetime, timedelta
+
+    frozen = namedtuple("Frozen", "access_key secret_key token")
+
+    class ExpiringCredentials:
+        _expiry_time = datetime.now(UTC) + timedelta(seconds=60)
+
+        def get_frozen_credentials(self: Self) -> object:
+            return frozen("AK", "SK", "TOK")
+
+    class ExpiringSession:
+        region_name = None
+
+        def get_credentials(self: Self) -> object:
+            return ExpiringCredentials()
+
+    monkeypatch.setattr(storage, "boto3_session", lambda *a, **k: ExpiringSession())
+    monkeypatch.setattr(storage.pyarrow.fs, "S3FileSystem", lambda **kwargs: "FS")
+
+    with caplog.at_level("WARNING"):
+        storage.arrow_filesystem("s3://bucket/a/b.parquet")
+
+    assert "expire in" in caplog.text

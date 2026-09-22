@@ -9,6 +9,7 @@ import json
 import re
 from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -750,7 +751,13 @@ def read_gzip_text_artifact(path: ArtifactPath) -> str:
 # three ways a directory of partitions with per-partition physical types breaks
 # a dataset scan. Catching the base is deliberate: any of them means "Arrow
 # cannot read these files as one table", and the answer is always the same.
-_ARROW_READ_ERRORS = (pyarrow.ArrowException,)
+# FileNotFoundError is deliberately alongside: it is an OSError, not an
+# ArrowException, so it escaped and turned a partition deleted between the
+# listing and the scan into a hard failure, where looping read_table returned
+# an empty frame and carried on. Note what is still NOT caught -- pyarrow's
+# ArrowIOError, which is how an auth or transport failure surfaces. Those must
+# stay fatal rather than becoming a slow, silent, wrongly-labelled fallback.
+_ARROW_READ_ERRORS = (pyarrow.ArrowException, FileNotFoundError)
 
 # Footer reads for schema unification are I/O-bound round trips, one per
 # partition, and the dataset scanner's own threads do not cover them: they
@@ -795,6 +802,29 @@ def _unified_schema(dataset: pyarrow.dataset.Dataset) -> pa.Schema:
     return pyarrow.unify_schemas(schemas)
 
 
+#: Below this much remaining credential lifetime, warn before starting a scan.
+#: ``S3FileSystem`` takes a *static* key triple, so unlike every boto3 call it
+#: cannot re-sign when a temporary credential rolls over mid-scan; botocore's
+#: own advisory refresh window is 900s, so that is the most a freshly frozen
+#: credential is guaranteed to be good for.
+_CREDENTIAL_LIFETIME_WARN_SECONDS = 900
+
+
+def strip_s3_scheme(path: ArtifactPath) -> str:
+    """Return the ``bucket/key`` form Arrow wants, or a local path unchanged.
+
+    Split out of ``arrow_filesystem`` because resolving a path list needs only
+    this half. Building a filesystem per path to reach it meant constructing —
+    and discarding — one ``S3FileSystem``, each owning its own AWS SDK client
+    and connection pool, for every partition in a scan.
+    """
+    normalized = normalize_artifact_path(path)
+    if not is_s3_uri(normalized):
+        return normalized
+    bucket, key = parse_s3_uri(normalized)
+    return f"{bucket}/{key.lstrip('/')}"
+
+
 def arrow_filesystem(path: ArtifactPath) -> tuple[object | None, str]:
     """Return the pyarrow filesystem and stripped path Arrow should read through.
 
@@ -806,26 +836,78 @@ def arrow_filesystem(path: ArtifactPath) -> tuple[object | None, str]:
     place, and it is built per call rather than memoized because a Session's
     frozen credentials can be temporary (SSO, assume-role) and a historical
     backfill outlives them. Construction issues no request.
+
+    Timeouts and retries are set explicitly to match what boto3 gets from
+    ``S3_CLIENT_CONFIG``. Left unset, pyarrow defaults to ``connect_timeout=-1``
+    and ``request_timeout=-1`` — unbounded — with 3 attempts, so moving the
+    reads here would otherwise have dropped both halves of #112's mitigation
+    (a stalled socket killed a 2.5h itemize) on the path that now does
+    essentially all the reading.
+
+    A session that resolves no credentials raises rather than falling through.
+    ``S3FileSystem()`` with no keys is not anonymous, it resolves its *own*
+    chain — and botocore drops the environment provider when a profile is set
+    explicitly while pyarrow checks the environment first, so the two can
+    disagree. Silently reading through one identity while writing through
+    another is exactly #71.
     """
     normalized = normalize_artifact_path(path)
+    resolved = strip_s3_scheme(normalized)
     if not is_s3_uri(normalized):
-        return None, normalized
-    bucket, key = parse_s3_uri(normalized)
+        return None, resolved
     session = boto3_session()
     credentials = session.get_credentials()
-    kwargs: dict[str, object] = {}
-    if credentials is not None:
-        frozen = credentials.get_frozen_credentials()
-        kwargs = {
-            "access_key": frozen.access_key,
-            "secret_key": frozen.secret_key,
-            "session_token": frozen.token,
-        }
+    if credentials is None:
+        msg = (
+            f"No AWS credentials for profile {configured_s3_profile()!r}; refusing "
+            f"to read {normalized} through pyarrow's own credential chain, which "
+            f"resolves differently from boto3's and would read as another identity."
+        )
+        raise RuntimeError(msg)
+    frozen = credentials.get_frozen_credentials()
+    _warn_on_short_credential_lifetime(credentials, normalized)
+    kwargs: dict[str, object] = {
+        "access_key": frozen.access_key,
+        "secret_key": frozen.secret_key,
+        "session_token": frozen.token,
+        "connect_timeout": S3_CLIENT_CONFIG.connect_timeout,
+        "request_timeout": S3_CLIENT_CONFIG.read_timeout,
+        "retry_strategy": pyarrow.fs.AwsStandardS3RetryStrategy(
+            max_attempts=S3_CLIENT_CONFIG.retries["max_attempts"]
+        ),
+    }
+    # botocore reads the region from AWS_DEFAULT_REGION only, while the ECS task
+    # definition injects AWS_REGION -- so this is usually unset in production and
+    # pyarrow resolves the region itself (it does read AWS_REGION). Passed when
+    # known purely to save that lookup.
     if session.region_name:
-        # Without a region pyarrow issues its own bucket-location lookup per
-        # filesystem; the Session already knows the answer.
         kwargs["region"] = session.region_name
-    return pyarrow.fs.S3FileSystem(**kwargs), f"{bucket}/{key.lstrip('/')}"
+    return pyarrow.fs.S3FileSystem(**kwargs), resolved
+
+
+def _warn_on_short_credential_lifetime(credentials: object, path: str) -> None:
+    """Say so up front when a scan is likely to outlive its credentials.
+
+    ``get_frozen_credentials`` does refresh, so each filesystem starts with a
+    fresh key triple — but pyarrow then holds it statically for the life of the
+    scan, and a full-corpus read is measured in minutes to hours. When that
+    runs out, every subsequent request fails with pyarrow's opaque
+    ``AWS Error UNKNOWN (HTTP status 400)``, which reads like anything but an
+    expiry. This does not extend the window; it names the cause in advance.
+    """
+    expiry = getattr(credentials, "_expiry_time", None)
+    if expiry is None:
+        return
+    remaining = (expiry - datetime.now(UTC)).total_seconds()
+    if remaining < _CREDENTIAL_LIFETIME_WARN_SECONDS:
+        LOGGER.warning(
+            "AWS credentials for profile %r expire in %.0fs; pyarrow holds a "
+            "static copy for the whole of %s, so a longer scan will fail with an "
+            "opaque AWS 400 rather than refreshing.",
+            configured_s3_profile(),
+            remaining,
+            path,
+        )
 
 
 def _open_parquet_file(path: ArtifactPath) -> pyarrow.parquet.ParquetFile:
@@ -855,9 +937,14 @@ def read_table(
     the one thing this behaviour exists to prevent.
     """
     normalized = normalize_artifact_path(path)
-    if not artifact_exists(normalized):
+    try:
+        parquet_file = _open_parquet_file(normalized)
+    except FileNotFoundError:
+        # Asked for rather than checked first: pyarrow's open already issues a
+        # HEAD to size the object, so an artifact_exists guard in front of it
+        # made every read of an existing partition pay two. Absence is the rare
+        # case, and it is exactly what the open reports.
         return pd.DataFrame(columns=columns)
-    parquet_file = _open_parquet_file(normalized)
     if columns is None:
         return parquet_file.read().to_pandas()
     requested = list(columns)
@@ -880,14 +967,15 @@ def count_table_rows(path: ArtifactPath) -> int | None:
     table on every publish.
     """
     normalized = normalize_artifact_path(path)
-    if not artifact_exists(normalized):
+    try:
+        return int(_open_parquet_file(normalized).metadata.num_rows)
+    except FileNotFoundError:
         return None
-    return int(_open_parquet_file(normalized).metadata.num_rows)
 
 
 def _read_dataset_with_arrow(
     paths: list[str], columns: Sequence[str] | None
-) -> pd.DataFrame | None:
+) -> tuple[pd.DataFrame | None, Exception | None]:
     """Read many partitions as one Arrow dataset, or None if they cannot unify.
 
     Worth a separate path from looping ``read_table`` because the scan is
@@ -909,9 +997,23 @@ def _read_dataset_with_arrow(
     ``ArrowTypeError: Unable to merge: Field amendment_inferred_by has
     incompatible types: double vs string``. The production dev root has not been
     rebuilt (#107), so this is the live case, not a hypothetical.
+
+    ``FileNotFoundError`` is caught alongside, and is a different story: it is
+    not an ``ArrowException``, so it used to escape and kill the read outright
+    where the old per-file path returned an empty frame and carried on. A
+    partition can genuinely vanish between the listing and the scan —
+    ``repair_document_shards`` and the snapshot prune both delete live
+    partitions — and the per-file fallback handles that case correctly.
+
+    The exception comes back with the result so the caller can say which of the
+    two happened. Reporting every fallback as "pre-#187 types" was a confident
+    wrong diagnosis on a corrupt or missing partition.
     """
     filesystem, _ = arrow_filesystem(paths[0])
-    resolved = [arrow_filesystem(path)[1] for path in paths]
+    # One filesystem for the whole scan; the rest of the list needs only the
+    # scheme stripped. Calling arrow_filesystem per path built and discarded an
+    # S3FileSystem — and a connection pool — for every partition.
+    resolved = [strip_s3_scheme(path) for path in paths]
     try:
         dataset = pyarrow.dataset.dataset(
             resolved, format="parquet", filesystem=filesystem
@@ -921,14 +1023,14 @@ def _read_dataset_with_arrow(
             resolved, format="parquet", filesystem=filesystem, schema=schema
         )
         if columns is None:
-            return unified.to_table().to_pandas()
+            return unified.to_table().to_pandas(), None
         # Project only the columns this root actually has; a name absent
         # everywhere is reindexed in below, matching the pandas path.
         present = [name for name in columns if name in schema.names]
         table = unified.to_table(columns=present).to_pandas()
-        return table.reindex(columns=list(columns))
-    except _ARROW_READ_ERRORS:
-        return None
+        return table.reindex(columns=list(columns)), None
+    except _ARROW_READ_ERRORS as error:
+        return None, error
 
 
 def read_dataset(
@@ -949,20 +1051,41 @@ def read_dataset(
     column can still infer a different physical type in different partitions.
     """
     paths = list(iter_partition_paths(base, partition_filter=partition_filter))
+    return read_partitions(paths, columns=columns, label=normalize_artifact_path(base))
+
+
+def read_partitions(
+    paths: Sequence[ArtifactPath],
+    *,
+    columns: Sequence[str] | None = None,
+    label: str | None = None,
+) -> pd.DataFrame:
+    """Read an explicit list of partitions as one table, Arrow first.
+
+    The same two-path read ``read_dataset`` uses, taking the paths rather than
+    discovering them, for callers that already know which partitions they want
+    — ``ingest._existing_accessions`` scopes itself to a date window and would
+    otherwise loop ``read_table`` and forgo the parallel scan entirely
+    (measured 26.45s against 1.75s over 1,640 partitions).
+
+    ``label`` names the group in the fallback log; the first path is used when
+    the caller has nothing better.
+    """
     if not paths:
         return pd.DataFrame(columns=columns)
-    table = _read_dataset_with_arrow(paths, columns)
+    resolved_paths = [normalize_artifact_path(path) for path in paths]
+    table, error = _read_dataset_with_arrow(resolved_paths, columns)
     if table is not None:
         return table
     LOGGER.info(
-        "Arrow could not read %s partitions under %s as one table "
-        "(pre-#187 per-partition types); falling back to a per-file read.",
-        len(paths),
-        normalize_artifact_path(base),
+        "Arrow could not read %s partitions under %s as one table (%s: %s); "
+        "falling back to a per-file read.",
+        len(resolved_paths),
+        label or resolved_paths[0],
+        type(error).__name__,
+        error,
     )
-    frames = [read_table(path, columns) for path in paths]
-    if not frames:
-        return pd.DataFrame(columns=columns)
+    frames = [read_table(path, columns) for path in resolved_paths]
     return pd.concat(frames, ignore_index=True)
 
 
