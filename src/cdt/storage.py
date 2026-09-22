@@ -285,6 +285,59 @@ def list_artifacts_with_versions(
     return results
 
 
+def artifact_content_versions(
+    base: ArtifactPath, *, suffix: str = ""
+) -> dict[str, str]:
+    """Map artifact path -> a version that changes only when the bytes change.
+
+    Deliberately distinct from ``list_artifacts_with_versions``, which the
+    completion registries use. That one is mtime-based locally, so a rewrite
+    with identical bytes reads as a change. For "does this partition need
+    reprocessing" that is the right trade — a false positive costs one
+    redundant partition. For "may we skip re-reading the whole corpus" it is
+    the wrong one: the matcher rewrites every shard on every run, usually to
+    byte-identical content, so an mtime-based answer would differ every time
+    and the skip would never happen. A guard that is silently always-false is
+    the failure this replaces.
+
+    On S3 this costs nothing beyond the LIST: the ETag already is the content
+    MD5 for the single-part ``put_object`` that ``write_table`` issues.
+    Locally the bytes are hashed, which is cheaper than the parquet decode the
+    skip may avoid.
+    """
+    normalized = normalize_artifact_path(base).rstrip("/")
+    if is_s3_uri(normalized):
+        return list_artifacts_with_versions(normalized, suffix=suffix)
+    root = Path(normalized)
+    if not root.exists():
+        return {}
+    pattern = f"**/*{suffix}" if suffix else "**/*"
+    versions: dict[str, str] = {}
+    for path in sorted(root.glob(pattern)):
+        if not path.is_file():
+            continue
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        versions[str(path)] = digest.hexdigest()
+    return versions
+
+
+def artifact_tree_digest(roots: Iterable[ArtifactPath], *, suffix: str = "") -> str:
+    """Digest the content versions of every artifact under a set of roots.
+
+    One value standing for "these trees, exactly as they are now", so a caller
+    can record it and later ask whether anything under them moved. Sorted so
+    listing order cannot change the answer.
+    """
+    versions: dict[str, str] = {}
+    for root in roots:
+        versions.update(artifact_content_versions(root, suffix=suffix))
+    payload = json.dumps(sorted(versions.items()), separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def iter_partition_paths(
     base: ArtifactPath,
     *,

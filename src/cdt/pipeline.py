@@ -48,6 +48,7 @@ from cdt.shared import get_logger
 from cdt.storage import (
     ArtifactPath,
     artifact_exists,
+    artifact_tree_digest,
     coerce_dataset_text,
     count_table_rows,
     delete_artifact,
@@ -369,14 +370,15 @@ class PipelineOrchestrator:
             "finalize",
             output_root=self.config.final_database_root,
         )
-        # Same gate, same value, as run_match_and_finalize: `cdt pipeline` and
-        # the live extractor backend pay the identical 25-minute publish, and
-        # they pay it on a run that matched nothing just as readily.
+        # Same gate, same question, as run_match_and_finalize: `cdt pipeline`
+        # and the live extractor backend pay the identical 25-minute publish,
+        # and they pay it on a run that changed nothing just as readily.
         final_outputs = (
             {}
             if publish_would_republish_nothing(
-                matched["debt_instrument"],
+                artifact_root=resolved_artifact_root,
                 final_database_root=self.config.final_database_root,
+                data_dir=self.config.data_dir,
                 force=self.config.force,
             )
             else write_final_output_tables(
@@ -454,8 +456,9 @@ def run_match_and_finalize(
             renew()
         apply_lineage_inference_pass(resolved_root, data_dir=data_dir, renew=renew)
     if publish_would_republish_nothing(
-        tables["debt_instrument"],
+        artifact_root=resolved_root,
         final_database_root=final_database_root,
+        data_dir=data_dir,
         force=force,
     ):
         return {}
@@ -514,11 +517,55 @@ def resolve_mode_dates(
 FINAL_SNAPSHOT_GUARD_RATIO = 0.5
 
 
+#: Pointer key holding the digest of the source partitions a generation was
+#: built from. Absent on any pointer written before the gate existed, which is
+#: read as "unknown" and publishes once to record one.
+PUBLISH_SOURCE_DIGEST_KEY = "source_digest"
+
+
+def publish_source_digest(
+    artifact_root: ArtifactPath, *, data_dir: Path | None = None
+) -> str:
+    """Digest every partition a publish would read, from one LIST per root.
+
+    This mirrors what ``pending_source_partitions`` does to decide a partition
+    needs reprocessing (#62) — compare a stored source version — but through
+    ``artifact_content_versions``, which is byte-based on both backends. The
+    registries' mtime-based version would be wrong here: the matcher rewrites
+    every shard on every run, almost always to identical content, so an
+    mtime-based digest would differ every time and the gate would never fire.
+
+    On S3 this is one LIST per root and the ETag comes along with it.
+    """
+    return artifact_tree_digest(
+        _publish_source_roots(artifact_root, data_dir=data_dir), suffix=".parquet"
+    )
+
+
+def _publish_source_roots(
+    artifact_root: ArtifactPath, *, data_dir: Path | None
+) -> list[str]:
+    """Every dataset root a publish reads, deduplicated, in table order."""
+    roots: list[str] = []
+    for entry in FINAL_OUTPUT_TABLES.values():
+        # One dataset per published table here. On dev, ``items`` unions the
+        # itemizer's root with the 6-K snippets root (#172), so both shapes are
+        # accepted: a digest that silently stopped covering a root would skip
+        # publishes it should not, and that merge would not conflict.
+        dataset_root_fns = entry if isinstance(entry, tuple) else (entry,)
+        for dataset_root_fn in dataset_root_fns:
+            root = dataset_root_fn(artifact_root, data_dir=data_dir)
+            if root not in roots:
+                roots.append(root)
+    return roots
+
+
 def publish_would_republish_nothing(
-    matched_instruments: pd.DataFrame,
     *,
+    artifact_root: ArtifactPath,
     final_database_root: ArtifactPath | None,
-    force: bool,
+    data_dir: Path | None = None,
+    force: bool = False,
 ) -> bool:
     """Return whether a publish would re-read the whole corpus to change nothing.
 
@@ -529,39 +576,72 @@ def publish_would_republish_nothing(
     per batch cycle, because both ``run_batch_backend`` and ``run_poll``
     finalize.
 
-    The gate is the value one branch above already consults: when match produced
-    no instruments, the lineage pass is skipped precisely because "it would read
-    three empty datasets to write none", and then the publish went ahead and read
-    four full ones to write the same four tables it wrote last time. Nothing in
-    such a run changed the datasets the publish reads — match wrote nothing and
-    the lineage pass did not run — so the existing snapshot and pointer are
-    already the correct answer.
+    The question is whether anything the publish *reads* has changed since the
+    generation the pointer names, so that is what this asks — a digest of the
+    five source dataset roots against the one recorded when that generation was
+    written. An earlier version of this gate asked instead whether match had
+    produced instruments, which is a different question with a much narrower
+    answer: ``match_pending_mentions`` rewrites and returns every shard's full
+    instrument table rather than a delta, so that frame is empty only on a
+    corpus that has never produced a single instrument. It would never have
+    fired on the 542-instrument root #110 was measured against, and it could not
+    see ``items`` at all — which itemize and the 6-K triage write *before* match
+    runs, and which is one of the four published tables.
 
-    Two things stop this from being a way to never publish. ``force`` overrides
-    it, which covers a run that crashed between writing a dataset and publishing
-    it and so left the datasets ahead of the pointer. And a final database root
-    that is missing any of its four ``latest.parquet`` objects publishes
-    regardless: skipping there would mean a freshly pointed output root stayed
-    empty until someone happened to pass ``--force``. That check is four HEAD
-    requests against the four tables the publish would write anyway.
+    Three things stop this from being a way to never publish. ``force``
+    overrides it. A pointer with no recorded digest — one written before this
+    existed, or none at all — publishes, which records one for next time. And a
+    final database root missing any of its four ``latest.parquet`` objects
+    publishes regardless: skipping there would mean a freshly pointed output
+    root stayed empty until someone happened to pass ``--force``. That check is
+    four HEAD requests against objects the publish would write anyway.
+
+    Note that a run which crashed between writing a dataset and publishing it no
+    longer needs ``--force`` to recover: the datasets moved, so the digest moved,
+    so the next run publishes on its own. That matters because ``force`` is the
+    pipeline-wide flag, and passing it also disables ``_guard_against_shrinkage``
+    — the one protection a post-crash republish most wants.
     """
-    if force or not matched_instruments.empty:
+    if force:
         return False
-    if final_database_root is not None and not all(
+    if final_database_root is None:
+        # Nothing to publish to: ``write_final_output_tables`` returns before it
+        # reads anything, so the answer is the same and this way it costs no
+        # listing to find out.
+        return True
+    pointer_path = final_pointer_path(artifact_root)
+    if not artifact_exists(pointer_path):
+        return False
+    pointer = read_json_artifact(pointer_path)
+    recorded = (
+        pointer.get(PUBLISH_SOURCE_DIGEST_KEY) if isinstance(pointer, dict) else None
+    )
+    if not recorded:
+        LOGGER.info(
+            "Publishing: %s records no source digest, so whether the sources "
+            "have moved since it was written is unknown.",
+            pointer_path,
+        )
+        return False
+    if recorded != publish_source_digest(artifact_root, data_dir=data_dir):
+        return False
+    if not all(
         artifact_exists(
             join_artifact_path(str(final_database_root), table_name, "latest.parquet")
         )
         for table_name in FINAL_OUTPUT_TABLES
     ):
         LOGGER.info(
-            "Publishing despite an empty match: %s has no complete published "
+            "Publishing despite unchanged sources: %s has no complete published "
             "generation yet.",
             final_database_root,
         )
         return False
     LOGGER.info(
-        "Skipping final publish: match produced no debt instruments, so the "
-        "published snapshot is already current. Use --force to publish anyway."
+        "Skipping final publish: no partition under the published datasets has "
+        "changed since generation %s, so the published snapshot is already "
+        "current. Use --force to publish anyway.",
+        pointer.get("run_id", "unknown"),
     )
     return True
 
@@ -665,6 +745,14 @@ def write_final_output_tables(
             "written_at": datetime.now(UTC).isoformat(),
             "schema_version": MATCHER_SCHEMA_VERSION,
             "tables": pointer_tables,
+            # What this generation was built from, so the next run can tell
+            # whether re-reading the corpus would change anything. Recorded
+            # after the reads above and before the pointer flips, and the
+            # publish writes nothing under the source roots, so it describes
+            # exactly the bytes these tables came from.
+            PUBLISH_SOURCE_DIGEST_KEY: publish_source_digest(
+                artifact_root, data_dir=data_dir
+            ),
         },
     )
 
