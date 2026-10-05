@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import date
+from operator import itemgetter
 from pathlib import Path
 from typing import Self, cast
 
@@ -329,6 +330,51 @@ def _read_registry_shards(shard_paths: list[str]) -> list[object]:
 _REGISTRY_VERSION = 3
 
 
+# Both key prefixes are derived once per object read or written rather than once
+# per key (#227). Per key, `join_artifact_path` built a `pathlib.Path` and
+# `_relative_registry_key` rebuilt a normalized prefix and an f-string, inside
+# comprehensions that run over every entry the registry holds. Measured on a
+# full-corpus-shaped registry of 440,000 entries, that made the load slower than
+# the single object it replaced -- 2.79 s against 2.05 s, or 6.14 s under a long
+# absolute root -- and made `_absolute_registry_key` 56% of the whole save under
+# cProfile. Hoisted, the same load is 1.34 s: faster than the pre-#191 object,
+# not 36% slower.
+#
+# A bare canonical partition path, which is the only shape either prefix is ever
+# applied to (`PARTITION_PATTERN.fullmatch` guarantees it, with no `.` or `..`
+# segment and no doubled separator), so the probe below derives the join prefix
+# by construction and cannot disagree with `join_artifact_path` on any root --
+# including `.` and `""`, where `pathlib` collapses the join rather than
+# prefixing it.
+_REGISTRY_PREFIX_PROBE = "documents/date=2000-01-01/shard=0000/part-0000.parquet"
+
+
+def _registry_join_prefix(artifact_root: str) -> str:
+    """Return the string that re-homes a relativized key under one root."""
+    joined = join_artifact_path(artifact_root, _REGISTRY_PREFIX_PROBE)
+    return joined[: -len(_REGISTRY_PREFIX_PROBE)]
+
+
+def _registry_strip_prefix(artifact_root: str) -> str:
+    """Return the prefix a key must carry for the root to be strippable."""
+    return f"{normalize_artifact_path(artifact_root).rstrip('/')}/"
+
+
+def _strip_registry_root(key: str, strip_prefix: str) -> str:
+    """Strip a precomputed root prefix off one registry key."""
+    if not key.startswith(strip_prefix):
+        return key
+    relative = key[len(strip_prefix) :]
+    return relative if PARTITION_PATTERN.fullmatch(relative) else key
+
+
+def _prepend_registry_root(stored: str, join_prefix: str) -> str:
+    """Reattach a precomputed root prefix to one persisted registry key."""
+    if not PARTITION_PATTERN.fullmatch(stored):
+        return stored
+    return join_prefix + stored
+
+
 def _relative_registry_key(key: str, artifact_root: str) -> str:
     """Return one registry key with the artifact root stripped off.
 
@@ -341,13 +387,11 @@ def _relative_registry_key(key: str, artifact_root: str) -> str:
 
     Relativized only when the result reads back through
     ``_absolute_registry_key``, so the two are exactly inverse and a key no
-    reader could reattach a root to is stored whole instead.
+    reader could reattach a root to is stored whole instead. The hot paths call
+    ``_strip_registry_root`` with the prefix hoisted out of their loop; this is
+    the one-key spelling, and the pair the inverse property is asserted on.
     """
-    prefix = f"{normalize_artifact_path(artifact_root).rstrip('/')}/"
-    if not key.startswith(prefix):
-        return key
-    relative = key[len(prefix) :]
-    return relative if PARTITION_PATTERN.fullmatch(relative) else key
+    return _strip_registry_root(key, _registry_strip_prefix(artifact_root))
 
 
 def _absolute_registry_key(stored: str, artifact_root: str) -> str:
@@ -358,17 +402,16 @@ def _absolute_registry_key(stored: str, artifact_root: str) -> str:
     parsers use, so a whole path or an S3 URI is not mistaken for one. Anything
     else, v1 and v2 keys included, is returned as stored.
     """
-    if not PARTITION_PATTERN.fullmatch(stored):
-        return stored
-    return join_artifact_path(artifact_root, stored)
+    return _prepend_registry_root(stored, _registry_join_prefix(artifact_root))
 
 
 def _registry_entries(
     payload: object, artifact_root: str
 ) -> dict[str, CompletedPartition]:
     """Parse one persisted registry object into whole-path-keyed entries."""
+    join_prefix = _registry_join_prefix(artifact_root)
     return {
-        _absolute_registry_key(key, artifact_root): entry
+        _prepend_registry_root(key, join_prefix): entry
         for key, entry in _parse_registry_payload(payload).items()
     }
 
@@ -406,7 +449,17 @@ def _registry_payload(
     *,
     artifact_root: str,
 ) -> dict[str, object]:
-    """Build the persisted v3 payload for one date shard of a registry."""
+    """Build the persisted v3 payload for one date shard of a registry.
+
+    Sorted on the relativized key alone (``itemgetter(0)``), not on the whole
+    tuple: a tuple sort falls through to comparing two ``CompletedPartition``
+    dataclasses whenever two keys relativize alike, and they are unordered, so
+    it raises ``TypeError``. Not reachable through ``save_completion_registry``
+    today -- ``_registry_entries`` absolutizes every stored key first -- but
+    crashing on a key collision is a bad trade for a free sort key, and
+    ``json.dumps(sort_keys=True)`` orders the written bytes anyway.
+    """
+    strip_prefix = _registry_strip_prefix(artifact_root)
     return {
         "stage": stage_name,
         "version": _REGISTRY_VERSION,
@@ -418,8 +471,11 @@ def _registry_payload(
                 **({} if entry.complete else {"complete": False}),
             }
             for path, entry in sorted(
-                (_relative_registry_key(key, artifact_root), entry)
-                for key, entry in registry.items()
+                (
+                    (_strip_registry_root(key, strip_prefix), entry)
+                    for key, entry in registry.items()
+                ),
+                key=itemgetter(0),
             )
         },
     }

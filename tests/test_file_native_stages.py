@@ -5442,6 +5442,85 @@ def test_a_v2_shard_is_normalized_on_its_next_write(tmp_path: Path) -> None:
     assert loaded[keys[1]].fingerprint == "old"
 
 
+def test_registry_key_prefixes_match_the_per_key_spelling(tmp_path: Path) -> None:
+    """The hoisted prefixes must agree with `join_artifact_path` on every root.
+
+    The per-key work was hoisted out of the load and save comprehensions for
+    cost (#227): `join_artifact_path` built a `pathlib.Path` per key and the
+    strip prefix was rebuilt per key. A hoisted prefix is only safe if it is
+    byte-identical to what the per-key call produced, and the roots where it
+    could differ are exactly the ones `pathlib` treats specially -- `.` and
+    `""` collapse the join instead of prefixing it, so an f-string prefix would
+    silently produce `./documents/...` where the real join produces
+    `documents/...`, inventing a key that names no partition.
+    """
+    bare = "documents/date=2024-01-02/shard=0001/part-0000.parquet"
+    for root in (
+        str(tmp_path),
+        f"{str(tmp_path)}/",
+        ".",
+        "",
+        "/",
+        "relative/root",
+        "s3://bucket/prefix",
+        "s3://bucket/prefix/",
+        "s3://bucket",
+        str(tmp_path / "a" / "very" / "deeply" / "nested" / "artifact" / "root"),
+    ):
+        hoisted = cdt_datasets._prepend_registry_root(  # noqa: SLF001
+            bare,
+            cdt_datasets._registry_join_prefix(root),  # noqa: SLF001
+        )
+        assert hoisted == cdt_datasets.join_artifact_path(root, bare), root
+        # And the pair still inverts through the hoisted strip prefix.
+        stripped = cdt_datasets._strip_registry_root(  # noqa: SLF001
+            hoisted,
+            cdt_datasets._registry_strip_prefix(root),  # noqa: SLF001
+        )
+        assert (
+            cdt_datasets._prepend_registry_root(  # noqa: SLF001
+                stripped,
+                cdt_datasets._registry_join_prefix(root),  # noqa: SLF001
+            )
+            == hoisted
+        ), root
+
+
+def test_registry_payload_sorts_on_the_key_without_comparing_entries() -> None:
+    """Two keys that relativize alike must not crash the payload build.
+
+    The sort was over `(key, entry)` tuples, which falls through to comparing
+    two `CompletedPartition` dataclasses when the keys tie -- and they are
+    unordered, so it raised TypeError. Not reachable through
+    `save_completion_registry` today, since `_registry_entries` absolutizes
+    every stored key first, but crashing a save on a key collision is a bad
+    trade for a sort key that costs nothing.
+
+    The collision still collapses to one persisted entry, because the payload's
+    `partitions` is a dict keyed on the relativized key -- that is inherent to
+    the format and not what the sort key changes. What it changes is crashing
+    versus a deterministic survivor: stable sort plus insertion-ordered dicts
+    means the later of the tied keys wins, every time.
+    """
+    payload = cdt_datasets._registry_payload(  # noqa: SLF001
+        "itemize",
+        "2024-01",
+        {
+            "documents/date=2024-01-02/shard=0001/part-0000.parquet": (
+                cdt_datasets.CompletedPartition(fingerprint="a")
+            ),
+            # Relativizes to the same bare key under the root below.
+            "./documents/date=2024-01-02/shard=0001/part-0000.parquet": (
+                cdt_datasets.CompletedPartition(fingerprint="b")
+            ),
+        },
+        artifact_root=".",
+    )
+    assert payload["partitions"] == {
+        "documents/date=2024-01-02/shard=0001/part-0000.parquet": {"fingerprint": "b"}
+    }
+
+
 def test_registry_key_relativizing_is_invertible(tmp_path: Path) -> None:
     """Every in-memory key shape round-trips through the persisted form unchanged.
 
