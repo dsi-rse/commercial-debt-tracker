@@ -4957,6 +4957,103 @@ def test_completion_registry_load_prefers_the_shard_whatever_the_list_order(
     assert loaded[key].fingerprint == "fresh"
 
 
+def test_migrating_a_legacy_registry_rehomes_its_root_spelling(
+    tmp_path: Path,
+) -> None:
+    """A migrated key must name the partition, not its old root (#227, #107).
+
+    The real `genwindow-eval-apr` registry spells its 1,640 keys
+    `data/genwindow-eval-apr/documents/...`, relative to the repo root. A run
+    whose artifact root is the absolute path to that directory strips only the
+    exact current root, so before this every adopted key was persisted in the
+    old spelling and the legacy object was then retired, making it permanent --
+    and re-processing one partition added a *second* key naming the same
+    partition. Root portability is the stated point of dropping the root from
+    the keys, and every root in existence carries a v2 object, so without the
+    re-homing that win applies to no existing root.
+    """
+    from cdt.datasets import (
+        CompletedPartition,
+        CompletionRegistry,
+        completion_registry_shard_path,
+        date_shard_partition_path,
+        legacy_completion_registry_path,
+        load_completion_registry,
+        save_completion_registry,
+    )
+
+    bare = "documents/date=2024-01-02/shard=0001/part-0000.parquet"
+    legacy = Path(legacy_completion_registry_path("itemize", artifact_root=tmp_path))
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text(
+        json.dumps(
+            {
+                "stage": "itemize",
+                "version": 2,
+                # A foreign root spelling, exactly the real registry's shape.
+                "partitions": {
+                    f"data/some-other-checkout/{bare}": {"fingerprint": "migrated"}
+                },
+            }
+        )
+    )
+
+    save_completion_registry("itemize", CompletionRegistry(), artifact_root=tmp_path)
+
+    shard = Path(
+        completion_registry_shard_path("itemize", "2024-01", artifact_root=tmp_path)
+    )
+    persisted = json.loads(shard.read_text())["partitions"]
+    assert list(persisted) == [bare], persisted
+
+    # The entry resolves to this root's partition, so the corpus reads as done.
+    current = date_shard_partition_path(
+        "documents", partition_date="2024-01-02", shard="0001", artifact_root=tmp_path
+    )
+    loaded = load_completion_registry("itemize", artifact_root=tmp_path)
+    assert loaded[current].fingerprint == "migrated"
+
+    # And re-processing it writes the same key, not a second one.
+    loaded[current] = CompletedPartition(fingerprint="reprocessed")
+    save_completion_registry("itemize", loaded, artifact_root=tmp_path)
+    assert list(json.loads(shard.read_text())["partitions"]) == [bare]
+
+
+def test_migration_adopts_undated_and_non_partition_keys_unchanged(
+    tmp_path: Path,
+) -> None:
+    """Keys with no partition identity have no root to re-home, so they survive.
+
+    Re-homing is a suffix match, which is deliberately looser than the readers'
+    `fullmatch`. Anything with no canonical partition in it -- a v1 list entry,
+    a cik-sharded partition, a bookkeeping key -- must be adopted byte-exact,
+    or the migration silently renames state whose only other copy it is about
+    to retire.
+    """
+    from cdt.datasets import (
+        CompletionRegistry,
+        completion_registry_shard_path,
+        legacy_completion_registry_path,
+        save_completion_registry,
+    )
+
+    odd_keys = [
+        "items/a",
+        "debt-instruments/cik_shard=0001/part-0000.parquet",
+        "bookkeeping-key",
+    ]
+    legacy = Path(legacy_completion_registry_path("classify", artifact_root=tmp_path))
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text(json.dumps({"source_partitions": odd_keys}))
+
+    save_completion_registry("classify", CompletionRegistry(), artifact_root=tmp_path)
+
+    shard = Path(
+        completion_registry_shard_path("classify", "unknown", artifact_root=tmp_path)
+    )
+    assert sorted(json.loads(shard.read_text())["partitions"]) == sorted(odd_keys)
+
+
 def test_completion_registry_shard_entry_beats_the_legacy_object(
     tmp_path: Path,
 ) -> None:

@@ -598,6 +598,29 @@ def _legacy_registry_to_migrate(
     keep a flag that a concurrent writer would also see (#88). The steady-state
     cost after migration is one HeadObject plus one GET of a ~200-byte marker
     per save, against the 56.8 MB this whole change is removing.
+
+    Adopted keys are re-homed onto the current root (#227). A v2 key carries
+    whatever whole path the writing run resolved, and the strip in
+    ``_registry_payload`` only removes the *exact* current root, so a key
+    written under a different spelling of the same root was persisted whole --
+    and then the legacy object was retired, making it permanent. Reproduced on
+    the real 1,640-entry ``genwindow-eval-apr`` registry, whose keys are
+    spelled ``data/genwindow-eval-apr/documents/...``: migrating under the
+    absolute path to that directory persisted all 1,640 in the old spelling,
+    and re-processing one partition then added a second key naming the same
+    partition. That falsifies ``_save_registry_shard``'s claim that a shard
+    "is normalized on its next write rather than accumulating both spellings".
+
+    Re-homing is the semantics #191 wanted rather than a new behaviour: the
+    stated point of dropping the root from the keys is that copying a root
+    keeps its registry valid, and every root in existence today carries a v2
+    object, so without this the portability win applies to no existing root.
+    Done by ``PARTITION_PATTERN.search`` -- the suffix match, against the
+    ``fullmatch`` the readers use -- so a key carrying any root spelling
+    resolves to the partition it names under this one. Keys with no canonical
+    partition in them (v1 list entries, cik-sharded partitions, bookkeeping
+    keys) have no partition identity to re-home and are adopted unchanged,
+    which keeps the key pair inverse.
     """
     path = legacy_completion_registry_path(
         stage_name, artifact_root=artifact_root, data_dir=data_dir
@@ -608,7 +631,26 @@ def _legacy_registry_to_migrate(
         payload, version = read_json_artifact_versioned(path)
     except FileNotFoundError:
         return {}, ""
-    return _registry_entries(payload, artifact_root), version
+    join_prefix = _registry_join_prefix(artifact_root)
+    adopted = {
+        _rehome_registry_key(key, join_prefix): entry
+        for key, entry in _registry_entries(payload, artifact_root).items()
+    }
+    return adopted, version
+
+
+def _rehome_registry_key(key: str, join_prefix: str) -> str:
+    """Return one adopted key re-pointed at the current artifact root.
+
+    Migration-path only: the readers deliberately use ``fullmatch`` so that a
+    whole path is never mistaken for a root-relative key, and that must stay
+    true. Here the whole path is exactly what has to be reinterpreted, because
+    the root it names is the root being migrated.
+    """
+    match = PARTITION_PATTERN.search(key)
+    if match is None:
+        return key
+    return join_prefix + match.group(0)
 
 
 def _retire_legacy_registry(
