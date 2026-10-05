@@ -4105,6 +4105,106 @@ def computed_sum_amount(
     return normalized_amount_from_text(model_amount) or model_amount
 
 
+def scaled_amount_from_sibling(
+    own_tag_ids: object,
+    sibling_tag_ids: object,
+    tag_details: dict[str, dict[str, object]],
+    model_amount: object,
+) -> str | None:
+    """Return the model's amount when a sibling fact's span carries its magnitude (#213).
+
+    Filing English writes a magnitude word once, after the second of two
+    figures. Crescent Capital BDC's Loan and Security Agreement amendment
+    (`000119312526241887-1-01`) says it "increased the facility size **from
+    $400.0 to $500.0 million**": NER tags `$400.0` (tag-15, chars 654-660) and
+    `$500.0 million` (tag-16, 664-678) as two `amount` spans, the model reads
+    the shared `million` correctly and returns `400000000` for the `prior`
+    commitment — and `amounts_agree` then compares that against the parser's
+    reading of the cited span alone, which is `400`. The correct value
+    published as null with `validation_errors: []`, and because
+    `mint_prior_state_rows` builds a predecessor only out of `prior` facts that
+    carry a value, the null suppressed the whole minted row and the item landed
+    in `skipped_unparsed_prior`.
+
+    The parser can already read the phrase — `normalized_amount_from_text("$400.0
+    to $500.0 million")` is `400000000` — so the entire failure is that the
+    cited span is tighter than the phrase carrying the magnitude. This reaches
+    an answer the parser already produces rather than inventing one.
+
+    **A sibling fact's cited span is acceptable evidence** (decided 2026-09-19).
+    The span *is* cited; it is simply cited by the neighbouring amount fact
+    rather than by the one being verified, so the arithmetic stays deterministic
+    and anchored to spans the model actually pointed at. The rejected
+    alternative was an `instrument_ie` rule requiring the model to cite both
+    spans on the `prior` fact — #165's precedent, which rode a fresh-window
+    eval. The *wider* alternative, a bare "nearest magnitude-bearing `amount`
+    span in the item", was also rejected: `tag_details` is the whole item's tag
+    map, so it would need no plumbing at all, but it would admit spans that no
+    fact cites.
+
+    Refusals mirror `computed_sum_amount`'s, and the two are mutually exclusive:
+    a sum needs `MINIMUM_COMPUTED_SUM_SPANS` parsed spans and this fires on one.
+    The product must equal the model's value exactly, and the return is the
+    model's own value re-normalized, so this can only ever *confirm* the model
+    and never originate a figure.
+
+    Measured by re-deriving `data/genwindow-run-branch` from its stored
+    responses: one fact rescued of 587, moving `skipped_unparsed_prior` 1 -> 0
+    and `minted` 15 -> 16, with every other refusal counter unchanged and
+    `lineage-verify`'s amendment pointers 22 -> 23 on unchanged heads and
+    families. The rescue fires on no other fact in any stored root. #214's Blue Owl
+    `($ in thousands)` table is untouched — its magnitude lives in an untagged
+    header that no fact cites, so there is no sibling magnitude to find and
+    guard 5 refuses all 18 of them.
+    """
+    # These first two refusals mirror `computed_sum_amount`'s and state the
+    # type contract, but mutation-testing shows neither is load-bearing *here*:
+    # `decimal_from_amount_string` is total and rejects every non-string
+    # itself, and the exact-product comparison below subsumes both, because
+    # `Decimal(...) != None` is simply True rather than a TypeError. Dropping
+    # either one, or both together, changes this function's result on no input.
+    # Kept for the contract and the symmetry with the precedent; recorded here
+    # so a later reader does not mistake them for guards that bite.
+    if not isinstance(model_amount, str):
+        return None
+    model_value = decimal_from_amount_string(model_amount)
+    if model_value is None:
+        return None
+    own_texts = cluster_span_texts(own_tag_ids, tag_details)
+    sibling_texts = [
+        text
+        for text in cluster_span_texts(sibling_tag_ids, tag_details)
+        if text not in set(own_texts)
+    ]
+    if any(is_rate_like_amount_text(text) for text in (*own_texts, *sibling_texts)):
+        return None
+    # The canonical span is the one `amounts_agree` just disagreed with, so it
+    # is the one whose reading this rescales (#120 picks it over a label).
+    own_text = canonical_amount_value(own_tag_ids, tag_details)
+    base = normalized_amount_from_text(own_text)
+    if base is None or magnitude_in_amount_text(own_text) is not None:
+        # A span already carrying a magnitude is never rescaled: `$500.0
+        # million` means what it says, and multiplying it again by the
+        # sibling's `million` would invent a figure six orders out.
+        return None
+    base_value = decimal_from_amount_string(base)
+    if base_value is None:
+        return None
+    magnitudes = {
+        magnitude
+        for magnitude in (magnitude_in_amount_text(text) for text in sibling_texts)
+        if magnitude is not None
+    }
+    if len(magnitudes) != 1:
+        # None means there is no shared magnitude word to borrow; more than one
+        # means the siblings disagree about which, and guessing between
+        # `million` and `billion` is a three-orders-of-magnitude error.
+        return None
+    if base_value * magnitudes.pop() != model_value:
+        return None
+    return normalized_amount_from_text(model_amount) or model_amount
+
+
 def amounts_agree(model_amount: object, parsed_amount: str | None) -> bool:
     """Return whether the model's amount is the same value the parser read.
 
@@ -4120,6 +4220,27 @@ def amounts_agree(model_amount: object, parsed_amount: str | None) -> bool:
     return model_value == parsed_value
 
 
+def magnitude_in_amount_text(text: str | None) -> int | None:
+    """Return the magnitude `normalized_amount_from_text` would apply, or None.
+
+    Factored out of the parser rather than written beside it so the two cannot
+    disagree about what counts as a magnitude word. `scaled_amount_from_sibling`
+    (#213) has to ask two questions the parser answers implicitly — does this
+    span carry a magnitude of its own, and which one does the neighbouring span
+    carry — and a second copy of this loop would drift exactly the way
+    `AMOUNT_SCALE_ALTERNATION`'s own comment records `trillion` drifting.
+    """
+    if not text:
+        return None
+    lowered = text.lower().replace(",", "")
+    for word in sorted(AMOUNT_MULTIPLIERS, key=len, reverse=True):
+        # `(?<![a-z])` rather than `\b` on the left so `$500mm` reads as well as
+        # `$500 mm`, while `million` still cannot match inside a longer word.
+        if re.search(rf"(?<![a-z]){word}\b", lowered):
+            return AMOUNT_MULTIPLIERS[word]
+    return None
+
+
 def normalized_amount_from_text(text: str | None) -> str | None:
     """Parse one amount mention into a normalized numeric string."""
     if not text:
@@ -4131,12 +4252,9 @@ def normalized_amount_from_text(text: str | None) -> str | None:
     amount = decimal_from_amount_string(match.group(0))
     if amount is None:
         return None
-    for word in sorted(AMOUNT_MULTIPLIERS, key=len, reverse=True):
-        # `(?<![a-z])` rather than `\b` on the left so `$500mm` reads as well as
-        # `$500 mm`, while `million` still cannot match inside a longer word.
-        if re.search(rf"(?<![a-z]){word}\b", lowered):
-            amount *= AMOUNT_MULTIPLIERS[word]
-            break
+    magnitude = magnitude_in_amount_text(text)
+    if magnitude is not None:
+        amount *= magnitude
     return normalize_numeric_string(amount)
 
 
@@ -4562,10 +4680,21 @@ def standardized_amounts_payloads(
     shape (kind unknown → null) so stored batch responses replay. When neither
     yields a value but the instrument's name embeds a principal, one
     name-derived principal entry is synthesized, preserving #129.
+
+    The shared-magnitude rescue (#213) runs here as a post-pass rather than
+    inside ``standardized_amount_payload``, which receives one ``amounts[*]``
+    entry and so cannot see the fact next to it. This is the narrowest place
+    the rule is expressible: both the built payloads and their evidence lists
+    are in hand, so "cited by a sibling amount fact of *this object*" can be
+    said. ``tag_details`` is the whole item's tag map, so a rule phrased over
+    it instead — the nearest magnitude-bearing `amount` span anywhere in the
+    item — would need no plumbing at all and was rejected for being strictly
+    wider: it would admit spans that no fact cites.
     """
     payloads: list[dict[str, object]] = []
     entries = obj.get("amounts")
     if isinstance(entries, list):
+        model_amounts: list[object] = []
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
@@ -4589,6 +4718,28 @@ def standardized_amounts_payloads(
             # instrument's current figure.
             payload["prior"] = entry.get("prior") is True
             payloads.append(payload)
+            model_amounts.append(entry.get("normalized_amount"))
+        for index, payload in enumerate(payloads):
+            if payload["normalized_amount"] is not None:
+                continue
+            siblings = [
+                tag_id
+                for position, sibling in enumerate(payloads)
+                if position != index
+                for tag_id in payload_tag_ids(sibling)
+            ]
+            scaled = scaled_amount_from_sibling(
+                payload_tag_ids(payload),
+                siblings,
+                tag_details,
+                model_amounts[index],
+            )
+            if scaled is not None:
+                payload["normalized_amount"] = scaled
+                # `currency` is left as it stands: it was read from this fact's
+                # own cited span, which is the right evidence for a currency
+                # even when the magnitude had to be borrowed.
+                payload["derived_from"] = DERIVED_FROM_SCALED
     elif "amount" in obj:
         payload = standardized_amount_payload(
             obj.get("amount"),
