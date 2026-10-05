@@ -656,3 +656,27 @@ def test_arrow_filesystem_warns_when_credentials_expire_before_a_scan_could(
         storage.arrow_filesystem("s3://bucket/a/b.parquet")
 
     assert "expire in" in caplog.text
+
+
+def test_count_partition_rows_totals_footers_without_reading_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ingest read-back's count must come from footers alone (#224).
+
+    A vanished partition counts as empty, as reading it would have, and no
+    paths at all is zero rather than an error.
+    """
+    _write(tmp_path / "a.parquet", [{"k": "1"}, {"k": "2"}])
+    _write(tmp_path / "b.parquet", [{"k": "3"}])
+
+    def _explode(*args: object, **kwargs: object) -> pd.DataFrame:
+        raise AssertionError("read row data to count rows")
+
+    monkeypatch.setattr(pq.ParquetFile, "read", _explode)
+    monkeypatch.setattr(storage, "read_table", _explode)
+
+    paths = [
+        str(tmp_path / name) for name in ("a.parquet", "b.parquet", "gone.parquet")
+    ]
+    assert storage.count_partition_rows(paths) == 3
+    assert storage.count_partition_rows([]) == 0

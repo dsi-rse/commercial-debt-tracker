@@ -22,6 +22,7 @@ from cdt.datasets import (
 )
 from cdt.shared import FailureClassifier, FailureRegistry, get_logger
 from cdt.storage import (
+    count_partition_rows,
     delete_artifact,
     get_object_bytes,
     iter_partition_paths,
@@ -372,6 +373,7 @@ def acquire_documents(
         ),
         ciks=ciks,
         s3_client=s3_client,
+        return_documents=True,
     )
     return documents
 
@@ -408,6 +410,7 @@ def acquire_documents_for_date_range(
         ),
         ciks=ciks,
         s3_client=s3_client,
+        return_documents=True,
     )
     return documents
 
@@ -419,8 +422,14 @@ def run_ingest_pipeline(
     s3_client: S3Client | None = None,
     candidate_source: Callable[[FailureRegistry], DocumentCandidateSource]
     | None = None,
+    return_documents: bool = False,
 ) -> tuple[pd.DataFrame, IngestRunResult]:
     """Run ingest using an orchestrator-style config object.
+
+    The frame is the run's documents only when ``return_documents`` is set;
+    otherwise it is empty and only ``IngestRunResult.total_rows`` reports how
+    many there are. Materialising it reads every body in the window (#224), and
+    no production caller uses it.
 
     ``candidate_source`` replaces the scraper-manifest scan with another way of
     finding filings — the direct-EDGAR 6-K path. It is a factory rather than a
@@ -620,12 +629,17 @@ def run_ingest_pipeline(
         )
         | document_partitions_written
     )
-    window_frames = [read_table(path, DOCUMENT_COLUMNS) for path in read_paths]
-    filtered_updated = (
-        pd.concat(window_frames, ignore_index=True).reset_index(drop=True)
-        if window_frames
-        else pd.DataFrame(columns=DOCUMENT_COLUMNS)
-    )
+    #
+    # Only the row count is read unless the caller asked for the documents
+    # themselves (#224). Every production caller discards the frame, and
+    # building it meant deserializing every body in the window, ``text``
+    # included, one partition at a time — on a historical run, the whole corpus.
+    if return_documents:
+        documents = read_partitions(read_paths, columns=DOCUMENT_COLUMNS)
+        total_rows = len(documents)
+    else:
+        documents = pd.DataFrame(columns=DOCUMENT_COLUMNS)
+        total_rows = count_partition_rows(read_paths)
     write_json_artifact(
         run_manifest,
         {
@@ -653,10 +667,10 @@ def run_ingest_pipeline(
         downloaded,
         skipped_existing,
         failures,
-        len(filtered_updated),
+        total_rows,
         documents_dataset_root,
     )
-    return filtered_updated.reindex(columns=DOCUMENT_COLUMNS), IngestRunResult(
+    return documents.reindex(columns=DOCUMENT_COLUMNS), IngestRunResult(
         mode=config.mode,
         start_date=config.start_date,
         end_date=config.end_date,
@@ -665,7 +679,7 @@ def run_ingest_pipeline(
         skipped_existing=skipped_existing,
         downloaded=downloaded,
         failures=failures,
-        total_rows=len(filtered_updated),
+        total_rows=total_rows,
         output_root=output_root,
         documents_root=documents_dataset_root,
         document_partitions=tuple(sorted(document_partitions_written)),

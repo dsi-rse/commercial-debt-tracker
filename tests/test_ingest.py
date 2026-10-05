@@ -397,8 +397,12 @@ def test_ingest_records_missing_document_failures(tmp_path: Path) -> None:
         data_dir=tmp_path,
         failure_file=tmp_path / "failures" / "ingest_failures.json",
     )
-    first, result = run_ingest_pipeline(config, ciks={"320193"}, s3_client=client)
-    second, _ = run_ingest_pipeline(config, ciks={"320193"}, s3_client=client)
+    first, result = run_ingest_pipeline(
+        config, ciks={"320193"}, s3_client=client, return_documents=True
+    )
+    second, _ = run_ingest_pipeline(
+        config, ciks={"320193"}, s3_client=client, return_documents=True
+    )
 
     assert first.empty
     assert second.empty
@@ -692,6 +696,7 @@ def test_force_reingest_repairs_pre_crc32_shard_duplicates(tmp_path: Path) -> No
         ),
         ciks={"320193"},
         s3_client=client,
+        return_documents=True,
     )
 
     assert table["accession_number"].to_list() == [accession]
@@ -906,6 +911,7 @@ def test_ingest_routes_configured_form_types_to_their_own_dataset(
         ),
         ciks={"320193"},
         s3_client=client,
+        return_documents=True,
     )
 
     # The 8-K manifest sits in the same bucket and date range and is not read:
@@ -1270,3 +1276,69 @@ def test_reingest_inside_the_window_still_skips_the_download(tmp_path: Path) -> 
     documents = read_dataset(documents_root(data_dir=tmp_path))
     assert documents["accession_number"].to_list() == [accession]
     assert documents["text"].to_list() == ["stored"]
+
+
+def test_the_read_back_counts_the_window_without_reading_its_bodies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reporting how many documents a window holds must not deserialize them (#224).
+
+    Every production caller discards the frame and keeps only ``total_rows``,
+    yet the read-back used to build it — every body in the window, ``text``
+    included, one partition at a time. On a historical run the window is the
+    whole 12.2 GB corpus. The count must still be right, and still cover rows
+    this run did not write.
+    """
+    from cdt import ingest as ingest_module
+    from cdt import storage
+
+    _store_document(tmp_path, "000114036126006577", "2024-01-02")
+    _store_document(tmp_path, "000114036126006578", "2024-01-03")
+    _store_document(tmp_path, "000114036126006579", "2024-02-01")  # outside
+
+    def no_bodies(*args: object, **kwargs: object) -> pd.DataFrame:
+        columns = kwargs.get("columns") or (args[1] if len(args) > 1 else None)
+        if columns is None or "text" in columns:
+            msg = "the read-back deserialized document bodies"
+            raise AssertionError(msg)
+        return real_read_partitions(*args, **kwargs)
+
+    def no_table_bodies(path: object, columns: object = None) -> pd.DataFrame:
+        # No manifests means no partition writes, so nothing else in this run
+        # has a reason to read a document body through read_table.
+        if columns is None or "text" in columns:
+            msg = "the read-back deserialized document bodies"
+            raise AssertionError(msg)
+        return storage.read_table(path, columns)
+
+    real_read_partitions = ingest_module.read_partitions
+    monkeypatch.setattr(ingest_module, "read_partitions", no_bodies)
+    monkeypatch.setattr(ingest_module, "read_table", no_table_bodies)
+
+    config = IngestConfig(
+        mode="historical",
+        bucket="sec-bucket",
+        cik_file=tmp_path / "ciks.txt",
+        start_date=date(2024, 1, 1),
+        end_date=date(2024, 1, 31),
+        data_dir=tmp_path,
+    )
+    table, result = run_ingest_pipeline(
+        config, ciks={"320193"}, s3_client=FakeS3Client({})
+    )
+
+    assert result.total_rows == 2
+    assert table.empty
+    assert list(table.columns) == DOCUMENT_COLUMNS
+
+    monkeypatch.setattr(ingest_module, "read_partitions", real_read_partitions)
+    monkeypatch.setattr(ingest_module, "read_table", storage.read_table)
+    documents, result = run_ingest_pipeline(
+        config, ciks={"320193"}, s3_client=FakeS3Client({}), return_documents=True
+    )
+
+    assert result.total_rows == 2
+    assert sorted(documents["accession_number"]) == [
+        "000114036126006577",
+        "000114036126006578",
+    ]

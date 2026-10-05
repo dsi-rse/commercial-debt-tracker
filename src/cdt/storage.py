@@ -986,6 +986,25 @@ def count_table_rows(path: ArtifactPath) -> int | None:
         return None
 
 
+def count_partition_rows(paths: Sequence[ArtifactPath]) -> int:
+    """Total the footer row counts of many partitions, reading them in parallel.
+
+    For a caller that needs how many rows a set of partitions holds and nothing
+    else: ingest's read-back used to materialise every partition in its window,
+    ``text`` included, only to take ``len()`` of the result (#224) — measured
+    65.44s against 0.67s for the same 9,077 rows on data/genwindow-eval-apr.
+    Threaded for the same reason as ``_unified_schema``: each footer is a round
+    trip, and on S3 a serial pass is one sequential request per partition. A
+    partition that vanished since the listing counts as empty, as reading it
+    would have.
+    """
+    if not paths:
+        return 0
+    with ThreadPoolExecutor(max_workers=min(_SCHEMA_WORKERS, len(paths))) as pool:
+        counts = list(pool.map(count_table_rows, paths))
+    return sum(count or 0 for count in counts)
+
+
 def _read_dataset_with_arrow(
     paths: list[str], columns: Sequence[str] | None
 ) -> tuple[pd.DataFrame | None, Exception | None]:

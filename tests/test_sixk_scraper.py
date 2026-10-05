@@ -226,7 +226,9 @@ def test_acquire_writes_six_k_rows_pointing_at_assembled_submissions(
     """A run assembles each filing's documents into one mirrored submission."""
     client = FakeS3Client(_objects())
 
-    table, result = acquire_scraped_sixk_documents(_config(tmp_path), s3_client=client)
+    table, result = acquire_scraped_sixk_documents(
+        _config(tmp_path), s3_client=client, return_documents=True
+    )
 
     assert table["accession_number"].to_list() == [HARMONY_STORED, VALE_STORED]
     assert table["form_type"].to_list() == ["6-K", "6-K/A"]
@@ -276,7 +278,9 @@ def test_cik_is_spelled_the_way_the_eight_k_path_spells_it(tmp_path: Path) -> No
     """
     client = FakeS3Client(_objects())
 
-    table, _ = acquire_scraped_sixk_documents(_config(tmp_path), s3_client=client)
+    table, _ = acquire_scraped_sixk_documents(
+        _config(tmp_path), s3_client=client, return_documents=True
+    )
 
     assert table["cik"].to_list() == [
         normalize_cik("1023514"),
@@ -327,7 +331,9 @@ def test_plain_text_documents_are_read_too(tmp_path: Path) -> None:
     """Whether the scraper gzipped its copy is not this path's business."""
     client = FakeS3Client(_objects(gzip_bodies=False))
 
-    table, result = acquire_scraped_sixk_documents(_config(tmp_path), s3_client=client)
+    table, result = acquire_scraped_sixk_documents(
+        _config(tmp_path), s3_client=client, return_documents=True
+    )
 
     assert result.failures == 0
     assert len(table) == EXPECTED_SIXK_ROWS
@@ -341,7 +347,9 @@ def test_already_mirrored_filings_are_not_reassembled(tmp_path: Path) -> None:
 
     second_client = FakeS3Client(objects)
     table, result = acquire_scraped_sixk_documents(
-        _config(tmp_path, force=True), s3_client=second_client
+        _config(tmp_path, force=True),
+        s3_client=second_client,
+        return_documents=True,
     )
 
     # force=True re-reads manifests and re-writes rows, so the rows are proof
@@ -361,7 +369,10 @@ def test_ciks_filter_which_filings_are_acquired(tmp_path: Path) -> None:
     client = FakeS3Client(_objects())
 
     table, _ = acquire_scraped_sixk_documents(
-        _config(tmp_path), ciks={"0001023514"}, s3_client=client
+        _config(tmp_path),
+        ciks={"0001023514"},
+        s3_client=client,
+        return_documents=True,
     )
 
     assert table["accession_number"].to_list() == [HARMONY_STORED]
@@ -382,7 +393,9 @@ def test_malformed_document_fails_the_filing_permanently(tmp_path: Path) -> None
     )
     client = FakeS3Client(objects)
 
-    table, result = acquire_scraped_sixk_documents(_config(tmp_path), s3_client=client)
+    table, result = acquire_scraped_sixk_documents(
+        _config(tmp_path), s3_client=client, return_documents=True
+    )
 
     assert table["accession_number"].to_list() == [VALE_STORED]
     assert result.failures == 1
@@ -399,7 +412,9 @@ def test_missing_document_object_fails_the_filing(tmp_path: Path) -> None:
     client = FakeS3Client(objects)
     client.missing.add((BUCKET, body_key))
 
-    table, result = acquire_scraped_sixk_documents(_config(tmp_path), s3_client=client)
+    table, result = acquire_scraped_sixk_documents(
+        _config(tmp_path), s3_client=client, return_documents=True
+    )
 
     assert table["accession_number"].to_list() == [VALE_STORED]
     assert result.failures == 1
@@ -418,7 +433,9 @@ def test_manifest_without_documents_fails_the_filing(tmp_path: Path) -> None:
     )
     client = FakeS3Client(objects)
 
-    table, result = acquire_scraped_sixk_documents(_config(tmp_path), s3_client=client)
+    table, result = acquire_scraped_sixk_documents(
+        _config(tmp_path), s3_client=client, return_documents=True
+    )
 
     assert table["accession_number"].to_list() == [VALE_STORED]
     assert result.failures == 1
