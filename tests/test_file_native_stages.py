@@ -14,6 +14,7 @@ import pyarrow.dataset
 import pytest
 from botocore.exceptions import ClientError, ReadTimeoutError
 
+from cdt import datasets as cdt_datasets
 from cdt import storage as cdt_storage
 from cdt.classifier import classifications_root, classify_pending_items
 from cdt.classifier import core as classifier_core
@@ -4157,12 +4158,9 @@ def test_extract_failures_are_recorded_and_cleared(
 
     # The partition is registered complete even though the row produced nothing,
     # which is exactly why the failure has to be recorded somewhere durable.
-    assert (
-        "extract"
-        in read_json_artifact(
-            completion_registry_path("extract", artifact_root=tmp_path)
-        )["stage"]
-    )
+    # Read through the loader, not a fixed path: the registry is a prefix of
+    # date shards since #191 and no test should re-encode its layout.
+    assert load_completed_partitions("extract", artifact_root=tmp_path)
     failures = load_row_failures("extract", artifact_root=tmp_path)
     assert len(failures) == 1
     entry = next(iter(failures.values()))
@@ -4398,6 +4396,974 @@ def test_pending_source_partitions_stamps_survive_concurrent_saves(
 
     final = load_completion_registry("classify", artifact_root=tmp_path)
     assert final[source_path].fingerprint is not None
+
+
+def seed_document_partitions_across_months(
+    tmp_path: Path, partitions: list[tuple[str, str]]
+) -> list[str]:
+    """Write one document partition per ``(date, shard)``, dates free-form.
+
+    seed_document_partitions' fixed pair is same-month; the registry shards by
+    year-month, so anything about sharding needs dates that straddle months.
+    """
+    paths: list[str] = []
+    for index, (filing_date, shard) in enumerate(partitions):
+        table = pd.DataFrame(
+            [
+                {
+                    "accession_number": f"00011403612600{index:04d}",
+                    "cik": "320193",
+                    "company_name": "Example Inc.",
+                    "url": "https://sec.example/full.txt",
+                    "text": (
+                        "ITEM INFORMATION: Other Events\n"
+                        "<DOCUMENT>\n<TYPE>8-K\n<TEXT>\n"
+                        "Item 8.01 Other Events.\n"
+                        "This is the extracted event text.\n"
+                        "</TEXT>\n</DOCUMENT>\n"
+                    ),
+                    "date": filing_date,
+                    "resource_uri": None,
+                }
+            ],
+            columns=DOCUMENT_COLUMNS,
+        )
+        paths.append(
+            write_partition_table(
+                tmp_path / "documents",
+                partition={"date": filing_date, "shard": shard},
+                table=table,
+            )
+        )
+    return paths
+
+
+def test_completion_registry_shards_entries_by_date_prefix(tmp_path: Path) -> None:
+    """One object per year-month, each holding only that month's entries (#191).
+
+    The single object it replaces is 56.8 MB at full corpus scale and was read
+    and rewritten whole every 100 partitions, 4,400 times per itemize pass.
+    """
+    from cdt.datasets import (
+        CompletedPartition,
+        completion_registry_shard_path,
+        date_shard_partition_path,
+        load_completion_registry,
+        save_completion_registry,
+    )
+
+    keys = [
+        date_shard_partition_path(
+            "documents", partition_date=day, shard="0001", artifact_root=tmp_path
+        )
+        for day in ("2024-01-02", "2024-01-31", "2024-02-01", "2024-03-15")
+    ]
+    save_completion_registry(
+        "itemize",
+        {
+            key: CompletedPartition(fingerprint=f"f{index}")
+            for index, key in enumerate(keys)
+        },
+        artifact_root=tmp_path,
+    )
+
+    shards = sorted(
+        path.name for path in (tmp_path / "runs" / "itemize" / "completed").iterdir()
+    )
+    assert shards == ["date=2024-01.json", "date=2024-02.json", "date=2024-03.json"]
+    january = json.loads(
+        Path(
+            completion_registry_shard_path("itemize", "2024-01", artifact_root=tmp_path)
+        ).read_text()
+    )
+    assert sorted(january["partitions"]) == [
+        "documents/date=2024-01-02/shard=0001/part-0000.parquet",
+        "documents/date=2024-01-31/shard=0001/part-0000.parquet",
+    ]
+    assert january["date_prefix"] == "2024-01"
+
+    # And the loader reassembles every shard into one registry.
+    loaded = load_completion_registry("itemize", artifact_root=tmp_path)
+    assert set(loaded) == set(keys)
+    assert loaded[keys[3]].fingerprint == "f3"
+
+
+def test_completion_registry_save_rewrites_only_the_months_it_touched(
+    tmp_path: Path,
+) -> None:
+    """The #191 fix itself: a batch save must not rewrite untouched months.
+
+    Before sharding, persisting one more partition read and rewrote every
+    entry the corpus had -- 113.5 MB of transfer per batch boundary at full
+    scale. Asserted on the objects actually touched, because an assertion that
+    the final state is correct passes just as well on the quadratic version.
+    """
+    from cdt.datasets import (
+        CompletedPartition,
+        completion_registry_shard_path,
+        date_shard_partition_path,
+        load_completion_registry,
+        save_completion_registry,
+    )
+
+    def key(day: str) -> str:
+        return date_shard_partition_path(
+            "documents", partition_date=day, shard="0001", artifact_root=tmp_path
+        )
+
+    old_months = [f"2024-{month:02d}-15" for month in range(1, 10)]
+    save_completion_registry(
+        "itemize",
+        {key(day): CompletedPartition(fingerprint="old") for day in old_months},
+        artifact_root=tmp_path,
+    )
+    january = Path(
+        completion_registry_shard_path("itemize", "2024-01", artifact_root=tmp_path)
+    )
+    january_before = january.read_bytes()
+
+    registry = load_completion_registry("itemize", artifact_root=tmp_path)
+    assert len(registry) == len(old_months)
+    registry[key("2024-10-15")] = CompletedPartition(fingerprint="new")
+
+    moved: list[str] = []
+
+    def record(name: str, function: object) -> object:
+        def wrapper(path: object, *args: object, **kwargs: object) -> object:
+            moved.append(f"{name}:{Path(str(path)).name}")
+            return function(path, *args, **kwargs)  # type: ignore[operator]
+
+        return wrapper
+
+    with pytest.MonkeyPatch.context() as patch:
+        for name, attribute in (
+            ("read", "read_json_artifact_versioned"),
+            ("write", "replace_json_artifact_if_match"),
+            ("create", "write_json_artifact_if_absent"),
+        ):
+            patch.setattr(
+                cdt_datasets,
+                attribute,
+                record(name, getattr(cdt_datasets, attribute)),
+            )
+        save_completion_registry("itemize", registry, artifact_root=tmp_path)
+
+    # Exactly one object created, nothing else read or rewritten.
+    assert moved == ["create:date=2024-10.json"]
+    assert january.read_bytes() == january_before
+
+
+def test_completion_registry_batch_saves_do_not_resend_earlier_batches(
+    tmp_path: Path,
+) -> None:
+    """A later batch boundary must not rewrite the months earlier ones wrote.
+
+    Stages save repeatedly against one registry object, at every batch
+    boundary, so an interruption does not discard the run's progress (#111).
+    The dirty set is what a save sends, so unless a committed key leaves it,
+    batch k re-sends every key from batches 1..k-1 and rewrites every shard
+    they span -- cost quadratic in the run's length, which is the thing #191
+    removes. The single-save test above cannot see this: it never saves the
+    same registry object twice, and no stage ever saves one only once.
+    """
+    from cdt.datasets import (
+        CompletedPartition,
+        CompletionRegistry,
+        date_shard_partition_path,
+        save_completion_registry,
+    )
+
+    def key(day: str) -> str:
+        return date_shard_partition_path(
+            "documents", partition_date=day, shard="0001", artifact_root=tmp_path
+        )
+
+    touched: list[str] = []
+
+    def record(function: object) -> object:
+        def wrapper(path: object, *args: object, **kwargs: object) -> object:
+            touched.append(Path(str(path)).name)
+            return function(path, *args, **kwargs)  # type: ignore[operator]
+
+        return wrapper
+
+    registry = CompletionRegistry()
+    with pytest.MonkeyPatch.context() as patch:
+        for attribute in (
+            "read_json_artifact_versioned",
+            "replace_json_artifact_if_match",
+            "write_json_artifact_if_absent",
+        ):
+            patch.setattr(
+                cdt_datasets, attribute, record(getattr(cdt_datasets, attribute))
+            )
+        for day in ("2024-01-15", "2024-02-15", "2024-03-15"):
+            registry[key(day)] = CompletedPartition(fingerprint="new")
+            touched.clear()
+            save_completion_registry("itemize", registry, artifact_root=tmp_path)
+            assert touched == [f"date={day[:7]}.json"], f"batch {day} touched {touched}"
+    # Every key is persisted, so nothing is owed to the next save.
+    assert not registry.dirty
+
+
+def test_completion_registry_reads_a_legacy_single_object(tmp_path: Path) -> None:
+    """A pre-#191 root is read, not seen as empty (#107).
+
+    Seeing it as empty is the #107 failure exactly: force=False reported 0
+    pending and force=True reported 20,046, because the registry consulted was
+    not the registry the corpus had. Here the same mistake would re-itemize
+    every partition ever written.
+    """
+    from cdt.datasets import (
+        legacy_completion_registry_path,
+        load_completed_partitions,
+        load_completion_registry,
+    )
+
+    legacy = Path(legacy_completion_registry_path("itemize", artifact_root=tmp_path))
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text(
+        json.dumps(
+            {
+                "stage": "itemize",
+                "version": 2,
+                "partitions": {
+                    "documents/date=2024-01-02/shard=0001/part-0000.parquet": {
+                        "fingerprint": "legacy-fp"
+                    }
+                },
+            }
+        )
+    )
+
+    loaded = load_completion_registry("itemize", artifact_root=tmp_path)
+    assert len(loaded) == 1
+    entry = next(iter(loaded.values()))
+    assert entry.fingerprint == "legacy-fp"
+    assert entry.complete
+    assert len(load_completed_partitions("itemize", artifact_root=tmp_path)) == 1
+
+
+def test_completion_registry_v1_legacy_list_still_reads(tmp_path: Path) -> None:
+    """The v1 path-list form survives the split to shards too."""
+    from cdt.datasets import legacy_completion_registry_path, load_completion_registry
+
+    legacy = Path(legacy_completion_registry_path("classify", artifact_root=tmp_path))
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text(json.dumps({"source_partitions": ["items/a", "items/b"]}))
+
+    loaded = load_completion_registry("classify", artifact_root=tmp_path)
+    assert set(loaded) == {"items/a", "items/b"}
+    assert all(entry.fingerprint is None for entry in loaded.values())
+
+
+def test_completion_registry_shard_entry_beats_the_legacy_object(
+    tmp_path: Path,
+) -> None:
+    """A re-written entry wins over the copy the legacy object still holds.
+
+    Load order is load-bearing while both layouts coexist: read the legacy
+    object as an overlay on top of the shards and a stale fingerprint would
+    resurrect, making a changed source partition look already done (#62).
+    """
+    from cdt.datasets import (
+        CompletedPartition,
+        date_shard_partition_path,
+        legacy_completion_registry_path,
+        load_completion_registry,
+        save_completion_registry,
+    )
+
+    key = date_shard_partition_path(
+        "documents", partition_date="2024-01-02", shard="0001", artifact_root=tmp_path
+    )
+    legacy = Path(legacy_completion_registry_path("itemize", artifact_root=tmp_path))
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text(
+        json.dumps(
+            {
+                "stage": "itemize",
+                "version": 2,
+                "partitions": {key: {"fingerprint": "stale"}},
+            }
+        )
+    )
+    save_completion_registry(
+        "itemize",
+        {key: CompletedPartition(fingerprint="fresh")},
+        artifact_root=tmp_path,
+    )
+
+    assert (
+        load_completion_registry("itemize", artifact_root=tmp_path)[key].fingerprint
+        == "fresh"
+    )
+
+
+def test_stage_manifest_points_at_the_registry_prefix(tmp_path: Path) -> None:
+    """The manifest names where the registry actually is, shards included.
+
+    Operators read this field to find the completion state of a run; before
+    #191 it named a single object, and left unchanged it would keep naming a
+    path that no longer exists.
+    """
+    seed_document_partition(tmp_path)
+    itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
+
+    manifest = read_json_artifact(
+        run_manifest_path("itemize", "latest", artifact_root=tmp_path)
+    )
+    prefix = completion_registry_path("itemize", artifact_root=tmp_path)
+    assert manifest["completion_registry"] == prefix
+    assert sorted(path.name for path in Path(prefix).iterdir()) == ["date=2024-01.json"]
+
+
+def test_completion_registry_keeps_undated_keys(tmp_path: Path) -> None:
+    """A key with no partition date round-trips instead of being dropped.
+
+    Dropping it would lose completion state silently, which is the same class
+    of bug as reading a legacy registry as empty.
+    """
+    from cdt.datasets import (
+        CompletedPartition,
+        load_completion_registry,
+        save_completion_registry,
+    )
+
+    # Including one that lives *under* the artifact root: the root is stripped
+    # from canonical partition keys only, because the reader reattaches it to
+    # canonical keys only. Strip it here too and the key changes identity on
+    # the way back, stranding whatever it names.
+    under_root = str(tmp_path / "documents" / "legacy-flat-file.parquet")
+    save_completion_registry(
+        "itemize",
+        {
+            "bookkeeping-key": CompletedPartition(fingerprint="f"),
+            under_root: CompletedPartition(fingerprint="g"),
+        },
+        artifact_root=tmp_path,
+    )
+
+    assert (tmp_path / "runs" / "itemize" / "completed" / "date=unknown.json").exists()
+    loaded = load_completion_registry("itemize", artifact_root=tmp_path)
+    assert loaded["bookkeeping-key"].fingerprint == "f"
+    assert loaded[under_root].fingerprint == "g"
+
+
+def test_completion_registry_shard_saves_merge_a_real_race(tmp_path: Path) -> None:
+    """Two writers racing on one shard must not lose each other's entries (#88).
+
+    The race is forced: writer A's compare-and-swap is interposed so writer B
+    lands *between* A's read and A's write, so A genuinely loses the swap and
+    has to re-read. A test where the two writers merely run in sequence proves
+    nothing about the retry loop.
+    """
+    from cdt.datasets import (
+        CompletedPartition,
+        date_shard_partition_path,
+        load_completion_registry,
+        save_completion_registry,
+    )
+
+    def key(shard: str) -> str:
+        return date_shard_partition_path(
+            "documents",
+            partition_date="2024-01-02",
+            shard=shard,
+            artifact_root=tmp_path,
+        )
+
+    save_completion_registry(
+        "itemize",
+        {key("0000"): CompletedPartition(fingerprint="seed")},
+        artifact_root=tmp_path,
+    )
+    writer_a = load_completion_registry("itemize", artifact_root=tmp_path)
+    writer_a[key("0001")] = CompletedPartition(fingerprint="a")
+
+    real_replace = cdt_datasets.replace_json_artifact_if_match
+    interposed: list[str] = []
+
+    def replace_after_b_writes(path: object, payload: object, *, version: str) -> bool:
+        if not interposed:
+            interposed.append("b")
+            # B commits its own entry into the same shard, invalidating A's
+            # version token; A's swap below must therefore fail and re-read.
+            writer_b = load_completion_registry("itemize", artifact_root=tmp_path)
+            writer_b[key("0002")] = CompletedPartition(fingerprint="b")
+            save_completion_registry("itemize", writer_b, artifact_root=tmp_path)
+        return real_replace(path, payload, version=version)  # type: ignore[arg-type]
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            cdt_datasets, "replace_json_artifact_if_match", replace_after_b_writes
+        )
+        save_completion_registry("itemize", writer_a, artifact_root=tmp_path)
+
+    assert interposed == ["b"]
+    final = load_completion_registry("itemize", artifact_root=tmp_path)
+    assert set(final) == {key("0000"), key("0001"), key("0002")}
+    assert final[key("0001")].fingerprint == "a"
+    assert final[key("0002")].fingerprint == "b"
+
+
+def test_completion_registry_shard_gives_up_after_losing_every_race(
+    tmp_path: Path,
+) -> None:
+    """Endless swap losses fail loudly rather than dropping the entries."""
+    from cdt.datasets import CompletedPartition, save_completion_registry
+
+    save_completion_registry(
+        "itemize", {"k": CompletedPartition(fingerprint="seed")}, artifact_root=tmp_path
+    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            cdt_datasets,
+            "replace_json_artifact_if_match",
+            lambda *args, **kwargs: False,
+        )
+        with pytest.raises(RuntimeError, match="compare-and-swap races"):
+            save_completion_registry(
+                "itemize",
+                {"k": CompletedPartition(fingerprint="new")},
+                artifact_root=tmp_path,
+            )
+
+
+def test_itemize_batch_progress_survives_a_mid_run_interruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#111's guarantee, re-pinned across the shard split (#191).
+
+    #111 moved the registry save inside the chunk loop precisely so an
+    interruption does not discard the run's progress -- up to 2.5 h of itemize
+    on the real corpus. Sharding must not trade that away, so: interrupt a run
+    partway and assert the completed prefix is persisted and skipped next time,
+    including across a month boundary where the progress spans two shards.
+    """
+    from cdt.datasets import load_completed_partitions
+
+    days = ["2024-01-02", "2024-01-03", "2024-02-01", "2024-02-02", "2024-03-01"]
+    paths = seed_document_partitions_across_months(
+        tmp_path, [(day, f"{index:04d}") for index, day in enumerate(days)]
+    )
+    real_itemize = itemizer_core.itemize_documents
+    calls: list[int] = []
+
+    def count(*, fail_on: int | None) -> object:
+        def wrapper(*args: object, **kwargs: object) -> pd.DataFrame:
+            calls.append(1)
+            if len(calls) == fail_on:
+                raise RuntimeError("infra interruption")
+            return real_itemize(*args, **kwargs)  # type: ignore[arg-type]
+
+        return wrapper
+
+    monkeypatch.setattr(itemizer_core, "itemize_documents", count(fail_on=4))
+    with pytest.raises(RuntimeError, match="infra interruption"):
+        itemize_pending_documents(artifact_root=tmp_path, batch_size=1)
+
+    # Three partitions finished; their completion is durable, in two shards.
+    completed = load_completed_partitions("itemize", artifact_root=tmp_path)
+    assert completed == set(paths[:3])
+    written = sorted(
+        path.name for path in (tmp_path / "runs" / "itemize" / "completed").iterdir()
+    )
+    assert written == ["date=2024-01.json", "date=2024-02.json"]
+
+    # And the resumed run pays only for what was left.
+    monkeypatch.setattr(itemizer_core, "itemize_documents", count(fail_on=None))
+    calls.clear()
+    itemize_pending_documents(artifact_root=tmp_path, batch_size=1)
+    assert len(calls) == 2
+    assert load_completed_partitions("itemize", artifact_root=tmp_path) == set(paths)
+
+
+def write_legacy_registry(
+    tmp_path: Path, stage: str, entries: dict[str, str | None]
+) -> Path:
+    """Write a pre-#191 single-object v2 registry with the given fingerprints."""
+    from cdt.datasets import legacy_completion_registry_path
+
+    path = Path(legacy_completion_registry_path(stage, artifact_root=tmp_path))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "stage": stage,
+                "version": 2,
+                "partitions": {
+                    key: {"fingerprint": fingerprint}
+                    for key, fingerprint in entries.items()
+                },
+            }
+        )
+    )
+    return path
+
+
+def document_keys(tmp_path: Path, days: list[str]) -> list[str]:
+    """Canonical document partition keys for the given days."""
+    from cdt.datasets import date_shard_partition_path
+
+    return [
+        date_shard_partition_path(
+            "documents", partition_date=day, shard="0001", artifact_root=tmp_path
+        )
+        for day in days
+    ]
+
+
+def test_first_save_migrates_the_legacy_object_into_date_shards(
+    tmp_path: Path,
+) -> None:
+    """An existing root's registry is moved into shards, not left stranded.
+
+    A root written before #191 has all of its completion state in the single
+    object. Leaving it there means every load keeps paying the full read the
+    sharding was meant to remove, and every save keeps two sources of truth
+    that drift.
+    """
+    from cdt.datasets import (
+        CompletedPartition,
+        CompletionRegistry,
+        completion_registry_path,
+        load_completion_registry,
+        save_completion_registry,
+    )
+
+    keys = document_keys(tmp_path, ["2024-01-02", "2024-01-31", "2024-02-05"])
+    legacy = write_legacy_registry(
+        tmp_path, "itemize", dict.fromkeys(keys, "legacy-fp")
+    )
+    fresh = document_keys(tmp_path, ["2024-03-01"])[0]
+    registry = CompletionRegistry()
+    registry[fresh] = CompletedPartition(fingerprint="fresh")
+
+    save_completion_registry("itemize", registry, artifact_root=tmp_path)
+
+    shards = sorted(
+        path.name for path in (tmp_path / "runs" / "itemize" / "completed").iterdir()
+    )
+    assert shards == ["date=2024-01.json", "date=2024-02.json", "date=2024-03.json"]
+    loaded = load_completion_registry("itemize", artifact_root=tmp_path)
+    assert set(loaded) == {*keys, fresh}
+    assert all(loaded[key].fingerprint == "legacy-fp" for key in keys)
+
+    # The old object is cleared in place, pointing at where the state went.
+    marker = json.loads(legacy.read_text())
+    assert marker["partitions"] == {}
+    assert marker["migrated_to"] == completion_registry_path(
+        "itemize", artifact_root=tmp_path
+    )
+
+
+def test_migration_keeps_the_legacy_object_until_every_shard_is_written(
+    tmp_path: Path,
+) -> None:
+    """Retire order is load-bearing: clear the old object last or lose state.
+
+    Clearing it first and then failing to write a shard destroys the only copy
+    of that shard's entries, which re-does that slice of the corpus (#107) or,
+    for extract, re-pays every row in it (#49). Forced here by making one
+    shard's write lose every compare-and-swap attempt.
+    """
+    from cdt.datasets import (
+        CompletionRegistry,
+        load_completion_registry,
+        save_completion_registry,
+    )
+
+    keys = document_keys(tmp_path, ["2024-01-02", "2024-02-05"])
+    legacy = write_legacy_registry(
+        tmp_path, "itemize", dict.fromkeys(keys, "legacy-fp")
+    )
+    real_create = cdt_datasets.write_json_artifact_if_absent
+
+    def fail_on_february(path: object, payload: object) -> bool:
+        if Path(str(path)).name == "date=2024-02.json":
+            return False
+        return real_create(path, payload)  # type: ignore[arg-type]
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(cdt_datasets, "write_json_artifact_if_absent", fail_on_february)
+        with pytest.raises(RuntimeError, match="compare-and-swap races"):
+            save_completion_registry(
+                "itemize", CompletionRegistry(), artifact_root=tmp_path
+            )
+
+    # February never landed, so the old object must still hold both entries.
+    assert set(json.loads(legacy.read_text())["partitions"]) == set(keys)
+    assert set(load_completion_registry("itemize", artifact_root=tmp_path)) == set(keys)
+
+    # And a retry migrates the whole thing, idempotently over January.
+    save_completion_registry("itemize", CompletionRegistry(), artifact_root=tmp_path)
+    assert json.loads(legacy.read_text())["partitions"] == {}
+    assert set(load_completion_registry("itemize", artifact_root=tmp_path)) == set(keys)
+
+
+def test_migration_never_overwrites_a_newer_shard_entry(tmp_path: Path) -> None:
+    """A shard entry was written after the split, so it beats the legacy copy.
+
+    Get this backwards and a partition re-processed since the upgrade reverts
+    to its pre-upgrade fingerprint, which makes a source partition that ingest
+    has since merged rows into look already done (#62).
+    """
+    from cdt.datasets import (
+        CompletedPartition,
+        load_completion_registry,
+        save_completion_registry,
+    )
+
+    key = document_keys(tmp_path, ["2024-01-02"])[0]
+    save_completion_registry(
+        "itemize",
+        {key: CompletedPartition(fingerprint="fresh")},
+        artifact_root=tmp_path,
+    )
+    # The legacy object is back, holding the pre-split value -- exactly what a
+    # retire that lost its swap, or an interrupted migration, leaves behind.
+    legacy = write_legacy_registry(tmp_path, "itemize", {key: "stale"})
+
+    save_completion_registry(
+        "itemize",
+        load_completion_registry("itemize", artifact_root=tmp_path),
+        artifact_root=tmp_path,
+    )
+
+    assert (
+        load_completion_registry("itemize", artifact_root=tmp_path)[key].fingerprint
+        == "fresh"
+    )
+    assert json.loads(legacy.read_text())["partitions"] == {}
+
+
+def test_migration_runs_on_a_save_that_changed_nothing(tmp_path: Path) -> None:
+    """The end-of-run save with an empty dirty set still migrates.
+
+    Every stage saves unconditionally after its chunk loop (#111), which is
+    what makes the first run after the upgrade carry the migration even when
+    the run found nothing pending.
+    """
+    from cdt.datasets import (
+        CompletionRegistry,
+        load_completion_registry,
+        save_completion_registry,
+    )
+
+    keys = document_keys(tmp_path, ["2024-01-02", "2024-02-05"])
+    write_legacy_registry(tmp_path, "itemize", dict.fromkeys(keys, "legacy-fp"))
+    untouched = CompletionRegistry()
+    assert untouched.dirty == set()
+
+    save_completion_registry("itemize", untouched, artifact_root=tmp_path)
+
+    assert sorted(
+        path.name for path in (tmp_path / "runs" / "itemize" / "completed").iterdir()
+    ) == ["date=2024-01.json", "date=2024-02.json"]
+    assert set(load_completion_registry("itemize", artifact_root=tmp_path)) == set(keys)
+
+
+def test_migration_leaves_the_legacy_object_alone_when_it_loses_the_swap(
+    tmp_path: Path,
+) -> None:
+    """A writer that appended to the old object mid-migration is not clobbered.
+
+    The adopted entries are already safe in shards by the time the marker is
+    swapped in, so a lost swap needs no retry; it only has to not destroy the
+    appended entry. The next save picks it up.
+    """
+    from cdt.datasets import (
+        CompletionRegistry,
+        load_completion_registry,
+        save_completion_registry,
+    )
+
+    key = document_keys(tmp_path, ["2024-01-02"])[0]
+    legacy = write_legacy_registry(tmp_path, "itemize", {key: "legacy-fp"})
+    appended = document_keys(tmp_path, ["2024-04-04"])[0]
+    real_replace = cdt_datasets.replace_json_artifact_if_match
+
+    def append_before_retiring(path: object, payload: object, *, version: str) -> bool:
+        if Path(str(path)).name == "completed-partitions.json":
+            # Another writer adds an entry after the migration read the object,
+            # invalidating the version token the retire is about to use.
+            write_legacy_registry(
+                tmp_path,
+                "itemize",
+                {key: "legacy-fp", appended: "appended-by-other-writer"},
+            )
+        return real_replace(path, payload, version=version)  # type: ignore[arg-type]
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            cdt_datasets, "replace_json_artifact_if_match", append_before_retiring
+        )
+        save_completion_registry(
+            "itemize", CompletionRegistry(), artifact_root=tmp_path
+        )
+
+    assert set(json.loads(legacy.read_text())["partitions"]) == {key, appended}
+    loaded = load_completion_registry("itemize", artifact_root=tmp_path)
+    assert loaded[appended].fingerprint == "appended-by-other-writer"
+
+    save_completion_registry("itemize", CompletionRegistry(), artifact_root=tmp_path)
+
+    assert json.loads(legacy.read_text())["partitions"] == {}
+    reloaded = load_completion_registry("itemize", artifact_root=tmp_path)
+    assert set(reloaded) == {key, appended}
+    assert reloaded[appended].fingerprint == "appended-by-other-writer"
+
+
+def test_migration_does_not_reprocess_an_existing_corpus(tmp_path: Path) -> None:
+    """The point of the whole read-compat path: no partition is re-done (#107).
+
+    #107 is what this guards: force=False reported 0 pending and force=True
+    reported 20,046, because the registry a run consulted was not the registry
+    the corpus had. A migration that read the old object as empty would make
+    the first post-upgrade run re-itemize the entire corpus.
+    """
+    from cdt.datasets import load_completed_partitions, pending_source_partitions
+
+    days = ["2024-01-02", "2024-01-03", "2024-02-01"]
+    paths = seed_document_partitions_across_months(
+        tmp_path, [(day, f"{index:04d}") for index, day in enumerate(days)]
+    )
+    fingerprints = cdt_storage.list_artifacts_with_versions(
+        str(tmp_path / "documents"), suffix=".parquet"
+    )
+    write_legacy_registry(
+        tmp_path, "itemize", {path: fingerprints[path] for path in paths}
+    )
+
+    itemize_pending_documents(artifact_root=tmp_path, batch_size=2)
+
+    manifest = read_json_artifact(
+        run_manifest_path("itemize", "latest", artifact_root=tmp_path)
+    )
+    assert manifest["partitions_visited"] == []
+    assert manifest["documents_processed"] == 0
+    assert load_completed_partitions("itemize", artifact_root=tmp_path) == set(paths)
+    # Migrated, so a second run reads shards only and still finds nothing.
+    pending, _ = pending_source_partitions(
+        "itemize", "documents", "items", artifact_root=tmp_path
+    )
+    assert pending == []
+
+
+def test_registry_keys_persist_without_the_artifact_root(tmp_path: Path) -> None:
+    """v3 stores the dataset-relative key, not the whole path (#191).
+
+    The root was repeated in all 440,000 entries: 129 B per entry with it,
+    105 B without, measured over a full-corpus-shaped registry. The in-memory
+    key is still the whole path, so none of the five call sites change.
+    """
+    from cdt.datasets import (
+        CompletedPartition,
+        completion_registry_shard_path,
+        load_completion_registry,
+        save_completion_registry,
+    )
+
+    key = document_keys(tmp_path, ["2024-01-02"])[0]
+    save_completion_registry(
+        "itemize", {key: CompletedPartition(fingerprint="f")}, artifact_root=tmp_path
+    )
+
+    payload = json.loads(
+        Path(
+            completion_registry_shard_path("itemize", "2024-01", artifact_root=tmp_path)
+        ).read_text()
+    )
+    assert payload["version"] == 3
+    assert list(payload["partitions"]) == [
+        "documents/date=2024-01-02/shard=0001/part-0000.parquet"
+    ]
+    assert load_completion_registry("itemize", artifact_root=tmp_path)[key].fingerprint
+
+
+def test_registry_size_no_longer_depends_on_how_deep_the_root_is(
+    tmp_path: Path,
+) -> None:
+    """The saving is measurable, so measure it rather than asserting it.
+
+    Two roots, one 60-odd characters deeper than the other, holding the same
+    partitions: the persisted shards must come out byte-identical in size. With
+    the root in the keys the deeper root paid its whole length 20 times over.
+    """
+    from cdt.datasets import (
+        CompletedPartition,
+        completion_registry_shard_path,
+        save_completion_registry,
+    )
+
+    days = [f"2024-01-{day:02d}" for day in range(1, 21)]
+
+    def shard_bytes(root: Path) -> int:
+        root.mkdir(parents=True, exist_ok=True)
+        save_completion_registry(
+            "itemize",
+            {
+                key: CompletedPartition(fingerprint="1111043-1788971943321871218")
+                for key in document_keys(root, days)
+            },
+            artifact_root=root,
+        )
+        return len(
+            Path(
+                completion_registry_shard_path("itemize", "2024-01", artifact_root=root)
+            ).read_bytes()
+        )
+
+    shallow = shard_bytes(tmp_path / "a")
+    deep = shard_bytes(tmp_path / ("b" * 40) / ("c" * 40))
+    assert shallow == deep
+    assert shallow / len(days) < 130
+
+
+def test_registry_follows_a_copied_artifact_root(tmp_path: Path) -> None:
+    """Dropping the root makes a registry portable, which it was not (#191).
+
+    Before this, copying an artifact root left every key prefixed with the
+    source root. Nothing in the copy matched, so the copy's corpus read as
+    entirely unprocessed -- #107's failure arriving by way of `cp -r`, and the
+    reason a scratch copy of an eval root could never be used to check
+    completion behaviour.
+    """
+    import shutil
+
+    from cdt.datasets import load_completed_partitions, pending_source_partitions
+
+    source = tmp_path / "source"
+    seed_document_partitions_across_months(
+        source, [("2024-01-02", "0000"), ("2024-02-05", "0001")]
+    )
+    itemize_pending_documents(artifact_root=source, batch_size=5)
+    assert len(load_completed_partitions("itemize", artifact_root=source)) == 2
+
+    copy = tmp_path / "copy"
+    shutil.copytree(source, copy)
+
+    completed = load_completed_partitions("itemize", artifact_root=copy)
+    assert completed == {
+        cdt_datasets.date_shard_partition_path(
+            "documents", partition_date=day, shard=shard, artifact_root=copy
+        )
+        for day, shard in (("2024-01-02", "0000"), ("2024-02-05", "0001"))
+    }
+    pending, _ = pending_source_partitions(
+        "itemize", "documents", "items", artifact_root=copy
+    )
+    assert pending == []
+
+
+def test_legacy_keys_do_not_get_a_second_root_bolted_on(tmp_path: Path) -> None:
+    """v2 keys carry a whole path already; the version, not the shape, decides.
+
+    The real registry on ``data/genwindow-eval-apr`` was written against a
+    *relative* root, so its keys look relative too. Reattaching a root by shape
+    would turn them into ``<root>/data/genwindow-eval-apr/documents/...`` and
+    match nothing -- re-doing the whole corpus.
+    """
+    from cdt.datasets import load_completion_registry
+
+    write_legacy_registry(
+        tmp_path,
+        "itemize",
+        {
+            "data/genwindow-eval-apr/documents/date=2026-04-15/shard=0000/part-0000.parquet": "fp"
+        },
+    )
+
+    assert set(load_completion_registry("itemize", artifact_root=tmp_path)) == {
+        "data/genwindow-eval-apr/documents/date=2026-04-15/shard=0000/part-0000.parquet"
+    }
+
+
+def test_a_v2_shard_is_normalized_on_its_next_write(tmp_path: Path) -> None:
+    """A shard at the old key convention gains no duplicate spelling of a key.
+
+    Both spellings surviving in one object would double-count the entry and,
+    worse, let the stale copy win a later merge.
+    """
+    from cdt.datasets import (
+        CompletedPartition,
+        completion_registry_shard_path,
+        load_completion_registry,
+        save_completion_registry,
+    )
+
+    keys = document_keys(tmp_path, ["2024-01-02", "2024-01-03"])
+    shard = Path(
+        completion_registry_shard_path("itemize", "2024-01", artifact_root=tmp_path)
+    )
+    shard.parent.mkdir(parents=True, exist_ok=True)
+    shard.write_text(
+        json.dumps(
+            {
+                "stage": "itemize",
+                "version": 2,
+                "date_prefix": "2024-01",
+                "partitions": {key: {"fingerprint": "old"} for key in keys},
+            }
+        )
+    )
+
+    save_completion_registry(
+        "itemize",
+        {keys[0]: CompletedPartition(fingerprint="new")},
+        artifact_root=tmp_path,
+    )
+
+    payload = json.loads(shard.read_text())
+    assert payload["version"] == 3
+    assert sorted(payload["partitions"]) == [
+        "documents/date=2024-01-02/shard=0001/part-0000.parquet",
+        "documents/date=2024-01-03/shard=0001/part-0000.parquet",
+    ]
+    loaded = load_completion_registry("itemize", artifact_root=tmp_path)
+    assert loaded[keys[0]].fingerprint == "new"
+    assert loaded[keys[1]].fingerprint == "old"
+
+
+def test_registry_key_relativizing_is_invertible(tmp_path: Path) -> None:
+    """Every in-memory key shape round-trips through the persisted form unchanged.
+
+    The pair is only safe if it is inverse: strip a root from a key the reader
+    would not reattach one to and the key silently changes identity, which
+    strands the partition it names. The shapes an in-memory registry can hold
+    are whole paths under the root (what the dataset listings produce), whole
+    paths that are not under it, S3 URIs, and non-partition bookkeeping keys.
+    """
+    root = str(tmp_path)
+    outside = str(tmp_path.parent / "elsewhere" / "documents")
+    for key in (
+        cdt_datasets.date_shard_partition_path(
+            "documents", partition_date="2024-01-02", shard="0001", artifact_root=root
+        ),
+        "s3://bucket/prefix/documents/date=2024-01-02/shard=0001/part-0000.parquet",
+        f"{outside}/date=2024-01-02/shard=0001/part-0000.parquet",
+        # Under the root but not a date/shard partition: a cik-sharded
+        # dataset, and a pre-migration flat file. Relativizing these would
+        # strip a prefix the reader will not put back, so the key changes
+        # identity and the partition it names is stranded.
+        cdt_datasets.cik_shard_partition_path(
+            "debt-instruments", cik_shard="0001", artifact_root=root
+        ),
+        str(tmp_path / "documents" / "legacy-flat-file.parquet"),
+        "bookkeeping-key",
+        "P",
+    ):
+        stored = cdt_datasets._relative_registry_key(key, root)  # noqa: SLF001
+        assert cdt_datasets._absolute_registry_key(stored, root) == key  # noqa: SLF001
+
+    # A bare relative canonical key is the *persisted* spelling, so it reads
+    # back as that partition under the current root -- which is exactly the
+    # portability the v3 keys buy.
+    bare = "documents/date=2024-01-02/shard=0001/part-0000.parquet"
+    assert cdt_datasets._absolute_registry_key(bare, root) == str(  # noqa: SLF001
+        tmp_path / bare
+    )
 
 
 def _seed_classifications(
