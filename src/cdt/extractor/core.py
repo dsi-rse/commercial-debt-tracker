@@ -951,11 +951,23 @@ def prior_attempt_tagged(row_state: ExtractionRowState, stage_name: str) -> bool
     tagged an organization and a date and then regressed to a bare echo has
     given up just as surely, and `prior_debt_instrument_high_water` -- which
     asks the narrower question that drives `early_stop` -- reads zero for it.
+
+    Attempts the provider aborted are excluded, for the reason the status
+    exists at all: an abort is not the model answering, so its body is not the
+    model's work to regress against. The text on an `ABORTED` record is
+    whatever the provider had emitted before it cut, and it is tagged -- all 58
+    `content_filter` responses in the stored corpora carry between 9 and 107
+    entity tags and at least one `debt_instrument` tag, with no empty bodies.
+    Counting them turned an honest untagged echo into a rejection the model
+    cannot act on: the abort contributes no assistant turn, so "re-emit your
+    previous tagged output" names work that is not in its context, and the row
+    exhausted its budget and died FAILED. That is the regression the
+    `attempt_index > 1` gate was replaced to avoid, reached by another route.
     """
     return any(
         count_ner_entity_tags(attempt.response)
         for attempt in row_state.all_attempts
-        if attempt.stage_name == stage_name
+        if attempt.stage_name == stage_name and attempt.status != ABORTED_ATTEMPT_STATUS
     )
 
 
@@ -997,12 +1009,25 @@ def prior_debt_instrument_high_water(
     validated. `to_state_dict`/`from_state_dict` already round-trip
     `all_attempts` in full, so the batch backend resumes with the same
     high-water mark and needed no schema change (#176).
+
+    Attempts the provider aborted are excluded, the same way
+    `prior_attempt_tagged` and `_ner_needed_a_retry` exclude them. The
+    judgement here is closer than it looks, and is made deliberately rather
+    than inherited: a truncated abort that tagged four instruments really is
+    evidence the item discloses debt, so reading it would catch a give-up this
+    now misses. It is excluded anyway, because the failure it raises tells the
+    model "an earlier attempt on this item tagged N -- keep every tag you
+    found", and on an aborted call the model neither produced those tags nor
+    can see them. A guard the model cannot satisfy costs the row its whole
+    budget and publishes nothing. If this is ever reconsidered, the retry
+    message has to change with it.
     """
     return max(
         (
             count_debt_instrument_tags(attempt.response)
             for attempt in row_state.all_attempts
             if attempt.stage_name == stage_name
+            and attempt.status != ABORTED_ATTEMPT_STATUS
         ),
         default=0,
     )

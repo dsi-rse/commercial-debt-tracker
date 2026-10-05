@@ -1632,8 +1632,13 @@ def test_live_client_sends_request_timeout(monkeypatch: pytest.MonkeyPatch) -> N
 # #127: the batch twin of the live loop's unbilled-abort resend
 # --------------------------------------------------------------------------- #
 
+# The same real truncated body as `CONTENT_FILTER_PARTIAL` in
+# `test_file_native_stages.py`: an abort carries partially-tagged XML, never an
+# empty string (58 of 58 in the stored corpora). Restated rather than imported
+# so the two test modules stay independent.
+BATCH_CONTENT_FILTER_PARTIAL = "<body>Item 8.01\nOther Events.\nOn <date>June 9, 2026</date>, the <organization>Company</organization> commenced an offering of <amount>$500.0 million</amount> in aggregate principal amount of its <debt_instrument>senior secured notes due 2031</debt_instrument> (the “<debt_instrument>Notes"
 BATCH_CONTENT_FILTERED = CompletionResult(
-    text="",
+    text=BATCH_CONTENT_FILTER_PARTIAL,
     finish_reason="content_filter",
     usage={"completion_tokens": 0, "prompt_tokens": 0, "cost": 0.0},
 )

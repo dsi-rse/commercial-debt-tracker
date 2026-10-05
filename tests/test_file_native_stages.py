@@ -2862,7 +2862,23 @@ MULTI_IE = json.dumps(
 )
 
 # As observed live: aborted upstream, nothing generated, nothing billed.
+# A real `content_filter` body, trimmed, from item 000114036126024567-8-01 in
+# `ie_review/runs/followups/full.jsonl` of the models repo. An abort arrives as
+# a normal 200 carrying whatever the provider had emitted before it cut, so it
+# is partially-tagged XML ending mid-tag -- not an empty string. All 58
+# `content_filter` responses in the stored corpora carry 9-107 entity tags and
+# at least one `debt_instrument` tag, and none is empty, so a `text=""` fixture
+# exercises a shape that has never occurred. It mattered: with an empty body
+# the cross-attempt guards in #176 could read an aborted call as the model's
+# own tagged work and no test objected.
+CONTENT_FILTER_PARTIAL = "<body>Item 8.01\nOther Events.\nOn <date>June 9, 2026</date>, the <organization>Company</organization> commenced an offering of <amount>$500.0 million</amount> in aggregate principal amount of its <debt_instrument>senior secured notes due 2031</debt_instrument> (the “<debt_instrument>Notes"
 CONTENT_FILTERED = CompletionResult(
+    text=CONTENT_FILTER_PARTIAL,
+    finish_reason="content_filter",
+    usage={"completion_tokens": 0, "prompt_tokens": 0, "cost": 0.0},
+)
+# The degenerate shape, kept so both are covered: some aborts may carry nothing.
+CONTENT_FILTERED_EMPTY = CompletionResult(
     text="",
     finish_reason="content_filter",
     usage={"completion_tokens": 0, "prompt_tokens": 0, "cost": 0.0},
@@ -2953,9 +2969,9 @@ def test_every_stage_gets_the_same_attempt_budget() -> None:
 def test_a_content_filtered_attempt_is_resent_as_the_original_request() -> None:
     """An upstream abort has nothing for the model to correct (#127, #135).
 
-    The ordinary retry path would append the aborted (empty) response as an
-    assistant turn plus a validation complaint about it, which every later call
-    in the row then pays prompt tokens for. A `content_filter` abort is not the
+    The ordinary retry path would append the aborted response as an assistant
+    turn plus a validation complaint about it, which every later call in the
+    row then pays prompt tokens for. A `content_filter` abort is not the
     model answering badly, so the same request goes back out unchanged.
     """
     row_state, client = _run_live(NODEBT_TEXT, [CONTENT_FILTERED, _stopped(NODEBT_NER)])
@@ -3011,7 +3027,7 @@ def test_persistent_content_filtering_terminates_at_the_resend_cap() -> None:
 
     Past the cap the abort used to fall through to `handle_response` and be
     scored as an ordinary bad answer: the row paid six more whole-item calls,
-    each one growing the retry conversation with an empty assistant turn, and
+    each one growing the retry conversation with a junk assistant turn, and
     the resulting `FAILED` attempt made #176's checks read a provider abort as
     a model failure. The row now terminates instead.
     """
@@ -3121,6 +3137,61 @@ def test_an_abort_does_not_make_an_honest_zero_tag_row_partial() -> None:
 
     assert row_state.state == "SUCCESS"
     assert row_state.salvage_notes == []
+
+
+def test_the_ner_guards_do_not_read_an_aborted_calls_partial_output() -> None:
+    """An abort is not the model's work, so it is not history to regress against.
+
+    `record_unbilled_abort` stores whatever the provider emitted before it cut,
+    and that text is tagged: all 58 `content_filter` responses in the stored
+    corpora carry between 9 and 107 entity tags and at least one
+    `debt_instrument` tag, and none of them is empty. Counted as the model's
+    own earlier work it makes the echo guard and the high-water mark fire on an
+    item the model has never successfully tagged, and the row then dies FAILED
+    on a complaint it cannot act on -- the abort adds no assistant turn, so
+    "keep every tag you found" names work that is not in its context
+    (#176, #127).
+    """
+    from cdt.extractor.core import (
+        count_debt_instrument_tags,
+        count_ner_entity_tags,
+        prior_attempt_tagged,
+        prior_debt_instrument_high_water,
+    )
+
+    # The fixture really is tagged, so the assertions below are not vacuous --
+    # this is exactly what a `text=""` fixture failed to exercise.
+    assert count_ner_entity_tags(CONTENT_FILTER_PARTIAL) == 5
+    assert count_debt_instrument_tags(CONTENT_FILTER_PARTIAL) == 2
+
+    row_state = _ner_row(MPLX_TEXT)
+    row_state.current_attempt.messages = NERStage().preprocess(row_state)
+    row_state.record_unbilled_abort(CONTENT_FILTER_PARTIAL, CONTENT_FILTERED)
+
+    assert prior_attempt_tagged(row_state, "ner") is False
+    assert prior_debt_instrument_high_water(row_state, "ner") == 0
+
+    # And the same row driven end to end: the honest echo publishes in two
+    # calls instead of looping to FAILED on an unanswerable complaint.
+    row_state, client = _run_live(
+        NODEBT_TEXT, [CONTENT_FILTERED, _stopped(f"<body>{NODEBT_TEXT}</body>")]
+    )
+
+    assert len(client.requests) == 2
+    assert row_state.state == "SUCCESS"
+    assert row_state.salvage_notes == []
+
+
+def test_an_empty_aborted_body_behaves_the_same_as_a_truncated_one() -> None:
+    """Both abort shapes are unscored calls, so neither changes the verdict (#127)."""
+    for aborted in (CONTENT_FILTERED, CONTENT_FILTERED_EMPTY):
+        row_state, client = _run_live(
+            NODEBT_TEXT, [aborted, _stopped(f"<body>{NODEBT_TEXT}</body>")]
+        )
+
+        assert len(client.requests) == 2
+        assert row_state.state == "SUCCESS"
+        assert row_state.salvage_notes == []
 
 
 def test_after_a_resend_the_next_answer_is_still_a_first_attempt() -> None:
