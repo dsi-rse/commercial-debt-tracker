@@ -501,7 +501,6 @@ This is the extracted event text.
                 "amendment_of": None,
                 "retired_by_json": "[]",
                 "split_of": None,
-                "lenders_json": '[{"mentions": [{"text": "Acme Bank"}]}]',
                 "lenders_known_incomplete": False,
                 "other_interested_parties_json": "[]",
                 "name_json": "{}",

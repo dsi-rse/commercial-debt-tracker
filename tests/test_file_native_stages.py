@@ -2131,6 +2131,45 @@ def test_is_rate_like_amount_text_requires_every_number_to_carry_a_rate() -> Non
     assert is_rate_like_amount_text("SOFR plus 100 basis points") is True
 
 
+def test_a_basis_point_margin_is_rate_like_however_the_filing_abbreviates_it() -> None:
+    """`bps` is the spelling filings use, and it was not in the marker set (#228).
+
+    `RATE_SUFFIX_PATTERN` carried the spelled-out `basis points` but not the
+    abbreviation, so `50 bps` read as a money amount and
+    `validate_amount_is_not_rate` passed a basis-point margin through as an
+    `amount`. `amounts_agree` does not catch it downstream either: it only
+    rejects a model figure that disagrees with the number in the cited span,
+    and the model reports the basis-point figure itself, so the two agree and
+    the margin publishes as a principal of 50. A wrong published value, not the
+    silent null of #182.
+
+    Distinct from #75/#102, which was the whitespace that hid the multi-word
+    marker from the predicate. That one is fixed, and the spelled-out assertions
+    above still pin it; this is the vocabulary rather than the normalization, so
+    it would have been present even with #102 perfect.
+    """
+    for spelling in ("50 bps", "50 bp", "50 BPS", "50 basis points"):
+        assert is_rate_like_amount_text(spelling) is True, spelling
+    # The shapes a margin is actually written in.
+    assert is_rate_like_amount_text("L+250 bps") is True
+    assert is_rate_like_amount_text("a margin of 275 bps") is True
+
+    # ... and the validator that depends on it now refuses the amount.
+    failures = validate_amount_is_not_rate(
+        index=0,
+        value={"evidence": ["tag-1"]},
+        tag_details={"tag-1": {"text": "50 bps"}},
+    )
+    assert len(failures) == 1
+    assert "'50 bps'" in failures[0]
+
+    # `bps?\b` must not swallow a real figure: the word boundary keeps it off
+    # longer words, and a principal still reads as a principal.
+    assert is_rate_like_amount_text("500,000 bpd of crude") is False
+    assert is_rate_like_amount_text("$500.0 million") is False
+    assert is_rate_like_amount_text("1,500,000") is False
+
+
 def test_instrument_ie_validate_rejects_rate_only_amount_evidence() -> None:
     """An amount citing only a rate should fail validation and retry."""
     response = json.dumps(
@@ -4203,6 +4242,94 @@ def test_instrument_relation_prompt_matches_the_accepted_relation_types() -> Non
     for relation_type in INSTRUMENT_RELATION_TYPES:
         assert f"`{relation_type}`" in prompt
     assert "retired_of" not in prompt
+
+
+def test_match_reads_a_partition_written_before_a_json_column_existed(
+    tmp_path: Path,
+) -> None:
+    """A mentions partition older than a `_json` column must still match (#193).
+
+    Nothing in this suite wrote a partition *missing* a later-added column, read
+    it back through `read_dataset`, and matched it -- every other old-shape test
+    writes the full current column list and leaves a value null, which is a
+    different thing. The gap mattered: `read_table` answers a projected read for
+    a column the file does not have by falling back to a full read plus
+    `reindex`, which fills it with NaN, and NaN is truthy, so
+    `str(row.get(col) or "[]")` yields the literal text `nan`.
+
+    `retired_by_json` fed `json.loads` directly, so the whole match pass died
+    with `JSONDecodeError: Expecting value`. Reproduced on the real corpus
+    before the fix: `cdt match` over `data/genwindow-run-dev` (245 mentions
+    partitions written before `retired_by_json`, `amounts_json` and
+    `parties_json` existed) crashed in `prepare_mention`; after it, the same
+    root completes with 679 edge rows and 572 instruments.
+    """
+    row = build_mention_row(
+        mention_id="m-1",
+        item_id="item-1",
+        accession_number="0001",
+        cik="320193",
+        date="2024-01-02",
+        name="Term Loan",
+        start_date="2024-01-01",
+        amount="$100 million",
+    )
+    # The partition as it was actually written, not the current shape with
+    # nulls: these three columns are simply not in the file's schema.
+    absent = ["retired_by_json", "amounts_json", "parties_json"]
+    legacy = pd.DataFrame([{k: v for k, v in row.items() if k not in absent}])
+    write_partition_table(
+        tmp_path / "mentions",
+        partition={"date": "2024-01-02", "shard": "0001"},
+        table=legacy,
+    )
+    # Pin the premise: if a future writer starts backfilling these columns this
+    # test would still pass while testing nothing.
+    stored = read_table(
+        tmp_path / "mentions" / "date=2024-01-02" / "shard=0001" / "part-0000.parquet"
+    )
+    assert not set(absent) & set(stored.columns)
+
+    tables = match_pending_mentions(artifact_root=tmp_path, batch_size=5)
+
+    assert tables["debt_instrument"]["debt_instrument_id"].to_list() == ["m-1"]
+    # The literal text `nan` must not have reached a published payload.
+    instruments = read_dataset(debt_instruments_root(tmp_path))
+    assert instruments["parties_json"].to_list() == ["[]"]
+
+
+def test_prepare_mention_reads_an_absent_json_column_as_an_empty_payload() -> None:
+    """Every `_json` read must survive NaN, not just the one that raised (#193).
+
+    Six sites shared the `str(row.get(col) or "[]")` idiom. Only
+    `retired_by_json` raised; the rest handed `parse_cluster_list` the text
+    `nan`, which it discards as a `JSONDecodeError` and returns `[]` for -- so
+    they degraded to the same empty payload the guard produces rather than
+    erroring. That makes them invisible, which is why they are pinned here
+    rather than left to the integration test above.
+    """
+    from cdt.matcher.core import prepare_mention
+
+    row = build_mention_row(
+        mention_id="m-1",
+        item_id="item-1",
+        accession_number="0001",
+        cik="320193",
+        date="2024-01-02",
+        name="Term Loan",
+        start_date="2024-01-01",
+        amount="$100 million",
+    )
+    # What `read_table`'s reindex fallback actually hands the matcher.
+    for column in ("retired_by_json", "amounts_json", "parties_json"):
+        row[column] = float("nan")
+
+    mention = prepare_mention(row)
+
+    assert mention.retired_by == ()
+    assert mention.amounts_json == "[]"
+    assert mention.parties_json == "[]"
+    assert mention.lender_signature == ""
 
 
 def test_match_pending_mentions_writes_match_datasets(tmp_path: Path) -> None:
@@ -10144,6 +10271,172 @@ def test_the_batch_finalize_publishes_through_the_mint_seam(tmp_path: Path) -> N
     assert len(minted) == 1
     successor = written[written["synthesized_by"].isna()].iloc[0]
     assert successor["amendment_of"] == minted.iloc[0]["debt_instrument_mention_id"]
+
+
+def test_the_batch_finalize_purges_an_item_re_extracted_to_zero_mentions(
+    tmp_path: Path,
+) -> None:
+    """Re-extraction withdrawing every mention has to withdraw the rows (#209).
+
+    The guard here tested `retired` alone. `retired` is built from the claimed
+    sources' `prior_item_ids` minus what is still relevant, so for the target
+    case -- item still relevant, re-extracted, model now returns nothing -- it
+    is empty while `replaced` holds the id. `mentions.empty and not retired` was
+    therefore true, the `continue` skipped the merge, and the previous pass's
+    rows stayed published as facts this pass had just withdrawn.
+
+    The suite's other pruning tests all drive the retired path instead
+    (`test_extractor_sources.py`), or assert the opposite: a visited-but-empty
+    partition must not be written when there is genuinely nothing to purge,
+    which is the branch that survives here because `replaced` is empty too.
+    """
+    from cdt.extractor.core import finalize_extract_outputs
+
+    def row_state(mentions: list[dict[str, object]]) -> ExtractionRowState:
+        state = ExtractionRowState(
+            item_row={
+                "item_id": "item-1",
+                "accession_number": "0001",
+                "cik": "0000320193",
+                "company_name": "Example Inc.",
+                "date": "2024-06-01",
+                "text": "a credit agreement",
+            },
+            stage_name="instrument_ie",
+        )
+        state.debt_instrument_mentions = mentions
+        state.finish("SUCCESS")
+        return state
+
+    common = {
+        "claimed": {},
+        "run_id": "20240601T000000000000Z",
+        "model": "test-model",
+        "reasoning_effort": "none",
+        "max_attempts": 3,
+        "artifact_root": tmp_path,
+    }
+    # A plain mention, with no `prior` term: this test is about the purge, and a
+    # minted predecessor would put a second row in the partition.
+    mention = build_mention_row(
+        mention_id="m-1",
+        item_id="item-1",
+        accession_number="0001",
+        cik="0000320193",
+        date="2024-06-01",
+        name="Term Loan",
+        start_date="2024-06-01",
+        amount="$100 million",
+    )
+    finalize_extract_outputs(
+        [(row_state([mention]), "2024-06-01", "0001")],
+        **common,  # type: ignore[arg-type]
+    )
+    assert read_dataset(mentions_root(tmp_path))["item_id"].astype(str).to_list() == [
+        "item-1"
+    ]
+
+    # The same still-relevant item, re-extracted to nothing.
+    finalize_extract_outputs(
+        [(row_state([]), "2024-06-01", "0001")],
+        **common,  # type: ignore[arg-type]
+    )
+
+    written = read_dataset(mentions_root(tmp_path))
+    assert written.empty, f"stale mentions survived: {written['item_id'].to_list()}"
+
+
+def test_the_batch_finalize_purges_an_item_that_stopped_being_relevant(
+    tmp_path: Path,
+) -> None:
+    """The batch guard's other input has to work too (#209).
+
+    `_mentions_partition_needs_write` takes two reasons to purge, and the test
+    above only drives one of them. `replaced` is "this item was re-extracted";
+    `retired` is "this item is gone from the source" -- built in this backend
+    from each claim's `prior_item_ids` minus whatever the claimed classification
+    partition still marks relevant. Nothing else prunes those rows, and a
+    mention whose item no longer exists still publishes, inflating the
+    instrument's counts and asserting facts from text the pipeline has stopped
+    sending.
+
+    That half predates #230 and was carried through the rewrite unchanged, which
+    is exactly why it needed pinning: passing `retired_item_ids=set()` at the
+    batch call site left the whole suite green. The live path's equivalent is
+    covered by `test_a_snippet_that_stops_being_relevant_loses_its_mentions` in
+    `test_extractor_sources.py`; this backend had nothing.
+
+    An item stops being relevant when the classifier is re-run and changes its
+    verdict, or when its id ceases to exist -- the 6-K path merging several
+    windows into one snippet (#172). Here the classification partition is
+    rewritten with `relevance` False, which is the first case.
+    """
+    from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
+    from cdt.extractor.core import finalize_extract_outputs
+
+    def row_state(mentions: list[dict[str, object]]) -> ExtractionRowState:
+        state = ExtractionRowState(
+            item_row={
+                "item_id": "item-1",
+                "accession_number": "0001",
+                "cik": "0000320193",
+                "company_name": "Example Inc.",
+                "date": "2024-06-01",
+                "text": "a credit agreement",
+            },
+            stage_name="instrument_ie",
+        )
+        state.debt_instrument_mentions = mentions
+        state.finish("SUCCESS")
+        return state
+
+    common = {
+        "run_id": "20240601T000000000000Z",
+        "model": "test-model",
+        "reasoning_effort": "none",
+        "max_attempts": 3,
+        "artifact_root": tmp_path,
+    }
+    mention = build_mention_row(
+        mention_id="m-1",
+        item_id="item-1",
+        accession_number="0001",
+        cik="0000320193",
+        date="2024-06-01",
+        name="Term Loan",
+        start_date="2024-06-01",
+        amount="$100 million",
+    )
+    finalize_extract_outputs(
+        [(row_state([mention]), "2024-06-01", "0001")],
+        claimed={},
+        **common,  # type: ignore[arg-type]
+    )
+    assert read_dataset(mentions_root(tmp_path))["item_id"].astype(str).to_list() == [
+        "item-1"
+    ]
+
+    # The classifier has since changed its verdict: the item the previous pass
+    # extracted is no longer relevant, so the source no longer offers it.
+    classification_path = write_partition_table(
+        classifications_root(tmp_path),
+        partition={"date": "2024-06-01", "shard": "0001"},
+        table=pd.DataFrame(
+            [{"item_id": "item-1", "relevance": False}],
+            columns=CLASSIFIED_ITEM_COLUMNS,
+        ),
+    )
+
+    # No row entries at all: this pass claimed the partition, found nothing
+    # relevant left in it, and so has only ids to withdraw.
+    finalize_extract_outputs(
+        [],
+        claimed={classification_path: {"prior_item_ids": ["item-1"]}},
+        **common,  # type: ignore[arg-type]
+    )
+
+    written = read_dataset(mentions_root(tmp_path))
+    assert written.empty, f"stale mentions survived: {written['item_id'].to_list()}"
 
 
 def test_extract_tables_publishes_through_the_mint_seam(

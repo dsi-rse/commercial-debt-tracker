@@ -736,6 +736,65 @@ def apply_observation_columns(
         )
 
 
+def _json_text(row: dict[str, object], column: str) -> str | None:
+    """Return one JSON column's text, or None when it holds no parseable JSON.
+
+    This stage projects its reads to the *current* column list
+    (`EXTRACTED_MENTION_COLUMNS`), and `read_table` answers a request for a
+    column a partition was written before by falling back to a full read plus
+    `reindex` — which fills the absent column with NaN rather than raising. The
+    six `_json` sites here then all went through `str(row.get(col) or "[]")`,
+    and NaN defeats that idiom twice over: it is *truthy*, so the `or` never
+    reaches the default, and `str(float("nan"))` is the literal text `nan`, so
+    the value handed on is a four-character string that is not JSON (#193).
+
+    Only one of the six raised: `retired_by_json` fed `json.loads` directly and
+    took the whole match pass down with it. Measured on `data/genwindow-run-dev`
+    (245 mentions partitions written before `retired_by_json`, `amounts_json`
+    and `parties_json` existed, still spelling retirement `retired_of`):
+    `cdt match` died in `prepare_mention` before this helper and completes after
+    it, at 679 edge rows and 572 instruments.
+
+    The other five all funnel into `parse_cluster_list`, which swallows
+    `JSONDecodeError` and answers `[]` for anything that is not a JSON array —
+    so the text `nan` and the default `[]` reach the same result, and the other
+    five are robustness rather than repair. Three of them are pinned anyway
+    because `PreparedMention` carries the *text* forward, and a field holding
+    `"nan"` is wrong whatever reads it next.
+
+    Returning `str | None` rather than `"[]"` keeps the "column absent" and
+    "column holds an empty list" cases distinguishable; callers that want a
+    payload either way spell the default themselves, as `coerce_dataset_text`'s
+    other callers do. Mirrors `_json_list`/`_json_dict` in `extractor/core.py`,
+    which solved the same NaN problem first.
+    """
+    text = coerce_dataset_text(row.get(column))
+    if text is None:
+        return None
+    try:
+        json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return text
+
+
+def _json_list(row: dict[str, object], column: str) -> list[object]:
+    """Return one JSON-array column's entries; absent, missing or junk reads empty.
+
+    The parsed counterpart to `_json_text`, for the one site that wants values
+    rather than a payload to carry forward (`retired_by_json`, a list of
+    instrument-mention ids). See `_json_text` for why the guard exists (#193).
+    """
+    text = coerce_dataset_text(row.get(column))
+    if text is None:
+        return []
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    return list(payload) if isinstance(payload, list) else []
+
+
 def build_cluster_profiles(
     *,
     mention_index: dict[str, PreparedMention],
@@ -799,9 +858,11 @@ def build_cluster_profiles(
         )
         if normalized_name:
             profile.normalized_name_fingerprints.add(normalized_name)
-        lenders = lender_signature(
-            instrument_row.get("parties_json") or instrument_row.get("lenders_json")
-        )
+        # Guarded for uniformity with the other `_json` reads in this module,
+        # not for a behaviour change: `lender_signature` funnels its argument
+        # through `parse_cluster_list`, which already answers `[]` for anything
+        # that is not a JSON array, so NaN and the default agree here (#193).
+        lenders = lender_signature(_json_text(instrument_row, "parties_json") or "[]")
         if lenders:
             profile.lender_signatures.add(lenders)
         for member_id in member_ids:
@@ -1439,7 +1500,15 @@ def build_debt_instrument_rows(
         parties_json = json.dumps(
             dedupe_party_clusters(
                 [
-                    str(existing_row.get("parties_json") or "[]"),
+                    # Guarded for uniformity, not for a behaviour change: this
+                    # text goes straight into `dedupe_party_clusters`, so the
+                    # text `nan` and the default `[]` both dedupe to no
+                    # clusters. Checked over the same twelve column shapes as
+                    # the `lender_signature` site and they agree on all twelve,
+                    # so the #193 issue body's "parties silently dropped from
+                    # the republished row" does not happen here -- an absent
+                    # column had no parties to carry forward in the first place.
+                    _json_text(existing_row, "parties_json") or "[]",
                     *[
                         mention_index[mention_id].parties_json
                         for mention_id in present_member_ids
@@ -1837,6 +1906,11 @@ def cluster_canonical_key(cluster: dict[str, object]) -> str:
 
 def prepare_mention(row: dict[str, object]) -> PreparedMention:
     """Normalize one mention row for matching."""
+    # Read once and shared by the two fields below. Both wanted the same guarded
+    # payload (#193), and `_json_text` parses to validate while `lender_keys`
+    # parses again to read -- so reading the column twice meant four
+    # `json.loads` per mention where two do.
+    parties_json = _json_text(row, "parties_json") or "[]"
     return PreparedMention(
         debt_instrument_mention_id=str(row["debt_instrument_mention_id"]),
         item_id=str(row["item_id"]),
@@ -1859,14 +1933,17 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
         principal_amount=coerce_optional_text(row.get("principal_amount")),
         principal_currency=coerce_optional_text(row.get("principal_currency")),
         principal_amount_kind=coerce_optional_text(row.get("principal_amount_kind")),
-        amounts_json=str(row.get("amounts_json") or "[]"),
+        amounts_json=_json_text(row, "amounts_json") or "[]",
         interest_rate_kind=coerce_optional_text(row.get("interest_rate_kind")),
         interest_rate_pct=coerce_optional_text(row.get("interest_rate_pct")),
         status=coerce_optional_text(row.get("status")),
         amendment_of=coerce_optional_text(row.get("amendment_of")),
-        retired_by=tuple(json.loads(str(row.get("retired_by_json") or "[]"))),
+        # The one site of the six that raised rather than degrading: a mentions
+        # partition written before `retired_by_json` existed reads NaN here, and
+        # `json.loads("nan")` took the whole match pass down (#193).
+        retired_by=tuple(str(entry) for entry in _json_list(row, "retired_by_json")),
         split_of=coerce_optional_text(row.get("split_of")),
-        parties_json=str(row.get("parties_json") or "[]"),
+        parties_json=parties_json,
         lender_disclosure=coerce_lender_disclosure(row.get("lender_disclosure")),
         normalized_amount=normalize_amount(
             coerce_optional_text(row.get("principal_amount"))
@@ -1878,7 +1955,16 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
         normalized_name_fingerprint=normalize_name_fingerprint(
             coerce_optional_text(row.get("name"))
         ),
-        lender_signature=lender_signature(row.get("parties_json")),
+        # Guarded for uniformity with the other five sites, not because this one
+        # was wrong: `lender_keys` funnels its argument through
+        # `parse_cluster_list`, which already answers `[]` for anything that is
+        # not a JSON array, so the text `nan` and the default `[]` produce the
+        # same signature. Checked over the twelve shapes a parquet column can
+        # hand this site -- NaN, None, blank, every `MISSING_TEXT_VALUES`
+        # placeholder, junk, a JSON object and a list of scalars -- and the
+        # guarded and unguarded readings agree on all twelve, so the #193 issue
+        # body is wrong to call this one a clustering change.
+        lender_signature=lender_signature(parties_json),
         synthesized_by=coerce_optional_text(row.get("synthesized_by")),
         synthesized_from_mention_id=coerce_optional_text(
             row.get("synthesized_from_mention_id")
