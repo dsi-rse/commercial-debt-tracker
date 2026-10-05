@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
@@ -255,6 +256,20 @@ def load_completion_registry(
     still carries. Loading is the one place that reads everything; it happens
     once or twice per run, against the 4,400 saves per itemize pass that #191
     is about.
+
+    The shard reads are issued concurrently because sharding turned one GET
+    into one per occupied month, and a serial loop over them is #110's
+    pathology in a new place (#227). Measured at full-corpus shape -- 393
+    shards -- a load issues one HeadObject, one LIST and 393 GETs; serially, at
+    the 70 ms round trip #110 measured on this same 1-vCPU stack, that is 27.5 s
+    per load and a pipeline run does five of them, growing by one shard every
+    month forever. Note that #191's own text claimed the old design "cannot be
+    fixed by parallelising reads, because it is one object"; that stopped being
+    true at 393 objects.
+
+    Overlay order is preserved regardless of completion order: ``map`` yields
+    in submission order, and ``list_artifacts`` already returns sorted paths,
+    so the shards still merge in exactly the sequence the serial loop used.
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     entries: dict[str, CompletedPartition] = {}
@@ -265,14 +280,41 @@ def load_completion_registry(
         entries.update(
             _registry_entries(read_json_artifact(legacy_path), resolved_root)
         )
-    for shard_path in list_artifacts(
+    shard_paths = list_artifacts(
         completion_registry_path(
             stage_name, artifact_root=resolved_root, data_dir=data_dir
         ),
         suffix=".json",
-    ):
-        entries.update(_registry_entries(read_json_artifact(shard_path), resolved_root))
+    )
+    for payload in _read_registry_shards(shard_paths):
+        entries.update(_registry_entries(payload, resolved_root))
     return CompletionRegistry(entries)
+
+
+# Capped at botocore's default `max_pool_connections` (10): the GETs all share
+# one cached client, and more threads than connections just queue inside the
+# pool while logging "connection pool is full" on every overflow. Raising both
+# together belongs with `S3_CLIENT_CONFIG` in storage.py, not here.
+_REGISTRY_LOAD_CONCURRENCY = 10
+
+
+def _read_registry_shards(shard_paths: list[str]) -> list[object]:
+    """Read registry shard objects concurrently, in ``shard_paths`` order.
+
+    Materialized rather than streamed so the pool is joined before the caller
+    merges anything: a read that raises surfaces from here, instead of halfway
+    through an overlay that has already mutated the registry being built.
+    """
+    if not shard_paths:
+        return []
+    if len(shard_paths) == 1:
+        # The overwhelmingly common local/test shape; skip the pool entirely so
+        # a one-shard load costs no thread setup.
+        return [read_json_artifact(shard_paths[0])]
+    with ThreadPoolExecutor(
+        max_workers=min(_REGISTRY_LOAD_CONCURRENCY, len(shard_paths))
+    ) as pool:
+        return list(pool.map(read_json_artifact, shard_paths))
 
 
 # v3 persists keys with the artifact root stripped off; v1 and v2 keys carry

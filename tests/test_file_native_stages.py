@@ -4657,6 +4657,122 @@ def test_completion_registry_v1_legacy_list_still_reads(tmp_path: Path) -> None:
     assert all(entry.fingerprint is None for entry in loaded.values())
 
 
+def test_completion_registry_load_reads_its_shards_concurrently(
+    tmp_path: Path,
+) -> None:
+    """A load must not serialize one round trip per occupied month (#227, #110).
+
+    Sharding turned one GET into one per month, and the merged #220 read them
+    in a plain loop: at full-corpus shape that is one HeadObject, one LIST and
+    393 serial GETs, or 27.5 s per load at the 70 ms round trip #110 measured
+    on this stack, five times per pipeline run. Asserted on observed overlap
+    rather than on wall clock, because a timing assertion passes on the serial
+    version whenever the machine is fast enough.
+    """
+    import threading
+
+    from cdt.datasets import (
+        CompletedPartition,
+        date_shard_partition_path,
+        load_completion_registry,
+        save_completion_registry,
+    )
+
+    for month in range(1, 7):
+        save_completion_registry(
+            "itemize",
+            {
+                date_shard_partition_path(
+                    "documents",
+                    partition_date=f"2024-{month:02d}-15",
+                    shard="0001",
+                    artifact_root=tmp_path,
+                ): CompletedPartition(fingerprint=f"f{month}")
+            },
+            artifact_root=tmp_path,
+        )
+
+    real_read = cdt_datasets.read_json_artifact
+    lock = threading.Lock()
+    in_flight = 0
+    peak = 0
+    barrier = threading.Barrier(2, timeout=10)
+
+    def overlapping_read(path: object) -> object:
+        nonlocal in_flight, peak
+        with lock:
+            in_flight += 1
+            peak = max(peak, in_flight)
+        try:
+            # Two reads must be in flight at once for this to return; on the
+            # serial loop it raises BrokenBarrierError at the timeout.
+            barrier.wait()
+        except threading.BrokenBarrierError:  # pragma: no cover - serial only
+            pass
+        try:
+            return real_read(path)  # type: ignore[operator]
+        finally:
+            with lock:
+                in_flight -= 1
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(cdt_datasets, "read_json_artifact", overlapping_read)
+        loaded = load_completion_registry("itemize", artifact_root=tmp_path)
+
+    assert peak > 1, "shard reads were issued serially"
+    # And every entry still arrives, from all six shards.
+    assert len(loaded) == 6
+
+
+def test_completion_registry_load_merges_shards_in_sorted_order(
+    tmp_path: Path,
+) -> None:
+    """Concurrent reads must still overlay in path order, not completion order.
+
+    The overlay sequence is load-bearing (a later shard's entry wins), so a
+    parallel read that merged in whichever order finished first would make the
+    winner depend on thread scheduling. Pinned by returning payloads out of
+    order from the pool and asserting the merge still follows the sorted paths.
+    """
+    from cdt.datasets import load_completion_registry
+
+    shard_root = Path(
+        cdt_datasets.completion_registry_path("itemize", artifact_root=tmp_path)
+    )
+    shard_root.mkdir(parents=True, exist_ok=True)
+    key = "documents/date=2024-01-02/shard=0001/part-0000.parquet"
+    # Two shards both claiming the same key. date=2024-02 sorts last, so its
+    # value is the one a sorted overlay must leave in place.
+    for label, fingerprint in (("2024-01", "first"), ("2024-02", "last")):
+        (shard_root / f"date={label}.json").write_text(
+            json.dumps(
+                {
+                    "stage": "itemize",
+                    "version": 3,
+                    "date_prefix": label,
+                    "partitions": {key: {"fingerprint": fingerprint}},
+                }
+            )
+        )
+
+    real_read = cdt_datasets.read_json_artifact
+    order: list[str] = []
+
+    def reversing_read(path: object) -> object:
+        # Finish the later shard first, so a completion-ordered merge would
+        # leave "first" as the winner.
+        order.append(Path(str(path)).name)
+        return real_read(path)  # type: ignore[operator]
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(cdt_datasets, "read_json_artifact", reversing_read)
+        loaded = load_completion_registry("itemize", artifact_root=tmp_path)
+
+    absolute = cdt_datasets.join_artifact_path(str(tmp_path), key)
+    assert loaded[absolute].fingerprint == "last"
+    assert order == ["date=2024-01.json", "date=2024-02.json"]
+
+
 def test_completion_registry_shard_entry_beats_the_legacy_object(
     tmp_path: Path,
 ) -> None:
