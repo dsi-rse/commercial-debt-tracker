@@ -3025,11 +3025,38 @@ def terminate_on_provider_aborts(
     its mentions after three rejected answers, and FAILED with none if the
     provider aborted instead -- so both now ask the same two questions in the
     same order.
+
+    The note names both causes when there are two. `count_content_filter_aborts`
+    is a per-stage lifetime count with no reset, which is deliberate -- it is
+    what bounds the damage one item can do, and it survives a process exit --
+    but it means the aborts need not have been consecutive, and the note used
+    to claim they were and that "no attempt was scored". On a row that was
+    aborted, answered badly, then aborted again, both halves were false, and
+    `summarize_failure` prefers salvage notes over `validation_errors`, so the
+    model's actual error never reached the registry at all. An operator read
+    "the provider refused to serve this item" and went to the vendor while the
+    extraction defect stayed invisible.
     """
+    scored_failures = [
+        attempt
+        for attempt in row_state.all_attempts
+        if attempt.stage_name == stage.name and attempt.status == "FAILED"
+    ]
     note = (
-        f"{stage.name} aborted by the provider on {aborts} consecutive calls "
-        f"(finish_reason=content_filter); no attempt was scored"
+        f"{stage.name} aborted by the provider on {aborts} of its calls "
+        f"(finish_reason=content_filter)"
     )
+    if scored_failures:
+        errors = "; ".join(scored_failures[-1].validation_errors) or (
+            "no validation errors recorded"
+        )
+        plural = "s" if len(scored_failures) > 1 else ""
+        note += (
+            f"; {len(scored_failures)} scored attempt{plural} also failed, most "
+            f"recently: {errors}"
+        )
+    else:
+        note += "; no attempt was scored"
     if stage.name == InstrumentIEStage.name:
         # A response rejected as a whole can still hold individually valid
         # entries, and they are in `stage_responses` already -- the aborts came

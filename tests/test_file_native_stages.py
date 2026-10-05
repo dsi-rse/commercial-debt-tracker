@@ -3222,9 +3222,98 @@ def test_persistent_content_filtering_terminates_at_the_resend_cap() -> None:
     assert row_state.current_attempt.attempt_index == 0
     # Every request was the pristine one: no conversation growth past the cap.
     assert all(request == client.requests[0] for request in client.requests)
-    assert "aborted by the provider on 7 consecutive calls" in summarize_failure(
-        row_state
+    summary = summarize_failure(row_state)
+    assert "aborted by the provider on 7 of its calls" in summary
+    # Nothing was scored on this row, so saying so is accurate here.
+    assert "no attempt was scored" in summary
+
+
+def test_the_abort_note_reports_the_model_failure_that_happened_too() -> None:
+    """When both the provider and the model failed, the registry says both (#127).
+
+    The abort count is a per-stage lifetime count with no reset, so aborts need
+    not be consecutive: this row is aborted six times, answers badly once, and
+    is aborted again past the cap. The note used to call all seven calls
+    "consecutive" and add "no attempt was scored", and because
+    `summarize_failure` prefers salvage notes over `validation_errors`, the
+    model's own error never reached the registry. An operator was told to go
+    and talk to the provider while the extraction defect stayed invisible.
+    """
+    from cdt.extractor.core import summarize_failure
+
+    row_state, client = _run_live(
+        MPLX_TEXT,
+        [CONTENT_FILTERED] * 6 + [_stopped("not xml at all")] + [CONTENT_FILTERED] * 5,
     )
+
+    assert len(client.requests) == 6 + 1 + 1
+    assert row_state.state == "FAILED"
+    statuses = [a.status for a in row_state.all_attempts if a.stage_name == "ner"]
+    assert statuses == ["ABORTED"] * 6 + ["FAILED", "ABORTED", "incomplete"]
+
+    summary = summarize_failure(row_state)
+    # The count is right, and no longer claims the calls were back to back.
+    assert "aborted by the provider on 7 of its calls" in summary
+    assert "consecutive" not in summary
+    # One call *was* scored, so the opposite claim is gone...
+    assert "no attempt was scored" not in summary
+    assert "1 scored attempt also failed" in summary
+    # ...and the model's own error reaches the registry alongside the abort.
+    assert "not valid XML" in summary
+
+
+def test_the_abort_note_only_reports_failures_from_the_stage_that_aborted() -> None:
+    """An earlier stage's failure is not this stage's story (#127).
+
+    NER fails once and then recovers, so the row reaches `instrument_ie` with a
+    scored failure already in its history. `instrument_ie` is then aborted to
+    its cap without ever being answered, and its note must say so -- citing
+    NER's error here would send an operator to the wrong stage.
+    """
+    from cdt.extractor.core import failed_stage_name, summarize_failure
+
+    row_state, client = _run_live(
+        MPLX_TEXT,
+        [_stopped("not xml at all"), _stopped(MPLX_TAGGED)] + [CONTENT_FILTERED] * 10,
+    )
+
+    assert len(client.requests) == 2 + 7
+    assert row_state.state == "FAILED"
+    assert failed_stage_name(row_state) == "instrument_ie"
+
+    summary = summarize_failure(row_state)
+    assert "instrument_ie aborted by the provider on 7 of its calls" in summary
+    # instrument_ie itself was never answered, so that claim is true of it...
+    assert "no attempt was scored" in summary
+    # ...and NER's failure, which belongs to a stage that went on to succeed,
+    # stays out of it.
+    assert "not valid XML" not in summary
+
+
+def test_the_abort_note_reports_the_most_recent_scored_failure() -> None:
+    """Of several scored failures, the latest is the one worth reporting (#127).
+
+    The model is shown its error and asked again, so the last rejection is the
+    state the row actually died in; an earlier one has already been superseded.
+    """
+    from cdt.extractor.core import summarize_failure
+
+    row_state, client = _run_live(
+        MPLX_TEXT,
+        [
+            _stopped("not xml at all"),
+            _stopped("<body>wrong text entirely</body>"),
+        ]
+        + [CONTENT_FILTERED] * 10,
+    )
+
+    assert len(client.requests) == 2 + 7
+    assert row_state.state == "FAILED"
+
+    summary = summarize_failure(row_state)
+    assert "2 scored attempts also failed" in summary
+    assert "must match the input text exactly" in summary
+    assert "not valid XML" not in summary
 
 
 def test_a_filtered_row_is_registered_against_the_stage_that_was_aborted() -> None:
