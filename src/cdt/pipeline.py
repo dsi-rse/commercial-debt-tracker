@@ -11,7 +11,7 @@ from typing import Self
 import pandas as pd
 
 from cdt.classifier import classify_pending_items, default_model_dir
-from cdt.datasets import normalize_cik, resolve_artifact_root
+from cdt.datasets import failure_registry_path, resolve_artifact_root
 from cdt.extractor import (
     DEFAULT_MAX_ATTEMPTS,
     DEFAULT_MODEL,
@@ -28,7 +28,6 @@ from cdt.ingest import (
     SIXK_FORM_TYPES,
     IngestConfig,
     IngestRunResult,
-    default_failure_file,
     run_ingest_pipeline,
 )
 from cdt.ingest import DEFAULT_BATCH_SIZE as DEFAULT_INGEST_BATCH_SIZE
@@ -361,8 +360,9 @@ class PipelineOrchestrator:
                 # submission in the mirror, and inlining bodies into the
                 # partition would make every read pay for every body (#69).
                 failure_file=self.config.failure_file
-                or default_failure_file(
-                    resolved_artifact_root,
+                or failure_registry_path(
+                    "ingest",
+                    artifact_root=resolved_artifact_root,
                     data_dir=self.config.data_dir,
                 ),
                 aws_profile=self.config.aws_profile,
@@ -424,8 +424,9 @@ class PipelineOrchestrator:
                 batch_size=self.config.ingest_batch_size,
                 download=self.config.download,
                 failure_file=self.config.failure_file
-                or default_failure_file(
-                    resolved_artifact_root,
+                or failure_registry_path(
+                    "ingest",
+                    artifact_root=resolved_artifact_root,
                     data_dir=self.config.data_dir,
                 ),
                 aws_profile=self.config.aws_profile,
@@ -1134,12 +1135,6 @@ def normalize_snapshot_text(table: pd.DataFrame) -> pd.DataFrame:
         if normalized[column].dtype != object:
             continue
         normalized[column] = normalized[column].map(normalize_snapshot_cell)
-    if "cik" in normalized.columns:
-        # Partitions written before #153 carry unpadded CIKs; published
-        # snapshots always carry SEC's canonical zero-padded form.
-        normalized["cik"] = normalized["cik"].map(
-            lambda value: normalize_cik(value) if isinstance(value, str) else value
-        )
     return normalized
 
 

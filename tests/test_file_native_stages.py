@@ -70,7 +70,6 @@ from cdt.matcher import (
     debt_instruments_root,
     match_pending_mentions,
     mention_cluster_edges_root,
-    mention_matches_root,
 )
 from cdt.matcher.core import (
     DEBT_INSTRUMENT_COLUMNS,
@@ -1628,14 +1627,14 @@ def test_instrument_ie_validate_accepts_party_kinds_and_roles() -> None:
 
 
 def test_instrument_ie_validate_rejects_unannotated_party_clusters() -> None:
-    """Bare tag-id lists and unknown annotations should fail validation."""
+    """Bare tag-id lists and unknown roles should fail validation."""
     response = json.dumps(
         [
             {
                 "name": ["tag-i-1"],
-                "lenders": [["tag-o-named"]],
-                "other_interested_parties": [
-                    {"tag_ids": ["tag-o-agent"], "role": "servicer"}
+                "parties": [
+                    ["tag-o-named"],
+                    {"tag_ids": ["tag-o-agent"], "role": "servicer"},
                 ],
             }
         ]
@@ -1644,19 +1643,19 @@ def test_instrument_ie_validate_rejects_unannotated_party_clusters() -> None:
     failures = InstrumentIEStage().validate(party_row_state(), response)
 
     assert any(
-        "'lenders' is not a property of this schema" in failure for failure in failures
+        "must be an object with 'tag_ids' and 'role'" in failure for failure in failures
     )
     assert any("'role' must be one of" in failure for failure in failures)
 
 
 def test_instrument_ie_validate_rejects_non_boolean_lenders_known_incomplete() -> None:
-    """The lenders_known_incomplete flag must be boolean when present."""
+    """The retired lenders_known_incomplete flag is rejected outright."""
     response = json.dumps([{"name": ["tag-i-1"], "lenders_known_incomplete": "yes"}])
 
     failures = InstrumentIEStage().validate(party_row_state(), response)
 
     assert any(
-        "'lenders_known_incomplete' must be true or false" in failure
+        "'lenders_known_incomplete' is not a property of this schema" in failure
         for failure in failures
     )
 
@@ -1668,13 +1667,14 @@ def test_instrument_ie_postprocess_persists_every_party_with_role_and_kind() -> 
             [
                 {
                     "name": ["tag-i-1"],
-                    "lenders": [
-                        {"tag_ids": ["tag-o-named"], "kind": "named"},
-                        {"tag_ids": ["tag-o-collective"], "kind": "collective"},
-                    ],
-                    "lenders_known_incomplete": True,
-                    "other_interested_parties": [
-                        {"tag_ids": ["tag-o-agent"], "role": "agent"}
+                    "parties": [
+                        {"tag_ids": ["tag-o-named"], "role": "lender", "kind": "named"},
+                        {
+                            "tag_ids": ["tag-o-collective"],
+                            "role": "lender",
+                            "kind": "collective",
+                        },
+                        {"tag_ids": ["tag-o-agent"], "role": "agent"},
                     ],
                 }
             ]
@@ -1704,31 +1704,15 @@ def test_instrument_ie_postprocess_leaves_named_only_lenders_unflagged() -> None
             [
                 {
                     "name": ["tag-i-1"],
-                    "lenders": [{"tag_ids": ["tag-o-named"], "kind": "named"}],
+                    "parties": [
+                        {"tag_ids": ["tag-o-named"], "role": "lender", "kind": "named"}
+                    ],
                 }
             ]
         )
     )
 
     assert mention["lender_disclosure"] == "complete"
-    assert len(json.loads(str(mention["parties_json"]))) == 1
-
-
-def test_instrument_ie_postprocess_honors_declared_incompleteness() -> None:
-    """A model-declared flag survives even when every cluster is named."""
-    mention = instrument_ie_mention(
-        json.dumps(
-            [
-                {
-                    "name": ["tag-i-1"],
-                    "lenders": [{"tag_ids": ["tag-o-named"], "kind": "named"}],
-                    "lenders_known_incomplete": True,
-                }
-            ]
-        )
-    )
-
-    assert mention["lender_disclosure"] == "collective_present"
     assert len(json.loads(str(mention["parties_json"]))) == 1
 
 
@@ -1739,8 +1723,12 @@ def test_instrument_ie_postprocess_keeps_collective_lenders_and_flags() -> None:
             [
                 {
                     "name": ["tag-i-1"],
-                    "lenders": [
-                        {"tag_ids": ["tag-o-collective"], "kind": "collective"}
+                    "parties": [
+                        {
+                            "tag_ids": ["tag-o-collective"],
+                            "role": "lender",
+                            "kind": "collective",
+                        }
                     ],
                 }
             ]
@@ -1765,7 +1753,7 @@ def test_instrument_ie_postprocess_keeps_the_borrower_with_its_role() -> None:
             [
                 {
                     "name": ["tag-i-1"],
-                    "other_interested_parties": [
+                    "parties": [
                         {"tag_ids": ["tag-o-borrower"], "role": "borrower"},
                         {"tag_ids": ["tag-o-agent"], "role": "agent"},
                     ],
@@ -1785,14 +1773,16 @@ def test_instrument_ie_postprocess_keeps_the_borrower_with_its_role() -> None:
 
 def test_lender_signature_prefers_the_named_party_over_an_alias() -> None:
     """A defined-term alias in the cluster must not hide the party it names."""
-    payload = json.dumps([{"mentions": [{"text": "Purchasers"}, {"text": "Oaktree"}]}])
+    payload = json.dumps(
+        [{"role": "lender", "spans": [{"text": "Purchasers"}, {"text": "Oaktree"}]}]
+    )
 
     assert lender_signature(payload) == "oaktree"
 
 
 def test_lender_signature_uses_stored_lender_clusters() -> None:
     """Lender signatures come from the persisted named clusters."""
-    payload = json.dumps([{"mentions": [{"text": "Acme Bank"}]}])
+    payload = json.dumps([{"role": "lender", "spans": [{"text": "Acme Bank"}]}])
 
     assert lender_signature(payload) == "acme bank"
 
@@ -1802,8 +1792,7 @@ def test_party_dedupe_trusts_the_extractors_canonical_name() -> None:
 
     Re-deriving the key from the spans normalized `EQT Corporation` down to
     `eqt` before choosing the longest text, so its own `Buyer Parent` alias won
-    and the two clusters below stayed apart as two lenders (#203). A payload
-    written before `canonical_name` existed still keys on its spans.
+    and the two clusters below stayed apart as two lenders (#203).
     """
     from cdt.matcher.core import dedupe_party_clusters
 
@@ -1821,9 +1810,6 @@ def test_party_dedupe_trusts_the_extractors_canonical_name() -> None:
         [json.dumps([named_with_alias]), json.dumps([named_alone])]
     )
     assert len(deduped) == 1
-
-    legacy = [{"role": "lender", "mentions": [{"text": "Acme Bank"}]}]
-    assert len(dedupe_party_clusters([json.dumps(legacy), json.dumps(legacy)])) == 1
 
 
 def test_match_pending_mentions_carries_lender_disclosure(tmp_path: Path) -> None:
@@ -2004,10 +1990,13 @@ def test_instrument_ie_postprocess_keeps_name_derived_end_date() -> None:
             [
                 {
                     "name": ["tag-i-1"],
-                    "maturity_date": {
-                        "evidence": ["tag-i-1"],
-                        "normalized_date": "2028-12-31",
-                    },
+                    "dates": [
+                        {
+                            "kind": "maturity",
+                            "evidence": ["tag-i-1"],
+                            "normalized_date": "2028-12-31",
+                        },
+                    ],
                 }
             ]
         )
@@ -2068,10 +2057,13 @@ def test_instrument_ie_postprocess_drops_end_date_that_contradicts_evidence() ->
             [
                 {
                     "name": ["tag-i-1"],
-                    "maturity_date": {
-                        "evidence": ["tag-d-1"],
-                        "normalized_date": "2028-12-31",
-                    },
+                    "dates": [
+                        {
+                            "kind": "maturity",
+                            "evidence": ["tag-d-1"],
+                            "normalized_date": "2028-12-31",
+                        },
+                    ],
                 }
             ]
         )
@@ -2176,11 +2168,14 @@ def test_instrument_ie_validate_rejects_rate_only_amount_evidence() -> None:
         [
             {
                 "name": ["tag-i-1"],
-                "amount": {
-                    "evidence": ["tag-a-rate"],
-                    "normalized_amount": "0.875",
-                    "currency": None,
-                },
+                "amounts": [
+                    {
+                        "kind": "principal",
+                        "evidence": ["tag-a-rate"],
+                        "normalized_amount": "0.875",
+                        "currency": None,
+                    }
+                ],
             }
         ]
     )
@@ -2258,11 +2253,14 @@ def test_instrument_ie_postprocess_drops_rate_amount() -> None:
         [
             {
                 "name": ["tag-i-1"],
-                "amount": {
-                    "evidence": ["tag-a-rate"],
-                    "normalized_amount": "0.875",
-                    "currency": "USD",
-                },
+                "amounts": [
+                    {
+                        "kind": "principal",
+                        "evidence": ["tag-a-rate"],
+                        "normalized_amount": "0.875",
+                        "currency": "USD",
+                    }
+                ],
             }
         ]
     )
@@ -3748,14 +3746,18 @@ def test_instrument_ie_postprocess_keeps_a_slash_format_date() -> None:
         [
             {
                 "name": ["tag-i-1"],
-                "start_date": {
-                    "evidence": ["tag-d-1"],
-                    "normalized_date": "2026-07-28",
-                },
-                "maturity_date": {
-                    "evidence": ["tag-d-2"],
-                    "normalized_date": "2028-07-28",
-                },
+                "dates": [
+                    {
+                        "kind": "closing",
+                        "evidence": ["tag-d-1"],
+                        "normalized_date": "2026-07-28",
+                    },
+                    {
+                        "kind": "maturity",
+                        "evidence": ["tag-d-2"],
+                        "normalized_date": "2028-07-28",
+                    },
+                ],
             }
         ]
     )
@@ -3950,13 +3952,16 @@ def test_instrument_ie_postprocess_keeps_an_amount_with_cents() -> None:
         [
             {
                 "name": ["tag-i-1"],
-                "amount": {
-                    "evidence": ["tag-a-1"],
-                    # The model reports the value it read, without the float
-                    # artifact the parser used to produce.
-                    "normalized_amount": "372246148.11",
-                    "currency": "USD",
-                },
+                "amounts": [
+                    {
+                        "kind": "principal",
+                        "evidence": ["tag-a-1"],
+                        # The model reports the value it read, without the float
+                        # artifact the parser used to produce.
+                        "normalized_amount": "372246148.11",
+                        "currency": "USD",
+                    }
+                ],
             }
         ]
     )
@@ -3984,11 +3989,14 @@ def test_instrument_ie_postprocess_accepts_a_differently_formatted_amount() -> N
         [
             {
                 "name": ["tag-i-1"],
-                "amount": {
-                    "evidence": ["tag-a-1"],
-                    "normalized_amount": "500000.00",
-                    "currency": "USD",
-                },
+                "amounts": [
+                    {
+                        "kind": "principal",
+                        "evidence": ["tag-a-1"],
+                        "normalized_amount": "500000.00",
+                        "currency": "USD",
+                    }
+                ],
             }
         ]
     )
@@ -4035,11 +4043,14 @@ def test_instrument_ie_postprocess_keeps_an_amount_clustered_with_its_label() ->
         [
             {
                 "name": ["tag-i-1"],
-                "amount": {
-                    "evidence": ["tag-a-figure", "tag-a-label"],
-                    "normalized_amount": "2000000",
-                    "currency": "USD",
-                },
+                "amounts": [
+                    {
+                        "kind": "principal",
+                        "evidence": ["tag-a-figure", "tag-a-label"],
+                        "normalized_amount": "2000000",
+                        "currency": "USD",
+                    }
+                ],
             }
         ]
     )
@@ -4082,11 +4093,14 @@ def test_instrument_ie_postprocess_keeps_a_canadian_dollar_currency() -> None:
         [
             {
                 "name": ["tag-i-1"],
-                "amount": {
-                    "evidence": ["tag-a-1"],
-                    "normalized_amount": "300000000",
-                    "currency": "CAD",
-                },
+                "amounts": [
+                    {
+                        "kind": "principal",
+                        "evidence": ["tag-a-1"],
+                        "normalized_amount": "300000000",
+                        "currency": "CAD",
+                    }
+                ],
             }
         ]
     )
@@ -4357,7 +4371,7 @@ def test_match_pending_mentions_writes_match_datasets(tmp_path: Path) -> None:
 
     tables = match_pending_mentions(artifact_root=tmp_path, batch_size=5)
 
-    written_matches = read_dataset(mention_matches_root(tmp_path))
+    written_matches = read_dataset(mention_cluster_edges_root(tmp_path))
     written_instruments = read_dataset(debt_instruments_root(tmp_path))
     assert len(tables["debt_instrument_mentions"]) == 1
     assert written_matches["edge_type"].to_list() == ["member"]
@@ -4372,7 +4386,7 @@ def test_company_names_by_cik_takes_the_newest_known_name() -> None:
                 mention_id="m-1",
                 item_id="item-1",
                 accession_number="0001",
-                cik="2078008",
+                cik="0002078008",
                 date="2024-01-02",
                 name="Term Loan",
                 start_date="2024-01-01",
@@ -4383,7 +4397,7 @@ def test_company_names_by_cik_takes_the_newest_known_name() -> None:
                 mention_id="m-2",
                 item_id="item-2",
                 accession_number="0002",
-                cik="2078008",
+                cik="0002078008",
                 date="2024-02-02",
                 name="Revolver",
                 start_date="2024-02-01",
@@ -4394,7 +4408,7 @@ def test_company_names_by_cik_takes_the_newest_known_name() -> None:
                 mention_id="m-3",
                 item_id="item-3",
                 accession_number="0003",
-                cik="320193",
+                cik="0000320193",
                 date="2024-03-02",
                 name="Senior Notes",
                 start_date="2024-03-01",
@@ -4755,7 +4769,7 @@ def test_match_pending_mentions_drains_all_shards(tmp_path: Path) -> None:
 
     tables = match_pending_mentions(artifact_root=tmp_path, batch_size=1)
 
-    written_matches = read_dataset(mention_matches_root(tmp_path))
+    written_matches = read_dataset(mention_cluster_edges_root(tmp_path))
     written_instruments = read_dataset(debt_instruments_root(tmp_path))
     assert len(tables["debt_instrument_mentions"]) == 2
     assert sorted(written_matches["debt_instrument_mention_id"].to_list()) == [
@@ -4828,7 +4842,7 @@ def test_match_pending_mentions_force_rebuilds_existing_memberships(
         loose_match_threshold=0.75,
     )
 
-    written_matches = read_dataset(mention_matches_root(tmp_path)).sort_values(
+    written_matches = read_dataset(mention_cluster_edges_root(tmp_path)).sort_values(
         ["debt_instrument_mention_id", "edge_type", "debt_instrument_id"]
     )
     written_instruments = read_dataset(debt_instruments_root(tmp_path)).sort_values(
@@ -5597,9 +5611,7 @@ def test_pending_source_partitions_skips_orphans_and_raises_on_flat_files(
         root / "items" / "date=2026-01-02" / "shard=0007" / "tmpabc123.parquet"
     ).write_bytes(b"")
 
-    pending, _ = pending_source_partitions(
-        "classify", "items", "classifications", artifact_root=str(root)
-    )
+    pending, _ = pending_source_partitions("classify", "items", artifact_root=str(root))
 
     assert len(pending) == 1
     assert pending[0][0].endswith("date=2026-01-02/shard=0007/part-0000.parquet")
@@ -5607,9 +5619,7 @@ def test_pending_source_partitions_skips_orphans_and_raises_on_flat_files(
     (root / "items" / "items.parquet").write_bytes(b"")
 
     with pytest.raises(ValueError, match="Non-canonical parquet file"):
-        pending_source_partitions(
-            "classify", "items", "classifications", artifact_root=str(root)
-        )
+        pending_source_partitions("classify", "items", artifact_root=str(root))
 
 
 def test_completion_registry_saves_merge_concurrent_updates(tmp_path: Path) -> None:
@@ -5644,38 +5654,6 @@ def test_completion_registry_saves_merge_concurrent_updates(tmp_path: Path) -> N
     assert final["P"].fingerprint == "f2"
     assert final["Q"].fingerprint == "q1"
     assert final["R"].fingerprint == "r1"
-
-
-def test_pending_source_partitions_stamps_survive_concurrent_saves(
-    tmp_path: Path,
-) -> None:
-    """Legacy-entry stamping counts as a change and survives the merge (#88)."""
-    from cdt.datasets import (
-        CompletedPartition,
-        load_completion_registry,
-        pending_source_partitions,
-        save_completion_registry,
-    )
-
-    table = pd.DataFrame({"item_id": ["a"], "text": ["x"]})
-    source_path = write_partition_table(
-        str(tmp_path / "items"),
-        partition={"date": "2026-01-02", "shard": "0007"},
-        table=table,
-    )
-    # A path-only entry: complete but fingerprint-less.
-    save_completion_registry(
-        "classify", {source_path: CompletedPartition()}, artifact_root=tmp_path
-    )
-
-    pending, registry = pending_source_partitions(
-        "classify", "items", "classifications", artifact_root=str(tmp_path)
-    )
-    assert pending == []
-    save_completion_registry("classify", registry, artifact_root=tmp_path)
-
-    final = load_completion_registry("classify", artifact_root=tmp_path)
-    assert final[source_path].fingerprint is not None
 
 
 def seed_document_partitions_across_months(
@@ -6344,9 +6322,7 @@ def test_registry_follows_a_copied_artifact_root(tmp_path: Path) -> None:
         )
         for day, shard in (("2024-01-02", "0000"), ("2024-02-05", "0001"))
     }
-    pending, _ = pending_source_partitions(
-        "itemize", "documents", "items", artifact_root=copy
-    )
+    pending, _ = pending_source_partitions("itemize", "documents", artifact_root=copy)
     assert pending == []
 
 
@@ -7012,10 +6988,6 @@ def test_salvage_notes_round_trip_through_batch_state() -> None:
     row_state.salvage_notes.append("instrument_ie dropped 1 entry")
     restored = ExtractionRowState.from_state_dict(row_state.to_state_dict())
     assert restored.salvage_notes == ["instrument_ie dropped 1 entry"]
-    # State written before salvage existed lacks the key entirely.
-    legacy = row_state.to_state_dict()
-    del legacy["salvage_notes"]
-    assert ExtractionRowState.from_state_dict(legacy).salvage_notes == []
 
 
 BALANCE_ITEM_XML = """
@@ -7129,29 +7101,6 @@ def test_instrument_ie_validate_rejects_unknown_amount_kinds() -> None:
     )
 
 
-def test_legacy_single_amount_shape_still_replays() -> None:
-    """Pre-#140 batch responses with a bare `amount` keep their value."""
-    row_state = balance_row_state()
-    row_state.stage_responses["instrument_ie"] = json.dumps(
-        [
-            {
-                "name": ["tag-i-1"],
-                "amount": {
-                    "evidence": ["tag-a-commitment"],
-                    "normalized_amount": "300000000",
-                    "currency": "USD",
-                },
-            }
-        ]
-    )
-    InstrumentIEStage().postprocess(row_state)
-
-    mention = row_state.debt_instrument_mentions[0]
-    assert mention["principal_amount"] == "300000000"
-    # The legacy shape carries no kind; the flat column still fills.
-    assert mention["principal_amount_kind"] is None
-
-
 DRAW_PERIOD_XML = """
 <body>
 The <debt_instrument id="tag-i-1">Delayed Draw Term Loan</debt_instrument> draw period
@@ -7172,14 +7121,18 @@ def test_commitment_termination_date_is_its_own_field() -> None:
         [
             {
                 "name": ["tag-i-1"],
-                "maturity_date": {
-                    "evidence": ["tag-d-maturity"],
-                    "normalized_date": "2031-06-30",
-                },
-                "commitment_termination_date": {
-                    "evidence": ["tag-d-draw"],
-                    "normalized_date": "2027-06-30",
-                },
+                "dates": [
+                    {
+                        "kind": "maturity",
+                        "evidence": ["tag-d-maturity"],
+                        "normalized_date": "2031-06-30",
+                    },
+                    {
+                        "kind": "commitment_termination",
+                        "evidence": ["tag-d-draw"],
+                        "normalized_date": "2027-06-30",
+                    },
+                ],
             }
         ]
     )
@@ -7192,29 +7145,6 @@ def test_commitment_termination_date_is_its_own_field() -> None:
     assert payload["derived_from"] == "stated"
 
 
-def test_legacy_end_date_property_replays_into_maturity_date() -> None:
-    """Pre-#158 batch responses using `end_date` keep their maturity."""
-    row_state = ExtractionRowState(
-        item_row={"item_id": "item-1"},
-        stage_name="instrument_ie",
-    )
-    row_state.ner_tagged_xml = DRAW_PERIOD_XML
-    row_state.stage_responses["instrument_ie"] = json.dumps(
-        [
-            {
-                "name": ["tag-i-1"],
-                "end_date": {
-                    "evidence": ["tag-d-maturity"],
-                    "normalized_date": "2031-06-30",
-                },
-            }
-        ]
-    )
-    InstrumentIEStage().postprocess(row_state)
-
-    assert row_state.debt_instrument_mentions[0]["maturity_date"] == "2031-06-30"
-
-
 TERMINATION_ITEM_XML = """
 <body>
 On <date id="tag-d-term">June 2, 2026</date>, the Company terminated its
@@ -7224,63 +7154,7 @@ dated as of <date id="tag-d-dated">October 11, 2023</date>.
 """.strip()
 
 
-def test_status_event_records_a_standalone_termination() -> None:
-    """A 1.02 termination is recordable without a successor object (#141)."""
-    row_state = ExtractionRowState(
-        item_row={"item_id": "item-1"},
-        stage_name="instrument_ie",
-    )
-    row_state.ner_tagged_xml = TERMINATION_ITEM_XML
-    row_state.stage_responses["instrument_ie"] = json.dumps(
-        [
-            {
-                "name": ["tag-i-1"],
-                "start_date": {
-                    "evidence": ["tag-d-dated"],
-                    "normalized_date": "2023-10-11",
-                },
-                "status_event": {
-                    "status": "terminated",
-                    "status_date": {
-                        "evidence": ["tag-d-term"],
-                        "normalized_date": "2026-06-02",
-                    },
-                },
-            }
-        ]
-    )
-    InstrumentIEStage().postprocess(row_state)
-
-    mention = row_state.debt_instrument_mentions[0]
-    assert mention["status"] == "terminated"
-    assert mention["status_date"] == "2026-06-02"
-    payload = json.loads(str(mention["status_json"]))
-    assert payload["status"] == "terminated"
-    assert [s["tag_id"] for s in payload["status_date"]["spans"]] == ["tag-d-term"]
-
-
-def test_status_event_validation_rejects_unknown_statuses() -> None:
-    """Only the seven agreed statuses validate; matured is derived, not extracted."""
-    row_state = ExtractionRowState(
-        item_row={"item_id": "item-1"},
-        stage_name="instrument_ie",
-    )
-    row_state.ner_tagged_xml = TERMINATION_ITEM_XML
-    response = json.dumps(
-        [
-            {
-                "name": ["tag-i-1"],
-                "status_event": {"status": "matured"},
-            }
-        ]
-    )
-    failures = InstrumentIEStage().validate(row_state, response)
-    assert any(
-        "'status_event.status' must be one of" in failure for failure in failures
-    )
-
-
-def test_missing_status_event_publishes_null_status() -> None:
+def test_no_event_publishes_null_status() -> None:
     """A mention that states no event carries no status."""
     row_state = ExtractionRowState(
         item_row={"item_id": "item-1"},
@@ -7662,14 +7536,18 @@ def test_computed_maturity_from_start_plus_tenor() -> None:
         [
             {
                 "name": ["tag-i-1"],
-                "start_date": {
-                    "evidence": ["tag-d-close"],
-                    "normalized_date": "2026-06-24",
-                },
-                "maturity_date": {
-                    "evidence": ["tag-t-1", "tag-d-close"],
-                    "normalized_date": "2031-06-24",
-                },
+                "dates": [
+                    {
+                        "kind": "closing",
+                        "evidence": ["tag-d-close"],
+                        "normalized_date": "2026-06-24",
+                    },
+                    {
+                        "kind": "maturity",
+                        "evidence": ["tag-t-1", "tag-d-close"],
+                        "normalized_date": "2031-06-24",
+                    },
+                ],
             }
         ]
     )
@@ -7928,7 +7806,8 @@ def test_dates_facts_publish_columns_from_current_closing_and_maturity() -> None
                 "normalized_date": "2026-03-05",
             },
             {
-                "kind": "expected_closing",
+                "kind": "closing",
+                "expected": True,
                 "evidence": ["tag-3"],
                 "normalized_date": "2026-03-12",
             },
@@ -7960,8 +7839,8 @@ def test_dates_facts_publish_columns_from_current_closing_and_maturity() -> None
     assert select_date_payload(payloads, "maturity")["normalized_date"] == "2031-06-23"
 
 
-def test_dates_facts_precision_and_legacy_shape() -> None:
-    """Month and year precision are read off the text; old responses replay with implied kinds."""
+def test_dates_facts_precision() -> None:
+    """Month and year precision are read off the text."""
     from cdt.extractor.core import standardized_dates_payloads
 
     tags = _dates_tag_details()
@@ -7986,18 +7865,6 @@ def test_dates_facts_precision_and_legacy_shape() -> None:
     )
     assert year[0]["kind"] == "maturity" and year[0]["normalized_date"] == "2031-12-31"
     assert year[0]["precision"] == "year" and year[0]["derived_from"] == "name"
-    legacy = standardized_dates_payloads(
-        {
-            "start_date": {"evidence": ["tag-2"], "normalized_date": "2026-03-05"},
-            "maturity_date": {"evidence": ["tag-5"], "normalized_date": "2031-06-23"},
-        },
-        tags,
-        name_text=None,
-    )
-    assert {(p["kind"], p["normalized_date"]) for p in legacy} == {
-        ("closing", "2026-03-05"),
-        ("maturity", "2031-06-23"),
-    }
 
 
 def test_dates_property_validation_rejects_bad_kind_and_two_current_maturities() -> (
@@ -8232,14 +8099,11 @@ def test_parties_list_derives_lender_disclosure() -> None:
     assert no_lender == "none_named"
 
 
-def test_current_shape_entry_without_parties_or_dates_is_not_legacy() -> None:
-    """An entry omitting both keys is current-schema, so disclosure is derived.
+def test_entry_without_parties_names_no_lender() -> None:
+    """An entry omitting `parties` discloses no lender, rather than every one.
 
     The prompt tells the model to omit a property the document says nothing
     about, so `{name, instrument_type, amounts}` is an ordinary response.
-    Inferring the shape from the *presence* of `parties`/`dates` sent it down
-    the legacy path, which published "every lender named" next to an empty
-    party list.
     """
     from cdt.extractor.core import party_payloads_and_disclosure
 
@@ -8249,32 +8113,6 @@ def test_current_shape_entry_without_parties_or_dates_is_not_legacy() -> None:
     )
     assert parties == []
     assert disclosure == "none_named"
-
-
-def test_legacy_declared_incompleteness_maps_onto_the_three_values() -> None:
-    """A stored response's declared boolean still replays, onto the new field."""
-    from cdt.extractor.core import party_payloads_and_disclosure
-
-    tags = {
-        "tag-1": {
-            "text": "JPMorgan Chase Bank, N.A.",
-            "type": "organization",
-            "char_start": 0,
-            "char_end": 25,
-        },
-    }
-    _, declared = party_payloads_and_disclosure(
-        {"lenders": [["tag-1"]], "lenders_known_incomplete": True}, tags
-    )
-    assert declared == "collective_present"
-    _, undeclared = party_payloads_and_disclosure(
-        {"lenders": [["tag-1"]], "lenders_known_incomplete": False}, tags
-    )
-    assert undeclared == "complete"
-    _, nobody = party_payloads_and_disclosure(
-        {"lenders": [], "lenders_known_incomplete": False}, tags
-    )
-    assert nobody == "none_named"
 
 
 def test_aggregate_lender_disclosure_precedence() -> None:
@@ -8518,8 +8356,8 @@ def test_semantic_validators_reject_misplaced_flags_and_kinds() -> None:
     )
 
 
-def test_live_validation_rejects_legacy_properties_but_replay_accepts_them() -> None:
-    """A fresh response reverting to status_event/lenders fails; stored responses still post-process."""
+def test_validation_rejects_legacy_properties() -> None:
+    """A response reverting to status_event/lenders/start_date fails validation."""
     from cdt.extractor.core import validate_no_legacy_properties
 
     legacy = {
@@ -9597,11 +9435,7 @@ def test_realign_tag_details_leaves_unalignable_text_untouched() -> None:
 
 
 def test_validate_parties_property_rejects_every_bad_shape() -> None:
-    """The new validator was indistinguishable from absent: `return []` passed.
-
-    The test that looked like its coverage feeds the legacy `lenders` key, so
-    its message assertion was satisfied by the older validator instead.
-    """
+    """Each malformed `parties` cluster gets its own failure message."""
     tags = {
         "tag-p-1": {
             "type": "organization",
@@ -9710,44 +9544,6 @@ def test_a_salvaged_row_registers_the_salvage_note_not_the_last_stage() -> None:
     assert "Unexpected response" not in str(record["error"])
     assert record["error"] == "; ".join(row_state.salvage_notes)
     assert "dropped 1" in str(record["error"])
-
-
-def test_a_whole_response_rejection_that_drops_nothing_says_so() -> None:
-    """`dropped 0` is a shape rejection, not a loss; the note must not claim one."""
-    from cdt.extractor.core import handle_response
-
-    row_state = ExtractionRowState(
-        item_row={"item_id": "item-1"},
-        stage_name="instrument_ie",
-    )
-    row_state.ner_tagged_xml = PARTY_ROLE_XML
-    # A bare object, plus a legacy property that only the whole-response check
-    # rejects: every entry validates on its own, so nothing is dropped.
-    handle_response(
-        row_state,
-        json.dumps({"name": ["tag-i-1"], "lenders_known_incomplete": True}),
-        max_attempts=1,
-    )
-
-    assert row_state.state == "PARTIAL"
-    assert row_state.salvage_notes
-    assert "dropped 0" not in row_state.salvage_notes[0]
-    assert "published every entry" in row_state.salvage_notes[0]
-
-
-def test_normalize_snapshot_text_pads_the_cik_column() -> None:
-    """#153's snapshot padding had no test, so disabling it passed."""
-    table = pd.DataFrame(
-        [
-            {"cik": "320193", "company_name": "Example Inc."},
-            {"cik": "0000707605", "company_name": "Already Padded Co"},
-            {"cik": None, "company_name": "No CIK Co"},
-        ]
-    )
-
-    normalized = normalize_snapshot_text(table)
-
-    assert normalized["cik"].to_list() == ["0000320193", "0000707605", None]
 
 
 def test_computed_sum_needs_two_addends_even_when_no_span_matches() -> None:

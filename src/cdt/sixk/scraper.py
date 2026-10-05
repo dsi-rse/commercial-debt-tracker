@@ -35,6 +35,7 @@ from typing import Self
 
 import pandas as pd
 
+from cdt.datasets import default_artifact_root
 from cdt.ingest import (
     SIXK_FORM_TYPES,
     DocumentCandidate,
@@ -45,8 +46,6 @@ from cdt.ingest import (
     S3Client,
     ScrapedFiling,
     decode_document_bytes,
-    default_output_root,
-    default_s3_client,
     filing_from_manifest_key,
     iter_manifest_keys_for_date_range,
     normalize_accession_number,
@@ -59,6 +58,9 @@ from cdt.storage import (
     get_object_bytes,
     parse_s3_uri,
     write_bytes_artifact,
+)
+from cdt.storage import (
+    s3_client as storage_s3_client,
 )
 
 LOGGER = get_logger(__name__)
@@ -152,7 +154,7 @@ class ScraperDocumentSource:
 
     def __iter__(self: Self) -> Iterator[DocumentCandidate]:
         """Assemble, mirror and yield every matching filing in the range."""
-        artifact_root = self.config.output_root or default_output_root(
+        artifact_root = self.config.output_root or default_artifact_root(
             self.config.data_dir
         )
         indexed = 0
@@ -299,7 +301,7 @@ def acquire_scraped_sixk_documents(
     if not config.form_types:
         msg = f"form_types must not be empty; expected one of {SIXK_FORM_TYPES}"
         raise ValueError(msg)
-    client = s3_client or default_s3_client(config.aws_profile)
+    client = s3_client or storage_s3_client(config.aws_profile)
     return run_ingest_pipeline(
         config,
         ciks=ciks,

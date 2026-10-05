@@ -12,7 +12,11 @@ from typing import Self
 import pandas as pd
 import pytest
 
-from cdt.datasets import parse_date_shard_partition
+from cdt.datasets import (
+    default_artifact_root,
+    failure_registry_path,
+    parse_date_shard_partition,
+)
 from cdt.ingest import (
     DOCUMENT_COLUMNS,
     SIXK_DOCUMENT_DATASET_NAME,
@@ -21,8 +25,6 @@ from cdt.ingest import (
     _partition_path,
     acquire_documents,
     acquire_documents_for_date_range,
-    default_failure_file,
-    default_output_root,
     documents_root,
     iter_filings,
     normalize_accession_number,
@@ -442,7 +444,7 @@ def test_ingest_records_download_failures(tmp_path: Path) -> None:
             start_date=date(2024, 1, 2),
             end_date=date(2024, 1, 2),
             data_dir=tmp_path,
-            failure_file=default_failure_file(tmp_path),
+            failure_file=failure_registry_path("ingest", artifact_root=tmp_path),
             download=True,
         ),
         ciks={"320193"},
@@ -639,122 +641,6 @@ def test_document_shard_is_stable_across_processes() -> None:
         check=True,
     ).stdout.strip()
     assert out == _document_shard("0001437749-26-027029")
-
-
-def test_force_reingest_repairs_pre_crc32_shard_duplicates(tmp_path: Path) -> None:
-    """A copy stored under a pre-#61 salted shard must not survive a --force run."""
-    import pandas as pd
-
-    from cdt.ingest import DOCUMENT_COLUMNS, _document_shard
-    from cdt.storage import write_partition_table
-
-    accession = "000114036126006577"
-    canonical_shard = _document_shard(accession)
-    stale_shard = f"{(int(canonical_shard) + 1) % 64:04d}"
-    write_partition_table(
-        documents_root(data_dir=tmp_path),
-        partition={"date": "2024-01-02", "shard": stale_shard},
-        table=pd.DataFrame(
-            [
-                {
-                    "accession_number": accession,
-                    "cik": "320193",
-                    "company_name": "Example Inc.",
-                    "url": "https://sec.example/full.txt",
-                    "text": "stale copy",
-                    "date": "2024-01-02",
-                    "resource_uri": None,
-                }
-            ],
-            columns=DOCUMENT_COLUMNS,
-        ),
-    )
-    client = FakeS3Client(
-        {
-            (
-                "sec-bucket",
-                "sec/2024-01-02/8-K/320193/000114036126006577/manifest.json",
-            ): _manifest_bytes(
-                "320193",
-                "0001140361-26-006577",
-                "8-K",
-                "2024-01-02",
-                "COMPLETE SUBMISSION TEXT FILE",
-            )
-        }
-    )
-
-    table, _ = run_ingest_pipeline(
-        IngestConfig(
-            mode="historical",
-            bucket="sec-bucket",
-            cik_file=tmp_path / "ciks.txt",
-            start_date=date(2024, 1, 2),
-            end_date=date(2024, 1, 2),
-            data_dir=tmp_path,
-            force=True,
-        ),
-        ciks={"320193"},
-        s3_client=client,
-        return_documents=True,
-    )
-
-    assert table["accession_number"].to_list() == [accession]
-    partition_files = list_artifacts(
-        documents_root(data_dir=tmp_path), suffix=".parquet"
-    )
-    assert len(partition_files) == 1
-    assert partition_files[0].endswith(
-        f"date=2024-01-02/shard={canonical_shard}/part-0000.parquet"
-    )
-    documents = read_dataset(documents_root(data_dir=tmp_path))
-    assert documents["accession_number"].to_list() == [accession]
-
-
-def test_repair_document_shards_moves_rows_without_canonical_copy(
-    tmp_path: Path,
-) -> None:
-    """A row that only exists under the wrong shard is moved, never dropped."""
-    import pandas as pd
-
-    from cdt.ingest import DOCUMENT_COLUMNS, _document_shard, repair_document_shards
-    from cdt.storage import write_partition_table
-
-    accession = "000114036126006577"
-    canonical_shard = _document_shard(accession)
-    stale_shard = f"{(int(canonical_shard) + 1) % 64:04d}"
-    write_partition_table(
-        documents_root(data_dir=tmp_path),
-        partition={"date": "2024-01-02", "shard": stale_shard},
-        table=pd.DataFrame(
-            [
-                {
-                    "accession_number": accession,
-                    "cik": "320193",
-                    "company_name": "Example Inc.",
-                    "url": "https://sec.example/full.txt",
-                    "text": "only copy",
-                    "date": "2024-01-02",
-                    "resource_uri": None,
-                }
-            ],
-            columns=DOCUMENT_COLUMNS,
-        ),
-    )
-
-    removed = repair_document_shards(documents_root(data_dir=tmp_path))
-
-    assert removed == 1
-    documents = read_dataset(documents_root(data_dir=tmp_path))
-    assert documents["accession_number"].to_list() == [accession]
-    assert documents["text"].to_list() == ["only copy"]
-    partition_files = list_artifacts(
-        documents_root(data_dir=tmp_path), suffix=".parquet"
-    )
-    assert len(partition_files) == 1
-    assert partition_files[0].endswith(
-        f"date=2024-01-02/shard={canonical_shard}/part-0000.parquet"
-    )
 
 
 def test_force_retries_registered_permanent_failures(tmp_path: Path) -> None:
@@ -1159,7 +1045,7 @@ def test_existing_accessions_reads_only_the_windowed_partitions(
 
     accessions = ingest._existing_accessions(
         "documents",
-        output_root=default_output_root(tmp_path),
+        output_root=default_artifact_root(tmp_path),
         start_date=date(2024, 1, 5),
         end_date=date(2024, 1, 6),
     )
@@ -1189,7 +1075,7 @@ def test_existing_accessions_projects_away_the_document_text(
 
     ingest._existing_accessions(
         "documents",
-        output_root=default_output_root(tmp_path),
+        output_root=default_artifact_root(tmp_path),
         start_date=date(2024, 1, 5),
         end_date=date(2024, 1, 5),
     )
@@ -1220,7 +1106,7 @@ def test_existing_accessions_scans_the_window_in_one_pass(
 
     accessions = ingest._existing_accessions(
         "documents",
-        output_root=default_output_root(tmp_path),
+        output_root=default_artifact_root(tmp_path),
         start_date=date(2024, 1, 5),
         end_date=date(2024, 1, 7),
     )

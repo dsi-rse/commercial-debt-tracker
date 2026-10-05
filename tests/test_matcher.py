@@ -915,9 +915,14 @@ def test_declaring_mention_cannot_join_target_cluster() -> None:
     assert score(old_notes, profile_from(new_notes)) == []
 
 
-LENDER_JSON = (
-    '[{"mentions": [{"text": "JPMorgan Chase Bank, N.A.", "tag_id": "tag-1"}],'
-    ' "tag_ids": ["tag-1"]}]'
+LENDER_JSON = json.dumps(
+    [
+        {
+            "role": "lender",
+            "canonical_name": "JPMorgan Chase Bank, N.A.",
+            "spans": [{"text": "JPMorgan Chase Bank, N.A.", "tag_id": "tag-1"}],
+        }
+    ]
 )
 
 
@@ -1168,10 +1173,6 @@ def test_lender_keys_reads_only_lender_clusters() -> None:
         ]
     )
     assert lender_keys(payload) == ["acme bank"]
-    # A cluster with no role at all predates the unified parties list (#150)
-    # and is still read as a lender.
-    legacy = json.dumps([{"spans": [{"text": "Acme Bank, N.A."}]}])
-    assert lender_keys(legacy) == ["acme bank"]
 
 
 def test_an_extracted_amendment_pointer_beats_a_carried_inferred_one() -> None:
@@ -1316,7 +1317,7 @@ def test_a_synthesized_row_borrows_its_successors_lenders_for_scoring() -> None:
                 "role": "lender",
                 "kind": "organization",
                 "canonical_name": "Acme Bank, N.A.",
-                "mentions": [{"text": "Acme Bank, N.A."}],
+                "spans": [{"text": "Acme Bank, N.A."}],
                 "tag_ids": ["tag-l-1"],
             }
         ]

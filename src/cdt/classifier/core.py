@@ -206,7 +206,6 @@ def classify_pending_items(
     pending_with_fingerprints, registry = pending_source_partitions(
         "classify",
         ITEM_DATASET_NAME,
-        CLASSIFICATION_DATASET_NAME,
         artifact_root=resolved_root,
         data_dir=data_dir,
         force=force,

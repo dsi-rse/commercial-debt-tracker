@@ -10,7 +10,6 @@ from cdt.matcher.core import (
     match_pending_mentions,
     match_tables,
     mention_cluster_edges_root,
-    mention_matches_root,
 )
 
 __all__ = [
@@ -23,5 +22,4 @@ __all__ = [
     "match_pending_mentions",
     "match_tables",
     "mention_cluster_edges_root",
-    "mention_matches_root",
 ]

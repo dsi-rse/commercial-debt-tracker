@@ -43,7 +43,6 @@ from cdt.extractor.batch import (
     _serialize_state_jsonl,
     active_job_path,
     build_request_body,
-    normalize_batch_model,
     openai_reasoning_effort,
 )
 from cdt.extractor.core import (
@@ -57,6 +56,7 @@ from cdt.extractor.core import (
     handle_response,
     initial_messages,
     load_prompt,
+    native_model_id,
     run_extraction_workflow,
     sampling_params,
 )
@@ -1016,7 +1016,7 @@ def test_extract_batch_response_text_variants() -> None:
 def test_configured_default_model_is_usable_by_both_backends() -> None:
     """The default must be an undated id, or every batch request 400s.
 
-    `normalize_batch_model` only strips the provider prefix, so a dated
+    `native_model_id` only strips the provider prefix, so a dated
     OpenRouter alias such as `openai/gpt-5.6-terra-20260709` reaches the OpenAI
     API as `gpt-5.6-terra-20260709` — an id it does not publish, which fails the
     whole batch rather than one row. The live backend needs the prefix present.
@@ -1026,7 +1026,7 @@ def test_configured_default_model_is_usable_by_both_backends() -> None:
 
     default = settings.DEFAULT_EXTRACTOR_MODEL
     assert default.startswith("openai/"), "live backend needs the OpenRouter prefix"
-    native = normalize_batch_model(default)
+    native = native_model_id(default)
     assert "/" not in native
     assert not re.search(r"-\d{8}$", native), (
         f"{default!r} carries a date suffix; the OpenAI API publishes this model "
@@ -1039,8 +1039,8 @@ def test_configured_default_model_is_usable_by_both_backends() -> None:
 
 def test_build_request_body_reasoning_and_model() -> None:
     """Model prefixes are stripped and reasoning_effort is mapped/validated."""
-    assert normalize_batch_model("openai/gpt-5.4") == "gpt-5.4"
-    assert normalize_batch_model("gpt-5.4") == "gpt-5.4"
+    assert native_model_id("openai/gpt-5.4") == "gpt-5.4"
+    assert native_model_id("gpt-5.4") == "gpt-5.4"
 
     # "none" is a value gpt-5.4 accepts, so it must reach the API unchanged:
     # sending "minimal" instead earned a 400 on every request (#31), and dropping
@@ -1425,27 +1425,6 @@ def test_orphan_input_download_failure_skips_adoption(tmp_path: Path) -> None:
     result = advance_extract_job(batch_client=client, artifact_root=tmp_path)
     assert result.status in {"waiting", "submitted"}
     assert describe_active_job(tmp_path).status == "active"
-
-
-def test_legacy_uncompressed_state_still_loads(tmp_path: Path) -> None:
-    """A job started before #86 (plain state.jsonl) keeps advancing after deploy."""
-    client = FakeBatchClient(
-        {"item-multi": {"ner": MULTI_NER, "instrument_ie": MULTI_IE}}
-    )
-    job_id = _seed_active_job(tmp_path, client)
-    job_dir = tmp_path / "extract-batches" / f"job_id={job_id}"
-    gz = job_dir / "state.jsonl.gz"
-    import gzip as _gzip
-
-    (job_dir / "state.jsonl").write_bytes(_gzip.decompress(gz.read_bytes()))
-    gz.unlink()
-
-    for _ in range(4):
-        result = advance_extract_job(batch_client=client, artifact_root=tmp_path)
-        if result.status == "completed":
-            break
-    assert result.status == "completed"
-    assert not read_dataset(mentions_root(tmp_path)).empty
 
 
 def test_batch_job_pays_only_for_new_rows_after_partition_grows(

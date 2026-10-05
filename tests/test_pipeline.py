@@ -12,7 +12,7 @@ import pytest
 from cdt.classifier import core as classifier_core
 from cdt.extractor.core import ExtractionRowState
 from cdt.ingest import IngestRunResult
-from cdt.matcher import debt_instruments_root, mention_matches_root
+from cdt.matcher import debt_instruments_root, mention_cluster_edges_root
 from cdt.pipeline import (
     ALL_TIME_START_DATE,
     DEFAULT_GENRES,
@@ -541,7 +541,7 @@ This is the extracted event text.
         )
     )
 
-    written_matches = read_dataset(mention_matches_root(tmp_path))
+    written_matches = read_dataset(mention_cluster_edges_root(tmp_path))
     written_instruments = read_dataset(debt_instruments_root(tmp_path))
     final_items = read_table(tmp_path / "database" / "cdt" / "items" / "latest.parquet")
     final_mentions = read_table(

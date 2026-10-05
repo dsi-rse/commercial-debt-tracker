@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Protocol, cast
 
 from cdt import settings
-from cdt.datasets import dataset_root, resolve_artifact_root
+from cdt.datasets import resolve_artifact_root
 from cdt.extractor.core import (
     DEFAULT_MAX_ATTEMPTS,
     CompletionResult,
@@ -60,7 +60,6 @@ from cdt.storage import (
     join_artifact_path,
     read_gzip_text_artifact,
     read_json_artifact,
-    read_text_artifact,
     write_gzip_text_artifact,
     write_json_artifact,
 )
@@ -242,11 +241,6 @@ def _batch_status_from_object(batch: object) -> BatchStatus:
     )
 
 
-def normalize_batch_model(model: str) -> str:
-    """Strip any provider prefix so an OpenRouter slug becomes a native id."""
-    return native_model_id(model)
-
-
 def openai_reasoning_effort(reasoning_effort: str) -> str:
     """Resolve a configured reasoning effort to one OpenAI accepts.
 
@@ -339,8 +333,6 @@ class JobState:
     rows: dict[str, RowEntry]
     # path -> {"fingerprint": ..., "prior_item_ids": [...]}, captured at claim
     # time so finalize can record row-outcome-keyed completion (#49, #62).
-    # Empty for jobs created before the v2 registry; finalize then writes
-    # fingerprint-less entries, the same v1-style record as before.
     claimed_state: dict[str, dict[str, object]] = field(default_factory=dict)
     batches: list[BatchRecord] = field(default_factory=list)
     all_batch_ids: list[str] = field(default_factory=list)
@@ -375,15 +367,6 @@ class ActiveJobSummary:
     claimed_partitions: int = 0
 
 
-def batches_root(
-    artifact_root: ArtifactPath | None = None, *, data_dir: Path | None = None
-) -> str:
-    """Return the root that stores extract batch job state."""
-    return dataset_root(
-        EXTRACT_BATCHES_DATASET, artifact_root=artifact_root, data_dir=data_dir
-    )
-
-
 def active_job_path(root: str) -> str:
     """Return the path of the single-active-job marker for an artifact root."""
     return join_artifact_path(root, EXTRACT_BATCHES_DATASET, ACTIVE_JOB_FILENAME)
@@ -399,11 +382,6 @@ def _manifest_path(root: str, job_id: str) -> str:
 
 def _state_path(root: str, job_id: str) -> str:
     return join_artifact_path(_job_dir(root, job_id), "state.jsonl.gz")
-
-
-def _legacy_state_path(root: str, job_id: str) -> str:
-    """Uncompressed state written by jobs started before #86; read-only."""
-    return join_artifact_path(_job_dir(root, job_id), "state.jsonl")
 
 
 def _batches_path(root: str, job_id: str) -> str:
@@ -536,11 +514,6 @@ def _load_job_state(root: str, job_id: str) -> JobState:
 
 def _read_job_state(root: str, job_id: str) -> JobState:
     state_path = _state_path(root, job_id)
-    if not artifact_exists(state_path):
-        # A job started before #86 wrote uncompressed state; the next
-        # _save_state writes the compressed path and the legacy file goes stale.
-        legacy = _legacy_state_path(root, job_id)
-        state_path = legacy if artifact_exists(legacy) else state_path
     for path in (
         _manifest_path(root, job_id),
         state_path,
@@ -549,11 +522,7 @@ def _read_job_state(root: str, job_id: str) -> JobState:
         if not artifact_exists(path):
             raise CorruptJobStateError(f"Extract job {job_id} is missing {path}.")
     manifest = cast(dict[str, object], read_json_artifact(_manifest_path(root, job_id)))
-    state_text = (
-        read_gzip_text_artifact(state_path)
-        if state_path.endswith(".gz")
-        else read_text_artifact(state_path)
-    )
+    state_text = read_gzip_text_artifact(state_path)
     rows = _load_state_jsonl(state_text)
     batches_payload = cast(
         dict[str, object], read_json_artifact(_batches_path(root, job_id))
@@ -1321,13 +1290,7 @@ def _finalize_job(root: str, job: JobState, *, data_dir: Path | None) -> None:
     ]
     mentions = finalize_extract_outputs(
         row_entries,
-        # Pre-v2 jobs have no claimed_state; fall back to fingerprint-less claims
-        # so their completion records match what they would have written before.
-        claimed=job.claimed_state
-        or {
-            path: {"fingerprint": None, "prior_item_ids": []}
-            for path in job.claimed_partitions
-        },
+        claimed=job.claimed_state,
         run_id=job.job_id,
         model=job.model,
         reasoning_effort=job.reasoning_effort,

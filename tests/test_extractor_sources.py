@@ -146,42 +146,6 @@ def test_pending_partitions_span_both_sources(tmp_path: Path) -> None:
     )
 
 
-def test_a_sixk_partition_is_pending_even_where_eightk_mentions_exist(
-    tmp_path: Path,
-) -> None:
-    """The trap: shared mentions coordinates must not adopt a 6-K partition.
-
-    Both sources write into one mentions dataset keyed by (date, shard). An
-    unextracted 6-K snippet partition that happens to share a date and shard
-    with already-extracted 8-K mentions used to be adopted as complete by the
-    pre-registry backfill rule — silently, producing no error and no rows. The
-    rule only makes sense for partitions written before the registry existed,
-    which no 6-K partition can be.
-    """
-    _write_classifications(tmp_path)
-    sixk_path = _write_snippets(tmp_path)
-    # An earlier 8-K extract run wrote mentions at these coordinates.
-    _write_mentions(tmp_path, EIGHTK_ITEM_ID)
-
-    pending, _registry = pending_extract_partitions(artifact_root=tmp_path)
-
-    assert [entry.classification_path for entry in pending] == [sixk_path]
-
-
-def test_an_eightk_partition_whose_mentions_predate_the_registry_is_adopted(
-    tmp_path: Path,
-) -> None:
-    """The rule the 6-K scoping must not break, for the case it exists for."""
-    eightk_path = _write_classifications(tmp_path)
-    _write_mentions(tmp_path, EIGHTK_ITEM_ID)
-
-    pending, registry = pending_extract_partitions(artifact_root=tmp_path)
-
-    assert pending == []
-    assert registry[eightk_path].complete
-    assert registry[eightk_path].fingerprint is not None
-
-
 def test_forcing_reclaims_partitions_from_both_sources(tmp_path: Path) -> None:
     """--force ignores the registry for either genre."""
     eightk_path = _write_classifications(tmp_path)

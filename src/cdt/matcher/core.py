@@ -17,7 +17,6 @@ import pandas as pd
 from cdt.datasets import (
     cik_shard_partition_path,
     dataset_root,
-    normalize_cik,
     resolve_artifact_root,
     run_manifest_path,
     shard_for_cik,
@@ -36,6 +35,7 @@ from cdt.matcher.lineage_inference import infer_amendment_parents
 from cdt.storage import (
     artifact_exists,
     coerce_dataset_text,
+    json_column,
     read_dataset,
     read_json_artifact,
     write_json_artifact,
@@ -147,15 +147,6 @@ def mention_cluster_edges_root(
         artifact_root=artifact_root,
         data_dir=data_dir,
     )
-
-
-def mention_matches_root(
-    artifact_root: str | Path | None = None,
-    *,
-    data_dir: Path | None = None,
-) -> str:
-    """Backward-compatible alias for the canonical mention-cluster-edges root."""
-    return mention_cluster_edges_root(artifact_root=artifact_root, data_dir=data_dir)
 
 
 def debt_instruments_root(
@@ -765,8 +756,7 @@ def _json_text(row: dict[str, object], column: str) -> str | None:
     Returning `str | None` rather than `"[]"` keeps the "column absent" and
     "column holds an empty list" cases distinguishable; callers that want a
     payload either way spell the default themselves, as `coerce_dataset_text`'s
-    other callers do. Mirrors `_json_list`/`_json_dict` in `extractor/core.py`,
-    which solved the same NaN problem first.
+    other callers do.
     """
     text = coerce_dataset_text(row.get(column))
     if text is None:
@@ -779,19 +769,8 @@ def _json_text(row: dict[str, object], column: str) -> str | None:
 
 
 def _json_list(row: dict[str, object], column: str) -> list[object]:
-    """Return one JSON-array column's entries; absent, missing or junk reads empty.
-
-    The parsed counterpart to `_json_text`, for the one site that wants values
-    rather than a payload to carry forward (`retired_by_json`, a list of
-    instrument-mention ids). See `_json_text` for why the guard exists (#193).
-    """
-    text = coerce_dataset_text(row.get(column))
-    if text is None:
-        return []
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        return []
+    """Return one JSON-array column's entries; absent, missing or junk reads empty."""
+    payload = json_column(row, column)
     return list(payload) if isinstance(payload, list) else []
 
 
@@ -827,7 +806,7 @@ def build_cluster_profiles(
         )
         profile = ClusterProfile(
             debt_instrument_id=debt_instrument_id,
-            cik=coerce_optional_cik(instrument_row.get("cik")) or "",
+            cik=coerce_optional_text(instrument_row.get("cik")) or "",
             seed_mention_id=seed_mention_id,
             member_ids=list(member_ids),
             normalized_amounts=set(),
@@ -1614,7 +1593,7 @@ def company_names_by_cik(mention_rows: pd.DataFrame) -> dict[str, str]:
         return {}
     newest: dict[str, tuple[tuple[str, str], str]] = {}
     for row in mention_rows.to_dict("records"):
-        cik = coerce_optional_cik(row.get("cik"))
+        cik = coerce_optional_text(row.get("cik"))
         company_name = coerce_optional_text(row.get("company_name"))
         if cik is None or company_name is None:
             continue
@@ -1858,15 +1837,11 @@ def party_dedupe_key(cluster: dict[str, object]) -> str:
     Ltd.` shrank to `ncl` and lost to its own `NCLC` alias, and `EQT
     Corporation` lost to `Buyer Parent`. Measured over the 1,632 party clusters
     of one eval window, the two agreed on 1,595 and the matcher's choice was the
-    worse one in the differences (#203). Payloads written before #150 carry no
-    `canonical_name`, so those still take the span-derived key. `lender_keys`
-    deliberately keeps the span-derived key: it is a match-scoring surface, and
-    changing it re-scores clusters, which a dedupe fix must not do.
+    worse one in the differences (#203). `lender_keys` deliberately keeps the
+    span-derived key: it is a match-scoring surface, and changing it re-scores
+    clusters, which a dedupe fix must not do.
     """
-    canonical_name = cluster.get("canonical_name")
-    if isinstance(canonical_name, str) and canonical_name.strip():
-        return normalize_party_text(canonical_name)
-    return cluster_canonical_key(cluster)
+    return normalize_party_text(str(cluster.get("canonical_name") or ""))
 
 
 def parse_cluster_list(value: str) -> list[dict[str, object]]:
@@ -1887,9 +1862,7 @@ def cluster_canonical_key(cluster: dict[str, object]) -> str:
     `Oaktree` and `Purchasers`. The specific name is the useful key, so generic
     party words lose to it even when the alias is the longer string.
     """
-    # Current payloads carry `spans`; partitions written before the evidence
-    # shape change (#128) carry `mentions`. Both list {text, offsets} dicts.
-    spans = cluster.get("spans", cluster.get("mentions", []))
+    spans = cluster.get("spans", [])
     if not isinstance(spans, list):
         return ""
     texts = [
@@ -1916,9 +1889,7 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
         item_id=str(row["item_id"]),
         raw_id=str(row["raw_id"]),
         accession_number=coerce_optional_text(row.get("accession_number")),
-        # Normalized so mentions written before CIKs were zero-padded (#153)
-        # still group with rows written after.
-        cik=coerce_optional_cik(row.get("cik")),
+        cik=coerce_optional_text(row.get("cik")),
         company_name=coerce_optional_text(row.get("company_name")),
         date=coerce_optional_text(row.get("date")),
         name=coerce_optional_text(row.get("name")),
@@ -2053,12 +2024,6 @@ def coerce_optional_bool(value: object) -> bool | None:
     return None
 
 
-def coerce_optional_cik(value: object) -> str | None:
-    """Return one canonical zero-padded CIK or None (#153)."""
-    text = coerce_dataset_text(value)
-    return normalize_cik(text) if text is not None else None
-
-
 def normalize_amount(value: str | None) -> str | None:
     """Normalize amount strings for matcher comparisons."""
     if value is None:
@@ -2130,15 +2095,10 @@ def normalize_name_fingerprint(value: str | None) -> str | None:
 
 
 def lender_keys(value: object) -> list[str]:
-    """Return normalized lender cluster keys in deterministic order.
-
-    Clusters without a ``role`` key are treated as lenders: they come from
-    payloads written before parties were unified (#150), when the lender list
-    was its own column.
-    """
+    """Return normalized lender cluster keys in deterministic order."""
     keys: list[str] = []
     for cluster in parse_cluster_list(str(value or "[]")):
-        if str(cluster.get("role", "lender")) != "lender":
+        if cluster.get("role") != "lender":
             continue
         key = cluster_canonical_key(cluster)
         if key:

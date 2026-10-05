@@ -13,19 +13,19 @@ from typing import Protocol, Self, cast
 
 import pandas as pd
 
-from cdt import settings
 from cdt.datasets import (
+    dataset_root,
+    default_artifact_root,
+    failure_registry_path,
     iter_date_shard_partitions,
     normalize_cik,
-    parse_date_shard_partition,
+    run_manifest_path,
     shard_label,
 )
 from cdt.shared import FailureClassifier, FailureRegistry, get_logger
 from cdt.storage import (
     count_partition_rows,
-    delete_artifact,
     get_object_bytes,
-    iter_partition_paths,
     join_artifact_path,
     normalize_artifact_path,
     parse_s3_uri,
@@ -33,10 +33,6 @@ from cdt.storage import (
     read_table,
     write_json_artifact,
     write_partition_table,
-    write_table,
-)
-from cdt.storage import (
-    s3_client as storage_s3_client,
 )
 
 LOGGER = get_logger(__name__)
@@ -85,8 +81,6 @@ DOCUMENT_DATASET_NAME = "documents"
 # consistency with it: the partition contract reads a path's date and shard and
 # never its dataset segment, so the name itself carries no behaviour.
 SIXK_DOCUMENT_DATASET_NAME = "documents-sixk"
-RUN_DATASET_NAME = "runs"
-FAILURE_DATASET_NAME = "failures"
 DOCUMENT_PARTITION_SHARDS = 64
 
 
@@ -288,21 +282,6 @@ class IngestRunResult:
     form_types: tuple[str, ...] = DEFAULT_FORM_TYPES
     dataset_name: str = DOCUMENT_DATASET_NAME
 
-    @property
-    def database_path(self: Self) -> str:
-        """Compatibility shim for legacy callers expecting a DB path."""
-        return self.run_manifest
-
-    @property
-    def documents_path(self: Self) -> str:
-        """Compatibility shim for legacy callers expecting a documents directory."""
-        return self.documents_root
-
-
-def default_output_root(data_dir: Path | None = None) -> str:
-    """Return the default local artifact root."""
-    return str(data_dir or settings.DATA_DIR)
-
 
 def documents_root(
     output_root: str | None = None,
@@ -311,30 +290,7 @@ def documents_root(
     dataset_name: str = DOCUMENT_DATASET_NAME,
 ) -> str:
     """Return the root URI for one canonical document dataset's partitions."""
-    return join_artifact_path(
-        output_root or default_output_root(data_dir), dataset_name
-    )
-
-
-def default_failure_file(
-    output_root: str | None = None,
-    *,
-    data_dir: Path | None = None,
-) -> str:
-    """Return the default ingest failure registry path."""
-    root = output_root or default_output_root(data_dir)
-    return join_artifact_path(root, FAILURE_DATASET_NAME, "ingest", "failures.json")
-
-
-def default_run_manifest_path(
-    run_id: str,
-    *,
-    output_root: str | None = None,
-    data_dir: Path | None = None,
-) -> str:
-    """Return the default run-manifest location for one ingest execution."""
-    root = output_root or default_output_root(data_dir)
-    return join_artifact_path(root, RUN_DATASET_NAME, "ingest", f"run_id={run_id}.json")
+    return dataset_root(dataset_name, artifact_root=output_root, data_dir=data_dir)
 
 
 def normalize_accession_number(accession_number: str) -> str:
@@ -364,7 +320,7 @@ def acquire_documents(
             start_date=date(year, 1, 1),
             end_date=date(year, 12, 31),
             data_dir=data_dir,
-            output_root=default_output_root(data_dir),
+            output_root=default_artifact_root(data_dir),
             force=force,
             batch_size=batch_size,
             download=download,
@@ -401,7 +357,7 @@ def acquire_documents_for_date_range(
             start_date=start_date,
             end_date=end_date,
             data_dir=data_dir,
-            output_root=default_output_root(data_dir),
+            output_root=default_artifact_root(data_dir),
             force=force,
             batch_size=batch_size,
             download=download,
@@ -449,25 +405,22 @@ def run_ingest_pipeline(
 
     def client() -> S3Client:
         if not resolved_client:
-            resolved_client.append(default_s3_client(config.aws_profile))
+            resolved_client.append(s3_client(config.aws_profile))
         return resolved_client[0]
 
     normalized_ciks = _normalize_ciks(ciks)
-    output_root = config.output_root or default_output_root(config.data_dir)
+    output_root = config.output_root or default_artifact_root(config.data_dir)
     documents_dataset_root = documents_root(
         output_root, data_dir=config.data_dir, dataset_name=config.dataset_name
     )
-    failure_file = config.failure_file or default_failure_file(
-        output_root,
-        data_dir=config.data_dir,
+    failure_file = config.failure_file or failure_registry_path(
+        "ingest", artifact_root=output_root, data_dir=config.data_dir
     )
     if not str(failure_file).startswith("s3://"):
         Path(str(failure_file)).parent.mkdir(parents=True, exist_ok=True)
     run_id = _run_id()
-    run_manifest = default_run_manifest_path(
-        run_id,
-        output_root=output_root,
-        data_dir=config.data_dir,
+    run_manifest = run_manifest_path(
+        "ingest", run_id, artifact_root=output_root, data_dir=config.data_dir
     )
     failure_registry = FailureRegistry(
         str(failure_file),
@@ -599,11 +552,6 @@ def run_ingest_pipeline(
     # Folded in after iteration: a source that fetches bodies knows what it
     # could not acquire, and those filings never reach the loop above.
     failures += source.failures
-    if config.force:
-        # A forced re-ingest rewrites every accession under its crc32 shard;
-        # copies stored under a pre-#61 salted shard would survive as
-        # cross-partition duplicates without this sweep.
-        repair_document_shards(documents_dataset_root)
     failure_registry.flush()
 
     # Read back the run's date window plus whatever it wrote outside it, rather
@@ -690,25 +638,6 @@ def run_ingest_pipeline(
     )
 
 
-def iter_document_candidates(
-    s3_client: S3Client,
-    bucket: str,
-    year: int,
-    ciks: set[str] | None = None,
-    *,
-    form_types: str | Sequence[str] = DEFAULT_FORM_TYPES,
-) -> list[DocumentCandidate]:
-    """Return manifest-backed document candidates for a year and optional CIKs."""
-    return iter_document_candidates_for_date_range(
-        s3_client,
-        bucket,
-        date(year, 1, 1),
-        date(year, 12, 31),
-        ciks,
-        form_types=form_types,
-    )
-
-
 def iter_document_candidates_for_date_range(
     s3_client: S3Client,
     bucket: str,
@@ -769,25 +698,6 @@ def iter_document_candidates_for_date_range(
     return candidates
 
 
-def iter_manifest_keys(
-    s3_client: S3Client,
-    bucket: str,
-    year: int,
-    *,
-    form_types: str | Sequence[str] = DEFAULT_FORM_TYPES,
-) -> list[str]:
-    """List manifest keys for every day in a filing year, per form type."""
-    return list(
-        _iter_manifest_keys(
-            s3_client,
-            bucket,
-            form_types,
-            date(year, 1, 1),
-            date(year, 12, 31),
-        )
-    )
-
-
 def iter_manifest_keys_for_date_range(
     s3_client: S3Client,
     bucket: str,
@@ -844,25 +754,6 @@ def iter_filings(
             LOGGER.info("Skipping failed manifest %s", manifest_key)
             continue
         yield filing
-
-
-def default_s3_client(profile_name: str | None = None) -> S3Client:
-    """Return the S3 client for a profile, or for the one ``--aws-profile`` set.
-
-    Delegates to ``storage.s3_client`` rather than building its own Session.
-    Two things were wrong with doing it here. It was uncached, so every call
-    paid credential resolution and endpoint discovery afresh and callers had to
-    memoize by hand — which is all ``itemizer.core.ensure_s3_client`` is. And
-    its default was the *empty* profile rather than the configured one, so
-    ``ensure_s3_client``'s unqualified call silently dropped ``--aws-profile``:
-    itemize and extract resolved document bodies through the ambient
-    credentials no matter what the flag said (#71).
-
-    The default is now ``None``, meaning "the configured profile". An explicit
-    name still wins, so ingest and the 6-K scraper keep passing
-    ``config.aws_profile``.
-    """
-    return cast(S3Client, storage_s3_client(profile_name))
 
 
 def s3_uri(bucket: str, key: str) -> str:
@@ -1090,10 +981,6 @@ def _failure_key_for_candidate(candidate: DocumentCandidate) -> tuple[str, str]:
     return parse_s3_uri(candidate.resource_uri)
 
 
-def _days_in_year(year: int) -> list[date]:
-    return list(_days_in_range(date(year, 1, 1), date(year, 12, 31)))
-
-
 def _days_in_range(start: date, end: date) -> Iterator[date]:
     if end < start:
         msg = f"end_date {end.isoformat()} is before start_date {start.isoformat()}"
@@ -1124,79 +1011,6 @@ def _partition_path(dataset_root: str, partition: dict[str, str]) -> str:
     for key, value in partition.items():
         partition_root = join_artifact_path(partition_root, f"{key}={value}")
     return join_artifact_path(partition_root, "part-0000.parquet")
-
-
-def repair_document_shards(documents_dataset_root: str) -> int:
-    """Move document rows stored under a non-canonical shard to their crc32 one.
-
-    Partitions written before #61 used the salted builtin hash, so a --force
-    re-ingest rewrites an accession under its crc32 shard while the historical
-    copy survives under the old one — per-partition dedup cannot see across
-    files, and itemize would emit duplicate item_ids from both. Rows whose
-    accession already has a canonical copy (the force re-ingest just refreshed
-    it) are dropped as stale; the rest are merged into their canonical
-    partition. Canonical writes happen before the stray partitions are
-    rewritten, so a crash mid-repair leaves a re-repairable duplicate, never a
-    lost row.
-
-    Returns the number of stray rows removed from non-canonical partitions.
-    """
-    stray_frames: list[pd.DataFrame] = []
-    rewrites: list[tuple[str, pd.DataFrame]] = []
-    for path in iter_partition_paths(documents_dataset_root):
-        partition = parse_date_shard_partition(path)
-        table = read_table(path, columns=DOCUMENT_COLUMNS)
-        if table.empty:
-            continue
-        canonical_shards = table["accession_number"].astype(str).map(_document_shard)
-        stray_mask = canonical_shards != partition["shard"]
-        if not stray_mask.any():
-            continue
-        stray_frames.append(table.loc[stray_mask])
-        rewrites.append((path, table.loc[~stray_mask]))
-    if not stray_frames:
-        return 0
-
-    strays = pd.concat(stray_frames, ignore_index=True)
-    grouped = strays.assign(
-        _shard=strays["accession_number"].astype(str).map(_document_shard)
-    ).groupby(["date", "_shard"], sort=True)
-    moved_frames: list[pd.DataFrame] = []
-    for (date_value, shard), group in grouped:
-        canonical = read_table(
-            _partition_path(
-                documents_dataset_root,
-                {"date": str(date_value), "shard": str(shard)},
-            ),
-            columns=DOCUMENT_COLUMNS,
-        )
-        canonical_accessions = (
-            set(canonical["accession_number"].astype(str))
-            if "accession_number" in canonical
-            else set()
-        )
-        moved_frames.append(
-            group.loc[
-                ~group["accession_number"].astype(str).isin(canonical_accessions)
-            ].drop(columns=["_shard"])
-        )
-    moved = pd.concat(moved_frames, ignore_index=True)
-    if not moved.empty:
-        _write_document_partitions(
-            documents_dataset_root, moved.reindex(columns=DOCUMENT_COLUMNS)
-        )
-    for path, kept in rewrites:
-        if kept.empty:
-            delete_artifact(path)
-        else:
-            write_table(path, kept.reindex(columns=DOCUMENT_COLUMNS))
-    LOGGER.info(
-        "Repaired document shards: strays_removed=%s rows_moved=%s partitions_rewritten=%s",
-        len(strays),
-        len(moved),
-        len(rewrites),
-    )
-    return len(strays)
 
 
 def _existing_accessions(
@@ -1232,8 +1046,7 @@ def _existing_accessions(
     re-downloaded and rewritten under its new date — because this set is an
     optimization, not the uniqueness guarantee. Uniqueness inside a partition is
     ``_write_document_partitions``, which merges and then
-    ``drop_duplicates(subset=["accession_number"], keep="last")``. A cross-date
-    copy is what ``repair_document_shards`` exists to reconcile.
+    ``drop_duplicates(subset=["accession_number"], keep="last")``.
     """
     paths = list(
         iter_date_shard_partitions(
