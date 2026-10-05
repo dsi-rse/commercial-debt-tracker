@@ -143,6 +143,14 @@ def _borrowers(row: dict[str, object]) -> set[tuple[str, ...]]:
     it names a role, not a company, so the row reads as naming no borrower and
     takes the silence path below. Valid JSON that is not a list reads the same
     way instead of raising, as `parse_cluster_list` does for every other payload.
+
+    The bespoke guard stays rather than routing through `matcher.core._json_text`
+    (#193): `matcher.core` imports this module, so the dependency only runs one
+    way, and this guard already produces the identical answer on every input the
+    helper handles — an absent column reads NaN, `str(NaN)` is the text `nan`,
+    `json.loads` raises, and the `except` returns the empty set the silence path
+    wants. It is the one of the seven `_json` reads in this stage that was never
+    broken, and inverting an import to share four lines would buy nothing.
     """
     try:
         parties = json.loads(str(row.get("parties_json") or "[]"))

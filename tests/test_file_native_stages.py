@@ -3052,6 +3052,180 @@ def test_instrument_relation_prompt_matches_the_accepted_relation_types() -> Non
     assert "retired_of" not in prompt
 
 
+def test_match_reads_a_partition_written_before_a_json_column_existed(
+    tmp_path: Path,
+) -> None:
+    """A mentions partition older than a `_json` column must still match (#193).
+
+    Nothing in this suite wrote a partition *missing* a later-added column, read
+    it back through `read_dataset`, and matched it -- every other old-shape test
+    writes the full current column list and leaves a value null, which is a
+    different thing. The gap mattered: `read_table` answers a projected read for
+    a column the file does not have by falling back to a full read plus
+    `reindex`, which fills it with NaN, and NaN is truthy, so
+    `str(row.get(col) or "[]")` yields the literal text `nan`.
+
+    `retired_by_json` fed `json.loads` directly, so the whole match pass died
+    with `JSONDecodeError: Expecting value`. Reproduced on the real corpus
+    before the fix: `cdt match` over `data/genwindow-run-dev` (245 mentions
+    partitions written before `retired_by_json`, `amounts_json` and
+    `parties_json` existed) crashed in `prepare_mention`; after it, the same
+    root completes with 679 edge rows and 572 instruments.
+    """
+    row = build_mention_row(
+        mention_id="m-1",
+        item_id="item-1",
+        accession_number="0001",
+        cik="320193",
+        date="2024-01-02",
+        name="Term Loan",
+        start_date="2024-01-01",
+        amount="$100 million",
+    )
+    # The partition as it was actually written, not the current shape with
+    # nulls: these three columns are simply not in the file's schema.
+    absent = ["retired_by_json", "amounts_json", "parties_json"]
+    legacy = pd.DataFrame([{k: v for k, v in row.items() if k not in absent}])
+    write_partition_table(
+        tmp_path / "mentions",
+        partition={"date": "2024-01-02", "shard": "0001"},
+        table=legacy,
+    )
+    # Pin the premise: if a future writer starts backfilling these columns this
+    # test would still pass while testing nothing.
+    stored = read_table(
+        tmp_path / "mentions" / "date=2024-01-02" / "shard=0001" / "part-0000.parquet"
+    )
+    assert not set(absent) & set(stored.columns)
+
+    tables = match_pending_mentions(artifact_root=tmp_path, batch_size=5)
+
+    assert tables["debt_instrument"]["debt_instrument_id"].to_list() == ["m-1"]
+    # The literal text `nan` must not have reached a published payload.
+    instruments = read_dataset(debt_instruments_root(tmp_path))
+    assert instruments["parties_json"].to_list() == ["[]"]
+
+
+def test_prepare_mention_reads_an_absent_json_column_as_an_empty_payload() -> None:
+    """Every `_json` read must survive NaN, not just the one that raised (#193).
+
+    Six sites shared the `str(row.get(col) or "[]")` idiom. Only
+    `retired_by_json` raised; the rest handed `parse_cluster_list` the text
+    `nan`, which it discards as a `JSONDecodeError` and returns `[]` for -- so
+    they degraded to the same empty payload the guard produces rather than
+    erroring. That makes them invisible, which is why they are pinned here
+    rather than left to the integration test above.
+    """
+    from cdt.matcher.core import prepare_mention
+
+    row = build_mention_row(
+        mention_id="m-1",
+        item_id="item-1",
+        accession_number="0001",
+        cik="320193",
+        date="2024-01-02",
+        name="Term Loan",
+        start_date="2024-01-01",
+        amount="$100 million",
+    )
+    # What `read_table`'s reindex fallback actually hands the matcher.
+    for column in ("retired_by_json", "amounts_json", "parties_json"):
+        row[column] = float("nan")
+
+    mention = prepare_mention(row)
+
+    assert mention.retired_by == ()
+    assert mention.amounts_json == "[]"
+    assert mention.parties_json == "[]"
+    assert mention.lender_signature == ""
+
+
+def test_cluster_profiles_still_reach_pre_150_lenders_beside_a_newer_partition(
+    tmp_path: Path,
+) -> None:
+    """The `parties_json`-to-`lenders_json` fallback must survive NaN (#193).
+
+    This is the site whose failure changed published output instead of raising.
+    `build_cluster_profiles` read
+    `instrument_row.get("parties_json") or instrument_row.get("lenders_json")`,
+    and a pre-#150 instruments partition has no `parties_json` at all. On a root
+    where *every* partition is that old the column is absent from the frame,
+    `.get` returns None, and the `or` falls through correctly -- which is why
+    this went unnoticed. Add one newer partition that does carry
+    `parties_json`, and `read_dataset`'s schema unification fills the old rows
+    with NaN; NaN is truthy, so the `or` stops falling through and the fallback
+    is dead exactly on the rows it exists for.
+
+    Measured on the real `data/genwindow-run-dev` instruments (573 rows, all
+    pre-#150): 135 rows carry a recoverable lender signature. Reading them
+    alongside one newer `parties_json`-bearing row took that 135 to 0 before the
+    fix, and leaves it at 135 after. Hence per column rather than one `or`.
+    """
+    from cdt.matcher.core import build_cluster_profiles, prepare_mention
+
+    old_style = {
+        "debt_instrument_id": "d-old",
+        "cik": "320193",
+        "name": "Term Loan",
+        "start_date": "2020-01-01",
+        # The pre-#150 shape as the corpus actually holds it: a role-less
+        # cluster keyed on `mentions`, which predates `spans` (#128).
+        "lenders_json": '[{"mentions": [{"text": "Acme Bank"}], "tag_ids": ["t-1"]}]',
+    }
+    new_style = {
+        "debt_instrument_id": "d-new",
+        "cik": "320193",
+        "name": "Revolver",
+        "start_date": "2024-01-01",
+        "parties_json": (
+            '[{"role": "lender", "spans": [{"text": "Beta Bank"}],'
+            ' "canonical_name": "Beta Bank"}]'
+        ),
+    }
+    for shard, record in (("0001", old_style), ("0002", new_style)):
+        write_partition_table(
+            tmp_path / "debt-instruments",
+            partition={"cik_shard": shard},
+            table=pd.DataFrame([record]),
+        )
+    # Unified across both partitions, exactly as `match_pending_mentions` reads
+    # them -- so the old row's `parties_json` is NaN rather than absent.
+    instruments = read_dataset(tmp_path / "debt-instruments")
+    assert (
+        instruments.loc[instruments["debt_instrument_id"] == "d-old", "parties_json"]
+        .isna()
+        .all()
+    )
+
+    mention = prepare_mention(
+        build_mention_row(
+            mention_id="m-1",
+            item_id="item-1",
+            accession_number="0001",
+            cik="320193",
+            date="2024-01-02",
+            name="Term Loan",
+            start_date="2020-01-01",
+            amount="$100 million",
+        )
+    )
+    profiles = build_cluster_profiles(
+        mention_index={mention.debt_instrument_mention_id: mention},
+        existing_edges=pd.DataFrame(
+            [
+                {
+                    "debt_instrument_mention_id": "m-1",
+                    "debt_instrument_id": "d-old",
+                    "edge_type": "member",
+                }
+            ]
+        ),
+        existing_instruments=instruments,
+    )
+
+    assert profiles["d-old"].lender_signatures == {"acme bank"}
+
+
 def test_match_pending_mentions_writes_match_datasets(tmp_path: Path) -> None:
     """Matcher should consume mention dataset and write match outputs."""
     mention_rows = pd.DataFrame(
