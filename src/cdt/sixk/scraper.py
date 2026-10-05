@@ -280,11 +280,13 @@ def acquire_scraped_sixk_documents(
     *,
     ciks: set[str] | None = None,
     s3_client: S3Client | None = None,
+    return_documents: bool = False,
 ) -> tuple[pd.DataFrame, IngestRunResult]:
     """Acquire 6-K filings from the scraper into the config's documents dataset.
 
     Shares every stage of ingest except where filings come from, so the run
     manifest, accession dedup and partition layout are the 8-K path's.
+    ``return_documents`` is ``run_ingest_pipeline``'s: off, the frame is empty.
     """
     if config.download:
         msg = (
@@ -302,6 +304,7 @@ def acquire_scraped_sixk_documents(
         config,
         ciks=ciks,
         s3_client=client,
+        return_documents=return_documents,
         candidate_source=lambda registry: ScraperDocumentSource(
             config=config,
             s3_client=client,
