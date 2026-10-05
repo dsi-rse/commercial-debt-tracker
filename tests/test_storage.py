@@ -561,20 +561,30 @@ def test_the_s3_branch_of_every_reader_actually_runs(
     change turns on — unexecuted by the suite. A typo in the stripped path or a
     dropped ``filesystem=`` would have shipped green.
 
-    Swapping in a LocalFileSystem keeps that branch honest with no network: the
-    readers are handed an ``s3://`` URI, take the S3 path through
-    ``strip_s3_scheme``, and read through a real pyarrow filesystem object.
+    Swapping in a filesystem rooted at a local directory keeps that branch
+    honest with no network: the readers are handed an ``s3://`` URI, take the
+    S3 path through ``strip_s3_scheme``, and read ``bucket/key`` through a real
+    pyarrow filesystem object exactly as they would through ``S3FileSystem``.
+
+    The stub returns the stripped path untouched, and the dataset read runs with
+    the per-file fallback made fatal. Mapping paths inside the stub instead let
+    the dataset scan fail on ``bucket/items/a.parquet`` and pass through the
+    fallback, so a dropped ``filesystem=`` or an unstripped path in
+    ``_read_dataset_with_arrow`` — either of which turns every production scan
+    into the slow path — stayed green.
     """
-    root = tmp_path / "bucket-root"
-    _write(root / "items" / "a.parquet", [{"k": "1", "text": "x"}])
-    _write(root / "items" / "b.parquet", [{"k": "2", "text": "y"}])
+    root = tmp_path / "s3"
+    _write(root / "bucket" / "items" / "a.parquet", [{"k": "1", "text": "x"}])
+    _write(root / "bucket" / "items" / "b.parquet", [{"k": "2", "text": "y"}])
+    filesystem = pyarrow.fs.SubTreeFileSystem(str(root), pyarrow.fs.LocalFileSystem())
+    resolved: list[str] = []
 
     def fake_filesystem(path: object) -> tuple[object, str]:
-        # Same shape arrow_filesystem returns for S3: a filesystem, and a path
-        # with the scheme stripped and rooted at the "bucket".
+        # Exactly what arrow_filesystem returns for S3: a filesystem, and the
+        # bucket/key form of the path.
         stripped = storage.strip_s3_scheme(path)
-        assert not str(stripped).startswith("s3://")
-        return pyarrow.fs.LocalFileSystem(), str(root / stripped.split("/", 1)[1])
+        resolved.append(stripped)
+        return filesystem, stripped
 
     monkeypatch.setattr(storage, "arrow_filesystem", fake_filesystem)
     monkeypatch.setattr(
@@ -584,8 +594,20 @@ def test_the_s3_branch_of_every_reader_actually_runs(
     assert storage.read_table("s3://bucket/items/a.parquet", ["k"])["k"].to_list() == [
         "1"
     ]
+    assert resolved == ["bucket/items/a.parquet"]
     assert storage.count_table_rows("s3://bucket/items/a.parquet") == 1
     assert storage.count_table_rows("s3://bucket/items/absent.parquet") is None
+    assert (
+        storage.count_partition_rows(
+            [*_S3_ITEM_PATHS, "s3://bucket/items/absent.parquet"]
+        )
+        == 2
+    )
+
+    def _explode(*args: object, **kwargs: object) -> pd.DataFrame:
+        raise AssertionError("fell back to the per-file path")
+
+    monkeypatch.setattr(storage, "read_table", _explode)
     table = storage.read_dataset("s3://bucket/items").sort_values("k")
     assert table["k"].to_list() == ["1", "2"]
 

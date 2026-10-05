@@ -985,14 +985,15 @@ def test_normalize_snapshot_text_is_not_the_publish_cost(tmp_path: Path) -> None
 
 
 @pytest.mark.parametrize(
-    ("change_a_source", "expected_publishes"),
-    [(True, 1), (False, 0)],
-    ids=["source-changed", "sources-unchanged"],
+    ("change_a_source", "force", "expected_publishes"),
+    [(True, False, 1), (False, False, 0), (False, True, 1)],
+    ids=["source-changed", "sources-unchanged", "forced"],
 )
 def test_run_pipeline_skips_the_publish_when_nothing_changed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     change_a_source: bool,
+    force: bool,
     expected_publishes: int,
 ) -> None:
     """`cdt pipeline` and the live backend pay the same publish, so same gate (#110).
@@ -1040,7 +1041,11 @@ def test_run_pipeline_skips_the_publish_when_nothing_changed(
             end_date=date(2024, 1, 31),
             artifact_root=str(tmp_path / "artifacts"),
             final_database_root=str(final_root),
+            force=force,
         )
     )
 
+    # "forced" pins that --force reaches the shared tail from this entry point
+    # too: only run_match_and_finalize had a force test, so this path could
+    # stop passing it and nothing would fail.
     assert len(published) == expected_publishes
