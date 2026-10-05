@@ -81,7 +81,7 @@ DEFAULT_MAX_BATCH_BYTES = 100 * 1024 * 1024
 DEFAULT_MAX_RESUBMISSIONS = 3
 # One job's rows (item text + per-stage message histories) live in a single
 # state blob rewritten every tick; claiming every pending partition after a
-# large backfill builds a multi-GB job that OOMs the poll task (#92). Whole
+# large backfill builds a multi-GB job that OOMs the poll task. Whole
 # partitions remain the claim unit, so the last one may overshoot slightly;
 # the next job claims the remainder when this one completes.
 DEFAULT_MAX_ROWS_PER_JOB = 10_000
@@ -89,12 +89,12 @@ DEFAULT_MAX_ROWS_PER_JOB = 10_000
 # sequential batch rounds (one per stage) plus retries, so multi-day jobs are
 # normal — but one alive this long has probably wedged (a batch stuck
 # in_progress upstream, rows ping-ponging through resubmissions). The literal
-# "Extract job stalled" below feeds a CloudWatch metric-filter alarm (#85).
+# "Extract job stalled" below feeds a CloudWatch metric-filter alarm.
 STALL_WARNING_TICKS = 96
 # reasoning_effort values gpt-5-class models accept, quoted verbatim from the API's
 # own rejection message: "Supported values are: 'none', 'low', 'medium', 'high',
 # and 'xhigh'." Note this is NOT the union of every OpenAI model's vocabulary —
-# 'minimal' is valid on some models and rejected here with a 400 (see #31).
+# 'minimal' is valid on some models and rejected here with a 400.
 OPENAI_REASONING_EFFORTS = frozenset({"none", "low", "medium", "high", "xhigh"})
 # The vocabularies otherwise align, so the configured effort passes through
 # unchanged (including "none", which disables reasoning on both backends rather
@@ -107,7 +107,7 @@ RESULT_STATUSES = frozenset({"completed", "expired"})
 # _fold_completed_batches) because the cause can be transient — enqueued-token
 # quota, provider incident — and one failed batch can carry a 40k-row chunk.
 # ``cancelled`` is deliberately NOT here: it is an operator action meaning
-# "stop", so its rows requeue like an expiry rather than terminating (#84).
+# "stop", so its rows requeue like an expiry rather than terminating.
 FATAL_STATUSES = frozenset({"failed"})
 TERMINAL_STATUSES = RESULT_STATUSES | FATAL_STATUSES | {"cancelled"}
 
@@ -161,7 +161,7 @@ class OpenAIBatchClient:
     def _client(self) -> object:
         from openai import OpenAI
 
-        # Explicit bounds so a hung socket cannot wedge a poll tick (#93):
+        # Explicit bounds so a hung socket cannot wedge a poll tick:
         # generous, because submit uploads batch files up to 100 MB.
         return OpenAI(api_key=self.api_key, timeout=600.0, max_retries=2)
 
@@ -332,7 +332,7 @@ class JobState:
     claimed_partitions: list[str]
     rows: dict[str, RowEntry]
     # path -> {"fingerprint": ..., "prior_item_ids": [...]}, captured at claim
-    # time so finalize can record row-outcome-keyed completion (#49, #62).
+    # time so finalize can record row-outcome-keyed completion.
     claimed_state: dict[str, dict[str, object]] = field(default_factory=dict)
     batches: list[BatchRecord] = field(default_factory=list)
     all_batch_ids: list[str] = field(default_factory=list)
@@ -415,9 +415,9 @@ def active_job_claimed_partition_paths(
 
     Read from the job manifest (cheap, written once at creation) so the live
     extract path can leave in-flight work alone instead of paying for it a
-    second time. A corrupt marker or manifest reads as "nothing claimed": the
-    poll tick self-heals those, and the live path double-extracting is the
-    pre-existing behavior, not a new failure.
+    second time. A corrupt marker or manifest reads as "nothing claimed" (the
+    poll tick self-heals those), at worst letting the live path re-extract a
+    claimed partition.
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     try:
@@ -730,14 +730,10 @@ def _fold_one_response(
 ) -> None:
     """Score one batch response, or re-send it unscored if the provider aborted.
 
-    The abort branch is the batch twin of the live loop's, and sits in the same
-    place relative to scoring for the same reason the 5xx branch above does:
-    the provider returned no answer, so there is nothing to validate and
-    nothing for the model to correct. ``pending`` has already been cleared and
-    ``current_attempt.messages`` is untouched, so ``_build_requests`` re-submits
-    the identical request on the next tick (#127, #135). At the resend cap
-    ``handle_provider_abort`` terminates the row instead, so a filtered row
-    stops occupying batch windows.
+    The batch twin of the live loop's abort branch: ``pending`` has already
+    been cleared and ``current_attempt.messages`` is untouched, so
+    ``_build_requests`` re-submits the identical request on the next tick. At
+    the resend cap ``handle_provider_abort`` terminates the row instead.
     """
     if is_content_filter_abort(completion):
         handle_provider_abort(entry.row_state, completion)
@@ -809,9 +805,8 @@ def _fold_completed_batches(
                 response = cast(dict[str, object], line.get("response") or {})
                 if is_infrastructure_status(response.get("status_code")):
                     # A 5xx/throttle on this request says nothing about the
-                    # filing (observed live: an OpenAI 500 permanently
-                    # terminated a row). Requeue under the same cap as
-                    # expiries instead of recording a verdict.
+                    # filing: requeue under the same cap as expiries instead
+                    # of recording a verdict.
                     entry.resubmissions += 1
                     if entry.resubmissions >= max_resubmissions:
                         record_stage_error(
@@ -1075,7 +1070,7 @@ def advance_extract_job(
     marker (match/finalize is the orchestrator's responsibility).
 
     ``renew_lease`` runs at phase boundaries and may raise (``LeaseLostError``)
-    to abort the tick when the caller's writer lease was stolen (#89). Both
+    to abort the tick when the caller's writer lease was stolen. Both
     call sites are crash-equivalent points: before the post-fold save (completed
     batches are re-folded idempotently next tick) and after submits are
     persisted, so an abort never loses durable state.
@@ -1260,9 +1255,9 @@ def _warn_if_stalled(job: JobState, terminal_rows: int) -> None:
 
     One job runs at a time, so a wedged job head-of-line blocks every newly
     classified filing while the poll-liveness alarm stays green (ticks keep
-    succeeding). The alarm on this literal is the "job stopped advancing"
-    signal #85 asks for; it re-fires every tick, holding the alarm in ALARM
-    until the job finishes or an operator resets it.
+    succeeding). The CloudWatch alarm on this literal is the "job stopped
+    advancing" signal; it re-fires every tick, holding the alarm in ALARM until
+    the job finishes or an operator resets it.
     """
     if job.tick < STALL_WARNING_TICKS:
         return

@@ -1,4 +1,4 @@
-"""Extractor stage for relevant SEC 8-K items."""
+"""Extractor stage for relevant SEC 8-K items and 6-K snippets."""
 
 from cdt.extractor.batch import (
     ActiveJobSummary,
