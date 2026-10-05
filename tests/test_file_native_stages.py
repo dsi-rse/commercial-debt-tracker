@@ -9304,6 +9304,99 @@ def test_the_batch_finalize_purges_an_item_re_extracted_to_zero_mentions(
     assert written.empty, f"stale mentions survived: {written['item_id'].to_list()}"
 
 
+def test_the_batch_finalize_purges_an_item_that_stopped_being_relevant(
+    tmp_path: Path,
+) -> None:
+    """The batch guard's other input has to work too (#209).
+
+    `_mentions_partition_needs_write` takes two reasons to purge, and the test
+    above only drives one of them. `replaced` is "this item was re-extracted";
+    `retired` is "this item is gone from the source" -- built in this backend
+    from each claim's `prior_item_ids` minus whatever the claimed classification
+    partition still marks relevant. Nothing else prunes those rows, and a
+    mention whose item no longer exists still publishes, inflating the
+    instrument's counts and asserting facts from text the pipeline has stopped
+    sending.
+
+    That half predates #230 and was carried through the rewrite unchanged, which
+    is exactly why it needed pinning: passing `retired_item_ids=set()` at the
+    batch call site left the whole suite green. The live path's equivalent is
+    covered by `test_a_snippet_that_stops_being_relevant_loses_its_mentions` in
+    `test_extractor_sources.py`; this backend had nothing.
+
+    An item stops being relevant when the classifier is re-run and changes its
+    verdict, or when its id ceases to exist -- the 6-K path merging several
+    windows into one snippet (#172). Here the classification partition is
+    rewritten with `relevance` False, which is the first case.
+    """
+    from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
+    from cdt.extractor.core import finalize_extract_outputs
+
+    def row_state(mentions: list[dict[str, object]]) -> ExtractionRowState:
+        state = ExtractionRowState(
+            item_row={
+                "item_id": "item-1",
+                "accession_number": "0001",
+                "cik": "0000320193",
+                "company_name": "Example Inc.",
+                "date": "2024-06-01",
+                "text": "a credit agreement",
+            },
+            stage_name="instrument_ie",
+        )
+        state.debt_instrument_mentions = mentions
+        state.finish("SUCCESS")
+        return state
+
+    common = {
+        "run_id": "20240601T000000000000Z",
+        "model": "test-model",
+        "reasoning_effort": "none",
+        "max_attempts": 3,
+        "artifact_root": tmp_path,
+    }
+    mention = build_mention_row(
+        mention_id="m-1",
+        item_id="item-1",
+        accession_number="0001",
+        cik="0000320193",
+        date="2024-06-01",
+        name="Term Loan",
+        start_date="2024-06-01",
+        amount="$100 million",
+    )
+    finalize_extract_outputs(
+        [(row_state([mention]), "2024-06-01", "0001")],
+        claimed={},
+        **common,  # type: ignore[arg-type]
+    )
+    assert read_dataset(mentions_root(tmp_path))["item_id"].astype(str).to_list() == [
+        "item-1"
+    ]
+
+    # The classifier has since changed its verdict: the item the previous pass
+    # extracted is no longer relevant, so the source no longer offers it.
+    classification_path = write_partition_table(
+        classifications_root(tmp_path),
+        partition={"date": "2024-06-01", "shard": "0001"},
+        table=pd.DataFrame(
+            [{"item_id": "item-1", "relevance": False}],
+            columns=CLASSIFIED_ITEM_COLUMNS,
+        ),
+    )
+
+    # No row entries at all: this pass claimed the partition, found nothing
+    # relevant left in it, and so has only ids to withdraw.
+    finalize_extract_outputs(
+        [],
+        claimed={classification_path: {"prior_item_ids": ["item-1"]}},
+        **common,  # type: ignore[arg-type]
+    )
+
+    written = read_dataset(mentions_root(tmp_path))
+    assert written.empty, f"stale mentions survived: {written['item_id'].to_list()}"
+
+
 def test_extract_tables_publishes_through_the_mint_seam(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
