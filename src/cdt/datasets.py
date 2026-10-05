@@ -271,6 +271,18 @@ def load_completion_registry(
     Overlay order is preserved regardless of completion order: ``map`` yields
     in submission order, and ``list_artifacts`` already returns sorted paths,
     so the shards still merge in exactly the sequence the serial loop used.
+
+    The legacy object is excluded from the shard listing explicitly, because on
+    S3 the shard prefix also matches it (#227): the prefix is
+    ``runs/<stage>/completed`` and the legacy object is
+    ``runs/<stage>/completed-partitions.json``, so a raw ``Prefix=`` match
+    returns it as if it were a shard and it is read twice per load. Before this
+    the merge was correct only by coincidence -- ``-`` (0x2D) sorts before
+    ``/`` (0x2F), which happened to keep the legacy copy ahead of the shards
+    and preserve the overlay order this docstring depends on. Reverse that
+    ordering and a stale fingerprint wins over the shard's fresh one, which is
+    #62. Local listing globs a directory and has no overlap, so this is
+    unobservable in a local test and is pinned with a stubbed S3 client.
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     entries: dict[str, CompletedPartition] = {}
@@ -281,12 +293,16 @@ def load_completion_registry(
         entries.update(
             _registry_entries(read_json_artifact(legacy_path), resolved_root)
         )
-    shard_paths = list_artifacts(
-        completion_registry_path(
-            stage_name, artifact_root=resolved_root, data_dir=data_dir
-        ),
-        suffix=".json",
-    )
+    shard_paths = [
+        path
+        for path in list_artifacts(
+            completion_registry_path(
+                stage_name, artifact_root=resolved_root, data_dir=data_dir
+            ),
+            suffix=".json",
+        )
+        if path != legacy_path
+    ]
     for payload in _read_registry_shards(shard_paths):
         entries.update(_registry_entries(payload, resolved_root))
     return CompletionRegistry(entries)

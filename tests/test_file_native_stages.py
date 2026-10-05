@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import logging
 from decimal import Decimal
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Self
 
 import pandas as pd
 import pyarrow as pa
@@ -4771,6 +4773,188 @@ def test_completion_registry_load_merges_shards_in_sorted_order(
     absolute = cdt_datasets.join_artifact_path(str(tmp_path), key)
     assert loaded[absolute].fingerprint == "last"
     assert order == ["date=2024-01.json", "date=2024-02.json"]
+
+
+# The shard prefix is `runs/<stage>/completed` and the legacy object is
+# `runs/<stage>/completed-partitions.json`, so on S3 a raw `Prefix=` match
+# returns the legacy object as if it were a shard (#227). Local listing globs a
+# directory and has no overlap, so the hazard is structurally invisible to every
+# other test in this file -- hence the stub. Deliberately minimal: only the
+# three calls `load_completion_registry` makes.
+REGISTRY_S3_BUCKET = "cdt-registry-test"
+
+
+class FakeRegistryPaginator:
+    """List-objects paginator over a flat key -> bytes mapping."""
+
+    def __init__(self: Self, objects: dict[str, bytes]) -> None:
+        """Hold the object map to page over."""
+        self.objects = objects
+
+    def paginate(self: Self, Bucket: str, Prefix: str) -> list[dict[str, object]]:  # noqa: N803
+        """Return one page of keys under Prefix, sorted as S3 returns them."""
+        del Bucket
+        contents = [
+            {"Key": key, "ETag": '"etag"'}
+            for key in sorted(self.objects)
+            if key.startswith(Prefix)
+        ]
+        return [{"Contents": contents}] if contents else [{}]
+
+
+class FakeRegistryS3Client:
+    """Minimal S3 double recording the requests a registry load issues."""
+
+    class exceptions:  # noqa: N801
+        """Namespace matching the botocore client's exception attribute."""
+
+        class ClientError(Exception):
+            """Carries the error response shape `artifact_exists` inspects."""
+
+            def __init__(self: Self, response: dict[str, object]) -> None:
+                """Record the botocore-shaped error response."""
+                super().__init__(str(response))
+                self.response = response
+
+    def __init__(self: Self, objects: dict[str, bytes]) -> None:
+        """Initialize with the bucket's contents and empty request logs."""
+        self.objects = dict(objects)
+        self.gets: list[str] = []
+        self.heads: list[str] = []
+
+    def get_paginator(self: Self, name: str) -> FakeRegistryPaginator:
+        """Return the fake list-objects paginator."""
+        assert name == "list_objects_v2"
+        return FakeRegistryPaginator(self.objects)
+
+    def head_object(self: Self, Bucket: str, Key: str) -> dict[str, str]:  # noqa: N803
+        """Record and answer a HeadObject."""
+        del Bucket
+        self.heads.append(Key)
+        if Key not in self.objects:
+            raise self.exceptions.ClientError({"Error": {"Code": "404"}})
+        return {"ETag": '"etag"'}
+
+    def get_object(self: Self, Bucket: str, Key: str) -> dict[str, object]:  # noqa: N803
+        """Record and answer a GET."""
+        del Bucket
+        self.gets.append(Key)
+        if Key not in self.objects:
+            raise self.exceptions.ClientError({"Error": {"Code": "NoSuchKey"}})
+        return {"Body": BytesIO(self.objects[Key]), "ETag": '"etag"'}
+
+
+def _registry_s3_objects(key: str) -> dict[str, bytes]:
+    """A migrated-but-not-retired root: legacy stale, shard fresh, same key."""
+    return {
+        "root/runs/itemize/completed-partitions.json": json.dumps(
+            {
+                "stage": "itemize",
+                "version": 2,
+                "partitions": {key: {"fingerprint": "stale"}},
+            }
+        ).encode(),
+        "root/runs/itemize/completed/date=2024-01.json": json.dumps(
+            {
+                "stage": "itemize",
+                "version": 3,
+                "date_prefix": "2024-01",
+                "partitions": {key: {"fingerprint": "fresh"}},
+            }
+        ).encode(),
+    }
+
+
+def test_completion_registry_load_does_not_read_the_legacy_object_as_a_shard() -> None:
+    """On S3 the shard prefix also matches the legacy object (#227).
+
+    `completion_registry_path()` returns `runs/<stage>/completed` and the
+    legacy object is `runs/<stage>/completed-partitions.json`, so a raw
+    `Prefix=` match returns it as a shard and the load GETs it twice. The merge
+    was correct only because `-` (0x2D) sorts before `/` (0x2F), which kept the
+    legacy copy ahead of the shards; nothing documented or tested that, and
+    reversing it resurrects a stale fingerprint over a fresh one, which is #62.
+    """
+    key = "documents/date=2024-01-02/shard=0001/part-0000.parquet"
+    client = FakeRegistryS3Client(_registry_s3_objects(key))
+    root = f"s3://{REGISTRY_S3_BUCKET}/root"
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(cdt_storage, "_S3_CLIENT", client)
+        # The prefix really does match the legacy object: that is the premise.
+        listed = cdt_storage.list_artifacts(
+            cdt_datasets.completion_registry_path("itemize", artifact_root=root),
+            suffix=".json",
+        )
+        assert any(path.endswith("completed-partitions.json") for path in listed)
+
+        client.gets.clear()
+        loaded = cdt_datasets.load_completion_registry("itemize", artifact_root=root)
+
+    legacy_gets = [g for g in client.gets if g.endswith("completed-partitions.json")]
+    assert len(legacy_gets) == 1, f"legacy object read {len(legacy_gets)} times"
+    # And the shard still wins, now by construction rather than by ASCII luck.
+    assert loaded[f"{root}/{key}"].fingerprint == "fresh"
+
+
+def test_completion_registry_load_prefers_the_shard_whatever_the_list_order(
+    tmp_path: Path,
+) -> None:
+    """The overlay must not depend on where the legacy object sorts (#227, #62).
+
+    With the legacy object matched by the shard prefix, correctness rested on
+    `-` (0x2D) sorting before `/` (0x2F), which kept it ahead of the shards.
+    Stubbed at `list_artifacts` rather than at the paginator because
+    `list_artifacts` returns `sorted(results)` itself, so a reversed paginator
+    is unobservable -- which is what made the first attempt at this test
+    vacuous. Listing the legacy object last is the order that resurrects its
+    stale fingerprint over the shard's fresh one.
+    """
+    from cdt.datasets import (
+        CompletedPartition,
+        date_shard_partition_path,
+        legacy_completion_registry_path,
+        load_completion_registry,
+        save_completion_registry,
+    )
+
+    key = date_shard_partition_path(
+        "documents", partition_date="2024-01-02", shard="0001", artifact_root=tmp_path
+    )
+    legacy = Path(legacy_completion_registry_path("itemize", artifact_root=tmp_path))
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text(
+        json.dumps(
+            {
+                "stage": "itemize",
+                "version": 2,
+                "partitions": {key: {"fingerprint": "stale"}},
+            }
+        )
+    )
+    # Write the shard without retiring the legacy object, so both copies of the
+    # key coexist -- the state a lost retire swap leaves behind.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(cdt_datasets, "_retire_legacy_registry", lambda *a, **k: True)
+        save_completion_registry(
+            "itemize",
+            {key: CompletedPartition(fingerprint="fresh")},
+            artifact_root=tmp_path,
+        )
+    assert json.loads(legacy.read_text())["partitions"], "legacy copy was retired"
+
+    real_list = cdt_datasets.list_artifacts
+
+    def list_with_legacy_last(base: object, *, suffix: str = "") -> list[str]:
+        """Mimic the S3 prefix collision, with the legacy object sorting last."""
+        listed = real_list(base, suffix=suffix)  # type: ignore[operator]
+        return [*listed, str(legacy)]
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(cdt_datasets, "list_artifacts", list_with_legacy_last)
+        loaded = load_completion_registry("itemize", artifact_root=tmp_path)
+
+    assert loaded[key].fingerprint == "fresh"
 
 
 def test_completion_registry_shard_entry_beats_the_legacy_object(
