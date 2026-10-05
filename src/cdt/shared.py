@@ -12,16 +12,15 @@ __all__ = ["FailureClassifier", "FailureRegistry", "get_logger"]
 
 
 class FailureRegistry(_SharedFailureRegistry):
-    """Registry with removal, until the shared package grows one.
+    """Shared FailureRegistry plus ``discard``, until the shared package has one.
 
-    Without ``discard``, a filing that succeeds on a --force retry stays
-    registered forever: every later normal run keeps skipping it and
-    failures.json permanently over-reports. Delete this subclass once
+    Without ``discard`` a filing that succeeds on a --force retry stays
+    registered, so later runs keep skipping it. Delete this subclass once
     idi-ftm2j-shared ships a discard method.
     """
 
     def discard(self: Self, key: tuple[str, str]) -> None:
-        """Remove a key so a successfully retried entity is retried again."""
+        """Remove ``key`` if registered, counting it toward the next flush."""
         with self._lock:
             if key not in self._entries:
                 return

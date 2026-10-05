@@ -10,9 +10,9 @@ DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
 
 
 def resolve_path(path: Path) -> Path:
-    """Resolve a path to an absolute path.
+    """Return ``path`` as an absolute, resolved path, expanding ``~``.
 
-    If the path is not absolute, it is assumed to be relative to the project root.
+    A relative path is taken relative to the project root.
     """
     path = path.expanduser()
     if not path.is_absolute():
@@ -20,47 +20,35 @@ def resolve_path(path: Path) -> Path:
     return path.resolve()
 
 
-# Load environment variables from .env file if it exists
 load_dotenv()
 
-# Set the data directory
 DATA_DIR = resolve_path(Path(os.environ.get("DATA_DIR", str(DEFAULT_DATA_DIR))))
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get(
     "OPENROUTER_API_TOKEN"
 )
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-# Single source of truth for the extractor model id, as an OpenRouter slug. The
-# batch backend strips the provider prefix (``native_model_id``), so both
-# backends stay on the same model when only this value changes.
-#
-# Keep the id undated. OpenRouter and the OpenAI API both expose this model
-# undated, so one value serves both backends; OpenRouter's dated alias
-# (`openai/gpt-5.6-terra-20260709`) normalizes to `gpt-5.6-terra-20260709`,
-# which the OpenAI API rejects with a 400 on every request in a batch.
+# The extractor model id, as an OpenRouter slug; the batch backend strips the
+# provider prefix (``native_model_id``), so one value serves both backends. Keep
+# it undated: OpenRouter's dated alias normalizes to an id the OpenAI API
+# rejects with a 400.
 DEFAULT_EXTRACTOR_MODEL = "openai/gpt-5.6-terra"
 EXTRACTOR_MODEL = os.environ.get("EXTRACTOR_MODEL") or DEFAULT_EXTRACTOR_MODEL
 EXTRACTOR_REASONING = os.environ.get("EXTRACTOR_REASONING", "none")
-# The OpenAI Batch API uses a reasoning_effort vocabulary distinct from
-# OpenRouter's, so the batch backend gets its own reasoning knob. It defaults to
-# the same model as the live backend.
+# The batch backend's model (default: the live model) and its own reasoning
+# knob, since the OpenAI Batch API's reasoning_effort vocabulary differs.
 EXTRACTOR_BATCH_MODEL = os.environ.get("EXTRACTOR_BATCH_MODEL") or EXTRACTOR_MODEL
 EXTRACTOR_BATCH_REASONING = os.environ.get("EXTRACTOR_BATCH_REASONING", "none")
 # Model id for the 6-K stage-2 triage, as an OpenRouter slug. Separate from the
-# extractor's because the two jobs want opposite trade-offs: triage reads a lot
-# of text and returns a list of ids, so it is priced for volume, while
-# extraction returns structured records and is priced for accuracy.
+# extractor's: triage is priced for volume, extraction for accuracy.
 DEFAULT_SIXK_TRIAGE_MODEL = "openai/gpt-5.6-luna"
 SIXK_TRIAGE_MODEL = os.environ.get("SIXK_TRIAGE_MODEL") or DEFAULT_SIXK_TRIAGE_MODEL
 DEFAULT_SIXK_TRIAGE_REASONING = "none"
 SIXK_TRIAGE_REASONING = (
     os.environ.get("SIXK_TRIAGE_REASONING") or DEFAULT_SIXK_TRIAGE_REASONING
 )
-# Which API the stage-2 triage call goes to: "openrouter" (the default, matching
-# the live extractor) or "openai". Stage 2 is priced for volume and the shared
-# OpenRouter account has hit its credit limit before — and OpenRouter reserves
-# an estimated maximum cost per in-flight request, so it fails first under
-# exactly this stage's shape. This makes that a setting change, not a blocked
-# run.
+# Which API the stage-2 triage call goes to: "openrouter" (default) or "openai".
+# "openai" is the fallback when OpenRouter credit runs short; OpenRouter reserves
+# a maximum cost per in-flight request, so this high-volume stage fails first.
 DEFAULT_SIXK_TRIAGE_PROVIDER = "openrouter"
 SIXK_TRIAGE_PROVIDER = (
     os.environ.get("SIXK_TRIAGE_PROVIDER") or DEFAULT_SIXK_TRIAGE_PROVIDER
