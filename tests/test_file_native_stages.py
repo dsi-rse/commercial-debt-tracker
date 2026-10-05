@@ -2536,7 +2536,8 @@ def test_ner_validate_rejects_an_echo_that_drops_non_debt_tags() -> None:
 def test_ner_validate_accepts_an_untagged_first_attempt() -> None:
     """On attempt 1 an untagged echo is the honest answer for a debt-free item (#176).
 
-    The echo check is retry-only for this reason. Measured over the three
+    The echo check is gated on earlier tagging for this reason, and was never
+    made unconditional for it. Measured over the three
     stored corpora carrying attempt logs (`genwindow-run-branch`,
     `genwindow-run-dev`, `genwindow-sol-retried`): of 761 attempt-1 NER
     responses, zero were byte-identical echoes, and the 63 with no
@@ -2570,7 +2571,8 @@ def test_an_untagged_echo_is_accepted_after_a_failure_that_found_nothing() -> No
     A debt-free item whose first attempt failed for a reason unrelated to
     tagging -- malformed XML here -- answers honestly with a bare echo on its
     second. The old gate rejected that answer on every remaining attempt and
-    the row died FAILED after six whole-item calls, losing the item. Nothing
+    the row died FAILED after three whole-item calls -- the stage's whole
+    budget -- losing the item. Nothing
     about the first attempt suggests the model can find anything here, so
     there is no earlier work for the echo to regress against.
 
@@ -2593,7 +2595,7 @@ def test_an_untagged_echo_is_accepted_after_a_failure_that_found_nothing() -> No
     assert handle_response(row_state, "not xml at all", max_attempts=3)
     assert handle_response(row_state, f"<body>{text}</body>", max_attempts=3) is None
 
-    # Two calls, not six, and the echo itself was accepted.
+    # Two calls, not three, and the echo itself was accepted.
     assert len([a for a in row_state.all_attempts if a.response is not None]) == 2
     assert row_state.all_attempts[0].status == "FAILED"
     assert row_state.all_attempts[-1].validation_errors == []
@@ -2914,7 +2916,8 @@ def test_ner_high_water_survives_the_resumable_batch_state() -> None:
 # --------------------------------------------------------------------------- #
 
 # The debt-free item and its honest answer: an untagged echo is correct here,
-# which is what makes it the right probe for the echo guard's retry-only rule.
+# which is what makes it the right probe for the echo guard's rule that an
+# echo is only a give-up once the model has tagged something on this row.
 NODEBT_TEXT = "This is the extracted event text."
 NODEBT_NER = f"<body>{NODEBT_TEXT}</body>"
 
@@ -3122,7 +3125,8 @@ def test_persistent_content_filtering_terminates_at_the_resend_cap() -> None:
     """Free retries still have to stop, and stopping must not blame the model (#127).
 
     Past the cap the abort used to fall through to `handle_response` and be
-    scored as an ordinary bad answer: the row paid six more whole-item calls,
+    scored as an ordinary bad answer: the row paid the stage's whole budget
+    again in whole-item calls,
     each one growing the retry conversation with a junk assistant turn, and
     the resulting `FAILED` attempt made #176's checks read a provider abort as
     a model failure. The row now terminates instead.

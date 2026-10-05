@@ -1069,16 +1069,21 @@ class NERStage:
         * a high-water mark -- zero `debt_instrument` tags is a failure when an
           earlier attempt on this row found some. It cannot misfire on a
           debt-free item, which found none on attempt 1 either.
-        * a byte-identical echo of the input, *on a retry only*. On attempt 1
-          an untagged echo is the honest answer for an item with nothing to
-          tag, and the `NODEBT_NER` fixture is exactly that. On a retry the
-          model has been shown its error and told to fix it, so returning the
-          raw input addresses nothing. Measured over the three stored corpora
-          that carry attempt logs (761 attempt-1 NER responses in
-          `genwindow-run-branch`, `genwindow-run-dev`, `genwindow-sol-retried`):
-          zero attempt-1 echoes, and the 63 responses with no `debt_instrument`
-          tag all carried some other tag. The single echo in the corpus is
-          MPLX's attempt 3.
+        * a byte-identical echo of the input, once an earlier attempt on this
+          row has tagged something. What makes an echo a give-up is that the
+          model found something here before and has now returned none of it --
+          not the attempt number it arrived on. On an item the model has never
+          tagged, the same response is the honest answer, and the `NODEBT_NER`
+          fixture is exactly that.
+
+          The check is deliberately not unconditional, and the corpus is why:
+          over the three stored corpora that carry attempt logs (761 attempt-1
+          NER responses in `genwindow-run-branch`, `genwindow-run-dev`,
+          `genwindow-sol-retried`), no attempt-1 response was a byte-identical
+          echo and the 63 carrying no `debt_instrument` tag all carried some
+          other tag. So rejecting every untagged echo would have bought nothing
+          and cost legitimate zero-instrument items their rows. The single echo
+          anywhere in the corpus is MPLX's attempt 3.
         """
         if not response or not isinstance(response, str):
             return [
@@ -1093,12 +1098,16 @@ class NERStage:
         # on the attempt number. `attempt_index > 1` was a proxy for "the model
         # has been shown its error and told to fix it", and it is the wrong
         # one: an item that genuinely has nothing to tag, whose first attempt
-        # failed for an unrelated reason -- malformed XML, a truncated response
-        # -- answers honestly with a bare echo, and that was being rejected on
-        # every remaining attempt until the row died FAILED. Measured against
-        # `dev`, such a row went from SUCCESS in 2 calls to FAILED in 6. What
-        # makes an echo a give-up is that the model found something here before
-        # and has now returned none of it.
+        # failed for a reason that itself tagged nothing -- malformed XML, a
+        # wrong-text wrapper -- answers honestly with a bare echo, and that was
+        # being rejected on every remaining attempt until the row died FAILED.
+        # Measured against `dev`, such a row went from SUCCESS in 2 calls to
+        # FAILED in 3, the stage's whole budget.
+        #
+        # A prior failure that *did* tag something is the opposite case and is
+        # still rejected, truncation included -- a truncated response carries
+        # opening tags, so it counts as earlier work
+        # (`test_an_echo_after_a_truncated_tagged_attempt_is_still_rejected`).
         if (
             prior_attempt_tagged(row_state, self.name)
             and response.strip() == ner_input_body(row_state).strip()

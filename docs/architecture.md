@@ -108,11 +108,14 @@ The extractor uses a multi-step validation workflow rather than accepting raw mo
 - the first stage produces XML-tagged NER output and validates that the text is preserved exactly
 - the next stages convert those tagged spans into structured instrument mentions
 - each row can retry validation failures up to `max_attempts`
+- calls the provider aborts are re-sent unscored instead, under their own cap, so a
+  filtered stage can make more calls than `max_attempts` alone implies
 - every attempt is recorded in the extractor audit log
 
 This is why CDT can tolerate LLM use in a batch pipeline without treating the model output as unverified truth.
 
-A row that ends non-SUCCESS produces no mentions, but its partition is still marked
+A row that ends FAILED or ERROR produces no mentions; a PARTIAL row publishes what
+survived (see [schema.md](schema.md)). Either way its partition is still marked
 completed, so it is never revisited. Both backends therefore record dropped rows in
 `failures/extract/failures.json` (see [schema.md](schema.md)) with their source partition,
 stage, and error. That registry is diagnostic — nothing reads it to schedule work — but it
@@ -171,7 +174,11 @@ Each tick:
 Whole-batch failures terminate their items rather than looping forever, recording the
 per-request reasons from the batch's error file (or, failing that, its batch-level
 errors); expired batches salvage whatever completed and re-submit the rest, up to a
-per-item cap of consecutive expired rounds. Job state lives under `extract-batches/`
+per-item cap of consecutive expired rounds. A response the provider aborted
+(`finish_reason=content_filter`) is re-sent unscored — it is not the model answering, so
+there is nothing to validate and nothing to correct — up to a per-stage cap, after which
+the row terminates rather than occupying further rounds (#127, #135). Job state lives
+under `extract-batches/`
 (see [schema.md](schema.md)).
 
 If `active.json` names a job directory that was deleted or only partially written, the
