@@ -1,14 +1,10 @@
 """Form 6-K triage: window a filing, then select snippets worth extracting.
 
-The 8-K path classifies numbered items. A 6-K has no item structure, so this
-path windows the document instead and runs two stages over the windows: a cheap
-recall-oriented classifier, then an LLM that sees a whole filing's admitted
-windows at once and prunes them. Between the two, an admitted window is expanded
-backwards into the context the 400-token crop cut off, which stage 1 must not
-see: its threshold is calibrated on the crop.
-
-Developed and evaluated in ``uchicago-dsi/commercial-debt-tracker-models``; see
-``docs/sixk-two-stage-triage.md`` for the measurements.
+A 6-K has no item structure, so the document is windowed and two stages run
+over the windows: a recall-oriented classifier, then an LLM that sees a whole
+filing's admitted windows at once and prunes them. Admitted windows are
+expanded backwards with context between the two. See
+``docs/sixk-two-stage-triage.md``.
 """
 
 from cdt.sixk.triage import (

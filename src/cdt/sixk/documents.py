@@ -1,15 +1,9 @@
 """Split a 6-K complete submission into the documents worth extracting from.
 
-A submission is a container: the 6-K body, its exhibits, and a pile of
-artifacts that carry no prose — graphics, XBRL instances, cover-page shells.
-The 8-K path never needed this because the itemizer works on the whole
-submission and finds items by heading; a 6-K has no item structure, so the
-genre's unit of text is the document.
-
-Flattening reuses the itemizer's HTML handling
-(:func:`cdt.itemizer.extract.normalize_body_lines`) rather than a second
-implementation: both genres then reach the extractor through the same
-normalization, which is what makes their measured behaviour comparable.
+A 6-K has no item structure, so its unit of text is the document: the 6-K
+body and the exhibits that carry prose. Documents are flattened with the
+itemizer's :func:`cdt.itemizer.extract.normalize_body_lines`, so both genres
+reach the extractor through the same normalization.
 """
 
 from __future__ import annotations
@@ -20,8 +14,7 @@ from dataclasses import dataclass
 from cdt.itemizer.extract import DOCUMENT_RE, TYPE_RE, normalize_body_lines
 
 #: Document types worth extracting from: the 6-K body and the exhibit families
-#: that carry agreement text. Everything else in a submission — graphics, XBRL
-#: instances, cover shells — has no prose to window.
+#: that carry agreement text.
 KEEP_TYPE_RE = re.compile(
     r"^(6-K(/A)?|EX-99(\.\d+)?|EX-1(\.\d+)?|EX-4(\.\d+)?|EX-10(\.\d+)?)$",
     re.IGNORECASE,
@@ -41,23 +34,12 @@ class SixkDocument:
 def prose_documents(submission: str) -> list[SixkDocument]:
     r"""Return the flattened prose documents of one complete submission.
 
-    Documents keep submission order, so a document's index is a stable part of a
-    snippet's identity.
-
-    Two fidelity notes, because this is the code path whose output the
-    generalization eval scored and small changes here move the measured numbers:
-
-    - The whole ``<DOCUMENT>`` block is flattened, not just its ``<TEXT>``, so a
-      document's first lines are its own ``<TYPE>``, sequence, filename and
-      description. That is noise, and it is the noise stage 1 and stage 2 were
-      measured against.
-    - The inline-XBRL prologue is *not* stripped here. It is stripped by
-      :func:`cdt.sixk.prepare_filing`, where the documented step order puts it.
-      Doing it in both places changes nothing — stripping is idempotent, since
-      stripped text begins at prose and a second pass finds no prologue to
-      measure — which is why the research harness could do both harmlessly.
-
-    In a raw docstring, so these escapes are the ones doctest evaluates:
+    Keeps documents whose ``<TYPE>`` matches :data:`KEEP_TYPE_RE` and whose
+    text is not blank, in submission order, so a document's index is a stable
+    part of a snippet's identity. The whole ``<DOCUMENT>`` block is flattened,
+    not just its ``<TEXT>``, so the text opens with the type, sequence and
+    filename lines; the triage stages were evaluated on text in that form. The
+    inline-XBRL prologue is left for :func:`cdt.sixk.prepare_filing` to strip.
 
     >>> submission = (
     ...     "<DOCUMENT><TYPE>6-K\n<TEXT><p>The Company issued notes.</p></TEXT>"

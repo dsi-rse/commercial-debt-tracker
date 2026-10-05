@@ -256,17 +256,107 @@ reproduces the acceptance numbers measured before it was wired: 27 filings,
 392 admitted windows, 219 snippets sent, 147,654 → 193,304 stage-2 input
 tokens (1.31x), 88 of the 219 being merged groups.
 
-## What is not in this change
+## Design notes behind the code
 
-Cross-row deduplication after extraction — that is where duplicate *mentions*
-should be resolved, by comparing extracted values rather than inferring from
-prose. Publishing 6-K snippets into `items/latest.parquet` is no longer open:
-the table is a union over both genres, stamped with a `form_type` column, so a
-6-K mention joins to its own snippet row rather than to nothing. What the
-website makes of a 6-K row's `item` -- a snippet id where an 8-K row carries a
-dotted item number -- is still a dashboard-side question.
+### `cdt.sixk.windows.strip_inline_xbrl_prologue`
 
-The scheduled pipeline does now run this stage: `pipeline.py` prepares both
-genres by default and the orchestrator takes `--genres` / `GENRES` to narrow a
-run. Worth knowing before enabling it on a wide CIK list: unlike the 8-K
-prepare chain, this stage costs an LLM call per filing with admitted windows.
+The prologue is stripped rather than the document dropped, because these
+documents carry real prose after it. Leaving it in costs twice: the NER stage
+must echo its input verbatim, so every prologue token is paid for at output
+prices and adds a chance of failing the identity check; and TF-IDF windows of
+tag soup dilute the stage-1 signal. `MIN_XBRL_TAG_SHARE` exists because a
+borrowings schedule is also mostly bare numbers, and stripping one would delete
+table bodies the annotation codebook rules relevant.
+
+`prepare_filing` strips idempotently: stripped text begins at prose, so a second
+pass finds no prologue. `cdt.sixk.documents.prose_documents` therefore leaves it
+alone, and the research harness, which stripped in both places, is still
+reproduced.
+
+### `MIN_EXPANSION_TOKENS`, `MAX_EXPANSION_TOKENS`, `MAX_MERGED_TOKENS`
+
+- **Minimum, 200.** Recovers a noun in 7 of 7 of the noun-less kept snippets
+  (above); 150 gets most of the way, and 200 is what also reaches the table
+  header above a page break, the shape reviewers could not read at all.
+- **Cap, 400.** Expansion is paid only on the 5.8% of windows stage 1 admits,
+  but the walk needs a stop when no header or blank line appears, or a document
+  of unbroken table rows would prepend itself to every window. Past the minimum
+  the cap only buys a tidier boundary, so it is one window wide.
+- **Merge ceiling, 2,000.** Without one, the generalization window's run of 21
+  adjacent windows merges to 8,191 tokens. When the ceiling cuts a run, the
+  window opening the next span still expands, so up to 400 tokens are sent
+  twice. That is the cheaper mistake: a window starting cold at the cut is the
+  noun-less failure again, and the run of 21 is exactly that case, its table
+  header sitting above a cut.
+
+Header detection (`_is_section_header`) errs towards "not a header": a missed
+header lets the walk continue to its minimum and pass over it, while a false
+one stops the walk early and can leave the instrument noun outside the window.
+
+### `cdt.sixk.triage`: what stage 2 is asked
+
+Stage 2 answers two questions that fail differently. Does the window state a
+concrete attribute of a specific instrument? Rejecting one that does not costs
+nothing. Is every attribute it states already in a kept window? Dropping a true
+duplicate is a precision gain, but dropping one that added an attribute is
+silent data loss, so the rule is conservative and every duplicate ruling must
+name the kept snippet covering it (`DROP_REASONS`, `validate_verdict`).
+
+The snippet fence carries a per-request nonce because snippet text is written
+by the filer. A bare `--- snippet N ---` delimiter is forgeable: a 6-K holding
+that string splits into blocks the model reads as separate snippets, a verdict
+on that numbering still partitions the ids, and a real disclosure is dropped at
+the filer's discretion.
+
+A filing with no admitted window makes no call: it is the common case at a 5.8%
+admission rate, and an empty user message is a 400 from several providers.
+
+### `cdt.sixk.stage`: dataset and row shape
+
+`sixk-snippets` is its own dataset rather than rows in `classifications`.
+Classify owns `classifications/date=D/shard=S/part-0000.parquet` and rewrites it
+whole, so a second writer would need genre-scoped merge-on-write and would race
+a second completion registry. One writer per dataset is the invariant the
+file-native design relies on.
+
+Dropped snippets are persisted with their verdict because stage 2 is a
+non-deterministic LLM whose decisions must be auditable. Windows stage 1
+rejected are not: at a 5.8% admission rate, storing them would grow the dataset
+about 17x to record that nothing happened. A row's `classification_score` is
+the highest score among its merged members, since the weakest would understate
+why the text was sent.
+
+`item_id` names a snippet's character span, not its first member window. A
+merged row named after its first member would keep that id when regrouping
+changed its text, and since the extractor skips ids it has finished, the new
+text would never be extracted while the absorbed members' old mentions had
+nothing to prune them. Two groupings covering one span carry the same text, so
+sharing an id there is correct.
+
+`sixk_member_windows` exists because a row is a stage-2 snippet rather than a
+window: with the accession and document index in `item`, it names every window
+stage 1 admitted.
+
+The stage recomputes a whole documents partition when ingest merged new rows
+into it, as itemize and classify do. Unlike them this costs an LLM call per
+filing with admitted windows; at about $0.25 per 1,000 filings that is accepted.
+
+The OpenAI provider (`SIXK_TRIAGE_PROVIDER=openai`) exists because OpenRouter
+reserves an estimated maximum cost per in-flight request, so it is the first to
+refuse under this stage's shape: many concurrent long-prompt calls.
+
+### `cdt.sixk.scraper`: assembly fidelity
+
+Assembling a submission from the scraper's per-document objects was checked
+against EDGAR on 23 real filings from 2016 to 2026, including a 6-K/A: every
+flattened prose document was byte-identical, which is what carries the triage
+stage's measured behaviour over from the corpus it was scored on.
+`DOCUMENT_MARKER` is checked rather than assumed because a source that stopped
+keeping the `<DOCUMENT>` wrapper would change the prose the window stage reads,
+with nothing downstream able to tell. The mirror is written as UTF-8 because
+that is what `decode_document_bytes` produced; any other encoding would change
+the text the extractor quotes as evidence.
+
+Recorded CIKs keep the manifest reader's 10-digit padded form, as 8-K rows do,
+so one issuer's CIK reads the same in both genres. `shard_for_cik` hashes the
+unpadded form, so sharding would survive either spelling.

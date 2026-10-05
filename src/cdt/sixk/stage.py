@@ -1,35 +1,16 @@
 """The 6-K triage stage: window a filing, score it, prune it, persist it.
 
-Where the 8-K path runs itemize → classify, the 6-K path runs this one stage,
-because a 6-K has no items to itemize and nothing for the item classifier to
-classify. It reads the 6-K documents dataset and writes ``sixk-snippets``,
-whose rows carry the classified-item columns verbatim — so the extractor reads
-both genres with one projection and no per-source knowledge.
+The 6-K counterpart of itemize → classify. Reads the 6-K documents dataset and
+writes ``sixk-snippets``, whose rows carry the classified-item columns plus
+:data:`SIXK_EXTRA_COLUMNS`, so the extractor reads both genres with one
+projection.
 
-Its own dataset rather than a shared ``classifications`` one: classify already
-owns ``classifications/date=D/shard=S/part-0000.parquet`` and rewrites it whole,
-so a second writer there would need merge-on-write with genre-scoped row
-replacement and an ordering hazard between two completion registries. One
-writer per dataset is the invariant the file-native design leans on.
-
-Between the two stages, an admitted window is expanded backwards into the
-context the 400-token crop cut off (#172), and windows whose expansions run
-into each other merge. Expansion happens *after* stage 1 and never before:
-``WINDOW_TOKENS`` is what the stage-1 model was fitted on and what its
-threshold was calibrated against, so widening the text it scores would
-invalidate both.
-
-Every window stage 1 admits is accounted for, kept or dropped, with the
-stage-2 verdict on the row. The unit of a row is the snippet stage 2 judged,
-not the window stage 1 admitted, because merging makes those differ: a merged
-snippet is one row listing its members in ``sixk_member_windows``. One row per
-member instead would carry the merged text more than once, and the extractor
-reads rows — it would pay for the same text twice, which is the cost merging
-exists to avoid. Dropped snippets are the mechanism rather than a side
-effect — stage 2 exists to consolidate siblings — and it is a non-deterministic
-LLM, so its decisions have to be auditable after the fact. Windows stage 1
-rejected are not persisted: it admits 5.8% of them, and storing the rest would
-grow the dataset ~17x to record that nothing happened.
+Per filing: window each prose document (:func:`cdt.sixk.prepare_filing`),
+admit windows with stage 1, expand and merge the admitted ones
+(:func:`cdt.sixk.expand_admitted_windows`), then judge them with stage 2. One
+row is written per snippet stage 2 judged, kept or dropped, with its verdict;
+windows stage 1 rejected are not persisted. Design notes are in
+``docs/sixk-two-stage-triage.md``.
 """
 
 from __future__ import annotations
@@ -80,25 +61,22 @@ STAGE_NAME = "sixk"
 DEFAULT_CONCURRENCY = 4
 #: Verdict vocabulary recorded per row, in ``sixk_verdict``.
 VERDICT_KEPT = "kept"
-#: Stage 2 could not be reached or would not answer, so stage-1 output stands.
+#: Stage 2 failed for the filing, so the stage-1 admission stands.
 VERDICT_KEPT_DEGRADED = "kept_degraded"
 VERDICT_DROPPED_NO_DETAILS = "dropped_no_details"
 VERDICT_DROPPED_DUPLICATE = "dropped_duplicate"
 KEPT_VERDICTS = frozenset({VERDICT_KEPT, VERDICT_KEPT_DEGRADED})
-#: Columns beyond the classified-item contract. The extractor projects the
-#: shared columns and never sees these; they exist so a stage-2 decision can be
-#: audited and a snippet traced back to its span of the flattened document.
+#: Columns beyond the classified-item contract, for auditing stage-2 decisions
+#: and tracing a snippet to its span of the flattened document. The extractor
+#: does not read them.
 SIXK_EXTRA_COLUMNS = [
     "sixk_window_start",
     "sixk_window_end",
     "sixk_token_count",
     "sixk_verdict",
     "sixk_duplicate_of",
-    # Comma-separated window indices this row's text answers for: several when
-    # adjacent admitted windows merged, one otherwise. With the row's own
-    # accession and document index (both in `item`), it names every window
-    # stage 1 admitted, which is what keeps admissions auditable now that a row
-    # is a stage-2 snippet rather than a window.
+    # Comma-separated indices of the admitted windows this row's text covers
+    # (several when adjacent windows merged).
     "sixk_member_windows",
 ]
 SIXK_SNIPPET_COLUMNS = [*CLASSIFIED_ITEM_COLUMNS, *SIXK_EXTRA_COLUMNS]
@@ -135,36 +113,19 @@ def snippet_id_for(
 def item_id_for(
     accession_number: str, document_index: int, start: int, end: int
 ) -> str:
-    """Build a snippet's extractor-facing item id: the span its text covers.
+    """Build a snippet's extractor-facing item id from the span its text covers.
 
-    Disjoint from 8-K item ids by construction (those are
-    ``{accession}-{item}`` with a dotted item number), which is what lets both
-    genres write mentions into one partition, merged by item id.
-
-    The span rather than a window index, because a row is the snippet stage 2
-    judged and adjacent admitted windows merge into one. Naming a merged row
-    after its first member lets one id denote different text between runs, and
-    the extractor skips an id it has already finished (#49): the regrouped
-    snippet would keep the old id and never be re-extracted -- so the expanded
-    text this stage exists to produce would never reach the model -- while the
-    members that lost their own id leave mentions behind with nothing to prune
-    them. A span moves whenever the text does, and two groups of one document
-    cannot share one, so the id names exactly what the row carries. Two
-    groupings covering the same span carry the same text, so sharing an id is
-    correct there rather than a collision.
+    Disjoint from 8-K item ids (``{accession}-{item}`` with a dotted item
+    number), so both genres can share a mentions partition keyed by item id.
+    Naming the span, not a window index, means the id changes whenever the
+    snippet's text does; the extractor skips ids it has already finished, so a
+    regrouped snippet must not keep its old id.
     """
     return f"{accession_number}-6K-{document_index}-{start}-{end}"
 
 
 class OpenRouterTextClient:
-    """The extractor's OpenRouter client, reduced to returning text.
-
-    ``extractor.core.OpenRouterChatClient`` returns a ``CompletionResult``
-    carrying provider metadata the extractor records per attempt;
-    ``SupportsChatCompletion`` here wants the text alone. Adapting is better
-    than a second client: request shaping, timeouts and the sampling rules for
-    reasoning models stay in one place.
-    """
+    """Adapt ``extractor.core.OpenRouterChatClient`` to return text only."""
 
     def __init__(self: Self, *, api_key: str | None = None) -> None:
         """Initialize the underlying extractor client."""
@@ -187,17 +148,14 @@ class OpenRouterTextClient:
 
 
 class OpenAIChatClient:
-    """Chat client talking to the OpenAI API directly.
-
-    Stage 2 is priced for volume and the shared OpenRouter account has run out
-    of credit before — and OpenRouter reserves an estimated maximum cost per
-    in-flight request, so it fails first under exactly this stage's shape (many
-    concurrent long-prompt calls). Selecting a provider is then a setting change
-    rather than a blocked run.
-    """
+    """Chat client for the OpenAI API, selected by ``SIXK_TRIAGE_PROVIDER=openai``."""
 
     def __init__(self: Self, *, api_key: str | None = None) -> None:
-        """Initialize the OpenAI client."""
+        """Initialize the OpenAI client.
+
+        Raises:
+            RuntimeError: If neither ``api_key`` nor ``OPENAI_API_KEY`` is set.
+        """
         from openai import AsyncOpenAI
 
         key = api_key or settings.OPENAI_API_KEY
@@ -224,7 +182,11 @@ class OpenAIChatClient:
 
 
 def default_triage_client() -> SupportsChatCompletion:
-    """Build the stage-2 client the configured provider asks for."""
+    """Build the stage-2 client for ``settings.SIXK_TRIAGE_PROVIDER``.
+
+    Raises:
+        ValueError: If the provider is neither ``openrouter`` nor ``openai``.
+    """
     provider = (settings.SIXK_TRIAGE_PROVIDER or PROVIDER_OPENROUTER).strip().lower()
     if provider == PROVIDER_OPENROUTER:
         return OpenRouterTextClient()
@@ -251,12 +213,9 @@ class _Candidate:
 class _SentSnippet:
     """One snippet as stage 2 receives it: an admitted window plus context.
 
-    ``candidate`` is the first member's, so the ``item`` column — the snippet
-    id stage 2 answered about — names the earliest window in the group, and no
-    two groups can claim the same one. The extractor-facing ``item_id`` is not
-    taken from it: that names the merged span instead, so that a regrouping
-    reads as different work rather than as an id the extractor has already
-    finished. See :func:`item_id_for`.
+    ``candidate`` is the group's first member; its snippet id is the row's
+    ``item``. The row's ``item_id`` comes from ``window``'s span instead (see
+    :func:`item_id_for`).
     """
 
     snippet: Snippet
@@ -286,9 +245,10 @@ def triage_documents(
 ) -> pd.DataFrame:
     """Window, score and prune in-memory 6-K document rows.
 
-    ``artifacts`` is a pre-loaded ``(model, threshold)`` pair; callers looping
-    over partitions pass it so the pickle is deserialized once per run rather
-    than once per partition, as the 8-K classifier does (#76).
+    ``artifacts`` is a pre-loaded ``(model, threshold)`` pair; when ``None`` the
+    model is loaded from ``model_dir``. ``client`` defaults to
+    :func:`default_triage_client`, built only if a stage-2 call is needed.
+    Returns one row per judged snippet; empty when nothing passes stage 1.
     """
     if documents.empty:
         return _empty_snippets()
@@ -372,8 +332,6 @@ def _candidates_for_filing(
     )
     candidates: list[_Candidate] = []
     for document_index, prose in enumerate(prose_documents(submission)):
-        # prepare_filing gates on debt vocabulary per document and windows what
-        # survives; the gate is why most filings produce nothing here.
         for window in prepare_filing(prose.text):
             candidates.append(
                 _Candidate(
@@ -389,11 +347,10 @@ def _candidates_for_filing(
 
 
 def _expand_admitted(plan: _FilingPlan, admitted: list[Snippet]) -> list[_SentSnippet]:
-    """Give each admitted window back the context its crop cut off (#172).
+    """Expand and merge one filing's admitted windows, document by document.
 
-    Grouped by document before expanding, because offsets only mean anything
-    within the text they index into: expanding across two documents would
-    splice unrelated text together, and `expand_admitted_windows` rejects it.
+    Each result takes its snippet id from the group's first member and its
+    score from the group's highest-scoring member.
     """
     by_snippet_id = {candidate.snippet_id: candidate for candidate in plan.candidates}
     scores = {snippet.snippet_id: snippet.score for snippet in admitted}
@@ -416,10 +373,6 @@ def _expand_admitted(plan: _FilingPlan, admitted: list[Snippet]) -> list[_SentSn
                     snippet=Snippet(
                         snippet_id=first.snippet_id,
                         text=expanded.window.text,
-                        # The strongest admission in the group. Stage 2 never
-                        # reads it; it is persisted as the row's
-                        # classification_score, where the weakest member's
-                        # would understate why the text was sent at all.
                         score=max(
                             scores[by_window_index[index].snippet_id]
                             for index in expanded.member_indices
@@ -441,14 +394,12 @@ def _judge_filings(
     concurrency: int,
     max_attempts: int | None,
 ) -> list[FilingVerdict | None]:
-    """Run stage 2 for every filing with admitted windows, bounded in flight.
+    """Run stage 2 concurrently for every filing with snippets to send.
 
-    One event loop for the whole batch, and a semaphore rather than a serial
-    loop: stage 2 sees a whole filing at once, so calls are independent and a
-    partition's worth of them is the natural unit of concurrency.
+    At most ``concurrency`` calls are in flight. Returns one verdict per plan,
+    ``None`` for a filing with nothing sent.
     """
-    # Built here, not by the caller: a batch whose filings all failed the gate
-    # makes no call, and must not need an API key to find that out.
+    # Built here so a batch that makes no call needs no API key.
     resolved_client = client or default_triage_client()
     semaphore = asyncio.Semaphore(concurrency)
     kwargs = {} if max_attempts is None else {"max_attempts": max_attempts}
@@ -500,9 +451,8 @@ def _snippet_rows(
         elif snippet.snippet_id in no_details:
             resolved = VERDICT_DROPPED_NO_DETAILS
         else:
-            # validate_verdict requires the answer to partition the ids, so
-            # this is unreachable through triage_filing; be explicit rather
-            # than silently mark an unjudged window relevant.
+            # Unreachable through triage_filing; never mark an unjudged
+            # snippet relevant.
             resolved = VERDICT_DROPPED_NO_DETAILS
         rows.append(_snippet_row(plan.document, item, resolved, duplicates))
     return rows
@@ -530,32 +480,25 @@ def _snippet_row(
         "cik": document.get("cik"),
         "company_name": document.get("company_name"),
         "url": document.get("url"),
-        # What the extractor reads: the expanded, possibly merged text, not
-        # the crop stage 1 scored.
         "text": item.window.text,
         "date": document.get("date"),
-        # Kept so a snippet can be traced to the submission it came from.
         "resource_uri": document.get("resource_uri"),
-        # 8-K itemizer fields with no 6-K analogue: a window has no declared
-        # item information, no per-item extraction status, and its duplicate
-        # decision is stage 2's, recorded in sixk_verdict.
+        # 8-K itemizer fields with no 6-K analogue; duplicates are recorded in
+        # sixk_verdict instead.
         "item_information": None,
         "extraction_status": None,
         "duplicate_resolution": None,
         # The document's own <TYPE>: 6-K, EX-99.1, ...
         "section_heading": candidate.document_type,
-        # Windows are character spans, not line ranges, so the line columns
-        # stay null and the span goes in the sixk_* columns below.
+        # Snippets are character spans, recorded in the sixk_* columns.
         "start_line": None,
         "end_line": None,
         "section_char_count": len(item.window.text),
-        # Same vocabulary as the 8-K classifier, so one consumer reading
-        # `label` across both genres sees one set of values.
+        # Same vocabulary as the 8-K classifier.
         "label": "relevant" if relevant else "irrelevant",
         "relevance": relevant,
         "classification_score": snippet.score,
-        # The expanded span, so the row's offsets and its text agree; the
-        # admitted crops inside it are named by sixk_member_windows.
+        # The expanded span, matching `text`.
         "sixk_window_start": item.window.start,
         "sixk_window_end": item.window.end,
         "sixk_token_count": item.window.token_count,
@@ -595,7 +538,16 @@ def triage_pending_documents(
     max_attempts: int | None = None,
     renew: Callable[[], None] | None = None,
 ) -> pd.DataFrame:
-    """Triage pending 6-K document partitions into snippet partitions."""
+    """Triage pending 6-K document partitions into snippet partitions.
+
+    A documents partition is pending when its fingerprint changed since it was
+    last triaged, or always with ``force``. Writes a snippets partition for each
+    one that yields rows, the completion registry and a run manifest; ``renew``
+    is called at each batch boundary. Returns the concatenated snippets.
+
+    Raises:
+        ValueError: If ``batch_size`` or ``concurrency`` is not positive.
+    """
     if batch_size <= 0:
         msg = f"batch_size must be positive, got {batch_size}"
         raise ValueError(msg)
@@ -609,11 +561,8 @@ def triage_pending_documents(
     visited_document_paths: set[str] = set()
     empty_partitions = 0
     total_documents = 0
-    # Fingerprint-keyed selection, like itemize and classify: a documents
-    # partition ingest merged new rows into is pending again and recomputed
-    # whole. Unlike those two this stage costs an LLM call per filing, so the
-    # recompute is not free — but a partition only changes when ingest actually
-    # merged something into it, and stage 2 is ~$0.25 per 1,000 filings (#62).
+    # A partition ingest merged rows into is recomputed whole, at one LLM call
+    # per filing with admitted windows.
     pending_with_fingerprints, registry = pending_source_partitions(
         STAGE_NAME,
         SIXK_DOCUMENT_DATASET_NAME,
@@ -687,8 +636,8 @@ def triage_pending_documents(
                 perf_counter() - partition_start,
             )
 
-        # Persist completion at every batch boundary and renew the lease there,
-        # for the reasons itemize and classify do (#111, #88).
+        # Persist completion and renew the writer lease per batch, so an
+        # interruption keeps finished batches and a long run keeps its lease.
         for document_path in chunk_paths:
             registry[document_path] = CompletedPartition(
                 fingerprint=source_fingerprints.get(document_path)
