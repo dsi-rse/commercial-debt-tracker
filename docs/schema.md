@@ -287,7 +287,7 @@ Columns:
 
 Primary key: `debt_instrument_mention_id`
 
-Rows publish from extractor states `SUCCESS` and `PARTIAL` (#152). A `PARTIAL` row salvaged what a terminal failure left intact — individually valid entries after a final `instrument_ie` validation failure, or mentions without lineage after a terminal `instrument_relation` failure — and also carries a failure-registry entry recording what was lost.
+Rows publish from extractor states `SUCCESS` and `PARTIAL` (#152). A `PARTIAL` row published less than a clean pass would, and also carries a failure-registry entry recording what was lost. Three things produce one: individually valid entries salvaged after a final `instrument_ie` validation failure, or mentions without lineage after a terminal `instrument_relation` failure (both #152); or a stage the provider aborted to its resend cap, which publishes whatever the row had already earned without the stage that was refused (#127).
 
 #### Evidence payload shapes
 

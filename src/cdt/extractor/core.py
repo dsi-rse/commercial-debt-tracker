@@ -57,6 +57,55 @@ from cdt.storage import (
 
 LOGGER = get_logger(__name__)
 DEFAULT_MAX_ATTEMPTS = 3
+# One budget for every stage, `--max-attempts`. #127 proposed giving NER more
+# on the reasoning that it is the only stage that must reproduce the item
+# verbatim, so it is the only one whose failures more attempts fix. The stored
+# corpora do not support the number: the NER-calls-per-row histogram over all
+# 761 rows is {1: 756, 2: 3, 3: 2}, so only two rows ever reached the cap, and
+# one of those is MPLX, whose third call is the give-up #176 now rejects -- it
+# would run to the larger budget and still fail. That leaves a single row
+# (`000133146326000103-2-03`, FHLB Boston) as the whole case, and the evidence
+# for it is that it passed on a *rerun* of the same arm, which is cross-run
+# variance rather than a fourth attempt recovering anything within a run.
+#
+# Against that, a bigger NER budget is paid on the most expensive call in the
+# pipeline -- the one stage that echoes the whole item back -- by every row
+# that legitimately exhausts, and by every row #176's guards now correctly
+# reject. Raise it again only with a measurement of attempts 4-6 on a fresh
+# window, and only after re-reading #176's ordering note: each extra attempt
+# is another chance for the model to pass NER by returning the input untagged.
+# A `content_filter` abort is not a verdict on the row and is not billed:
+# eleven of thirteen live NER calls against `openai/gpt-5.6-terra` came back
+# `finish_reason=content_filter` with `completion_tokens=0`, `prompt_tokens=0`
+# and `cost=0.0` -- aborted upstream, unbilled -- and the cut point is
+# nondeterministic, three repeats of one item giving 1,163 / 280 / 1,375
+# characters (#127, #135). So resending is both the correct remedy and a free
+# one.
+#
+# It is classified by the *callers*, before `handle_response`, for the same
+# reason every other unbilled failure is: a connection reset, a timeout, a 429
+# or a 5xx raises and is caught by `is_infrastructure_error`, so it never
+# becomes an attempt at all. A filtered response differs only in arriving as a
+# normal 200 with a body (see `completion_result_from_batch_line`), not in
+# kind. Scoring it and then exempting it from the budget would make every
+# cross-attempt check -- the give-up check and the high-water mark -- read a
+# call the model never answered as earlier work the model is now regressing
+# against.
+#
+# The cap is not about the cost of retrying. It is there because the
+# non-billing claim is *unverified*: thirteen calls against one model, and
+# internally inconsistent (280-1,375 characters of text alongside
+# `completion_tokens=0`). The batch route reports no `cost` field at all, so it
+# cannot be checked there. The cap bounds the damage if the assumption is
+# wrong, and the resend is logged so it can be noticed.
+#
+# `max_tokens` is deliberately still unset: the evidence says the length cap
+# was never the constraint (it rescued one item and broke another).
+MAX_CONTENT_FILTER_RESENDS = 6
+# Status for an attempt the provider aborted: a call was made, but it returned
+# no answer to score. Distinct from "FAILED", which means the model answered
+# and the answer was rejected -- the difference every cross-attempt check needs.
+ABORTED_ATTEMPT_STATUS = "ABORTED"
 # PARTIAL rows publish their mentions like SUCCESS but also keep a failure
 # registry entry recording what salvage dropped (#152).
 PUBLISHABLE_ROW_STATES = frozenset({"SUCCESS", "PARTIAL"})
@@ -658,6 +707,45 @@ class ExtractionRowState:
             messages=new_messages,
         )
 
+    def record_unbilled_abort(
+        self, response: str, completion: CompletionResult
+    ) -> None:
+        """Log a call the provider aborted, without scoring it (#127, #135).
+
+        The outstanding attempt is left exactly as it was, so the caller
+        re-sends the identical request and the model's next real answer is
+        scored as the attempt it actually is. Nothing here touches
+        ``current_attempt``: no response, no ``attempt_index`` bump, no
+        validation. There is nothing for the model to correct, so the repair
+        conversation ``retry`` builds -- the aborted response as an assistant
+        turn plus a complaint about it -- would be noise every later call in
+        the row pays prompt tokens for.
+
+        The abort is still appended to ``all_attempts`` so the audit log and
+        #135's telemetry keep a true record of the calls made, and so the
+        resend cap survives a process exit: the batch backend folds one
+        response per tick, so the count has to come from state that
+        ``to_state_dict`` already round-trips rather than from a local.
+
+        ``messages`` is deliberately left empty: the request is by construction
+        identical to the one on the attempt that eventually gets scored, and
+        copying it per abort is what made a persistently filtered row's state
+        grow several-fold.
+        """
+        self.all_attempts.append(
+            AttemptRecord(
+                stage_name=self.current_attempt.stage_name,
+                attempt_index=self.current_attempt.attempt_index,
+                response=response,
+                status=ABORTED_ATTEMPT_STATUS,
+                finish_reason=completion.finish_reason,
+                refusal=completion.refusal,
+                usage=completion.usage,
+                response_id=completion.response_id,
+                served_model=completion.served_model,
+            )
+        )
+
     def finish(self, state: str) -> None:
         """Finish processing for this row.
 
@@ -808,6 +896,144 @@ class OpenRouterChatClient:
         return completion_result_from_response(response)
 
 
+# A bare opening tag: NER output carries no attributes, but the high-water
+# check below counts tags in *earlier* attempts too, and those are exactly the
+# responses that failed — truncated mid-document, or never well-formed XML at
+# all. So the count is a regex rather than a parse, and tolerates an attribute
+# it should never see.
+DEBT_INSTRUMENT_OPEN_TAG_RE = re.compile(r"<debt_instrument(?:\s[^>]*)?>")
+
+
+# Every tag `NERStage.validate` accepts, and the entity subset of it. `body` is
+# the wrapper the stage supplies itself, so it is not evidence the model tagged
+# anything -- an untagged echo carries it.
+NER_ALLOWED_TAGS = frozenset(
+    {
+        "body",
+        "person",
+        "organization",
+        "debt_instrument",
+        "agreement",
+        "date",
+        "duration",
+        "amount",
+        "interest_rate",
+    }
+)
+NER_ENTITY_TAGS = NER_ALLOWED_TAGS - {"body"}
+NER_ENTITY_OPEN_TAG_RE = re.compile(
+    r"<(?:" + "|".join(sorted(NER_ENTITY_TAGS)) + r")(?:\s[^>]*)?>"
+)
+
+
+def count_ner_entity_tags(response: str | None) -> int:
+    """Count opening entity tags in one raw NER response.
+
+    A regex for the same reason `count_debt_instrument_tags` is one: the
+    callers include attempts that failed, and those are exactly the responses
+    that did not parse as XML.
+    """
+    if not response:
+        return 0
+    return len(NER_ENTITY_OPEN_TAG_RE.findall(response))
+
+
+def prior_attempt_tagged(row_state: ExtractionRowState, stage_name: str) -> bool:
+    """Whether any earlier attempt on this row tagged anything at all (#176).
+
+    The condition the byte-identical-echo check needs. "Returning the input
+    verbatim addresses nothing" is only true once the model has shown it can
+    find something in this item: dropping to a bare echo is then a regression
+    against its own work. On an item the model has never tagged, the same
+    response is the honest answer, and the `NODEBT_NER` fixture is exactly
+    that.
+
+    Deliberately any entity tag, not just `debt_instrument`. A response that
+    tagged an organization and a date and then regressed to a bare echo has
+    given up just as surely, and `prior_debt_instrument_high_water` -- which
+    asks the narrower question that drives `early_stop` -- reads zero for it.
+
+    Attempts the provider aborted are excluded, for the reason the status
+    exists at all: an abort is not the model answering, so its body is not the
+    model's work to regress against. The text on an `ABORTED` record is
+    whatever the provider had emitted before it cut, and it is tagged -- all 58
+    `content_filter` responses in the stored corpora carry between 9 and 107
+    entity tags and at least one `debt_instrument` tag, with no empty bodies.
+    Counting them turned an honest untagged echo into a rejection the model
+    cannot act on: the abort contributes no assistant turn, so "re-emit your
+    previous tagged output" names work that is not in its context, and the row
+    exhausted its budget and died FAILED. That is the regression the
+    `attempt_index > 1` gate was replaced to avoid, reached by another route.
+    """
+    return any(
+        count_ner_entity_tags(attempt.response)
+        for attempt in row_state.all_attempts
+        if attempt.stage_name == stage_name and attempt.status != ABORTED_ATTEMPT_STATUS
+    )
+
+
+def ner_input_body(row_state: ExtractionRowState) -> str:
+    """Return the exact `<body>`-wrapped text the NER stage sends the model.
+
+    Only `NERStage.preprocess` needs it now. It was introduced so that
+    `validate`'s give-up check could compare a response against precisely what
+    the model was handed, but that check asks for a tag count instead, which
+    needs no copy of the request and cannot drift from it (#176). The text is
+    wrapped unescaped, which is deliberate and load-bearing elsewhere -- an
+    item containing a bare `&` produces a response that only parses after
+    `repair_unescaped_ampersands`.
+    """
+    return f"<body>{row_state.text}</body>"
+
+
+def count_debt_instrument_tags(response: str | None) -> int:
+    """Count `<debt_instrument>` opening tags in one raw NER response.
+
+    Deliberately not `parse_tag_details`: the callers include failed attempts,
+    whose responses are the ones that did not parse (11 of 27 NER failures on
+    the PR #57 window were `Response is not valid XML`, #127). A truncated
+    response with an unclosed tag still tells us the model was tagging, which
+    is the only question the high-water mark asks.
+    """
+    if not response:
+        return 0
+    return len(DEBT_INSTRUMENT_OPEN_TAG_RE.findall(response))
+
+
+def prior_debt_instrument_high_water(
+    row_state: ExtractionRowState, stage_name: str
+) -> int:
+    """Most `debt_instrument` tags any earlier attempt on this row produced.
+
+    `all_attempts` holds the completed attempts -- `retry` appends the outgoing
+    one before building the next -- so this never sees the response being
+    validated. `to_state_dict`/`from_state_dict` already round-trip
+    `all_attempts` in full, so the batch backend resumes with the same
+    high-water mark and needed no schema change (#176).
+
+    Attempts the provider aborted are excluded, the same way
+    `prior_attempt_tagged` excludes them. The
+    judgement here is closer than it looks, and is made deliberately rather
+    than inherited: a truncated abort that tagged four instruments really is
+    evidence the item discloses debt, so reading it would catch a give-up this
+    now misses. It is excluded anyway, because the failure it raises tells the
+    model "an earlier attempt on this item tagged N -- keep every tag you
+    found", and on an aborted call the model neither produced those tags nor
+    can see them. A guard the model cannot satisfy costs the row its whole
+    budget and publishes nothing. If this is ever reconsidered, the retry
+    message has to change with it.
+    """
+    return max(
+        (
+            count_debt_instrument_tags(attempt.response)
+            for attempt in row_state.all_attempts
+            if attempt.stage_name == stage_name
+            and attempt.status != ABORTED_ATTEMPT_STATUS
+        ),
+        default=0,
+    )
+
+
 class NERStage:
     """NER stage using XML-tagged output."""
 
@@ -817,13 +1043,89 @@ class NERStage:
         prompt = load_prompt("ner")
         return [
             {"role": "system", "content": prompt},
-            {"role": "user", "content": f"<body>{row_state.text}</body>"},
+            {"role": "user", "content": ner_input_body(row_state)},
         ]
 
     def validate(self, row_state: ExtractionRowState, response: str) -> list[str]:
+        """Check one NER response, and what it lost against the row's earlier ones.
+
+        The six structural checks below are each correct alone, and together
+        they admit the response that motivated #176: a bare
+        `<body>{input}</body>` with zero tags is well-formed, correctly rooted,
+        uses no disallowed tag, carries no attributes, has no empty tag, and
+        strips to text identical to the input. `early_stop` then reads zero
+        `debt_instrument` tags as "this filing disclosed no debt" and the row
+        publishes SUCCESS with no mentions -- indistinguishable downstream from
+        a genuine zero, and its completion record makes a re-run skip it.
+
+        MPLX item 2.03 (`000119312519257376-2-03`) is the case: attempts 1 and 2
+        tagged 91 `debt_instrument` spans each and failed only the copy-fidelity
+        check, and attempt 3 returned the model's own input byte for byte,
+        passed, and published 0 mentions against six note series and a term
+        loan. `000121390026025721-1-01` is the same story at 15 spans.
+
+        Two cross-attempt checks close it, because the row already held the
+        evidence to tell a give-up from a genuine zero:
+
+        * a high-water mark -- zero `debt_instrument` tags is a failure when an
+          earlier attempt on this row found some. It cannot misfire on a
+          debt-free item, which found none on attempt 1 either.
+        * a response that tags nothing at all, once an earlier attempt on this
+          row has tagged something. That is what makes a give-up a give-up: the
+          model found something here before and has now returned none of it --
+          not the attempt number it arrived on, and not the exact bytes it
+          returned. On an item the model has never tagged, an untagged response
+          is the honest answer, and the `NODEBT_NER` fixture is exactly that.
+
+          Stated as a tag count rather than as "byte-identical to the input",
+          which is what it was first written as. The copy-fidelity check below
+          already guarantees the text is the input, so "no tags" is the whole
+          of the question, and asking it that way cannot be stepped around by
+          whitespace: an echo with one extra space, a newline inside `<body>`,
+          or doubled inter-word spacing cleared the byte comparison while
+          `collapse_whitespace` let it clear copy fidelity too. It also removes
+          the need for the check to rebuild the request string, so there is no
+          second copy to keep in step with `preprocess`.
+
+          The check is deliberately not unconditional, and the corpus is why:
+          over the three stored corpora that carry attempt logs (761 attempt-1
+          NER responses in `genwindow-run-branch`, `genwindow-run-dev`,
+          `genwindow-sol-retried`), no attempt-1 response was a byte-identical
+          echo and the 63 carrying no `debt_instrument` tag all carried some
+          other tag. So rejecting every untagged echo would have bought nothing
+          and cost legitimate zero-instrument items their rows. The single echo
+          anywhere in the corpus is MPLX's attempt 3.
+        """
         if not response or not isinstance(response, str):
             return [
                 "Model returned empty or non-text output. Even if no entities are present, return the input text."
+            ]
+
+        # Compared before the ampersand repair, and against a string built by
+        # the same helper that built the request: the give-up this names is a
+        # byte-for-byte echo of what the model was sent.
+        #
+        # Gated on the model having tagged something earlier on this row, not
+        # on the attempt number. `attempt_index > 1` was a proxy for "the model
+        # has been shown its error and told to fix it", and it is the wrong
+        # one: an item that genuinely has nothing to tag, whose first attempt
+        # failed for a reason that itself tagged nothing -- malformed XML, a
+        # wrong-text wrapper -- answers honestly with a bare echo, and that was
+        # being rejected on every remaining attempt until the row died FAILED.
+        # Measured against `dev`, such a row went from SUCCESS in 2 calls to
+        # FAILED in 3, the stage's whole budget.
+        #
+        # A prior failure that *did* tag something is the opposite case and is
+        # still rejected, truncation included -- a truncated response carries
+        # opening tags, so it counts as earlier work
+        # (`test_an_echo_after_a_truncated_tagged_attempt_is_still_rejected`).
+        if prior_attempt_tagged(row_state, self.name) and not count_ner_entity_tags(
+            response
+        ):
+            return [
+                "Response contains no tags at all, but an earlier attempt on this item "
+                "tagged entities, so this response drops every one of them. Re-emit "
+                "your previous tagged output with the text corrected."
             ]
 
         response = repair_unescaped_ampersands(response)
@@ -835,19 +1137,8 @@ class NERStage:
             return ["Response root must be <body>."]
 
         failures: list[str] = []
-        allowed_tags = {
-            "body",
-            "person",
-            "organization",
-            "debt_instrument",
-            "agreement",
-            "date",
-            "duration",
-            "amount",
-            "interest_rate",
-        }
         for element in root.iter():
-            if element.tag not in allowed_tags:
+            if element.tag not in NER_ALLOWED_TAGS:
                 failures.append(f"Disallowed tag found: {element.tag}")
             if element.tag != "body" and element.attrib:
                 failures.append("Tags contain attributes; only bare tags are allowed.")
@@ -858,6 +1149,14 @@ class NERStage:
         if collapse_whitespace(plain_text) != collapse_whitespace(row_state.text):
             failures.append(
                 "Response text with tags stripped must match the input text exactly."
+            )
+
+        high_water = prior_debt_instrument_high_water(row_state, self.name)
+        if high_water and not count_debt_instrument_tags(response):
+            failures.append(
+                f"Response contains no <debt_instrument> tags, but an earlier attempt "
+                f"on this item tagged {high_water}. Keep every tag you found and "
+                f"correct only the text."
             )
         return failures
 
@@ -876,10 +1175,23 @@ class NERStage:
         )
 
     def build_retry_message(self, failures: list[str]) -> str:
+        """Build the NER retry turn, asking for a repair rather than a redo.
+
+        The version this replaces listed only what the *text* had to satisfy --
+        "return the original input text exactly", "the stripped text must match
+        the original input exactly" -- and made tagging sound optional ("only
+        add the allowed bare tags"). The cheapest response satisfying every
+        bullet was to add nothing, and on MPLX item 2.03 that is what came back
+        (#176). The preserve clause goes first so the instruction the model is
+        most likely to follow is the one it was previously missing.
+        """
         return (
             "Your previous NER output failed validation.\n"
             f"Validation errors: {failures}\n"
             "Retry requirements:\n"
+            "- Keep every tag from your previous output. Fix only the text so it "
+            "matches the input exactly.\n"
+            "- Returning the input untagged is not a valid fix; it will be rejected.\n"
             "- Return the original input text exactly, wrapped in <body>...</body>.\n"
             "- Only add the allowed bare tags.\n"
             "- Do not add attributes, comments, or extra text.\n"
@@ -2768,8 +3080,17 @@ def handle_response(
     """Advance one row given the response to its outstanding request.
 
     Applies the current stage's validate/postprocess, then either advances to the
-    next stage, schedules a retry, or terminates the row. Returns the messages for
-    the next LLM call, or None when the row has reached a terminal state.
+    next stage, schedules a retry, or terminates the row. Returns the messages
+    for the next LLM call, or None when the row has reached a terminal state.
+
+    Every call that reaches here is a scored attempt: the model answered, and
+    the answer is either accepted or rejected. Calls the provider aborted never
+    arrive, because both backends classify them first and re-send without
+    scoring (`is_content_filter_abort`, `ExtractionRowState.record_unbilled_abort`)
+    -- the same place and for the same reason an infrastructure error is
+    classified before it can become an attempt (#127, #135).
+
+    `max_attempts` is the budget, and it is the same for every stage.
     """
     stage = STAGE_BY_NAME[row_state.current_attempt.stage_name]
     stage_index = STAGE_INDEX[stage.name]
@@ -2786,6 +3107,145 @@ def handle_response(
     return list(row_state.current_attempt.messages)
 
 
+def is_content_filter_abort(completion: CompletionResult | None) -> bool:
+    """Whether the provider aborted this response instead of the model ending it.
+
+    The distinction is the whole content of #135: without `finish_reason` an
+    upstream abort and a model that chose to stop look identical in the audit
+    log, and they need opposite remedies -- resend the same request, versus
+    change the request.
+    """
+    return completion is not None and completion.finish_reason == "content_filter"
+
+
+def count_content_filter_aborts(row_state: ExtractionRowState, stage_name: str) -> int:
+    """Count this stage's calls on this row that the provider aborted unscored.
+
+    Read off `all_attempts` rather than a counter held by the caller, because
+    the batch backend folds one response per tick: the cap has to survive a
+    process exit, and `to_state_dict` already round-trips these records.
+    """
+    return sum(
+        1
+        for attempt in row_state.all_attempts
+        if attempt.stage_name == stage_name and attempt.status == ABORTED_ATTEMPT_STATUS
+    )
+
+
+def terminate_on_provider_aborts(
+    row_state: ExtractionRowState, stage: StageSpec, aborts: int
+) -> None:
+    """End a row the provider will not process, without blaming the model.
+
+    Reaching `MAX_CONTENT_FILTER_RESENDS` means "stop re-sending", not "the
+    model answered badly". Scoring the abort instead -- which is what falling
+    through to `handle_response` would do -- charges the row for a call it
+    never got an answer to, grows the retry conversation with an empty
+    assistant turn plus a complaint about it, and leaves a `FAILED` attempt
+    that every cross-attempt check in #176 reads as the model having failed --
+    one abort past the cap was enough to reject the honest answer that followed
+    it.
+
+    #152's rule still applies to what the row already earned, and it applies
+    the same way `_salvage_or_fail` applies it after a scored failure: a stage
+    the provider will not run costs the item what that stage would have added,
+    not what earlier stages already validated. The two paths kept diverging on
+    `instrument_ie` -- a row with a salvageable response finished PARTIAL with
+    its mentions after three rejected answers, and FAILED with none if the
+    provider aborted instead -- so both now ask the same two questions in the
+    same order.
+
+    The note names both causes when there are two. `count_content_filter_aborts`
+    is a per-stage lifetime count with no reset, which is deliberate -- it is
+    what bounds the damage one item can do, and it survives a process exit --
+    but it means the aborts need not have been consecutive, and the note used
+    to claim they were and that "no attempt was scored". On a row that was
+    aborted, answered badly, then aborted again, both halves were false, and
+    `summarize_failure` prefers salvage notes over `validation_errors`, so the
+    model's actual error never reached the registry at all. An operator read
+    "the provider refused to serve this item" and went to the vendor while the
+    extraction defect stayed invisible.
+    """
+    scored_failures = [
+        attempt
+        for attempt in row_state.all_attempts
+        if attempt.stage_name == stage.name and attempt.status == "FAILED"
+    ]
+    note = (
+        f"{stage.name} aborted by the provider on {aborts} of its calls "
+        f"(finish_reason=content_filter)"
+    )
+    if scored_failures:
+        errors = "; ".join(scored_failures[-1].validation_errors) or (
+            "no validation errors recorded"
+        )
+        plural = "s" if len(scored_failures) > 1 else ""
+        note += (
+            f"; {len(scored_failures)} scored attempt{plural} also failed, most "
+            f"recently: {errors}"
+        )
+    else:
+        note += "; no attempt was scored"
+    if stage.name == InstrumentIEStage.name:
+        # A response rejected as a whole can still hold individually valid
+        # entries, and they are in `stage_responses` already -- the aborts came
+        # after it, not instead of it. Published without lineage, because the
+        # relation stage is where the provider stopped.
+        dropped = salvage_instrument_ie_entries(row_state)
+        if dropped is not None:
+            stage.postprocess(row_state)
+            if row_state.debt_instrument_mentions:
+                row_state.salvage_notes.append(
+                    f"{note}; the entries its last scored answer validated are "
+                    "published without lineage relations"
+                )
+                row_state.finish("PARTIAL")
+                return
+    if (
+        stage.name == InstrumentRelationStage.name
+        and row_state.debt_instrument_mentions
+    ):
+        row_state.salvage_notes.append(
+            f"{note}; mentions published without lineage relations"
+        )
+        row_state.finish("PARTIAL")
+        return
+    row_state.salvage_notes.append(note)
+    row_state.finish("FAILED")
+
+
+def handle_provider_abort(
+    row_state: ExtractionRowState, completion: CompletionResult
+) -> bool:
+    """Record an unbilled provider abort. True if the request should go back out.
+
+    Shared by both backends so the live loop and the batch fold cannot drift on
+    a decision neither of them scores. Returns False when the resend cap is
+    reached and the row has been terminated (#127, #135).
+    """
+    stage = STAGE_BY_NAME[row_state.current_attempt.stage_name]
+    resend = (
+        count_content_filter_aborts(row_state, stage.name) < MAX_CONTENT_FILTER_RESENDS
+    )
+    row_state.record_unbilled_abort(completion.text, completion)
+    aborts = count_content_filter_aborts(row_state, stage.name)
+    LOGGER.warning(
+        "Provider aborted item=%s stage=%s abort=%s/%s (finish_reason=%s, "
+        "usage=%s); %s",
+        row_state.item_id,
+        stage.name,
+        aborts,
+        MAX_CONTENT_FILTER_RESENDS + 1,
+        completion.finish_reason,
+        completion.usage,
+        "re-sending unscored" if resend else "resend cap reached, terminating row",
+    )
+    if resend:
+        return True
+    terminate_on_provider_aborts(row_state, stage, aborts)
+    return False
+
+
 def _advance_after_stage(
     row_state: ExtractionRowState,
     stage: StageSpec,
@@ -2793,6 +3253,25 @@ def _advance_after_stage(
 ) -> list[dict[str, str]] | None:
     """Move one row past a completed stage: finish it or start the next stage."""
     if stage.early_stop(row_state):
+        # A zero-tag NER response that got this far is the honest "this filing
+        # disclosed no debt", and it finishes SUCCESS whether or not the row
+        # needed a retry to produce it.
+        #
+        # It used to finish PARTIAL when the row had retried, on the reasoning
+        # that a model which already failed once is as likely to be giving up
+        # as reporting a genuine zero, so the outcome should be filed as a
+        # possible loss. The reasoning was sound and the remedy was not: a
+        # PARTIAL row is terminal like any other, so `terminal_ids` records it
+        # and the next run skips it (`collect_pending_extract_items`). It
+        # bought a registry entry and no re-extraction, while asserting a loss
+        # that nothing had evidence for.
+        #
+        # A give-up the row *does* hold evidence for is a validation failure
+        # instead -- `validate`'s high-water mark and give-up check both reject
+        # one -- so it retries to the stage's budget and then terminates FAILED
+        # through the ordinary path, which is both counted and re-extractable.
+        # Where there is no earlier tagging to compare against there is no
+        # evidence either way, and a clean zero is the honest reading (#176).
         row_state.finish("SUCCESS")
         return None
     if stage_index == len(EXTRACTOR_STAGES) - 1:
@@ -2921,6 +3400,14 @@ async def run_extraction_workflow(
                 raise InfrastructureError(f"{type(exc).__name__}: {exc}") from exc
             record_stage_error(row_state, f"{type(exc).__name__}: {exc}")
             return row_state
+        if is_content_filter_abort(completion):
+            # Classified here, beside the infrastructure branch above, because
+            # it is the same kind of event: the provider returned no answer, so
+            # there is nothing to score and nothing for the model to correct.
+            # `messages` is untouched, so the identical request goes back out.
+            if not handle_provider_abort(row_state, completion):
+                return row_state
+            continue
         messages = handle_response(
             row_state,
             completion.text,

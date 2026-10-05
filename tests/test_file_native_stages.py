@@ -2505,6 +2505,1166 @@ def test_ner_validate_still_rejects_a_stray_angle_bracket() -> None:
     assert failures and "not valid XML" in failures[0]
 
 
+# --------------------------------------------------------------------------- #
+# #176: a NER retry must not pass by returning the input untagged
+# --------------------------------------------------------------------------- #
+
+# MPLX item 2.03 (`000119312519257376-2-03`) in miniature: one note series the
+# model tags, in an item whose verbatim reproduction it then gets wrong.
+MPLX_TEXT = "The Company issued 6.250% Senior Notes due 2022."
+MPLX_TAGGED_BUT_UNFAITHFUL = (
+    "<body>The Company issued <debt_instrument>6.250% Senior Notes due "
+    "2022</debt_instrument>!</body>"
+)
+MPLX_IE = json.dumps([{"name": ["tag-1"]}])
+# The same tagging with the text left exactly as it was given.
+MPLX_TAGGED = (
+    "<body>The Company issued <debt_instrument>6.250% Senior Notes due "
+    "2022</debt_instrument>.</body>"
+)
+
+
+def _ner_row(text: str) -> ExtractionRowState:
+    return ExtractionRowState(
+        item_row={"item_id": "item-1", "text": text}, stage_name="ner"
+    )
+
+
+def test_ner_validate_rejects_a_zero_tag_retry_after_an_earlier_attempt_tagged() -> (
+    None
+):
+    """The high-water mark: dropping every tag on retry is a failure (#176)."""
+    from cdt.extractor.core import AttemptRecord
+
+    row_state = _ner_row(MPLX_TEXT)
+    row_state.all_attempts.append(
+        AttemptRecord(
+            stage_name="ner",
+            attempt_index=1,
+            response=MPLX_TAGGED_BUT_UNFAITHFUL,
+            status="FAILED",
+        )
+    )
+
+    # Valid, faithful, and carrying no `debt_instrument` -- it passes all six
+    # structural checks. Tagged with a `date` so it is not also a byte echo,
+    # which isolates the high-water check from the echo check.
+    failures = NERStage().validate(
+        row_state,
+        "<body>The Company issued 6.250% Senior Notes due <date>2022</date>.</body>",
+    )
+
+    assert failures
+    assert any("no <debt_instrument> tags" in failure for failure in failures)
+    # The message quotes the count so the retry turn names what was lost.
+    assert any("tagged 1" in failure for failure in failures)
+
+
+def test_ner_validate_high_water_never_misfires_on_a_debt_free_item() -> None:
+    """An item with no debt found none on attempt 1 either, so nothing regresses (#176).
+
+    This is the check that makes the high-water mark safe to apply
+    unconditionally: it is a comparison against the row's own history, not a
+    floor on how many tags a response must carry.
+    """
+    from cdt.extractor.core import AttemptRecord
+
+    text = "Acme Corp filed this report on January 1, 2024."
+    row_state = _ner_row(text)
+    row_state.all_attempts.append(
+        AttemptRecord(
+            stage_name="ner",
+            attempt_index=1,
+            response="not xml at all",
+            status="FAILED",
+        )
+    )
+    response = (
+        "<body><organization>Acme Corp</organization> filed this report on "
+        "<date>January 1, 2024</date>.</body>"
+    )
+
+    assert NERStage().validate(row_state, response) == []
+
+
+def test_ner_high_water_counts_tags_in_attempts_that_never_parsed() -> None:
+    """A truncated prior attempt still proves the model was tagging (#176, #127).
+
+    11 of 27 NER failures on the PR #57 window were `Response is not valid
+    XML`, so a high-water mark built on `parse_tag_details` would read zero for
+    exactly the attempts that matter most.
+    """
+    from cdt.extractor.core import (
+        AttemptRecord,
+        count_debt_instrument_tags,
+        prior_debt_instrument_high_water,
+    )
+
+    truncated = (
+        "<body>The Company issued <debt_instrument>6.250% Senior Notes"
+        "</debt_instrument> and <debt_instrument>5.250% Notes"
+    )
+    assert count_debt_instrument_tags(truncated) == 2
+
+    row_state = _ner_row(MPLX_TEXT)
+    row_state.all_attempts.append(
+        AttemptRecord(stage_name="ner", response=truncated, status="FAILED")
+    )
+    # Another stage's attempts are not this stage's history.
+    row_state.all_attempts.append(
+        AttemptRecord(
+            stage_name="instrument_ie",
+            response="<debt_instrument><debt_instrument><debt_instrument>",
+            status="FAILED",
+        )
+    )
+
+    assert prior_debt_instrument_high_water(row_state, "ner") == 2
+
+
+def test_ner_validate_rejects_a_byte_identical_echo_after_the_model_tagged() -> None:
+    """Returning the input verbatim is a regression against the model's own work (#176).
+
+    MPLX attempt 3 was byte-identical to the model's own input, `<body>`
+    wrapper included, and passed. Driven through `handle_response` rather than
+    hand-setting `attempt_index`: what makes the echo a give-up is that an
+    earlier attempt on this row tagged something, and only a driven row builds
+    that history the way production does.
+    """
+    from cdt.extractor.core import handle_response, ner_input_body
+
+    row_state = _ner_row(MPLX_TEXT)
+    row_state.current_attempt.messages = NERStage().preprocess(row_state)
+    assert handle_response(row_state, MPLX_TAGGED_BUT_UNFAITHFUL, max_attempts=3)
+
+    echo = ner_input_body(row_state)
+    assert echo == f"<body>{MPLX_TEXT}</body>"
+
+    failures = NERStage().validate(row_state, echo)
+
+    assert failures
+    assert any("drops every one of them" in failure for failure in failures)
+
+
+def test_ner_validate_rejects_an_echo_that_drops_non_debt_tags() -> None:
+    """Giving up is giving up even when the item has no debt (#176).
+
+    The high-water mark asks the narrower question that drives `early_stop`:
+    did an earlier attempt find a `debt_instrument`? A response that tagged an
+    organization and a date and then regressed to a bare echo reads zero there,
+    but the model has still discarded everything it found.
+    """
+    from cdt.extractor.core import handle_response
+
+    text = "Acme Corp filed this report on January 1, 2024."
+    row_state = _ner_row(text)
+    row_state.current_attempt.messages = NERStage().preprocess(row_state)
+    # Tags an organization and a date, and fails only copy fidelity.
+    unfaithful = (
+        "<body><organization>Acme Corp</organization> filed this report on "
+        "<date>January 1, 2024</date>!</body>"
+    )
+    assert handle_response(row_state, unfaithful, max_attempts=3)
+
+    failures = NERStage().validate(row_state, f"<body>{text}</body>")
+
+    assert failures
+    assert any("drops every one of them" in failure for failure in failures)
+
+
+def test_ner_validate_accepts_an_untagged_first_attempt() -> None:
+    """On attempt 1 an untagged echo is the honest answer for a debt-free item (#176).
+
+    The echo check is gated on earlier tagging for this reason, and was never
+    made unconditional for it. Measured over the three
+    stored corpora carrying attempt logs (`genwindow-run-branch`,
+    `genwindow-run-dev`, `genwindow-sol-retried`): of 761 attempt-1 NER
+    responses, zero were byte-identical echoes, and the 63 with no
+    `debt_instrument` tag all carried some other tag. The only echo in the
+    corpus is MPLX's attempt 3.
+
+    Driven through `handle_response` rather than calling `validate` directly,
+    because the boundary is exactly where `add_response` leaves
+    `attempt_index`: 1 on a first attempt, not 0. A direct `validate` call on a
+    freshly built row state sees 0, so it would pass an off-by-one guard that
+    rejects every genuine first attempt.
+    """
+    from cdt.extractor.core import handle_response
+
+    text = "This is the extracted event text."
+    row_state = _ner_row(text)
+    row_state.current_attempt.messages = NERStage().preprocess(row_state)
+
+    assert handle_response(row_state, f"<body>{text}</body>", max_attempts=3) is None
+
+    assert row_state.all_attempts[0].attempt_index == 1
+    assert row_state.all_attempts[0].validation_errors == []
+    # An item with nothing to tag is a clean zero, not a give-up.
+    assert row_state.state == "SUCCESS"
+    assert row_state.debt_instrument_mentions == []
+
+
+def test_an_untagged_echo_is_accepted_after_a_failure_that_found_nothing() -> None:
+    """The regression the old `attempt_index > 1` gate caused (#176).
+
+    A debt-free item whose first attempt failed for a reason unrelated to
+    tagging -- malformed XML here -- answers honestly with a bare echo on its
+    second. The old gate rejected that answer on every remaining attempt and
+    the row died FAILED after three whole-item calls -- the stage's whole
+    budget -- losing the item. Nothing
+    about the first attempt suggests the model can find anything here, so
+    there is no earlier work for the echo to regress against.
+
+    Nothing on this row is evidence of a give-up, so it finishes SUCCESS. The
+    zero used to be filed as a possible loss instead; see
+    `_advance_after_stage` for why that was dropped.
+    """
+    from cdt.extractor.core import (
+        PUBLISHABLE_ROW_STATES,
+        handle_response,
+        published_mention_rows,
+    )
+
+    text = "This is the extracted event text."
+    row_state = _ner_row(text)
+    row_state.current_attempt.messages = NERStage().preprocess(row_state)
+
+    assert handle_response(row_state, "not xml at all", max_attempts=3)
+    assert handle_response(row_state, f"<body>{text}</body>", max_attempts=3) is None
+
+    # Two calls, not three, and the echo itself was accepted.
+    assert len([a for a in row_state.all_attempts if a.response is not None]) == 2
+    assert row_state.all_attempts[0].status == "FAILED"
+    assert row_state.all_attempts[-1].validation_errors == []
+    assert row_state.all_attempts[-1].status == "SUCCESS"
+    assert row_state.state == "SUCCESS"
+    assert row_state.state in PUBLISHABLE_ROW_STATES
+    assert published_mention_rows(row_state) == []
+    assert row_state.salvage_notes == []
+
+
+def test_ner_high_water_is_the_most_any_attempt_found_not_the_least() -> None:
+    """The mark is the *maximum* across attempts, which is what makes it a guard (#176).
+
+    MPLX is the shape that needs it: attempt 1 tagged 91 spans, attempt 2 came
+    back malformed and tagged none, and attempt 3 was the untagged echo. Taking
+    the minimum -- or just the last -- would read zero off attempt 2, switch the
+    guard off, and let attempt 3 publish as a clean zero, which is the defect
+    #176 describes, verbatim.
+    """
+    from cdt.extractor.core import AttemptRecord, prior_debt_instrument_high_water
+
+    row_state = _ner_row(MPLX_TEXT)
+    row_state.all_attempts.append(
+        AttemptRecord(
+            stage_name="ner",
+            attempt_index=1,
+            response=MPLX_TAGGED_BUT_UNFAITHFUL,
+            status="FAILED",
+        )
+    )
+    row_state.all_attempts.append(
+        AttemptRecord(
+            stage_name="ner",
+            attempt_index=2,
+            response="not xml at all",
+            status="FAILED",
+        )
+    )
+
+    # Tag counts across this row's history are 1 then 0: the max is 1, while
+    # the min and the most recent are both 0.
+    assert prior_debt_instrument_high_water(row_state, "ner") == 1
+
+
+def test_ner_give_up_check_is_not_escaped_by_whitespace() -> None:
+    """Perturbing the whitespace must not buy a give-up a pass (#176).
+
+    The check was first written as "byte-identical to the input", and every
+    one of these clears that comparison: a trailing newline, a space after
+    `<body>`, newlines inside it, a space in the opening tag, doubled
+    inter-word spacing. None of them clears copy fidelity either way, because
+    that check runs on `collapse_whitespace`, so each one used to reach
+    `early_stop` as an accepted zero-tag response. Asking for a tag count
+    instead makes the whole family unreachable rather than enumerable.
+    """
+    from cdt.extractor.core import AttemptRecord
+
+    for response in (
+        f"<body>{MPLX_TEXT}</body>",
+        f"<body>{MPLX_TEXT}</body>\n",
+        f"<body> {MPLX_TEXT}</body>",
+        f"<body>\n{MPLX_TEXT}\n</body>",
+        f"<body >{MPLX_TEXT}</body>",
+        "<body>" + MPLX_TEXT.replace(" ", "  ") + "</body>",
+    ):
+        row_state = _ner_row(MPLX_TEXT)
+        row_state.all_attempts.append(
+            AttemptRecord(
+                stage_name="ner",
+                attempt_index=1,
+                response=MPLX_TAGGED_BUT_UNFAITHFUL,
+                status="FAILED",
+            )
+        )
+
+        failures = NERStage().validate(row_state, response)
+
+        assert any(
+            "drops every one of them" in failure for failure in failures
+        ), response
+
+
+def test_ner_high_water_accepts_a_reduced_but_nonzero_tag_count() -> None:
+    """The high-water check is exact-zero by design, and the boundary is deliberate.
+
+    A model that merges two adjacent spans into one has not given up, and no
+    false-positive rate has been measured for any ratio threshold. Pinned so
+    that tightening this to "fewer tags than before" is a visible decision
+    rather than a quiet one (#176).
+    """
+    from cdt.extractor.core import AttemptRecord
+
+    text = "The Company issued 6.250% Notes due 2022 and 5.250% Notes due 2025."
+    two_tags = (
+        "<body>The Company issued <debt_instrument>6.250% Notes due "
+        "2022</debt_instrument> and <debt_instrument>5.250% Notes due "
+        "2025</debt_instrument>.</body>"
+    )
+    one_tag = (
+        "<body>The Company issued <debt_instrument>6.250% Notes due 2022 and "
+        "5.250% Notes due 2025</debt_instrument>.</body>"
+    )
+    row_state = _ner_row(text)
+    row_state.all_attempts.append(
+        AttemptRecord(
+            stage_name="ner", attempt_index=1, response=two_tags, status="FAILED"
+        )
+    )
+
+    assert NERStage().validate(row_state, one_tag) == []
+
+
+def test_prior_attempt_tagged_reads_the_row_the_way_the_echo_guard_needs() -> None:
+    """The three properties the echo gate rests on (#176).
+
+    Mirrors `test_ner_high_water_counts_tags_in_attempts_that_never_parsed`
+    for the wider any-tag question the echo check asks.
+    """
+    from cdt.extractor.core import (
+        AttemptRecord,
+        count_ner_entity_tags,
+        prior_attempt_tagged,
+    )
+
+    # 1. `<body>` is the wrapper this stage supplies, not something the model
+    #    found, so an untagged echo must not count as having tagged anything.
+    assert count_ner_entity_tags("<body>plain text</body>") == 0
+    # 2. A truncated attempt that never parsed still proves the model was
+    #    tagging, which is why this counts by regex rather than by parse.
+    assert count_ner_entity_tags("<body>x <debt_instrument>Term Loa") == 1
+    assert count_ner_entity_tags("not xml at all") == 0
+
+    row_state = _ner_row(MPLX_TEXT)
+    # An earlier attempt that wrapped the input and tagged nothing.
+    row_state.all_attempts.append(
+        AttemptRecord(
+            stage_name="ner", response="<body>wrong text</body>", status="FAILED"
+        )
+    )
+    assert prior_attempt_tagged(row_state, "ner") is False
+
+    # 3. Another stage's attempts are not this stage's history.
+    row_state.all_attempts.append(
+        AttemptRecord(
+            stage_name="instrument_ie",
+            response="<organization>A</organization>",
+            status="FAILED",
+        )
+    )
+    assert prior_attempt_tagged(row_state, "ner") is False
+
+    row_state.all_attempts.append(
+        AttemptRecord(stage_name="ner", response="<body>x <date>2022", status="FAILED")
+    )
+    assert prior_attempt_tagged(row_state, "ner") is True
+
+
+def test_an_echo_is_accepted_when_the_earlier_attempt_also_tagged_nothing() -> None:
+    """A wrapper is not a tag: the `<body>` the stage supplies proves nothing (#176).
+
+    Attempt 1 wraps the input and tags nothing, failing only copy fidelity. It
+    gives no evidence the model can find anything in this item, so attempt 2's
+    honest echo is still the honest answer.
+    """
+    from cdt.extractor.core import handle_response
+
+    text = "This is the extracted event text."
+    row_state = _ner_row(text)
+    row_state.current_attempt.messages = NERStage().preprocess(row_state)
+
+    assert handle_response(
+        row_state, "<body>wrong text entirely</body>", max_attempts=3
+    )
+    assert handle_response(row_state, f"<body>{text}</body>", max_attempts=3) is None
+
+    assert row_state.all_attempts[-1].validation_errors == []
+    assert row_state.state == "SUCCESS"
+    assert row_state.salvage_notes == []
+
+
+def test_a_give_up_is_retried_and_the_row_recovers_if_a_later_answer_passes() -> None:
+    """A give-up spends an attempt, it does not end the row (#176).
+
+    The give-up check is an ordinary validation failure, so the model is told
+    what was wrong and asked again, and a row that answers properly on the
+    next attempt finishes SUCCESS with its mentions -- the same as any other
+    row that needed a retry. Only running out of attempts ends it.
+    """
+    row_state, client = _run_live(
+        MPLX_TEXT,
+        [
+            # Tagged, but it rewrote the text: fails copy fidelity.
+            _stopped(MPLX_TAGGED_BUT_UNFAITHFUL),
+            # Gives up -- drops every tag it had found.
+            _stopped(f"<body>{MPLX_TEXT}</body>"),
+            # Then answers properly, and the row carries on to instrument_ie.
+            _stopped(MPLX_TAGGED),
+            _stopped(MPLX_IE),
+        ],
+    )
+
+    assert len(client.requests) == 4
+    assert row_state.state == "SUCCESS"
+    assert len(row_state.debt_instrument_mentions) == 1
+    assert row_state.salvage_notes == []
+    # The give-up was scored as a failed attempt, not as a terminal verdict.
+    statuses = [a.status for a in row_state.all_attempts if a.stage_name == "ner"]
+    assert statuses == ["FAILED", "FAILED", "SUCCESS"]
+
+
+def test_an_echo_after_a_truncated_tagged_attempt_is_still_rejected() -> None:
+    """A response cut mid-tag still proves the model was tagging (#176, #127)."""
+    from cdt.extractor.core import handle_response
+
+    row_state = _ner_row(MPLX_TEXT)
+    row_state.current_attempt.messages = NERStage().preprocess(row_state)
+    # Truncated mid-name, so it never parses -- a parse-based count reads zero.
+    truncated = "<body>The Company issued <debt_instrument>6.250% Senior No"
+    assert handle_response(row_state, truncated, max_attempts=3)
+
+    failures = NERStage().validate(row_state, f"<body>{MPLX_TEXT}</body>")
+
+    assert failures
+    assert any("drops every one of them" in failure for failure in failures)
+
+
+def test_ner_retry_message_tells_the_model_to_keep_its_tags() -> None:
+    """The retry turn must ask for a repair, not invite a redo (#176)."""
+    message = NERStage().build_retry_message(["stripped text mismatch"])
+
+    assert "Keep every tag from your previous output" in message
+    assert "untagged is not a valid fix" in message
+    # The preserve clause leads, ahead of the copy-fidelity bullets that the
+    # model previously satisfied by discarding its work.
+    assert message.index("Keep every tag") < message.index(
+        "Return the original input text exactly"
+    )
+
+
+def test_mplx_untagged_echo_no_longer_publishes_as_a_clean_success() -> None:
+    """End to end on #176's headline case: a counted loss, not a silent zero.
+
+    Before this, attempts 1 and 2 failed the copy-fidelity check with 91
+    `debt_instrument` spans each, attempt 3 returned the input byte for byte,
+    validated clean, and the row published `SUCCESS` with 0 mentions against
+    six note series and a term loan -- writing a completion record that makes a
+    re-run skip the item.
+    """
+    from cdt.extractor.core import handle_response, summarize_failure
+
+    row_state = _ner_row(MPLX_TEXT)
+    row_state.current_attempt.messages = NERStage().preprocess(row_state)
+
+    # Attempts 1 and 2 tag densely and fail only copy fidelity, as MPLX's did.
+    assert handle_response(row_state, MPLX_TAGGED_BUT_UNFAITHFUL, max_attempts=3)
+    assert handle_response(row_state, MPLX_TAGGED_BUT_UNFAITHFUL, max_attempts=3)
+
+    # Attempt 3 is the give-up that used to pass, and so is every attempt after
+    # it: the row exhausts NER's budget being rejected rather than early-stopping
+    # SUCCESS on the first one.
+    echo = f"<body>{MPLX_TEXT}</body>"
+    calls = 2
+    result: list[dict[str, str]] | None = [{}]
+    while result is not None and calls < 20:
+        result = handle_response(row_state, echo, max_attempts=3)
+        calls += 1
+
+    assert result is None
+    # One budget for every stage (#127).
+    assert calls == 3
+    assert row_state.state == "FAILED"
+    # FAILED exactly: a give-up the row can evidence retries to the stage's
+    # budget and then terminates like any other exhausted stage.
+    assert row_state.state == "FAILED"
+    assert row_state.debt_instrument_mentions == []
+    assert "drops every one of them" in summarize_failure(row_state)
+    # No attempt on this row was ever accepted.
+    assert [a.status for a in row_state.all_attempts] == ["FAILED"] * 3
+
+
+def test_a_zero_tag_row_with_no_earlier_tagging_is_a_clean_zero() -> None:
+    """With no earlier tags to compare against, a zero is a finding, not a loss.
+
+    Attempt 1 failed for a reason unrelated to tagging and itself found no
+    `debt_instrument`, so neither the high-water mark nor the give-up check has
+    anything to fire on -- and nothing else on the row suggests the model can
+    find debt here. The row finishes SUCCESS with no failure record.
+
+    This is the case that used to finish PARTIAL as a "possible loss". It was
+    dropped because PARTIAL is terminal like any other state, so it bought a
+    registry entry and no re-extraction while asserting a loss nothing had
+    evidence for. A give-up the row *can* evidence is a validation failure, so
+    it retries and then fails for real -- see
+    `test_mplx_untagged_echo_no_longer_publishes_as_a_clean_success`.
+    """
+    from cdt.extractor.core import (
+        PUBLISHABLE_ROW_STATES,
+        handle_response,
+        published_mention_rows,
+    )
+
+    text = "Acme Corp filed this report on January 1, 2024."
+    row_state = _ner_row(text)
+    row_state.current_attempt.messages = NERStage().preprocess(row_state)
+    tagged_no_debt = (
+        "<body><organization>Acme Corp</organization> filed this report on "
+        "<date>January 1, 2024</date>.</body>"
+    )
+
+    assert handle_response(row_state, "not xml at all", max_attempts=3)
+    assert handle_response(row_state, tagged_no_debt, max_attempts=3) is None
+
+    assert row_state.state == "SUCCESS"
+    assert row_state.state in PUBLISHABLE_ROW_STATES
+    assert published_mention_rows(row_state) == []
+    assert row_state.salvage_notes == []
+
+
+def test_a_genuinely_debt_free_item_still_early_stops_success() -> None:
+    """The no-retry path is untouched: a clean zero stays a clean SUCCESS (#176)."""
+    from cdt.extractor.core import handle_response
+
+    text = "Acme Corp filed this report on January 1, 2024."
+    row_state = _ner_row(text)
+    row_state.current_attempt.messages = NERStage().preprocess(row_state)
+    tagged_no_debt = (
+        "<body><organization>Acme Corp</organization> filed this report on "
+        "<date>January 1, 2024</date>.</body>"
+    )
+
+    assert handle_response(row_state, tagged_no_debt, max_attempts=3) is None
+
+    assert row_state.state == "SUCCESS"
+    assert row_state.salvage_notes == []
+
+
+def test_ner_high_water_survives_the_resumable_batch_state() -> None:
+    """Batch resumability needed no schema change: `all_attempts` already round-trips.
+
+    A batch row can cross a process exit between its failed attempt and its
+    retry, so the guard has to be rebuildable from `state.jsonl` alone (#176).
+    """
+    from cdt.extractor.core import prior_debt_instrument_high_water
+
+    row_state = _ner_row(MPLX_TEXT)
+    row_state.current_attempt.messages = NERStage().preprocess(row_state)
+    from cdt.extractor.core import handle_response
+
+    assert handle_response(row_state, MPLX_TAGGED_BUT_UNFAITHFUL, max_attempts=3)
+    assert prior_debt_instrument_high_water(row_state, "ner") == 1
+
+    restored = ExtractionRowState.from_state_dict(row_state.to_state_dict())
+
+    assert prior_debt_instrument_high_water(restored, "ner") == 1
+    # And the restored row rejects the give-up just as the live one would. A
+    # zero-tag response that is not also a byte echo, so this exercises the
+    # high-water mark rather than the echo check, which returns first.
+    failures = NERStage().validate(
+        restored,
+        "<body>The Company issued 6.250% Senior Notes due <date>2022</date>.</body>",
+    )
+    assert failures and any("no <debt_instrument> tags" in f for f in failures)
+
+
+# --------------------------------------------------------------------------- #
+# #127: a NER-specific attempt budget, and unbilled content_filter aborts
+# --------------------------------------------------------------------------- #
+
+# The debt-free item and its honest answer: an untagged echo is correct here,
+# which is what makes it the right probe for the echo guard's rule that an
+# echo is only a give-up once the model has tagged something on this row.
+NODEBT_TEXT = "This is the extracted event text."
+NODEBT_NER = f"<body>{NODEBT_TEXT}</body>"
+
+# A two-instrument item, so the relation stage actually runs on it.
+MULTI_TEXT = "Company entered into a Term Loan and a Revolver on January 1, 2024."
+MULTI_NER = (
+    "<body>Company entered into a <debt_instrument>Term Loan</debt_instrument> "
+    "and a <debt_instrument>Revolver</debt_instrument> on "
+    "<date>January 1, 2024</date>.</body>"
+)
+# One entry that validates and one that cites a tag id the NER output never
+# produced, so `instrument_ie` rejects the response as a whole while
+# `salvage_instrument_ie_entries` keeps the first entry (#152).
+MULTI_IE_ONE_BAD = json.dumps(
+    [
+        {
+            "name": ["tag-1"],
+            "dates": [
+                {
+                    "kind": "closing",
+                    "evidence": ["tag-3"],
+                    "normalized_date": "2024-01-01",
+                }
+            ],
+        },
+        {"name": ["tag-99"]},
+    ]
+)
+MULTI_IE = json.dumps(
+    [
+        {
+            "name": ["tag-1"],
+            "dates": [
+                {
+                    "kind": "closing",
+                    "evidence": ["tag-3"],
+                    "normalized_date": "2024-01-01",
+                }
+            ],
+        },
+        {
+            "name": ["tag-2"],
+            "dates": [
+                {
+                    "kind": "closing",
+                    "evidence": ["tag-3"],
+                    "normalized_date": "2024-01-01",
+                }
+            ],
+        },
+    ]
+)
+
+# As observed live: aborted upstream, nothing generated, nothing billed.
+# A real `content_filter` body, trimmed, from item 000114036126024567-8-01 in
+# `ie_review/runs/followups/full.jsonl` of the models repo. An abort arrives as
+# a normal 200 carrying whatever the provider had emitted before it cut, so it
+# is partially-tagged XML ending mid-tag -- not an empty string. All 58
+# `content_filter` responses in the stored corpora carry 9-107 entity tags and
+# at least one `debt_instrument` tag, and none is empty, so a `text=""` fixture
+# exercises a shape that has never occurred. It mattered: with an empty body
+# the cross-attempt guards in #176 could read an aborted call as the model's
+# own tagged work and no test objected.
+CONTENT_FILTER_PARTIAL = "<body>Item 8.01\nOther Events.\nOn <date>June 9, 2026</date>, the <organization>Company</organization> commenced an offering of <amount>$500.0 million</amount> in aggregate principal amount of its <debt_instrument>senior secured notes due 2031</debt_instrument> (the “<debt_instrument>Notes"
+CONTENT_FILTERED = CompletionResult(
+    text=CONTENT_FILTER_PARTIAL,
+    finish_reason="content_filter",
+    usage={"completion_tokens": 0, "prompt_tokens": 0, "cost": 0.0},
+)
+# The degenerate shape, kept so both are covered: some aborts may carry nothing.
+CONTENT_FILTERED_EMPTY = CompletionResult(
+    text="",
+    finish_reason="content_filter",
+    usage={"completion_tokens": 0, "prompt_tokens": 0, "cost": 0.0},
+)
+
+
+def _stopped(text: str) -> CompletionResult:
+    return CompletionResult(text=text, finish_reason="stop")
+
+
+class _ScriptedCompletionClient:
+    """Fake chat client replaying scripted `CompletionResult`s.
+
+    Unlike the text-only scripted client in `test_extractor_batch.py`, this one
+    scripts the whole completion, so a `content_filter` abort can be injected
+    where it really occurs -- at the provider boundary, above
+    `handle_response` -- rather than simulated by hand-feeding the scorer
+    (#127, #135).
+    """
+
+    def __init__(
+        self: _ScriptedCompletionClient, completions: list[CompletionResult]
+    ) -> None:
+        """Store the completions to hand back in order."""
+        self.completions = list(completions)
+        self.requests: list[list[dict[str, str]]] = []
+
+    async def complete(
+        self: _ScriptedCompletionClient,
+        *,
+        messages: list[dict[str, str]],
+        model: str,
+        reasoning_effort: str,
+    ) -> CompletionResult:
+        """Record the request and return the next scripted completion."""
+        del model, reasoning_effort
+        self.requests.append([dict(message) for message in messages])
+        return self.completions[len(self.requests) - 1]
+
+
+def _run_live(
+    text: str, completions: list[CompletionResult], max_attempts: int = 3
+) -> tuple[ExtractionRowState, _ScriptedCompletionClient]:
+    """Drive the real live loop, returning (row_state, client)."""
+    import asyncio
+
+    from cdt.extractor.core import run_extraction_workflow
+
+    client = _ScriptedCompletionClient(completions)
+    row_state = asyncio.run(
+        run_extraction_workflow(
+            item_row={"item_id": "item-1", "text": text},
+            model="m",
+            reasoning_effort="none",
+            max_attempts=max_attempts,
+            client=client,
+        )
+    )
+    return row_state, client
+
+
+def test_every_stage_gets_the_same_attempt_budget() -> None:
+    """`--max-attempts` means the same thing for every stage (#127).
+
+    #127 proposed a larger NER budget; the stored corpora do not support the
+    number (only two of 761 rows ever reached the cap, and one of those is the
+    give-up #176 now rejects), so NER is back in line with the rest. Driven
+    end to end rather than asserted against a helper, because the budget is
+    only real if the loop stops there.
+    """
+    from cdt.extractor.core import DEFAULT_MAX_ATTEMPTS
+
+    # Pinned as a literal for the same reason MAX_CONTENT_FILTER_RESENDS is:
+    # the budget *is* the number, so restating the constant asserts nothing
+    # about its value.
+    assert DEFAULT_MAX_ATTEMPTS == 3
+
+    # NER: three scored attempts, then the row terminates.
+    row_state, client = _run_live(MPLX_TEXT, [_stopped("not xml")] * 10)
+    assert len(client.requests) == 3
+    assert row_state.state == "FAILED"
+
+    # instrument_ie: the same three, after a NER pass.
+    row_state, client = _run_live(
+        MULTI_TEXT, [_stopped(MULTI_NER)] + [_stopped("not json")] * 10
+    )
+    assert len(client.requests) == 1 + 3
+    assert row_state.state == "FAILED"
+
+    # And the operator's knob still moves it.
+    row_state, client = _run_live(MPLX_TEXT, [_stopped("not xml")] * 10, max_attempts=5)
+    assert len(client.requests) == 5
+
+
+def test_a_content_filtered_attempt_is_resent_as_the_original_request() -> None:
+    """An upstream abort has nothing for the model to correct (#127, #135).
+
+    The ordinary retry path would append the aborted response as an assistant
+    turn plus a validation complaint about it, which every later call in the
+    row then pays prompt tokens for. A `content_filter` abort is not the
+    model answering badly, so the same request goes back out unchanged.
+    """
+    row_state, client = _run_live(NODEBT_TEXT, [CONTENT_FILTERED, _stopped(NODEBT_NER)])
+
+    assert len(client.requests) == 2
+    # Byte-identical resend: no assistant turn, no complaint, same request.
+    assert client.requests[1] == client.requests[0]
+    assert all(message["role"] != "assistant" for message in client.requests[1])
+    assert row_state.state == "SUCCESS"
+
+
+def test_a_provider_abort_is_recorded_but_not_scored() -> None:
+    """The audit log keeps the call; the scorer never sees it (#127, #135).
+
+    `attempt_index` stays a true count of *scored* attempts, so the model's
+    first real answer is attempt 1 even when the provider aborted first -- which
+    is what keeps #176's cross-attempt checks from reading an abort as a retry.
+    """
+    row_state, _ = _run_live(NODEBT_TEXT, [CONTENT_FILTERED, _stopped(NODEBT_NER)])
+
+    statuses = [
+        (a.stage_name, a.attempt_index, a.status) for a in row_state.all_attempts
+    ]
+    assert statuses == [("ner", 0, "ABORTED"), ("ner", 1, "SUCCESS")]
+    aborted = row_state.all_attempts[0]
+    assert aborted.finish_reason == "content_filter"
+    assert aborted.usage == {"completion_tokens": 0, "prompt_tokens": 0, "cost": 0.0}
+    # The request is identical to the scored attempt's, so it is not stored twice.
+    assert aborted.messages == []
+
+
+def test_content_filter_aborts_do_not_consume_the_stage_budget() -> None:
+    """Unscored calls must not spend the row's attempts (#127, #135).
+
+    Eleven of thirteen live NER calls came back `content_filter` with
+    `completion_tokens=0` and `cost=0.0`, and the cut point is nondeterministic
+    (1,163 / 280 / 1,375 characters on three repeats of one item), so resending
+    is both correct and free.
+    """
+    # Three aborts, then the stage's full budget of three real attempts, all
+    # rejected. The aborts cost the row nothing: it still gets all three.
+    completions = [CONTENT_FILTERED] * 3 + [_stopped("not xml")] * 3
+    row_state, client = _run_live(MPLX_TEXT, completions)
+
+    assert len(client.requests) == 6
+    assert row_state.state == "FAILED"
+    scored = [a for a in row_state.all_attempts if a.status != "ABORTED"]
+    assert [a.attempt_index for a in scored] == [1, 2, 3]
+
+
+def test_persistent_content_filtering_terminates_at_the_resend_cap() -> None:
+    """Free retries still have to stop, and stopping must not blame the model (#127).
+
+    Past the cap the abort used to fall through to `handle_response` and be
+    scored as an ordinary bad answer: the row paid the stage's whole budget
+    again in whole-item calls,
+    each one growing the retry conversation with a junk assistant turn, and
+    the resulting `FAILED` attempt made #176's checks read a provider abort as
+    a model failure. The row now terminates instead.
+    """
+    from cdt.extractor.core import MAX_CONTENT_FILTER_RESENDS, summarize_failure
+
+    # Pinned as a literal: the cap bounds spend on a filtered row, so restating
+    # the constant here would assert nothing about its value.
+    assert MAX_CONTENT_FILTER_RESENDS == 6
+
+    row_state, client = _run_live(MPLX_TEXT, [CONTENT_FILTERED] * 40)
+
+    # Six re-sends plus the call that trips the cap, and no more.
+    assert len(client.requests) == 7
+    assert row_state.state == "FAILED"
+    # Not one call was scored, so the model is never blamed for the abort.
+    # The trailing "incomplete" is the unused outstanding attempt that
+    # `finish` always appends, not a call that was made.
+    assert [a.status for a in row_state.all_attempts] == ["ABORTED"] * 7 + [
+        "incomplete"
+    ]
+    assert row_state.current_attempt.attempt_index == 0
+    # Every request was the pristine one: no conversation growth past the cap.
+    assert all(request == client.requests[0] for request in client.requests)
+    summary = summarize_failure(row_state)
+    assert "aborted by the provider on 7 of its calls" in summary
+    # Nothing was scored on this row, so saying so is accurate here.
+    assert "no attempt was scored" in summary
+
+
+def test_the_abort_note_reports_the_model_failure_that_happened_too() -> None:
+    """When both the provider and the model failed, the registry says both (#127).
+
+    The abort count is a per-stage lifetime count with no reset, so aborts need
+    not be consecutive: this row is aborted six times, answers badly once, and
+    is aborted again past the cap. The note used to call all seven calls
+    "consecutive" and add "no attempt was scored", and because
+    `summarize_failure` prefers salvage notes over `validation_errors`, the
+    model's own error never reached the registry. An operator was told to go
+    and talk to the provider while the extraction defect stayed invisible.
+    """
+    from cdt.extractor.core import summarize_failure
+
+    row_state, client = _run_live(
+        MPLX_TEXT,
+        [CONTENT_FILTERED] * 6 + [_stopped("not xml at all")] + [CONTENT_FILTERED] * 5,
+    )
+
+    assert len(client.requests) == 6 + 1 + 1
+    assert row_state.state == "FAILED"
+    statuses = [a.status for a in row_state.all_attempts if a.stage_name == "ner"]
+    assert statuses == ["ABORTED"] * 6 + ["FAILED", "ABORTED", "incomplete"]
+
+    summary = summarize_failure(row_state)
+    # The count is right, and no longer claims the calls were back to back.
+    assert "aborted by the provider on 7 of its calls" in summary
+    assert "consecutive" not in summary
+    # One call *was* scored, so the opposite claim is gone...
+    assert "no attempt was scored" not in summary
+    assert "1 scored attempt also failed" in summary
+    # ...and the model's own error reaches the registry alongside the abort.
+    assert "not valid XML" in summary
+
+
+def test_the_abort_note_only_reports_failures_from_the_stage_that_aborted() -> None:
+    """An earlier stage's failure is not this stage's story (#127).
+
+    NER fails once and then recovers, so the row reaches `instrument_ie` with a
+    scored failure already in its history. `instrument_ie` is then aborted to
+    its cap without ever being answered, and its note must say so -- citing
+    NER's error here would send an operator to the wrong stage.
+    """
+    from cdt.extractor.core import failed_stage_name, summarize_failure
+
+    row_state, client = _run_live(
+        MPLX_TEXT,
+        [_stopped("not xml at all"), _stopped(MPLX_TAGGED)] + [CONTENT_FILTERED] * 10,
+    )
+
+    assert len(client.requests) == 2 + 7
+    assert row_state.state == "FAILED"
+    assert failed_stage_name(row_state) == "instrument_ie"
+
+    summary = summarize_failure(row_state)
+    assert "instrument_ie aborted by the provider on 7 of its calls" in summary
+    # instrument_ie itself was never answered, so that claim is true of it...
+    assert "no attempt was scored" in summary
+    # ...and NER's failure, which belongs to a stage that went on to succeed,
+    # stays out of it.
+    assert "not valid XML" not in summary
+
+
+def test_the_abort_note_reports_the_most_recent_scored_failure() -> None:
+    """Of several scored failures, the latest is the one worth reporting (#127).
+
+    The model is shown its error and asked again, so the last rejection is the
+    state the row actually died in; an earlier one has already been superseded.
+    """
+    from cdt.extractor.core import summarize_failure
+
+    row_state, client = _run_live(
+        MPLX_TEXT,
+        [
+            _stopped("not xml at all"),
+            _stopped("<body>wrong text entirely</body>"),
+        ]
+        + [CONTENT_FILTERED] * 10,
+    )
+
+    assert len(client.requests) == 2 + 7
+    assert row_state.state == "FAILED"
+
+    summary = summarize_failure(row_state)
+    assert "2 scored attempts also failed" in summary
+    assert "must match the input text exactly" in summary
+    assert "not valid XML" not in summary
+
+
+def test_a_filtered_row_is_registered_against_the_stage_that_was_aborted() -> None:
+    """An operator retrying the row needs the stage, not a generic failure (#127)."""
+    from cdt.extractor.core import failed_stage_name
+
+    row_state, _ = _run_live(MPLX_TEXT, [CONTENT_FILTERED] * 40)
+
+    assert failed_stage_name(row_state) == "ner"
+
+
+def test_aborts_at_the_relation_stage_still_publish_the_items_mentions() -> None:
+    """#152's rule holds: a stage the provider will not run costs lineage, not instruments.
+
+    The relation stage is the last one, and its output is only lineage. A row
+    whose instruments already validated must not lose them because the
+    provider refused to run the final call.
+    """
+    from cdt.extractor.core import PUBLISHABLE_ROW_STATES, summarize_failure
+
+    row_state, client = _run_live(
+        MULTI_TEXT,
+        [_stopped(MULTI_NER), _stopped(MULTI_IE)] + [CONTENT_FILTERED] * 40,
+    )
+
+    # Two scored calls for ner and instrument_ie, then the relation stage is
+    # aborted to its cap.
+    assert len(client.requests) == 2 + 7
+    assert row_state.state == "PARTIAL"
+    assert row_state.state in PUBLISHABLE_ROW_STATES
+    assert len(row_state.debt_instrument_mentions) == 2
+    assert "mentions published without lineage relations" in summarize_failure(
+        row_state
+    )
+
+
+def test_aborts_at_the_ie_stage_still_publish_the_entries_that_validated() -> None:
+    """The abort cap applies #152 the same way a scored failure does (#127, #152).
+
+    An `instrument_ie` response rejected as a whole can still hold valid
+    entries, and when the provider then aborts the stage to its cap those
+    entries are already sitting in `stage_responses` -- the aborts came after
+    the answer, not instead of it. Terminating FAILED there threw them away,
+    while the same row reaching the same dead end through three *scored*
+    failures published them. Same loss, same remedy, so the two terminal paths
+    now agree.
+    """
+    from cdt.extractor.core import PUBLISHABLE_ROW_STATES, summarize_failure
+
+    row_state, client = _run_live(
+        MULTI_TEXT,
+        [_stopped(MULTI_NER), _stopped(MULTI_IE_ONE_BAD)] + [CONTENT_FILTERED] * 40,
+    )
+
+    # One NER call, one scored instrument_ie answer, then the stage is aborted
+    # to its cap.
+    assert len(client.requests) == 1 + 1 + 7
+    assert row_state.state == "PARTIAL"
+    assert row_state.state in PUBLISHABLE_ROW_STATES
+    # The entry that validated publishes; the one citing a missing tag does not.
+    assert len(row_state.debt_instrument_mentions) == 1
+    assert "published without lineage relations" in summarize_failure(row_state)
+    # And the invalid entry is gone from the stored response, not merely
+    # ignored downstream: `salvage_instrument_ie_entries` rewrites what the
+    # audit log keeps, so the kept set is recorded rather than inferred.
+    # `postprocess` would have skipped the bad entry either way, so the mention
+    # count alone cannot tell a salvage from an unfiltered publish.
+    assert "tag-99" not in row_state.stage_responses["instrument_ie"]
+
+
+def test_content_filter_resend_cap_survives_the_resumable_batch_state() -> None:
+    """A batch row can cross a process exit between an abort and its resend (#127).
+
+    The cap is read off `all_attempts` rather than a counter held by the
+    caller, precisely because the batch backend folds one response per tick.
+    """
+    from cdt.extractor.core import count_content_filter_aborts
+
+    row_state = _ner_row(MPLX_TEXT)
+    row_state.current_attempt.messages = NERStage().preprocess(row_state)
+    for _ in range(2):
+        row_state.record_unbilled_abort("", CONTENT_FILTERED)
+
+    assert count_content_filter_aborts(row_state, "ner") == 2
+
+    restored = ExtractionRowState.from_state_dict(row_state.to_state_dict())
+
+    assert count_content_filter_aborts(restored, "ner") == 2
+    # And the outstanding request is unchanged, so the resend is byte-identical.
+    assert restored.current_attempt.messages == NERStage().preprocess(row_state)
+    assert restored.current_attempt.attempt_index == 0
+
+
+# --------------------------------------------------------------------------- #
+# #176 and #127 together: an abort must not look like a retry
+# --------------------------------------------------------------------------- #
+
+
+def test_an_abort_does_not_make_an_honest_zero_tag_row_partial() -> None:
+    """A provider abort is not the model failing, so the row is a clean zero (#176, #127).
+
+    An aborted call carries its own status rather than `FAILED`, so nothing
+    downstream treats the row as one the model answered badly: a debt-free item
+    whose first call was aborted publishes its honest zero with no failure
+    record attached.
+    """
+    tagged_no_debt = (
+        "<body><organization>Acme Corp</organization> filed this report on "
+        "<date>January 1, 2024</date>.</body>"
+    )
+    row_state, _ = _run_live(
+        "Acme Corp filed this report on January 1, 2024.",
+        [CONTENT_FILTERED, _stopped(tagged_no_debt)],
+    )
+
+    assert row_state.state == "SUCCESS"
+    assert row_state.salvage_notes == []
+
+
+def test_the_ner_guards_do_not_read_an_aborted_calls_partial_output() -> None:
+    """An abort is not the model's work, so it is not history to regress against.
+
+    `record_unbilled_abort` stores whatever the provider emitted before it cut,
+    and that text is tagged: all 58 `content_filter` responses in the stored
+    corpora carry between 9 and 107 entity tags and at least one
+    `debt_instrument` tag, and none of them is empty. Counted as the model's
+    own earlier work it makes the echo guard and the high-water mark fire on an
+    item the model has never successfully tagged, and the row then dies FAILED
+    on a complaint it cannot act on -- the abort adds no assistant turn, so
+    "keep every tag you found" names work that is not in its context
+    (#176, #127).
+    """
+    from cdt.extractor.core import (
+        count_debt_instrument_tags,
+        count_ner_entity_tags,
+        prior_attempt_tagged,
+        prior_debt_instrument_high_water,
+    )
+
+    # The fixture really is tagged, so the assertions below are not vacuous --
+    # this is exactly what a `text=""` fixture failed to exercise.
+    assert count_ner_entity_tags(CONTENT_FILTER_PARTIAL) == 5
+    assert count_debt_instrument_tags(CONTENT_FILTER_PARTIAL) == 2
+
+    row_state = _ner_row(MPLX_TEXT)
+    row_state.current_attempt.messages = NERStage().preprocess(row_state)
+    row_state.record_unbilled_abort(CONTENT_FILTER_PARTIAL, CONTENT_FILTERED)
+
+    assert prior_attempt_tagged(row_state, "ner") is False
+    assert prior_debt_instrument_high_water(row_state, "ner") == 0
+
+    # And the same row driven end to end: the honest echo publishes in two
+    # calls instead of looping to FAILED on an unanswerable complaint.
+    row_state, client = _run_live(
+        NODEBT_TEXT, [CONTENT_FILTERED, _stopped(f"<body>{NODEBT_TEXT}</body>")]
+    )
+
+    assert len(client.requests) == 2
+    assert row_state.state == "SUCCESS"
+    assert row_state.salvage_notes == []
+
+
+def test_an_empty_aborted_body_behaves_the_same_as_a_truncated_one() -> None:
+    """Both abort shapes are unscored calls, so neither changes the verdict (#127)."""
+    for aborted in (CONTENT_FILTERED, CONTENT_FILTERED_EMPTY):
+        row_state, client = _run_live(
+            NODEBT_TEXT, [aborted, _stopped(f"<body>{NODEBT_TEXT}</body>")]
+        )
+
+        assert len(client.requests) == 2
+        assert row_state.state == "SUCCESS"
+        assert row_state.salvage_notes == []
+
+
+def test_abort_counts_are_kept_per_stage_not_per_row() -> None:
+    """Each stage gets its own resend budget (#127).
+
+    Filtering is nondeterministic per call, so one row can be aborted on an
+    early stage, recover, and be aborted again later. Counted per row, the
+    earlier stage's aborts would eat the later stage's budget and terminate a
+    row that still had resends coming to it.
+    """
+    from cdt.extractor.core import count_content_filter_aborts
+
+    row_state, client = _run_live(
+        MULTI_TEXT,
+        [CONTENT_FILTERED] * 3
+        + [_stopped(MULTI_NER), _stopped(MULTI_IE)]
+        + [CONTENT_FILTERED] * 40,
+    )
+
+    # Three NER aborts, a NER pass, an instrument_ie pass, and then the
+    # relation stage still gets its own full seven before terminating.
+    assert len(client.requests) == 3 + 2 + 7
+    assert count_content_filter_aborts(row_state, "ner") == 3
+    assert count_content_filter_aborts(row_state, "instrument_relation") == 7
+    # #152 still applies: the mentions it already earned publish.
+    assert row_state.state == "PARTIAL"
+    assert len(row_state.debt_instrument_mentions) == 2
+
+
+def test_after_a_resend_the_next_answer_is_still_a_first_attempt() -> None:
+    """The echo guard must not fire on an answer the model was never corrected on.
+
+    The model has been shown no error after a provider abort -- the pristine
+    request went back out -- so an untagged echo is still the honest answer for
+    an item with nothing to tag (#176, #127).
+    """
+    echo = f"<body>{NODEBT_TEXT}</body>"
+    row_state, client = _run_live(NODEBT_TEXT, [CONTENT_FILTERED, _stopped(echo)])
+
+    assert len(client.requests) == 2
+    scored = [a for a in row_state.all_attempts if a.status != "ABORTED"]
+    assert [a.validation_errors for a in scored] == [[]]
+    assert row_state.state == "SUCCESS"
+    assert row_state.debt_instrument_mentions == []
+
+
 def test_normalized_date_from_text_reads_every_filing_spelling() -> None:
     """A format the parser cannot read discards a date the model got right (#133).
 
