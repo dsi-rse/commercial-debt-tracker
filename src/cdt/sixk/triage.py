@@ -30,8 +30,8 @@ if TYPE_CHECKING:
 
 LOGGER = get_logger(__name__)
 
-#: Stage-1 cutoff, used only when an artifact carries no threshold of its own.
-#: Prefer the threshold :func:`load_stage1_model` reads from the artifact.
+#: Stage-1 cutoff. Prefer the threshold :func:`load_stage1_model` reads from
+#: the artifact.
 DEFAULT_STAGE1_THRESHOLD = 0.332
 
 #: Built-in stage-2 model; :func:`triage_filing` reads the configured

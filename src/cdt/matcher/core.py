@@ -701,9 +701,9 @@ def apply_observation_columns(
 def _json_text(row: dict[str, object], column: str) -> str | None:
     """Return one JSON column's text, or None when it holds no parseable JSON.
 
-    An absent column (NaN from a projected read of an older partition), a
-    missing value and invalid JSON all return None, so "absent" stays
-    distinguishable from an empty list; callers spell their own default.
+    An absent column, a missing value and invalid JSON all return None, so
+    "absent" stays distinguishable from an empty list; callers spell their own
+    default.
     """
     text = coerce_dataset_text(row.get(column))
     if text is None:
@@ -1872,7 +1872,7 @@ def coerce_optional_bool(value: object) -> bool | None:
     """Return one nullable flag read back from a published row.
 
     A declared `bool` column round-trips as Python or numpy bools with nulls
-    read as None or NaN; a row that predates the column has nothing at all.
+    read as None or NaN.
     Text spellings are accepted so a hand-built frame reads the same way.
     """
     if value is None or isinstance(value, bool):
