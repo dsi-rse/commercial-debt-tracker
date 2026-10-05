@@ -87,9 +87,9 @@ DEFAULT_MAX_ATTEMPTS = 3
 # becomes an attempt at all. A filtered response differs only in arriving as a
 # normal 200 with a body (see `completion_result_from_batch_line`), not in
 # kind. Scoring it and then exempting it from the budget would make every
-# cross-attempt check -- the echo guard, the high-water mark,
-# `_ner_needed_a_retry` -- read a call the model never answered as a retry the
-# model failed.
+# cross-attempt check -- the give-up check and the high-water mark -- read a
+# call the model never answered as earlier work the model is now regressing
+# against.
 #
 # The cap is not about the cost of retrying. It is there because the
 # non-billing claim is *unverified*: thirteen calls against one model, and
@@ -1011,7 +1011,7 @@ def prior_debt_instrument_high_water(
     high-water mark and needed no schema change (#176).
 
     Attempts the provider aborted are excluded, the same way
-    `prior_attempt_tagged` and `_ner_needed_a_retry` exclude them. The
+    `prior_attempt_tagged` excludes them. The
     judgement here is closer than it looks, and is made deliberately rather
     than inherited: a truncated abort that tagged four instruments really is
     evidence the item discloses debt, so reading it would catch a give-up this
@@ -3013,9 +3013,9 @@ def terminate_on_provider_aborts(
     through to `handle_response` would do -- charges the row for a call it
     never got an answer to, grows the retry conversation with an empty
     assistant turn plus a complaint about it, and leaves a `FAILED` attempt
-    that every cross-attempt check in #176 reads as the model having failed.
-    One abort past the cap was enough to publish a debt-free item as a PARTIAL
-    "possible loss".
+    that every cross-attempt check in #176 reads as the model having failed --
+    one abort past the cap was enough to reject the honest answer that followed
+    it.
 
     #152's rule still applies to what the row already earned, and it applies
     the same way `_salvage_or_fail` applies it after a scored failure: a stage
@@ -3090,24 +3090,6 @@ def handle_provider_abort(
     return False
 
 
-def _ner_needed_a_retry(row_state: ExtractionRowState) -> bool:
-    """Whether any earlier NER attempt on this row failed validation.
-
-    Read off `all_attempts`, which `retry` has already appended the failed
-    attempt to, and which the batch backend round-trips through
-    `to_state_dict`, so a resumed row is judged the same as a live one (#176).
-
-    Only "FAILED" counts, which is why an aborted call carries its own status:
-    a provider abort is not the model answering badly, so a row whose first
-    call was aborted and whose first real answer found no debt is an honest
-    zero, not a retry-recovered one.
-    """
-    return any(
-        attempt.stage_name == NERStage.name and attempt.status == "FAILED"
-        for attempt in row_state.all_attempts
-    )
-
-
 def _advance_after_stage(
     row_state: ExtractionRowState,
     stage: StageSpec,
@@ -3115,28 +3097,25 @@ def _advance_after_stage(
 ) -> list[dict[str, str]] | None:
     """Move one row past a completed stage: finish it or start the next stage."""
     if stage.early_stop(row_state):
-        if stage.name == NERStage.name and _ner_needed_a_retry(row_state):
-            # A zero-tag NER response is normally the honest "this filing
-            # disclosed no debt", and early-stopping it SUCCESS is right. It is
-            # not right when the row only got here by retrying: the model
-            # already failed once on this item, so zero tags is at least as
-            # likely to be a give-up as a finding, and #152's precedent applies
-            # -- publish what there is (nothing) but leave a failure-registry
-            # record so the loss is counted and a re-run picks the item up
-            # instead of skipping it on a completion record (#176).
-            #
-            # `validate`'s high-water and echo checks catch the give-ups the row
-            # holds direct evidence for. This is the residual: a first attempt
-            # that failed for some other reason while itself finding no tags
-            # leaves nothing to compare against, so the outcome is marked
-            # uncertain rather than asserted clean.
-            row_state.salvage_notes.append(
-                "ner recovered on retry with no debt_instrument tags; the item "
-                "publishes no mentions and is recorded as a possible loss rather "
-                "than a clean zero"
-            )
-            row_state.finish("PARTIAL")
-            return None
+        # A zero-tag NER response that got this far is the honest "this filing
+        # disclosed no debt", and it finishes SUCCESS whether or not the row
+        # needed a retry to produce it.
+        #
+        # It used to finish PARTIAL when the row had retried, on the reasoning
+        # that a model which already failed once is as likely to be giving up
+        # as reporting a genuine zero, so the outcome should be filed as a
+        # possible loss. The reasoning was sound and the remedy was not: a
+        # PARTIAL row is terminal like any other, so `terminal_ids` records it
+        # and the next run skips it (`collect_pending_extract_items`). It
+        # bought a registry entry and no re-extraction, while asserting a loss
+        # that nothing had evidence for.
+        #
+        # A give-up the row *does* hold evidence for is a validation failure
+        # instead -- `validate`'s high-water mark and give-up check both reject
+        # one -- so it retries to the stage's budget and then terminates FAILED
+        # through the ordinary path, which is both counted and re-extractable.
+        # Where there is no earlier tagging to compare against there is no
+        # evidence either way, and a clean zero is the honest reading (#176).
         row_state.finish("SUCCESS")
         return None
     if stage_index == len(EXTRACTOR_STAGES) - 1:

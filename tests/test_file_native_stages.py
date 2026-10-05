@@ -2383,6 +2383,12 @@ MPLX_TAGGED_BUT_UNFAITHFUL = (
     "<body>The Company issued <debt_instrument>6.250% Senior Notes due "
     "2022</debt_instrument>!</body>"
 )
+MPLX_IE = json.dumps([{"name": ["tag-1"]}])
+# The same tagging with the text left exactly as it was given.
+MPLX_TAGGED = (
+    "<body>The Company issued <debt_instrument>6.250% Senior Notes due "
+    "2022</debt_instrument>.</body>"
+)
 
 
 def _ner_row(text: str) -> ExtractionRowState:
@@ -2576,11 +2582,9 @@ def test_an_untagged_echo_is_accepted_after_a_failure_that_found_nothing() -> No
     about the first attempt suggests the model can find anything here, so
     there is no earlier work for the echo to regress against.
 
-    The row still finishes PARTIAL rather than SUCCESS, and that is fix 2 of
-    #176 doing its job, not the same defect: a first attempt that failed for
-    an unrelated reason while itself finding no tags leaves nothing to compare
-    against, so the zero is recorded as uncertain. PARTIAL publishes exactly
-    what SUCCESS would -- no mentions -- and additionally counts the row.
+    Nothing on this row is evidence of a give-up, so it finishes SUCCESS. The
+    zero used to be filed as a possible loss instead; see
+    `_advance_after_stage` for why that was dropped.
     """
     from cdt.extractor.core import (
         PUBLISHABLE_ROW_STATES,
@@ -2600,9 +2604,10 @@ def test_an_untagged_echo_is_accepted_after_a_failure_that_found_nothing() -> No
     assert row_state.all_attempts[0].status == "FAILED"
     assert row_state.all_attempts[-1].validation_errors == []
     assert row_state.all_attempts[-1].status == "SUCCESS"
-    assert row_state.state == "PARTIAL"
+    assert row_state.state == "SUCCESS"
     assert row_state.state in PUBLISHABLE_ROW_STATES
     assert published_mention_rows(row_state) == []
+    assert row_state.salvage_notes == []
 
 
 def test_ner_high_water_is_the_most_any_attempt_found_not_the_least() -> None:
@@ -2771,7 +2776,38 @@ def test_an_echo_is_accepted_when_the_earlier_attempt_also_tagged_nothing() -> N
     assert handle_response(row_state, f"<body>{text}</body>", max_attempts=3) is None
 
     assert row_state.all_attempts[-1].validation_errors == []
-    assert row_state.state == "PARTIAL"
+    assert row_state.state == "SUCCESS"
+    assert row_state.salvage_notes == []
+
+
+def test_a_give_up_is_retried_and_the_row_recovers_if_a_later_answer_passes() -> None:
+    """A give-up spends an attempt, it does not end the row (#176).
+
+    The give-up check is an ordinary validation failure, so the model is told
+    what was wrong and asked again, and a row that answers properly on the
+    next attempt finishes SUCCESS with its mentions -- the same as any other
+    row that needed a retry. Only running out of attempts ends it.
+    """
+    row_state, client = _run_live(
+        MPLX_TEXT,
+        [
+            # Tagged, but it rewrote the text: fails copy fidelity.
+            _stopped(MPLX_TAGGED_BUT_UNFAITHFUL),
+            # Gives up -- drops every tag it had found.
+            _stopped(f"<body>{MPLX_TEXT}</body>"),
+            # Then answers properly, and the row carries on to instrument_ie.
+            _stopped(MPLX_TAGGED),
+            _stopped(MPLX_IE),
+        ],
+    )
+
+    assert len(client.requests) == 4
+    assert row_state.state == "SUCCESS"
+    assert len(row_state.debt_instrument_mentions) == 1
+    assert row_state.salvage_notes == []
+    # The give-up was scored as a failed attempt, not as a terminal verdict.
+    statuses = [a.status for a in row_state.all_attempts if a.stage_name == "ner"]
+    assert statuses == ["FAILED", "FAILED", "SUCCESS"]
 
 
 def test_an_echo_after_a_truncated_tagged_attempt_is_still_rejected() -> None:
@@ -2835,28 +2871,34 @@ def test_mplx_untagged_echo_no_longer_publishes_as_a_clean_success() -> None:
     # One budget for every stage (#127).
     assert calls == 3
     assert row_state.state == "FAILED"
-    assert row_state.state != "SUCCESS"
+    # FAILED exactly: a give-up the row can evidence retries to the stage's
+    # budget and then terminates like any other exhausted stage.
+    assert row_state.state == "FAILED"
     assert row_state.debt_instrument_mentions == []
     assert "drops every one of them" in summarize_failure(row_state)
     # No attempt on this row was ever accepted.
     assert [a.status for a in row_state.all_attempts] == ["FAILED"] * 3
 
 
-def test_retry_recovered_zero_tag_row_finishes_partial_not_success() -> None:
-    """The residual #176 case: no earlier tags to compare, so mark it uncertain.
+def test_a_zero_tag_row_with_no_earlier_tagging_is_a_clean_zero() -> None:
+    """With no earlier tags to compare against, a zero is a finding, not a loss.
 
     Attempt 1 failed for a reason unrelated to tagging and itself found no
-    `debt_instrument`, so neither the high-water mark nor the echo check has
-    anything to fire on. PARTIAL publishes the row's (empty) mentions exactly
-    as SUCCESS would but files a failure-registry record, so the loss is
-    counted and a re-run picks the item up. This is the gap #152 left.
+    `debt_instrument`, so neither the high-water mark nor the give-up check has
+    anything to fire on -- and nothing else on the row suggests the model can
+    find debt here. The row finishes SUCCESS with no failure record.
+
+    This is the case that used to finish PARTIAL as a "possible loss". It was
+    dropped because PARTIAL is terminal like any other state, so it bought a
+    registry entry and no re-extraction while asserting a loss nothing had
+    evidence for. A give-up the row *can* evidence is a validation failure, so
+    it retries and then fails for real -- see
+    `test_mplx_untagged_echo_no_longer_publishes_as_a_clean_success`.
     """
     from cdt.extractor.core import (
         PUBLISHABLE_ROW_STATES,
-        failed_stage_name,
         handle_response,
         published_mention_rows,
-        summarize_failure,
     )
 
     text = "Acme Corp filed this report on January 1, 2024."
@@ -2870,12 +2912,10 @@ def test_retry_recovered_zero_tag_row_finishes_partial_not_success() -> None:
     assert handle_response(row_state, "not xml at all", max_attempts=3)
     assert handle_response(row_state, tagged_no_debt, max_attempts=3) is None
 
-    assert row_state.state == "PARTIAL"
+    assert row_state.state == "SUCCESS"
     assert row_state.state in PUBLISHABLE_ROW_STATES
     assert published_mention_rows(row_state) == []
-    # The registry entry points an operator at the stage to retry.
-    assert failed_stage_name(row_state) == "ner"
-    assert "possible loss" in summarize_failure(row_state)
+    assert row_state.salvage_notes == []
 
 
 def test_a_genuinely_debt_free_item_still_early_stops_success() -> None:
@@ -3286,10 +3326,10 @@ def test_content_filter_resend_cap_survives_the_resumable_batch_state() -> None:
 def test_an_abort_does_not_make_an_honest_zero_tag_row_partial() -> None:
     """A provider abort is not the model failing, so the row is a clean zero (#176, #127).
 
-    `_ner_needed_a_retry` keys off attempts the model actually answered badly.
-    An aborted call carries its own status, so a debt-free item whose first
-    call was aborted still publishes SUCCESS rather than a PARTIAL recorded as
-    a possible loss.
+    An aborted call carries its own status rather than `FAILED`, so nothing
+    downstream treats the row as one the model answered badly: a debt-free item
+    whose first call was aborted publishes its honest zero with no failure
+    record attached.
     """
     tagged_no_debt = (
         "<body><organization>Acme Corp</organization> filed this report on "
