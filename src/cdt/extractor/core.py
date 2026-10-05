@@ -340,7 +340,18 @@ YEAR_ONLY_MATURITY_SUFFIX = "-12-31"
 # A rate marker counts only where it sits on a number, so the value the parser
 # would read is the rate itself rather than a percentage of something else (#103).
 AMOUNT_VALUE_PATTERN = re.compile(r"\d[\d,]*(?:\.\d+)?")
-RATE_SUFFIX_PATTERN = re.compile(r"\s*(?:%|percent\b|basis\s+points?\b)", re.IGNORECASE)
+# `bps` as well as the spelled-out marker: the abbreviation is what filings
+# actually write, and without it `is_rate_like_amount_text` read `50 bps` as a
+# money amount, so `validate_amount_is_not_rate` let a basis-point margin
+# through as an `amount`. `amounts_agree` does not catch it either -- it only
+# rejects a model figure that disagrees with the span's number, and the model
+# reports the basis-point figure itself, so the two agree and a 50bp margin
+# published as a principal of 50. A wrong value, not the silent null of #182
+# (#228). Distinct from #75/#102, which was the whitespace that hid the
+# multi-word marker: this is the vocabulary, not the normalization.
+RATE_SUFFIX_PATTERN = re.compile(
+    r"\s*(?:%|percent\b|basis\s+points?\b|bps?\b)", re.IGNORECASE
+)
 # A principal stated inside an instrument name: `$183.36 million term loan`,
 # `C$300 million notes due 2033`. The currency marker is required, so a coupon
 # rate or a maturity year in the same name cannot be read as the principal.

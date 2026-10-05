@@ -2138,6 +2138,45 @@ def test_is_rate_like_amount_text_requires_every_number_to_carry_a_rate() -> Non
     assert is_rate_like_amount_text("SOFR plus 100 basis points") is True
 
 
+def test_a_basis_point_margin_is_rate_like_however_the_filing_abbreviates_it() -> None:
+    """`bps` is the spelling filings use, and it was not in the marker set (#228).
+
+    `RATE_SUFFIX_PATTERN` carried the spelled-out `basis points` but not the
+    abbreviation, so `50 bps` read as a money amount and
+    `validate_amount_is_not_rate` passed a basis-point margin through as an
+    `amount`. `amounts_agree` does not catch it downstream either: it only
+    rejects a model figure that disagrees with the number in the cited span,
+    and the model reports the basis-point figure itself, so the two agree and
+    the margin publishes as a principal of 50. A wrong published value, not the
+    silent null of #182.
+
+    Distinct from #75/#102, which was the whitespace that hid the multi-word
+    marker from the predicate. That one is fixed, and the spelled-out assertions
+    above still pin it; this is the vocabulary rather than the normalization, so
+    it would have been present even with #102 perfect.
+    """
+    for spelling in ("50 bps", "50 bp", "50 BPS", "50 basis points"):
+        assert is_rate_like_amount_text(spelling) is True, spelling
+    # The shapes a margin is actually written in.
+    assert is_rate_like_amount_text("L+250 bps") is True
+    assert is_rate_like_amount_text("a margin of 275 bps") is True
+
+    # ... and the validator that depends on it now refuses the amount.
+    failures = validate_amount_is_not_rate(
+        index=0,
+        value={"evidence": ["tag-1"]},
+        tag_details={"tag-1": {"text": "50 bps"}},
+    )
+    assert len(failures) == 1
+    assert "'50 bps'" in failures[0]
+
+    # `bps?\b` must not swallow a real figure: the word boundary keeps it off
+    # longer words, and a principal still reads as a principal.
+    assert is_rate_like_amount_text("500,000 bpd of crude") is False
+    assert is_rate_like_amount_text("$500.0 million") is False
+    assert is_rate_like_amount_text("1,500,000") is False
+
+
 def test_instrument_ie_validate_rejects_rate_only_amount_evidence() -> None:
     """An amount citing only a rate should fail validation and retry."""
     response = json.dumps(
