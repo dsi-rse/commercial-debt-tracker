@@ -401,3 +401,58 @@ def test_new_snippets_merge_without_dropping_the_other_genres_mentions(
         [EIGHTK_ITEM_ID, SIXK_ITEM_ID, second_item_id]
     )
     assert len(list((tmp_path / "mentions").glob("**/*.parquet"))) == 1
+
+
+def _stub_workflow_with_no_mentions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make extraction succeed and produce no mentions at all."""
+
+    async def fake_run_extraction_workflow(**kwargs: object) -> ExtractionRowState:
+        row_state = ExtractionRowState(
+            item_row=kwargs["item_row"],  # type: ignore[arg-type]
+            stage_name="instrument_ie",
+        )
+        row_state.debt_instrument_mentions = []
+        row_state.finish("SUCCESS")
+        return row_state
+
+    monkeypatch.setattr(
+        "cdt.extractor.core.run_extraction_workflow", fake_run_extraction_workflow
+    )
+
+
+def test_a_still_relevant_item_re_extracted_to_zero_mentions_is_purged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-extraction withdrawing every mention has to withdraw the rows (#209).
+
+    Every other pruning test in this suite drives the *retired* path: the item
+    stopped being relevant, or its id ceased to exist, so the source no longer
+    carries it. This is the case none of them reached -- the item is still
+    relevant and still claimed, it is re-extracted, and this time the model
+    returns nothing. `retired_item_ids` is therefore empty (it is
+    `done_item_ids - relevant_item_ids`, and the item is relevant) while
+    `replaced_item_ids` holds the id.
+
+    Under `--force` the merge was gated on
+    `replaced_item_ids & pending.done_item_ids`, and a forced partition carries
+    `done_item_ids=frozenset()` by construction -- `pending_extract_partitions`
+    forgets what was done so the rows get re-extracted -- so that intersection
+    was always empty and the partition fell through to the branch that counted
+    it as empty and never merged. The previous pass's mentions stayed published
+    as facts the new pass had just withdrawn.
+    """
+    _write_classifications(tmp_path)
+    _stub_workflow(monkeypatch)
+    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+    assert read_dataset(mentions_root(tmp_path))["item_id"].astype(str).to_list() == [
+        EIGHTK_ITEM_ID
+    ]
+
+    # The same still-relevant item, re-extracted to nothing. `force` is what
+    # makes extract claim an item it has already completed, so the leak is only
+    # reachable this way -- and `force` is also what empties `done_item_ids`.
+    _stub_workflow_with_no_mentions(monkeypatch)
+    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None, force=True)
+
+    written = read_dataset(mentions_root(tmp_path))
+    assert written.empty, f"stale mentions survived: {written['item_id'].to_list()}"

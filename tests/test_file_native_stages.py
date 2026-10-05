@@ -9278,6 +9278,79 @@ def test_the_batch_finalize_publishes_through_the_mint_seam(tmp_path: Path) -> N
     assert successor["amendment_of"] == minted.iloc[0]["debt_instrument_mention_id"]
 
 
+def test_the_batch_finalize_purges_an_item_re_extracted_to_zero_mentions(
+    tmp_path: Path,
+) -> None:
+    """Re-extraction withdrawing every mention has to withdraw the rows (#209).
+
+    The guard here tested `retired` alone. `retired` is built from the claimed
+    sources' `prior_item_ids` minus what is still relevant, so for the target
+    case -- item still relevant, re-extracted, model now returns nothing -- it
+    is empty while `replaced` holds the id. `mentions.empty and not retired` was
+    therefore true, the `continue` skipped the merge, and the previous pass's
+    rows stayed published as facts this pass had just withdrawn.
+
+    The suite's other pruning tests all drive the retired path instead
+    (`test_extractor_sources.py`), or assert the opposite: a visited-but-empty
+    partition must not be written when there is genuinely nothing to purge,
+    which is the branch that survives here because `replaced` is empty too.
+    """
+    from cdt.extractor.core import finalize_extract_outputs
+
+    def row_state(mentions: list[dict[str, object]]) -> ExtractionRowState:
+        state = ExtractionRowState(
+            item_row={
+                "item_id": "item-1",
+                "accession_number": "0001",
+                "cik": "0000320193",
+                "company_name": "Example Inc.",
+                "date": "2024-06-01",
+                "text": "a credit agreement",
+            },
+            stage_name="instrument_ie",
+        )
+        state.debt_instrument_mentions = mentions
+        state.finish("SUCCESS")
+        return state
+
+    common = {
+        "claimed": {},
+        "run_id": "20240601T000000000000Z",
+        "model": "test-model",
+        "reasoning_effort": "none",
+        "max_attempts": 3,
+        "artifact_root": tmp_path,
+    }
+    # A plain mention, with no `prior` term: this test is about the purge, and a
+    # minted predecessor would put a second row in the partition.
+    mention = build_mention_row(
+        mention_id="m-1",
+        item_id="item-1",
+        accession_number="0001",
+        cik="0000320193",
+        date="2024-06-01",
+        name="Term Loan",
+        start_date="2024-06-01",
+        amount="$100 million",
+    )
+    finalize_extract_outputs(
+        [(row_state([mention]), "2024-06-01", "0001")],
+        **common,  # type: ignore[arg-type]
+    )
+    assert read_dataset(mentions_root(tmp_path))["item_id"].astype(str).to_list() == [
+        "item-1"
+    ]
+
+    # The same still-relevant item, re-extracted to nothing.
+    finalize_extract_outputs(
+        [(row_state([]), "2024-06-01", "0001")],
+        **common,  # type: ignore[arg-type]
+    )
+
+    written = read_dataset(mentions_root(tmp_path))
+    assert written.empty, f"stale mentions survived: {written['item_id'].to_list()}"
+
+
 def test_extract_tables_publishes_through_the_mint_seam(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

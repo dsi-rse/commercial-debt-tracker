@@ -2111,6 +2111,57 @@ def backfill_mentions(
     return counts
 
 
+def _mentions_partition_needs_write(
+    resolved_root: str,
+    *,
+    data_dir: Path | None,
+    partition: dict[str, str],
+    new_mentions: pd.DataFrame,
+    replaced_item_ids: set[str],
+    retired_item_ids: set[str],
+) -> bool:
+    """Whether this partition has rows to add or rows to take away (#209).
+
+    Both backends decide this, and both got it wrong in their own way, so the
+    rule lives in one place. There are two reasons to write: new mentions to
+    add, or ids to remove from what is already stored. The second is the one
+    that leaked -- an item that is still relevant, is re-extracted, and this
+    time yields *no* mentions has to have its previous rows withdrawn, or the
+    pipeline keeps publishing facts the newer pass retracted.
+
+    `retired_item_ids` cannot carry that case: it is
+    `done_item_ids - relevant_item_ids`, and the item is still relevant, so it
+    is empty while `replaced_item_ids` holds the id. The batch path tested only
+    `retired` and so skipped the merge outright. The live path tested
+    `replaced_item_ids & pending.done_item_ids`, which looks right but is empty
+    under `--force` by construction: `pending_extract_partitions` deliberately
+    sets `done_item_ids=frozenset()` for a forced partition so its rows get
+    re-extracted, which also erased the evidence that there was anything to
+    purge.
+
+    Asking the stored partition is what both were reaching for and neither
+    could express. It is also why "ids to remove" is not simply
+    `replaced_item_ids`: on a first-ever extraction that yields nothing, every
+    claimed id is `replaced` and there is no partition to purge from, and
+    writing then would create an empty parquet file where the pipeline's
+    contract is to create none
+    (`test_extract_pending_items_skips_empty_outputs_on_rerun`).
+    """
+    if not new_mentions.empty:
+        return True
+    if not (replaced_item_ids or retired_item_ids):
+        return False
+    return artifact_exists(
+        date_shard_partition_path(
+            MENTIONS_DATASET_NAME,
+            partition_date=partition["date"],
+            shard=partition["shard"],
+            artifact_root=resolved_root,
+            data_dir=data_dir,
+        )
+    )
+
+
 def _merge_mentions_partition(
     resolved_root: str,
     *,
@@ -2348,12 +2399,16 @@ def extract_pending_items(
         mentions = pd.DataFrame(mention_rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
         # Rows this partition was extracted for last time and no longer has.
         retired_item_ids = set(pending.done_item_ids) - relevant_item_ids
-        if mentions.empty and not replaced_item_ids and not retired_item_ids:
-            empty_partitions += 1
-        elif (
-            not mentions.empty
-            or replaced_item_ids & pending.done_item_ids
-            or retired_item_ids
+        # One condition, shared with the batch path: the three-branch form here
+        # had a middle test that disagreed with the first, and the gap between
+        # them was the `--force` leak (#209).
+        if _mentions_partition_needs_write(
+            resolved_root,
+            data_dir=data_dir,
+            partition=partition,
+            new_mentions=mentions,
+            replaced_item_ids=replaced_item_ids,
+            retired_item_ids=retired_item_ids,
         ):
             partitions_written.append(
                 _merge_mentions_partition(
@@ -2552,7 +2607,21 @@ def finalize_extract_outputs(
         mentions = pd.DataFrame(mention_rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
         replaced = terminal_by_partition.get((partition_date, shard), set())
         retired = retired_by_partition.get((partition_date, shard), set())
-        if mentions.empty and not retired:
+        # `replaced` as well as `retired`, via the predicate the live path also
+        # uses: testing `retired` alone skipped the purge for a still-relevant
+        # item re-extracted to zero mentions (#209).
+        # `_merge_mentions_partition` already handles an empty `new_mentions`
+        # beside a populated `replaced_item_ids` correctly -- it drops the
+        # replaced ids and writes what is left -- so the bug was only ever in
+        # this guard.
+        if not _mentions_partition_needs_write(
+            resolved_root,
+            data_dir=data_dir,
+            partition={"date": partition_date, "shard": shard},
+            new_mentions=mentions,
+            replaced_item_ids=replaced,
+            retired_item_ids=retired,
+        ):
             empty_partitions += 1
             continue
         partitions_written.append(
