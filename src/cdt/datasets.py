@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import date
+from operator import itemgetter
 from pathlib import Path
 from typing import Self, cast
 
@@ -34,7 +36,6 @@ LOGGER = get_logger(__name__)
 # `normalize_reasoning_effort` from `cdt.extractor.core`, so the dependency runs
 # the other way. This module is the leaf both sides already import.
 SIXK_SNIPPET_DATASET_NAME = "sixk-snippets"
-ITEMIZE_CLASSIFY_EXTRACT_SHARDS = 8
 MATCH_SHARDS = 64
 PARTITION_PATTERN = re.compile(
     r"(?P<dataset>[a-z\-]+)/date=(?P<date>\d{4}-\d{2}-\d{2})/shard=(?P<shard>\d{4})/part-0000\.parquet$"
@@ -86,7 +87,7 @@ def run_manifest_path(
     )
 
 
-def completion_registry_path(
+def completion_registry_root(
     stage_name: str,
     *,
     artifact_root: ArtifactPath | None = None,
@@ -106,8 +107,13 @@ def completion_registry_path(
     source partition's year-month, a cycle touches only the one or two months
     its 100-partition chunk covers and moves half a megabyte.
 
-    Callers that want the pre-#191 object -- read-compat and migration -- want
-    ``legacy_completion_registry_path`` instead.
+    Named ``_root``, not ``_path``, because this module splits the two without
+    exception and #220 broke that (#227): prefixes are ``*_root``
+    (``dataset_root``, ``items_root``, ``mentions_root``, ``batches_root``,
+    ``mirror_root``) and single objects are ``*_path`` (``run_manifest_path``,
+    ``failure_registry_path``, ``active_job_path``, ``final_pointer_path``).
+    With ``completion_registry_shard_path`` for the objects underneath it, this
+    is the coherent pair.
     """
     return join_artifact_path(
         resolve_artifact_root(artifact_root, data_dir=data_dir),
@@ -117,25 +123,24 @@ def completion_registry_path(
     )
 
 
-def legacy_completion_registry_path(
+def completion_registry_path(
     stage_name: str,
     *,
     artifact_root: ArtifactPath | None = None,
     data_dir: Path | None = None,
 ) -> str:
-    """Return the pre-#191 single-object registry path, for read-compat.
+    """Deprecated alias for ``completion_registry_root``; do not add callers.
 
-    Still read on every load, because an artifact root written before #191 has
-    all of its completion state here and nowhere else. Reading it as empty is
-    not a slow path, it is the #107 failure mode: ``force=False`` reported 0
-    pending partitions and ``force=True`` reported 20,046, because the registry
-    the run consulted was not the registry the corpus had.
+    Kept only because four stage modules still import this name, and all four
+    live in files owned by branches running in parallel with this one, where a
+    rename would be a pure textual conflict for no behavioural gain. Retiring
+    it -- the four call sites, plus the five run manifests whose
+    ``"completion_registry"`` key now names a directory while its neighbours
+    ``"audit_path"`` and ``"failure_registry"`` still name files -- is tracked
+    on #227 and should land once those branches merge.
     """
-    return join_artifact_path(
-        resolve_artifact_root(artifact_root, data_dir=data_dir),
-        "runs",
-        stage_name,
-        "completed-partitions.json",
+    return completion_registry_root(
+        stage_name, artifact_root=artifact_root, data_dir=data_dir
     )
 
 
@@ -146,8 +151,7 @@ def legacy_completion_registry_path(
 # rewrite per batch boundary into a ~0.2 MB one (#191).
 _REGISTRY_SHARD_DATE_CHARS = len("YYYY-MM")
 # A key with no parseable partition date still has to round-trip. Dropping it
-# would silently lose completion state -- the same class of bug as reading a
-# legacy registry as empty -- so it gets a named shard of its own.
+# would silently lose completion state, so it gets a named shard of its own.
 _UNDATED_REGISTRY_SHARD = "unknown"
 
 
@@ -168,7 +172,7 @@ def completion_registry_shard_path(
 ) -> str:
     """Return the path of one date-prefix shard of a stage's registry."""
     return join_artifact_path(
-        completion_registry_path(
+        completion_registry_root(
             stage_name, artifact_root=artifact_root, data_dir=data_dir
         ),
         f"date={shard_label}.json",
@@ -177,11 +181,12 @@ def completion_registry_shard_path(
 
 @dataclass
 class CompletedPartition:
-    """One source partition's completion record (registry v2).
+    """One source partition's completion record.
 
     ``fingerprint`` is the source object's version at processing time (S3 ETag;
-    size+mtime locally); None on entries migrated from the v1 path list, which
-    read as "complete as recorded, reprocess if the source ever changes".
+    size+mtime locally); None on entries saved path-only through
+    ``save_completed_partitions``, which read as "complete as recorded,
+    reprocess if the source ever changes".
     ``item_ids`` (extract only) are the content-terminal rows — SUCCESS or
     FAILED-on-validation — so re-processing a partition is row-level and never
     re-pays rows that already have a real outcome (#49, #62).
@@ -232,7 +237,7 @@ def load_completed_partitions(
     artifact_root: ArtifactPath | None = None,
     data_dir: Path | None = None,
 ) -> set[str]:
-    """Load completed source partition paths for one stage (v1-compatible view)."""
+    """Load completed source partition paths for one stage, ignoring fingerprints."""
     return {
         path
         for path, entry in load_completion_registry(
@@ -248,43 +253,127 @@ def load_completion_registry(
     artifact_root: ArtifactPath | None = None,
     data_dir: Path | None = None,
 ) -> CompletionRegistry:
-    """Load one stage's registry from every date shard, plus the legacy object.
+    """Load one stage's registry from every date shard.
 
-    The pre-#191 single object is read first and the date shards overlay it, so
-    an entry a run re-wrote after the split wins over the copy the legacy object
-    still carries. Loading is the one place that reads everything; it happens
-    once or twice per run, against the 4,400 saves per itemize pass that #191
-    is about.
+    Loading is the one place that reads everything; it happens once or twice
+    per run, against the 4,400 saves per itemize pass that #191 is about.
+
+    The pre-#191 single ``runs/<stage>/completed-partitions.json`` object is
+    not read: nothing in that format is kept during beta, so there is no
+    migration path from it and no rollback path back to it. On S3 the shard
+    prefix ``runs/<stage>/completed`` also matches that object, so the listing
+    keeps only ``date=`` files rather than everything under the prefix.
+
+    The shard reads are issued concurrently because sharding turned one GET
+    into one per occupied month, and a serial loop over them is #110's
+    pathology in a new place (#227). Measured at full-corpus shape -- 393
+    shards -- a load issues one LIST and 393 GETs; serially, at
+    the 70 ms round trip #110 measured on this same 1-vCPU stack, that is 27.5 s
+    per load and a pipeline run does five of them, growing by one shard every
+    month forever. Note that #191's own text claimed the old design "cannot be
+    fixed by parallelising reads, because it is one object"; that stopped being
+    true at 393 objects.
+
+    Overlay order is preserved regardless of completion order: ``map`` yields
+    in submission order, and ``list_artifacts`` already returns sorted paths,
+    so the shards still merge in exactly the sequence the serial loop used.
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     entries: dict[str, CompletedPartition] = {}
-    legacy_path = legacy_completion_registry_path(
-        stage_name, artifact_root=resolved_root, data_dir=data_dir
-    )
-    if artifact_exists(legacy_path):
-        entries.update(
-            _registry_entries(read_json_artifact(legacy_path), resolved_root)
+    shard_paths = [
+        path
+        for path in list_artifacts(
+            completion_registry_root(
+                stage_name, artifact_root=resolved_root, data_dir=data_dir
+            ),
+            suffix=".json",
         )
-    for shard_path in list_artifacts(
-        completion_registry_path(
-            stage_name, artifact_root=resolved_root, data_dir=data_dir
-        ),
-        suffix=".json",
-    ):
-        entries.update(_registry_entries(read_json_artifact(shard_path), resolved_root))
+        if path.rsplit("/", 1)[-1].startswith("date=")
+    ]
+    for payload in _read_registry_shards(shard_paths):
+        entries.update(_registry_entries(payload, resolved_root))
     return CompletionRegistry(entries)
 
 
-# v3 persists keys with the artifact root stripped off; v1 and v2 keys carry
-# whatever whole path the writing run resolved. Both forms are read by shape
-# rather than by version, which is safe because the shapes cannot collide: a
-# relativized key is a *bare* canonical partition path, and any whole path --
-# `/srv/cdt/documents/date=...`, `s3://bucket/documents/date=...`, or the
-# relative `data/genwindow-eval-apr/documents/date=...` the real registry on
-# that root holds -- has a dataset segment with a slash in it, which the
-# pattern's `[a-z\-]+` cannot match under `fullmatch`. So no v2 key is ever
-# mistaken for a v3 one and given a second root.
+# Capped at botocore's default `max_pool_connections` (10): the GETs all share
+# one cached client, and more threads than connections just queue inside the
+# pool while logging "connection pool is full" on every overflow. Raising both
+# together belongs with `S3_CLIENT_CONFIG` in storage.py, not here.
+_REGISTRY_LOAD_CONCURRENCY = 10
+
+
+def _read_registry_shards(shard_paths: list[str]) -> list[object]:
+    """Read registry shard objects concurrently, in ``shard_paths`` order.
+
+    Materialized rather than streamed so the pool is joined before the caller
+    merges anything: a read that raises surfaces from here, instead of halfway
+    through an overlay that has already mutated the registry being built.
+    """
+    if not shard_paths:
+        return []
+    if len(shard_paths) == 1:
+        # The overwhelmingly common local/test shape; skip the pool entirely so
+        # a one-shard load costs no thread setup.
+        return [read_json_artifact(shard_paths[0])]
+    with ThreadPoolExecutor(
+        max_workers=min(_REGISTRY_LOAD_CONCURRENCY, len(shard_paths))
+    ) as pool:
+        return list(pool.map(read_json_artifact, shard_paths))
+
+
+# Keys are persisted with the artifact root stripped off when the remainder is a
+# bare canonical partition path, and whole otherwise. The two are told apart by
+# shape, which is safe because they cannot collide: any whole path --
+# `/srv/cdt/documents/date=...`, `s3://bucket/documents/date=...` -- has a
+# dataset segment with a slash in it, which the pattern's `[a-z\-]+` cannot
+# match under `fullmatch`. So no whole key is ever given a second root.
 _REGISTRY_VERSION = 3
+
+
+# Both key prefixes are derived once per object read or written rather than once
+# per key (#227). Per key, `join_artifact_path` built a `pathlib.Path` and
+# `_relative_registry_key` rebuilt a normalized prefix and an f-string, inside
+# comprehensions that run over every entry the registry holds. Measured on a
+# full-corpus-shaped registry of 440,000 entries (local storage, best of three),
+# that made the load 2.32 s against 1.06 s for the single object it replaced,
+# and made `_absolute_registry_key` 56% of the whole save under cProfile.
+# Hoisted, the same load is 1.08 s: level with the pre-#191 object on a short
+# root, and faster under a long absolute root (1.18 s against 1.27 s), because
+# the per-key cost no longer grows with the root's length.
+#
+# A bare canonical partition path, which is the only shape either prefix is ever
+# applied to (`PARTITION_PATTERN.fullmatch` guarantees it, with no `.` or `..`
+# segment and no doubled separator), so the probe below derives the join prefix
+# by construction and cannot disagree with `join_artifact_path` on any root --
+# including `.` and `""`, where `pathlib` collapses the join rather than
+# prefixing it.
+_REGISTRY_PREFIX_PROBE = "documents/date=2000-01-01/shard=0000/part-0000.parquet"
+
+
+def _registry_join_prefix(artifact_root: str) -> str:
+    """Return the string that re-homes a relativized key under one root."""
+    joined = join_artifact_path(artifact_root, _REGISTRY_PREFIX_PROBE)
+    return joined[: -len(_REGISTRY_PREFIX_PROBE)]
+
+
+def _registry_strip_prefix(artifact_root: str) -> str:
+    """Return the prefix a key must carry for the root to be strippable."""
+    return f"{normalize_artifact_path(artifact_root).rstrip('/')}/"
+
+
+def _strip_registry_root(key: str, strip_prefix: str) -> str:
+    """Strip a precomputed root prefix off one registry key."""
+    if not key.startswith(strip_prefix):
+        return key
+    relative = key[len(strip_prefix) :]
+    return relative if PARTITION_PATTERN.fullmatch(relative) else key
+
+
+def _prepend_registry_root(stored: str, join_prefix: str) -> str:
+    """Reattach a precomputed root prefix to one persisted registry key."""
+    if not PARTITION_PATTERN.fullmatch(stored):
+        return stored
+    return join_prefix + stored
 
 
 def _relative_registry_key(key: str, artifact_root: str) -> str:
@@ -299,13 +388,11 @@ def _relative_registry_key(key: str, artifact_root: str) -> str:
 
     Relativized only when the result reads back through
     ``_absolute_registry_key``, so the two are exactly inverse and a key no
-    reader could reattach a root to is stored whole instead.
+    reader could reattach a root to is stored whole instead. The hot paths call
+    ``_strip_registry_root`` with the prefix hoisted out of their loop; this is
+    the one-key spelling, and the pair the inverse property is asserted on.
     """
-    prefix = f"{normalize_artifact_path(artifact_root).rstrip('/')}/"
-    if not key.startswith(prefix):
-        return key
-    relative = key[len(prefix) :]
-    return relative if PARTITION_PATTERN.fullmatch(relative) else key
+    return _strip_registry_root(key, _registry_strip_prefix(artifact_root))
 
 
 def _absolute_registry_key(stored: str, artifact_root: str) -> str:
@@ -314,47 +401,43 @@ def _absolute_registry_key(stored: str, artifact_root: str) -> str:
     A stored key is root-relative exactly when it is a bare canonical
     date/shard partition path -- ``fullmatch``, not the suffix ``search`` the
     parsers use, so a whole path or an S3 URI is not mistaken for one. Anything
-    else, v1 and v2 keys included, is returned as stored.
+    else is returned as stored.
     """
-    if not PARTITION_PATTERN.fullmatch(stored):
-        return stored
-    return join_artifact_path(artifact_root, stored)
+    return _prepend_registry_root(stored, _registry_join_prefix(artifact_root))
 
 
 def _registry_entries(
     payload: object, artifact_root: str
 ) -> dict[str, CompletedPartition]:
     """Parse one persisted registry object into whole-path-keyed entries."""
+    join_prefix = _registry_join_prefix(artifact_root)
     return {
-        _absolute_registry_key(key, artifact_root): entry
+        _prepend_registry_root(key, join_prefix): entry
         for key, entry in _parse_registry_payload(payload).items()
     }
 
 
 def _parse_registry_payload(payload: object) -> dict[str, CompletedPartition]:
-    """Parse a persisted registry payload (v3, v2 or v1); junk reads as empty."""
+    """Parse one persisted registry shard payload; junk reads as empty."""
     if not isinstance(payload, dict):
         return {}
     partitions = payload.get("partitions")
-    if isinstance(partitions, dict):
-        registry: dict[str, CompletedPartition] = {}
-        for key, entry in partitions.items():
-            if not str(key).strip() or not isinstance(entry, dict):
-                continue
-            fingerprint = entry.get("fingerprint")
-            item_ids = entry.get("item_ids", [])
-            registry[str(key)] = CompletedPartition(
-                fingerprint=str(fingerprint) if fingerprint else None,
-                item_ids=frozenset(
-                    str(item) for item in item_ids if isinstance(item_ids, list)
-                ),
-                complete=bool(entry.get("complete", True)),
-            )
-        return registry
-    values = payload.get("source_partitions", [])
-    if not isinstance(values, list):
+    if not isinstance(partitions, dict):
         return {}
-    return {str(value): CompletedPartition() for value in values if str(value).strip()}
+    registry: dict[str, CompletedPartition] = {}
+    for key, entry in partitions.items():
+        if not str(key).strip() or not isinstance(entry, dict):
+            continue
+        fingerprint = entry.get("fingerprint")
+        item_ids = entry.get("item_ids", [])
+        registry[str(key)] = CompletedPartition(
+            fingerprint=str(fingerprint) if fingerprint else None,
+            item_ids=frozenset(
+                str(item) for item in item_ids if isinstance(item_ids, list)
+            ),
+            complete=bool(entry.get("complete", True)),
+        )
+    return registry
 
 
 def _registry_payload(
@@ -364,7 +447,17 @@ def _registry_payload(
     *,
     artifact_root: str,
 ) -> dict[str, object]:
-    """Build the persisted v3 payload for one date shard of a registry."""
+    """Build the persisted v3 payload for one date shard of a registry.
+
+    Sorted on the relativized key alone (``itemgetter(0)``), not on the whole
+    tuple: a tuple sort falls through to comparing two ``CompletedPartition``
+    dataclasses whenever two keys relativize alike, and they are unordered, so
+    it raises ``TypeError``. Not reachable through ``save_completion_registry``
+    today -- ``_registry_entries`` absolutizes every stored key first -- but
+    crashing on a key collision is a bad trade for a free sort key, and
+    ``json.dumps(sort_keys=True)`` orders the written bytes anyway.
+    """
+    strip_prefix = _registry_strip_prefix(artifact_root)
     return {
         "stage": stage_name,
         "version": _REGISTRY_VERSION,
@@ -376,8 +469,11 @@ def _registry_payload(
                 **({} if entry.complete else {"complete": False}),
             }
             for path, entry in sorted(
-                (_relative_registry_key(key, artifact_root), entry)
-                for key, entry in registry.items()
+                (
+                    (_strip_registry_root(key, strip_prefix), entry)
+                    for key, entry in registry.items()
+                ),
+                key=itemgetter(0),
             )
         },
     }
@@ -414,36 +510,31 @@ def save_completion_registry(
     bookkeeping.
 
     Each shard's compare-and-swap is independent, which is what keeps the
-    per-batch save of #111 durable: a save interrupted after three of five
-    shards leaves those three persisted, and every persisted entry is a
-    partition whose output was already written.
-
-    A save is also where an existing root's pre-#191 single object is folded
-    into date shards, because a save is the only point that holds the writer
-    lease. Every stage saves unconditionally at the end of its run, so the
-    migration lands on the first run after the upgrade even when nothing was
-    pending.
+    per-batch save of #111 durable *for the stages that save per batch*: a save
+    interrupted after three of five shards leaves those three persisted, and
+    every persisted entry is a partition whose output was already written.
+    Itemize, classify and 6-K triage do save at every batch boundary. Extract
+    does not, and it is the stage where this matters most (#227):
+    ``extract_pending_items`` accepts ``batch_size`` but never chunks its
+    partition loop -- the value only reaches the run manifest -- so its sole
+    save is after the loop, an interruption still discards the whole run's
+    registry progress, and that one save is also the only one that can span
+    ~400 shards. Still strictly better than the pre-#191 object, which lost
+    100% of its progress on the same interruption; just not the per-batch
+    durability #111 asked for.
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     changed = sorted(
         registry.dirty if isinstance(registry, CompletionRegistry) else registry
     )
-    adopted, legacy_version = _legacy_registry_to_migrate(
-        stage_name, artifact_root=resolved_root, data_dir=data_dir
-    )
     by_shard: dict[str, dict[str, CompletedPartition]] = {}
     for key in changed:
         by_shard.setdefault(_registry_shard_label(key), {})[key] = registry[key]
-    adopted_by_shard: dict[str, dict[str, CompletedPartition]] = {}
-    for key, entry in adopted.items():
-        adopted_by_shard.setdefault(_registry_shard_label(key), {})[key] = entry
-    for shard_label in sorted(by_shard.keys() | adopted_by_shard.keys()):
-        shard_entries = by_shard.get(shard_label, {})
+    for shard_label, shard_entries in sorted(by_shard.items()):
         _save_registry_shard(
             stage_name,
             shard_label,
             shard_entries,
-            adopted=adopted_by_shard.get(shard_label, {}),
             artifact_root=resolved_root,
             data_dir=data_dir,
         )
@@ -457,79 +548,8 @@ def save_completion_registry(
         # stay clean and only the failed shard's keys are retried.
         if isinstance(registry, CompletionRegistry):
             registry.dirty -= shard_entries.keys()
-    if adopted:
-        # Only after every shard's swap succeeded -- _save_registry_shard
-        # raises rather than returning on exhaustion, so the marker below can
-        # never be written over state that did not make it into a shard.
-        _retire_legacy_registry(
-            stage_name,
-            legacy_version,
-            artifact_root=resolved_root,
-            data_dir=data_dir,
-        )
-    return completion_registry_path(
+    return completion_registry_root(
         stage_name, artifact_root=resolved_root, data_dir=data_dir
-    )
-
-
-def _legacy_registry_to_migrate(
-    stage_name: str,
-    *,
-    artifact_root: str,
-    data_dir: Path | None,
-) -> tuple[dict[str, CompletedPartition], str]:
-    """Return the pre-#191 object's entries and the version token to retire it.
-
-    Read on every save, not once behind a flag, because there is nowhere to
-    keep a flag that a concurrent writer would also see (#88). The steady-state
-    cost after migration is one HeadObject plus one GET of a ~200-byte marker
-    per save, against the 56.8 MB this whole change is removing.
-    """
-    path = legacy_completion_registry_path(
-        stage_name, artifact_root=artifact_root, data_dir=data_dir
-    )
-    if not artifact_exists(path):
-        return {}, ""
-    try:
-        payload, version = read_json_artifact_versioned(path)
-    except FileNotFoundError:
-        return {}, ""
-    return _registry_entries(payload, artifact_root), version
-
-
-def _retire_legacy_registry(
-    stage_name: str,
-    version: str,
-    *,
-    artifact_root: ArtifactPath | None,
-    data_dir: Path | None,
-) -> bool:
-    """Replace a migrated pre-#191 object with an empty forwarding marker.
-
-    Compare-and-swapped on the version the migration read, so a writer that
-    added entries to the object in the meantime is not clobbered. A lost swap
-    is harmless and needs no retry: the object stays as it was, every entry it
-    held is already in a shard, and the next save migrates it again --
-    idempotently, because an adopted entry never overwrites the shard's copy.
-
-    Cleared rather than deleted so the object survives as an operator-visible
-    record of where the state went. The migration is still one-way: code from
-    before #191 reads the marker as an empty registry, which is the #107
-    failure mode, so a rollback has to rebuild the object from the shards.
-    """
-    return replace_json_artifact_if_match(
-        legacy_completion_registry_path(
-            stage_name, artifact_root=artifact_root, data_dir=data_dir
-        ),
-        {
-            "stage": stage_name,
-            "version": 2,
-            "partitions": {},
-            "migrated_to": completion_registry_path(
-                stage_name, artifact_root=artifact_root, data_dir=data_dir
-            ),
-        },
-        version=version,
     )
 
 
@@ -538,16 +558,10 @@ def _save_registry_shard(
     shard_label: str,
     entries: dict[str, CompletedPartition],
     *,
-    adopted: dict[str, CompletedPartition],
     artifact_root: str,
     data_dir: Path | None,
 ) -> str:
     """Compare-and-swap ``entries`` into one date shard of a stage's registry.
-
-    ``adopted`` entries come from the pre-#191 single object and are inserted
-    only where the shard has no entry for the key: anything already in the
-    shard was written after the split and is therefore newer than the copy the
-    legacy object still carries.
 
     The merge runs on whole-path keys and the payload strips the root on the
     way out, so a shard written at an older key convention is normalized on
@@ -563,7 +577,7 @@ def _save_registry_shard(
                 _registry_payload(
                     stage_name,
                     shard_label,
-                    {**adopted, **entries},
+                    entries,
                     artifact_root=artifact_root,
                 ),
             ):
@@ -574,8 +588,6 @@ def _save_registry_shard(
         except FileNotFoundError:
             continue
         merged = _registry_entries(payload, artifact_root)
-        for key, entry in adopted.items():
-            merged.setdefault(key, entry)
         merged.update(entries)
         if replace_json_artifact_if_match(
             path,
@@ -599,10 +611,10 @@ def save_completed_partitions(
     artifact_root: ArtifactPath | None = None,
     data_dir: Path | None = None,
 ) -> str:
-    """Persist completed partitions path-only (v1-compatible writer).
+    """Persist completed partitions path-only, without fingerprints.
 
-    Merges into the v2 registry without fingerprints; callers migrating to
-    row-aware completion should use save_completion_registry directly.
+    Callers that need row-aware completion should use
+    ``save_completion_registry`` directly.
     """
     registry = load_completion_registry(
         stage_name, artifact_root=artifact_root, data_dir=data_dir
@@ -629,8 +641,8 @@ def pending_source_partitions(
     pending when it has no completion entry or its source fingerprint changed —
     ingest merges late-arriving rows into partition files in place, and a
     path-level "target exists" skip silently strands those rows forever (#62).
-    Legacy entries (v1 lists, or targets that predate the registry) are stamped
-    with the current fingerprint in the returned registry so future growth is
+    Entries with no fingerprint (saved path-only, or targets that predate the
+    registry) are stamped with the current fingerprint in the returned registry so future growth is
     detectable; the caller persists it via save_completion_registry.
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
@@ -924,11 +936,6 @@ def shard_label(value: str, shard_count: int) -> str:
     change here strands existing partitions (#61), so change it nowhere else.
     """
     return f"{zlib_crc32(value) % shard_count:04d}"
-
-
-def shard_for_accession(accession_number: str) -> str:
-    """Return the canonical date/shard partition for one accession."""
-    return shard_label(accession_number, ITEMIZE_CLASSIFY_EXTRACT_SHARDS)
 
 
 CIK_DIGITS = 10
