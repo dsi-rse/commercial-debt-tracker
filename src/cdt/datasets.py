@@ -260,7 +260,9 @@ def load_completion_registry(
 
     The pre-#191 single ``runs/<stage>/completed-partitions.json`` object is
     not read: nothing in that format is kept during beta, so there is no
-    migration path from it and no rollback path back to it.
+    migration path from it and no rollback path back to it. On S3 the shard
+    prefix ``runs/<stage>/completed`` also matches that object, so the listing
+    keeps only ``date=`` files rather than everything under the prefix.
 
     The shard reads are issued concurrently because sharding turned one GET
     into one per occupied month, and a serial loop over them is #110's
@@ -278,12 +280,16 @@ def load_completion_registry(
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     entries: dict[str, CompletedPartition] = {}
-    shard_paths = list_artifacts(
-        completion_registry_root(
-            stage_name, artifact_root=resolved_root, data_dir=data_dir
-        ),
-        suffix=".json",
-    )
+    shard_paths = [
+        path
+        for path in list_artifacts(
+            completion_registry_root(
+                stage_name, artifact_root=resolved_root, data_dir=data_dir
+            ),
+            suffix=".json",
+        )
+        if path.rsplit("/", 1)[-1].startswith("date=")
+    ]
     for payload in _read_registry_shards(shard_paths):
         entries.update(_registry_entries(payload, resolved_root))
     return CompletionRegistry(entries)

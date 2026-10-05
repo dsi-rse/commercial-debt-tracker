@@ -5826,6 +5826,43 @@ def test_completion_registry_load_reads_its_shards_concurrently(
     assert len(loaded) == 6
 
 
+def test_completion_registry_load_reads_only_date_shards() -> None:
+    """A sibling object the S3 prefix also matches is not read as a shard.
+
+    On S3 the shard prefix ``runs/<stage>/completed`` is a raw ``Prefix=``, so
+    it also lists ``runs/<stage>/completed-partitions.json``, the pre-#191
+    single object (#227). Local listing globs inside the directory and never
+    sees it, so the listing is stubbed to return what S3 would.
+    """
+    root = "s3://bucket/root"
+    shard = f"{root}/runs/itemize/completed/date=2024-01.json"
+    sibling = f"{root}/runs/itemize/completed-partitions.json"
+    key = "documents/date=2024-01-02/shard=0001/part-0000.parquet"
+    reads: list[str] = []
+
+    def read(path: object) -> object:
+        reads.append(str(path))
+        fingerprint = "shard" if path == shard else "sibling"
+        return {
+            "stage": "itemize",
+            "version": 3,
+            "partitions": {
+                key: {"fingerprint": fingerprint},
+                f"{key}.only-in-{fingerprint}": {"fingerprint": fingerprint},
+            },
+        }
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            cdt_datasets, "list_artifacts", lambda *a, **k: sorted([shard, sibling])
+        )
+        patch.setattr(cdt_datasets, "read_json_artifact", read)
+        loaded = cdt_datasets.load_completion_registry("itemize", artifact_root=root)
+
+    assert reads == [shard]
+    assert {entry.fingerprint for entry in loaded.values()} == {"shard"}
+
+
 def test_completion_registry_load_merges_shards_in_sorted_order(
     tmp_path: Path,
 ) -> None:
