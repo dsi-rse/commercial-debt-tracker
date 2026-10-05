@@ -2603,6 +2603,95 @@ def test_an_untagged_echo_is_accepted_after_a_failure_that_found_nothing() -> No
     assert published_mention_rows(row_state) == []
 
 
+def test_ner_high_water_is_the_most_any_attempt_found_not_the_least() -> None:
+    """The mark is the *maximum* across attempts, which is what makes it a guard (#176).
+
+    MPLX is the shape that needs it: attempt 1 tagged 91 spans, attempt 2 came
+    back malformed and tagged none, and attempt 3 was the untagged echo. Taking
+    the minimum -- or just the last -- would read zero off attempt 2, switch the
+    guard off, and let attempt 3 publish as a clean zero, which is the defect
+    #176 describes, verbatim.
+    """
+    from cdt.extractor.core import AttemptRecord, prior_debt_instrument_high_water
+
+    row_state = _ner_row(MPLX_TEXT)
+    row_state.all_attempts.append(
+        AttemptRecord(
+            stage_name="ner",
+            attempt_index=1,
+            response=MPLX_TAGGED_BUT_UNFAITHFUL,
+            status="FAILED",
+        )
+    )
+    row_state.all_attempts.append(
+        AttemptRecord(
+            stage_name="ner",
+            attempt_index=2,
+            response="not xml at all",
+            status="FAILED",
+        )
+    )
+
+    # Tag counts across this row's history are 1 then 0: the max is 1, while
+    # the min and the most recent are both 0.
+    assert prior_debt_instrument_high_water(row_state, "ner") == 1
+
+
+def test_ner_echo_guard_ignores_surrounding_whitespace() -> None:
+    """A trailing newline must not buy a give-up a pass (#176).
+
+    Completions routinely arrive with trailing whitespace. Compared without
+    stripping both sides, such a response is not byte-identical to the input,
+    the echo guard misses it, and an untagged give-up publishes as a clean
+    zero.
+    """
+    from cdt.extractor.core import AttemptRecord
+
+    row_state = _ner_row(MPLX_TEXT)
+    row_state.all_attempts.append(
+        AttemptRecord(
+            stage_name="ner",
+            attempt_index=1,
+            response=MPLX_TAGGED_BUT_UNFAITHFUL,
+            status="FAILED",
+        )
+    )
+
+    failures = NERStage().validate(row_state, f"<body>{MPLX_TEXT}</body>\n")
+
+    assert any("byte-identical to the input" in failure for failure in failures)
+
+
+def test_ner_high_water_accepts_a_reduced_but_nonzero_tag_count() -> None:
+    """The high-water check is exact-zero by design, and the boundary is deliberate.
+
+    A model that merges two adjacent spans into one has not given up, and no
+    false-positive rate has been measured for any ratio threshold. Pinned so
+    that tightening this to "fewer tags than before" is a visible decision
+    rather than a quiet one (#176).
+    """
+    from cdt.extractor.core import AttemptRecord
+
+    text = "The Company issued 6.250% Notes due 2022 and 5.250% Notes due 2025."
+    two_tags = (
+        "<body>The Company issued <debt_instrument>6.250% Notes due "
+        "2022</debt_instrument> and <debt_instrument>5.250% Notes due "
+        "2025</debt_instrument>.</body>"
+    )
+    one_tag = (
+        "<body>The Company issued <debt_instrument>6.250% Notes due 2022 and "
+        "5.250% Notes due 2025</debt_instrument>.</body>"
+    )
+    row_state = _ner_row(text)
+    row_state.all_attempts.append(
+        AttemptRecord(
+            stage_name="ner", attempt_index=1, response=two_tags, status="FAILED"
+        )
+    )
+
+    assert NERStage().validate(row_state, one_tag) == []
+
+
 def test_prior_attempt_tagged_reads_the_row_the_way_the_echo_guard_needs() -> None:
     """The three properties the echo gate rests on (#176).
 
@@ -2949,6 +3038,13 @@ def test_every_stage_gets_the_same_attempt_budget() -> None:
     end to end rather than asserted against a helper, because the budget is
     only real if the loop stops there.
     """
+    from cdt.extractor.core import DEFAULT_MAX_ATTEMPTS
+
+    # Pinned as a literal for the same reason MAX_CONTENT_FILTER_RESENDS is:
+    # the budget *is* the number, so restating the constant asserts nothing
+    # about its value.
+    assert DEFAULT_MAX_ATTEMPTS == 3
+
     # NER: three scored attempts, then the row terminates.
     row_state, client = _run_live(MPLX_TEXT, [_stopped("not xml")] * 10)
     assert len(client.requests) == 3
@@ -3192,6 +3288,33 @@ def test_an_empty_aborted_body_behaves_the_same_as_a_truncated_one() -> None:
         assert len(client.requests) == 2
         assert row_state.state == "SUCCESS"
         assert row_state.salvage_notes == []
+
+
+def test_abort_counts_are_kept_per_stage_not_per_row() -> None:
+    """Each stage gets its own resend budget (#127).
+
+    Filtering is nondeterministic per call, so one row can be aborted on an
+    early stage, recover, and be aborted again later. Counted per row, the
+    earlier stage's aborts would eat the later stage's budget and terminate a
+    row that still had resends coming to it.
+    """
+    from cdt.extractor.core import count_content_filter_aborts
+
+    row_state, client = _run_live(
+        MULTI_TEXT,
+        [CONTENT_FILTERED] * 3
+        + [_stopped(MULTI_NER), _stopped(MULTI_IE)]
+        + [CONTENT_FILTERED] * 40,
+    )
+
+    # Three NER aborts, a NER pass, an instrument_ie pass, and then the
+    # relation stage still gets its own full seven before terminating.
+    assert len(client.requests) == 3 + 2 + 7
+    assert count_content_filter_aborts(row_state, "ner") == 3
+    assert count_content_filter_aborts(row_state, "instrument_relation") == 7
+    # #152 still applies: the mentions it already earned publish.
+    assert row_state.state == "PARTIAL"
+    assert len(row_state.debt_instrument_mentions) == 2
 
 
 def test_after_a_resend_the_next_answer_is_still_a_first_attempt() -> None:
