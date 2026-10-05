@@ -7,7 +7,7 @@ import hashlib
 import io
 import json
 import re
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
@@ -325,17 +325,30 @@ def artifact_content_versions(
     return versions
 
 
-def artifact_tree_digest(roots: Iterable[ArtifactPath], *, suffix: str = "") -> str:
+def artifact_tree_digest(
+    roots: Iterable[ArtifactPath],
+    *,
+    suffix: str = "",
+    context: Mapping[str, object] | None = None,
+) -> str:
     """Digest the content versions of every artifact under a set of roots.
 
     One value standing for "these trees, exactly as they are now", so a caller
     can record it and later ask whether anything under them moved. Sorted so
     listing order cannot change the answer.
+
+    ``context`` is anything else, JSON-serialisable, that the caller's answer
+    depends on besides the bytes — a code or schema version, say — folded into
+    the same digest so a change to it reads as a move.
     """
     versions: dict[str, str] = {}
     for root in roots:
         versions.update(artifact_content_versions(root, suffix=suffix))
-    payload = json.dumps(sorted(versions.items()), separators=(",", ":"))
+    payload = json.dumps(
+        {"context": context or {}, "versions": sorted(versions.items())},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
