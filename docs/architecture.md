@@ -1,6 +1,6 @@
 # CDT Architecture
 
-Commercial Debt Tracker (CDT) turns SEC 8-K filings into a canonical, queryable history of debt instruments without maintaining an application database.
+Commercial Debt Tracker (CDT) turns SEC 8-K and 6-K filings into a canonical, queryable history of debt instruments without maintaining an application database.
 
 ## End-to-End Flow
 
@@ -21,7 +21,7 @@ those issuers happened to file is not something the caller should have to know.
 3. `classify`
    Uses a local TF-IDF plus linear SVC model to mark item sections as relevant or irrelevant before any LLM call.
 4. `ingest-sixk`
-   The 6-K genre's acquisition. The scraper stores a 6-K as one object per document rather than one complete submission, so this assembles the submission and mirrors it under `raw-documents/sixk/`, writing `documents-sixk` partitions. Its own dataset, because every stage selects work by source-partition fingerprint (#62): 6-K rows landing in 8-K partitions would make the whole 8-K corpus pending again.
+   The 6-K genre's acquisition. The scraper stores a 6-K as one object per document rather than one complete submission, so this assembles the submission and mirrors it under `raw-documents/sixk/`, writing `documents-sixk` partitions. It is a separate dataset because every stage selects work by source-partition fingerprint: 6-K rows landing in 8-K partitions would make the whole 8-K corpus pending again.
 5. `sixk`
    The 6-K genre's triage, in place of itemize → classify: a 6-K has no items to itemize and nothing for the item classifier to classify. It windows each document, scores the windows with a local model, expands the admitted ones into the context their crop cut off, and has an LLM prune the survivors, writing `sixk-snippets` rows in the same classified-item columns `classify` produces.
 6. `extract`
@@ -33,7 +33,7 @@ The stage-oriented CLI is `cdt`. The deployment-oriented entrypoint is `cdt-orch
 
 After matching, the pipeline can optionally materialize four final snapshot tables for downstream consumers:
 
-- `items/latest.parquet` — both genres: 8-K item sections and 6-K snippets, in the itemizer's column shape. Every mention joins to its source row here by `item_id`, and consumers read the item text, the filing's SEC URL and its accession number off it — so a genre missing from this table publishes mentions that join to nothing. A 6-K row's `item` is its snippet id (`{accession}:{document}:{window}`) where an 8-K row's is a dotted item number; the snippet's own span and stage-2 verdict stay in `sixk-snippets`. A `form_type` column (`8-K` or `6-K`) is stamped on each row as the table is published, because nothing in the itemizer's sixteen columns records which kind of filing a row came out of and the `item` column is not a reliable substitute
+- `items/latest.parquet` — both genres: 8-K item sections and 6-K snippets, in the itemizer's column shape. Every mention joins to its source row here by `item_id`, and consumers read the item text, the filing's SEC URL and its accession number off it — so a genre missing from this table publishes mentions that join to nothing. A 6-K row's `item` is its snippet id (`{accession}:{document}:{window}`) where an 8-K row's is a dotted item number; the snippet's own span and stage-2 verdict stay in `sixk-snippets`. A `form_type` column (`8-K` or `6-K`) is stamped on each row as the table is published, because nothing in the itemizer's sixteen columns records which kind of filing a row came out of and the `item` column is not a reliable substitute.
 - `debt-instruments/latest.parquet`
 - `debt-instrument-mentions/latest.parquet`
 - `mention-cluster-edges/latest.parquet`
@@ -46,7 +46,7 @@ CDT stores canonical state as Parquet, JSON, and JSONL artifacts under one root 
 
 That choice is visible throughout the code:
 
-- stage completion is inferred from partition presence
+- stage completion is recorded per source partition in a completion registry, keyed by the source file's fingerprint, so a partition that grows is processed again
 - partitions are rewritten deterministically
 - stage manifests are sidecar metadata, not the source of truth
 - the same pipeline can target either local paths or `s3://` URIs
@@ -156,10 +156,10 @@ backend ran it:
   `o4` families, matched on the native id) reject `temperature != 1`, so temperature is
   sent only to models that can honor it; for those it is pinned to `0.0`.
 - Reasoning effort is configured in OpenRouter's vocabulary and translated for OpenAI by
-  `openai_reasoning_effort`: `none` → `minimal` and `xhigh` → `high`. Translating rather
-  than dropping matters — an omitted `reasoning_effort` leaves a `gpt-5` batch on the API
-  default (`medium`) while the live backend ran with reasoning off. An effort neither
-  vocabulary accepts raises on the poll tick before a job is created.
+  `openai_reasoning_effort`. The two vocabularies agree except for OpenRouter's `minimal`,
+  which maps to `low`. The effort is always sent: an omitted `reasoning_effort` would leave
+  a `gpt-5` batch on the API default (`medium`) while the live backend ran with reasoning
+  off. An effort neither vocabulary accepts raises on the poll tick before a job is created.
 
 ### The batch extract state machine
 
@@ -192,9 +192,8 @@ errors); expired batches salvage whatever completed and re-submit the rest, up t
 per-item cap of consecutive expired rounds. A response the provider aborted
 (`finish_reason=content_filter`) is re-sent unscored — it is not the model answering, so
 there is nothing to validate and nothing to correct — up to a per-stage cap, after which
-the row terminates rather than occupying further rounds (#127, #135). Job state lives
-under `extract-batches/`
-(see [schema.md](schema.md)).
+the row terminates rather than occupying further rounds. Job state lives under
+`extract-batches/` (see [schema.md](schema.md)).
 
 If `active.json` names a job directory that was deleted or only partially written, the
 tick cannot load it. Rather than raising the same way forever, it logs the reason, clears
@@ -228,13 +227,13 @@ The matcher uses deterministic surfaces, every one of them derived from extracto
 
 This is a pragmatic middle ground: simpler than a graph database or long-lived entity service, but enough to build useful instrument histories from noisy filing text.
 
-### Stage boundary: the matcher does not extract (#184)
+### Stage boundary: the matcher does not extract
 
 **The matcher consumes extraction output and filing metadata. It never derives a new fact about an instrument from source text.** Deciding which mentions are the same instrument, and rolling up what the extractor already asserted, is the whole of its job.
 
 This is not stylistic. Two invariants depend on it:
 
-- **Every published value is citable (#154).** Each evidence payload records `spans` whose offsets index the source item's `text` exactly. A value the matcher derives from text has no span and cannot acquire one, because no span was ever bound to that object — it would publish as fact with no route back to the sentence behind it.
+- **Every published value is citable.** Each evidence payload records `spans` whose offsets index the source item's `text` exactly. A value the matcher derives from text has no span and cannot acquire one, because no span was ever bound to that object — it would publish as fact with no route back to the sentence behind it.
 - **Facts are bound to objects; text is bound to documents.** The extractor resolves a fact to one object through `raw_id`. Item text carries no such scoping, so a rule that reads item text here attributes a document-level observation to whichever objects happen to be in scope. In a filing that names several instruments, that is all of them.
 
 The line is not "no heuristics in the matcher". The matcher does parse text-like attributes — `name_rates_are_compatible` pulls coupon rates out of name fingerprints — and that is fine, because of *how* the result is used:
@@ -249,15 +248,10 @@ Practical consequences when extending the matcher:
 - If a needed fact is not in the extractor's output, the fix belongs in the extractor — add the property there, bound to an object and cited with spans — not in a matcher heuristic that reconstructs it from text.
 - A new published column that records a matcher inference, rather than an extractor fact, needs a provenance column that survives an incremental rematch, and it needs saying so in `docs/schema.md`.
 
-`ordinal_chain` in `cdt.matcher.lineage_inference` illustrates the right side of the line: it reasons over the `name` column, the filing dates, and the borrower the extractor bound to each row in `parties_json` — all extractor facts, all cited. Its predecessor rule, `prior_fact`, illustrates the other direction. It inferred an `amendment_of` link from a `prior`-marked amount, and could see only prior *amounts*, because the matcher's working set carries no `dates_json`. The extractor now mints that predecessor itself, from the same `prior` marks and the prior dates too (#203): a new object with its own terms is a **fact**, and facts are made in the IE stage. The rule of thumb, sharpened: **IE owns facts; the matcher decides identity and may build views over extractor facts, but it neither creates objects nor asserts facts.**
+`ordinal_chain` in `cdt.matcher.lineage_inference` illustrates the right side of the line: it reasons over the `name` column, the filing dates, and the borrower the extractor bound to each row in `parties_json` — all extractor facts, all cited. The other side is an instrument's prior state, the terms it had before an amendment: that is a new object with its own terms, so the extractor mints it from the filing's `prior` marks rather than the matcher inferring it. The rule of thumb: **IE owns facts; the matcher decides identity and may build views over extractor facts, but it neither creates objects nor asserts facts.**
 
 ## Dashboard Handoff
 
-After matching succeeds, CDT can write final parquet snapshots for dashboard and database consumers:
+After matching succeeds, CDT can write the four final parquet snapshots listed under [End-to-End Flow](#end-to-end-flow).
 
-- `items/latest.parquet` — both genres: 8-K item sections and 6-K snippets, in the itemizer's column shape. Every mention joins to its source row here by `item_id`, and consumers read the item text, the filing's SEC URL and its accession number off it — so a genre missing from this table publishes mentions that join to nothing. A 6-K row's `item` is its snippet id (`{accession}:{document}:{window}`) where an 8-K row's is a dotted item number; the snippet's own span and stage-2 verdict stay in `sixk-snippets`. A `form_type` column (`8-K` or `6-K`) is stamped on each row as the table is published, because nothing in the itemizer's sixteen columns records which kind of filing a row came out of and the `item` column is not a reliable substitute
-- `debt-instruments/latest.parquet`
-- `debt-instrument-mentions/latest.parquet`
-- `mention-cluster-edges/latest.parquet`
-
-The processor does not publish Cloudflare R2 JSON directly. The website publisher — `dsi-rse/commercial-debt-tracker-website` — reads these final parquet snapshots and writes `generated/*` JSON to R2. (The older `commercial-debt-tracker-dashboard` repository is archived; older documents that name it mean this one.) Anything that needs a notion of *now* — the lifecycle status cascade #196 removed from this repository — is derived there against an explicit `asOf` (website#15). A synthesized prior state (#203) reaches the publisher as an ordinary instrument row with `is_lineage_head` false and `superseded_by_debt_instrument_id` set, and `synthesized_only` true when no filing describes it on its own; the publisher collapses it beneath its head like any other superseded state.
+The processor does not publish Cloudflare R2 JSON directly. The website publisher — `dsi-rse/commercial-debt-tracker-website` — reads these final parquet snapshots and writes `generated/*` JSON to R2. Anything that needs a notion of *now*, such as an instrument's lifecycle status, is derived there against an explicit `asOf` (website#15). A synthesized prior state reaches the publisher as an ordinary instrument row with `is_lineage_head` false and `superseded_by_debt_instrument_id` set, and `synthesized_only` true when no filing describes it on its own; the publisher collapses it beneath its head like any other superseded state.

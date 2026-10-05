@@ -56,7 +56,7 @@ poll scheduler target overrides it to `poll`. Scheduled production runs are ther
 equivalent to:
 
 ```bash
-cdt-orchestrator daily   # daily schedule: ingest/itemize/classify + match/finalize, submits no extract
+cdt-orchestrator daily   # daily schedule: prepare both genres + match/finalize, submits no extract
 cdt-orchestrator poll    # hourly schedule: advances the OpenAI batch extract job one step
 ```
 
@@ -65,6 +65,27 @@ defer extraction to the poller — a historical backfill's classified items are 
 by the next poll tick. Historical runs are never scheduled automatically. Pass
 `--extractor-backend live` (before the mode) for the synchronous OpenRouter pipeline
 that extracts within the run itself.
+
+### The 6-K chain
+
+Every scheduled run prepares both filing genres: 8-K (ingest → itemize → classify) and
+6-K (ingest-sixk → sixk triage). The task definition sets none of the 6-K settings, so
+the defaults below are what runs in production. Each can be set as an environment
+variable on the task, or passed as the matching flag.
+
+| Setting | Default | Effect |
+|---|---|---|
+| `GENRES` / `--genres` | `8-K,6-K` | Restrict a run to one genre. |
+| `SIXK_CIK_FILE` / `--sixk-cik-file` | the run's CIK file | CIKs for the 6-K chain. A CIK list chosen for 8-K coverage may contain no foreign private issuers, which makes the 6-K chain a no-op. |
+| `SIXK_TRIAGE_PROVIDER` | `openrouter` | Stage-2 triage backend: `openrouter` (uses `OPENROUTER_API_KEY`) or `openai` (uses `OPENAI_API_KEY`). |
+| `SIXK_TRIAGE_MODEL` | `openai/gpt-5.6-luna` | Stage-2 model, as an OpenRouter slug. |
+| `SIXK_TRIAGE_REASONING` | `none` | Stage-2 reasoning effort. |
+
+**Cost:** unlike the 8-K prepare chain, 6-K triage is not free. The `daily` run makes one
+synchronous LLM call per 6-K filing that has windows admitted by the local stage-1 model.
+That call is billed to the triage provider's account, outside the OpenAI batch discount.
+See [sixk-two-stage-triage.md](sixk-two-stage-triage.md) for measured cost per filing.
+Set `GENRES=8-K` to turn the chain off.
 
 ## CI/CD Flow
 

@@ -1,10 +1,10 @@
 # Commercial Debt Tracker
 
-Commercial Debt Tracker (CDT) processes SEC 8-K filings to build a file-native history of debt instruments. It:
+Commercial Debt Tracker (CDT) processes SEC 8-K and 6-K filings to build a file-native history of debt instruments. It:
 
 - ingests complete submission text files for a configured CIK universe
-- itemizes the 8-K sections most likely to contain debt disclosures
-- classifies those sections for debt relevance
+- itemizes the 8-K sections most likely to contain debt disclosures, and classifies them for debt relevance
+- triages 6-K filings into debt-relevant snippets (see [docs/sixk-two-stage-triage.md](docs/sixk-two-stage-triage.md))
 - uses an LLM-backed extractor to produce structured debt-instrument mentions
 - matches mentions into instrument-level histories
 - optionally writes dashboard-facing final parquet snapshots
@@ -39,8 +39,8 @@ The deployed service is a single ECS Fargate task running `cdt-orchestrator`, wi
 - an hourly EventBridge Scheduler trigger that runs `cdt-orchestrator poll`
 - manual historical backfills via `scripts/run-historical.sh` (admin-run ECS task command overrides; see [docs/deployment.md](docs/deployment.md))
 
-The deployed `daily` run does ingest → itemize → classify and refreshes match/final
-snapshots, but hands the expensive LLM extract stage to OpenAI's Batch API. The hourly
+The deployed `daily` run does ingest → itemize → classify for 8-K and ingest → triage
+for 6-K, and refreshes match/final snapshots, but hands the expensive LLM extract stage to OpenAI's Batch API. The hourly
 `poll` run advances that asynchronous batch job one step at a time and re-runs match +
 finalize when it completes. See [docs/architecture.md](docs/architecture.md) for the
 extract state machine.
@@ -62,6 +62,8 @@ uv run ruff check .
 uv run pytest -v
 ```
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to contribute changes.
+
 Main local entrypoints:
 
 ```bash
@@ -74,6 +76,7 @@ make local-run
 Notes:
 
 - `cdt` is the stage-oriented CLI for local and ad hoc runs.
+- Both `cdt pipeline` and `cdt-orchestrator` prepare 8-K and 6-K filings by default; `--genres 8-K` (or `6-K`) narrows a run to one genre, and `--sixk-cik-file` gives the 6-K genre its own CIK list.
 - `cdt-orchestrator` is the deployment-oriented entrypoint used by ECS.
 - `cdt pipeline` writes final snapshots only when `--final-database-root` is passed.
 - `cdt-orchestrator` reads `FINAL_DATABASE_ROOT` from the environment, or accepts `--final-database-root` before the mode.
@@ -84,13 +87,13 @@ Notes:
 
 ## Dashboard Handoff
 
-This repo communicates with `../commercial-debt-tracker-dashboard` through the final snapshot parquet contract, not through a database or API.
+This repo communicates with the website publisher, [`dsi-rse/commercial-debt-tracker-website`](https://github.com/dsi-rse/commercial-debt-tracker-website) (checked out as `../commercial-debt-tracker-website`), through the final snapshot parquet contract, not through a database or API.
 
 For local development with a shared `DATA_DIR`:
 
 - CDT writes canonical working artifacts to `DATA_DIR/commercial-debt-tracker/local`
 - CDT writes dashboard-facing final snapshots to `DATA_DIR/commercial-debt-tracker/database/cdt`
-- the dashboard repo reads those four `latest.parquet` files and builds its local `generated/*.json` snapshot from them
+- the website repo reads those four `latest.parquet` files and builds its local `generated/*.json` snapshot from them
 
 The dashboard-facing files are:
 
@@ -113,7 +116,7 @@ To test the processor and dashboard together on your machine:
 LOCAL_CIK_FILE=/abs/path/to/ciks.txt ./scripts/local-pipeline.sh historical --start-date 2020-01-01 --end-date 2021-12-31
 ```
 
-3. In `../commercial-debt-tracker-dashboard`, run:
+3. In `../commercial-debt-tracker-website`, run:
 
 ```bash
 npm run local:dev
@@ -149,5 +152,8 @@ Optional runtime configuration:
 - `SIXK_TRIAGE_MODEL` (default `openai/gpt-5.6-luna`) and `SIXK_TRIAGE_REASONING`
   (default `none`) for the Form 6-K stage-2 triage. Separate from `EXTRACTOR_MODEL`
   because triage reads a lot of text and returns a list of ids, so it is priced for
-  volume; see `docs/sixk-two-stage-triage.md`.
+  volume; see `docs/sixk-two-stage-triage.md`. `SIXK_TRIAGE_PROVIDER` (`openrouter` default,
+  or `openai`) picks the API the triage call goes to.
+- `GENRES` (default `8-K,6-K`) and `SIXK_CIK_FILE`: orchestrator defaults for
+  `--genres` and `--sixk-cik-file`
 
