@@ -146,6 +146,32 @@ def test_pending_partitions_span_both_sources(tmp_path: Path) -> None:
     )
 
 
+def test_a_sixk_partition_is_pending_even_where_eightk_mentions_exist(
+    tmp_path: Path,
+) -> None:
+    """Mentions at a 6-K partition's (date, shard) do not make it complete."""
+    _write_classifications(tmp_path)
+    sixk_path = _write_snippets(tmp_path)
+    _write_mentions(tmp_path, EIGHTK_ITEM_ID)
+
+    pending, _registry = pending_extract_partitions(artifact_root=tmp_path)
+
+    assert sixk_path in [entry.classification_path for entry in pending]
+
+
+def test_existing_mentions_without_a_registry_entry_are_reprocessed(
+    tmp_path: Path,
+) -> None:
+    """Only the completion registry marks a partition done, not its outputs."""
+    eightk_path = _write_classifications(tmp_path)
+    _write_mentions(tmp_path, EIGHTK_ITEM_ID)
+
+    pending, registry = pending_extract_partitions(artifact_root=tmp_path)
+
+    assert [entry.classification_path for entry in pending] == [eightk_path]
+    assert eightk_path not in registry
+
+
 def test_forcing_reclaims_partitions_from_both_sources(tmp_path: Path) -> None:
     """--force ignores the registry for either genre."""
     eightk_path = _write_classifications(tmp_path)

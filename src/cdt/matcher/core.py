@@ -817,7 +817,6 @@ def build_cluster_profiles(
         )
         normalized_amount = normalize_amount(
             coerce_optional_text(instrument_row.get("principal_amount"))
-            or coerce_optional_text(instrument_row.get("amount"))
         )
         if normalized_amount:
             profile.normalized_amounts.add(normalized_amount)
@@ -828,7 +827,6 @@ def build_cluster_profiles(
             profile.normalized_start_dates.add(normalized_start_date)
         normalized_end_date = normalize_date(
             coerce_optional_text(instrument_row.get("maturity_date"))
-            or coerce_optional_text(instrument_row.get("end_date"))
         )
         if normalized_end_date:
             profile.normalized_end_dates.add(normalized_end_date)
@@ -1678,9 +1676,7 @@ def canonical_maturity_fields(
             fallback = fields
     if fallback is not None:
         return fallback
-    value = coerce_optional_text(
-        existing_row.get("maturity_date") or existing_row.get("end_date")
-    )
+    value = coerce_optional_text(existing_row.get("maturity_date"))
     return {
         "maturity_date": value,
         "maturity_source_mention_id": (
@@ -1712,9 +1708,7 @@ def principal_amount_fields(
                 "principal_source_mention_id": mention_id,
             }
     return {
-        "principal_amount": coerce_optional_text(
-            existing_row.get("principal_amount") or existing_row.get("amount")
-        ),
+        "principal_amount": coerce_optional_text(existing_row.get("principal_amount")),
         "principal_currency": coerce_optional_text(
             existing_row.get("principal_currency")
         ),

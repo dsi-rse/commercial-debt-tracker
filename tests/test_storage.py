@@ -90,22 +90,23 @@ def test_storage_clients_use_the_configured_aws_profile() -> None:
     assert FakeSession.created == ["analysis"]
 
 
-def test_default_s3_client_without_a_profile_resolves_the_configured_one() -> None:
-    """``ensure_s3_client()`` passes no profile, which must mean the configured one.
+def test_document_bodies_on_s3_resolve_through_the_configured_profile() -> None:
+    """``ensure_s3_client`` passes no profile, which must mean the configured one.
 
-    That call is how itemize and extract resolve document bodies from S3, so its
-    default silently decided the credentials for two whole stages.
+    That call is how itemize and 6-K triage resolve document bodies from S3, so its
+    default decides the credentials for two whole stages.
     """
+    from cdt.itemizer.core import ensure_s3_client
+
     storage.configure_s3_profile("analysis")
 
-    assert storage.s3_client() == "s3:'analysis'"
+    assert ensure_s3_client(None, [{"resource_uri": "s3://b/k"}]) == "s3:'analysis'"
 
 
 def test_an_explicit_profile_still_wins_over_the_configured_one() -> None:
     """Ingest and the 6-K scraper keep passing ``config.aws_profile``."""
     storage.configure_s3_profile("analysis")
 
-    assert storage.s3_client("other") == "s3:'other'"
     assert storage.s3_client("other") == "s3:'other'"
 
 

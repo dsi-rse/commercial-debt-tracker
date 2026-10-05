@@ -3806,11 +3806,14 @@ def test_instrument_ie_postprocess_recovers_a_principal_from_the_name() -> None:
             {
                 "name": ["tag-i-1"],
                 # No `amount` span exists, so the model cites nothing.
-                "amount": {
-                    "evidence": [],
-                    "normalized_amount": "183360000",
-                    "currency": "USD",
-                },
+                "amounts": [
+                    {
+                        "kind": "principal",
+                        "evidence": [],
+                        "normalized_amount": "183360000",
+                        "currency": "USD",
+                    }
+                ],
             }
         ]
     )
@@ -3821,6 +3824,7 @@ def test_instrument_ie_postprocess_recovers_a_principal_from_the_name() -> None:
     payload = json.loads(str(mention["amounts_json"]))[0]
     assert mention["principal_amount"] == "183360000"
     assert payload["currency"] == "USD"
+    assert payload["derived_from"] == "name"
     # Nothing was cited, so the evidence list stays empty, as it does for a
     # name-derived maturity.
     assert payload["spans"] == []
@@ -5622,6 +5626,30 @@ def test_pending_source_partitions_skips_orphans_and_raises_on_flat_files(
         pending_source_partitions("classify", "items", artifact_root=str(root))
 
 
+def test_pending_source_partitions_reprocesses_outputs_without_a_registry_entry(
+    tmp_path: Path,
+) -> None:
+    """A target partition at the same coordinates does not mark its source done."""
+    from cdt.datasets import pending_source_partitions
+
+    root = tmp_path / "artifacts"
+    partition = {"date": "2026-01-02", "shard": "0007"}
+    table = pd.DataFrame({"item_id": ["a"], "text": ["x"]})
+    source_path = write_partition_table(
+        str(root / "items"), partition=partition, table=table
+    )
+    write_partition_table(
+        str(root / "classifications"), partition=partition, table=table
+    )
+
+    pending, registry = pending_source_partitions(
+        "classify", "items", artifact_root=str(root)
+    )
+
+    assert [path for path, _fingerprint in pending] == [source_path]
+    assert source_path not in registry
+
+
 def test_completion_registry_saves_merge_concurrent_updates(tmp_path: Path) -> None:
     """Overlapping writers must not lose each other's registry entries (#88).
 
@@ -6924,6 +6952,33 @@ def test_terminal_ie_failure_salvages_the_valid_entries() -> None:
     assert "dropped 1" in row_state.salvage_notes[0]
 
 
+def test_terminal_ie_failure_drops_an_entry_with_a_retired_property() -> None:
+    """Salvage applies the retired-property check per entry, like validation."""
+    from cdt.extractor.core import handle_response
+
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"},
+        stage_name="instrument_ie",
+    )
+    row_state.ner_tagged_xml = (
+        '<body>The Company has a <debt_instrument id="tag-i-1">Term Loan</debt_instrument>'
+        ' and a <debt_instrument id="tag-i-2">Revolving Credit Facility'
+        "</debt_instrument>.</body>"
+    )
+    response = json.dumps(
+        [
+            {"name": ["tag-i-1"]},
+            {"name": ["tag-i-2"], "status_event": {"status": "repaid"}},
+        ]
+    )
+    result = handle_response(row_state, response, max_attempts=1)
+
+    assert result is None
+    assert row_state.state == "PARTIAL"
+    assert [m["name"] for m in row_state.debt_instrument_mentions] == ["Term Loan"]
+    assert "dropped 1" in row_state.salvage_notes[0]
+
+
 def test_terminal_relation_failure_publishes_mentions_without_lineage() -> None:
     """A relation-stage failure keeps the already-validated mentions (#152)."""
     from cdt.extractor.core import handle_response
@@ -7571,10 +7626,13 @@ def test_computed_maturity_rejects_arithmetic_that_misses() -> None:
         [
             {
                 "name": ["tag-i-1"],
-                "maturity_date": {
-                    "evidence": ["tag-t-1", "tag-d-close"],
-                    "normalized_date": "2030-06-24",
-                },
+                "dates": [
+                    {
+                        "kind": "maturity",
+                        "evidence": ["tag-t-1", "tag-d-close"],
+                        "normalized_date": "2030-06-24",
+                    }
+                ],
             }
         ]
     )
