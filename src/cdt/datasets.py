@@ -88,7 +88,7 @@ def run_manifest_path(
     )
 
 
-def completion_registry_path(
+def completion_registry_root(
     stage_name: str,
     *,
     artifact_root: ArtifactPath | None = None,
@@ -108,6 +108,14 @@ def completion_registry_path(
     source partition's year-month, a cycle touches only the one or two months
     its 100-partition chunk covers and moves half a megabyte.
 
+    Named ``_root``, not ``_path``, because this module splits the two without
+    exception and #220 broke that (#227): prefixes are ``*_root``
+    (``dataset_root``, ``items_root``, ``mentions_root``, ``batches_root``,
+    ``mirror_root``) and single objects are ``*_path`` (``run_manifest_path``,
+    ``failure_registry_path``, ``active_job_path``, ``final_pointer_path``).
+    With ``completion_registry_shard_path`` for the objects underneath it, this
+    is the coherent pair.
+
     Callers that want the pre-#191 object -- read-compat and migration -- want
     ``legacy_completion_registry_path`` instead.
     """
@@ -116,6 +124,27 @@ def completion_registry_path(
         "runs",
         stage_name,
         "completed",
+    )
+
+
+def completion_registry_path(
+    stage_name: str,
+    *,
+    artifact_root: ArtifactPath | None = None,
+    data_dir: Path | None = None,
+) -> str:
+    """Deprecated alias for ``completion_registry_root``; do not add callers.
+
+    Kept only because four stage modules still import this name, and all four
+    live in files owned by branches running in parallel with this one, where a
+    rename would be a pure textual conflict for no behavioural gain. Retiring
+    it -- the four call sites, plus the five run manifests whose
+    ``"completion_registry"`` key now names a directory while its neighbours
+    ``"audit_path"`` and ``"failure_registry"`` still name files -- is tracked
+    on #227 and should land once those branches merge.
+    """
+    return completion_registry_root(
+        stage_name, artifact_root=artifact_root, data_dir=data_dir
     )
 
 
@@ -170,7 +199,7 @@ def completion_registry_shard_path(
 ) -> str:
     """Return the path of one date-prefix shard of a stage's registry."""
     return join_artifact_path(
-        completion_registry_path(
+        completion_registry_root(
             stage_name, artifact_root=artifact_root, data_dir=data_dir
         ),
         f"date={shard_label}.json",
@@ -296,7 +325,7 @@ def load_completion_registry(
     shard_paths = [
         path
         for path in list_artifacts(
-            completion_registry_path(
+            completion_registry_root(
                 stage_name, artifact_root=resolved_root, data_dir=data_dir
             ),
             suffix=".json",
@@ -581,7 +610,7 @@ def save_completion_registry(
             artifact_root=resolved_root,
             data_dir=data_dir,
         )
-    return completion_registry_path(
+    return completion_registry_root(
         stage_name, artifact_root=resolved_root, data_dir=data_dir
     )
 
@@ -681,7 +710,7 @@ def _retire_legacy_registry(
             "stage": stage_name,
             "version": 2,
             "partitions": {},
-            "migrated_to": completion_registry_path(
+            "migrated_to": completion_registry_root(
                 stage_name, artifact_root=artifact_root, data_dir=data_dir
             ),
         },

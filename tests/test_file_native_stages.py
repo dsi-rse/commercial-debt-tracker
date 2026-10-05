@@ -22,7 +22,7 @@ from cdt.classifier import classifications_root, classify_pending_items
 from cdt.classifier import core as classifier_core
 from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
 from cdt.datasets import (
-    completion_registry_path,
+    completion_registry_root,
     existing_date_shard_partition_ids,
     load_completed_partitions,
     load_row_failures,
@@ -4739,7 +4739,7 @@ def test_completion_registry_load_merges_shards_in_sorted_order(
     from cdt.datasets import load_completion_registry
 
     shard_root = Path(
-        cdt_datasets.completion_registry_path("itemize", artifact_root=tmp_path)
+        cdt_datasets.completion_registry_root("itemize", artifact_root=tmp_path)
     )
     shard_root.mkdir(parents=True, exist_ok=True)
     key = "documents/date=2024-01-02/shard=0001/part-0000.parquet"
@@ -4868,7 +4868,7 @@ def _registry_s3_objects(key: str) -> dict[str, bytes]:
 def test_completion_registry_load_does_not_read_the_legacy_object_as_a_shard() -> None:
     """On S3 the shard prefix also matches the legacy object (#227).
 
-    `completion_registry_path()` returns `runs/<stage>/completed` and the
+    `completion_registry_root()` returns `runs/<stage>/completed` and the
     legacy object is `runs/<stage>/completed-partitions.json`, so a raw
     `Prefix=` match returns it as a shard and the load GETs it twice. The merge
     was correct only because `-` (0x2D) sorts before `/` (0x2F), which kept the
@@ -4883,7 +4883,7 @@ def test_completion_registry_load_does_not_read_the_legacy_object_as_a_shard() -
         patch.setattr(cdt_storage, "_S3_CLIENT", client)
         # The prefix really does match the legacy object: that is the premise.
         listed = cdt_storage.list_artifacts(
-            cdt_datasets.completion_registry_path("itemize", artifact_root=root),
+            cdt_datasets.completion_registry_root("itemize", artifact_root=root),
             suffix=".json",
         )
         assert any(path.endswith("completed-partitions.json") for path in listed)
@@ -5122,7 +5122,7 @@ def test_stage_manifest_points_at_the_registry_prefix(tmp_path: Path) -> None:
     manifest = read_json_artifact(
         run_manifest_path("itemize", "latest", artifact_root=tmp_path)
     )
-    prefix = completion_registry_path("itemize", artifact_root=tmp_path)
+    prefix = completion_registry_root("itemize", artifact_root=tmp_path)
     assert manifest["completion_registry"] == prefix
     assert sorted(path.name for path in Path(prefix).iterdir()) == ["date=2024-01.json"]
 
@@ -5336,7 +5336,7 @@ def test_first_save_migrates_the_legacy_object_into_date_shards(
     from cdt.datasets import (
         CompletedPartition,
         CompletionRegistry,
-        completion_registry_path,
+        completion_registry_root,
         load_completion_registry,
         save_completion_registry,
     )
@@ -5362,7 +5362,7 @@ def test_first_save_migrates_the_legacy_object_into_date_shards(
     # The old object is cleared in place, pointing at where the state went.
     marker = json.loads(legacy.read_text())
     assert marker["partitions"] == {}
-    assert marker["migrated_to"] == completion_registry_path(
+    assert marker["migrated_to"] == completion_registry_root(
         "itemize", artifact_root=tmp_path
     )
 
@@ -5812,6 +5812,26 @@ def test_registry_payload_sorts_on_the_key_without_comparing_entries() -> None:
     assert payload["partitions"] == {
         "documents/date=2024-01-02/shard=0001/part-0000.parquet": {"fingerprint": "b"}
     }
+
+
+def test_completion_registry_root_and_its_deprecated_alias_agree(
+    tmp_path: Path,
+) -> None:
+    """The alias must keep delegating, and the shard must sit under the root.
+
+    `completion_registry_path` returned a prefix while keeping the `_path`
+    name, which this module otherwise reserves for single objects (#227). The
+    alias stays only until the four stage-module call sites move. Pinned so it
+    cannot silently diverge from the name it forwards to while both exist.
+    """
+    root = cdt_datasets.completion_registry_root("itemize", artifact_root=tmp_path)
+    assert (
+        cdt_datasets.completion_registry_path("itemize", artifact_root=tmp_path) == root
+    )
+    shard = cdt_datasets.completion_registry_shard_path(
+        "itemize", "2024-01", artifact_root=tmp_path
+    )
+    assert shard == str(Path(root, "date=2024-01.json"))
 
 
 def test_registry_key_relativizing_is_invertible(tmp_path: Path) -> None:
