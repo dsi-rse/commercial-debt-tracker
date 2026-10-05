@@ -974,12 +974,12 @@ def prior_attempt_tagged(row_state: ExtractionRowState, stage_name: str) -> bool
 def ner_input_body(row_state: ExtractionRowState) -> str:
     """Return the exact `<body>`-wrapped text the NER stage sends the model.
 
-    Shared by `NERStage.preprocess` and the byte-identical-echo check in
-    `NERStage.validate` (#176) so the two cannot drift: the check means "the
-    model returned precisely what it was handed", and it is only true of a
-    string built the same way the request was. The text is wrapped unescaped,
-    which is deliberate and load-bearing elsewhere -- an item containing a bare
-    `&` produces a response that only parses after
+    Only `NERStage.preprocess` needs it now. It was introduced so that
+    `validate`'s give-up check could compare a response against precisely what
+    the model was handed, but that check asks for a tag count instead, which
+    needs no copy of the request and cannot drift from it (#176). The text is
+    wrapped unescaped, which is deliberate and load-bearing elsewhere -- an
+    item containing a bare `&` produces a response that only parses after
     `repair_unescaped_ampersands`.
     """
     return f"<body>{row_state.text}</body>"
@@ -1069,12 +1069,22 @@ class NERStage:
         * a high-water mark -- zero `debt_instrument` tags is a failure when an
           earlier attempt on this row found some. It cannot misfire on a
           debt-free item, which found none on attempt 1 either.
-        * a byte-identical echo of the input, once an earlier attempt on this
-          row has tagged something. What makes an echo a give-up is that the
+        * a response that tags nothing at all, once an earlier attempt on this
+          row has tagged something. That is what makes a give-up a give-up: the
           model found something here before and has now returned none of it --
-          not the attempt number it arrived on. On an item the model has never
-          tagged, the same response is the honest answer, and the `NODEBT_NER`
-          fixture is exactly that.
+          not the attempt number it arrived on, and not the exact bytes it
+          returned. On an item the model has never tagged, an untagged response
+          is the honest answer, and the `NODEBT_NER` fixture is exactly that.
+
+          Stated as a tag count rather than as "byte-identical to the input",
+          which is what it was first written as. The copy-fidelity check below
+          already guarantees the text is the input, so "no tags" is the whole
+          of the question, and asking it that way cannot be stepped around by
+          whitespace: an echo with one extra space, a newline inside `<body>`,
+          or doubled inter-word spacing cleared the byte comparison while
+          `collapse_whitespace` let it clear copy fidelity too. It also removes
+          the need for the check to rebuild the request string, so there is no
+          second copy to keep in step with `preprocess`.
 
           The check is deliberately not unconditional, and the corpus is why:
           over the three stored corpora that carry attempt logs (761 attempt-1
@@ -1108,14 +1118,13 @@ class NERStage:
         # still rejected, truncation included -- a truncated response carries
         # opening tags, so it counts as earlier work
         # (`test_an_echo_after_a_truncated_tagged_attempt_is_still_rejected`).
-        if (
-            prior_attempt_tagged(row_state, self.name)
-            and response.strip() == ner_input_body(row_state).strip()
+        if prior_attempt_tagged(row_state, self.name) and not count_ner_entity_tags(
+            response
         ):
             return [
-                "Response is byte-identical to the input text you were given, so it "
-                "addresses none of the previous errors and adds no tags. Re-emit your "
-                "previous tagged output with the text corrected."
+                "Response contains no tags at all, but an earlier attempt on this item "
+                "tagged entities, so this response drops every one of them. Re-emit "
+                "your previous tagged output with the text corrected."
             ]
 
         response = repair_unescaped_ampersands(response)

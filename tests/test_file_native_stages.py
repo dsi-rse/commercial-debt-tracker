@@ -2504,7 +2504,7 @@ def test_ner_validate_rejects_a_byte_identical_echo_after_the_model_tagged() -> 
     failures = NERStage().validate(row_state, echo)
 
     assert failures
-    assert any("byte-identical to the input" in failure for failure in failures)
+    assert any("drops every one of them" in failure for failure in failures)
 
 
 def test_ner_validate_rejects_an_echo_that_drops_non_debt_tags() -> None:
@@ -2530,7 +2530,7 @@ def test_ner_validate_rejects_an_echo_that_drops_non_debt_tags() -> None:
     failures = NERStage().validate(row_state, f"<body>{text}</body>")
 
     assert failures
-    assert any("byte-identical to the input" in failure for failure in failures)
+    assert any("drops every one of them" in failure for failure in failures)
 
 
 def test_ner_validate_accepts_an_untagged_first_attempt() -> None:
@@ -2639,29 +2639,42 @@ def test_ner_high_water_is_the_most_any_attempt_found_not_the_least() -> None:
     assert prior_debt_instrument_high_water(row_state, "ner") == 1
 
 
-def test_ner_echo_guard_ignores_surrounding_whitespace() -> None:
-    """A trailing newline must not buy a give-up a pass (#176).
+def test_ner_give_up_check_is_not_escaped_by_whitespace() -> None:
+    """Perturbing the whitespace must not buy a give-up a pass (#176).
 
-    Completions routinely arrive with trailing whitespace. Compared without
-    stripping both sides, such a response is not byte-identical to the input,
-    the echo guard misses it, and an untagged give-up publishes as a clean
-    zero.
+    The check was first written as "byte-identical to the input", and every
+    one of these clears that comparison: a trailing newline, a space after
+    `<body>`, newlines inside it, a space in the opening tag, doubled
+    inter-word spacing. None of them clears copy fidelity either way, because
+    that check runs on `collapse_whitespace`, so each one used to reach
+    `early_stop` as an accepted zero-tag response. Asking for a tag count
+    instead makes the whole family unreachable rather than enumerable.
     """
     from cdt.extractor.core import AttemptRecord
 
-    row_state = _ner_row(MPLX_TEXT)
-    row_state.all_attempts.append(
-        AttemptRecord(
-            stage_name="ner",
-            attempt_index=1,
-            response=MPLX_TAGGED_BUT_UNFAITHFUL,
-            status="FAILED",
+    for response in (
+        f"<body>{MPLX_TEXT}</body>",
+        f"<body>{MPLX_TEXT}</body>\n",
+        f"<body> {MPLX_TEXT}</body>",
+        f"<body>\n{MPLX_TEXT}\n</body>",
+        f"<body >{MPLX_TEXT}</body>",
+        "<body>" + MPLX_TEXT.replace(" ", "  ") + "</body>",
+    ):
+        row_state = _ner_row(MPLX_TEXT)
+        row_state.all_attempts.append(
+            AttemptRecord(
+                stage_name="ner",
+                attempt_index=1,
+                response=MPLX_TAGGED_BUT_UNFAITHFUL,
+                status="FAILED",
+            )
         )
-    )
 
-    failures = NERStage().validate(row_state, f"<body>{MPLX_TEXT}</body>\n")
+        failures = NERStage().validate(row_state, response)
 
-    assert any("byte-identical to the input" in failure for failure in failures)
+        assert any(
+            "drops every one of them" in failure for failure in failures
+        ), response
 
 
 def test_ner_high_water_accepts_a_reduced_but_nonzero_tag_count() -> None:
@@ -2774,7 +2787,7 @@ def test_an_echo_after_a_truncated_tagged_attempt_is_still_rejected() -> None:
     failures = NERStage().validate(row_state, f"<body>{MPLX_TEXT}</body>")
 
     assert failures
-    assert any("byte-identical to the input" in failure for failure in failures)
+    assert any("drops every one of them" in failure for failure in failures)
 
 
 def test_ner_retry_message_tells_the_model_to_keep_its_tags() -> None:
@@ -2824,7 +2837,7 @@ def test_mplx_untagged_echo_no_longer_publishes_as_a_clean_success() -> None:
     assert row_state.state == "FAILED"
     assert row_state.state != "SUCCESS"
     assert row_state.debt_instrument_mentions == []
-    assert "byte-identical to the input" in summarize_failure(row_state)
+    assert "drops every one of them" in summarize_failure(row_state)
     # No attempt on this row was ever accepted.
     assert [a.status for a in row_state.all_attempts] == ["FAILED"] * 3
 
