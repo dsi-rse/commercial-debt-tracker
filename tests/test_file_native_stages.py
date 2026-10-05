@@ -9293,3 +9293,348 @@ def test_the_lineage_pass_records_a_run_manifest(tmp_path: Path) -> None:
     for path in manifest["partitions_written"]:
         assert artifact_exists(path)
         assert "debt-instruments" in path
+
+
+def test_magnitude_in_amount_text_is_the_magnitude_the_parser_applies() -> None:
+    """The helper and the parser must not drift about what a magnitude is (#213).
+
+    `scaled_amount_from_sibling` asks two questions the parser answers only
+    implicitly, so the loop was factored out rather than copied. This pins the
+    invariant that makes that safe: for every magnitude word in the table, the
+    helper reports exactly the factor the parser multiplied by.
+    """
+    from cdt.extractor.core import (
+        AMOUNT_MULTIPLIERS,
+        magnitude_in_amount_text,
+        normalized_amount_from_text,
+    )
+
+    for word, factor in AMOUNT_MULTIPLIERS.items():
+        assert magnitude_in_amount_text(f"$1 {word}") == factor
+        assert normalized_amount_from_text(f"$1 {word}") == str(factor)
+    # A bare figure carries no magnitude of its own, which is the condition the
+    # rescue's fourth guard tests.
+    assert magnitude_in_amount_text("$400.0") is None
+    assert magnitude_in_amount_text("1,050,000") is None
+    assert magnitude_in_amount_text(None) is None
+    # `(?<![a-z])` on the left, so a magnitude cannot match inside a word.
+    assert magnitude_in_amount_text("$500mm") == 1_000_000
+    assert magnitude_in_amount_text("$7 per bnillion") is None
+
+
+def _shared_magnitude_tags() -> dict[str, dict[str, object]]:
+    """Crescent Capital BDC's two spans, at their real offsets (#213).
+
+    `000119312526241887-1-01`: "increased the facility size from $400.0 to
+    $500.0 million".
+    """
+    return {
+        "tag-15": {
+            "type": "amount",
+            "text": "$400.0",
+            "char_start": 654,
+            "char_end": 660,
+        },
+        "tag-16": {
+            "type": "amount",
+            "text": "$500.0 million",
+            "char_start": 664,
+            "char_end": 678,
+        },
+    }
+
+
+def test_scaled_amount_from_sibling_refuses_everything_but_the_exact_product() -> None:
+    """Each of the rescue's seven refusals, isolated (#213).
+
+    Mirrors `computed_sum_amount`'s guards one for one, and the two are
+    mutually exclusive: a sum needs `MINIMUM_COMPUTED_SUM_SPANS` parsed spans
+    and this fires on one.
+    """
+    from cdt.extractor.core import scaled_amount_from_sibling
+
+    tags = _shared_magnitude_tags()
+    own, sibling = ["tag-15"], ["tag-16"]
+
+    # The case the issue was filed for: $400.0 scaled by the sibling's shared
+    # `million` is exactly the 400000000 the model returned.
+    assert scaled_amount_from_sibling(own, sibling, tags, "400000000") == "400000000"
+
+    # 1. A non-string model amount is not a value to confirm.
+    assert scaled_amount_from_sibling(own, sibling, tags, 400000000) is None
+    assert scaled_amount_from_sibling(own, sibling, tags, None) is None
+
+    # 2. A model amount that is not a number cannot be compared to a product.
+    assert (
+        scaled_amount_from_sibling(own, sibling, tags, "four hundred million") is None
+    )
+
+    # 3. A rate is not a principal, whether it is this fact's span or a
+    #    sibling's. Both halves have to bite: 0.50 x 1,000,000 is 500000, and
+    #    a rate span would serve as a borrowed magnitude just as well.
+    rate_tags = dict(tags) | {
+        "tag-rate": {
+            "type": "amount",
+            "text": "0.50%",
+            "char_start": 700,
+            "char_end": 705,
+        }
+    }
+    assert (
+        scaled_amount_from_sibling(["tag-rate"], sibling, rate_tags, "500000") is None
+    )
+    assert (
+        scaled_amount_from_sibling(own, ["tag-16", "tag-rate"], rate_tags, "400000000")
+        is None
+    )
+
+    # 4. A span already carrying a magnitude is never rescaled. `$500.0
+    #    million` means what it says; multiplying it again by the sibling's
+    #    `million` would publish a figure six orders of magnitude out.
+    assert scaled_amount_from_sibling(sibling, own, tags, "500000000") is None
+    both_scaled = dict(tags) | {
+        "tag-17": {
+            "type": "amount",
+            "text": "$400.0 million",
+            "char_start": 654,
+            "char_end": 668,
+        }
+    }
+    assert (
+        scaled_amount_from_sibling(["tag-17"], sibling, both_scaled, "400000000000000")
+        is None
+    )
+
+    # 5. Exactly one distinct magnitude among the siblings, or refuse. None at
+    #    all is #214's untagged `($ in thousands)` header: there is nothing
+    #    cited to borrow.
+    bare_tags = dict(tags) | {
+        "tag-bare": {
+            "type": "amount",
+            "text": "$500.0",
+            "char_start": 664,
+            "char_end": 670,
+        }
+    }
+    assert scaled_amount_from_sibling(own, ["tag-bare"], bare_tags, "400000000") is None
+    #    And two disagreeing magnitudes: guessing between `million` and
+    #    `billion` is a three-orders-of-magnitude error.
+    two_tags = dict(tags) | {
+        "tag-18": {
+            "type": "amount",
+            "text": "$2.0 billion",
+            "char_start": 700,
+            "char_end": 712,
+        }
+    }
+    assert (
+        scaled_amount_from_sibling(own, ["tag-16", "tag-18"], two_tags, "400000000")
+        is None
+    )
+
+    # 6. The product must equal the model's value exactly -- no rounding, no
+    #    tolerance, in either direction.
+    assert scaled_amount_from_sibling(own, sibling, tags, "400000001") is None
+    assert scaled_amount_from_sibling(own, sibling, tags, "399999999") is None
+    assert scaled_amount_from_sibling(own, sibling, tags, "400000000.5") is None
+
+    # 7. The return is the model's own value re-normalized, so the rescue only
+    #    ever confirms a figure and never originates one.
+    assert scaled_amount_from_sibling(own, sibling, tags, "400,000,000") == "400000000"
+
+
+def test_a_shared_magnitude_word_publishes_the_prior_commitment() -> None:
+    """A magnitude written once for two figures no longer drops one (#213).
+
+    Crescent Capital BDC's amendment says the facility size went "from $400.0
+    to $500.0 million". NER tags the two figures separately, the model reads
+    the shared `million` correctly and returns 400000000 for the `prior`
+    commitment -- and `amounts_agree` compared that against the parser's
+    reading of `$400.0` alone, which is 400, so the correct value published as
+    null with `validation_errors: []`.
+
+    Re-derived from the stored responses on `data/genwindow-run-branch`, this
+    is the one fact of 587 the rescue reaches, and it moves
+    `skipped_unparsed_prior` 1 -> 0 and `minted` 15 -> 16 because
+    `mint_prior_state_rows` builds a predecessor only out of `prior` facts that
+    carry a value.
+    """
+    from cdt.extractor.core import standardized_amounts_payloads
+
+    payloads = standardized_amounts_payloads(
+        {
+            "amounts": [
+                {
+                    "kind": "commitment",
+                    "evidence": ["tag-15"],
+                    "normalized_amount": "400000000",
+                    "currency": "USD",
+                    "prior": True,
+                },
+                {
+                    "kind": "commitment",
+                    "evidence": ["tag-16"],
+                    "normalized_amount": "500000000",
+                    "currency": "USD",
+                },
+            ]
+        },
+        _shared_magnitude_tags(),
+        name_text=None,
+    )
+    prior, current = payloads
+    assert prior["normalized_amount"] == "400000000"
+    # A new marker rather than `"computed"`, which means arithmetic over
+    # addends; nothing in `src/` consumes `derived_from` on the amount side.
+    assert prior["derived_from"] == "scaled"
+    # The currency came from this fact's own cited span and is kept as it was.
+    assert prior["currency"] == "USD"
+    assert prior["prior"] is True
+    # The sibling that carries the magnitude is read as stated, not rescaled.
+    assert current["normalized_amount"] == "500000000"
+    assert current["derived_from"] == "stated"
+
+
+def test_the_scale_rescue_leaves_an_untagged_unit_header_alone() -> None:
+    """#214's table stays null: no fact cites the scale, so none can borrow it.
+
+    Blue Owl Technology Income Corp (`000186945326000042-8-01`) reports its
+    debt-capacity table under a bare `($ in thousands)` header. NER tags 83
+    `amount` spans on that item and nothing covering the unit -- the tag
+    vocabulary has no category it falls under -- so there is no cited sibling
+    magnitude and this rescue cannot reach it. That is #214, deferred to
+    post-Beta because it needs a NER category plus `AMOUNT_EVIDENCE_TAG_TYPES`
+    plus an `instrument_ie` rule.
+
+    Pinned as a test rather than left to the guard: re-deriving
+    `data/genwindow-sol-retried` from its stored responses leaves all 18 of
+    this filing's amounts null, and a change that silently started rescaling
+    table cells would be out of scope and unreviewed.
+    """
+    from cdt.extractor.core import standardized_amounts_payloads
+
+    payloads = standardized_amounts_payloads(
+        {
+            "amounts": [
+                {
+                    "kind": "commitment",
+                    "evidence": ["tag-cell-1"],
+                    "normalized_amount": "1050000000",
+                    "currency": "USD",
+                },
+                {
+                    "kind": "outstanding_balance",
+                    "evidence": ["tag-cell-2"],
+                    "normalized_amount": "435230000",
+                    "currency": "USD",
+                },
+            ]
+        },
+        {
+            "tag-cell-1": {
+                "type": "amount",
+                "text": "1,050,000",
+                "char_start": 200,
+                "char_end": 209,
+            },
+            "tag-cell-2": {
+                "type": "amount",
+                "text": "435,230",
+                "char_start": 213,
+                "char_end": 220,
+            },
+        },
+        name_text=None,
+    )
+    assert [payload["normalized_amount"] for payload in payloads] == [None, None]
+    assert [payload["derived_from"] for payload in payloads] == [None, None]
+
+
+def test_the_scale_rescue_refuses_a_magnitude_on_any_own_span_not_just_canonical() -> (
+    None
+):
+    """A fact citing its own magnitude is never rescaled, whichever span holds it.
+
+    The bare-figure guard reads every span the fact cites. It used to ask only
+    `canonical_amount_value`, which is the *longest parseable* span, so a
+    magnitude sitting on any other cited span was invisible to it and the
+    rescue scaled the fact anyway -- while the fact held `$500.0 million` in
+    its own evidence. Multiplying a span that already carries `million` by a
+    sibling's `million` is the six-orders-out figure the guard exists to
+    refuse.
+
+    Reachable from model output rather than hypothetical: unlike the single
+    `amount` property, `validate_amounts_property` never calls
+    `validate_standardized_single_value_cardinality`, so one `amounts[*]` entry
+    may cite several spans with distinct parsed values and still validate. Of
+    762 amount facts in the stored corpus, 4 cite two or more spans and 1
+    carries a magnitude on a non-canonical span.
+    """
+    from cdt.extractor.core import canonical_amount_value, scaled_amount_from_sibling
+
+    tags = {
+        # The longer span is the bare figure, so it wins canonical selection
+        # and the magnitude-bearing span is the one the old guard could not see.
+        "own-bare": {
+            "type": "amount",
+            "text": "aggregate principal amount of $400.0",
+            "char_start": 100,
+            "char_end": 136,
+        },
+        "own-scaled": {
+            "type": "amount",
+            "text": "$500.0 million",
+            "char_start": 140,
+            "char_end": 154,
+        },
+        "sibling": {
+            "type": "amount",
+            "text": "$2.0 million",
+            "char_start": 200,
+            "char_end": 212,
+        },
+    }
+    own = ["own-bare", "own-scaled"]
+    # The premise: the canonical span really is the bare one, so this case
+    # reaches the guard rather than being refused earlier for some other reason.
+    assert canonical_amount_value(own, tags) == "aggregate principal amount of $400.0"
+    # 400 x 1,000,000 is exactly the model's value, so every other refusal --
+    # the rate guard, the one-distinct-magnitude guard, the exact product --
+    # passes. Only reading the magnitude off `$500.0 million` refuses it.
+    assert scaled_amount_from_sibling(own, ["sibling"], tags, "400000000") is None
+
+    # The same guard covers what filtering the siblings against the fact's own
+    # span texts used to catch: a sibling citing the very span that carries
+    # this fact's magnitude. The filter was redundant once the guard reads
+    # every own span, so it is gone and this pins the behaviour it provided.
+    assert scaled_amount_from_sibling(own, ["own-scaled"], tags, "400000000") is None
+
+    # A fact whose every cited span is a bare figure is still rescued, so the
+    # widened guard did not simply switch the rescue off: the label carries no
+    # magnitude, and the reading comes from the span that parses.
+    labelled = {
+        "own-figure": {
+            "type": "amount",
+            "text": "$400.0",
+            "char_start": 654,
+            "char_end": 660,
+        },
+        "own-label": {
+            "type": "amount",
+            "text": "Aggregate Commitment",
+            "char_start": 600,
+            "char_end": 620,
+        },
+        "sibling": {
+            "type": "amount",
+            "text": "$500.0 million",
+            "char_start": 664,
+            "char_end": 678,
+        },
+    }
+    assert (
+        scaled_amount_from_sibling(
+            ["own-figure", "own-label"], ["sibling"], labelled, "400000000"
+        )
+        == "400000000"
+    )
