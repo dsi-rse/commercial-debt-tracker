@@ -3017,13 +3017,34 @@ def terminate_on_provider_aborts(
     One abort past the cap was enough to publish a debt-free item as a PARTIAL
     "possible loss".
 
-    #152's rule still applies to what the row already earned: a relation stage
-    the provider will not run costs the item its lineage, not its instruments.
+    #152's rule still applies to what the row already earned, and it applies
+    the same way `_salvage_or_fail` applies it after a scored failure: a stage
+    the provider will not run costs the item what that stage would have added,
+    not what earlier stages already validated. The two paths kept diverging on
+    `instrument_ie` -- a row with a salvageable response finished PARTIAL with
+    its mentions after three rejected answers, and FAILED with none if the
+    provider aborted instead -- so both now ask the same two questions in the
+    same order.
     """
     note = (
         f"{stage.name} aborted by the provider on {aborts} consecutive calls "
         f"(finish_reason=content_filter); no attempt was scored"
     )
+    if stage.name == InstrumentIEStage.name:
+        # A response rejected as a whole can still hold individually valid
+        # entries, and they are in `stage_responses` already -- the aborts came
+        # after it, not instead of it. Published without lineage, because the
+        # relation stage is where the provider stopped.
+        dropped = salvage_instrument_ie_entries(row_state)
+        if dropped is not None:
+            stage.postprocess(row_state)
+            if row_state.debt_instrument_mentions:
+                row_state.salvage_notes.append(
+                    f"{note}; the entries its last scored answer validated are "
+                    "published without lineage relations"
+                )
+                row_state.finish("PARTIAL")
+                return
     if (
         stage.name == InstrumentRelationStage.name
         and row_state.debt_instrument_mentions

@@ -2941,6 +2941,24 @@ MULTI_NER = (
     "and a <debt_instrument>Revolver</debt_instrument> on "
     "<date>January 1, 2024</date>.</body>"
 )
+# One entry that validates and one that cites a tag id the NER output never
+# produced, so `instrument_ie` rejects the response as a whole while
+# `salvage_instrument_ie_entries` keeps the first entry (#152).
+MULTI_IE_ONE_BAD = json.dumps(
+    [
+        {
+            "name": ["tag-1"],
+            "dates": [
+                {
+                    "kind": "closing",
+                    "evidence": ["tag-3"],
+                    "normalized_date": "2024-01-01",
+                }
+            ],
+        },
+        {"name": ["tag-99"]},
+    ]
+)
 MULTI_IE = json.dumps(
     [
         {
@@ -3201,6 +3219,40 @@ def test_aborts_at_the_relation_stage_still_publish_the_items_mentions() -> None
     assert "mentions published without lineage relations" in summarize_failure(
         row_state
     )
+
+
+def test_aborts_at_the_ie_stage_still_publish_the_entries_that_validated() -> None:
+    """The abort cap applies #152 the same way a scored failure does (#127, #152).
+
+    An `instrument_ie` response rejected as a whole can still hold valid
+    entries, and when the provider then aborts the stage to its cap those
+    entries are already sitting in `stage_responses` -- the aborts came after
+    the answer, not instead of it. Terminating FAILED there threw them away,
+    while the same row reaching the same dead end through three *scored*
+    failures published them. Same loss, same remedy, so the two terminal paths
+    now agree.
+    """
+    from cdt.extractor.core import PUBLISHABLE_ROW_STATES, summarize_failure
+
+    row_state, client = _run_live(
+        MULTI_TEXT,
+        [_stopped(MULTI_NER), _stopped(MULTI_IE_ONE_BAD)] + [CONTENT_FILTERED] * 40,
+    )
+
+    # One NER call, one scored instrument_ie answer, then the stage is aborted
+    # to its cap.
+    assert len(client.requests) == 1 + 1 + 7
+    assert row_state.state == "PARTIAL"
+    assert row_state.state in PUBLISHABLE_ROW_STATES
+    # The entry that validated publishes; the one citing a missing tag does not.
+    assert len(row_state.debt_instrument_mentions) == 1
+    assert "published without lineage relations" in summarize_failure(row_state)
+    # And the invalid entry is gone from the stored response, not merely
+    # ignored downstream: `salvage_instrument_ie_entries` rewrites what the
+    # audit log keeps, so the kept set is recorded rather than inferred.
+    # `postprocess` would have skipped the bad entry either way, so the mention
+    # count alone cannot tell a salvage from an unfiltered publish.
+    assert "tag-99" not in row_state.stage_responses["instrument_ie"]
 
 
 def test_content_filter_resend_cap_survives_the_resumable_batch_state() -> None:
