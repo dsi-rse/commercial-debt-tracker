@@ -456,6 +456,36 @@ def test_ingest_records_download_failures(tmp_path: Path) -> None:
     assert failure_json["entries"] == []
 
 
+def test_ingest_without_an_injected_client_builds_one_from_the_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without ``s3_client``, ingest builds the storage client for ``aws_profile``."""
+    client = FakeS3Client({})
+    profiles: list[str | None] = []
+
+    def fake_storage_client(profile_name: str | None = None) -> FakeS3Client:
+        profiles.append(profile_name)
+        return client
+
+    monkeypatch.setattr("cdt.ingest.storage_s3_client", fake_storage_client)
+
+    _, result = run_ingest_pipeline(
+        IngestConfig(
+            mode="historical",
+            bucket="sec-bucket",
+            cik_file=tmp_path / "ciks.txt",
+            start_date=date(2024, 1, 2),
+            end_date=date(2024, 1, 2),
+            data_dir=tmp_path,
+            aws_profile="analysis",
+        ),
+        ciks={"320193"},
+    )
+
+    assert profiles == ["analysis"]
+    assert result.failures == 0
+
+
 def test_iter_filings_yields_manifest_objects_for_form_type_list() -> None:
     """Manifest iteration unions exact form type prefixes over the date range."""
     client = FakeS3Client(

@@ -34,6 +34,9 @@ from cdt.storage import (
     write_json_artifact,
     write_partition_table,
 )
+from cdt.storage import (
+    s3_client as storage_s3_client,
+)
 
 LOGGER = get_logger(__name__)
 DOCUMENT_COLUMNS = [
@@ -405,7 +408,7 @@ def run_ingest_pipeline(
 
     def client() -> S3Client:
         if not resolved_client:
-            resolved_client.append(s3_client(config.aws_profile))
+            resolved_client.append(storage_s3_client(config.aws_profile))
         return resolved_client[0]
 
     normalized_ciks = _normalize_ciks(ciks)
