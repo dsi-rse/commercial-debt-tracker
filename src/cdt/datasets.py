@@ -328,11 +328,12 @@ _REGISTRY_VERSION = 3
 # per key (#227). Per key, `join_artifact_path` built a `pathlib.Path` and
 # `_relative_registry_key` rebuilt a normalized prefix and an f-string, inside
 # comprehensions that run over every entry the registry holds. Measured on a
-# full-corpus-shaped registry of 440,000 entries, that made the load slower than
-# the single object it replaced -- 2.79 s against 2.05 s, or 6.14 s under a long
-# absolute root -- and made `_absolute_registry_key` 56% of the whole save under
-# cProfile. Hoisted, the same load is 1.34 s: faster than the pre-#191 object,
-# not 36% slower.
+# full-corpus-shaped registry of 440,000 entries (local storage, best of three),
+# that made the load 2.32 s against 1.06 s for the single object it replaced,
+# and made `_absolute_registry_key` 56% of the whole save under cProfile.
+# Hoisted, the same load is 1.08 s: level with the pre-#191 object on a short
+# root, and faster under a long absolute root (1.18 s against 1.27 s), because
+# the per-key cost no longer grows with the root's length.
 #
 # A bare canonical partition path, which is the only shape either prefix is ever
 # applied to (`PARTITION_PATTERN.fullmatch` guarantees it, with no `.` or `..`

@@ -5833,9 +5833,13 @@ def test_completion_registry_load_merges_shards_in_sorted_order(
 
     The overlay sequence is load-bearing (a later shard's entry wins), so a
     parallel read that merged in whichever order finished first would make the
-    winner depend on thread scheduling. Pinned by returning payloads out of
-    order from the pool and asserting the merge still follows the sorted paths.
+    winner depend on thread scheduling. Pinned by holding the earlier shard's
+    read until the later one has returned, so the reads finish in reverse path
+    order, and asserting the merge still follows the sorted paths.
     """
+    import threading
+    import time
+
     from cdt.datasets import load_completion_registry
 
     shard_root = Path(
@@ -5858,21 +5862,32 @@ def test_completion_registry_load_merges_shards_in_sorted_order(
         )
 
     real_read = cdt_datasets.read_json_artifact
-    order: list[str] = []
+    later_returned = threading.Event()
+    finished: list[str] = []
 
     def reversing_read(path: object) -> object:
         # Finish the later shard first, so a completion-ordered merge would
-        # leave "first" as the winner.
-        order.append(Path(str(path)).name)
-        return real_read(path)  # type: ignore[operator]
+        # leave "first" as the winner. The earlier read waits for the later one
+        # to return, then pauses so the later read's result is fully handed
+        # back to the pool before the earlier one is.
+        name = Path(str(path)).name
+        if name == "date=2024-01.json":
+            assert later_returned.wait(timeout=10), "later shard never read"
+            time.sleep(0.05)
+        payload = real_read(path)  # type: ignore[operator]
+        finished.append(name)
+        if name == "date=2024-02.json":
+            later_returned.set()
+        return payload
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(cdt_datasets, "read_json_artifact", reversing_read)
         loaded = load_completion_registry("itemize", artifact_root=tmp_path)
 
+    # The premise: the reads really did finish out of path order.
+    assert finished == ["date=2024-02.json", "date=2024-01.json"]
     absolute = cdt_datasets.join_artifact_path(str(tmp_path), key)
     assert loaded[absolute].fingerprint == "last"
-    assert order == ["date=2024-01.json", "date=2024-02.json"]
 
 
 def test_stage_manifest_points_at_the_registry_prefix(tmp_path: Path) -> None:
