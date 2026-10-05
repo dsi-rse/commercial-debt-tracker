@@ -4142,11 +4142,15 @@ def scaled_amount_from_sibling(
     map, so it would need no plumbing at all, but it would admit spans that no
     fact cites.
 
-    Refusals mirror `computed_sum_amount`'s, and the two are mutually exclusive:
-    a sum needs `MINIMUM_COMPUTED_SUM_SPANS` parsed spans and this fires on one.
-    The product must equal the model's value exactly, and the return is the
-    model's own value re-normalized, so this can only ever *confirm* the model
-    and never originate a figure.
+    Refusals mirror `computed_sum_amount`'s. The two cannot both land: one
+    needs the sum of the cited spans to equal the model's value, the other
+    needs one span's reading times a factor of at least a thousand to equal it,
+    and no value satisfies both. It is the exact-product comparison that
+    separates them rather than a span count -- this takes its reading from
+    `canonical_amount_value` and so never counts the spans it was given. The
+    product must equal the model's value exactly, and the return is the model's
+    own value re-normalized, so this can only ever *confirm* the model and
+    never originate a figure.
 
     Measured by re-deriving `data/genwindow-run-branch` from its stored
     responses: one fact rescued of 587, moving `skipped_unparsed_prior` 1 -> 0
@@ -4171,21 +4175,34 @@ def scaled_amount_from_sibling(
     if model_value is None:
         return None
     own_texts = cluster_span_texts(own_tag_ids, tag_details)
-    sibling_texts = [
-        text
-        for text in cluster_span_texts(sibling_tag_ids, tag_details)
-        if text not in set(own_texts)
-    ]
+    sibling_texts = cluster_span_texts(sibling_tag_ids, tag_details)
     if any(is_rate_like_amount_text(text) for text in (*own_texts, *sibling_texts)):
         return None
-    # The canonical span is the one `amounts_agree` just disagreed with, so it
-    # is the one whose reading this rescales (#120 picks it over a label).
+    # `canonical_amount_value` supplies the reading, because that is the span
+    # `amounts_agree` just disagreed with (#120 prefers a parseable span to a
+    # pure label).
     own_text = canonical_amount_value(own_tag_ids, tag_details)
     base = normalized_amount_from_text(own_text)
-    if base is None or magnitude_in_amount_text(own_text) is not None:
-        # A span already carrying a magnitude is never rescaled: `$500.0
-        # million` means what it says, and multiplying it again by the
-        # sibling's `million` would invent a figure six orders out.
+    # Asked of *every* own span, not just the canonical one. A span already
+    # carrying a magnitude is never rescaled: `$500.0 million` means what it
+    # says, and multiplying it again by the sibling's `million` would invent a
+    # figure six orders out. Checking only the canonical span let that happen
+    # whenever the magnitude sat on a span the selector did not pick -- a fact
+    # citing both `aggregate principal amount of $400.0` and `$500.0 million`
+    # was rescaled by a sibling's `million` while holding the magnitude in its
+    # own evidence, because the longer bare span won the selection. Reachable
+    # from model output: unlike the single `amount` property,
+    # `validate_amounts_property` never runs
+    # `validate_standardized_single_value_cardinality`, so an `amounts[*]`
+    # entry may cite several spans with distinct values and still validate.
+    #
+    # This is also why `sibling_texts` needs no filtering against `own_texts`.
+    # No own span may carry a magnitude by the time we get here, so a sibling
+    # citing one of this fact's own spans contributes nothing to `magnitudes`
+    # and cannot change the result.
+    if base is None or any(
+        magnitude_in_amount_text(text) is not None for text in own_texts
+    ):
         return None
     base_value = decimal_from_amount_string(base)
     if base_value is None:

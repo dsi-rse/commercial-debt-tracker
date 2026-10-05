@@ -9548,3 +9548,93 @@ def test_the_scale_rescue_leaves_an_untagged_unit_header_alone() -> None:
     )
     assert [payload["normalized_amount"] for payload in payloads] == [None, None]
     assert [payload["derived_from"] for payload in payloads] == [None, None]
+
+
+def test_the_scale_rescue_refuses_a_magnitude_on_any_own_span_not_just_canonical() -> (
+    None
+):
+    """A fact citing its own magnitude is never rescaled, whichever span holds it.
+
+    The bare-figure guard reads every span the fact cites. It used to ask only
+    `canonical_amount_value`, which is the *longest parseable* span, so a
+    magnitude sitting on any other cited span was invisible to it and the
+    rescue scaled the fact anyway -- while the fact held `$500.0 million` in
+    its own evidence. Multiplying a span that already carries `million` by a
+    sibling's `million` is the six-orders-out figure the guard exists to
+    refuse.
+
+    Reachable from model output rather than hypothetical: unlike the single
+    `amount` property, `validate_amounts_property` never calls
+    `validate_standardized_single_value_cardinality`, so one `amounts[*]` entry
+    may cite several spans with distinct parsed values and still validate. Of
+    762 amount facts in the stored corpus, 4 cite two or more spans and 1
+    carries a magnitude on a non-canonical span.
+    """
+    from cdt.extractor.core import canonical_amount_value, scaled_amount_from_sibling
+
+    tags = {
+        # The longer span is the bare figure, so it wins canonical selection
+        # and the magnitude-bearing span is the one the old guard could not see.
+        "own-bare": {
+            "type": "amount",
+            "text": "aggregate principal amount of $400.0",
+            "char_start": 100,
+            "char_end": 136,
+        },
+        "own-scaled": {
+            "type": "amount",
+            "text": "$500.0 million",
+            "char_start": 140,
+            "char_end": 154,
+        },
+        "sibling": {
+            "type": "amount",
+            "text": "$2.0 million",
+            "char_start": 200,
+            "char_end": 212,
+        },
+    }
+    own = ["own-bare", "own-scaled"]
+    # The premise: the canonical span really is the bare one, so this case
+    # reaches the guard rather than being refused earlier for some other reason.
+    assert canonical_amount_value(own, tags) == "aggregate principal amount of $400.0"
+    # 400 x 1,000,000 is exactly the model's value, so every other refusal --
+    # the rate guard, the one-distinct-magnitude guard, the exact product --
+    # passes. Only reading the magnitude off `$500.0 million` refuses it.
+    assert scaled_amount_from_sibling(own, ["sibling"], tags, "400000000") is None
+
+    # The same guard covers what filtering the siblings against the fact's own
+    # span texts used to catch: a sibling citing the very span that carries
+    # this fact's magnitude. The filter was redundant once the guard reads
+    # every own span, so it is gone and this pins the behaviour it provided.
+    assert scaled_amount_from_sibling(own, ["own-scaled"], tags, "400000000") is None
+
+    # A fact whose every cited span is a bare figure is still rescued, so the
+    # widened guard did not simply switch the rescue off: the label carries no
+    # magnitude, and the reading comes from the span that parses.
+    labelled = {
+        "own-figure": {
+            "type": "amount",
+            "text": "$400.0",
+            "char_start": 654,
+            "char_end": 660,
+        },
+        "own-label": {
+            "type": "amount",
+            "text": "Aggregate Commitment",
+            "char_start": 600,
+            "char_end": 620,
+        },
+        "sibling": {
+            "type": "amount",
+            "text": "$500.0 million",
+            "char_start": 664,
+            "char_end": 678,
+        },
+    }
+    assert (
+        scaled_amount_from_sibling(
+            ["own-figure", "own-label"], ["sibling"], labelled, "400000000"
+        )
+        == "400000000"
+    )
