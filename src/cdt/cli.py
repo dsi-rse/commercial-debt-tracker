@@ -90,11 +90,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the cdt command-line interface."""
     parser = build_parser()
     args = parser.parse_args(argv)
-    # Once, here, rather than threaded to each factory by hand: --aws-profile
-    # used to reach only the client ingest built for itself, so every artifact
-    # read and write went through the ambient credentials instead (#71). Doing
-    # it at the single point where the flag enters the process also covers the
-    # subcommands that never had a way to pass it on.
+    # Process-wide, so every S3 client any subcommand builds uses the profile.
     configure_s3_profile(getattr(args, "aws_profile", None))
     return int(args.func(args))
 
@@ -109,12 +105,7 @@ def add_artifact_root_argument(parser: argparse.ArgumentParser) -> None:
 
 
 def add_final_database_root_argument(parser: argparse.ArgumentParser) -> None:
-    """Add --final-database-root only where a command actually honors it.
-
-    Stage subcommands used to accept it via the shared artifact-root helper and
-    silently ignore it (#72) — misleading anyone redirecting final output for a
-    single stage run.
-    """
+    """Add --final-database-root; only for commands that publish final tables."""
     parser.add_argument(
         "--final-database-root",
         default=None,
@@ -141,11 +132,9 @@ def add_logging_arguments(parser: argparse.ArgumentParser, *, noun: str) -> None
 def acquire_stage_lease(
     artifact_root: str, logger: logging.Logger, noun: str
 ) -> Lease | None:
-    """Take the pipeline-writer lease for one stage run, or say why not.
+    """Take the pipeline-writer lease for one stage run.
 
-    Stage subcommands rewrite the same completion registries and datasets the
-    scheduled orchestrator runs do; unserialized writers lose registry updates
-    and silently strand partitions (#88).
+    Returns None, after logging an error naming ``noun``, when the lease is held.
     """
     lease = acquire_lease(artifact_root, PIPELINE_WRITER_LEASE)
     if lease is None:
@@ -945,15 +934,8 @@ def run_backfill_mentions(args: argparse.Namespace) -> int:
         if lease is None:
             return 1
     try:
-        # A whole-dataset rewrite on a lease it never renewed: the default TTL
-        # is 2h, and once it elapses the next orchestrator tick legitimately
-        # steals the lease and starts extract/match while this is still
-        # overwriting one partition file at a time. Both writers full-overwrite
-        # the same object, so rows are lost silently and `release_lease`
-        # no-ops after a steal. This is the #89 class, and the tell was that
-        # #203 added `renew` to the lineage pass for exactly this reason and
-        # omitted it here (#211). At reference-corpus scale 236 partitions take
-        # ~10s, so the window was never close; the wiring is the point.
+        # A whole-dataset rewrite: renew, or a TTL-expired lease could be
+        # stolen and another writer would overwrite the same partitions.
         counts = backfill_mentions(
             artifact_root,
             dry_run=args.dry_run,
@@ -997,9 +979,8 @@ def run_matcher(args: argparse.Namespace) -> int:
             loose_match_threshold=args.loose_match_threshold,
             ambiguity_margin=args.ambiguity_margin,
         )
-        # Always, as the pipeline does: an amend-and-restate chain spans
-        # filings, so its links exist only once every shard has matched (#170,
-        # #204). Every inferred pointer is re-derived here, never carried.
+        # Always, as the pipeline does: lineage spans filings, so it is a
+        # post-pass over every shard.
         stats = apply_lineage_inference_pass(artifact_root, renew=renewer(lease))
         logger.info(
             "Lineage inference: %s links (%s re-opened), lineage heads %s -> %s",

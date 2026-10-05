@@ -47,42 +47,31 @@ DOCUMENT_COLUMNS = [
     "text",
     "date",
     "resource_uri",
-    # Which SEC form the row is ("8-K", "8-K/A", "6-K", ...) and how it was
-    # acquired. Both are provenance rather than keys, so partitions written
-    # before they existed stay readable: read_table falls back to a full read
-    # plus reindex when a column is absent, and a null form_type is an 8-K,
-    # which is all this pipeline acquired until the 6-K path existed.
+    # Provenance, not keys: the SEC form ("8-K", "6-K/A", ...) and a
+    # DocumentSource value.
     "form_type",
     "source",
 ]
-# The SEC scraper's output bucket, which CDT reads. In dev this is the same
-# bucket CDT writes its own artifacts to, separated only by prefix: the scraper
-# owns `sec/`, CDT owns `processors/cdt/` and `database/cdt/`.
+# The SEC scraper's output bucket. In dev CDT writes to it too, by prefix: the
+# scraper owns `sec/`, CDT owns `processors/cdt/` and `database/cdt/`.
 DEFAULT_BUCKET = "idi-dev-ftm2j-shared-processor-storage"
 DEFAULT_AWS_PROFILE = ""
 DEFAULT_S3_PREFIX = "sec"
 CDT_FORM_TYPE = "8-K"
-# Ingest itself is form-agnostic; this default keeps every existing caller,
-# CLI flag and deployed schedule on 8-K until one asks for another form.
 DEFAULT_FORM_TYPES: tuple[str, ...] = (CDT_FORM_TYPE,)
-# The 6-K genre's forms. Here rather than in either 6-K source, because both
-# acquire the same two forms and the CLI defaults to them before it knows which
-# source will run.
+# The 6-K genre's forms.
 SIXK_FORM_TYPES: tuple[str, ...] = ("6-K", "6-K/A")
 CDT_DOCUMENT_TYPE = "COMPLETE SUBMISSION TEXT FILE"
 CDT_DOCUMENT_DESCRIPTION = "COMPLETE SUBMISSION TEXT FILE"
 DEFAULT_BATCH_SIZE = 100
 PROGRESS_DAY_INTERVAL = 30
 # {prefix...}/{date}/{form}/{cik}/{accession}/manifest.json — the CIK is
-# counted from the END so a multi-segment --s3-prefix cannot shift it (#73).
+# counted from the end so a multi-segment --s3-prefix cannot shift it.
 MANIFEST_KEY_CIK_INDEX_FROM_END = -3
 MIN_MANIFEST_KEY_PARTS = 5
 DEFAULT_OUTPUT_PREFIX = "processors/cdt"
 DOCUMENT_DATASET_NAME = "documents"
 # The 6-K genre's own documents dataset (see IngestConfig.dataset_name).
-# Named for the `cdt.sixk` package rather than "documents-6k" only for
-# consistency with it: the partition contract reads a path's date and shard and
-# never its dataset segment, so the name itself carries no behaviour.
 SIXK_DOCUMENT_DATASET_NAME = "documents-sixk"
 DOCUMENT_PARTITION_SHARDS = 64
 
@@ -107,9 +96,7 @@ class IngestFailureClassifier(FailureClassifier):
             {
                 IngestFailureType.INVALID_MANIFEST,
                 IngestFailureType.DOCUMENT_NOT_FOUND,
-                # Re-reading the same object returns the same bytes, so a
-                # document that is not in dissemination format never becomes
-                # one by retrying.
+                # Re-reading the same object returns the same bytes.
                 IngestFailureType.MALFORMED_DOCUMENT,
             }
         )
@@ -147,13 +134,7 @@ class S3Client(Protocol):
 
 
 class DocumentSource(StrEnum):
-    """How a document row was acquired.
-
-    Recorded per row because the two sources coexist: the scraper carries no
-    6-K, so those are fetched from EDGAR directly until it does, and a row's
-    provenance has to survive that cutover rather than be inferred from when it
-    was written.
-    """
+    """How a document row was acquired, recorded per row in ``source``."""
 
     S3_MANIFEST = "s3-manifest"
     EDGAR = "edgar"
@@ -176,11 +157,8 @@ class DocumentCandidate:
 class DocumentCandidateSource(Protocol):
     """A source of document candidates for one ingest run.
 
-    ``failures`` is read once iteration is done and folded into the run's
-    failure count. A source that only *indexes* filings (the scraper path, where
-    bodies stay in S3 until a stage needs them) reports zero; one that acquires
-    the bodies itself, as the direct-EDGAR 6-K path must, reports what it could
-    not fetch — the same thing ``download=True`` counts.
+    ``failures`` is read after iteration and added to the run's failure count:
+    the candidates the source could not acquire, which never reach ingest.
     """
 
     def __iter__(self: Self) -> Iterator[DocumentCandidate]:
@@ -203,11 +181,7 @@ class ListCandidateSource:
 
     @property
     def failures(self: Self) -> int:
-        """Return zero: a list cannot have failed to acquire anything.
-
-        Failures on the scraper path are per-manifest and already recorded in
-        the failure registry by the iterator that built the list.
-        """
+        """Return zero; whoever built the list recorded its failures."""
         return 0
 
 
@@ -257,10 +231,9 @@ class IngestConfig:
     aws_profile: str = DEFAULT_AWS_PROFILE
     s3_prefix: str = DEFAULT_S3_PREFIX
     form_types: tuple[str, ...] = DEFAULT_FORM_TYPES
-    # Each genre gets its own documents dataset. Mixing forms into one would
-    # merge new rows into partitions the 8-K path has already processed, and
-    # every downstream stage selects work by source-partition fingerprint (#62):
-    # a 6-K backfill would make the whole 8-K corpus pending again.
+    # Each genre gets its own documents dataset: downstream stages select work
+    # by source-partition fingerprint, so mixing forms would make one genre's
+    # backfill re-pend the other's partitions.
     dataset_name: str = DOCUMENT_DATASET_NAME
 
 
@@ -383,27 +356,32 @@ def run_ingest_pipeline(
     | None = None,
     return_documents: bool = False,
 ) -> tuple[pd.DataFrame, IngestRunResult]:
-    """Run ingest using an orchestrator-style config object.
+    """Ingest one date window into the config's documents dataset.
 
-    The frame is the run's documents only when ``return_documents`` is set;
-    otherwise it is empty and only ``IngestRunResult.total_rows`` reports how
-    many there are. Materialising it reads every body in the window (#224), and
-    no production caller uses it.
+    Skips accessions already stored in the window (unless ``force``), merges
+    new rows into date/shard partitions in batches, and writes a run manifest.
 
-    ``candidate_source`` replaces the scraper-manifest scan with another way of
-    finding filings — the direct-EDGAR 6-K path. It is a factory rather than a
-    source because the failure registry lives here: two registries over one
-    ``failures.json`` would overwrite each other's entries. Everything after the
-    candidates is shared, which is what makes switching sources cheap: accession
-    dedup, batched partition merges, the read-back window and the run manifest
-    do not care where a filing came from.
+    Args:
+        config: The run's configuration.
+        ciks: CIKs to keep; None keeps every filer.
+        s3_client: Client to use; None builds one from ``config.aws_profile``
+            when first needed.
+        candidate_source: Factory, given this run's failure registry, for a
+            source that replaces the 8-K scraper-manifest scan.
+        return_documents: Read back and return the window's documents. When
+            False the frame is empty and only ``total_rows`` counts them.
+
+    Returns:
+        The documents frame (see ``return_documents``) and the run summary.
+
+    Raises:
+        ValueError: If ``config.batch_size`` is not positive.
     """
     if config.batch_size <= 0:
         msg = f"batch_size must be positive, got {config.batch_size}"
         raise ValueError(msg)
 
-    # Built on demand: a run that reads EDGAR and writes a local artifact root
-    # has no business constructing an S3 client (or requiring its profile).
+    # Built on demand: a run that never touches S3 must not need a profile.
     resolved_client: list[S3Client] = [s3_client] if s3_client is not None else []
 
     def client() -> S3Client:
@@ -496,11 +474,8 @@ def run_ingest_pipeline(
                 failure_registry=failure_registry,
                 s3_prefix=config.s3_prefix,
                 form_types=config.form_types,
-                # --force retries even permanently registered failures: a
-                # variant document label or a since-fixed scraper bug would
-                # otherwise poison a filing forever, with hand-editing
-                # failures.json as the only remedy (#67). New failures are
-                # still recorded through the registry.
+                # --force retries even permanently registered failures; new
+                # failures are still recorded.
                 retry_registered_failures=config.force,
             )
         )
@@ -543,8 +518,7 @@ def run_ingest_pipeline(
                 continue
             downloaded += 1
             if config.force:
-                # The registered download failure did not reproduce; drop it so
-                # normal runs stop skipping this filing (#67).
+                # The registered failure did not reproduce; drop it.
                 failure_registry.discard(_failure_key_for_candidate(candidate))
 
         pending_rows.append(row)
@@ -552,23 +526,11 @@ def run_ingest_pipeline(
             flush_pending_rows()
 
     flush_pending_rows()
-    # Folded in after iteration: a source that fetches bodies knows what it
-    # could not acquire, and those filings never reach the loop above.
     failures += source.failures
     failure_registry.flush()
 
-    # Read back the run's date window plus whatever it wrote outside it, rather
-    # than the whole dataset — that deserialized every historical 8-K body a
-    # second time per run (#69). The union matters because a source can
-    # legitimately write outside the window: an EDGAR daily index is a
-    # dissemination feed and lists filings dated earlier, each written to its
-    # own filing-date partition. Reading only the window would report fewer rows
-    # than the run wrote. For the scraper path the union is a no-op, because its
-    # candidates come from per-filing-date prefixes.
-    #
-    # No row-level date filter: _write_document_partitions groups on the date
-    # column, so every row in date=D/shard=S has date D, and the partition
-    # selection is already exact.
+    # Read back the window's partitions plus any this run wrote outside it. No
+    # row-level date filter is needed: partitions are keyed on the row's date.
     read_paths = sorted(
         set(
             iter_date_shard_partitions(
@@ -580,11 +542,7 @@ def run_ingest_pipeline(
         )
         | document_partitions_written
     )
-    #
-    # Only the row count is read unless the caller asked for the documents
-    # themselves (#224). Every production caller discards the frame, and
-    # building it meant deserializing every body in the window, ``text``
-    # included, one partition at a time — on a historical run, the whole corpus.
+    # Footer row counts only, unless the caller asked for the documents.
     if return_documents:
         documents = read_partitions(read_paths, columns=DOCUMENT_COLUMNS)
         total_rows = len(documents)
@@ -653,14 +611,20 @@ def iter_document_candidates_for_date_range(
     retry_registered_failures: bool = False,
     form_types: str | Sequence[str] = DEFAULT_FORM_TYPES,
 ) -> list[DocumentCandidate]:
-    """Return manifest-backed document candidates for a date range.
+    """Return manifest-backed document candidates for an inclusive date range.
 
-    ``retry_registered_failures`` re-attempts filings the failure registry marked
-    permanent; the registry is still passed through so a repeat failure is
-    re-recorded rather than lost.
-
-    ``form_types`` are SEC form names ("8-K", "6-K/A"); the ``/`` becomes ``_``
-    in the scraper's prefixes, which ``_normalize_form_types`` handles.
+    Args:
+        s3_client: Client for the scraper bucket.
+        bucket: The scraper bucket.
+        start_date: First filing date scanned.
+        end_date: Last filing date scanned.
+        ciks: CIKs to keep; None keeps every filer.
+        failure_registry: Where new failures are recorded and known ones looked
+            up; None records nothing.
+        s3_prefix: The scraper's key prefix.
+        retry_registered_failures: Re-attempt manifests the registry marks
+            failed, discarding the entry when one now succeeds.
+        form_types: SEC form names ("8-K", "6-K/A").
     """
     candidates: list[DocumentCandidate] = []
     for manifest_key in _iter_manifest_keys(
@@ -694,8 +658,7 @@ def iter_document_candidates_for_date_range(
                 and failure_registry is not None
                 and key in failure_registry
             ):
-                # The registered manifest failure did not reproduce; drop it so
-                # normal runs stop skipping this filing (#67).
+                # The registered failure did not reproduce; drop it.
                 failure_registry.discard(key)
             candidates.append(candidate)
     return candidates
@@ -713,9 +676,7 @@ def iter_manifest_keys_for_date_range(
 ) -> Iterator[str]:
     """Yield manifest keys for the given forms over an inclusive date range.
 
-    The scan itself, without the 8-K path's document selection: a source that
-    needs every document of a filing rather than one named one (the 6-K genre)
-    reads the same keys and builds its own candidates from them.
+    Only the scan: no document selection and no failure-registry lookup.
     """
     return _iter_manifest_keys(
         s3_client,
@@ -789,9 +750,7 @@ def _candidate_from_filing(
         url=document.url,
         resource_uri=normalize_s3_uri(bucket, document.s3_key),
         date=filing.filing_date.isoformat(),
-        # The manifest's own form_type, not the prefix the key was found under:
-        # the prefix spells "8-K/A" as "8-K_A", and un-spelling it would be a
-        # guess about which underscore was a slash.
+        # The manifest's form_type, not the key prefix, which spells "/" as "_".
         form_type=filing.form_type,
         source=DocumentSource.S3_MANIFEST,
     )
@@ -804,12 +763,11 @@ def filing_from_manifest_key(
     *,
     failure_registry: FailureRegistry | None = None,
 ) -> ScrapedFiling | None:
-    """Read one manifest into a filing, or None with the failure recorded.
+    """Read one manifest into a filing.
 
-    Shared by both genres: an unreadable manifest, an unparseable one and one
-    the scraper itself marked failed mean the same thing whichever form is
-    being ingested, and a single implementation keeps them classified the same
-    way in ``failures.json``.
+    Returns None for an unreadable or invalid manifest (recorded in
+    ``failure_registry`` when given) and for one the scraper marked failed
+    (not recorded).
     """
     try:
         manifest = _read_json_object(s3_client, bucket, manifest_key)
@@ -999,12 +957,9 @@ def _run_id() -> str:
 
 
 def _document_shard(accession_number: str) -> str:
-    """Stable document shard for one accession.
+    """Return the document shard for one accession, stable across processes.
 
-    Python's builtin ``hash`` is salted per process, so the same accession
-    landed in different shards across runs — a forced re-ingest then wrote a
-    second copy into a new partition that per-partition dedup could never see
-    (#61). The crc32 scheme in datasets.shard_label pins the assignment.
+    Per-partition dedup relies on an accession always landing in the same shard.
     """
     return shard_label(accession_number, DOCUMENT_PARTITION_SHARDS)
 
@@ -1023,33 +978,11 @@ def _existing_accessions(
     start_date: date,
     end_date: date,
 ) -> set[str]:
-    """Return already-ingested accessions filed inside this run's date window.
+    """Return already-ingested accessions stored under this run's date window.
 
-    This used to read the *whole* ``documents`` dataset projected to
-    ``accession_number``, and a comment credited #69's projection pushdown with
-    making that cheap. On S3 that credit was misplaced: ``read_table`` GETs the
-    entire object and only then hands pandas a ``columns=`` list, so projection
-    saved deserialization and nothing else. Measured on
-    ``data/genwindow-eval-apr``, ``documents`` is 12.2 GB across 1,640
-    partitions at 1.345 MB/row — essentially all of it the ``text`` column —
-    while the accession numbers alone are 0.2988 MB of compressed column
-    chunks. Every ingest, including one that turns out to have nothing to do,
-    moved the whole corpus to build a set of 9,077 strings (#190).
-
-    Scoping to ``[start_date, end_date]`` rests on the same invariant the
-    read-back at the end of ``run_ingest`` already relies on: a row is written
-    to the partition for its own ``candidate.date``, and ``candidate.date`` is
-    the manifest's ``filing_date``, which is also the day prefix
-    ``_iter_manifest_keys`` found it under. So every accession this run could be
-    offered is stored under a date in this window, and the window is exact.
-
-    Where the two differ is a manifest whose ``filing_date`` moved between runs
-    (a scraper repair): the stored copy is then under the old date, outside the
-    window, and this set misses it. The consequence is bounded — the document is
-    re-downloaded and rewritten under its new date — because this set is an
-    optimization, not the uniqueness guarantee. Uniqueness inside a partition is
-    ``_write_document_partitions``, which merges and then
-    ``drop_duplicates(subset=["accession_number"], keep="last")``.
+    A skip-list optimization, not the uniqueness guarantee: that is the
+    per-partition dedup in ``_write_document_partitions``. See
+    docs/decisions/pipeline-ingest-and-publish.md for why the window suffices.
     """
     paths = list(
         iter_date_shard_partitions(
@@ -1059,12 +992,7 @@ def _existing_accessions(
             end_date=end_date,
         )
     )
-    # One parallel scan over the window, not a read per partition. Looping
-    # `read_table` here would forgo the very thing the other half of #190
-    # added: measured on data/genwindow-eval-apr/documents, 1,640 partitions
-    # take 26.45s one at a time against 1.75s as a single scan, for the same
-    # 9,077 accessions. Daily mode's five-day window bounds the loop, but
-    # `--mode historical` defaults to 1994-to-today, which is the whole corpus.
+    # One parallel scan, not a read per partition (measured in the decisions doc).
     table = read_partitions(paths, columns=["accession_number"])
     if table.empty or "accession_number" not in table:
         return set()
@@ -1088,8 +1016,7 @@ def _write_document_partitions(
         ).groupby("shard", sort=True):
             partition = {"date": str(date_value), "shard": str(shard)}
             path = _partition_path(documents_dataset_root, partition)
-            # The partition holds exactly one file at a known path; listing the
-            # whole dataset to find it costs a full LIST per group per flush.
+            # Read the one known file directly; listing would cost a LIST per group.
             existing = read_table(path, columns=DOCUMENT_COLUMNS)
             merged = pd.concat(
                 [

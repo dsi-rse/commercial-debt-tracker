@@ -67,13 +67,8 @@ from cdt.storage import (
 )
 
 #: Published table -> the datasets it is built from, concatenated in order.
-#: ``items`` is a union because both genres produce one: an 8-K item section
-#: and a 6-K snippet are each "the unit of text a mention was extracted from",
-#: and every consumer joins a mention to its unit by ``item_id``. Publishing
-#: only the 8-K units leaves every 6-K mention with no row to join to, which
-#: is not a missing nicety — the website reads item text, the filing's SEC URL
-#: and its accession number off that row, so a 6-K instrument renders with
-#: none of them (#172).
+#: ``items`` unions 8-K item sections and 6-K snippets; see
+#: docs/decisions/pipeline-ingest-and-publish.md.
 FINAL_OUTPUT_TABLES: dict[str, tuple[Callable[..., str], ...]] = {
     "items": (items_root, sixk_snippets_root),
     "debt-instruments": (debt_instruments_root,),
@@ -81,47 +76,29 @@ FINAL_OUTPUT_TABLES: dict[str, tuple[Callable[..., str], ...]] = {
     "mention-cluster-edges": (mention_cluster_edges_root,),
 }
 
-#: Columns a published table keeps when the datasets it unions are not the
-#: same width. A 6-K snippet row carries the classifier's three columns and
-#: the stage's six on top of the itemizer's sixteen; the published ``items``
-#: table is the itemizer's shape, so those are projected away rather than
-#: widening a published table with columns that are null for every 8-K row.
-#: The snippet's own span and verdict stay queryable in ``sixk-snippets``.
+#: Columns a published table is projected to when its datasets differ in width.
 FINAL_OUTPUT_TABLE_COLUMNS: dict[str, list[str]] = {"items": ITEM_COLUMNS}
 
-#: The column stamped on a unioned table's rows to say which dataset they came
-#: from, appended after the projection above.
+#: Column stamped on a unioned table's rows naming the genre they came from.
 FORM_TYPE_COLUMN = "form_type"
 
-#: The two filing genres the pipeline knows how to prepare. A genre is a form
-#: family plus the stages that turn it into rows the extractor can read: 8-K
-#: goes ingest → itemize → classify, 6-K goes ingest → triage. They converge at
-#: extract, which reads both through one projection.
+#: Filing genres: 8-K runs ingest → itemize → classify, 6-K runs ingest →
+#: triage; both converge at extract.
 GENRE_8K = "8-K"
 GENRE_6K = "6-K"
-#: Both, by default. A run is asked for CIKs and a date range, and which forms
-#: those filers happened to file in it is not something the caller should have
-#: to know or keep in sync with the scraper's coverage; `--genres` narrows it
-#: when a run is deliberately about one of them.
+#: Genres the CLI entry points prepare unless `--genres` narrows them.
 DEFAULT_GENRES: tuple[str, ...] = (GENRE_8K, GENRE_6K)
 GENRES = DEFAULT_GENRES
 
 #: Published table -> the ``form_type`` stamped on each dataset it unions,
-#: positionally matching FINAL_OUTPUT_TABLES. Only ``items`` unions more than
-#: one dataset, and it is the one table where a consumer otherwise cannot tell
-#: the genres apart: an 8-K item section and a 6-K snippet are both "the unit
-#: of text a mention came from", and none of the itemizer's sixteen columns
-#: records which kind of filing it came out of. ``form_type`` rather than a
-#: new name because the documents dataset already calls it that and already
-#: carries these same two values, so one vocabulary covers both ends.
+#: positionally matching FINAL_OUTPUT_TABLES.
 FINAL_OUTPUT_TABLE_FORM_TYPES: dict[str, tuple[str, ...]] = {
     "items": (GENRE_8K, GENRE_6K),
 }
 
 ALL_TIME_START_DATE = date(1994, 1, 1)
-# Daily mode re-scans this many days back (ending yesterday) so late-arriving
-# or since-repaired scraper manifests are picked up instead of falling outside
-# a moved-on one-day window forever (#90).
+# Daily mode re-scans this many days back, ending yesterday, so late or
+# repaired scraper manifests are still picked up.
 DAILY_LOOKBACK_DAYS = 5
 DEFAULT_STAGE_BATCH_SIZE = 100
 PIPELINE_MODES = ("daily", "historical")
@@ -158,19 +135,10 @@ class PipelineConfig:
     strong_match_threshold: float = DEFAULT_MEMBERSHIP_THRESHOLD
     loose_match_threshold: float = DEFAULT_RELATED_THRESHOLD
     ambiguity_margin: float = DEFAULT_AMBIGUITY_MARGIN
-    #: Which genres to prepare. Deliberately narrower than DEFAULT_GENRES,
-    #: which is what both entry points default their `--genres` flag to and
-    #: pass through here — so a scheduled or hand-typed run still prepares
-    #: both, and `test_scheduled_runs_prepare_both_genres_by_default` pins
-    #: that. Building a config in code is not asking for a run, though, and
-    #: the 6-K chain scrapes the network and calls a paid model before it
-    #: does anything else. A caller that never mentions genres should get
-    #: the stages it named and nothing that spends money on its behalf.
+    #: Which genres to prepare. 8-K only when built in code, because the 6-K
+    #: chain scrapes and calls a paid model; the CLIs pass DEFAULT_GENRES.
     genres: tuple[str, ...] = (GENRE_8K,)
-    #: CIKs for the 6-K genre, when they differ from the run's. Defaults to
-    #: `cik_file`: one list of issuers is the point, and a separate one exists
-    #: only because a list chosen for 8-K coverage can contain no foreign
-    #: private issuers at all, which would make the 6-K chain a no-op.
+    #: CIKs for the 6-K genre; None means `cik_file`.
     sixk_cik_file: ArtifactPath | None = None
     sixk_form_types: tuple[str, ...] = SIXK_FORM_TYPES
     sixk_batch_size: int = DEFAULT_STAGE_BATCH_SIZE
@@ -184,8 +152,8 @@ class PipelineRunResult:
     mode: str
     start_date: date
     end_date: date
-    #: None when the run did not prepare that genre, which is different from a
-    #: genre that ran and found nothing — the latter has a result with zeroes.
+    #: None when the run did not prepare that genre; a genre that ran and
+    #: found nothing has a result with zeroes.
     ingest: IngestRunResult | None
     itemized_rows: int
     classified_rows: int
@@ -204,8 +172,7 @@ class PipelineRunResult:
 class _PrepareOutcome:
     """What the prepare phases produced, per genre.
 
-    A dataclass rather than a widening tuple because either chain can be absent
-    and the caller has to be able to tell absent from empty.
+    An ``*_ingest`` of None means that genre's chain did not run.
     """
 
     ingest: IngestRunResult | None = None
@@ -253,10 +220,7 @@ class PipelineOrchestrator:
 
     def _setup(self: Self) -> tuple[date, date, set[str], str]:
         """Resolve dates, CIKs, and the artifact root and emit the run banner."""
-        # Validated here rather than trusted from the caller: a config built in
-        # code (a test, the orchestrator, a notebook) skips the CLI's parsing,
-        # and a genre list that matches nothing would run extract and finalize
-        # over whatever the last run left behind and report success.
+        # A config built in code skips the CLI's parsing; validate here.
         normalize_genres(self.config.genres)
         resolved_start, resolved_end = resolve_mode_dates(
             self.config.mode,
@@ -275,11 +239,9 @@ class PipelineOrchestrator:
         return resolved_start, resolved_end, ciks, resolved_artifact_root
 
     def _renew(self: Self, renew: Callable[[], None] | None) -> None:
-        """Extend the caller's writer lease at a stage boundary.
+        """Extend the caller's writer lease at a stage boundary; no-op if None.
 
-        Historical runs outlast the lease TTL by hours; renewing between stages
-        keeps the run from being stolen mid-write, and the hook raises
-        LeaseLostError if it already was (#89).
+        The hook raises LeaseLostError if the lease was already stolen.
         """
         if renew is not None:
             renew()
@@ -294,11 +256,8 @@ class PipelineOrchestrator:
     ) -> _PrepareOutcome:
         """Prepare every genre this run asked for, in genre order.
 
-        The chains are independent up to extract: they read different documents
-        datasets and write different classification sources (#62 selects work
-        by source-partition fingerprint, per dataset). So a genre that fails
-        does not corrupt the other's state — it just leaves its own partitions
-        pending for the next run.
+        The chains share no datasets, so a failing genre leaves only its own
+        partitions pending.
         """
         outcome = _PrepareOutcome()
         if GENRE_8K in self.config.genres:
@@ -332,12 +291,7 @@ class PipelineOrchestrator:
         resolved_artifact_root: str,
         renew: Callable[[], None] | None = None,
     ) -> tuple[IngestRunResult, pd.DataFrame]:
-        """Run the 6-K chain: acquire filings, then triage them into snippets.
-
-        Two stages where 8-K has three: a 6-K has no items to itemize and so
-        nothing for the item classifier to classify, and the triage stage
-        writes rows in the same classified-item columns the classifier does.
-        """
+        """Run the 6-K chain: acquire filings, then triage them into snippets."""
         sixk_ciks = read_cik_file(self.config.sixk_cik_file or self.config.cik_file)
         self._log_stage_start(
             "ingest-sixk",
@@ -356,9 +310,8 @@ class PipelineOrchestrator:
                 output_root=resolved_artifact_root,
                 force=self.config.force,
                 batch_size=self.config.ingest_batch_size,
-                # Never `download`: a 6-K row points at the assembled
-                # submission in the mirror, and inlining bodies into the
-                # partition would make every read pay for every body (#69).
+                # Never `download`: a 6-K row points at the mirrored
+                # submission; inlining bodies makes every read pay for them.
                 failure_file=self.config.failure_file
                 or failure_registry_path(
                     "ingest",
@@ -475,11 +428,7 @@ class PipelineOrchestrator:
         return ingest_result, items, classified
 
     def run_prepare(self: Self, renew: Callable[[], None] | None = None) -> str:
-        """Run only ingest → itemize → classify; return the artifact root.
-
-        Used by the deployed ``daily`` orchestrator, which defers the expensive
-        extract stage to the asynchronous batch poller.
-        """
+        """Run only the prepare stages of each genre; return the artifact root."""
         resolved_start, resolved_end, ciks, resolved_artifact_root = self._setup()
         self._prepare_genres(
             resolved_start, resolved_end, ciks, resolved_artifact_root, renew
@@ -559,7 +508,6 @@ class PipelineOrchestrator:
             sixk_ingest=prepared.sixk_ingest,
             sixk_snippet_rows=len(prepared.snippets),
         )
-        # One shared tail rather than a second copy: see finalize_after_match.
         finalize_after_match(
             matched["debt_instrument"],
             artifact_root=resolved_artifact_root,
@@ -585,7 +533,7 @@ def run_pipeline(
 def run_prepare_stages(
     config: PipelineConfig, *, renew: Callable[[], None] | None = None
 ) -> str:
-    """Run ingest → itemize → classify for a config; return the artifact root."""
+    """Run only the prepare stages for a config; return the artifact root."""
     return PipelineOrchestrator(config).run_prepare(renew)
 
 
@@ -601,14 +549,13 @@ def run_match_and_finalize(
     ambiguity_margin: float = DEFAULT_AMBIGUITY_MARGIN,
     renew: Callable[[], None] | None = None,
 ) -> dict[str, str]:
-    """Run match on existing mentions and rewrite final snapshots.
+    """Run match on existing mentions, then finalize; idempotent.
 
-    Both stages are deterministic and idempotent, so this is safe to run
-    repeatedly: the daily orchestrator calls it to keep snapshots fresh while a
-    batch extract job is still in flight, and the poller calls it when a job
-    completes. ``renew`` extends the caller's writer lease per matched shard
-    and before the snapshot rewrite — this is the longest phase, and it must
-    not keep publishing on a lease another run has stolen (#89).
+    ``renew`` extends the caller's writer lease per matched shard and before
+    the publish, so a stolen lease cannot keep publishing.
+
+    Returns:
+        Published table name -> snapshot path; empty when nothing was published.
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     tables = match_pending_mentions(
@@ -632,16 +579,12 @@ def run_match_and_finalize(
 
 
 def normalize_genres(values: str | Sequence[str]) -> tuple[str, ...]:
-    """Parse and validate a genre selection, preserving pipeline order.
+    """Parse a genre selection into GENRES order, case-insensitively, deduplicated.
 
-    Accepts a comma-separated string (what a CLI flag or an env var carries)
-    or a sequence. Order is normalized to the pipeline's own, so 8-K prepares
-    first whichever way the caller spelled the list, and duplicates collapse.
+    Accepts a comma-separated string or a sequence.
 
     Raises:
-        ValueError: If the selection is empty or names an unknown genre. An
-            unknown genre is a typo — a run that quietly prepared nothing, or
-            prepared less than asked, would look like a corpus with no filings.
+        ValueError: If the selection is empty or names an unknown genre.
     """
     if isinstance(values, str):
         requested = [value.strip() for value in values.split(",")]
@@ -673,13 +616,14 @@ def resolve_mode_dates(
     start_date: date | None,
     end_date: date | None,
 ) -> tuple[date, date]:
-    """Resolve mode-specific dates for ingest-like commands.
+    """Resolve a mode's ``(start, end)`` dates.
 
-    Daily defaults to a rolling lookback window ending yesterday, not a single
-    day: a manifest the scraper writes (or repairs) after CDT's morning pass
-    would otherwise never be scanned again — a permanent, unobservable gap
-    (#90). Ingest dedups by accession, so the re-scan costs only LIST/GET
-    requests, and the fingerprint registries propagate late merges downstream.
+    Historical fills a missing start with ALL_TIME_START_DATE and a missing end
+    with today. Daily with neither date gives the DAILY_LOOKBACK_DAYS window
+    ending yesterday; daily with only one of them is an error.
+
+    Raises:
+        ValueError: On an unknown mode, or daily with only one date given.
     """
     if mode not in PIPELINE_MODES:
         msg = f"unsupported mode {mode!r}"
@@ -700,24 +644,18 @@ def resolve_mode_dates(
     return start_date, end_date
 
 
-# A table shrinking below this fraction of its previously published row count
-# blocks the publish (unless forced): the likeliest causes are a bug or a
-# half-built artifact root, not a legitimate mass deletion of filings.
+# A table shrinking below this fraction of its published row count blocks the
+# publish unless forced.
 FINAL_SNAPSHOT_GUARD_RATIO = 0.5
 
 
-#: Pointer key holding the digest of the source partitions a generation was
-#: built from. Absent on any pointer written before the gate existed, which is
-#: read as "unknown" and publishes once to record one.
+#: Pointer key holding the source digest a generation was built from. Absent
+#: means unknown, which publishes.
 PUBLISH_SOURCE_DIGEST_KEY = "source_digest"
 
-#: Bump whenever the publish changes what it writes for the same source bytes:
-#: a column projection, the ``form_type`` stamp, ``normalize_snapshot_text``,
-#: anything in ``write_final_output_tables`` that reshapes a table. The source
-#: digest cannot see code, so without a bump the gate keeps skipping and the
-#: published tables keep the old shape until some partition happens to move
-#: (#223). The table layout and ``MATCHER_SCHEMA_VERSION`` are folded in
-#: automatically; this is for the changes neither of those can show.
+#: Bump whenever the publish writes something different for the same source
+#: bytes (a projection, the ``form_type`` stamp, ``normalize_snapshot_text``):
+#: the source digest cannot see code, so without a bump the gate keeps skipping.
 PUBLISH_FORMAT_VERSION = 1
 
 
@@ -726,19 +664,9 @@ def publish_source_digest(
 ) -> str:
     """Digest every partition a publish would read, and how it would read them.
 
-    This mirrors what ``pending_source_partitions`` does to decide a partition
-    needs reprocessing (#62) — compare a stored source version — but through
-    ``artifact_content_versions``, which is byte-based on both backends. The
-    registries' mtime-based version would be wrong here: the matcher rewrites
-    every shard on every run, almost always to identical content, so an
-    mtime-based digest would differ every time and the gate would never fire.
-
-    The bytes alone are not the whole input, though. The same partitions
-    published by a different publisher are a different snapshot, so the
-    digest also covers which roots feed which table, the matcher schema
-    version, and ``PUBLISH_FORMAT_VERSION`` (#223).
-
-    On S3 this is one LIST per root and the ETag comes along with it.
+    Covers the content versions (not mtimes) of every ``.parquet`` under the
+    source roots, plus the table layout, ``MATCHER_SCHEMA_VERSION`` and
+    ``PUBLISH_FORMAT_VERSION``. One LIST per root on S3.
     """
     layout = {
         table_name: [
@@ -764,10 +692,6 @@ def _publish_source_roots(
     """Every dataset root a publish reads, deduplicated, in table order."""
     roots: list[str] = []
     for entry in FINAL_OUTPUT_TABLES.values():
-        # One dataset per published table here. On dev, ``items`` unions the
-        # itemizer's root with the 6-K snippets root (#172), so both shapes are
-        # accepted: a digest that silently stopped covering a root would skip
-        # publishes it should not, and that merge would not conflict.
         dataset_root_fns = entry if isinstance(entry, tuple) else (entry,)
         for dataset_root_fn in dataset_root_fns:
             root = dataset_root_fn(artifact_root, data_dir=data_dir)
@@ -784,54 +708,18 @@ def publish_would_republish_nothing(
     force: bool = False,
     source_digest: str | None = None,
 ) -> bool:
-    """Return whether a publish would re-read the whole corpus to change nothing.
+    """Return whether the publish can be skipped because its sources are unchanged.
 
-    The publish is the most expensive thing in the pipeline and it is bounded by
-    request count, not bytes: measured in production, publishing a delta of 14
-    documents took 25 minutes and 21,214 sequential GETs at ~70 ms each. It pays
-    that regardless of whether the run produced anything, and it pays it twice
-    per batch cycle, because both ``run_batch_backend`` and ``run_poll``
-    finalize.
-
-    The question is whether anything the publish *reads* has changed since the
-    generation the pointer names, so that is what this asks — a digest of the
-    five source dataset roots against the one recorded when that generation was
-    written. An earlier version of this gate asked instead whether match had
-    produced instruments, which is a different question with a much narrower
-    answer: ``match_pending_mentions`` rewrites and returns every shard's full
-    instrument table rather than a delta, so that frame is empty only on a
-    corpus that has never produced a single instrument. It would never have
-    fired on the 542-instrument root #110 was measured against, and it could not
-    see ``items`` at all — which itemize and the 6-K triage write *before* match
-    runs, and which is one of the four published tables.
-
-    Three things stop this from being a way to never publish. ``force``
-    overrides it. A pointer with no recorded digest — one written before this
-    existed, or none at all — publishes, which records one for next time. And a
-    final database root missing any of its four ``latest.parquet`` objects
-    publishes regardless: skipping there would mean a freshly pointed output
-    root stayed empty until someone happened to pass ``--force``. That check is
-    four HEAD requests against objects the publish would write anyway.
-
-    Note that a run which crashed between writing a dataset and publishing it no
-    longer needs ``--force`` to recover: the datasets moved, so the digest moved,
-    so the next run publishes on its own. That matters because ``force`` is the
-    pipeline-wide flag, and passing it also disables ``_guard_against_shrinkage``
-    — the one protection a post-crash republish most wants. The same holds for a
-    crash *during* the publish: the digest is recorded only once all four
-    ``latest.parquet`` objects are written (#222), so an interrupted publish
-    leaves a pointer with none.
-
-    ``source_digest`` is the caller's ``publish_source_digest``, when it has
-    one already, so the publish can record the same value without listing
-    again.
+    True when there is no final database root, or when the pointer's recorded
+    source digest equals the current one and every published table's
+    ``latest.parquet`` exists. False when ``force`` is set, the pointer or its
+    digest is missing, the digest differs, or a published table is missing.
+    ``source_digest`` is the caller's ``publish_source_digest`` if already
+    computed; None computes it here.
     """
     if force:
         return False
     if final_database_root is None:
-        # Nothing to publish to: ``write_final_output_tables`` returns before it
-        # reads anything, so the answer is the same and this way it costs no
-        # listing to find out.
         return True
     pointer_path = final_pointer_path(artifact_root)
     if not artifact_exists(pointer_path):
@@ -887,23 +775,15 @@ def finalize_after_match(
     log_stage_start: Callable[..., None] = _ignore_stage,
     log_stage_complete: Callable[..., None] = _ignore_stage,
 ) -> dict[str, str]:
-    """Run the lineage post-pass and the publish: the tail every path shares.
+    """Run the lineage post-pass, then publish unless the gate says skip.
 
-    One copy rather than two. #170 is what the second copy costs: the lineage
-    pass was wired into one of three entry points and production published 537
-    of 542 instruments as lineage heads, because `cdt pipeline` and the live
-    extractor backend silently skipped it. Both paths reach the same three
-    steps here, so a fix to any of them cannot land on only one again.
+    Every entry point that runs match must finish through here. The lineage
+    pass is skipped when ``matched_instruments`` is empty. ``renew`` extends
+    the caller's writer lease before each long step, so a stolen lease cannot
+    keep publishing.
 
-    Amendment lineage spans filings, so it can only be derived once every shard
-    has matched, which makes it a post-pass over the whole corpus. It re-derives
-    every pointer it ever inferred (#204) and renews the lease as it goes; it is
-    skipped only when match produced nothing at all, since it would then read
-    three empty datasets to write none.
-
-    ``renew`` extends the caller's writer lease before each long step. This is
-    the longest phase of a run, and it must not keep publishing on a lease
-    another run has stolen (#89).
+    Returns:
+        Published table name -> snapshot path; empty when nothing was published.
     """
     if not matched_instruments.empty:
         if renew is not None:
@@ -914,8 +794,7 @@ def finalize_after_match(
         )
         log_stage_complete("infer-lineage", **lineage_stats)
     log_stage_start("finalize", output_root=final_database_root)
-    # Once, after lineage (which writes debt-instruments) and before the
-    # publish reads anything, shared by the gate and the pointer it records.
+    # After lineage (which writes debt-instruments), before the publish reads.
     source_digest = (
         None
         if final_database_root is None
@@ -946,13 +825,7 @@ def finalize_after_match(
 
 
 def final_snapshots_root(artifact_root: ArtifactPath) -> str:
-    """Return the root for consistent snapshot generations and their pointer.
-
-    Deliberately under the artifact root, not the final database root: the
-    final database prefix is a parquet-only contract surface for downstream
-    consumers, so the control metadata (``latest.json``) and the immutable
-    generation copies live with the pipeline's other artifacts instead.
-    """
+    """Return the root, under the artifact root, of snapshot generations and pointer."""
     return join_artifact_path(str(artifact_root), "final-snapshots")
 
 
@@ -969,26 +842,20 @@ def write_final_output_tables(
     force: bool = False,
     source_digest: str | None = None,
 ) -> dict[str, str]:
-    """Publish the final tables: guarded, with an atomic generation pointer (#91).
+    """Publish the final tables as one generation behind an atomic pointer.
 
-    Writing four independent ``<table>/latest.parquet`` objects in a loop can
-    never be consistent as a set: a consumer polling mid-loop reads mixed
-    generations (mentions referencing instruments that did not exist yet), a
-    crash between writes leaves that state published permanently, and an
-    accidentally empty dataset silently clobbers a good snapshot with zero rows.
+    Writes every table under ``final-snapshots/snapshot=<run_id>/``, replaces
+    ``latest.json`` (run id, schema version, per-table paths and row counts),
+    refreshes each ``<table>/latest.parquet`` under the final database root,
+    then records ``source_digest`` in the pointer. Prunes all generations but
+    the current and prior one. No-op when ``final_database_root`` is None.
 
-    So every publish first lands whole under an immutable
-    ``final-snapshots/snapshot=<run_id>/`` prefix beneath the *artifact* root,
-    and a single ``latest.json`` pointer there — the object consumers wanting
-    a consistent four-table generation should resolve — is replaced as the
-    last, atomic step, carrying the run id, schema version, and per-table row
-    counts. Only then are the per-table ``<table>/latest.parquet`` objects
-    under the final database root refreshed: that prefix stays parquet-only
-    (its contract), with each object individually atomic but the set not
-    consistent mid-publish. Unless ``force``, the publish refuses when a
-    previously non-empty table would become empty or shrink below
-    FINAL_SNAPSHOT_GUARD_RATIO of its prior row count. Generations other than
-    the current and prior one are pruned.
+    Returns:
+        Published table name -> snapshot path.
+
+    Raises:
+        ValueError: Unless ``force``, if a published table would shrink below
+            FINAL_SNAPSHOT_GUARD_RATIO of its current row count.
     """
     if final_database_root is None:
         return {}
@@ -1017,10 +884,8 @@ def write_final_output_tables(
         )
         for table_name, dataset_root_fns in FINAL_OUTPUT_TABLES.items()
     }
-    # Guard against what is actually published, not the pointer: the pointer
-    # lives with the artifact root, so a half-built or freshly-pointed artifact
-    # root has no pointer — exactly the case that must not clobber a good
-    # database. Footer metadata gives the counts without decoding columns.
+    # Guard against the published tables, not the pointer: a half-built
+    # artifact root has no pointer and must still not clobber a good database.
     previous_counts = {
         table_name: rows
         for table_name in FINAL_OUTPUT_TABLES
@@ -1063,12 +928,8 @@ def write_final_output_tables(
             table,
         )
 
-    # Only now is the generation published everywhere the gate trusts it to be,
-    # so only now does the pointer say what it was built from (#222). Recorded
-    # with the first write instead, a crash in the loop above left a pointer
-    # whose digest matched while the database root still held the previous
-    # tables, and every later run skipped. A crash here leaves no digest, which
-    # the gate reads as "unknown" and publishes.
+    # The digest goes in last: a crash before here must leave no digest, so
+    # the next run publishes rather than skipping over stale tables.
     write_json_artifact(
         pointer_path, {**pointer, PUBLISH_SOURCE_DIGEST_KEY: source_digest}
     )
@@ -1089,18 +950,9 @@ def _read_published_table(
 ) -> pd.DataFrame:
     """Read one published table, concatenating the datasets it unions.
 
-    Empty frames are dropped before the concat rather than passed through it.
-    A dataset with no partitions reads back as all-object columns, and pandas
-    would widen the integer columns of the frames beside it to float to make
-    room — silently changing a published table's types on any run where one
-    genre produced nothing.
-
-    Where a table unions more than one dataset, each frame is stamped with the
-    ``form_type`` it came from before the concat, so the genres stay tellable
-    apart in the published table. Stamped here rather than read from the source
-    because neither dataset carries the column: the itemizer deliberately does
-    not copy it out of the documents dataset, to keep an ingest-side column
-    from reshaping four datasets at once.
+    Each frame is projected to FINAL_OUTPUT_TABLE_COLUMNS and stamped with its
+    FINAL_OUTPUT_TABLE_FORM_TYPES entry, where the table has them. Empty frames
+    are left out of the concat so they cannot widen integer columns to float.
     """
     columns = FINAL_OUTPUT_TABLE_COLUMNS.get(table_name)
     form_types = FINAL_OUTPUT_TABLE_FORM_TYPES.get(table_name)
@@ -1121,13 +973,7 @@ def _read_published_table(
 
 
 def normalize_snapshot_text(table: pd.DataFrame) -> pd.DataFrame:
-    """Return one snapshot table with placeholder text values replaced by nulls.
-
-    Partitions written before a text column existed, or by a stage that
-    stringified a missing value, carry literal text such as ``nan``. Dashboard
-    consumers read these snapshots directly, so they are normalized on the way
-    out instead of rendering the placeholder.
-    """
+    """Return a copy of a table with placeholder text (such as ``nan``) nulled."""
     if table.empty:
         return table
     normalized = table.copy()
@@ -1139,12 +985,7 @@ def normalize_snapshot_text(table: pd.DataFrame) -> pd.DataFrame:
 
 
 def normalize_snapshot_cell(value: object) -> object:
-    """Null one placeholder string, leaving non-text values at their own type.
-
-    An object column can hold booleans when older partitions predate the column,
-    so only text cells are coerced. Mapping everything through the text helper
-    would publish `True` as the string `"True"`.
-    """
+    """Null one placeholder string; return non-string values unchanged."""
     if isinstance(value, str):
         return coerce_dataset_text(value)
     return value
@@ -1156,7 +997,11 @@ def _guard_against_shrinkage(
     *,
     force: bool,
 ) -> None:
-    """Refuse to publish a snapshot that looks like data loss, unless forced."""
+    """Refuse to publish a table shrinking below the guard ratio, unless forced.
+
+    Raises:
+        ValueError: If any table regressed and ``force`` is False.
+    """
     regressions: list[str] = []
     for table_name, table in tables.items():
         prior_rows = previous_counts.get(table_name, 0)
@@ -1181,10 +1026,9 @@ def _guard_against_shrinkage(
 
 
 def _prune_old_snapshots(snapshots_root: str, *, keep_run_ids: set[str]) -> None:
-    """Delete snapshot generations other than the current and prior one.
+    """Delete snapshot generations whose run id is not in ``keep_run_ids``.
 
-    Two generations stay readable so a consumer that resolved the previous
-    pointer moments ago can still finish reading it.
+    The prior generation is kept so a reader of the previous pointer can finish.
     """
     keep_prefixes = tuple(f"snapshot={run_id}/" for run_id in keep_run_ids if run_id)
     for path in list_artifacts(snapshots_root, suffix=".parquet"):
