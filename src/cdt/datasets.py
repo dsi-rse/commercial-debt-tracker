@@ -557,15 +557,30 @@ def save_completion_registry(
     bookkeeping.
 
     Each shard's compare-and-swap is independent, which is what keeps the
-    per-batch save of #111 durable: a save interrupted after three of five
-    shards leaves those three persisted, and every persisted entry is a
-    partition whose output was already written.
+    per-batch save of #111 durable *for the stages that save per batch*: a save
+    interrupted after three of five shards leaves those three persisted, and
+    every persisted entry is a partition whose output was already written.
+    Itemize, classify and 6-K triage do save at every batch boundary. Extract
+    does not, and it is the stage where this matters most (#227):
+    ``extract_pending_items`` accepts ``batch_size`` but never chunks its
+    partition loop -- the value only reaches the run manifest -- so its sole
+    save is after the loop, an interruption still discards the whole run's
+    registry progress, and that one save is also the only one that can span
+    ~400 shards. Still strictly better than the pre-#191 object, which lost
+    100% of its progress on the same interruption; just not the per-batch
+    durability #111 asked for.
 
     A save is also where an existing root's pre-#191 single object is folded
-    into date shards, because a save is the only point that holds the writer
-    lease. Every stage saves unconditionally at the end of its run, so the
-    migration lands on the first run after the upgrade even when nothing was
-    pending.
+    into date shards. Not because a save is the only point holding the writer
+    lease -- that is false, and was the stated reason: four of the five call
+    sites reach this from a CLI subcommand that takes the lease and never
+    renews it against a 2 h TTL and a ~2.5 h real-corpus itemize, which is its
+    own pre-existing bug (#226). The migration needs no exclusion at all: it is
+    idempotent and compare-and-swap-safe, because an adopted entry never
+    overwrites a shard's newer copy and a lost swap re-reads and retries, so
+    two writers migrating concurrently cannot lose an entry. Every stage saves
+    unconditionally at the end of its run, so the migration lands on the first
+    run after the upgrade even when nothing was pending.
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     changed = sorted(
