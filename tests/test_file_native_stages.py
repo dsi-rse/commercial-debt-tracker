@@ -28,7 +28,6 @@ from cdt.datasets import (
     load_row_failures,
     normalize_cik,
     run_manifest_path,
-    shard_for_accession,
     shard_for_cik,
 )
 from cdt.extractor import extract_pending_items, mentions_root
@@ -109,12 +108,6 @@ class FakeModel:
         """Return a single strong-positive score."""
         del texts
         return [2.0]
-
-
-def test_shard_for_accession_uses_eight_date_shards() -> None:
-    """Date-partitioned stages should only use shards 0000 through 0007."""
-    shards = {shard_for_accession(str(index)) for index in range(200)}
-    assert shards == {f"{index:04d}" for index in range(8)}
 
 
 def test_normalize_cik_zero_pads_digits_and_leaves_junk_visible() -> None:

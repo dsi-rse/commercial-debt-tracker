@@ -36,7 +36,6 @@ LOGGER = get_logger(__name__)
 # `normalize_reasoning_effort` from `cdt.extractor.core`, so the dependency runs
 # the other way. This module is the leaf both sides already import.
 SIXK_SNIPPET_DATASET_NAME = "sixk-snippets"
-ITEMIZE_CLASSIFY_EXTRACT_SHARDS = 8
 MATCH_SHARDS = 64
 PARTITION_PATTERN = re.compile(
     r"(?P<dataset>[a-z\-]+)/date=(?P<date>\d{4}-\d{2}-\d{2})/shard=(?P<shard>\d{4})/part-0000\.parquet$"
@@ -1192,11 +1191,6 @@ def shard_label(value: str, shard_count: int) -> str:
     change here strands existing partitions (#61), so change it nowhere else.
     """
     return f"{zlib_crc32(value) % shard_count:04d}"
-
-
-def shard_for_accession(accession_number: str) -> str:
-    """Return the canonical date/shard partition for one accession."""
-    return shard_label(accession_number, ITEMIZE_CLASSIFY_EXTRACT_SHARDS)
 
 
 CIK_DIGITS = 10
