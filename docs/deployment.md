@@ -253,12 +253,60 @@ and prints the task ARN and a log-tail command. See
 [docs/deployment-dev.md](deployment-dev.md) for the underlying `aws ecs
 run-task` pattern the script wraps.
 
+## Rolling Back Past the Sharded Completion Registry (#191)
+
+**Run `cdt rebuild-legacy-registry <stage>` before redeploying an image from
+before #191, for every stage.** A rollback without it re-pays work, and for
+`extract` that is real LLM spend.
+
+#191 split each stage's completion registry from one
+`runs/<stage>/completed-partitions.json` object into one object per year-month
+under `runs/<stage>/completed/`. The first save on an existing root migrates
+the old object and replaces it with an empty forwarding marker. Code from
+before #191 has no shard reader, so it reads that marker as an empty registry
+and reports every partition pending -- the #107 failure mode -- and then
+blind-writes a fresh v2 object over the marker, destroying the breadcrumb.
+
+Blast radius by stage, if it happens anyway:
+
+- `itemize`, `classify`, `sixk-triage` are bounded by their target-exists fast
+  path, so they re-scan but mostly do not re-compute.
+- `extract` is not. Its backfill adoption is deliberately scoped to the 8-K
+  `classifications` dataset, so every `sixk-snippets` partition goes back to
+  pending with no row-level protection and re-pays model calls.
+
+No state is lost either way -- the shards survive, and the merge on the way
+back in is `setdefault`, so re-migrating is self-healing -- but the model spend
+is not recoverable.
+
+```bash
+# Before the rollback deploy, under the pipeline-writer lease (the command
+# takes it for you). --dry-run reports the entry count without writing.
+cdt rebuild-legacy-registry itemize --artifact-root s3://<bucket>/<prefix>
+cdt rebuild-legacy-registry classify --artifact-root s3://<bucket>/<prefix>
+cdt rebuild-legacy-registry sixk-triage --artifact-root s3://<bucket>/<prefix>
+cdt rebuild-legacy-registry extract --artifact-root s3://<bucket>/<prefix>
+```
+
+It writes whatever the shards currently hold, in the whole-path v2 key spelling
+pre-#191 code matches on, and leaves the shards untouched -- so it is safe to
+run without rolling back, safe to run twice, and doubles as the reconciliation
+tool if a shard is ever lost or restored from object-version history.
+
+Note that every writer takes `PIPELINE_WRITER_LEASE`, so the migration hazard
+is sequential rather than concurrent -- but the lease knows nothing about code
+version, and manual stage runs from a checkout are explicitly endorsed
+elsewhere in these docs, so a mixed-version window is reachable without any
+deploy at all.
+
 ## Operational Guidance
 
 - Keep the scheduler disabled on a new environment until a manual historical smoke test succeeds.
 - Treat the configured default CIK file as the environment's normal run scope.
 - Use a smaller CIK file and narrow date range for first backfills.
 - Prefer `--force` only when intentionally recomputing existing partitions.
+- Run `cdt rebuild-legacy-registry <stage>` before any rollback to an image
+  from before #191 (see above).
 
 ## Prod Launch Checklist
 

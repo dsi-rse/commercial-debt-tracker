@@ -700,7 +700,12 @@ def _retire_legacy_registry(
     Cleared rather than deleted so the object survives as an operator-visible
     record of where the state went. The migration is still one-way: code from
     before #191 reads the marker as an empty registry, which is the #107
-    failure mode, so a rollback has to rebuild the object from the shards.
+    failure mode, so a rollback has to rebuild the object from the shards --
+    which is what ``rebuild_legacy_completion_registry`` and
+    ``cdt rebuild-legacy-registry`` are for (#227). Deployment here is an image
+    redeploy, so a rollback is precisely the operation that produces the empty
+    read; shipping the migration without its down path left that unrecoverable
+    except by hand.
     """
     return replace_json_artifact_if_match(
         legacy_completion_registry_path(
@@ -716,6 +721,69 @@ def _retire_legacy_registry(
         },
         version=version,
     )
+
+
+def rebuild_legacy_completion_registry(
+    stage_name: str,
+    *,
+    artifact_root: ArtifactPath | None = None,
+    data_dir: Path | None = None,
+) -> tuple[int, str]:
+    """Rebuild the pre-#191 single object from the date shards (#227).
+
+    The down path for #191's migration, which shipped without one. Deployment
+    is an image redeploy, so rolling back to code from before #191 is exactly
+    the operation that reads the forwarding marker as an empty registry -- the
+    #107 failure mode -- and then blind-writes a fresh v2 object over it,
+    destroying the breadcrumb the marker exists to leave.
+
+    That costs real money rather than just time. Itemize, classify and 6-K
+    triage are bounded by their target-exists fast path, but extract's backfill
+    adoption is deliberately scoped to the 8-K ``classifications`` dataset
+    (``extractor/core.py``: ``adoptable_paths`` is only filled when
+    ``source == CLASSIFICATION_DATASET_NAME``), so every ``sixk-snippets``
+    partition goes back to pending with no row-level protection and re-pays LLM
+    extraction.
+
+    Doubles as the reconciliation tool if a shard is ever lost: it writes
+    whatever the shards currently hold, so running it after restoring a shard
+    from object-version history reassembles the whole registry.
+
+    Writes keys in the v2 whole-path spelling, because that is what pre-#191
+    code reads; the shards are left exactly as they are, so this is safe to run
+    without rolling back and safe to run twice. Returns the entry count and the
+    path written. Callers must hold ``PIPELINE_WRITER_LEASE``: this is a blind
+    overwrite of an object that concurrent stage saves also migrate.
+    """
+    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    registry = load_completion_registry(
+        stage_name, artifact_root=resolved_root, data_dir=data_dir
+    )
+    path = legacy_completion_registry_path(
+        stage_name, artifact_root=resolved_root, data_dir=data_dir
+    )
+    write_json_artifact(
+        path,
+        {
+            "stage": stage_name,
+            "version": 2,
+            "partitions": {
+                key: {
+                    "fingerprint": entry.fingerprint,
+                    **({"item_ids": sorted(entry.item_ids)} if entry.item_ids else {}),
+                    **({} if entry.complete else {"complete": False}),
+                }
+                for key, entry in sorted(registry.items(), key=itemgetter(0))
+            },
+        },
+    )
+    LOGGER.info(
+        "Rebuilt the pre-#191 %r completion registry at %s from %d shard entries",
+        stage_name,
+        path,
+        len(registry),
+    )
+    return len(registry), path
 
 
 def _save_registry_shard(

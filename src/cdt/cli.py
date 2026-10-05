@@ -17,7 +17,7 @@ from cdt.classifier import (
     default_model_dir,
     train_classifier_model,
 )
-from cdt.datasets import dataset_root
+from cdt.datasets import dataset_root, rebuild_legacy_completion_registry
 from cdt.extractor import (
     DEFAULT_MAX_ATTEMPTS as DEFAULT_EXTRACTOR_MAX_ATTEMPTS,
 )
@@ -341,6 +341,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_logging_arguments(reset_job_parser, noun="reset")
     reset_job_parser.set_defaults(func=run_reset_extract_job)
+
+    rebuild_registry_parser = subparsers.add_parser(
+        "rebuild-legacy-registry",
+        help=(
+            "Rebuild a stage's pre-#191 single completion-registry object from "
+            "its date shards. The down path for the #191 migration: run this "
+            "BEFORE rolling back to an image from before #191, or that code "
+            "reads the registry as empty and re-pays the work (#227)."
+        ),
+    )
+    rebuild_registry_parser.add_argument(
+        "stage",
+        help="Stage whose registry to rebuild (itemize, classify, extract, sixk-triage).",
+    )
+    add_artifact_root_argument(rebuild_registry_parser)
+    rebuild_registry_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report the entry count that would be written without writing it.",
+    )
+    add_logging_arguments(rebuild_registry_parser, noun="rebuild")
+    rebuild_registry_parser.set_defaults(func=run_rebuild_legacy_registry)
 
     backfill_parser = subparsers.add_parser(
         "backfill-mentions",
@@ -924,6 +946,45 @@ def run_reset_extract_job(args: argparse.Namespace) -> int:
         return 1
     print(f"Cleared the active extract job marker for {job_id}.")
     print("The next poll tick starts a fresh job from unclaimed partitions.")
+    return 0
+
+
+def run_rebuild_legacy_registry(args: argparse.Namespace) -> int:
+    """Rebuild a stage's pre-#191 registry object from its date shards.
+
+    The down path for #191's migration (#227). Deployment is an image
+    redeploy, so rolling back past #191 is exactly the operation that reads the
+    forwarding marker as an empty registry and re-pays the work -- and for
+    extract that is LLM spend, because its backfill adoption is scoped to the
+    8-K `classifications` dataset and every `sixk-snippets` partition goes back
+    to pending unprotected.
+    """
+    configure_logging(quiet=args.quiet, log_file=args.log_file)
+    logger = logging.getLogger(__name__)
+    artifact_root = args.artifact_root or default_output_root()
+    if args.dry_run:
+        from cdt.datasets import load_completion_registry
+
+        count = len(load_completion_registry(args.stage, artifact_root=artifact_root))
+        print(f"Would rebuild the {args.stage!r} registry with {count} entries.")
+        print("Re-run without --dry-run to write it.")
+        return 0
+    # The same lease every stage save takes: this blind-overwrites an object
+    # that a concurrent save would otherwise be migrating underneath us.
+    lease = acquire_stage_lease(artifact_root, logger, "the registry rebuild")
+    if lease is None:
+        return 1
+    try:
+        count, path = rebuild_legacy_completion_registry(
+            args.stage, artifact_root=artifact_root
+        )
+    except Exception:
+        logger.exception("Rebuilding the legacy completion registry failed")
+        return 1
+    finally:
+        release_lease(lease)
+    print(f"Wrote {count} entries to {path}.")
+    print("The date shards are unchanged, so this is safe to run again.")
     return 0
 
 

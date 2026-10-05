@@ -5054,6 +5054,110 @@ def test_migration_adopts_undated_and_non_partition_keys_unchanged(
     assert sorted(json.loads(shard.read_text())["partitions"]) == sorted(odd_keys)
 
 
+def test_rebuild_legacy_registry_restores_what_pre_191_code_reads(
+    tmp_path: Path,
+) -> None:
+    """The #191 migration's down path, which shipped nowhere (#227, #107).
+
+    Deployment is an image redeploy, so rolling back past #191 is exactly the
+    operation that reads the forwarding marker as an empty registry -- #107's
+    failure mode -- and then blind-writes a fresh v2 object over it. Before
+    this there was no script, no subcommand and no runbook entry to rebuild the
+    object from the shards; `grep -ri rollback src/ tests/ docs/` returned one
+    docstring sentence.
+
+    Asserted against the partition paths a stage actually enumerates, not just
+    against the entry count, because pre-#191 code matches completion by whole
+    path and a count can be right while every key names nothing.
+    """
+    from cdt.datasets import (
+        CompletedPartition,
+        CompletionRegistry,
+        completion_registry_root,
+        iter_date_shard_partitions,
+        legacy_completion_registry_path,
+        rebuild_legacy_completion_registry,
+        save_completion_registry,
+    )
+
+    seed_document_partitions_across_months(
+        tmp_path, [("2024-01-02", "0001"), ("2024-02-05", "0003")]
+    )
+    real = set(iter_date_shard_partitions("documents", artifact_root=tmp_path))
+    assert len(real) > 1
+
+    save_completion_registry(
+        "itemize",
+        {path: CompletedPartition(fingerprint="fp") for path in real},
+        artifact_root=tmp_path,
+    )
+    legacy = Path(legacy_completion_registry_path("itemize", artifact_root=tmp_path))
+    # Migrate, so the single object becomes an empty forwarding marker.
+    save_completion_registry("itemize", CompletionRegistry(), artifact_root=tmp_path)
+    if legacy.exists():
+        assert not json.loads(legacy.read_text())["partitions"]
+
+    count, path = rebuild_legacy_completion_registry("itemize", artifact_root=tmp_path)
+
+    rebuilt = json.loads(Path(path).read_text())
+    assert rebuilt["version"] == 2
+    assert "migrated_to" not in rebuilt
+    assert count == len(real)
+    # The keys name the partitions on this root, whole-path, as v2 readers need.
+    assert set(rebuilt["partitions"]) == real
+    # The shards are untouched, so current code is unaffected and a second run
+    # is a no-op.
+    shard_dir = Path(completion_registry_root("itemize", artifact_root=tmp_path))
+    before = {p.name: p.read_bytes() for p in shard_dir.glob("*.json")}
+    assert rebuild_legacy_completion_registry("itemize", artifact_root=tmp_path) == (
+        count,
+        path,
+    )
+    assert {p.name: p.read_bytes() for p in shard_dir.glob("*.json")} == before
+    assert json.loads(Path(path).read_text()) == rebuilt
+
+
+def test_rebuild_legacy_registry_preserves_item_ids_and_incompleteness(
+    tmp_path: Path,
+) -> None:
+    """A rebuilt entry must keep the fields that make re-processing row-level.
+
+    `item_ids` and `complete: False` are what keep a re-processed partition from
+    re-paying rows that already have a real outcome (#49, #62). A rollback that
+    dropped them would turn a partial partition into a fully pending one, which
+    for extract is LLM spend.
+    """
+    from cdt.datasets import (
+        CompletedPartition,
+        date_shard_partition_path,
+        legacy_completion_registry_path,
+        rebuild_legacy_completion_registry,
+        save_completion_registry,
+    )
+
+    key = date_shard_partition_path(
+        "documents", partition_date="2024-01-02", shard="0001", artifact_root=tmp_path
+    )
+    save_completion_registry(
+        "extract",
+        {
+            key: CompletedPartition(
+                fingerprint="fp", item_ids=frozenset({"b", "a"}), complete=False
+            )
+        },
+        artifact_root=tmp_path,
+    )
+
+    _, path = rebuild_legacy_completion_registry("extract", artifact_root=tmp_path)
+    entry = json.loads(Path(path).read_text())["partitions"][key]
+    assert entry == {
+        "fingerprint": "fp",
+        "item_ids": ["a", "b"],
+        "complete": False,
+    }
+    assert path == legacy_completion_registry_path("extract", artifact_root=tmp_path)
+
+
 def test_completion_registry_shard_entry_beats_the_legacy_object(
     tmp_path: Path,
 ) -> None:
