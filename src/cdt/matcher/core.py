@@ -757,27 +757,16 @@ def _json_text(row: dict[str, object], column: str) -> str | None:
 
     The other five all funnel into `parse_cluster_list`, which swallows
     `JSONDecodeError` and answers `[]` for anything that is not a JSON array —
-    so the text `nan` and the default `[]` reach the same result, and four of
-    the five are robustness rather than repair. Three of them are pinned anyway
+    so the text `nan` and the default `[]` reach the same result, and the other
+    five are robustness rather than repair. Three of them are pinned anyway
     because `PreparedMention` carries the *text* forward, and a field holding
     `"nan"` is wrong whatever reads it next.
 
-    The fifth is the one that really changed published output, and for a reason
-    the idiom only half explains: `build_cluster_profiles` falls back from
-    `parties_json` to the pre-#150 `lenders_json`, and because NaN is truthy the
-    `or` stopped falling through. On a root where *every* partition is pre-#150
-    the column is absent rather than NaN, `.get` returns None, and the fallback
-    works — which is why this hid. Read one newer `parties_json`-bearing
-    partition beside them and schema unification fills the old rows with NaN:
-    over the 573 real instrument rows in `data/genwindow-run-dev`, the 135 that
-    carry a recoverable lender signature dropped to 0.
-
-    Returning None rather than `"[]"` is deliberate: `build_cluster_profiles`
-    falls back from `parties_json` to the pre-#150 `lenders_json`, and a helper
-    that cannot distinguish "this column is absent" from "this column holds an
-    empty list" cannot express that fall-through. Callers that want a payload
-    either way spell the default themselves. Mirrors `_json_list`/`_json_dict`
-    in `extractor/core.py`, which solved the same NaN problem first.
+    Returning `str | None` rather than `"[]"` keeps the "column absent" and
+    "column holds an empty list" cases distinguishable; callers that want a
+    payload either way spell the default themselves, as `coerce_dataset_text`'s
+    other callers do. Mirrors `_json_list`/`_json_dict` in `extractor/core.py`,
+    which solved the same NaN problem first.
     """
     text = coerce_dataset_text(row.get(column))
     if text is None:
@@ -869,16 +858,11 @@ def build_cluster_profiles(
         )
         if normalized_name:
             profile.normalized_name_fingerprints.add(normalized_name)
-        # Per column, not one `or` over both raw values: a pre-#150 instruments
-        # partition has no `parties_json` at all, so `read_table` hands this row
-        # NaN for it — and NaN is truthy, so the raw `or` never fell through to
-        # the `lenders_json` this row actually carries. The fallback was dead
-        # exactly on the partitions it exists for (#193).
-        lenders = lender_signature(
-            _json_text(instrument_row, "parties_json")
-            or _json_text(instrument_row, "lenders_json")
-            or "[]"
-        )
+        # Guarded for uniformity with the other `_json` reads in this module,
+        # not for a behaviour change: `lender_signature` funnels its argument
+        # through `parse_cluster_list`, which already answers `[]` for anything
+        # that is not a JSON array, so NaN and the default agree here (#193).
+        lenders = lender_signature(_json_text(instrument_row, "parties_json") or "[]")
         if lenders:
             profile.lender_signatures.add(lenders)
         for member_id in member_ids:
@@ -1979,8 +1963,7 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
         # hand this site -- NaN, None, blank, every `MISSING_TEXT_VALUES`
         # placeholder, junk, a JSON object and a list of scalars -- and the
         # guarded and unguarded readings agree on all twelve, so the #193 issue
-        # body is wrong to call this one a clustering change (the one that
-        # really is, is `build_cluster_profiles`' dead `lenders_json` fallback).
+        # body is wrong to call this one a clustering change.
         lender_signature=lender_signature(parties_json),
         synthesized_by=coerce_optional_text(row.get("synthesized_by")),
         synthesized_from_mention_id=coerce_optional_text(
