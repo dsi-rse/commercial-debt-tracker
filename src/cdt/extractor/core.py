@@ -4986,6 +4986,15 @@ def standardized_end_date_payload(
 DERIVED_FROM_STATED = "stated"
 DERIVED_FROM_NAME = "name"
 DERIVED_FROM_COMPUTED = "computed"
+# An amount read off its own cited span and scaled by a magnitude word carried
+# by a *sibling* amount fact's cited span, because the filing wrote that word
+# once for two figures: `from $400.0 to $500.0 million` (#213). A separate
+# marker rather than `"computed"`, which means arithmetic over addends and is
+# consumed as such on the maturity side (`DERIVED_MATURITY_KINDS`,
+# `matcher/core.py`); `src/` has no amount-side consumer of `derived_from` at
+# all, so a new value costs nothing and is the more honest record of how the
+# figure was reached.
+DERIVED_FROM_SCALED = "scaled"
 # A term carried onto a synthesized predecessor row from the amended object it
 # was minted from, because the filing marked no `prior` value for that kind and
 # so states it unchanged (#203). The spans are the successor's; the marker is
