@@ -5062,6 +5062,14 @@ def test_completion_registry_shard_entry_beats_the_legacy_object(
     Load order is load-bearing while both layouts coexist: read the legacy
     object as an overlay on top of the shards and a stale fingerprint would
     resurrect, making a changed source partition look already done (#62).
+
+    The retire is stubbed out because otherwise this test asserts nothing
+    (#227). It was written before the migration existed; now the same save
+    retires the legacy object, so by the time the load runs that object is an
+    empty marker and the order is unobservable -- inverting the overlay in
+    `load_completion_registry` left the whole suite green. The coexisting state
+    is reachable in production: the retire's compare-and-swap can lose, which
+    this suite constructs elsewhere, and a stale entry is then still present.
     """
     from cdt.datasets import (
         CompletedPartition,
@@ -5085,11 +5093,15 @@ def test_completion_registry_shard_entry_beats_the_legacy_object(
             }
         )
     )
-    save_completion_registry(
-        "itemize",
-        {key: CompletedPartition(fingerprint="fresh")},
-        artifact_root=tmp_path,
-    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(cdt_datasets, "_retire_legacy_registry", lambda *a, **k: True)
+        save_completion_registry(
+            "itemize",
+            {key: CompletedPartition(fingerprint="fresh")},
+            artifact_root=tmp_path,
+        )
+    # The premise: both copies of the key really are still present.
+    assert json.loads(legacy.read_text())["partitions"][key]["fingerprint"] == "stale"
 
     assert (
         load_completion_registry("itemize", artifact_root=tmp_path)[key].fingerprint
