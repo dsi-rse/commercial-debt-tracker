@@ -10,8 +10,13 @@ This module infers such links across filings within one CIK, with one rule:
 Only a null `amendment_of_debt_instrument_id` is filled, and a child is left
 unlinked whenever the evidence does not single out one parent. Every input is
 extractor output (canonical `name`, `first_seen_filing_date`, `start_date`, and
-the borrowers in `parties_json`); filing text is never read. Rationale and
-measurements: docs/decisions/matching-and-lineage.md.
+the borrowers in `parties_json`); filing text is never read.
+
+`infer_amendment_parents` is the rule over instrument rows.
+`apply_lineage_inference_pass` runs it across the whole corpus after every shard
+has matched, rewriting the debt-instruments shards and writing an
+`infer-lineage` run manifest. Rationale and measurements:
+docs/decisions/matching-and-lineage.md.
 """
 
 from __future__ import annotations
@@ -19,6 +24,34 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Callable
+from pathlib import Path
+
+import pandas as pd
+
+from cdt.datasets import (
+    dataset_root,
+    resolve_artifact_root,
+    run_manifest_path,
+    shard_for_cik,
+)
+from cdt.extractor.core import (
+    DEBT_INSTRUMENT_MENTION_COLUMNS as EXTRACTED_MENTION_COLUMNS,
+)
+from cdt.extractor.core import MENTIONS_DATASET_NAME
+from cdt.matcher.instruments import apply_lifecycle_rollup, apply_observation_columns
+from cdt.matcher.normalize import coerce_optional_text, prepare_mention
+from cdt.matcher.schema import (
+    DEBT_INSTRUMENT_COLUMNS,
+    MATCHER_SCHEMA_VERSION,
+    debt_instruments_root,
+    mention_cluster_edges_root,
+)
+from cdt.storage import (
+    read_dataset,
+    write_json_artifact,
+    write_partition_table,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -293,3 +326,130 @@ def infer_amendment_parents(
         ambiguous,
     )
     return resolved
+
+
+def apply_lineage_inference_pass(
+    artifact_root: str | Path,
+    *,
+    data_dir: Path | None = None,
+    renew: Callable[[], None] | None = None,
+) -> dict[str, int]:
+    """Infer amendment lineage across the whole corpus, after all shards match.
+
+    Every pointer with an `amendment_inferred_by` is re-opened and re-derived
+    with ``infer_amendment_parents``, so published lineage depends only on the
+    current rules and rows; extracted pointers are never re-opened. The
+    observation and rollup columns are recomputed, every debt-instruments shard
+    is rewritten, and an `infer-lineage` run manifest is written. ``renew`` is
+    called before the work starts and before each shard is rewritten, and must
+    raise if the writer lease has been lost.
+
+    Returns counts: ``links``, ``reopened``, ``heads_before``, ``heads_after``;
+    all zero, with nothing written, when instruments, edges or mentions are
+    empty.
+    """
+    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    instruments = read_dataset(debt_instruments_root(resolved_root, data_dir=data_dir))
+    edges = read_dataset(mention_cluster_edges_root(resolved_root, data_dir=data_dir))
+    mentions = read_dataset(
+        dataset_root(
+            MENTIONS_DATASET_NAME, artifact_root=resolved_root, data_dir=data_dir
+        ),
+        columns=EXTRACTED_MENTION_COLUMNS,
+    )
+    if instruments.empty or edges.empty or mentions.empty:
+        return {"links": 0, "reopened": 0, "heads_before": 0, "heads_after": 0}
+    if renew is not None:
+        renew()
+
+    member_edges = edges[edges["edge_type"] == "member"]
+    member_groups: dict[str, list[str]] = {}
+    for row in member_edges.to_dict("records"):
+        member_groups.setdefault(str(row["debt_instrument_id"]), []).append(
+            str(row["debt_instrument_mention_id"])
+        )
+    mention_index = {
+        str(row["debt_instrument_mention_id"]): prepare_mention(row)
+        for row in mentions.to_dict("records")
+    }
+    rows = instruments.to_dict("records")
+    heads_before = sum(1 for row in rows if row.get("is_lineage_head"))
+
+    # Before inferring as well as after: the rules read `first_seen_filing_date`,
+    # which the rollup rewrites, so the pass must not depend on the on-disk value.
+    apply_observation_columns(
+        rows, member_groups=member_groups, mention_index=mention_index
+    )
+
+    reopened = 0
+    for row in rows:
+        if coerce_optional_text(row.get("amendment_inferred_by")) is None:
+            continue
+        row["amendment_of_debt_instrument_id"] = None
+        row["amendment_inferred_by"] = None
+        reopened += 1
+
+    inferred = infer_amendment_parents(rows)
+    by_id = {str(row["debt_instrument_id"]): row for row in rows}
+    for child_id, (parent_id, rule) in inferred.items():
+        by_id[child_id]["amendment_of_debt_instrument_id"] = parent_id
+        by_id[child_id]["amendment_inferred_by"] = rule
+
+    apply_lifecycle_rollup(
+        rows,
+        member_groups=member_groups,
+        mention_index=mention_index,
+    )
+    heads_after = sum(1 for row in rows if row.get("is_lineage_head"))
+    frame = pd.DataFrame(rows, columns=DEBT_INSTRUMENT_COLUMNS)
+    # Same shard assignment as `match_pending_mentions`, null cik included, or a
+    # rewritten row lands in a second shard beside its stale copy.
+    frame["_shard"] = (
+        frame["cik"].fillna("").map(lambda value: shard_for_cik(str(value)))
+    )
+    partitions_written: list[str] = []
+    for cik_shard, shard_rows in frame.groupby("_shard"):
+        if renew is not None:
+            renew()
+        partitions_written.append(
+            write_partition_table(
+                debt_instruments_root(resolved_root, data_dir=data_dir),
+                partition={"cik_shard": str(cik_shard)},
+                table=shard_rows.drop(columns=["_shard"]).reindex(
+                    columns=DEBT_INSTRUMENT_COLUMNS
+                ),
+            )
+        )
+    # This pass rewrites partitions the match manifest lists, so it records its
+    # own manifest.
+    write_json_artifact(
+        run_manifest_path(
+            "infer-lineage",
+            "latest",
+            artifact_root=resolved_root,
+            data_dir=data_dir,
+        ),
+        {
+            "artifact_root": resolved_root,
+            "stage": "infer-lineage",
+            "partitions_written": partitions_written,
+            "links": len(inferred),
+            "reopened": reopened,
+            "heads_before": heads_before,
+            "heads_after": heads_after,
+            "schema_version": MATCHER_SCHEMA_VERSION,
+        },
+    )
+    LOGGER.info(
+        "Lineage inference pass: %s links (%s inferred pointers re-opened), heads %s -> %s",
+        len(inferred),
+        reopened,
+        heads_before,
+        heads_after,
+    )
+    return {
+        "links": len(inferred),
+        "reopened": reopened,
+        "heads_before": heads_before,
+        "heads_after": heads_after,
+    }

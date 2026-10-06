@@ -45,7 +45,8 @@ from cdt.matcher import (
     match_pending_mentions,
     mention_cluster_edges_root,
 )
-from cdt.matcher.core import MATCHER_SCHEMA_VERSION, apply_lineage_inference_pass
+from cdt.matcher.lineage_inference import apply_lineage_inference_pass
+from cdt.matcher.schema import MATCHER_SCHEMA_VERSION
 from cdt.shared import get_logger
 from cdt.sixk.scraper import acquire_scraped_sixk_documents
 from cdt.sixk.stage import DEFAULT_CONCURRENCY as SIXK_DEFAULT_CONCURRENCY

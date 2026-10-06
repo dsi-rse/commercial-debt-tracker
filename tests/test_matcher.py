@@ -7,24 +7,24 @@ import json
 import pandas as pd
 
 from cdt.extractor.core import DEBT_INSTRUMENT_MENTION_COLUMNS
-from cdt.matcher.core import (
+from cdt.matcher.compat import (
     NAME_CLASS_GATE,
-    PreparedMention,
-    borrowed_lender_signature,
-    build_debt_instrument_rows,
-    build_empty_profile,
-    derive_parent_links,
     end_dates_are_compatible,
-    lender_signature,
-    match_tables,
-    mention_sort_key,
     name_class_sizes,
     name_rate_tokens,
     name_rates_are_compatible,
+)
+from cdt.matcher.instruments import build_debt_instrument_rows, derive_parent_links
+from cdt.matcher.normalize import (
+    borrowed_lender_signature,
+    lender_signature,
+    mention_sort_key,
     normalize_name_fingerprint,
     prepare_mention,
-    score_candidates_for_mention,
 )
+from cdt.matcher.schema import PreparedMention
+from cdt.matcher.scoring import build_empty_profile, score_candidates_for_mention
+from cdt.matcher.stage import match_tables
 
 
 def mention_row(**overrides: object) -> dict[str, object]:
@@ -230,7 +230,7 @@ def test_synthesized_mentions_do_not_widen_the_name_class() -> None:
     always joined that cluster through the name path split off on its own
     (measured on the EQT chain, #203).
     """
-    from cdt.matcher.core import name_class_sizes
+    from cdt.matcher.compat import name_class_sizes
 
     original, amendment, _ = predecessor_pair()
     mints = [
@@ -1064,7 +1064,8 @@ def test_a_generic_cluster_cannot_claim_an_individuating_name() -> None:
 
 def test_name_only_tie_prefers_a_live_cluster_over_a_retired_one() -> None:
     """The second of four sort components, which no fixture varied."""
-    from cdt.matcher.core import CandidateScore, resolve_candidates
+    from cdt.matcher.schema import CandidateScore
+    from cdt.matcher.scoring import resolve_candidates
 
     mention = prepare_mention(mention_row(debt_instrument_mention_id="mention-new"))
 
@@ -1095,7 +1096,8 @@ def test_name_only_tie_prefers_a_live_cluster_over_a_retired_one() -> None:
 
 def test_name_only_tie_prefers_the_largest_cluster_then_the_lowest_id() -> None:
     """The third and fourth sort components; the fourth is what makes it stable."""
-    from cdt.matcher.core import CandidateScore, resolve_candidates
+    from cdt.matcher.schema import CandidateScore
+    from cdt.matcher.scoring import resolve_candidates
 
     mention = prepare_mention(mention_row(debt_instrument_mention_id="mention-new"))
 
@@ -1163,7 +1165,7 @@ def test_relaxed_key_rule_is_gated_at_exactly_the_name_class_gate() -> None:
 
 def test_lender_keys_reads_only_lender_clusters() -> None:
     """Without the role filter a borrower's name joins the lender signature."""
-    from cdt.matcher.core import lender_keys
+    from cdt.matcher.normalize import lender_keys
 
     payload = json.dumps(
         [

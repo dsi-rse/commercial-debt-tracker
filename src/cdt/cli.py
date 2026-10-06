@@ -64,7 +64,7 @@ from cdt.matcher import (
     match_pending_mentions,
     mention_cluster_edges_root,
 )
-from cdt.matcher.core import apply_lineage_inference_pass
+from cdt.matcher.lineage_inference import apply_lineage_inference_pass
 from cdt.pipeline import (
     ALL_TIME_START_DATE as PIPELINE_ALL_TIME_START_DATE,
 )

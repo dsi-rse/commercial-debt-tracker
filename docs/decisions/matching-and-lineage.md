@@ -1,6 +1,6 @@
 # Matching and lineage: design decisions and measurements
 
-The matcher (`src/cdt/matcher/core.py`) groups extracted debt-instrument
+The matcher (`src/cdt/matcher/`) groups extracted debt-instrument
 mentions into stable clusters within one CIK. It writes membership, related and
 ambiguous edges, rolls each cluster up into one published row, and then runs a
 corpus-wide pass (`src/cdt/matcher/lineage_inference.py`) that infers amendment
@@ -285,8 +285,10 @@ active revolvers at once (#170).
 - **Silence is not disagreement.** Refusing a link whenever a party is missing
   would drop ordinary links to the many mentions that never name a borrower.
 - **Local JSON guard.** `_borrowers` parses `parties_json` itself rather than
-  calling `matcher.core._json_text`, because `matcher.core` imports this
-  module. It returns the same answer on every input the helper handles.
+  calling `matcher.normalize._json_text`. That was forced when both lived in
+  one module that imported this one; since the split it is not, and the two
+  could be unified. It returns the same answer on every input the helper
+  handles.
 
 ## `infer_amendment_parents`: ordering guards
 

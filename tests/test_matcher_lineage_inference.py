@@ -8,9 +8,9 @@ import json
 import pandas as pd
 import pytest
 
-from cdt.matcher import core, lineage_inference
-from cdt.matcher.core import prepare_mention
+from cdt.matcher import lineage_inference, stage
 from cdt.matcher.lineage_inference import infer_amendment_parents
+from cdt.matcher.normalize import prepare_mention
 
 
 def mention(mention_id: str, **overrides: object) -> dict[str, object]:
@@ -92,7 +92,7 @@ def test_the_matcher_never_reads_filing_text(monkeypatch: object) -> None:
     result = infer_amendment_parents(rows)
     assert result == {}
     assert not hasattr(lineage_inference, "DATED_REFERENCE")
-    assert not hasattr(core, "read_item_texts")
+    assert not hasattr(stage, "read_item_texts")
     # Instrument rows are the whole input. `member_groups` and `mention_index`
     # were required and immediately `del`-ed once #203 moved `prior_fact` to the
     # extractor, kept "so a future mention-reading rule keeps one call shape" —
@@ -102,7 +102,7 @@ def test_the_matcher_never_reads_filing_text(monkeypatch: object) -> None:
     for parameter in ("item_texts", "member_groups", "mention_index"):
         assert parameter not in signature.parameters, parameter
     for name in ("match_tables", "match_pending_mentions"):
-        parameters = inspect.signature(getattr(core, name)).parameters
+        parameters = inspect.signature(getattr(stage, name)).parameters
         assert "item_texts" not in parameters, name
         assert "infer_lineage" not in parameters, name
 
@@ -253,7 +253,7 @@ def test_match_tables_itself_never_infers_a_pointer() -> None:
     could never see both states of one facility. The pass runs after every
     match (`run_match_and_finalize`, `cdt match`), not behind a flag.
     """
-    from cdt.matcher.core import match_tables
+    from cdt.matcher.stage import match_tables
 
     mentions = pd.DataFrame(
         [
