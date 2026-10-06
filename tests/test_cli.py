@@ -280,7 +280,7 @@ def test_ingest_cli_logs_failures_to_file(
     )
 
     assert status == 1
-    assert "Ingest failed" in log_file.read_text(encoding="utf-8")
+    assert "Genre ingest failed: genre=8-K" in log_file.read_text(encoding="utf-8")
     assert "simulated failure" in log_file.read_text(encoding="utf-8")
 
 
@@ -1105,3 +1105,84 @@ def test_ingest_cli_genres_narrows_the_run(
 
     assert status == 0
     assert [call[0] for call in calls] == ["6-K"]
+
+
+def test_ingest_cli_one_failing_genre_does_not_stop_the_other(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """6-K still ingests when 8-K raises, and the command exits non-zero."""
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("320193\n", encoding="utf-8")
+    calls: list[tuple[str, tuple[str, ...], str, bool, set[str] | None]] = []
+
+    def failing(config: cli.IngestConfig, **kwargs: object) -> object:
+        del config, kwargs
+        raise RuntimeError("simulated 8-K failure")
+
+    monkeypatch.setattr("cdt.ingest.genres.acquire_eightk_documents", failing)
+    monkeypatch.setattr(
+        "cdt.ingest.genres.acquire_scraped_sixk_documents",
+        _recording_acquirer(calls, "6-K"),
+    )
+
+    status = cli.main(
+        [
+            "ingest",
+            "--quiet",
+            "--artifact-root",
+            str(tmp_path),
+            "historical",
+            str(cik_file),
+            "--start-date",
+            "2024-01-01",
+            "--end-date",
+            "2024-01-31",
+        ]
+    )
+
+    assert status == 1
+    assert [call[0] for call in calls] == ["6-K"]
+
+
+def test_pipeline_cli_exits_non_zero_when_a_genre_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run that published the other genre is still reported as failed."""
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("320193\n", encoding="utf-8")
+    monkeypatch.setattr(
+        cli,
+        "run_pipeline",
+        lambda config, **kwargs: PipelineRunResult(
+            mode="historical",
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 1, 31),
+            ingest=None,
+            itemized_rows=0,
+            classified_rows=0,
+            extracted_rows=0,
+            matched_rows=0,
+            debt_instrument_rows=0,
+            classifier_model_dir=tmp_path,
+            artifact_root=str(tmp_path),
+            extractor_run_path=str(tmp_path / "run.jsonl"),
+            failed_genres=("6-K",),
+        ),
+    )
+
+    status = cli.main(
+        [
+            "pipeline",
+            "--quiet",
+            "--artifact-root",
+            str(tmp_path),
+            "historical",
+            str(cik_file),
+            "--start-date",
+            "2024-01-01",
+            "--end-date",
+            "2024-01-31",
+        ]
+    )
+
+    assert status == 1

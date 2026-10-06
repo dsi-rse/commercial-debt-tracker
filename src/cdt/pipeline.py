@@ -37,6 +37,7 @@ from cdt.ingest.core import (
 )
 from cdt.ingest.core import DEFAULT_BATCH_SIZE as DEFAULT_INGEST_BATCH_SIZE
 from cdt.ingest.genres import ingest_genre
+from cdt.lease import LeaseLostError
 from cdt.matcher import (
     DEFAULT_AMBIGUITY_MARGIN,
     DEFAULT_MEMBERSHIP_THRESHOLD,
@@ -122,6 +123,9 @@ class PipelineRunResult:
     genres: tuple[str, ...] = DEFAULT_GENRES
     sixk_ingest: IngestRunResult | None = None
     sixk_snippet_rows: int = 0
+    #: Genres whose prepare chain failed; extract, match and publish still ran
+    #: over the rest, and the caller reports the run as failed.
+    failed_genres: tuple[str, ...] = ()
 
 
 @dataclass
@@ -136,6 +140,16 @@ class _PrepareOutcome:
     classified: pd.DataFrame = field(default_factory=pd.DataFrame)
     sixk_ingest: IngestRunResult | None = None
     snippets: pd.DataFrame = field(default_factory=pd.DataFrame)
+    #: Genres whose chain raised; the others still ran.
+    failed_genres: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PrepareResult:
+    """What a prepare-only run produced: its artifact root, and any failed genre."""
+
+    artifact_root: str
+    failed_genres: tuple[str, ...] = ()
 
 
 class PipelineOrchestrator:
@@ -241,8 +255,10 @@ class PipelineOrchestrator:
         """Prepare every genre this run asked for, in genre order.
 
         Each genre writes its own documents and classification datasets, so a
-        failing genre cannot corrupt the other's. The chains run one after the
-        other: a failure in the 8-K chain stops the run before 6-K starts.
+        failing genre cannot corrupt the other's. A genre whose chain raises is
+        logged and recorded in ``failed_genres`` and the next genre still runs;
+        its partitions stay pending for the next run. ``LeaseLostError`` is not
+        caught: a run that lost its lease must stop writing.
         """
         outcome = _PrepareOutcome()
         prepare = {GENRE_8K: self._prepare_eightk, GENRE_6K: self._prepare_sixk}
@@ -252,14 +268,20 @@ class PipelineOrchestrator:
                     "Skipping the %s chain: genres=%s", genre, self.config.genres
                 )
                 continue
-            prepare[genre](
-                outcome,
-                resolved_start,
-                resolved_end,
-                ciks,
-                resolved_artifact_root,
-                renew,
-            )
+            try:
+                prepare[genre](
+                    outcome,
+                    resolved_start,
+                    resolved_end,
+                    ciks,
+                    resolved_artifact_root,
+                    renew,
+                )
+            except LeaseLostError:
+                raise
+            except Exception:
+                self.logger.exception("Genre prepare failed: genre=%s", genre)
+                outcome.failed_genres.append(genre)
         return outcome
 
     def _prepare_eightk(
@@ -405,13 +427,15 @@ class PipelineOrchestrator:
         self._log_stage_complete("classify", rows=len(classified))
         return ingest_result, items, classified
 
-    def run_prepare(self: Self, renew: Callable[[], None] | None = None) -> str:
-        """Run only the prepare stages of each genre; return the artifact root."""
+    def run_prepare(
+        self: Self, renew: Callable[[], None] | None = None
+    ) -> PrepareResult:
+        """Run only the prepare stages of each genre."""
         resolved_start, resolved_end, ciks, resolved_artifact_root = self._setup()
-        self._prepare_genres(
+        prepared = self._prepare_genres(
             resolved_start, resolved_end, ciks, resolved_artifact_root, renew
         )
-        return resolved_artifact_root
+        return PrepareResult(resolved_artifact_root, tuple(prepared.failed_genres))
 
     def run(self: Self, renew: Callable[[], None] | None = None) -> PipelineRunResult:
         """Execute the full CDT pipeline."""
@@ -485,6 +509,7 @@ class PipelineOrchestrator:
             genres=self.config.genres,
             sixk_ingest=prepared.sixk_ingest,
             sixk_snippet_rows=len(prepared.snippets),
+            failed_genres=tuple(prepared.failed_genres),
         )
         finalize_after_match(
             matched["debt_instrument"],
@@ -510,8 +535,8 @@ def run_pipeline(
 
 def run_prepare_stages(
     config: PipelineConfig, *, renew: Callable[[], None] | None = None
-) -> str:
-    """Run only the prepare stages for a config; return the artifact root."""
+) -> PrepareResult:
+    """Run only the prepare stages for a config."""
     return PipelineOrchestrator(config).run_prepare(renew)
 
 

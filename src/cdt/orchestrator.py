@@ -301,7 +301,8 @@ def run_batch_backend(args: argparse.Namespace) -> int:
         return 1
     renew = renewer(lease)
     try:
-        artifact_root = run_prepare_stages(config, renew=renew)
+        prepared = run_prepare_stages(config, renew=renew)
+        artifact_root = prepared.artifact_root
         LOGGER.info(
             "Extraction deferred to the batch poller: pending items are claimed by "
             "the next `poll` run. Ensure the poll schedule is enabled, or run "
@@ -322,6 +323,14 @@ def run_batch_backend(args: argparse.Namespace) -> int:
         return 1
     finally:
         release_lease(lease)
+    if prepared.failed_genres:
+        # A partial success is a failure: exit non-zero and skip the heartbeat
+        # below, so the daily-heartbeat alarm still fires.
+        LOGGER.error(
+            "Run finished with failed genres: %s; their partitions stay pending",
+            ",".join(prepared.failed_genres),
+        )
+        return 1
     # The daily-heartbeat CloudWatch alarm matches this literal; keep it in
     # sync with pulumi/infra/alerts.py.
     LOGGER.info(
@@ -427,6 +436,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     finally:
         release_lease(lease)
     print(result.artifact_root)
+    if result.failed_genres:
+        LOGGER.error(
+            "Live run finished with failed genres: %s; their partitions stay pending",
+            ",".join(result.failed_genres),
+        )
+        return 1
     return 0
 
 

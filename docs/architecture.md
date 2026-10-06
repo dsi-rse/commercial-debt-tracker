@@ -86,6 +86,8 @@ Three execution modes exist:
   extraction. `--extractor-backend live` runs the synchronous OpenRouter pipeline
   instead, so a single command produces final outputs.
 
+Genres are prepared independently. If one genre's chain fails, the run logs `Genre prepare failed: genre=<g>` with the traceback, prepares the other genres, still extracts, matches and publishes, and then exits nonzero. The failed genre's partitions stay pending for the next run. A lost writer lease is never caught this way: it stops the run.
+
 The scheduler runs `daily` (once a day) and `poll` (hourly). Historical runs are manual
 by design so wide backfills are deliberate, observable operations. Where no poll
 schedule is running (e.g. a local backfill), either run `cdt-orchestrator poll` by hand

@@ -96,6 +96,13 @@ source-partition fingerprint per dataset (#62). A genre that fails therefore
 cannot corrupt the other genre's state. It only leaves its own partitions
 pending for the next run.
 
+That is why each genre's chain runs in its own `try` (2026-10): one genre
+failing, for example the 6-K triage provider running out of credit, no longer
+takes down the other genre's prepare, extract and publish. A partial success
+is still a failed run. It exits nonzero and skips the daily heartbeat line, so
+the heartbeat alarm and the ECS task-failure alarm fire as before.
+`LeaseLostError` is re-raised: a run that lost its lease must stop writing.
+
 ### `PipelineOrchestrator._ingest_and_triage_sixk` (never `download`)
 
 A 6-K row points at the assembled submission in CDT's mirror. Inlining bodies

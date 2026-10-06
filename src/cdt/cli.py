@@ -45,6 +45,7 @@ from cdt.ingest.core import (
     DEFAULT_BUCKET,
     DEFAULT_S3_PREFIX,
     IngestConfig,
+    IngestRunResult,
     documents_root,
 )
 from cdt.ingest.genres import ingest_genre
@@ -468,9 +469,17 @@ def run_ingest(args: argparse.Namespace) -> int:
             config.output_root,
         )
         ciks = read_cik_file(args.cik_file)
-        results = [
-            (genre, ingest_genre(genre, config, ciks=ciks)[1]) for genre in args.genres
-        ]
+        results: list[tuple[str, IngestRunResult]] = []
+        failed: list[str] = []
+        for genre in args.genres:
+            try:
+                results.append((genre, ingest_genre(genre, config, ciks=ciks)[1]))
+            except ValueError:
+                raise
+            except Exception:
+                # One genre failing does not stop the others.
+                logger.exception("Genre ingest failed: genre=%s", genre)
+                failed.append(genre)
     except ValueError as exc:
         logger.error("Invalid ingest arguments: %s", exc)
         return 2
@@ -488,8 +497,12 @@ def run_ingest(args: argparse.Namespace) -> int:
         print(f"  Run manifest: {result.run_manifest}.")
         if result.failures:
             print(f"  Filings that could not be acquired: {result.failures}.")
-    print(f"Output root: {results[0][1].output_root}.")
-    print(f"Failure registry: {results[0][1].failure_file}.")
+    if results:
+        print(f"Output root: {results[0][1].output_root}.")
+        print(f"Failure registry: {results[0][1].failure_file}.")
+    if failed:
+        print(f"Failed genres: {','.join(failed)}; see the log.")
+        return 1
     return 0
 
 
@@ -601,6 +614,9 @@ def run_pipeline_command(args: argparse.Namespace) -> int:
     print(
         f"Artifact root: {result.artifact_root}. Debt instruments: {debt_instruments_root(result.artifact_root)}."
     )
+    if result.failed_genres:
+        print(f"Failed genres: {','.join(result.failed_genres)}; see the log.")
+        return 1
     print(f"Extractor runs: {result.extractor_run_path}.")
     registry = result.ingest or result.sixk_ingest
     if registry is not None:
