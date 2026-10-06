@@ -20,27 +20,26 @@ from cdt.datasets import (
     run_manifest_path,
     save_completion_registry,
 )
+from cdt.extractor.batch import active_job_claimed_partition_paths
 from cdt.extractor.llm import normalize_reasoning_effort
 from cdt.extractor.outputs import (
     _mentions_partition_needs_write,
     _merge_mentions_partition,
+    failure_record,
+    merge_row_failures,
     pending_extract_partitions,
+    summarize_failure,
 )
 from cdt.extractor.prior_state import published_mention_rows
 from cdt.extractor.schema import DEBT_INSTRUMENT_MENTION_COLUMNS
 from cdt.extractor.state import (
     DEFAULT_MAX_ATTEMPTS,
     PUBLISHABLE_ROW_STATES,
-    STATE_ITEM_ROW_FIELDS,
     InfrastructureError,
     SupportsChatCompletion,
-    coerce_native,
 )
 from cdt.extractor.workflow import (
-    _failure_record,
-    _merge_row_failures,
     run_extraction_workflow,
-    summarize_failure,
 )
 from cdt.shared import get_logger
 from cdt.storage import (
@@ -52,64 +51,6 @@ from cdt.storage import (
 LOGGER = get_logger(__name__)
 
 EXTRACTOR_PROGRESS_LOG_INTERVAL = 10
-
-
-def collect_pending_extract_items(
-    *,
-    artifact_root: str | Path | None = None,
-    data_dir: Path | None = None,
-    force: bool = False,
-    max_rows: int | None = None,
-) -> tuple[list[tuple[dict[str, str | None], str, str]], dict[str, dict[str, object]]]:
-    """Collect relevant items awaiting extraction across pending partitions.
-
-    Returns ``(entries, claimed)`` where each entry is a native-typed item row
-    plus its originating ``(date, shard)``, and ``claimed`` maps each claimed
-    classification partition to its source fingerprint and the item_ids that
-    were already terminal before this job — the state finalize needs to record
-    row-outcome-keyed completion and to detect source growth. Uses the same
-    selection as ``extract_pending_items`` so both backends claim the same
-    work, row by row.
-
-    ``max_rows`` stops claiming partitions once the collected row count reaches
-    it (whole partitions stay the atomic claim unit, so the last claimed
-    partition may overshoot); None claims everything. Unclaimed partitions stay
-    pending for the next job, which bounds the full text one poll tick holds.
-    """
-    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
-    pending, _registry = pending_extract_partitions(
-        artifact_root=resolved_root, data_dir=data_dir, force=force
-    )
-    entries: list[tuple[dict[str, str | None], str, str]] = []
-    claimed: dict[str, dict[str, object]] = {}
-    deferred_partitions = 0
-    for pending_partition in pending:
-        if max_rows is not None and len(entries) >= max_rows:
-            deferred_partitions += 1
-            continue
-        claimed[pending_partition.classification_path] = {
-            "fingerprint": pending_partition.fingerprint,
-            "prior_item_ids": sorted(pending_partition.done_item_ids),
-        }
-        batch_items = read_table(
-            pending_partition.classification_path, CLASSIFIED_ITEM_COLUMNS
-        ).reindex(columns=CLASSIFIED_ITEM_COLUMNS)
-        relevant_items = batch_items.loc[batch_items["relevance"].fillna(False)]
-        for item_row in relevant_items.to_dict("records"):
-            if str(item_row["item_id"]) in pending_partition.done_item_ids:
-                continue
-            coerced = {
-                key: coerce_native(item_row.get(key)) for key in STATE_ITEM_ROW_FIELDS
-            }
-            entries.append((coerced, pending_partition.date, pending_partition.shard))
-    if deferred_partitions:
-        LOGGER.info(
-            "Deferred %s pending partition(s) beyond the %s-row job cap; the "
-            "next job claims them once this one completes.",
-            deferred_partitions,
-            max_rows,
-        )
-    return entries, claimed
 
 
 def extract_pending_items(
@@ -144,10 +85,7 @@ def extract_pending_items(
     empty_partitions = 0
     # Partitions the active batch job claimed are its to finish: extracting them
     # live too would pay for every row twice and let the job's later finalize
-    # overwrite the newer live mentions with stale results. Imported lazily —
-    # batch.py imports from this module.
-    from cdt.extractor.batch import active_job_claimed_partition_paths
-
+    # overwrite the newer live mentions with stale results.
     claimed_by_batch_job = (
         set()
         if force
@@ -219,7 +157,7 @@ def extract_pending_items(
             if row_state.state == "SUCCESS":
                 succeeded_item_ids.add(row_state.item_id)
             else:
-                failed_rows[row_state.item_id] = _failure_record(
+                failed_rows[row_state.item_id] = failure_record(
                     row_state,
                     partition_date=pending.date,
                     shard=pending.shard,
@@ -297,7 +235,7 @@ def extract_pending_items(
         artifact_root=resolved_root,
         data_dir=data_dir,
     )
-    failure_registry, total_known_failures = _merge_row_failures(
+    failure_registry, total_known_failures = merge_row_failures(
         failed_rows,
         succeeded_item_ids,
         artifact_root=resolved_root,

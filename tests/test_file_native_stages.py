@@ -3016,7 +3016,8 @@ def test_mplx_untagged_echo_no_longer_publishes_as_a_clean_success() -> None:
     six note series and a term loan -- writing a completion record that makes a
     re-run skip the item.
     """
-    from cdt.extractor.workflow import handle_response, summarize_failure
+    from cdt.extractor.outputs import summarize_failure
+    from cdt.extractor.workflow import handle_response
 
     row_state = _ner_row(MPLX_TEXT)
     row_state.current_attempt.messages = NERStage().preprocess(row_state)
@@ -3368,8 +3369,8 @@ def test_persistent_content_filtering_terminates_at_the_resend_cap() -> None:
     the resulting `FAILED` attempt made #176's checks read a provider abort as
     a model failure. The row now terminates instead.
     """
+    from cdt.extractor.outputs import summarize_failure
     from cdt.extractor.state import MAX_CONTENT_FILTER_RESENDS
-    from cdt.extractor.workflow import summarize_failure
 
     # Pinned as a literal: the cap bounds spend on a filtered row, so restating
     # the constant here would assert nothing about its value.
@@ -3406,7 +3407,7 @@ def test_the_abort_note_reports_the_model_failure_that_happened_too() -> None:
     model's own error never reached the registry. An operator was told to go
     and talk to the provider while the extraction defect stayed invisible.
     """
-    from cdt.extractor.workflow import summarize_failure
+    from cdt.extractor.outputs import summarize_failure
 
     row_state, client = _run_live(
         MPLX_TEXT,
@@ -3437,7 +3438,7 @@ def test_the_abort_note_only_reports_failures_from_the_stage_that_aborted() -> N
     its cap without ever being answered, and its note must say so -- citing
     NER's error here would send an operator to the wrong stage.
     """
-    from cdt.extractor.workflow import failed_stage_name, summarize_failure
+    from cdt.extractor.outputs import failed_stage_name, summarize_failure
 
     row_state, client = _run_live(
         MPLX_TEXT,
@@ -3463,7 +3464,7 @@ def test_the_abort_note_reports_the_most_recent_scored_failure() -> None:
     The model is shown its error and asked again, so the last rejection is the
     state the row actually died in; an earlier one has already been superseded.
     """
-    from cdt.extractor.workflow import summarize_failure
+    from cdt.extractor.outputs import summarize_failure
 
     row_state, client = _run_live(
         MPLX_TEXT,
@@ -3485,7 +3486,7 @@ def test_the_abort_note_reports_the_most_recent_scored_failure() -> None:
 
 def test_a_filtered_row_is_registered_against_the_stage_that_was_aborted() -> None:
     """An operator retrying the row needs the stage, not a generic failure (#127)."""
-    from cdt.extractor.workflow import failed_stage_name
+    from cdt.extractor.outputs import failed_stage_name
 
     row_state, _ = _run_live(MPLX_TEXT, [CONTENT_FILTERED] * 40)
 
@@ -3499,8 +3500,8 @@ def test_aborts_at_the_relation_stage_still_publish_the_items_mentions() -> None
     whose instruments already validated must not lose them because the
     provider refused to run the final call.
     """
+    from cdt.extractor.outputs import summarize_failure
     from cdt.extractor.state import PUBLISHABLE_ROW_STATES
-    from cdt.extractor.workflow import summarize_failure
 
     row_state, client = _run_live(
         MULTI_TEXT,
@@ -3529,8 +3530,8 @@ def test_aborts_at_the_ie_stage_still_publish_the_entries_that_validated() -> No
     failures published them. Same loss, same remedy, so the two terminal paths
     now agree.
     """
+    from cdt.extractor.outputs import summarize_failure
     from cdt.extractor.state import PUBLISHABLE_ROW_STATES
-    from cdt.extractor.workflow import summarize_failure
 
     row_state, client = _run_live(
         MULTI_TEXT,
@@ -9571,7 +9572,7 @@ def test_validate_parties_property_rejects_every_bad_shape() -> None:
 def test_a_salvaged_row_registers_the_salvage_note_not_the_last_stage() -> None:
     """A PARTIAL row's registry entry must say what salvage dropped (#152).
 
-    `_failure_record` read `current_attempt`, so a row salvaged at
+    `failure_record` read `current_attempt`, so a row salvaged at
     `instrument_ie` that then completed `instrument_relation` published
     `stage: instrument_relation` and the invented error "Unexpected response at
     stage instrument_relation" — naming a stage that succeeded and describing a
@@ -9579,11 +9580,8 @@ def test_a_salvaged_row_registers_the_salvage_note_not_the_last_stage() -> None:
     published exactly that, so the row here keeps two mentions in order to
     advance past the stage it was salvaged at.
     """
-    from cdt.extractor.workflow import (
-        _failure_record,
-        failed_stage_name,
-        handle_response,
-    )
+    from cdt.extractor.outputs import failed_stage_name, failure_record
+    from cdt.extractor.workflow import handle_response
 
     row_state = ExtractionRowState(
         item_row={"item_id": "item-1", "accession_number": "0001", "cik": "0000320193"},
@@ -9614,7 +9612,7 @@ def test_a_salvaged_row_registers_the_salvage_note_not_the_last_stage() -> None:
     assert row_state.current_attempt.stage_name == "instrument_relation"
     assert not row_state.current_attempt.validation_errors
 
-    record = _failure_record(
+    record = failure_record(
         row_state,
         partition_date="2026-09-04",
         shard="0025",

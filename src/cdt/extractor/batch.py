@@ -36,7 +36,6 @@ from typing import Protocol, cast
 
 from cdt import settings
 from cdt.datasets import resolve_artifact_root
-from cdt.extractor.live import collect_pending_extract_items
 from cdt.extractor.llm import (
     completion_result_from_batch_line,
     is_content_filter_abort,
@@ -44,7 +43,10 @@ from cdt.extractor.llm import (
     native_model_id,
     sampling_params,
 )
-from cdt.extractor.outputs import finalize_extract_outputs
+from cdt.extractor.outputs import (
+    collect_pending_extract_items,
+    finalize_extract_outputs,
+)
 from cdt.extractor.state import (
     DEFAULT_MAX_ATTEMPTS,
     CompletionResult,

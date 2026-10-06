@@ -1,4 +1,4 @@
-"""Select pending partitions and write extraction outputs; shared by the live and batch backends."""
+"""Select pending work and write extraction outputs: mentions and the completion and failure registries; shared by both backends."""
 
 from __future__ import annotations
 
@@ -22,15 +22,22 @@ from cdt.datasets import (
     extractor_run_path,
     iter_date_shard_partitions,
     load_completion_registry,
+    load_row_failures,
     parse_date_shard_partition,
     resolve_artifact_root,
     run_manifest_path,
     save_completion_registry,
+    save_row_failures,
 )
 from cdt.extractor.prior_state import mint_prior_state_rows, published_mention_rows
 from cdt.extractor.schema import DEBT_INSTRUMENT_MENTION_COLUMNS
-from cdt.extractor.state import PUBLISHABLE_ROW_STATES, ExtractionRowState
-from cdt.extractor.workflow import _failure_record, _merge_row_failures
+from cdt.extractor.stages import EXTRACTOR_STAGES
+from cdt.extractor.state import (
+    PUBLISHABLE_ROW_STATES,
+    STATE_ITEM_ROW_FIELDS,
+    ExtractionRowState,
+    coerce_native,
+)
 from cdt.shared import get_logger
 from cdt.storage import (
     artifact_exists,
@@ -170,6 +177,64 @@ def pending_extract_partitions(
     return pending, registry
 
 
+def collect_pending_extract_items(
+    *,
+    artifact_root: str | Path | None = None,
+    data_dir: Path | None = None,
+    force: bool = False,
+    max_rows: int | None = None,
+) -> tuple[list[tuple[dict[str, str | None], str, str]], dict[str, dict[str, object]]]:
+    """Collect relevant items awaiting extraction across pending partitions.
+
+    Returns ``(entries, claimed)`` where each entry is a native-typed item row
+    plus its originating ``(date, shard)``, and ``claimed`` maps each claimed
+    classification partition to its source fingerprint and the item_ids that
+    were already terminal before this job — the state finalize needs to record
+    row-outcome-keyed completion and to detect source growth. Uses the same
+    selection as ``extract_pending_items`` so both backends claim the same
+    work, row by row.
+
+    ``max_rows`` stops claiming partitions once the collected row count reaches
+    it (whole partitions stay the atomic claim unit, so the last claimed
+    partition may overshoot); None claims everything. Unclaimed partitions stay
+    pending for the next job, which bounds the full text one poll tick holds.
+    """
+    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    pending, _registry = pending_extract_partitions(
+        artifact_root=resolved_root, data_dir=data_dir, force=force
+    )
+    entries: list[tuple[dict[str, str | None], str, str]] = []
+    claimed: dict[str, dict[str, object]] = {}
+    deferred_partitions = 0
+    for pending_partition in pending:
+        if max_rows is not None and len(entries) >= max_rows:
+            deferred_partitions += 1
+            continue
+        claimed[pending_partition.classification_path] = {
+            "fingerprint": pending_partition.fingerprint,
+            "prior_item_ids": sorted(pending_partition.done_item_ids),
+        }
+        batch_items = read_table(
+            pending_partition.classification_path, CLASSIFIED_ITEM_COLUMNS
+        ).reindex(columns=CLASSIFIED_ITEM_COLUMNS)
+        relevant_items = batch_items.loc[batch_items["relevance"].fillna(False)]
+        for item_row in relevant_items.to_dict("records"):
+            if str(item_row["item_id"]) in pending_partition.done_item_ids:
+                continue
+            coerced = {
+                key: coerce_native(item_row.get(key)) for key in STATE_ITEM_ROW_FIELDS
+            }
+            entries.append((coerced, pending_partition.date, pending_partition.shard))
+    if deferred_partitions:
+        LOGGER.info(
+            "Deferred %s pending partition(s) beyond the %s-row job cap; the "
+            "next job claims them once this one completes.",
+            deferred_partitions,
+            max_rows,
+        )
+    return entries, claimed
+
+
 def backfill_mentions(
     artifact_root: str | Path | None = None,
     *,
@@ -305,6 +370,86 @@ def _merge_mentions_partition(
     return target_path
 
 
+def summarize_failure(row_state: ExtractionRowState) -> str:
+    """Summarize what this row lost, for its failure-registry entry.
+
+    A salvaged row is terminal-but-publishable: its last attempt often
+    succeeded, so the attempt carries no validation errors and the generic
+    "unexpected response" summary below would describe a stage that worked.
+    The salvage notes are the only record of what was actually dropped, so they
+    are what the registry reports.
+    """
+    if row_state.salvage_notes:
+        return "; ".join(row_state.salvage_notes)
+    failures = row_state.current_attempt.validation_errors
+    if failures:
+        return "; ".join(failures)
+    if row_state.current_attempt.response:
+        return f"Unexpected response at stage {row_state.current_attempt.stage_name}"
+    return f"Extractor failed at stage {row_state.current_attempt.stage_name}"
+
+
+def failed_stage_name(row_state: ExtractionRowState) -> str:
+    """Return the stage whose failure this row is registered for.
+
+    For a salvaged row that is the stage salvage fired in, not the last stage
+    the row ran — an operator retrying the row needs the former.
+    """
+    for note in row_state.salvage_notes:
+        stage_name, _, _ = note.partition(" ")
+        if stage_name in {stage.name for stage in EXTRACTOR_STAGES}:
+            return stage_name
+    return row_state.current_attempt.stage_name
+
+
+def failure_record(
+    row_state: ExtractionRowState,
+    *,
+    partition_date: str,
+    shard: str,
+    run_id: str,
+    backend: str,
+) -> dict[str, object]:
+    """Build one failure-registry entry for a terminal non-SUCCESS row."""
+    return {
+        "item_id": row_state.item_id,
+        "accession_number": row_state.item_row.get("accession_number"),
+        "cik": row_state.item_row.get("cik"),
+        "date": partition_date,
+        "shard": shard,
+        "state": row_state.state,
+        "stage": failed_stage_name(row_state),
+        "run_id": run_id,
+        "backend": backend,
+        "error": summarize_failure(row_state),
+    }
+
+
+def merge_row_failures(
+    failures: dict[str, dict[str, object]],
+    succeeded_item_ids: set[str],
+    *,
+    artifact_root: str,
+    data_dir: Path | None,
+) -> tuple[str, int]:
+    """Merge this run's row outcomes into the extract failure registry.
+
+    Failures are added or refreshed; rows that succeeded this run clear any
+    earlier entry, so a re-extract that fixes a row does not leave a stale
+    failure behind. Returns the registry path and its total entry count.
+    """
+    registry = load_row_failures(
+        "extract", artifact_root=artifact_root, data_dir=data_dir
+    )
+    for item_id in succeeded_item_ids:
+        registry.pop(item_id, None)
+    registry.update(failures)
+    path = save_row_failures(
+        "extract", registry, artifact_root=artifact_root, data_dir=data_dir
+    )
+    return path, len(registry)
+
+
 def finalize_extract_outputs(
     row_entries: list[tuple[ExtractionRowState, str, str]],
     *,
@@ -339,7 +484,7 @@ def finalize_extract_outputs(
         if row_state.state == "SUCCESS":
             succeeded_item_ids.add(row_state.item_id)
         else:
-            failed_rows[row_state.item_id] = _failure_record(
+            failed_rows[row_state.item_id] = failure_record(
                 row_state,
                 partition_date=partition_date,
                 shard=shard,
@@ -444,7 +589,7 @@ def finalize_extract_outputs(
     )
     # Claiming the partitions above marks these rows done for good, so record the
     # ones that produced nothing before that fact is only visible in the audit log.
-    failure_registry, total_known_failures = _merge_row_failures(
+    failure_registry, total_known_failures = merge_row_failures(
         failed_rows,
         succeeded_item_ids,
         artifact_root=resolved_root,

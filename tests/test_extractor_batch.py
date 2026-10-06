@@ -1556,7 +1556,7 @@ def test_stall_warning_fires_only_past_the_tick_threshold(
 
 def test_collect_pending_extract_items_caps_claimed_rows(tmp_path: Path) -> None:
     """Claiming stops at max_rows; unclaimed partitions stay pending (#92)."""
-    from cdt.extractor.live import collect_pending_extract_items
+    from cdt.extractor.outputs import collect_pending_extract_items
 
     for index, (date_value, shard) in enumerate(
         [("2024-01-02", "0001"), ("2024-01-03", "0002"), ("2024-01-04", "0003")],

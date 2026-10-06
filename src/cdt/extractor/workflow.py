@@ -2,12 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
-from cdt.datasets import (
-    load_row_failures,
-    save_row_failures,
-)
 from cdt.extractor.llm import OpenRouterChatClient, is_content_filter_abort
 from cdt.extractor.stages import (
     EXTRACTOR_STAGES,
@@ -314,83 +308,3 @@ async def run_extraction_workflow(
             completion=completion,
         )
     return row_state
-
-
-def summarize_failure(row_state: ExtractionRowState) -> str:
-    """Summarize what this row lost, for its failure-registry entry.
-
-    A salvaged row is terminal-but-publishable: its last attempt often
-    succeeded, so the attempt carries no validation errors and the generic
-    "unexpected response" summary below would describe a stage that worked.
-    The salvage notes are the only record of what was actually dropped, so they
-    are what the registry reports.
-    """
-    if row_state.salvage_notes:
-        return "; ".join(row_state.salvage_notes)
-    failures = row_state.current_attempt.validation_errors
-    if failures:
-        return "; ".join(failures)
-    if row_state.current_attempt.response:
-        return f"Unexpected response at stage {row_state.current_attempt.stage_name}"
-    return f"Extractor failed at stage {row_state.current_attempt.stage_name}"
-
-
-def failed_stage_name(row_state: ExtractionRowState) -> str:
-    """Return the stage whose failure this row is registered for.
-
-    For a salvaged row that is the stage salvage fired in, not the last stage
-    the row ran — an operator retrying the row needs the former.
-    """
-    for note in row_state.salvage_notes:
-        stage_name, _, _ = note.partition(" ")
-        if stage_name in {stage.name for stage in EXTRACTOR_STAGES}:
-            return stage_name
-    return row_state.current_attempt.stage_name
-
-
-def _failure_record(
-    row_state: ExtractionRowState,
-    *,
-    partition_date: str,
-    shard: str,
-    run_id: str,
-    backend: str,
-) -> dict[str, object]:
-    """Build one failure-registry entry for a terminal non-SUCCESS row."""
-    return {
-        "item_id": row_state.item_id,
-        "accession_number": row_state.item_row.get("accession_number"),
-        "cik": row_state.item_row.get("cik"),
-        "date": partition_date,
-        "shard": shard,
-        "state": row_state.state,
-        "stage": failed_stage_name(row_state),
-        "run_id": run_id,
-        "backend": backend,
-        "error": summarize_failure(row_state),
-    }
-
-
-def _merge_row_failures(
-    failures: dict[str, dict[str, object]],
-    succeeded_item_ids: set[str],
-    *,
-    artifact_root: str,
-    data_dir: Path | None,
-) -> tuple[str, int]:
-    """Merge this run's row outcomes into the extract failure registry.
-
-    Failures are added or refreshed; rows that succeeded this run clear any
-    earlier entry, so a re-extract that fixes a row does not leave a stale
-    failure behind. Returns the registry path and its total entry count.
-    """
-    registry = load_row_failures(
-        "extract", artifact_root=artifact_root, data_dir=data_dir
-    )
-    for item_id in succeeded_item_ids:
-        registry.pop(item_id, None)
-    registry.update(failures)
-    path = save_row_failures(
-        "extract", registry, artifact_root=artifact_root, data_dir=data_dir
-    )
-    return path, len(registry)
