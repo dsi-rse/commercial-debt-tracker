@@ -25,10 +25,10 @@ from cdt.ingest import (
     _partition_path,
     acquire_documents,
     acquire_documents_for_date_range,
+    acquire_eightk_documents,
     documents_root,
     iter_filings,
     normalize_accession_number,
-    run_ingest_pipeline,
 )
 from cdt.storage.objects import list_artifacts
 from cdt.storage.tables import read_dataset, read_table, write_table
@@ -400,10 +400,10 @@ def test_ingest_records_missing_document_failures(tmp_path: Path) -> None:
         data_dir=tmp_path,
         failure_file=tmp_path / "failures" / "ingest_failures.json",
     )
-    first, result = run_ingest_pipeline(
+    first, result = acquire_eightk_documents(
         config, ciks={"320193"}, s3_client=client, return_documents=True
     )
-    second, _ = run_ingest_pipeline(
+    second, _ = acquire_eightk_documents(
         config, ciks={"320193"}, s3_client=client, return_documents=True
     )
 
@@ -437,7 +437,7 @@ def test_ingest_records_download_failures(tmp_path: Path) -> None:
         }
     )
 
-    _, result = run_ingest_pipeline(
+    _, result = acquire_eightk_documents(
         IngestConfig(
             mode="historical",
             bucket="sec-bucket",
@@ -470,7 +470,7 @@ def test_ingest_without_an_injected_client_builds_one_from_the_profile(
 
     monkeypatch.setattr("cdt.ingest.storage_s3_client", fake_storage_client)
 
-    _, result = run_ingest_pipeline(
+    _, result = acquire_eightk_documents(
         IngestConfig(
             mode="historical",
             bucket="sec-bucket",
@@ -814,7 +814,7 @@ def test_ingest_routes_configured_form_types_to_their_own_dataset(
         }
     )
 
-    table, result = run_ingest_pipeline(
+    table, result = acquire_eightk_documents(
         IngestConfig(
             mode="historical",
             bucket="sec-bucket",
@@ -898,7 +898,7 @@ def test_ingesting_six_k_leaves_the_eight_k_partitions_byte_identical(
         "output_root": str(tmp_path),
     }
 
-    run_ingest_pipeline(
+    acquire_eightk_documents(
         IngestConfig(**common),
         ciks={"320193"},
         s3_client=client,
@@ -907,7 +907,7 @@ def test_ingesting_six_k_leaves_the_eight_k_partitions_byte_identical(
     before = {path: Path(path).read_bytes() for path in eightk_paths}
     assert before
 
-    run_ingest_pipeline(
+    acquire_eightk_documents(
         IngestConfig(
             **common,
             form_types=("6-K",),
@@ -978,7 +978,7 @@ def test_partitions_written_before_the_provenance_columns_stay_readable(
             ),
         }
     )
-    run_ingest_pipeline(
+    acquire_eightk_documents(
         IngestConfig(
             mode="historical",
             bucket="sec-bucket",
@@ -1174,7 +1174,7 @@ def test_reingest_inside_the_window_still_skips_the_download(tmp_path: Path) -> 
         }
     )
 
-    _, result = run_ingest_pipeline(
+    _, result = acquire_eightk_documents(
         IngestConfig(
             mode="historical",
             bucket="sec-bucket",
@@ -1240,7 +1240,7 @@ def test_the_read_back_counts_the_window_without_reading_its_bodies(
         end_date=date(2024, 1, 31),
         data_dir=tmp_path,
     )
-    table, result = run_ingest_pipeline(
+    table, result = acquire_eightk_documents(
         config, ciks={"320193"}, s3_client=FakeS3Client({})
     )
 
@@ -1250,7 +1250,7 @@ def test_the_read_back_counts_the_window_without_reading_its_bodies(
 
     monkeypatch.setattr(ingest_module, "read_partitions", real_read_partitions)
     monkeypatch.setattr(ingest_module, "read_table", storage_tables.read_table)
-    documents, result = run_ingest_pipeline(
+    documents, result = acquire_eightk_documents(
         config, ciks={"320193"}, s3_client=FakeS3Client({}), return_documents=True
     )
 

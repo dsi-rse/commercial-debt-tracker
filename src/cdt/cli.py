@@ -41,8 +41,8 @@ from cdt.ingest import (
     SIXK_DOCUMENT_DATASET_NAME,
     SIXK_FORM_TYPES,
     IngestConfig,
+    acquire_eightk_documents,
     documents_root,
-    run_ingest_pipeline,
 )
 from cdt.itemizer import (
     POTENTIALLY_RELEVANT_ITEM_NUMBERS,
@@ -509,7 +509,7 @@ def run_ingest(args: argparse.Namespace) -> int:
             config.batch_size,
             config.output_root,
         )
-        _, result = run_ingest_pipeline(config, ciks=read_cik_file(args.cik_file))
+        _, result = acquire_eightk_documents(config, ciks=read_cik_file(args.cik_file))
     except ValueError as exc:
         logger.error("Invalid ingest arguments: %s", exc)
         return 2

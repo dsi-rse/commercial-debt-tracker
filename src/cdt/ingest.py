@@ -288,7 +288,7 @@ def acquire_documents(
     dataset_name: str = DOCUMENT_DATASET_NAME,
 ) -> pd.DataFrame:
     """Acquire matching documents for a year and update document partitions."""
-    documents, _ = run_ingest_pipeline(
+    documents, _ = acquire_eightk_documents(
         IngestConfig(
             mode="historical",
             bucket=bucket,
@@ -325,7 +325,7 @@ def acquire_documents_for_date_range(
     dataset_name: str = DOCUMENT_DATASET_NAME,
 ) -> pd.DataFrame:
     """Acquire matching documents for a date range and update partitions."""
-    documents, _ = run_ingest_pipeline(
+    documents, _ = acquire_eightk_documents(
         IngestConfig(
             mode="historical",
             bucket=bucket,
@@ -352,8 +352,7 @@ def run_ingest_pipeline(
     *,
     ciks: set[str] | None = None,
     s3_client: S3Client | None = None,
-    candidate_source: Callable[[FailureRegistry], DocumentCandidateSource]
-    | None = None,
+    candidate_source: Callable[[FailureRegistry], DocumentCandidateSource],
     return_documents: bool = False,
 ) -> tuple[pd.DataFrame, IngestRunResult]:
     """Ingest one date window into the config's documents dataset.
@@ -366,8 +365,9 @@ def run_ingest_pipeline(
         ciks: CIKs to keep; None keeps every filer.
         s3_client: Client to use; None builds one from ``config.aws_profile``
             when first needed.
-        candidate_source: Factory, given this run's failure registry, for a
-            source that replaces the 8-K scraper-manifest scan.
+        candidate_source: Factory, given this run's failure registry, for the
+            source of this genre's candidates (``acquire_eightk_documents`` and
+            the 6-K scraper each pass their own).
         return_documents: Read back and return the window's documents. When
             False the frame is empty and only ``total_rows`` counts them.
 
@@ -461,25 +461,7 @@ def run_ingest_pipeline(
         )
         pending_rows = []
 
-    source: DocumentCandidateSource = (
-        candidate_source(failure_registry)
-        if candidate_source is not None
-        else ListCandidateSource(
-            iter_document_candidates_for_date_range(
-                client(),
-                config.bucket,
-                config.start_date,
-                config.end_date,
-                normalized_ciks,
-                failure_registry=failure_registry,
-                s3_prefix=config.s3_prefix,
-                form_types=config.form_types,
-                # --force retries even permanently registered failures; new
-                # failures are still recorded.
-                retry_registered_failures=config.force,
-            )
-        )
-    )
+    source: DocumentCandidateSource = candidate_source(failure_registry)
     for candidate in source:
         candidates_seen += 1
         if candidate.accession_number in seen_accessions:
@@ -596,6 +578,47 @@ def run_ingest_pipeline(
         run_manifest=run_manifest,
         form_types=config.form_types,
         dataset_name=config.dataset_name,
+    )
+
+
+def acquire_eightk_documents(
+    config: IngestConfig,
+    *,
+    ciks: set[str] | None = None,
+    s3_client: S3Client | None = None,
+    return_documents: bool = False,
+) -> tuple[pd.DataFrame, IngestRunResult]:
+    """Ingest the 8-K complete submissions the scraper's manifests list.
+
+    Candidates come from ``iter_document_candidates_for_date_range`` over the
+    config's window, form types and S3 prefix. ``config.force`` also retries
+    filings the failure registry marks permanent. Returns what
+    ``run_ingest_pipeline`` returns.
+    """
+
+    def manifest_source(failure_registry: FailureRegistry) -> DocumentCandidateSource:
+        return ListCandidateSource(
+            iter_document_candidates_for_date_range(
+                s3_client or storage_s3_client(config.aws_profile),
+                config.bucket,
+                config.start_date,
+                config.end_date,
+                _normalize_ciks(ciks),
+                failure_registry=failure_registry,
+                s3_prefix=config.s3_prefix,
+                form_types=config.form_types,
+                # --force retries even permanently registered failures; new
+                # failures are still recorded.
+                retry_registered_failures=config.force,
+            )
+        )
+
+    return run_ingest_pipeline(
+        config,
+        ciks=ciks,
+        s3_client=s3_client,
+        candidate_source=manifest_source,
+        return_documents=return_documents,
     )
 
 

@@ -66,7 +66,7 @@ def test_ingest_cli_reads_cik_file_and_calls_acquire(
             run_manifest=str(tmp_path / "runs" / "ingest" / "run_id=1.json"),
         )
 
-    monkeypatch.setattr(cli, "run_ingest_pipeline", fake_run_ingest_pipeline)
+    monkeypatch.setattr(cli, "acquire_eightk_documents", fake_run_ingest_pipeline)
 
     status = cli.main(
         [
@@ -146,7 +146,7 @@ def test_ingest_cli_historical_defaults_to_all_time_date_range(
             run_manifest=str(tmp_path / "runs" / "ingest" / "run_id=1.json"),
         )
 
-    monkeypatch.setattr(cli, "run_ingest_pipeline", fake_run_ingest_pipeline)
+    monkeypatch.setattr(cli, "acquire_eightk_documents", fake_run_ingest_pipeline)
 
     status = cli.main(["ingest", "--quiet", "historical", str(cik_file)])
 
@@ -196,7 +196,7 @@ def test_ingest_cli_daily_defaults_to_lookback_window(
             run_manifest=str(tmp_path / "runs" / "ingest" / "run_id=1.json"),
         )
 
-    monkeypatch.setattr(cli, "run_ingest_pipeline", fake_run_ingest_pipeline)
+    monkeypatch.setattr(cli, "acquire_eightk_documents", fake_run_ingest_pipeline)
 
     status = cli.main(["ingest", "--quiet", "daily", str(cik_file)])
 
@@ -246,7 +246,7 @@ def test_ingest_cli_logs_failures_to_file(
         del config, ciks, s3_client
         raise RuntimeError("simulated failure")
 
-    monkeypatch.setattr(cli, "run_ingest_pipeline", fake_run_ingest_pipeline)
+    monkeypatch.setattr(cli, "acquire_eightk_documents", fake_run_ingest_pipeline)
 
     status = cli.main(
         [

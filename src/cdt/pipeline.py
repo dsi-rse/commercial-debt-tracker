@@ -32,7 +32,7 @@ from cdt.ingest import (
     SIXK_FORM_TYPES,
     IngestConfig,
     IngestRunResult,
-    run_ingest_pipeline,
+    acquire_eightk_documents,
 )
 from cdt.ingest import DEFAULT_BATCH_SIZE as DEFAULT_INGEST_BATCH_SIZE
 from cdt.itemizer import (
@@ -336,7 +336,7 @@ class PipelineOrchestrator:
             batch_size=self.config.ingest_batch_size,
             download=self.config.download,
         )
-        ingest_table, ingest_result = run_ingest_pipeline(
+        ingest_table, ingest_result = acquire_eightk_documents(
             IngestConfig(
                 mode=self.config.mode,
                 bucket=self.config.bucket,
