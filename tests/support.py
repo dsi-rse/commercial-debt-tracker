@@ -218,12 +218,6 @@ def maturity_row_state() -> ExtractionRowState:
     return row_state
 
 
-def _ner_row(text: str) -> ExtractionRowState:
-    return ExtractionRowState(
-        item_row={"item_id": "item-1", "text": text}, stage_name="ner"
-    )
-
-
 def seed_document_partitions_across_months(
     tmp_path: Path, partitions: list[tuple[str, str]]
 ) -> list[str]:

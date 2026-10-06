@@ -8,7 +8,6 @@ from types import SimpleNamespace
 from support import (
     PARTY_ROLE_XML,
     _dates_tag_details,
-    _ner_row,
     maturity_row_state,
     party_row_state,
 )
@@ -37,6 +36,12 @@ from cdt.extractor.validate import (
     validate_interest_rate,
     validate_parties_property,
 )
+
+
+def _ner_row(text: str) -> ExtractionRowState:
+    return ExtractionRowState(
+        item_row={"item_id": "item-1", "text": text}, stage_name="ner"
+    )
 
 
 def test_instrument_ie_validate_allows_shared_evidence_and_skipped_collective_tags() -> (
@@ -1054,6 +1059,79 @@ def test_an_echo_is_accepted_when_the_earlier_attempt_also_tagged_nothing() -> N
 
     assert row_state.all_attempts[-1].validation_errors == []
     assert row_state.state == "SUCCESS"
+    assert row_state.salvage_notes == []
+
+
+def test_an_untagged_echo_is_accepted_after_a_failure_that_found_nothing() -> None:
+    """The regression the old `attempt_index > 1` gate caused (#176).
+
+    A debt-free item whose first attempt failed for a reason unrelated to
+    tagging -- malformed XML here -- answers honestly with a bare echo on its
+    second. The old gate rejected that answer on every remaining attempt and
+    the row died FAILED after three whole-item calls -- the stage's whole
+    budget -- losing the item. Nothing
+    about the first attempt suggests the model can find anything here, so
+    there is no earlier work for the echo to regress against.
+
+    Nothing on this row is evidence of a give-up, so it finishes SUCCESS. The
+    zero used to be filed as a possible loss instead; see
+    `_advance_after_stage` for why that was dropped.
+    """
+    from cdt.extractor.prior_state import published_mention_rows
+    from cdt.extractor.state import PUBLISHABLE_ROW_STATES
+    from cdt.extractor.workflow import handle_response
+
+    text = "This is the extracted event text."
+    row_state = _ner_row(text)
+    row_state.current_attempt.messages = NERStage().preprocess(row_state)
+
+    assert handle_response(row_state, "not xml at all", max_attempts=3)
+    assert handle_response(row_state, f"<body>{text}</body>", max_attempts=3) is None
+
+    # Two calls, not three, and the echo itself was accepted.
+    assert len([a for a in row_state.all_attempts if a.response is not None]) == 2
+    assert row_state.all_attempts[0].status == "FAILED"
+    assert row_state.all_attempts[-1].validation_errors == []
+    assert row_state.all_attempts[-1].status == "SUCCESS"
+    assert row_state.state == "SUCCESS"
+    assert row_state.state in PUBLISHABLE_ROW_STATES
+    assert published_mention_rows(row_state) == []
+    assert row_state.salvage_notes == []
+
+
+def test_a_zero_tag_row_with_no_earlier_tagging_is_a_clean_zero() -> None:
+    """With no earlier tags to compare against, a zero is a finding, not a loss.
+
+    Attempt 1 failed for a reason unrelated to tagging and itself found no
+    `debt_instrument`, so neither the high-water mark nor the give-up check has
+    anything to fire on -- and nothing else on the row suggests the model can
+    find debt here. The row finishes SUCCESS with no failure record.
+
+    This is the case that used to finish PARTIAL as a "possible loss". It was
+    dropped because PARTIAL is terminal like any other state, so it bought a
+    registry entry and no re-extraction while asserting a loss nothing had
+    evidence for. A give-up the row *can* evidence is a validation failure, so
+    it retries and then fails for real -- see
+    `test_mplx_untagged_echo_no_longer_publishes_as_a_clean_success`.
+    """
+    from cdt.extractor.prior_state import published_mention_rows
+    from cdt.extractor.state import PUBLISHABLE_ROW_STATES
+    from cdt.extractor.workflow import handle_response
+
+    text = "Acme Corp filed this report on January 1, 2024."
+    row_state = _ner_row(text)
+    row_state.current_attempt.messages = NERStage().preprocess(row_state)
+    tagged_no_debt = (
+        "<body><organization>Acme Corp</organization> filed this report on "
+        "<date>January 1, 2024</date>.</body>"
+    )
+
+    assert handle_response(row_state, "not xml at all", max_attempts=3)
+    assert handle_response(row_state, tagged_no_debt, max_attempts=3) is None
+
+    assert row_state.state == "SUCCESS"
+    assert row_state.state in PUBLISHABLE_ROW_STATES
+    assert published_mention_rows(row_state) == []
     assert row_state.salvage_notes == []
 
 
