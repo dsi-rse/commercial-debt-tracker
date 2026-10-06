@@ -1,4 +1,4 @@
-"""Publish the final snapshot tables after matching, unless their sources are unchanged."""
+"""Run the post-match lineage pass, then publish the final snapshot tables unless their sources are unchanged."""
 
 from __future__ import annotations
 
