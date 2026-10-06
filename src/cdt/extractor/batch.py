@@ -1,6 +1,6 @@
 """OpenAI Batch API backend and poll-driven state machine for extraction.
 
-The synchronous extractor (``cdt.extractor.core``) drives the same stage objects
+The live backend (``cdt.extractor.live``) drives the same stage objects
 through live OpenRouter chat completions. This module instead advances those
 stages asynchronously through OpenAI's Batch API, which is ~50% cheaper but can
 take up to 24h per round. Because the workflow is several sequential, retryable
@@ -36,22 +36,28 @@ from typing import Protocol, cast
 
 from cdt import settings
 from cdt.datasets import resolve_artifact_root
-from cdt.extractor.core import (
+from cdt.extractor.llm import (
+    completion_result_from_batch_line,
+    is_content_filter_abort,
+    is_reasoning_model,
+    native_model_id,
+    sampling_params,
+)
+from cdt.extractor.outputs import (
+    collect_pending_extract_items,
+    finalize_extract_outputs,
+)
+from cdt.extractor.state import (
     DEFAULT_MAX_ATTEMPTS,
     CompletionResult,
     ExtractionRowState,
-    collect_pending_extract_items,
-    completion_result_from_batch_line,
-    finalize_extract_outputs,
+    is_infrastructure_status,
+)
+from cdt.extractor.workflow import (
     handle_provider_abort,
     handle_response,
     initial_messages,
-    is_content_filter_abort,
-    is_infrastructure_status,
-    is_reasoning_model,
-    native_model_id,
     record_stage_error,
-    sampling_params,
 )
 from cdt.shared import get_logger
 from cdt.storage import (

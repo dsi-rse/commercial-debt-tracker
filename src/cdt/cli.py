@@ -33,7 +33,7 @@ from cdt.extractor import (
     mentions_root,
     reset_active_job,
 )
-from cdt.extractor.core import CLASSIFICATION_SOURCES, backfill_mentions
+from cdt.extractor.outputs import CLASSIFICATION_SOURCES, backfill_mentions
 from cdt.ingest import (
     DEFAULT_AWS_PROFILE,
     DEFAULT_BUCKET,

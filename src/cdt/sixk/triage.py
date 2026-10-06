@@ -22,7 +22,7 @@ from cdt.classifier.core import (
     load_training_artifacts,
     score_model,
 )
-from cdt.extractor.core import normalize_reasoning_effort
+from cdt.extractor.llm import normalize_reasoning_effort
 from cdt.shared import get_logger
 
 if TYPE_CHECKING:

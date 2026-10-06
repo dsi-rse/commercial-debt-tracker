@@ -34,7 +34,7 @@ LOGGER = get_logger(__name__)
 
 # The 6-K triage stage's output dataset. Named here, not beside its writer,
 # because the extractor must name it and cannot import ``cdt.sixk`` (which
-# imports ``cdt.extractor.core``); this module is the leaf both import.
+# imports ``cdt.extractor``); this module is the leaf both import.
 SIXK_SNIPPET_DATASET_NAME = "sixk-snippets"
 MATCH_SHARDS = 64
 PARTITION_PATTERN = re.compile(

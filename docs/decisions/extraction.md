@@ -1,6 +1,6 @@
 # Extraction: design decisions and measurements
 
-The extractor (`src/cdt/extractor/core.py`, with the OpenAI Batch backend in
+The extractor (`src/cdt/extractor/`, with the OpenAI Batch backend in
 `src/cdt/extractor/batch.py`) runs three LLM stages over each relevant 8-K item
 or 6-K snippet: NER tags entity spans in the item text, instrument IE turns the
 tagged text into kind-typed facts per debt instrument, and the relation stage

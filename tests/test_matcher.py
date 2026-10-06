@@ -6,7 +6,7 @@ import json
 
 import pandas as pd
 
-from cdt.extractor.core import DEBT_INSTRUMENT_MENTION_COLUMNS
+from cdt.extractor.schema import DEBT_INSTRUMENT_MENTION_COLUMNS
 from cdt.matcher.compat import (
     NAME_CLASS_GATE,
     end_dates_are_compatible,
