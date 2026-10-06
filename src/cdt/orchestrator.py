@@ -43,7 +43,7 @@ from cdt.pipeline import (
     run_prepare_stages,
 )
 from cdt.shared import get_logger
-from cdt.storage import configure_s3_profile
+from cdt.storage.objects import configure_s3_profile
 
 LOGGER = get_logger(__name__)
 

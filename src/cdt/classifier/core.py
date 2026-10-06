@@ -14,23 +14,22 @@ import numpy as np
 import pandas as pd
 
 from cdt import settings
-from cdt.datasets import (
+from cdt.completion import (
     CompletedPartition,
     completion_registry_path,
+    pending_source_partitions,
+    save_completion_registry,
+)
+from cdt.datasets import (
     dataset_root,
     date_shard_partition_path,
     parse_date_shard_partition,
-    pending_source_partitions,
     resolve_artifact_root,
     run_manifest_path,
-    save_completion_registry,
 )
 from cdt.itemizer.core import ITEM_COLUMNS, ITEM_DATASET_NAME
-from cdt.storage import (
-    read_table,
-    write_json_artifact,
-    write_partition_table,
-)
+from cdt.storage.objects import write_json_artifact
+from cdt.storage.tables import read_table, write_partition_table
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_TARGET_RECALL = 0.99

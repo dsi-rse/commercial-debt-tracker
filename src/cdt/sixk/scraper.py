@@ -35,15 +35,13 @@ from cdt.ingest import (
 )
 from cdt.shared import FailureRegistry, get_logger
 from cdt.sixk.mirror import mirror_path
-from cdt.storage import (
+from cdt.storage.objects import (
     artifact_exists,
     get_object_bytes,
     parse_s3_uri,
     write_bytes_artifact,
 )
-from cdt.storage import (
-    s3_client as storage_s3_client,
-)
+from cdt.storage.objects import s3_client as storage_s3_client
 
 LOGGER = get_logger(__name__)
 

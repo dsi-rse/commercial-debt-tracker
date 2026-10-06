@@ -11,7 +11,8 @@ import pyarrow.fs
 import pyarrow.parquet as pq
 import pytest
 
-from cdt import storage
+from cdt.storage import objects as storage_objects
+from cdt.storage import tables as storage_tables
 
 
 class FakeFrozenCredentials(NamedTuple):
@@ -70,7 +71,7 @@ def _fake_boto3_session(monkeypatch: pytest.MonkeyPatch) -> None:
     tests depend on the shared fixture, so if it ever stops resetting, the
     memoization test fails rather than the leak going unnoticed.
     """
-    monkeypatch.setattr(storage.boto3, "Session", FakeSession)
+    monkeypatch.setattr(storage_objects.boto3, "Session", FakeSession)
     FakeSession.created = []
 
 
@@ -83,10 +84,10 @@ def test_storage_clients_use_the_configured_aws_profile() -> None:
     list_objects_v2 behind a partition scan and every write through whatever the
     ambient chain resolved.
     """
-    storage.configure_s3_profile("analysis")
+    storage_objects.configure_s3_profile("analysis")
 
-    assert storage.configured_s3_profile() == "analysis"
-    assert storage.s3_client() == "s3:'analysis'"
+    assert storage_objects.configured_s3_profile() == "analysis"
+    assert storage_objects.s3_client() == "s3:'analysis'"
     assert FakeSession.created == ["analysis"]
 
 
@@ -98,34 +99,34 @@ def test_document_bodies_on_s3_resolve_through_the_configured_profile() -> None:
     """
     from cdt.itemizer.core import ensure_s3_client
 
-    storage.configure_s3_profile("analysis")
+    storage_objects.configure_s3_profile("analysis")
 
     assert ensure_s3_client(None, [{"resource_uri": "s3://b/k"}]) == "s3:'analysis'"
 
 
 def test_an_explicit_profile_still_wins_over_the_configured_one() -> None:
     """Ingest and the 6-K scraper keep passing ``config.aws_profile``."""
-    storage.configure_s3_profile("analysis")
+    storage_objects.configure_s3_profile("analysis")
 
-    assert storage.s3_client("other") == "s3:'other'"
+    assert storage_objects.s3_client("other") == "s3:'other'"
 
 
 def test_the_empty_profile_means_the_ambient_credential_chain() -> None:
     """The CLI default is "", which must stay "no profile" (the old behaviour)."""
-    storage.configure_s3_profile(None)
+    storage_objects.configure_s3_profile(None)
 
-    assert storage.s3_client() == "s3:None"
+    assert storage_objects.s3_client() == "s3:None"
     assert FakeSession.created == [None]
 
 
 def test_clients_are_memoized_per_profile() -> None:
     """One credentialed object per profile: construction is the #83 cost."""
-    storage.configure_s3_profile("analysis")
+    storage_objects.configure_s3_profile("analysis")
 
-    first = storage.s3_client()
-    second = storage.s3_client()
-    third = storage.s3_client("analysis")
-    other = storage.s3_client("second-account")
+    first = storage_objects.s3_client()
+    second = storage_objects.s3_client()
+    third = storage_objects.s3_client("analysis")
+    other = storage_objects.s3_client("second-account")
 
     assert first is second is third
     assert other != first
@@ -138,9 +139,9 @@ def test_a_configured_profile_is_set_for_the_next_test_to_find() -> None:
     These two are deliberately order-coupled and must stay adjacent and in
     this order. Nothing else in the suite would notice the leak they detect.
     """
-    storage.configure_s3_profile("leaks-into-the-next-test")
+    storage_objects.configure_s3_profile("leaks-into-the-next-test")
 
-    assert storage.configured_s3_profile() == "leaks-into-the-next-test"
+    assert storage_objects.configured_s3_profile() == "leaks-into-the-next-test"
 
 
 def test_a_profile_set_by_an_earlier_test_does_not_leak_into_this_one() -> None:
@@ -155,7 +156,7 @@ def test_a_profile_set_by_an_earlier_test_does_not_leak_into_this_one() -> None:
     only way to test it is to pollute deliberately and check the next test is
     clean.
     """
-    assert storage.configured_s3_profile() == ""
+    assert storage_objects.configured_s3_profile() == ""
 
 
 def test_cli_main_configures_the_profile_from_the_flag(
@@ -202,7 +203,7 @@ def _parser_returning(*, exit_code: int = 0, **attrs: object):  # noqa: ANN202
 
 
 def _write(path: Path, rows: list[dict[str, object]]) -> None:
-    storage.write_table(str(path), pd.DataFrame(rows))
+    storage_tables.write_table(str(path), pd.DataFrame(rows))
 
 
 def _write_raw(path: Path, table: pa.Table) -> None:
@@ -232,7 +233,9 @@ def test_read_dataset_unifies_schemas_instead_of_trusting_the_first_file(
     _write(root / "a.parquet", [{"k": "1"}])
     _write(root / "b.parquet", [{"k": "2", "later": "kept"}])
 
-    table = storage.read_dataset(str(root)).sort_values("k").reset_index(drop=True)
+    table = (
+        storage_tables.read_dataset(str(root)).sort_values("k").reset_index(drop=True)
+    )
 
     assert list(table.columns) == ["k", "later"]
     assert table["later"].isna().to_list() == [True, False]
@@ -253,7 +256,7 @@ def test_the_footer_reads_behind_schema_unification_are_parallel(
     option 1 is to parallelise exactly this.
     """
     pools: list[int | None] = []
-    real_pool = storage.ThreadPoolExecutor
+    real_pool = storage_tables.ThreadPoolExecutor
 
     class RecordingPool(real_pool):  # type: ignore[misc, valid-type]
         def __init__(
@@ -262,12 +265,12 @@ def test_the_footer_reads_behind_schema_unification_are_parallel(
             pools.append(max_workers)
             super().__init__(max_workers=max_workers, **kwargs)
 
-    monkeypatch.setattr(storage, "ThreadPoolExecutor", RecordingPool)
+    monkeypatch.setattr(storage_tables, "ThreadPoolExecutor", RecordingPool)
     root = tmp_path / "items"
     for index in range(5):
         _write(root / f"p{index}.parquet", [{"k": str(index)}])
 
-    table = storage.read_dataset(str(root))
+    table = storage_tables.read_dataset(str(root))
 
     assert len(table) == 5
     assert pools == [5], "footers were read one at a time"
@@ -301,14 +304,14 @@ def test_read_dataset_falls_back_when_partitions_cannot_be_unified(
     # The Arrow path must genuinely be unable to read this, or the test proves
     # nothing about the fallback — and it must say why, since the log names the
     # cause and a corrupt partition takes the same branch.
-    table, error = storage._read_dataset_with_arrow(
+    table, error = storage_tables._read_dataset_with_arrow(
         sorted(str(p) for p in root.rglob("*.parquet")), None
     )
     assert table is None
     assert isinstance(error, pa.ArrowException)
 
     table = (
-        storage.read_dataset(str(root))
+        storage_tables.read_dataset(str(root))
         .sort_values("debt_instrument_id")
         .reset_index(drop=True)
     )
@@ -335,7 +338,7 @@ def test_the_fallback_log_names_the_error_that_caused_it(
     (root / "b.parquet").write_bytes(b"not a parquet file at all")
 
     with caplog.at_level("INFO"), pytest.raises(pa.ArrowInvalid):
-        storage.read_dataset(str(root))
+        storage_tables.read_dataset(str(root))
 
     assert "ArrowInvalid" in caplog.text
     assert "Parquet magic bytes not found" in caplog.text
@@ -357,15 +360,15 @@ def test_one_filesystem_is_built_for_a_whole_scan(
         _write(root / f"p{index}.parquet", [{"k": str(index)}])
 
     calls: list[object] = []
-    original = storage.arrow_filesystem
+    original = storage_tables.arrow_filesystem
 
     def counting_arrow_filesystem(path: object) -> tuple[object | None, str]:
         calls.append(path)
         return original(path)
 
-    monkeypatch.setattr(storage, "arrow_filesystem", counting_arrow_filesystem)
+    monkeypatch.setattr(storage_tables, "arrow_filesystem", counting_arrow_filesystem)
 
-    assert len(storage.read_dataset(str(root))) == 6
+    assert len(storage_tables.read_dataset(str(root))) == 6
     assert len(calls) == 1
 
 
@@ -386,9 +389,11 @@ def test_read_dataset_uses_the_arrow_path_when_partitions_do_unify(
     def _explode(*args: object, **kwargs: object) -> pd.DataFrame:
         raise AssertionError("fell back to the per-file path")
 
-    monkeypatch.setattr(storage, "read_table", _explode)
+    monkeypatch.setattr(storage_tables, "read_table", _explode)
 
-    table = storage.read_dataset(str(root)).sort_values("k").reset_index(drop=True)
+    table = (
+        storage_tables.read_dataset(str(root)).sort_values("k").reset_index(drop=True)
+    )
 
     assert table["k"].to_list() == ["1", "2"]
 
@@ -410,9 +415,9 @@ def test_read_dataset_projection_reindexes_a_column_absent_everywhere(
     def _explode(*args: object, **kwargs: object) -> pd.DataFrame:
         raise AssertionError("fell back to the per-file path")
 
-    monkeypatch.setattr(storage, "read_table", _explode)
+    monkeypatch.setattr(storage_tables, "read_table", _explode)
 
-    table = storage.read_dataset(str(root), columns=["k", "nowhere"])
+    table = storage_tables.read_dataset(str(root), columns=["k", "nowhere"])
 
     assert list(table.columns) == ["k", "nowhere"]
     assert table["nowhere"].isna().all()
@@ -428,7 +433,7 @@ def test_read_dataset_still_skips_orphaned_tempfiles(tmp_path: Path) -> None:
     _write(root / "a.parquet", [{"k": "1"}])
     (root / "tmpabc123.parquet").write_bytes(b"")
 
-    assert storage.read_dataset(str(root))["k"].to_list() == ["1"]
+    assert storage_tables.read_dataset(str(root))["k"].to_list() == ["1"]
 
 
 def test_read_dataset_honors_the_partition_filter(tmp_path: Path) -> None:
@@ -437,7 +442,9 @@ def test_read_dataset_honors_the_partition_filter(tmp_path: Path) -> None:
     _write(root / "date=2026-01-01" / "part-0000.parquet", [{"k": "old"}])
     _write(root / "date=2026-01-02" / "part-0000.parquet", [{"k": "new"}])
 
-    table = storage.read_dataset(str(root), partition_filter={"date": "2026-01-02"})
+    table = storage_tables.read_dataset(
+        str(root), partition_filter={"date": "2026-01-02"}
+    )
 
     assert table["k"].to_list() == ["new"]
 
@@ -462,13 +469,13 @@ def test_read_table_projects_without_reading_the_other_columns(
 
     path = tmp_path / "t.parquet"
     _write(path, [{"k": "1", "text": "x" * 100}])
-    monkeypatch.setattr(storage.pd, "read_parquet", _explode)
+    monkeypatch.setattr(storage_tables.pd, "read_parquet", _explode)
 
-    assert list(storage.read_table(path, ["k"]).columns) == ["k"]
-    assert list(storage.read_table(path, ["text", "k"]).columns) == ["text", "k"]
+    assert list(storage_tables.read_table(path, ["k"]).columns) == ["k"]
+    assert list(storage_tables.read_table(path, ["text", "k"]).columns) == ["text", "k"]
     # And a requested-but-absent column still comes back, null, rather than
     # being silently dropped: ParquetFile.read does not raise on one.
-    tolerant = storage.read_table(path, ["k", "missing"])
+    tolerant = storage_tables.read_table(path, ["k", "missing"])
     assert list(tolerant.columns) == ["k", "missing"]
     assert tolerant["missing"].isna().all()
 
@@ -490,13 +497,13 @@ def test_count_table_rows_reads_only_the_footer(
     _write(path, [{"k": "1"}, {"k": "2"}, {"k": "3"}])
     monkeypatch.setattr(pq.ParquetFile, "read", _explode)
 
-    assert storage.count_table_rows(path) == 3
-    assert storage.count_table_rows(tmp_path / "absent.parquet") is None
+    assert storage_tables.count_table_rows(path) == 3
+    assert storage_tables.count_table_rows(tmp_path / "absent.parquet") is None
 
 
 def test_arrow_filesystem_leaves_local_paths_alone() -> None:
     """Local reads need no filesystem object; only S3 gets one."""
-    filesystem, resolved = storage.arrow_filesystem("/artifacts/x/y.parquet")
+    filesystem, resolved = storage_tables.arrow_filesystem("/artifacts/x/y.parquet")
 
     assert filesystem is None
     assert resolved == "/artifacts/x/y.parquet"
@@ -512,14 +519,14 @@ def test_arrow_filesystem_builds_s3_on_the_configured_profile(
     building its own.
     """
     built: list[dict[str, object]] = []
-    storage.configure_s3_profile("analysis")
+    storage_objects.configure_s3_profile("analysis")
     monkeypatch.setattr(
-        storage.pyarrow.fs,
+        storage_tables.pyarrow.fs,
         "S3FileSystem",
         lambda **kwargs: built.append(kwargs) or "FS",
     )
 
-    filesystem, resolved = storage.arrow_filesystem("s3://bucket/a/b.parquet")
+    filesystem, resolved = storage_tables.arrow_filesystem("s3://bucket/a/b.parquet")
 
     assert filesystem == "FS"
     assert resolved == "bucket/a/b.parquet"
@@ -533,8 +540,8 @@ def test_arrow_filesystem_builds_s3_on_the_configured_profile(
             "access_key": "AK-analysis",
             "secret_key": "SK-analysis",
             "session_token": "TOK-analysis",
-            "connect_timeout": storage.S3_CLIENT_CONFIG.connect_timeout,
-            "request_timeout": storage.S3_CLIENT_CONFIG.read_timeout,
+            "connect_timeout": storage_objects.S3_CLIENT_CONFIG.connect_timeout,
+            "request_timeout": storage_objects.S3_CLIENT_CONFIG.read_timeout,
             "retry_strategy": built[0]["retry_strategy"],
             "region": "us-east-2",
         }
@@ -543,7 +550,7 @@ def test_arrow_filesystem_builds_s3_on_the_configured_profile(
     # gets from S3_CLIENT_CONFIG: moving reads here would otherwise have
     # dropped #112's timeout and retry mitigation on the main read path.
     assert isinstance(
-        built[0]["retry_strategy"], storage.pyarrow.fs.AwsStandardS3RetryStrategy
+        built[0]["retry_strategy"], storage_tables.pyarrow.fs.AwsStandardS3RetryStrategy
     )
 
 
@@ -579,23 +586,23 @@ def test_the_s3_branch_of_every_reader_actually_runs(
     def fake_filesystem(path: object) -> tuple[object, str]:
         # Exactly what arrow_filesystem returns for S3: a filesystem, and the
         # bucket/key form of the path.
-        stripped = storage.strip_s3_scheme(path)
+        stripped = storage_tables.strip_s3_scheme(path)
         resolved.append(stripped)
         return filesystem, stripped
 
-    monkeypatch.setattr(storage, "arrow_filesystem", fake_filesystem)
+    monkeypatch.setattr(storage_tables, "arrow_filesystem", fake_filesystem)
     monkeypatch.setattr(
-        storage, "iter_partition_paths", lambda *a, **k: iter(_S3_ITEM_PATHS)
+        storage_tables, "iter_partition_paths", lambda *a, **k: iter(_S3_ITEM_PATHS)
     )
 
-    assert storage.read_table("s3://bucket/items/a.parquet", ["k"])["k"].to_list() == [
-        "1"
-    ]
+    assert storage_tables.read_table("s3://bucket/items/a.parquet", ["k"])[
+        "k"
+    ].to_list() == ["1"]
     assert resolved == ["bucket/items/a.parquet"]
-    assert storage.count_table_rows("s3://bucket/items/a.parquet") == 1
-    assert storage.count_table_rows("s3://bucket/items/absent.parquet") is None
+    assert storage_tables.count_table_rows("s3://bucket/items/a.parquet") == 1
+    assert storage_tables.count_table_rows("s3://bucket/items/absent.parquet") is None
     assert (
-        storage.count_partition_rows(
+        storage_tables.count_partition_rows(
             [*_S3_ITEM_PATHS, "s3://bucket/items/absent.parquet"]
         )
         == 2
@@ -604,8 +611,8 @@ def test_the_s3_branch_of_every_reader_actually_runs(
     def _explode(*args: object, **kwargs: object) -> pd.DataFrame:
         raise AssertionError("fell back to the per-file path")
 
-    monkeypatch.setattr(storage, "read_table", _explode)
-    table = storage.read_dataset("s3://bucket/items").sort_values("k")
+    monkeypatch.setattr(storage_tables, "read_table", _explode)
+    table = storage_tables.read_dataset("s3://bucket/items").sort_values("k")
     assert table["k"].to_list() == ["1", "2"]
 
 
@@ -633,11 +640,11 @@ def test_arrow_filesystem_refuses_a_session_with_no_credentials(
             return None
 
     monkeypatch.setattr(
-        storage, "boto3_session", lambda *a, **k: CredentiallessSession()
+        storage_tables, "boto3_session", lambda *a, **k: CredentiallessSession()
     )
 
     with pytest.raises(RuntimeError, match="No AWS credentials"):
-        storage.arrow_filesystem("s3://bucket/a/b.parquet")
+        storage_tables.arrow_filesystem("s3://bucket/a/b.parquet")
 
 
 def test_arrow_filesystem_warns_when_credentials_expire_before_a_scan_could(
@@ -668,11 +675,15 @@ def test_arrow_filesystem_warns_when_credentials_expire_before_a_scan_could(
         def get_credentials(self: Self) -> object:
             return ExpiringCredentials()
 
-    monkeypatch.setattr(storage, "boto3_session", lambda *a, **k: ExpiringSession())
-    monkeypatch.setattr(storage.pyarrow.fs, "S3FileSystem", lambda **kwargs: "FS")
+    monkeypatch.setattr(
+        storage_tables, "boto3_session", lambda *a, **k: ExpiringSession()
+    )
+    monkeypatch.setattr(
+        storage_tables.pyarrow.fs, "S3FileSystem", lambda **kwargs: "FS"
+    )
 
     with caplog.at_level("WARNING"):
-        storage.arrow_filesystem("s3://bucket/a/b.parquet")
+        storage_tables.arrow_filesystem("s3://bucket/a/b.parquet")
 
     assert "expire in" in caplog.text
 
@@ -692,10 +703,10 @@ def test_count_partition_rows_totals_footers_without_reading_data(
         raise AssertionError("read row data to count rows")
 
     monkeypatch.setattr(pq.ParquetFile, "read", _explode)
-    monkeypatch.setattr(storage, "read_table", _explode)
+    monkeypatch.setattr(storage_tables, "read_table", _explode)
 
     paths = [
         str(tmp_path / name) for name in ("a.parquet", "b.parquet", "gone.parquet")
     ]
-    assert storage.count_partition_rows(paths) == 3
-    assert storage.count_partition_rows([]) == 0
+    assert storage_tables.count_partition_rows(paths) == 3
+    assert storage_tables.count_partition_rows([]) == 0

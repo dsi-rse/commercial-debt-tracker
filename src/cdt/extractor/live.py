@@ -12,14 +12,12 @@ import pandas as pd
 
 from cdt import settings
 from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
-from cdt.datasets import (
+from cdt.completion import (
     CompletedPartition,
     completion_registry_path,
-    extractor_run_path,
-    resolve_artifact_root,
-    run_manifest_path,
     save_completion_registry,
 )
+from cdt.datasets import extractor_run_path, resolve_artifact_root, run_manifest_path
 from cdt.extractor.batch import active_job_claimed_partition_paths
 from cdt.extractor.llm import normalize_reasoning_effort
 from cdt.extractor.outputs import (
@@ -42,11 +40,8 @@ from cdt.extractor.workflow import (
     run_extraction_workflow,
 )
 from cdt.shared import get_logger
-from cdt.storage import (
-    read_table,
-    write_json_artifact,
-    write_text_artifact,
-)
+from cdt.storage.objects import write_json_artifact, write_text_artifact
+from cdt.storage.tables import read_table
 
 LOGGER = get_logger(__name__)
 

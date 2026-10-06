@@ -65,9 +65,7 @@ from cdt.matcher import (
     mention_cluster_edges_root,
 )
 from cdt.matcher.lineage_inference import apply_lineage_inference_pass
-from cdt.pipeline import (
-    ALL_TIME_START_DATE as PIPELINE_ALL_TIME_START_DATE,
-)
+from cdt.pipeline import ALL_TIME_START_DATE as PIPELINE_ALL_TIME_START_DATE
 from cdt.pipeline import (
     DEFAULT_GENRES,
     PipelineConfig,
@@ -80,7 +78,7 @@ from cdt.sixk.mirror import mirror_root
 from cdt.sixk.scraper import acquire_scraped_sixk_documents
 from cdt.sixk.stage import DEFAULT_CONCURRENCY as SIXK_DEFAULT_CONCURRENCY
 from cdt.sixk.stage import sixk_snippets_root, triage_pending_documents
-from cdt.storage import configure_s3_profile
+from cdt.storage.objects import configure_s3_profile
 
 ALL_TIME_START_DATE = date(1994, 1, 1)
 DEFAULT_BATCH_SIZE = 100

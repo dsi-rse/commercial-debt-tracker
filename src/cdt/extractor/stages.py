@@ -47,7 +47,7 @@ from cdt.extractor.tags import (
     repair_unescaped_ampersands,
 )
 from cdt.extractor.validate import validate_instrument_entry
-from cdt.storage import coerce_dataset_text
+from cdt.storage.columns import coerce_dataset_text
 
 # A regex rather than a parse: the high-water check counts tags in earlier,
 # failed attempts, which may be truncated or not well-formed XML. Tolerates an

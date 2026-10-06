@@ -30,7 +30,8 @@ from cdt.ingest import (
     normalize_accession_number,
     run_ingest_pipeline,
 )
-from cdt.storage import list_artifacts, read_dataset, read_table, write_table
+from cdt.storage.objects import list_artifacts
+from cdt.storage.tables import read_dataset, read_table, write_table
 
 EXPECTED_PARTITION_FILES = 3
 
@@ -1031,7 +1032,7 @@ def _document_row(accession: str, filing_date: str) -> dict[str, object]:
 
 
 def _store_document(data_dir: Path, accession: str, filing_date: str) -> None:
-    from cdt.storage import write_partition_table
+    from cdt.storage.tables import write_partition_table
 
     write_partition_table(
         documents_root(data_dir=data_dir),
@@ -1206,7 +1207,7 @@ def test_the_read_back_counts_the_window_without_reading_its_bodies(
     this run did not write.
     """
     from cdt import ingest as ingest_module
-    from cdt import storage
+    from cdt.storage import tables as storage_tables
 
     _store_document(tmp_path, "000114036126006577", "2024-01-02")
     _store_document(tmp_path, "000114036126006578", "2024-01-03")
@@ -1225,7 +1226,7 @@ def test_the_read_back_counts_the_window_without_reading_its_bodies(
         if columns is None or "text" in columns:
             msg = "the read-back deserialized document bodies"
             raise AssertionError(msg)
-        return storage.read_table(path, columns)
+        return storage_tables.read_table(path, columns)
 
     real_read_partitions = ingest_module.read_partitions
     monkeypatch.setattr(ingest_module, "read_partitions", no_bodies)
@@ -1248,7 +1249,7 @@ def test_the_read_back_counts_the_window_without_reading_its_bodies(
     assert list(table.columns) == DOCUMENT_COLUMNS
 
     monkeypatch.setattr(ingest_module, "read_partitions", real_read_partitions)
-    monkeypatch.setattr(ingest_module, "read_table", storage.read_table)
+    monkeypatch.setattr(ingest_module, "read_table", storage_tables.read_table)
     documents, result = run_ingest_pipeline(
         config, ciks={"320193"}, s3_client=FakeS3Client({}), return_documents=True
     )

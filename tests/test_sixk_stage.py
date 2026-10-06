@@ -13,7 +13,8 @@ import pandas as pd
 import pytest
 
 from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS, score_model
-from cdt.datasets import load_completion_registry, run_manifest_path
+from cdt.completion import load_completion_registry
+from cdt.datasets import run_manifest_path
 from cdt.ingest import DOCUMENT_COLUMNS, SIXK_DOCUMENT_DATASET_NAME
 from cdt.ingest import documents_root as ingest_documents_root
 from cdt.sixk import stage as sixk_stage
@@ -31,12 +32,8 @@ from cdt.sixk.stage import (
     triage_pending_documents,
 )
 from cdt.sixk.windows import prepare_filing, strip_inline_xbrl_prologue
-from cdt.storage import (
-    list_artifacts,
-    read_dataset,
-    read_json_artifact,
-    write_partition_table,
-)
+from cdt.storage.objects import list_artifacts, read_json_artifact
+from cdt.storage.tables import read_dataset, write_partition_table
 
 # Long enough to pass the debt-vocabulary gate and window into one crop.
 DEBT_PROSE = (

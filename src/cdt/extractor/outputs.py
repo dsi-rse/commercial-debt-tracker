@@ -11,22 +11,24 @@ from typing import cast
 import pandas as pd
 
 from cdt.classifier.core import CLASSIFICATION_DATASET_NAME, CLASSIFIED_ITEM_COLUMNS
-from cdt.datasets import (
-    PARTITION_PATTERN,
-    SIXK_SNIPPET_DATASET_NAME,
+from cdt.completion import (
     CompletedPartition,
     CompletionRegistry,
     completion_registry_path,
+    load_completion_registry,
+    save_completion_registry,
+)
+from cdt.datasets import (
+    PARTITION_PATTERN,
+    SIXK_SNIPPET_DATASET_NAME,
     dataset_root,
     date_shard_partition_path,
     extractor_run_path,
     iter_date_shard_partitions,
-    load_completion_registry,
     load_row_failures,
     parse_date_shard_partition,
     resolve_artifact_root,
     run_manifest_path,
-    save_completion_registry,
     save_row_failures,
 )
 from cdt.extractor.prior_state import mint_prior_state_rows, published_mention_rows
@@ -39,15 +41,14 @@ from cdt.extractor.state import (
     coerce_native,
 )
 from cdt.shared import get_logger
-from cdt.storage import (
+from cdt.storage.columns import coerce_dataset_text
+from cdt.storage.objects import (
     artifact_exists,
-    coerce_dataset_text,
     list_artifacts_with_versions,
-    read_table,
     write_json_artifact,
-    write_partition_table,
     write_text_artifact,
 )
+from cdt.storage.tables import read_table, write_partition_table
 
 LOGGER = get_logger(__name__)
 

@@ -20,7 +20,8 @@ import pytest
 import cdt.extractor.batch as batch_module
 from cdt.classifier import classifications_root
 from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
-from cdt.datasets import load_completion_registry, load_row_failures
+from cdt.completion import load_completion_registry
+from cdt.datasets import load_row_failures
 from cdt.extractor import (
     advance_extract_job,
     describe_active_job,
@@ -64,12 +65,8 @@ from cdt.extractor.workflow import (
     initial_messages,
     run_extraction_workflow,
 )
-from cdt.storage import (
-    artifact_exists,
-    read_dataset,
-    read_json_artifact,
-    write_partition_table,
-)
+from cdt.storage.objects import artifact_exists, read_json_artifact
+from cdt.storage.tables import read_dataset, write_partition_table
 
 # --------------------------------------------------------------------------- #
 # Canned prompts/responses that exercise all three stages deterministically

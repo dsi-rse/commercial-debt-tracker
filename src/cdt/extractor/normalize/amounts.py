@@ -34,7 +34,7 @@ from cdt.extractor.tags import (
     single_value_evidence_tag_ids,
 )
 from cdt.shared import get_logger
-from cdt.storage import canonical_numeric_text
+from cdt.storage.columns import canonical_numeric_text
 
 LOGGER = get_logger(__name__)
 

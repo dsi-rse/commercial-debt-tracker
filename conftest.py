@@ -31,11 +31,11 @@ def _isolated_s3_profile(monkeypatch: pytest.MonkeyPatch) -> None:
     stub stays local to that module: this only has to guarantee isolation, not
     fake AWS for everyone.
     """
-    from cdt import storage
+    from cdt.storage import objects as storage_objects
 
-    monkeypatch.setattr(storage, "_S3_CLIENTS", {})
-    monkeypatch.setattr(storage, "_BOTO3_SESSIONS", {})
-    monkeypatch.setattr(storage, "_CONFIGURED_S3_PROFILE", "")
+    monkeypatch.setattr(storage_objects, "_S3_CLIENTS", {})
+    monkeypatch.setattr(storage_objects, "_BOTO3_SESSIONS", {})
+    monkeypatch.setattr(storage_objects, "_CONFIGURED_S3_PROFILE", "")
 
 
 @pytest.fixture(autouse=True)

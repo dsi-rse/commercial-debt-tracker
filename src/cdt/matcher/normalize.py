@@ -14,10 +14,7 @@ from cdt.extractor.schema import (
     LENDER_DISCLOSURE_VALUES,
 )
 from cdt.matcher.schema import PreparedMention
-from cdt.storage import (
-    coerce_dataset_text,
-    json_column,
-)
+from cdt.storage.columns import coerce_dataset_text, json_column
 
 GENERIC_LENDER_TERMS = frozenset(
     {

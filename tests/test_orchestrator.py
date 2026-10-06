@@ -10,9 +10,10 @@ from pathlib import Path
 import pytest
 
 import cdt.orchestrator as orch
+from cdt.datasets import GENRE_6K, GENRE_8K
 from cdt.extractor import ExtractTickResult
 from cdt.lease import acquire_lease
-from cdt.pipeline import DEFAULT_GENRES, GENRE_6K, GENRE_8K
+from cdt.pipeline import DEFAULT_GENRES
 
 
 def test_poll_finalizes_on_completion(
@@ -670,7 +671,7 @@ def test_poll_aborts_when_lease_stolen_mid_tick(
 ) -> None:
     """A tick whose lease was stolen must not run match/finalize (#89)."""
     from cdt.lease import lease_path
-    from cdt.storage import read_json_artifact, write_json_artifact
+    from cdt.storage.objects import read_json_artifact, write_json_artifact
 
     monkeypatch.setattr(orch, "OpenAIBatchClient", lambda: object())
 

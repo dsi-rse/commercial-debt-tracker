@@ -31,7 +31,8 @@ from cdt.sixk.scraper import (
     assemble_submission,
     documents_in_sequence,
 )
-from cdt.storage import read_dataset, read_json_artifact
+from cdt.storage.objects import read_json_artifact
+from cdt.storage.tables import read_dataset
 
 BUCKET = "scraper-bucket"
 HARMONY_ACCESSION = "0001628280-26-060803"

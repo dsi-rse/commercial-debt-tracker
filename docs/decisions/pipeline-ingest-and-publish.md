@@ -9,6 +9,8 @@ can search for a name you saw in the code.
 
 ## Stage orchestration (`cdt.pipeline`)
 
+The `FINAL_OUTPUT_*` constants and `finalize_after_match` below live in `cdt.publish`, and `GENRE_8K` / `GENRE_6K` in `cdt.datasets`; they are described here because they shape the run.
+
 ### `FINAL_OUTPUT_TABLES`
 
 The published `items` table unions the itemizer's 8-K item sections with the
@@ -117,7 +119,7 @@ every pointer it has ever inferred (#204). It is skipped only when match
 produced nothing, because it would then read three empty datasets to write
 none.
 
-## The publish (`cdt.pipeline`)
+## The publish (`cdt.publish`)
 
 ### `write_final_output_tables` (atomic generation)
 

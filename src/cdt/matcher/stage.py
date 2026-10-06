@@ -50,13 +50,8 @@ from cdt.matcher.scoring import (
     resolve_candidates,
     score_candidates_for_mention,
 )
-from cdt.storage import (
-    artifact_exists,
-    read_dataset,
-    read_json_artifact,
-    write_json_artifact,
-    write_partition_table,
-)
+from cdt.storage.objects import artifact_exists, read_json_artifact, write_json_artifact
+from cdt.storage.tables import read_dataset, write_partition_table
 
 LOGGER = logging.getLogger(__name__)
 

@@ -13,12 +13,12 @@ import pandas as pd
 import pytest
 
 from cdt.classifier.core import CLASSIFICATION_DATASET_NAME, CLASSIFIED_ITEM_COLUMNS
-from cdt.datasets import (
-    SIXK_SNIPPET_DATASET_NAME,
+from cdt.completion import (
     CompletedPartition,
     load_completion_registry,
     save_completion_registry,
 )
+from cdt.datasets import SIXK_SNIPPET_DATASET_NAME
 from cdt.extractor import extract_pending_items, mentions_root
 from cdt.extractor.outputs import (
     CLASSIFICATION_SOURCES,
@@ -28,7 +28,7 @@ from cdt.extractor.outputs import (
 from cdt.extractor.schema import DEBT_INSTRUMENT_MENTION_COLUMNS
 from cdt.extractor.state import ExtractionRowState
 from cdt.sixk.stage import SIXK_SNIPPET_COLUMNS, item_id_for
-from cdt.storage import read_dataset, write_partition_table
+from cdt.storage.tables import read_dataset, write_partition_table
 
 PARTITION = {"date": "2026-09-08", "shard": "0001"}
 EIGHTK_ACCESSION = "000114036126006577"

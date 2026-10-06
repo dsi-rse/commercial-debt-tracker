@@ -8,7 +8,7 @@ it. Each section is headed by the name it explains, so you can search for a
 name from the code. Measurements name the data root they were taken on; rerun
 them before relying on them for a new decision.
 
-## storage.py
+## `cdt.storage` (`objects.py`, `tables.py`, `columns.py`)
 
 ### `configure_s3_profile`, `s3_client`, `boto3_session`
 
@@ -244,7 +244,7 @@ empty `tmp*.parquet` inside a partition directory, and every `**/*.parquet`
 reader failed on it (#68). `write_table` now uses `.parquet.tmp`. Readers
 still skip the old pattern, because existing roots may contain such files.
 
-## datasets.py
+## `completion.py` (the registry) and `datasets.py` (paths and shards)
 
 ### `completion_registry_root`, `_REGISTRY_SHARD_DATE_CHARS` (registry sharding)
 

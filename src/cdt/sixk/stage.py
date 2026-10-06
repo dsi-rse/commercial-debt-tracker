@@ -26,17 +26,19 @@ import pandas as pd
 
 from cdt import settings
 from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
-from cdt.datasets import (
-    SIXK_SNIPPET_DATASET_NAME,
+from cdt.completion import (
     CompletedPartition,
     completion_registry_path,
+    pending_source_partitions,
+    save_completion_registry,
+)
+from cdt.datasets import (
+    SIXK_SNIPPET_DATASET_NAME,
     dataset_root,
     date_shard_partition_path,
     parse_date_shard_partition,
-    pending_source_partitions,
     resolve_artifact_root,
     run_manifest_path,
-    save_completion_registry,
 )
 from cdt.ingest import DOCUMENT_COLUMNS, SIXK_DOCUMENT_DATASET_NAME
 from cdt.itemizer.core import document_text_for_record, ensure_s3_client
@@ -51,7 +53,8 @@ from cdt.sixk.triage import (
     triage_filing,
 )
 from cdt.sixk.windows import TextWindow, expand_admitted_windows, prepare_filing
-from cdt.storage import read_table, write_json_artifact, write_partition_table
+from cdt.storage.objects import write_json_artifact
+from cdt.storage.tables import read_table, write_partition_table
 
 LOGGER = get_logger(__name__)
 
