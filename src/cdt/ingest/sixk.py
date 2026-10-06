@@ -248,7 +248,7 @@ def acquire_scraped_sixk_documents(
 ) -> tuple[pd.DataFrame, IngestRunResult]:
     """Acquire 6-K filings from the scraper into the config's documents dataset.
 
-    Runs :func:`cdt.ingest.run_ingest_pipeline` with
+    Runs :func:`cdt.ingest.core.run_ingest_pipeline` with
     :class:`ScraperDocumentSource` as the candidate source. The frame is empty
     unless ``return_documents``.
 

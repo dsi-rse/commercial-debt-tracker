@@ -30,7 +30,7 @@ The scraper's source data and CDT's own artifacts can live in the same bucket (t
 narrowed with an `s3:prefix` condition, not a resource path, and an incomplete prefix list
 would produce silent empty listings rather than an error.
 
-`idi:source_prefix` must match `cdt.ingest.DEFAULT_S3_PREFIX` — Pulumi cannot import the
+`idi:source_prefix` must match `cdt.ingest.core.DEFAULT_S3_PREFIX` — Pulumi cannot import the
 package, so the two are coupled by convention. A mismatch denies every read ingest
 attempts.
 

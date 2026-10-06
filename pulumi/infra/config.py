@@ -24,7 +24,7 @@ bucket_name = aws.ssm.get_parameter(
 output_bucket_name = config.get("output_bucket_name") or bucket_name
 artifact_prefix = config.get("artifact_prefix") or "processors/cdt"
 final_database_prefix = config.get("final_database_prefix") or "database/cdt"
-# The scraper-owned prefix ingest reads. MUST match cdt.ingest.DEFAULT_S3_PREFIX:
+# The scraper-owned prefix ingest reads. MUST match cdt.ingest.core.DEFAULT_S3_PREFIX:
 # Pulumi cannot import the package, so the two are coupled by convention. If they
 # drift, the task role denies every GetObject ingest attempts.
 source_prefix = config.get("source_prefix") or "sec"

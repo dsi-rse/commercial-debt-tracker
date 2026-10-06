@@ -728,6 +728,70 @@ def test_force_retries_registered_permanent_failures(tmp_path: Path) -> None:
     assert persisted["entries"] == []
 
 
+@pytest.mark.parametrize(
+    ("force", "expected_accessions"),
+    [(False, []), (True, ["000114036126006577"])],
+    ids=["registered-failure-skipped", "forced-retry"],
+)
+def test_acquire_eightk_documents_passes_force_and_prefix_to_the_manifest_walk(
+    tmp_path: Path, force: bool, expected_accessions: list[str]
+) -> None:
+    """``config.s3_prefix`` picks the manifests and ``config.force`` retries permanent failures.
+
+    A filing under the default ``sec/`` prefix is a decoy: ingest must not see it.
+    """
+    from cdt.ingest.core import IngestFailureClassifier, IngestFailureType
+    from cdt.shared import FailureRegistry
+
+    manifest_key = "custom/2024-01-02/8-K/320193/000114036126006577/manifest.json"
+    client = FakeS3Client(
+        {
+            ("sec-bucket", manifest_key): _manifest_bytes(
+                "320193",
+                "0001140361-26-006577",
+                "8-K",
+                "2024-01-02",
+                "COMPLETE SUBMISSION TEXT FILE",
+                s3_key="s3://sec-bucket/custom/2024-01-02/8-K/320193/000114036126006577/document.htm",
+            ),
+            (
+                "sec-bucket",
+                "sec/2024-01-02/8-K/320193/000000000024000001/manifest.json",
+            ): _manifest_bytes(
+                "320193",
+                "0000000000-24-000001",
+                "8-K",
+                "2024-01-02",
+                "COMPLETE SUBMISSION TEXT FILE",
+                s3_key="s3://sec-bucket/sec/2024-01-02/8-K/320193/000000000024000001/document.htm",
+            ),
+        }
+    )
+    failure_file = failure_registry_path("ingest", artifact_root=tmp_path)
+    Path(failure_file).parent.mkdir(parents=True)
+    registry = FailureRegistry(failure_file, IngestFailureClassifier())
+    registry.add(("sec-bucket", manifest_key), IngestFailureType.DOCUMENT_NOT_FOUND)
+    registry.flush()
+
+    documents, _ = acquire_eightk_documents(
+        IngestConfig(
+            mode="historical",
+            bucket="sec-bucket",
+            cik_file=tmp_path / "ciks.txt",
+            start_date=date(2024, 1, 2),
+            end_date=date(2024, 1, 2),
+            data_dir=tmp_path,
+            failure_file=failure_file,
+            force=force,
+            s3_prefix="custom",
+        ),
+        s3_client=client,
+        return_documents=True,
+    )
+
+    assert documents["accession_number"].tolist() == expected_accessions
+
+
 def test_key_matches_ciks_with_multi_segment_prefix() -> None:
     """The CIK segment is found from the key's end, not a fixed index (#73)."""
     from cdt.ingest.core import _key_matches_ciks
