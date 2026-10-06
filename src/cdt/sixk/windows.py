@@ -1,21 +1,11 @@
-"""Preprocessing for Form 6-K documents ahead of the two-stage triage.
+"""Windowing for Form 6-K documents ahead of the two-stage triage.
 
-Ported from the ``uchicago-dsi/commercial-debt-tracker-models`` research repo,
-where the window size, the keyword gate and the inline-XBRL rule were each
-chosen against labelled data. The pieces belong together because they only make
-sense as a sequence: strip the XBRL padding, gate on debt vocabulary, then cut
-the survivor into the windows the classifier was trained on. That sequence is
-:func:`prepare_filing` rather than a comment, because the granularity each step
-runs at is not recoverable from the individual functions.
-
-Windows are 400 tokens, not the 2,000 the 8-K path uses. Only 1.2% of positive
-windows proved context-dependent at that size, and the smaller crop cut
-extraction tokens to 0.34x while still matching 146 of 154 known mentions.
-
-A crop that small does lose the noun naming the instrument often enough to
-matter, so :func:`expand_admitted_windows` gives it back -- after stage 1 has
-scored the unexpanded window, which is the only place the fix is free. See the
-section comment above it.
+Before stage 1, :func:`prepare_filing` strips the inline-XBRL prologue, gates
+the document on debt vocabulary, and cuts it into :data:`WINDOW_TOKENS`-token
+windows. After stage 1, :func:`expand_admitted_windows` prepends context to the
+admitted windows and merges adjacent ones. Window size, gate vocabulary and
+expansion limits were chosen against labelled data; see
+``docs/sixk-two-stage-triage.md``.
 """
 
 from __future__ import annotations
@@ -103,9 +93,8 @@ _XBRL_TAG_LINE = re.compile(r"(?i)^[A-Za-z][\w-]*:[\w.-]+$")
 #: A prologue must be at least this many lines before stripping is worthwhile.
 MIN_XBRL_PROLOGUE_LINES = 20
 
-#: Share of prologue lines that must be namespaced tags. Bare scalars alone are
-#: not enough: a borrowings schedule is also mostly bare numbers, and stripping
-#: one would delete the table bodies the annotation codebook rules relevant.
+#: Share of prologue lines that must be namespaced tags, so that a borrowings
+#: schedule (also mostly bare numbers) is not mistaken for a prologue.
 MIN_XBRL_TAG_SHARE = 0.10
 
 #: Share of prologue lines that must be context facts of some kind.
@@ -141,21 +130,16 @@ def strip_inline_xbrl_prologue(text: str) -> str:
     r"""Drop the leading block of inline-XBRL context facts from extracted text.
 
     Inline-XBRL 6-K documents (``<ticker>-<yyyymmdd>.htm``) extract with a long
-    prologue of context facts before any prose -- namespaced tags such as
-    ``iso4217:USD`` but also bare scalars such as the CIK, the period end and
-    lone numbers. The NER stage must echo its input verbatim, so every prologue
-    token is paid for at output prices and adds a chance of failing the identity
-    check, and TF-IDF windows of tag soup dilute the classifier signal. These
-    documents carry real prose after the prologue, so they are cleaned rather
-    than dropped.
+    prologue of context facts -- namespaced tags such as ``iso4217:USD`` and bare
+    scalars such as the CIK or period end -- before any prose.
 
-    Stripping stops at the first line that reads as prose, and is skipped unless
-    the block before it is long enough to matter, is almost entirely context
-    facts, and contains namespaced tags. A document with no prose at all is left
-    untouched. That last condition is what separates a
-    context dump from a numeric table: a borrowings schedule is also mostly bare
-    numbers, and stripping one would delete the very rows the annotation
-    codebook rules relevant. Text without such a prologue is returned unchanged.
+    The prologue ends at the last context-fact line before the first prose line,
+    so title lines between the two survive. It is removed only when it has at
+    least :data:`MIN_XBRL_PROLOGUE_LINES` lines, at least
+    :data:`MIN_XBRL_CONTEXT_SHARE` of them context facts and at least
+    :data:`MIN_XBRL_TAG_SHARE` namespaced tags; the tag share is what keeps a
+    numeric table, also mostly bare scalars, from being stripped. Text with no
+    prose line, or no qualifying prologue, is returned unchanged.
 
     Args:
         text: Extracted document text.
@@ -179,9 +163,8 @@ def strip_inline_xbrl_prologue(text: str) -> str:
     )
     if index is None:
         return text
-    # End the block at the last context fact, not at the first prose line, so
-    # that title and cover-header lines between the two survive. Losing them
-    # would cost the extraction stage the filer's own name.
+    # End at the last context fact, not the first prose line: the cover lines
+    # between them carry the filer's name.
     end = 0
     for offset in range(index):
         if _XBRL_CONTEXT_LINE.match(lines[offset].strip()):
@@ -198,10 +181,8 @@ def strip_inline_xbrl_prologue(text: str) -> str:
     return "\n".join(lines[end:])
 
 
-#: Document-level gate vocabulary. Pass ``keywords=`` to
-#: :func:`matched_debt_keywords` or :func:`has_debt_keyword` to widen a single
-#: run; the shipped tuple is what the 13.4% pass rate in the docs was measured
-#: against, so changing it in place invalidates that figure.
+#: Document-level gate vocabulary. Pass ``keywords=`` to widen a single run;
+#: the documented gate pass rate was measured against this tuple.
 DEBT_KEYWORDS: tuple[str, ...] = (
     "credit agreement",
     "indenture",
@@ -310,13 +291,10 @@ def has_debt_keyword(
 class TextWindow:
     """One contiguous window of a document.
 
-    ``text`` always equals ``source[start:end]``, and ``source`` is carried
-    rather than left to the caller because the post-admission expansion in
-    :func:`expand_admitted_windows` reads text *outside* the window. The text
-    those offsets refer to is the gated body, not the original document -- they
-    differ by however long an inline-XBRL prologue was stripped -- and a caller
-    holding both would eventually pass the wrong one, shifting every expansion
-    by that length with nothing to fail on.
+    ``text`` always equals ``source[start:end]``. ``source`` is the text the
+    offsets index into -- the prologue-stripped body, not the original
+    document -- carried so :func:`expand_admitted_windows` can read outside the
+    window without the caller supplying a text that might not match.
     """
 
     index: int
@@ -324,8 +302,7 @@ class TextWindow:
     start: int
     end: int
     token_count: int
-    #: Excluded from ``repr`` only because it is a whole document: a window's
-    #: repr in a failing assertion should stay readable.
+    #: The whole indexed text; kept out of ``repr`` for readability.
     source: str = field(repr=False)
 
 
@@ -347,8 +324,7 @@ def _split_span(
     """Split a span on a boundary pattern into spans that tile it exactly.
 
     Each boundary stays with the span it follows, so the spans concatenate back
-    to the original slice. Windows are emitted as one slice of the source, so
-    dropping the boundaries here would undercount their tokens.
+    to the original slice and their token counts cover every character.
     """
     spans: list[tuple[int, int]] = []
     position = start
@@ -410,16 +386,14 @@ def _leaf_spans(
 def _bounded_spans(text: str, *, max_tokens: int) -> list[tuple[int, int, int]]:
     r"""Return token-bounded spans that tile the text, with their token counts.
 
-    Counts include each span's trailing whitespace, so the packing in
-    :func:`_pack_spans` accounts for every character it will emit.
+    Counts include each span's trailing whitespace. Summed counts are not an
+    upper bound on the joined slice: ``o200k_base`` groups digits as
+    ``\p{N}{1,3}``, so ``", 8,72,6  "`` (8) plus ``"217"`` (1) joins to 10.
+    :func:`_to_windows` therefore re-measures and bisects, which is what makes
+    ``max_tokens`` a guarantee.
 
-    Summing counts is still only an approximation of the joined slice's cost,
-    not an upper bound on it: ``o200k_base`` groups digits as ``\p{N}{1,3}``, so
-    joining two spans can *raise* the count -- ``count_tokens(", 8,72,6  ")`` is
-    8 and ``count_tokens("217")`` is 1, but the concatenation is 10, not 9.
-    :func:`_to_windows` re-measures each candidate and bisects anything over
-    budget, which is what makes ``max_tokens`` an actual guarantee. That
-    bisection branch is load-bearing rather than defensive.
+    Raises:
+        ValueError: If ``max_tokens`` is less than 1.
     """
     if max_tokens < 1:
         raise ValueError(f"max_tokens must be positive, got {max_tokens}")
@@ -479,9 +453,8 @@ def _to_windows(
                 )
             ]
         )
-        # Bind the base before extending: ``list.extend`` consumes the
-        # generator incrementally, so reading ``len(windows)`` inside it would
-        # see the earlier pieces of this same candidate already appended.
+        # ``extend`` consumes the generator incrementally, so ``len(windows)``
+        # read inside it would count this candidate's earlier pieces.
         base = len(windows)
         windows.extend(
             TextWindow(
@@ -534,24 +507,16 @@ def prepare_filing(
     target_tokens: int = WINDOW_TOKENS,
     keywords: tuple[str, ...] = DEBT_KEYWORDS,
 ) -> list[TextWindow]:
-    """Run steps 1-3 of the sequence: strip, gate, then window.
+    """Strip the XBRL prologue, gate the whole document, then window it.
 
-    The order is load-bearing and was previously recorded only in prose. The
-    keyword gate applies to the *whole document*, after the prologue is stripped
-    and before it is cut up. Applying it per window instead would silently change
-    the measured 13.4% pass rate -- a filing that says "indenture" once in its
-    introduction would keep only the windows repeating the word, rather than all
-    of them -- and nothing would fail while it happened. Stripping after gating
-    would likewise let a prologue's tag names, which are made of debt
-    vocabulary, pass a filing whose prose never mentions debt.
+    The keyword gate applies to the whole stripped document, not per window:
+    a filing that passes keeps all its windows. These are the windows stage 1
+    scores; see docs/sixk-two-stage-triage.md for why the order matters.
 
     Args:
         text: Extracted document text.
         target_tokens: Window size; see :func:`split_into_windows`.
         keywords: Gate vocabulary; see :data:`DEBT_KEYWORDS`.
-
-    These are the windows stage 1 scores. What stage 2 and extraction see is
-    :func:`expand_admitted_windows` applied to the ones stage 1 admits.
 
     Returns:
         Windows for a filing that passes the gate, in document order; empty when
@@ -570,52 +535,33 @@ def prepare_filing(
 
 # --- Post-admission expansion -------------------------------------------------
 #
-# Everything above runs before stage 1. Everything below runs *after* it, on the
-# windows stage 1 admitted, and never on the windows it scores: the shipped
-# stage-1 model and its calibrated threshold are properties of the 400-token
-# crop, so widening the text it sees would invalidate both. Expanding after
-# admission buys context for extraction at no cost to the classifier.
+# Everything below runs on the windows stage 1 admitted, never on the windows it
+# scores: the stage-1 model and threshold are calibrated on the unexpanded crop.
 
-#: Tokens of context prepended to an admitted window, unless a section header
-#: is reached sooner. A 400-token crop can keep an instrument's amounts, rates
-#: and dates while cutting away the noun that names it, which leaves the
-#: extractor nothing to anchor on -- the input no longer determines an answer.
-#: Chosen by replaying the generalization window's 392 admitted windows: of the
-#: kept snippets carrying money, a rate or a date with no instrument noun
-#: anywhere, 7 of 7 recover a noun at 200 tokens, against 4 of 7 at 100. Most
-#: of the way there by 150; 200 is what also reaches the table header above a
-#: page break, which is the shape the reviewers could not read at all.
+#: Tokens of context prepended to an admitted window unless a section header is
+#: reached sooner. Chosen empirically; see docs/sixk-two-stage-triage.md.
 MIN_EXPANSION_TOKENS = 200
 
-#: Hard cap on the context prepended to one admitted window. Expansion is paid
-#: only on the 5.8% of windows stage 1 admits, but the walk backwards needs a
-#: stop for the case where no header and no blank line is found: without one,
-#: a document of unbroken table rows would prepend itself to every window.
-#: Past the minimum this only buys a tidier boundary, so it is one window wide
-#: rather than generous.
+#: Hard cap on the context prepended to one admitted window, for when the walk
+#: backwards finds no header or blank line (e.g. unbroken table rows).
 MAX_EXPANSION_TOKENS = 400
 
-#: Ceiling on one merged window. Adjacent admitted windows merge rather than
-#: emit their shared context twice, and a run of them would otherwise merge
-#: without limit -- the generalization window has a run of 21, reaching 8,191
-#: tokens. 2,000 is what the 8-K path already sends the same extractor, so no
-#: 6-K snippet is larger than something that stage already handles. The budget
-#: is summed from the parts rather than measured on the join, like the packing
-#: in :func:`_bounded_spans`, so it is a target and not a guarantee.
+#: Ceiling on the merged-window estimate, matching the largest snippet the 8-K
+#: path sends the extractor. The estimate counts the first member's context and
+#: each member's own tokens, not the text a later member's expansion pulls in to
+#: reach the span, so each merge can add up to :data:`MAX_EXPANSION_TOKENS`
+#: uncounted and a merged window can exceed this ceiling.
 MAX_MERGED_TOKENS = 2_000
 
 #: Longest a line can be and still read as a heading rather than a sentence.
 MAX_HEADER_WORDS = 12
 
-#: How far back a paragraph-boundary test looks. Long enough to see a blank
-#: line through an indented continuation, short enough that the test stays
-#: bounded work per candidate.
+#: Characters a paragraph-boundary test looks back through.
 _PARAGRAPH_LOOKBACK = 200
 
-#: Characters scanned per token of budget when collecting candidate stops. Only
-#: a bound on the search, not on the result: the token budget is what decides
-#: how far the walk goes. Generous because table text runs far fewer characters
-#: per token than prose does.
+#: Characters scanned per token of budget when collecting candidate stops. A
+#: bound on the search only; the token budget decides how far the walk goes.
+#: Generous because table text has far fewer characters per token than prose.
 _CHARS_PER_TOKEN_BOUND = 24
 
 #: An explicitly numbered heading: ``Item 5.02``, ``NOTE 12 - BORROWINGS``,
@@ -637,14 +583,11 @@ _PARAGRAPH_BREAK_BEFORE = re.compile(r"\n[^\S\n]*\n\s*\Z")
 class ExpandedWindow:
     """One admitted window with its context, and the windows it absorbed.
 
-    ``window`` is the text extraction should see. ``member_indices`` holds the
-    indices of every admitted window it covers, in document order: adjacent
-    admitted windows merge rather than emit their shared context twice, so a
-    caller persisting one row per admitted window still knows which rows this
-    text answers for. A merged window is larger than ``WINDOW_TOKENS`` by
-    design, bounded by :data:`MAX_MERGED_TOKENS`: its members were separate
-    snippets bound for extraction anyway, and merging them sends the text they
-    share once instead of twice.
+    ``window`` is the text stage 2 and extraction see; its ``index`` is the
+    first member's. ``member_indices`` holds the indices of every admitted
+    window it covers, in document order. A merged window may exceed
+    :data:`WINDOW_TOKENS`, and can exceed :data:`MAX_MERGED_TOKENS` (see
+    there).
     """
 
     window: TextWindow
@@ -654,20 +597,13 @@ class ExpandedWindow:
 def _is_section_header(line: str, *, isolated: bool) -> bool:
     """Return whether a line reads as a section header rather than body text.
 
-    Casing alone does not decide it. Extracted 6-K text puts one table cell per
-    line, and a cell reads exactly like a heading: ``Currency``, ``Book Value``
-    and ``I`` are all short, unpunctuated and capitalised. Worse, the lines that
-    survive a page break inside a table -- ``GRUPO SUPERVIELLE S.A.``, ``NOTES
-    TO THE CONSOLIDATED FINANCIAL STATEMENTS`` -- look like the strongest
-    headings in the document while marking nothing at all. So a casing-based
-    header also has to stand alone in its own paragraph, which a cell in a
-    column of cells does not. Only an explicitly numbered heading is taken on
-    its wording alone.
-
-    Erring towards ``False`` is the cheap direction: the walk backwards then
-    carries on to its token minimum and passes over the unrecognised heading on
-    the way. A false ``True`` stops the walk early and can leave the instrument
-    noun outside the window, which is the failure expansion exists to fix.
+    A header has at most :data:`MAX_HEADER_WORDS` words. An explicitly numbered
+    heading (``Item 5.02``, ``Note 12``) qualifies on its wording; otherwise
+    the line must be isolated, contain no digits, not end in
+    ``.``/``,``/``;``, and be upper case, end in ``:``, or be title case --
+    isolation is what rejects table cells, which extract one per line and read
+    like headings. Ambiguous lines return ``False``: a missed header only lets
+    the walk continue to its token minimum, while a false one stops it early.
 
     Args:
         line: A single line of extracted text.
@@ -696,10 +632,8 @@ def _is_section_header(line: str, *, isolated: bool) -> bool:
         return False
     if _NUMBERED_HEADING.match(text):
         return True
-    # A digit outside a numbered heading means the line carries data, and a
-    # table row is the shape most easily mistaken for a heading. Stopping the
-    # walk on a row is the worst outcome available here, because the row above
-    # it is where the header actually is.
+    # A digit outside a numbered heading marks a table row, whose real header
+    # sits above it.
     if any(character.isdigit() for character in text):
         return False
     if not isolated or not any(character.isalpha() for character in text):
@@ -774,11 +708,10 @@ def _farthest_within_budget(
 ) -> int | None:
     """Return the last candidate position whose span to ``limit`` fits a budget.
 
-    Candidates run nearest-first, so the span to ``limit`` only grows along the
-    list and a bisection finds the boundary in a handful of token counts rather
-    than one per line. Token counts of nested spans are non-decreasing but not
-    provably so -- BPE merges across a new boundary -- and an off-by-one token
-    at the edge of a heuristic budget does not matter.
+    Candidates run nearest-first, so the span grows along the list and the
+    boundary is found by bisection. BPE merges make nested-span counts only
+    approximately monotone; an off-by-one token at the edge is acceptable.
+    ``None`` when even the nearest candidate exceeds the budget.
     """
     if count_tokens(text[candidates[0] : limit]) > budget:
         return None
@@ -801,7 +734,8 @@ def _first_reaching_minimum(
 ) -> int | None:
     """Return the first candidate position whose span to ``limit`` reaches a minimum.
 
-    Bisects on the same monotonicity as :func:`_farthest_within_budget`.
+    Bisects like :func:`_farthest_within_budget`; ``None`` when even the
+    farthest candidate falls short.
     """
     if count_tokens(text[candidates[-1] : limit]) < minimum:
         return None
@@ -824,12 +758,9 @@ def _expansion_start(
 ) -> int:
     r"""Return the offset an admitted window should be expanded back to.
 
-    The stop is chosen in the order the failure demands. A section header ends
-    the walk wherever it is found, because the section title is both the
-    likeliest place the instrument is named and the point past which the text
-    belongs to something else. Otherwise the walk takes at least ``min_tokens``
-    and then stops at the nearest blank line, falling back to the line boundary
-    where the minimum was met. Nothing crosses ``max_tokens``.
+    The walk backwards stops at the first of: the nearest section header; the
+    nearest blank line once ``min_tokens`` are taken; the line boundary where
+    ``min_tokens`` was met. Nothing crosses ``max_tokens``.
 
     Args:
         text: Document text the window indexes into.
@@ -870,8 +801,7 @@ def _expansion_start(
         return header
     minimum = _first_reaching_minimum(text, reachable, start, minimum=min_tokens)
     if minimum is None:
-        # The whole reachable prefix is shorter than the minimum, so there is
-        # nothing to choose between: take all of it.
+        # Everything reachable is shorter than the minimum: take all of it.
         return reachable[-1]
     paragraph = next(
         (offset for offset in reachable[minimum:] if _is_paragraph_start(text, offset)),
@@ -890,9 +820,9 @@ def _line_at(text: str, offset: int) -> str:
 class _MergedSpan:
     """A span under construction, with a running token estimate.
 
-    The estimate sums the parts -- prepended context plus each member's own
-    count -- rather than re-measuring the join on every merge, which would make
-    a long run quadratic in the text it covers.
+    The estimate sums the first member's prepended context and each member's
+    own count rather than re-measuring the join, which would make a long run
+    quadratic; context a later member brings is not counted.
     """
 
     start: int
@@ -935,10 +865,10 @@ def expand_admitted_windows(
 ) -> list[ExpandedWindow]:
     r"""Prepend context to the windows stage 1 admitted, merging what overlaps.
 
-    Run this between stage 1 and stage 2, never before stage 1: see the section
-    comment above. Windows must come from one document, since offsets are only
-    comparable within the text they index into and merging spans across two
-    documents would splice unrelated text together.
+    Runs between stage 1 and stage 2, never before stage 1. Each window is
+    expanded backwards (see :func:`_expansion_start`); a window whose expansion
+    reaches or abuts the previous span joins it while the merged estimate stays
+    within ``max_merged_tokens``, and otherwise starts a new span.
 
     Args:
         windows: Admitted windows from a single document, in any order.
@@ -987,23 +917,14 @@ def expand_admitted_windows(
         start = _expansion_start(
             source, window.start, min_tokens=min_tokens, max_tokens=max_tokens
         )
-        # An expansion that reaches into its predecessor -- or is separated from
-        # it by whitespace alone -- emits text the predecessor already carries,
-        # so the two become one window instead of two overlapping ones. Slicing
-        # with a start before the previous end yields "", which is why the
-        # overlap case and the abutting case read the same here.
+        # Overlap slices to "", so overlapping and whitespace-separated
+        # expansions both count as adjacent.
         adjacent = bool(spans) and not source[spans[-1].end : start].strip()
         if adjacent and spans[-1].tokens + window.token_count <= max_merged_tokens:
             spans[-1] = spans[-1].merged(window)
         else:
-            # Either this window's expansion did not reach its predecessor, or
-            # the run is longer than one window may be and the budget cut it
-            # here. A window opening a cut run still expands, so the text
-            # either side of the cut is sent twice; that is the cheaper
-            # mistake, because the duplicate is bounded by ``max_tokens``
-            # while a window starting cold at the cut is back to the failure
-            # this function exists to fix. The run of 21 in the generalization
-            # window is exactly that case: its table header sits above a cut.
+            # A window opening a run cut by the budget still expands, so up to
+            # ``max_tokens`` of text is sent twice rather than starting cold.
             spans.append(
                 _MergedSpan.of(
                     window,

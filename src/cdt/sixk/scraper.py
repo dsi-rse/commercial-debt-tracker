@@ -1,29 +1,11 @@
-"""Acquire Form 6-K filings from the scraper's bucket, like every other form.
+"""Acquire Form 6-K filings from the scraper's bucket, the 6-K path's only source.
 
-The scraper carries 6-K over its whole history — every filing-date partition
-from 2016-01-04 onward has them — so this is the 6-K path's only source, as the
-scraper's bucket is the 8-K path's only source. An earlier direct-EDGAR
-acquisition existed for the window when the bucket held no 6-K at all; it was
-removed once the bucket carried them, because a second way to acquire one genre
-is a second failure taxonomy, a second throttling policy and a second thing to
-keep true for no remaining benefit.
-
-It cannot reuse the 8-K path's candidate scan, for one reason: what the scraper
-stores per filing differs by form. An 8-K filing is one object, the complete
-submission text file, and the 8-K candidate names it through ``resource_uri``.
-A 6-K filing is one object *per document* (the 6-K body, then its exhibits) and
-no whole-submission object exists to name, while the triage stage reads one
-submission per row — it splits a filing into its prose documents itself.
-
-So this source assembles the submission the scraper did not store, and mirrors
-it under CDT's own prefix. Assembly is a concatenation and nothing more: each
-stored object is already the document's dissemination-format ``<DOCUMENT>``
-block, header lines included, so joining them in sequence order reproduces the
-submission EDGAR itself serves, minus the ``<SEC-HEADER>`` preamble that
-:func:`cdt.sixk.documents.prose_documents` discards anyway. Checked against
-EDGAR on 23 real filings spanning 2016 to 2026, including a 6-K/A: every
-flattened prose document came out byte-identical, which is what carries the
-triage stage's measured behaviour over from the corpus it was scored on.
+The scraper stores a 6-K as one object per document (body, then exhibits),
+with no whole-submission object, so this source assembles the submission by
+concatenating the stored ``<DOCUMENT>`` blocks in sequence order and mirrors it
+(:mod:`cdt.sixk.mirror`). The result is EDGAR's complete submission minus the
+``<SEC-HEADER>`` preamble; see ``docs/sixk-two-stage-triage.md`` for how that
+was checked.
 """
 
 from __future__ import annotations
@@ -67,12 +49,10 @@ LOGGER = get_logger(__name__)
 
 
 def submission_url(cik: str, accession_number: str) -> str:
-    """Return the complete-submission text file URL for one filing.
+    """Return the EDGAR complete-submission text file URL for one filing.
 
-    Not fetched — recorded. It names, publicly, the submission a row's
-    assembled text *is*, which is what an 8-K row's ``url`` names for the
-    object the scraper stored. ``accession_number`` is the manifest's dashed
-    form; the directory segment is the same digits without dashes.
+    ``accession_number`` must be the dashed form; the dash-stripped form names
+    a file that does not exist. The URL is recorded, never fetched.
     """
     return (
         f"https://www.sec.gov/Archives/edgar/data/{cik.lstrip('0')}/"
@@ -80,10 +60,8 @@ def submission_url(cik: str, accession_number: str) -> str:
     )
 
 
-#: The marker every stored document begins with. Checked rather than assumed:
-#: assembly is only faithful because the scraper keeps the ``<DOCUMENT>``
-#: wrapper, and a source that quietly stopped doing so would produce prose the
-#: window stage reads differently, with nothing downstream able to tell.
+#: The marker every stored document must begin with for assembly to be
+#: faithful; checked by :func:`assemble_submission`.
 DOCUMENT_MARKER = "<DOCUMENT>"
 
 
@@ -94,10 +72,12 @@ class MalformedSubmissionError(RuntimeError):
 def assemble_submission(filing: ScrapedFiling, documents: list[str]) -> str:
     """Return one complete submission from a filing's stored documents.
 
-    ``documents`` are the decoded objects in the order they should appear.
-    Concatenated verbatim — no separator, no re-encoding — because each is
-    already a complete ``<DOCUMENT>`` block and the extractor later quotes this
-    text as evidence.
+    ``documents`` are the decoded objects in submission order, concatenated
+    verbatim with no separator.
+
+    Raises:
+        MalformedSubmissionError: If a document does not begin with
+            :data:`DOCUMENT_MARKER`.
     """
     for index, document in enumerate(documents):
         if not document.lstrip().startswith(DOCUMENT_MARKER):
@@ -114,11 +94,9 @@ def assemble_submission(filing: ScrapedFiling, documents: list[str]) -> str:
 def documents_in_sequence(filing: ScrapedFiling) -> list[str]:
     """Return the filing's document S3 URIs in submission order.
 
-    Sorted by the manifest's own ``seq``, which is the submission's document
-    order and therefore the order a snippet's ``document_index`` counts in.
-    A document with no usable sequence sorts last rather than failing the
-    filing: its position is unknown, and dropping the filing over it would lose
-    prose that is still readable.
+    Sorted by the manifest's ``seq``, the order a snippet's ``document_index``
+    counts in. A document with no integer ``seq`` sorts last; one with no S3 key
+    is omitted.
     """
     ordered = sorted(filing.documents, key=lambda document: _sequence(document.seq))
     return [document.s3_key for document in ordered if document.s3_key]
@@ -135,10 +113,10 @@ def _sequence(value: str) -> int:
 class ScraperDocumentSource:
     """6-K candidates assembled from the scraper's per-document objects.
 
-    Acquisition happens during iteration: a candidate exists only once its
-    submission has been mirrored, and a filing already mirrored is yielded
-    without re-reading its documents. That makes the mirror the resume ledger,
-    so re-running a range costs one existence check per filing.
+    Iterating mirrors each filing's assembled submission and yields its
+    candidate. A filing whose mirror exists is yielded without re-reading its
+    documents unless ``config.force``; a filing that fails is recorded in
+    ``failure_registry`` and skipped.
     """
 
     config: IngestConfig
@@ -180,8 +158,7 @@ class ScraperDocumentSource:
                 failure_registry=self.failure_registry,
             )
             if filing is None:
-                # Already recorded and counted by the shared reader; a manifest
-                # the scraper marked failed is not a failure of this run.
+                # Recorded by the shared reader; not a failure of this run.
                 continue
             indexed += 1
             target = mirror_path(
@@ -235,9 +212,6 @@ class ScraperDocumentSource:
             LOGGER.error("%s", error)
             self._record(key, IngestFailureType.MALFORMED_DOCUMENT)
             return False
-        # UTF-8 because that is what decode_document_bytes produced: the stored
-        # objects are decoded once here, and re-encoding to anything else would
-        # change the text the extractor quotes as evidence.
         write_bytes_artifact(target, gzip.compress(submission.encode("utf-8")))
         if self.config.force and self.failure_registry is not None:
             # The registered failure did not reproduce, so stop skipping it.
@@ -247,20 +221,10 @@ class ScraperDocumentSource:
     def _candidate(self: Self, filing: ScrapedFiling, target: str) -> DocumentCandidate:
         return DocumentCandidate(
             accession_number=normalize_accession_number(filing.accession_number),
-            # Exactly what the 8-K candidate records: the manifest reader's
-            # canonical 10-digit padded form (#153). Stripping it here instead
-            # would publish one issuer's CIK in two spellings across the two
-            # genres. Sharding would survive that — `shard_for_cik` hashes the
-            # unpadded form deliberately — but a published column that reads
-            # differently per genre is the inconsistency this path exists to
-            # avoid.
+            # Kept 10-digit padded, as the 8-K candidate records it.
             cik=filing.cik,
             company_name=filing.company_name,
-            # The submission this row's text is, named where it is public —
-            # what an 8-K row's `url` means for the object the scraper stored.
-            # The scraper's own per-document URLs cannot be one value. Built
-            # from the manifest's dashed accession, the spelling sec.gov serves
-            # it under; the stored, dash-stripped one names a file that 404s.
+            # Dashed accession: the stored dash-stripped form 404s on sec.gov.
             url=submission_url(filing.cik, filing.accession_number),
             resource_uri=target,
             date=filing.filing_date.isoformat(),
@@ -286,9 +250,13 @@ def acquire_scraped_sixk_documents(
 ) -> tuple[pd.DataFrame, IngestRunResult]:
     """Acquire 6-K filings from the scraper into the config's documents dataset.
 
-    Shares every stage of ingest except where filings come from, so the run
-    manifest, accession dedup and partition layout are the 8-K path's.
-    ``return_documents`` is ``run_ingest_pipeline``'s: off, the frame is empty.
+    Runs :func:`cdt.ingest.run_ingest_pipeline` with
+    :class:`ScraperDocumentSource` as the candidate source. The frame is empty
+    unless ``return_documents``.
+
+    Raises:
+        ValueError: If ``config.download`` is set or ``config.form_types`` is
+            empty.
     """
     if config.download:
         msg = (

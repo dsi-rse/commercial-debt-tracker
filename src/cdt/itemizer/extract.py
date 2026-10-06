@@ -66,9 +66,8 @@ ITEM_NAME_TO_NUMBER = {
     "financial statements and exhibits": "9.01",
 }
 
-# The closed set of real 8-K item numbers. A number that merely looks like one
-# ('6.00' from a rate table cell, '2.00' from a price) can never be a heading,
-# no matter how heading-shaped the line is (#63).
+# The closed set of real 8-K item numbers; nothing else can be a heading
+# ('6.00' from a rate table cell, '2.00' from a price).
 VALID_ITEM_NUMBERS = frozenset(ITEM_NAME_TO_NUMBER.values())
 
 
@@ -203,10 +202,8 @@ def extract_items_from_document(document: DocumentText) -> list[ItemSection]:
     lines = normalize_body_lines(primary_8k_body(document.text))
     headings = item_headings(lines)
     rows = []
-    # item_id is accession + item_number, so a header repeating an ITEM
-    # INFORMATION line (which SEC headers do produce) or two labels mapping to
-    # one number would emit duplicate primary keys and corrupt downstream joins
-    # (#74). Keep the first occurrence of each key.
+    # item_id is accession + item_number: keep only the first occurrence of
+    # each, since headers can repeat a line or map two labels to one number.
     seen_keys: set[str] = set()
     for item_information in iter_item_information_values(document.text):
         item_number = ITEM_NAME_TO_NUMBER.get(item_information)
@@ -332,11 +329,9 @@ def leading_item_numbers(line: str) -> tuple[str, ...]:
     if any(phrase in normalized_casefold for phrase in NON_HEADING_PHRASES):
         return ()
 
-    # Only real 8-K item numbers count, and even those are rejected when they
-    # read as money or a rate: '$1.05 billion' inside a heading line, or a
-    # coupon like '5.25%' — '5.25% Senior Notes due 2029' as a body line (HTML
-    # table cells become their own lines) otherwise truncated the enclosing
-    # item section right at the debt text this pipeline targets (#63).
+    # Reject numbers that read as money or a rate ('$1.05 billion', '5.25%
+    # Senior Notes'): table cells become their own lines, and a false heading
+    # there would truncate the section at the debt text.
     item_match = re.match(r"^\s*Item\b(?P<rest>.*)$", normalized, re.IGNORECASE)
     if item_match:
         numbers = re.findall(r"(?<![$€£])\b\d\.0\d\b(?!\s*%)", item_match.group("rest"))

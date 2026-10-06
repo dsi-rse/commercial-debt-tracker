@@ -1,5 +1,7 @@
 # Wiring the 6-K path into the pipeline
 
+> **Decision record, last revised 2026-09-22.** This describes the design as it was decided and the state of the code at the time. It is kept for its reasoning; it is not a description of the current code. For that, see `docs/architecture.md` and the module docstrings.
+
 `cdt.sixk` landed on `dev` as a library with tests and no callers. Its own doc
 closes with the gap this plan fills:
 

@@ -1,23 +1,16 @@
-"""Dedicated orchestrator entrypoint for ECS and local batch runs.
+"""Orchestrator entrypoint for ECS and local runs.
 
-Deployment uses two schedules:
+Modes:
 
-- ``daily`` runs ingest → itemize → classify and refreshes match/final snapshots.
-  With the default ``batch`` backend it does NOT run the LLM extract stage; that is
-  handed to the asynchronous OpenAI Batch poller.
-- ``poll`` runs hourly, advancing the OpenAI batch extract job by one tick and, when
-  a job completes, re-running match + finalize.
+- ``daily`` and ``historical`` run the prepare stages, then match and
+  finalize. With the default ``batch`` backend extraction is left to ``poll``;
+  ``--extractor-backend live`` runs the synchronous pipeline instead.
+- ``poll`` advances the OpenAI batch extract job by one tick and, when the job
+  completes, runs match and finalize.
 
-A single ``pipeline-writer`` lease (``cdt.lease``) serializes every mutator of
-extract job state and the match/final snapshots: a poll tick that outlives its
-hour (or an EventBridge retry) cannot overlap the next tick, and ``daily``'s
-match/finalize cannot interleave with a completing poll's. A run that finds the
-lease held skips its turn (``locked``) and the next scheduled run picks it up.
-
-``historical`` follows the same shape as ``daily`` — with the default ``batch``
-backend it prepares its date range and hands extraction to the poller, whose next
-tick claims the pending partitions. ``--extractor-backend live`` (on either mode)
-keeps the original fully synchronous pipeline that extracts via OpenRouter.
+Every mode runs under the ``pipeline-writer`` lease. ``daily`` and
+``historical`` wait up to LEASE_WAIT_SECONDS for it and fail if it stays held;
+``poll`` skips its tick and prints ``locked``.
 """
 
 from __future__ import annotations
@@ -54,20 +47,14 @@ from cdt.storage import configure_s3_profile
 
 LOGGER = get_logger(__name__)
 
-# Daily/historical runs must not silently skip a day's work because an hourly
-# poll tick briefly held the lease: a normal tick is minutes, so a bounded wait
-# absorbs it. A wedged holder outlasts the wait and the run fails loudly (#88).
+# How long daily/historical wait for a lease held by a poll tick before failing.
 LEASE_WAIT_SECONDS = 15 * 60
 LEASE_POLL_SECONDS = 30
 
-# ECS has no task-level timeout: a Fargate task runs (and bills) until its
-# process exits, so a run wedged past every client timeout must reap itself
-# (#93). Deadlines are per mode — a poll tick is minutes (the 2h matches the
-# lease TTL), daily is bounded by its 24h cadence, and historical backfills
-# legitimately run long. Override with --max-runtime-hours.
+# Per-mode wall-clock deadline for the runtime watchdog: ECS has no task-level
+# timeout, so a wedged run must reap itself. Override with --max-runtime-hours.
 MODE_DEADLINE_HOURS: dict[str, float] = {"poll": 2, "daily": 12, "historical": 72}
-# EX_SOFTWARE: distinguishes a watchdog self-reap from an ordinary crash in
-# the task's stoppedReason; any nonzero exit trips the task-failure alarm (#85).
+# EX_SOFTWARE, so a watchdog self-reap is distinguishable from a crash.
 WATCHDOG_EXIT_CODE = 70
 
 
@@ -77,12 +64,11 @@ def start_runtime_watchdog(
     *,
     exit_fn: Callable[[int], None] = os._exit,
 ) -> threading.Timer:
-    """Arm a daemon timer that hard-exits the process past its deadline.
+    """Arm a daemon timer that calls ``exit_fn(WATCHDOG_EXIT_CODE)`` past the deadline.
 
-    ``os._exit`` deliberately skips ``finally`` blocks: every artifact write is
-    already crash-safe, and the unreleased lease is exactly the crash path the
-    TTL/steal design recovers — a clean shutdown of a wedged process is not
-    achievable anyway.
+    The deadline is ``max_runtime_hours``, or MODE_DEADLINE_HOURS[mode] when
+    None. The default ``os._exit`` skips ``finally`` blocks; an unreleased lease
+    is recovered by its TTL.
     """
     hours = (
         max_runtime_hours
@@ -129,12 +115,7 @@ _SECRET_ENV_VARS = ("OPENAI_API_KEY", "OPENROUTER_API_KEY")
 
 
 def reject_placeholder_secrets() -> None:
-    """Fail fast when an injected API key still holds the Pulumi placeholder.
-
-    Without this, a task launched before the one-time ``aws ssm put-parameter``
-    spends a full ingest/itemize/classify before dying on a provider 401 that
-    reads like a revoked key.
-    """
+    """Raise SystemExit if an API-key env var still holds the Pulumi placeholder."""
     stale = [
         name
         for name in _SECRET_ENV_VARS
@@ -150,7 +131,7 @@ def reject_placeholder_secrets() -> None:
 
 
 def default_cik_file() -> str:
-    """Return the default deployed CIK file path."""
+    """Return ``CDT_DEFAULT_CIK_FILE``; raise RuntimeError if it is unset."""
     value = os.environ.get("CDT_DEFAULT_CIK_FILE")
     if not value:
         raise RuntimeError("CDT_DEFAULT_CIK_FILE is required for orchestrator runs.")
@@ -167,8 +148,7 @@ def _add_stage_batch_size_arguments(subparser: argparse.ArgumentParser) -> None:
     subparser.add_argument(
         "--classify-batch-size", type=positive_int, default=DEFAULT_STAGE_BATCH_SIZE
     )
-    # Defaults to None so a daily batch-backend run can tell an explicit override
-    # (which it must warn about) from the unset default.
+    # None, so the batch backend can warn about an explicit value.
     subparser.add_argument(
         "--extract-batch-size",
         type=positive_int,
@@ -263,8 +243,7 @@ def build_parser() -> argparse.ArgumentParser:
     poll.add_argument("--max-attempts", type=positive_int, default=DEFAULT_MAX_ATTEMPTS)
     poll.add_argument("--max-requests-per-batch", type=positive_int, default=None)
     poll.add_argument("--max-batch-bytes", type=positive_int, default=None)
-    # Caps rows claimed into one job so a post-backfill job cannot OOM the
-    # poll task; deferred partitions form the next job (#92).
+    # Caps rows claimed into one job so it cannot OOM the poll task.
     poll.add_argument("--max-rows-per-job", type=positive_int, default=None)
     return parser
 
@@ -300,11 +279,10 @@ def _pipeline_config(args: argparse.Namespace) -> PipelineConfig:
 
 
 def run_batch_backend(args: argparse.Namespace) -> int:
-    """Run ingest/itemize/classify plus match/finalize, deferring extract to poll.
+    """Run the prepare stages plus match/finalize under the lease; defer extract to poll.
 
-    Serves both ``daily`` and ``historical``: the pipeline config carries the
-    mode, so only the resolved date range differs. The next poll tick claims
-    whatever classification partitions this run leaves pending.
+    Serves both ``daily`` and ``historical``. Returns the exit code: 1 when the
+    lease cannot be acquired or is lost, else 0 (the artifact root is printed).
     """
     if args.extract_batch_size is not None:
         LOGGER.warning(
@@ -321,9 +299,7 @@ def run_batch_backend(args: argparse.Namespace) -> int:
             "tick with --force while no job is active."
         )
     config = _pipeline_config(args)
-    # The prepare stages rewrite the same completion registries a poll tick's
-    # finalize does, so the whole run — not just match/finalize — holds the
-    # writer lease (#88).
+    # Prepare writes registries a poll tick also writes, so the lease covers it.
     resolved_root = resolve_artifact_root(args.artifact_root)
     lease = acquire_lease_with_wait(resolved_root, PIPELINE_WRITER_LEASE)
     if lease is None:
@@ -341,10 +317,8 @@ def run_batch_backend(args: argparse.Namespace) -> int:
             "the next `poll` run. Ensure the poll schedule is enabled, or run "
             "`cdt-orchestrator poll` manually — nothing else drives extraction."
         )
-        # Keep final snapshots fresh from whatever mentions already exist; the
-        # in-flight batch job (advanced by ``poll``) will refresh them again when
-        # it completes. Prepare can outlast the TTL, so renew — and if the lease
-        # was stolen, the snapshots belong to another run now.
+        # Publish from the mentions that already exist; poll publishes again
+        # when the batch job completes.
         renew()
         run_match_and_finalize(
             artifact_root=artifact_root,
@@ -358,9 +332,8 @@ def run_batch_backend(args: argparse.Namespace) -> int:
         return 1
     finally:
         release_lease(lease)
-    # The literal below feeds the daily-heartbeat CloudWatch alarm (#85): a
-    # missing "mode=daily" completion for a day means the run crashed, wedged,
-    # or never launched. Keep it in sync with pulumi/infra/alerts.py.
+    # The daily-heartbeat CloudWatch alarm matches this literal; keep it in
+    # sync with pulumi/infra/alerts.py.
     LOGGER.info(
         "Orchestrator run complete: mode=%s artifact_root=%s",
         config.mode,
@@ -373,9 +346,8 @@ def run_batch_backend(args: argparse.Namespace) -> int:
 def run_poll(args: argparse.Namespace) -> int:
     """Advance the OpenAI batch extract job by one tick; finalize on completion.
 
-    The whole tick (including the completion-triggered match/finalize) runs
-    under the pipeline-writer lease; if another run holds it, this tick is
-    skipped and reports ``locked``.
+    Runs under the pipeline-writer lease. Prints the job status, or ``locked``
+    when the lease is held (exit 0). Returns 1 if the lease is lost mid-tick.
     """
     resolved_root = resolve_artifact_root(args.artifact_root)
     lease = acquire_lease(resolved_root, PIPELINE_WRITER_LEASE)
@@ -393,9 +365,7 @@ def run_poll(args: argparse.Namespace) -> int:
             "artifact_root": resolved_root,
             "max_attempts": args.max_attempts,
             "force": args.force,
-            # Extend the lease at the tick's phase boundaries so a legitimately
-            # long fold/submit is not stolen by the next hourly run; the hook
-            # raises LeaseLostError if it already was, aborting the tick (#89).
+            # Renewed at phase boundaries; raises LeaseLostError if stolen.
             "renew_lease": renew,
         }
         if args.max_requests_per_batch is not None:
@@ -405,8 +375,8 @@ def run_poll(args: argparse.Namespace) -> int:
         if args.max_rows_per_job is not None:
             tick_kwargs["max_rows_per_job"] = args.max_rows_per_job
         result = advance_extract_job(**tick_kwargs)
-        # The literal below feeds the poll-liveness CloudWatch alarm (#85);
-        # keep it in sync with pulumi/infra/alerts.py.
+        # The poll-liveness CloudWatch alarm matches this literal; keep it in
+        # sync with pulumi/infra/alerts.py.
         LOGGER.info(
             "Poll tick complete: status=%s job=%s folded=%s submitted=%s in_flight=%s terminal=%s",
             result.status,
@@ -439,10 +409,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     configure_logging(quiet=args.quiet)
-    # Before every other credentialed thing this process does: --aws-profile
-    # (or AWS_PROFILE) previously reached only ingest's own client, so the
-    # orchestrator's artifact reads, writes and lease took the ambient
-    # credentials no matter what it was set to (#71).
+    # Before any S3 access, so artifact reads, writes and the lease all use it.
     configure_s3_profile(args.aws_profile)
     reject_placeholder_secrets()
     start_runtime_watchdog(args.mode, args.max_runtime_hours)
@@ -452,9 +419,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.extractor_backend == "batch":
         return run_batch_backend(args)
 
-    # The live backend: the original synchronous pipeline. It rewrites the same
-    # completion registries and match/final snapshots the poll tick does, so it
-    # runs under the same writer lease rather than interleaving with one.
+    # The live backend writes what a poll tick writes, so it takes the lease too.
     resolved_root = resolve_artifact_root(args.artifact_root)
     lease = acquire_lease_with_wait(resolved_root, PIPELINE_WRITER_LEASE)
     if lease is None:

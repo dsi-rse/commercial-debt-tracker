@@ -53,11 +53,9 @@ ITEM_METADATA_COLUMNS = [
     "end_line",
     "section_char_count",
 ]
-# The document columns an item row copies. Pinned here rather than spread from
-# ingest.DOCUMENT_COLUMNS: items, classifications, mentions and the published
-# items snapshot all derive their schema from this list, so a column added to
-# the documents dataset would otherwise reshape four datasets and the
-# dashboard's contract as a side effect of an ingest change.
+# The document columns an item row copies. Pinned, not derived from
+# ingest.DOCUMENT_COLUMNS: four datasets and the published items table take
+# their schema from this list.
 ITEM_DOCUMENT_COLUMNS = [
     "accession_number",
     "cik",
@@ -100,7 +98,11 @@ def itemize_documents(
     s3_client: object | None = None,
     item_numbers: tuple[str, ...] | None = None,
 ) -> pd.DataFrame:
-    """Extract relevant item sections from complete 8-K documents."""
+    """Extract the selected item sections from complete 8-K documents.
+
+    ``item_numbers`` of None selects POTENTIALLY_RELEVANT_ITEM_NUMBERS;
+    ``force`` is ignored. Returns an ITEM_COLUMNS frame, empty if no rows.
+    """
     del force
     if documents.empty:
         return pd.DataFrame(columns=ITEM_COLUMNS)
@@ -148,7 +150,18 @@ def itemize_pending_documents(
     item_numbers: tuple[str, ...] | None = None,
     renew: Callable[[], None] | None = None,
 ) -> pd.DataFrame:
-    """Itemize canonical document partitions into canonical item partitions."""
+    """Itemize pending documents partitions into item partitions.
+
+    A partition is pending when its fingerprint differs from the completion
+    registry's (or always, with ``force``) and is recomputed whole. Completion
+    is saved and ``renew`` called after every ``batch_size`` partitions.
+
+    Returns:
+        The item rows written this run, in ITEM_COLUMNS order.
+
+    Raises:
+        ValueError: If ``batch_size`` is not positive.
+    """
     if batch_size <= 0:
         msg = f"batch_size must be positive, got {batch_size}"
         raise ValueError(msg)
@@ -161,10 +174,6 @@ def itemize_pending_documents(
     total_documents = 0
     empty_partitions = 0
     shared_s3_client = s3_client
-    # Fingerprint-keyed selection: a documents partition ingest merged new rows
-    # into is pending again, and the whole partition is recomputed — itemize is
-    # cheap and deterministic, so row-level diffing is not worth its complexity
-    # here (#62).
     pending_with_fingerprints, registry = pending_source_partitions(
         "itemize",
         "documents",
@@ -228,13 +237,8 @@ def itemize_pending_documents(
                 perf_counter() - partition_start,
             )
 
-        # Persist completion at every batch boundary: the registry was written
-        # once at stage end, so any interruption discarded the whole run's
-        # progress -- up to 2.5h of itemize on the real corpus (#111). Repeat
-        # saves are cheap and concurrency-safe: only dirty entries are merged
-        # via compare-and-swap (#88). Renew the writer lease at the same
-        # boundary, because a stage that outlasts the lease TTL was otherwise
-        # stolen mid-run and aborted at the next stage boundary (#111).
+        # Save completion and renew the lease at every batch boundary, so an
+        # interruption keeps finished batches and a long stage is not stolen.
         for document_path in chunk_paths:
             registry[document_path] = CompletedPartition(
                 fingerprint=source_fingerprints.get(document_path)
@@ -248,9 +252,8 @@ def itemize_pending_documents(
         if renew is not None:
             renew()
 
-    # Still save once at the end: pending_source_partitions may have refreshed
-    # registry entries (backfill, fingerprint adoption) even when nothing was
-    # pending, and those land in the dirty set outside any chunk (#111).
+    # Save once more: pending_source_partitions can dirty entries even when
+    # nothing was pending.
     save_completion_registry(
         "itemize",
         registry,
@@ -307,7 +310,10 @@ def itemize_document_record(
     s3_client: object | None = None,
     item_numbers: tuple[str, ...] | None = None,
 ) -> list[ItemSection]:
-    """Extract item sections from one document record."""
+    """Extract item sections from one document record.
+
+    ``item_numbers`` of None returns every section, mapped or not.
+    """
     text = document_text_for_record(
         document,
         data_dir=data_dir,
@@ -360,12 +366,13 @@ def document_text_for_record(
     data_dir: Path | None = None,
     s3_client: object | None = None,
 ) -> str:
-    """Return one document row's text, from the row or from its resource.
+    """Return one documents row's text: its inline ``text``, else its resource.
 
-    Public because both genres resolve a documents-dataset row the same way: a
-    row carries either inline text (``download=True`` ingest) or a
-    ``resource_uri`` pointing at the stored submission — the scraper's copy for
-    8-K, CDT's own mirror for 6-K.
+    A relative local ``resource_uri`` resolves against ``data_dir``.
+
+    Raises:
+        ValueError: If the row has neither text nor a resource URI, or the
+            resource is on S3 and ``s3_client`` is None.
     """
     text = document.get("text")
     if isinstance(text, str) and text.strip():
@@ -404,11 +411,7 @@ def ensure_s3_client(
     s3_client: object | None,
     documents: list[dict[str, object]],
 ) -> object | None:
-    """Return a client only if some row's resource actually lives on S3.
-
-    Public for the same reason as ``document_text_for_record``: a local run
-    with mirrored bodies must not need AWS to resolve them.
-    """
+    """Return ``s3_client``, else a new client if some row's resource is on S3, else None."""
     if s3_client is not None:
         return s3_client
     for document in documents:
@@ -419,7 +422,7 @@ def ensure_s3_client(
 
 
 def normalize_item_numbers(item_numbers: tuple[str, ...] | None) -> tuple[str, ...]:
-    """Normalize configured item numbers or return the default relevant set."""
+    """Strip and deduplicate item numbers; empty or None gives the default set."""
     values = item_numbers or POTENTIALLY_RELEVANT_ITEM_NUMBERS
     normalized = []
     for value in values:

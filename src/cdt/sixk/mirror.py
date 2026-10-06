@@ -1,11 +1,7 @@
-"""Where CDT keeps its own copy of a 6-K submission.
+"""Where CDT keeps its own assembled copy of each 6-K submission.
 
-A 6-K document row points at one submission through ``resource_uri``, the way an
-8-K row points at the scraper's complete submission text file. The 6-K path
-cannot point at such a file, because the scraper stores a filing as one object
-*per document* with no whole-submission object to name. So ingest assembles one
-and writes it here, and the row names it — which is what keeps the row shape,
-and every stage that reads it, identical across the two genres.
+A 6-K document row's ``resource_uri`` names its mirror copy, as an 8-K row's
+names the scraper's complete submission file.
 """
 
 from __future__ import annotations
@@ -28,15 +24,9 @@ def mirror_path(
 ) -> str:
     """Return the mirror path for one submission.
 
-    Gzipped, and read back through ``ingest.decode_document_bytes``, which
-    sniffs the gzip magic — so the stage that resolves this URI needs to know
-    nothing about the compression, and the scraper's copies are stored the same
-    way. Date-prefixed for navigability and so a storage lifecycle rule can
-    address the old ones.
-
-    Doubles as the resume ledger: a filing whose mirror exists is not read or
-    assembled again, so re-running a range costs one existence check per filing
-    and no document reads.
+    The file is gzipped (``ingest.decode_document_bytes`` detects that on
+    read) and lives under ``date={filing_date}/`` so lifecycle rules can target
+    old partitions. Its existence marks the filing as already acquired.
     """
     return join_artifact_path(
         mirror_root(artifact_root),

@@ -153,9 +153,9 @@ def classify_items(
 ) -> pd.DataFrame:
     """Classify in-memory item rows using a saved binary model.
 
-    ``artifacts`` is a pre-loaded ``(model, threshold)`` pair; callers looping
-    over partitions pass it so the pickle is deserialized once per run instead
-    of once per partition (#76).
+    Adds ``label``, ``relevance`` and ``classification_score``. ``artifacts`` is
+    a pre-loaded ``(model, threshold)`` pair; None loads them from
+    ``model_dir`` (default ``default_model_dir(data_dir)``). ``force`` is ignored.
     """
     del force
     if items.empty:
@@ -190,7 +190,18 @@ def classify_pending_items(
     force: bool = False,
     renew: Callable[[], None] | None = None,
 ) -> pd.DataFrame:
-    """Classify item partitions and persist canonical classification partitions."""
+    """Classify pending item partitions into classification partitions.
+
+    A partition is pending when its fingerprint differs from the completion
+    registry's (or always, with ``force``) and is recomputed whole. Completion
+    is saved and ``renew`` called after every ``batch_size`` partitions.
+
+    Returns:
+        The classified rows written this run, in CLASSIFIED_ITEM_COLUMNS order.
+
+    Raises:
+        ValueError: If ``batch_size`` is not positive.
+    """
     if batch_size <= 0:
         msg = f"batch_size must be positive, got {batch_size}"
         raise ValueError(msg)
@@ -200,9 +211,6 @@ def classify_pending_items(
     partitions_written: list[str] = []
     visited_item_paths: set[str] = set()
     empty_partitions = 0
-    # Fingerprint-keyed selection: an items partition the itemizer rewrote (its
-    # source grew) is pending again and recomputed whole — classification is
-    # cheap and deterministic, so row-level diffing is not worth it here (#62).
     pending_with_fingerprints, registry = pending_source_partitions(
         "classify",
         ITEM_DATASET_NAME,
@@ -213,8 +221,7 @@ def classify_pending_items(
     pending_item_paths = [path for path, _ in pending_with_fingerprints]
     source_fingerprints = dict(pending_with_fingerprints)
 
-    # Unpickle the model once per run: per-partition loads dominate large
-    # backfills with redundant deserialization and S3 GETs (#76).
+    # Unpickle the model once per run, not per partition.
     artifacts: tuple[object, float] | None = None
     if pending_item_paths:
         resolved_model_dir = model_dir or default_model_dir(data_dir)
@@ -268,13 +275,8 @@ def classify_pending_items(
                 perf_counter() - partition_start,
             )
 
-        # Persist completion at every batch boundary: the registry was written
-        # once at stage end, so any interruption discarded the whole run's
-        # progress (#111). Repeat saves are cheap and concurrency-safe: only
-        # dirty entries are merged via compare-and-swap (#88). Renew the writer
-        # lease at the same boundary, because a stage that outlasts the lease
-        # TTL was otherwise stolen mid-run and aborted at the next stage
-        # boundary (#111).
+        # Save completion and renew the lease at every batch boundary, so an
+        # interruption keeps finished batches and a long stage is not stolen.
         for item_path in chunk_paths:
             registry[item_path] = CompletedPartition(
                 fingerprint=source_fingerprints.get(item_path)
@@ -288,9 +290,8 @@ def classify_pending_items(
         if renew is not None:
             renew()
 
-    # Still save once at the end: pending_source_partitions may have refreshed
-    # registry entries (backfill, fingerprint adoption) even when nothing was
-    # pending, and those land in the dirty set outside any chunk (#111).
+    # Save once more: pending_source_partitions can dirty entries even when
+    # nothing was pending.
     save_completion_registry(
         "classify",
         registry,
@@ -334,13 +335,13 @@ def _minor_version(version: str) -> tuple[str, ...]:
 def load_training_artifacts(
     model_dir: Path,
 ) -> tuple[SupportsDecisionFunction, float, dict[str, object]]:
-    """Load a fitted model and metadata from disk.
+    """Load a fitted model, its threshold and its metadata from ``model_dir``.
 
-    Refuses a pickle trained under a different scikit-learn minor: the model is
-    the relevance gate deciding which items reach the LLM, its threshold is
-    calibrated against the training version's scoring behaviour, and sklearn
-    only warns on mismatch -- a drift of a few percent in relevance would look
-    like normal fluctuation in corpus size (#109).
+    Logs a warning when the metadata records no ``sklearn_version``.
+
+    Raises:
+        RuntimeError: If the recorded scikit-learn major.minor differs from
+            the running one.
     """
     model_path = model_dir / MODEL_FILENAME
     metadata_path = model_dir / METADATA_FILENAME

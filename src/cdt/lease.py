@@ -1,23 +1,16 @@
 """Advisory single-writer lease over artifact storage.
 
-EventBridge fires the poll schedule hourly whether or not the previous tick
-finished, and both the ``daily`` and ``poll`` orchestrator modes rewrite the
-match/final snapshots. This module serializes those writers with a small lease
-object under ``{artifact_root}/locks/<name>.json``, acquired with a conditional
-create (S3 ``If-None-Match: *`` / local exclusive create) and stolen after its
-TTL expires with a conditional replace (S3 ``If-Match`` compare-and-swap), so
-two racing acquirers can never both win.
+Serializes pipeline writers (overlapping poll ticks, daily runs) with a lease
+object at ``{artifact_root}/locks/<name>.json``. It is acquired by conditional
+create (S3 ``If-None-Match: *`` / local exclusive create) and, once expired,
+taken over by conditional replace (S3 ``If-Match``), so two racing acquirers
+never both win.
 
-Losing the lease is not an error: callers skip their turn and the next
-scheduled run picks the work up. The TTL only matters after a crash — releases
-happen in a ``finally`` — so it is sized generously above a normal tick.
-
-Releasing marks the lock object expired rather than deleting it, so the steady
-state is a lease that exists and is free. Two different situations therefore
-reach the same compare-and-swap: a normal handoff from a holder that released,
-and a rescue from a holder that died still holding it. Only the second is worth a
-warning, and they are told apart by the exact ``_EXPIRED`` stamp a release writes
-(see ``_log_takeover``).
+Failing to acquire is not an error: the caller skips its turn and the next
+scheduled run picks the work up. Releasing stamps the object with the
+``_EXPIRED`` sentinel rather than deleting it, which lets a takeover tell a
+normal handoff from a rescue of a holder that died (see ``_log_takeover``).
+The TTL only matters after such a crash.
 """
 
 from __future__ import annotations
@@ -40,11 +33,10 @@ from cdt.storage import (
 
 LOGGER = get_logger(__name__)
 
-# A poll tick is normally minutes; the TTL only gates recovery after a crash.
+# Sized well above a normal tick (minutes); it only gates recovery after a crash.
 DEFAULT_LEASE_TTL_SECONDS = 2 * 60 * 60
-# One lease serializes every writer of extract job state and match/final
-# snapshots: poll ticks (hourly schedule + EventBridge retries), daily's
-# match/finalize, and the admin reset command.
+# The one lease every writer of extract job state and match/final snapshots
+# holds: poll ticks, daily's match/finalize, and the admin reset command.
 PIPELINE_WRITER_LEASE = "pipeline-writer"
 _EXPIRED = "1970-01-01T00:00:00+00:00"
 
@@ -82,11 +74,10 @@ def _current_expiry(payload: object) -> datetime | None:
 
 
 def _was_released(payload: object) -> bool:
-    """True when the previous holder released cleanly rather than dying.
+    """Return whether the previous holder released cleanly rather than dying.
 
-    ``release_lease`` stamps exactly ``_EXPIRED``, a value no live lease can hold,
-    so it distinguishes a normal handoff from a TTL rescue. A corrupt payload
-    counts as not-released: unreadable lock state is worth reporting.
+    True only for the exact ``_EXPIRED`` stamp ``release_lease`` writes, a value
+    no live lease can hold. A corrupt payload counts as not released.
     """
     return isinstance(payload, dict) and str(payload.get("expires_at")) == _EXPIRED
 
@@ -95,13 +86,11 @@ def _log_takeover(name: str, previous: object) -> None:
     """Log a lease takeover at a level matching what actually happened."""
     holder = previous.get("holder") if isinstance(previous, dict) else None
     if _was_released(previous):
-        # The overwhelmingly common path: every tick after the first takes over a
-        # lease its predecessor released on the way out. Logging that at WARNING
-        # would bury the case below under ~24 false alarms a day.
+        # The normal handoff on every tick; WARNING would bury the case below.
         LOGGER.debug("Acquired released lease %s (previous holder %s)", name, holder)
         return
-    # "Stole lease" feeds a CloudWatch metric-filter alarm (#85); keep the
-    # literal in sync with pulumi/infra/alerts.py.
+    # "Stole lease" feeds a CloudWatch metric-filter alarm; keep the literal in
+    # sync with pulumi/infra/alerts.py.
     LOGGER.warning(
         "Stole lease %s from holder %s: it expired without being released, so that "
         "run likely died mid-tick — check for a lost run.",
@@ -116,7 +105,7 @@ def acquire_lease(
     *,
     ttl_seconds: int = DEFAULT_LEASE_TTL_SECONDS,
 ) -> Lease | None:
-    """Acquire the named lease, stealing it only if expired; None if held."""
+    """Acquire the named lease, taking it over only if expired or corrupt; None if held."""
     path = lease_path(artifact_root, name)
     holder = uuid.uuid4().hex
     now = datetime.now(UTC)
@@ -138,10 +127,8 @@ def acquire_lease(
 def renew_lease(lease: Lease, *, ttl_seconds: int = DEFAULT_LEASE_TTL_SECONDS) -> bool:
     """Extend a held lease's expiry; False if it was stolen or storage raced.
 
-    The TTL is sized for a normal tick, but folding a large job's results can
-    outlast it; renewing at phase boundaries keeps a legitimately long holder
-    from being stolen by the next scheduled run mid-write. A False return means
-    the caller no longer holds the lease and should treat the tick as lost.
+    Call at phase boundaries of work that can outlast the TTL. False means the
+    caller no longer holds the lease and must treat the tick as lost.
     """
     current, version = read_json_artifact_versioned(lease.path)
     if not isinstance(current, dict) or current.get("holder") != lease.holder:
@@ -160,18 +147,15 @@ class LeaseLostError(RuntimeError):
     """A phase-boundary renewal found the lease no longer held.
 
     The holder must stop writing immediately: another run owns the datasets and
-    snapshots now, and continuing would interleave two writers — the exact
-    corruption the lease exists to prevent (#89).
+    snapshots now, and continuing would interleave two writers.
     """
 
 
 def renewer(lease: Lease) -> Callable[[], None]:
     """Return a renewal callback that raises LeaseLostError instead of a bool.
 
-    Long phases pass a renewal hook across module boundaries; a discarded
-    ``renew_lease`` return value let a run keep writing on a lease another
-    process had already stolen (#89). Raising makes losing the lease
-    impossible to ignore.
+    For long phases that take a renewal hook across module boundaries, where
+    a False return could be silently discarded.
     """
 
     def renew() -> None:

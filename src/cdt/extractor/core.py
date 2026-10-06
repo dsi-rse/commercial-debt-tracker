@@ -1,4 +1,8 @@
-"""LLM-backed extractor stage for relevant SEC 8-K items."""
+"""LLM-backed extractor: NER, instrument IE and relation stages over relevant items.
+
+Items are 8-K items and 6-K snippets from ``CLASSIFICATION_SOURCES``; the
+live backend lives here, the OpenAI Batch backend in ``cdt.extractor.batch``.
+"""
 
 # ruff: noqa: ANN101, ANN102, D102, D105, D107
 
@@ -56,58 +60,20 @@ from cdt.storage import (
 )
 
 LOGGER = get_logger(__name__)
+# One attempt budget for every stage (`--max-attempts`). See
+# docs/decisions/extraction.md before raising it.
 DEFAULT_MAX_ATTEMPTS = 3
-# One budget for every stage, `--max-attempts`. #127 proposed giving NER more
-# on the reasoning that it is the only stage that must reproduce the item
-# verbatim, so it is the only one whose failures more attempts fix. The stored
-# corpora do not support the number: the NER-calls-per-row histogram over all
-# 761 rows is {1: 756, 2: 3, 3: 2}, so only two rows ever reached the cap, and
-# one of those is MPLX, whose third call is the give-up #176 now rejects -- it
-# would run to the larger budget and still fail. That leaves a single row
-# (`000133146326000103-2-03`, FHLB Boston) as the whole case, and the evidence
-# for it is that it passed on a *rerun* of the same arm, which is cross-run
-# variance rather than a fourth attempt recovering anything within a run.
-#
-# Against that, a bigger NER budget is paid on the most expensive call in the
-# pipeline -- the one stage that echoes the whole item back -- by every row
-# that legitimately exhausts, and by every row #176's guards now correctly
-# reject. Raise it again only with a measurement of attempts 4-6 on a fresh
-# window, and only after re-reading #176's ordering note: each extra attempt
-# is another chance for the model to pass NER by returning the input untagged.
-# A `content_filter` abort is not a verdict on the row and is not billed:
-# eleven of thirteen live NER calls against `openai/gpt-5.6-terra` came back
-# `finish_reason=content_filter` with `completion_tokens=0`, `prompt_tokens=0`
-# and `cost=0.0` -- aborted upstream, unbilled -- and the cut point is
-# nondeterministic, three repeats of one item giving 1,163 / 280 / 1,375
-# characters (#127, #135). So resending is both the correct remedy and a free
-# one.
-#
-# It is classified by the *callers*, before `handle_response`, for the same
-# reason every other unbilled failure is: a connection reset, a timeout, a 429
-# or a 5xx raises and is caught by `is_infrastructure_error`, so it never
-# becomes an attempt at all. A filtered response differs only in arriving as a
-# normal 200 with a body (see `completion_result_from_batch_line`), not in
-# kind. Scoring it and then exempting it from the budget would make every
-# cross-attempt check -- the give-up check and the high-water mark -- read a
-# call the model never answered as earlier work the model is now regressing
-# against.
-#
-# The cap is not about the cost of retrying. It is there because the
-# non-billing claim is *unverified*: thirteen calls against one model, and
-# internally inconsistent (280-1,375 characters of text alongside
-# `completion_tokens=0`). The batch route reports no `cost` field at all, so it
-# cannot be checked there. The cap bounds the damage if the assumption is
-# wrong, and the resend is logged so it can be noticed.
-#
-# `max_tokens` is deliberately still unset: the evidence says the length cap
-# was never the constraint (it rescued one item and broke another).
+# Resends of a `content_filter` abort per stage call. The abort is classified
+# by the callers, before `handle_response`, so it never becomes a scored
+# attempt; the cap bounds the cost if the abort turns out to be billed.
+# `max_tokens` is deliberately unset. See docs/decisions/extraction.md.
 MAX_CONTENT_FILTER_RESENDS = 6
 # Status for an attempt the provider aborted: a call was made, but it returned
 # no answer to score. Distinct from "FAILED", which means the model answered
 # and the answer was rejected -- the difference every cross-attempt check needs.
 ABORTED_ATTEMPT_STATUS = "ABORTED"
 # PARTIAL rows publish their mentions like SUCCESS but also keep a failure
-# registry entry recording what salvage dropped (#152).
+# registry entry recording what salvage dropped.
 PUBLISHABLE_ROW_STATES = frozenset({"SUCCESS", "PARTIAL"})
 DEFAULT_MODEL = settings.DEFAULT_EXTRACTOR_MODEL
 DEFAULT_REASONING_EFFORT = "none"
@@ -126,8 +92,8 @@ COLLECTIVE_LENDER_KIND = "collective"
 INSTRUMENT_SINGLE_VALUE_PROPERTIES = {"name": {"debt_instrument"}}
 # One mention can state several money facts about one instrument — a $2.5B
 # commitment and a $270.5M outstanding balance — so amounts are a kind-typed
-# list (#140). The matcher keys only on commitment/principal; the other kinds
-# are observations.
+# list. The matcher keys only on commitment/principal; the other kinds are
+# observations.
 AMOUNT_KINDS = {
     "commitment",
     "principal",
@@ -137,17 +103,15 @@ AMOUNT_KINDS = {
     "proceeds",
 }
 PRINCIPAL_AMOUNT_KINDS = ("commitment", "principal")
-# Kind-typed date facts (stage 1 of the dates overhaul). The old single-value
-# `start_date` / `maturity_date` / `commitment_termination_date` slots made the
-# model arbitrate between competing dates; a list of facts records each stated
-# date once and lets the post-processor choose the published columns.
+# Kind-typed date facts: each stated date is recorded once and the
+# post-processor chooses the published columns (`DATE_COLUMN_KINDS`).
 DATE_KINDS = {
     "agreement",  # the instrument's own `dated as of` date
     "announcement",  # pricing, launch, or commitment-letter date
     "closing",  # closing, issuance, funding, or effective date: the start
     "maturity",  # when the borrowed money must be repaid
     "commitment_termination",  # when the lender's obligation to lend ends
-    # Stage 2: events are dated facts too, and the mention's status is derived.
+    # Events are dated facts too, and the mention's status is derived.
     "amendment",  # terms modified; the amendment's effective or signing date
     "repayment",  # a payment that leaves the obligation outstanding
     "retirement",  # repaid in full, redeemed in whole, defeased, discharged
@@ -169,8 +133,7 @@ TERMINAL_DATE_KINDS = {"retirement", "termination", "exchange", "default"}
 # The kinds an instrument has at most one current value of, which
 # `instrument_ie.md` advertises as "(validated)". `closing` is an event kind but
 # still singular: two current closings describe two instruments, exactly as two
-# maturities do. Keying the cap off `not in EVENT_DATE_KINDS` silently exempted
-# it, so one of the two dates published and the other was dropped.
+# maturities do, so this set is not derivable from EVENT_DATE_KINDS.
 SINGLE_CURRENT_DATE_KINDS = {
     "agreement",
     "closing",
@@ -218,11 +181,9 @@ PARTY_ROLES = {
     "other",
 }
 PARTY_KINDS = {"named", "collective"}
-# How completely the document identifies who holds the debt. The boolean this
-# replaces was true for two different reasons — a collective lender phrase, or
-# no named lender at all — and 395 of 517 true values on the 2026-09 window were
-# the second case, so a consumer reading the flag could not tell "something is
-# undisclosed" from "nothing was disclosed here".
+# How completely the document identifies who holds the debt: a named-only
+# syndicate, a collective phrase present, or no named lender at all. See
+# docs/decisions/extraction.md for why this is three-valued.
 LENDER_DISCLOSURE_COMPLETE = "complete"
 LENDER_DISCLOSURE_COLLECTIVE_PRESENT = "collective_present"
 LENDER_DISCLOSURE_NONE_NAMED = "none_named"
@@ -234,9 +195,8 @@ LENDER_DISCLOSURE_VALUES = {
 # Precedence for rolling several mentions of one instrument into one answer.
 # `collective_present` wins outright: one filing showing `the other lenders
 # party thereto` means holders are hidden however many other filings name some.
-# `complete` beats `none_named` because a filing that named every lender
-# supersedes one that named none — the reverse would let a passing reference
-# erase a full syndicate list.
+# `complete` beats `none_named`, so a passing reference cannot erase a full
+# syndicate list.
 LENDER_DISCLOSURE_PRECEDENCE = {
     LENDER_DISCLOSURE_NONE_NAMED: 0,
     LENDER_DISCLOSURE_COMPLETE: 1,
@@ -250,15 +210,12 @@ DATE_COLUMN_KINDS = {
 }
 DATE_PRECISIONS = ("day", "month", "year")
 AMOUNT_EVIDENCE_TAG_TYPES = {"amount", "debt_instrument"}
-# What one mention says happened to its instrument (#141). `matured` is
-# deliberately absent: filings almost never say it, and no stage here derives a
-# lifecycle status at all (#196).
 INTEREST_RATE_KINDS = {"fixed", "floating"}
 INTEREST_RATE_EVIDENCE_TAG_TYPES = {"interest_rate", "debt_instrument"}
 # `6.5 percent senior notes` spells the marker out; it is still a rate, not an amount.
 RATE_PCT_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*(?:%|percent\b)", re.IGNORECASE)
-# The four instrument categories the site facets on (#156); anything else
-# stays null rather than stretching a bucket.
+# The four instrument categories the site facets on; anything else stays null
+# rather than stretching a bucket.
 INSTRUMENT_TYPES = {
     "term_loan",
     "revolving_credit",
@@ -271,13 +228,13 @@ INSTRUMENT_RELATION_TYPES = {"amendment_of", "retired_by", "split_of"}
 NUMERIC_STRING_PATTERN = re.compile(r"^\d+(?:\.\d+)?$")
 # One `due` can carry a list of maturities: `due 2028 and 2030`,
 # `due October 1, 2028 and 2030`, `due October 1, 2028 and October 1, 2030`. Each
-# is two maturities, and matching only the first silently invented one (#104).
+# is two maturities, not one.
 MATURITY_COORDINATED_YEARS = (
     r"(?:\s*(?:,|/|&|and(?:/or)?|or)\s*(?:[A-Za-z]+\s+\d{1,2},?\s+)?\d{4})*"
 )
 # Like MATURITY_COORDINATED_YEARS, but each further year may carry a bare month
 # with no day, so `due October 1, 2028 and April 2030` and `due April 2033 and
-# June 2035` both read as two maturities (#164).
+# June 2035` both read as two maturities.
 MATURITY_MONTH_YEAR_COORDINATION = (
     r"(?:\s*(?:,|/|&|and(?:/or)?|or)\s*(?:[A-Za-z]+\s+(?:\d{1,2},?\s+)?)?\d{4})*"
 )
@@ -290,7 +247,7 @@ MATURITY_YEAR_PATTERN = re.compile(
     rf"\bdue\s+(?:in\s+)?(?P<years>\d{{4}}{MATURITY_COORDINATED_YEARS})\b",
     re.IGNORECASE,
 )
-# A facility tenor such as `five-year` or `364-day` (#166). Only a duration
+# A facility tenor such as `five-year` or `364-day`. Only a duration
 # span stating exactly one tenor anchors computed-maturity arithmetic.
 TENOR_WORD_NUMBERS = {
     "one": 1,
@@ -313,8 +270,8 @@ TENOR_PATTERN = re.compile(
     + r")[-\s](?P<unit>year|month|day)s?\b",
     re.IGNORECASE,
 )
-# `due April 2033` states a month-resolution maturity (#164); it normalizes to
-# the month's last day.
+# `due April 2033` states a month-resolution maturity; it normalizes to the
+# month's last day.
 MATURITY_MONTH_YEAR_PATTERN = re.compile(
     r"\bdue\s+(?:in\s+)?(?P<month>[A-Za-z]+),?\s+(?P<year>\d{4})"
     rf"(?P<more>{MATURITY_MONTH_YEAR_COORDINATION})",
@@ -323,30 +280,20 @@ MATURITY_MONTH_YEAR_PATTERN = re.compile(
 FOUR_DIGIT_YEAR_PATTERN = re.compile(r"\d{4}")
 YEAR_ONLY_MATURITY_SUFFIX = "-12-31"
 # A rate marker counts only where it sits on a number, so the value the parser
-# would read is the rate itself rather than a percentage of something else (#103).
+# would read is the rate itself rather than a percentage of something else.
 AMOUNT_VALUE_PATTERN = re.compile(r"\d[\d,]*(?:\.\d+)?")
 # `bps` as well as the spelled-out marker: the abbreviation is what filings
-# actually write, and without it `is_rate_like_amount_text` read `50 bps` as a
-# money amount, so `validate_amount_is_not_rate` let a basis-point margin
-# through as an `amount`. `amounts_agree` does not catch it either -- it only
-# rejects a model figure that disagrees with the span's number, and the model
-# reports the basis-point figure itself, so the two agree and a 50bp margin
-# published as a principal of 50. A wrong value, not the silent null of #182
-# (#228). Distinct from #75/#102, which was the whitespace that hid the
-# multi-word marker: this is the vocabulary, not the normalization.
+# actually write, and `amounts_agree` cannot catch a basis-point margin the
+# model reports as an amount, since the two figures agree.
 RATE_SUFFIX_PATTERN = re.compile(
     r"\s*(?:%|percent\b|basis\s+points?\b|bps?\b)", re.IGNORECASE
 )
 # A principal stated inside an instrument name: `$183.36 million term loan`,
 # `C$300 million notes due 2033`. The currency marker is required, so a coupon
 # rate or a maturity year in the same name cannot be read as the principal.
-# Magnitude words, spelled out and abbreviated (#182). The abbreviations matter
-# because #129's name-derived principal reads the instrument's own name, and
-# names use them: `Citibank $382.5 mil. Revolving Credit Facility`, `Syndicated
-# $850.0 mil. Facility` (Costamare's 6-K facility schedules). Without them
-# `$382.5 mil.` parsed as 382.5 — six orders out. On a cited span that merely
-# published null, because `amounts_agree` rejected the mismatch; on the
-# name-derived path there is no model value to disagree with, so it published.
+# Magnitude words, spelled out and abbreviated: instrument names use the
+# abbreviations (`Citibank $382.5 mil. Revolving Credit Facility`), and the
+# name-derived principal has no model value to cross-check against.
 AMOUNT_MULTIPLIERS = {
     "thousand": 1_000,
     "thousands": 1_000,
@@ -364,8 +311,7 @@ AMOUNT_MULTIPLIERS = {
     "trillions": 1_000_000_000_000,
 }
 # Built from the table above so a magnitude this pattern recognizes is always one
-# the parser can apply. The two drifted before: `trillion` matched here and
-# multiplied nowhere.
+# the parser can apply.
 AMOUNT_SCALE_ALTERNATION = "|".join(sorted(AMOUNT_MULTIPLIERS, key=len, reverse=True))
 NAME_EMBEDDED_AMOUNT_PATTERN = re.compile(
     r"(?P<currency>[A-Z]{0,2}\$|€|£|¥)\s?"
@@ -375,17 +321,17 @@ NAME_EMBEDDED_AMOUNT_PATTERN = re.compile(
 )
 ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # An ampersand that starts no entity. The NER response has to be well-formed XML
-# while reproducing text that may carry a bare `&` (#127).
+# while reproducing text that may carry a bare `&`.
 UNESCAPED_AMPERSAND_PATTERN = re.compile(
     r"&(?!(?:amp|lt|gt|quot|apos);|#(?:\d+|x[0-9A-Fa-f]+);)"
 )
 # Zero-padding is optional on the way in, so a model writing `2026-7-28` is read
-# as the day it means rather than dropped for its shape (#133).
+# as the day it means rather than dropped for its shape.
 LENIENT_ISO_DATE_PATTERN = re.compile(
     r"^(?P<year>\d{4})-(?P<month>\d{1,2})-(?P<day>\d{1,2})$"
 )
 # Filing dates come in three further spellings. The four-digit year is required:
-# `7/28/26` needs a century guessed, and a null beats a wrong decade (#133).
+# `7/28/26` needs a century guessed, and a null beats a wrong decade.
 NUMERIC_DATE_PATTERN = re.compile(
     r"(?<!\d)(?P<month>\d{1,2})/(?P<day>\d{1,2})/(?P<year>\d{4})(?!\d)"
 )
@@ -397,10 +343,9 @@ MONTH_FIRST_DATE_PATTERN = re.compile(
 DAY_FIRST_DATE_PATTERN = re.compile(
     r"(?<!\d)(?P<day>\d{1,2})\s+(?P<month>[A-Za-z]+),?\s+(?P<year>\d{4})(?!\d)"
 )
-# `June 2016`, `in March 2056`: a month-resolution date outside an instrument
-# name. #164 only read these after `due`, so `matures in June 2016` and `legal
-# final maturity date is in March 2056` published nothing. Read for maturities
-# only (`normalized_month_year_from_text`), to the month's last day.
+# `matures in June 2016`, `is in March 2056`: a month-resolution date outside
+# a `due` phrase. Read for maturities only (`normalized_month_year_from_text`),
+# to the month's last day.
 MONTH_YEAR_DATE_PATTERN = re.compile(
     r"(?<![A-Za-z\d])(?P<month>[A-Za-z]+),?\s+(?P<year>\d{4})(?!\d)"
 )
@@ -492,9 +437,8 @@ DEBT_INSTRUMENT_MENTION_COLUMNS = [
     "dates_json",
     "lender_disclosure",
     # Set only on a row the extractor synthesized rather than the model
-    # returned: the rule that minted it, and the mention it was minted from
-    # (#203). Null on every model-emitted row. Neither is hashed into the
-    # mention id, so adding them re-keys nothing.
+    # returned: the rule that minted it, and the mention it was minted from.
+    # Null on every model-emitted row. Neither is hashed into the mention id.
     "synthesized_by",
     "synthesized_from_mention_id",
 ]
@@ -506,8 +450,8 @@ class InfrastructureError(RuntimeError):
     Billing (402), throttling (429), timeouts, connection resets, and 5xx are
     properties of the run environment, not of the filing being extracted: one
     occurrence predicts thousands more, so the live driver aborts the run at the
-    first one instead of burning retries across the corpus and terminating rows
-    that never got a real verdict (#49).
+    first one instead of burning retries and terminating rows that never got a
+    real verdict.
     """
 
 
@@ -561,11 +505,8 @@ class AttemptRecord:
     response: str | None = None
     validation_errors: list[str] = field(default_factory=list)
     status: str = "incomplete"
-    # Provider metadata. Without `finish_reason` a response that the provider
-    # aborted is indistinguishable in the audit log from one the model chose to
-    # end, and those need opposite remedies: four items lost to NER in one
-    # held-out window turned out to be `content_filter` aborts rather than the
-    # length cap or the model stopping that they were twice diagnosed as (#135).
+    # Provider metadata. `finish_reason` separates a provider abort from a
+    # response the model chose to end; they need opposite remedies.
     finish_reason: str | None = None
     refusal: str | None = None
     usage: dict[str, object] | None = None
@@ -657,27 +598,13 @@ class ExtractionRowState:
     def record_unbilled_abort(
         self, response: str, completion: CompletionResult
     ) -> None:
-        """Log a call the provider aborted, without scoring it (#127, #135).
+        """Record a call the provider aborted, without scoring it.
 
-        The outstanding attempt is left exactly as it was, so the caller
-        re-sends the identical request and the model's next real answer is
-        scored as the attempt it actually is. Nothing here touches
-        ``current_attempt``: no response, no ``attempt_index`` bump, no
-        validation. There is nothing for the model to correct, so the repair
-        conversation ``retry`` builds -- the aborted response as an assistant
-        turn plus a complaint about it -- would be noise every later call in
-        the row pays prompt tokens for.
-
-        The abort is still appended to ``all_attempts`` so the audit log and
-        #135's telemetry keep a true record of the calls made, and so the
-        resend cap survives a process exit: the batch backend folds one
-        response per tick, so the count has to come from state that
-        ``to_state_dict`` already round-trips rather than from a local.
-
-        ``messages`` is deliberately left empty: the request is by construction
-        identical to the one on the attempt that eventually gets scored, and
-        copying it per abort is what made a persistently filtered row's state
-        grow several-fold.
+        Appends an ``ABORTED`` record (response and provider metadata, empty
+        ``messages``) to ``all_attempts`` and leaves ``current_attempt``
+        untouched, so the caller resends the identical request and the next
+        real answer is scored as the attempt it is. The appended records are
+        what the resend cap counts, so the count survives a batch resume.
         """
         self.all_attempts.append(
             AttemptRecord(
@@ -697,8 +624,8 @@ class ExtractionRowState:
         """Finish processing for this row.
 
         A row that reached the end only because a terminal failure was salvaged
-        (#152) finishes PARTIAL rather than SUCCESS: its mentions publish, but
-        the failure registry keeps a record of what was lost.
+        finishes PARTIAL rather than SUCCESS: its mentions publish, but the
+        failure registry keeps a record of what was lost.
         """
         self.all_attempts.append(self.current_attempt)
         if state == "SUCCESS" and self.salvage_notes:
@@ -795,10 +722,9 @@ class StageSpec(Protocol):
         """Build retry guidance after a validation failure."""
 
 
-# Bounds every live chat call: without a client timeout, one non-responsive
-# provider socket wedges the whole synchronous run — and the ECS task hosting
-# it — indefinitely (#93). Generous because reasoning models legitimately take
-# minutes per response.
+# Bounds every live chat call, so one non-responsive provider socket cannot
+# wedge the synchronous run. Generous because reasoning models legitimately
+# take minutes per response.
 LIVE_REQUEST_TIMEOUT_SECONDS = 600
 
 
@@ -842,11 +768,9 @@ class OpenRouterChatClient:
         return completion_result_from_response(response)
 
 
-# A bare opening tag: NER output carries no attributes, but the high-water
-# check below counts tags in *earlier* attempts too, and those are exactly the
-# responses that failed — truncated mid-document, or never well-formed XML at
-# all. So the count is a regex rather than a parse, and tolerates an attribute
-# it should never see.
+# A regex rather than a parse: the high-water check counts tags in earlier,
+# failed attempts, which may be truncated or not well-formed XML. Tolerates an
+# attribute NER output should never carry.
 DEBT_INSTRUMENT_OPEN_TAG_RE = re.compile(r"<debt_instrument(?:\s[^>]*)?>")
 
 
@@ -873,11 +797,9 @@ NER_ENTITY_OPEN_TAG_RE = re.compile(
 
 
 def count_ner_entity_tags(response: str | None) -> int:
-    """Count opening entity tags in one raw NER response.
+    """Count opening entity tags in one raw, possibly malformed NER response.
 
-    A regex for the same reason `count_debt_instrument_tags` is one: the
-    callers include attempts that failed, and those are exactly the responses
-    that did not parse as XML.
+    Returns 0 for None or an empty response.
     """
     if not response:
         return 0
@@ -885,31 +807,11 @@ def count_ner_entity_tags(response: str | None) -> int:
 
 
 def prior_attempt_tagged(row_state: ExtractionRowState, stage_name: str) -> bool:
-    """Whether any earlier attempt on this row tagged anything at all (#176).
+    """Whether any earlier, non-aborted attempt of this stage tagged any entity.
 
-    The condition the byte-identical-echo check needs. "Returning the input
-    verbatim addresses nothing" is only true once the model has shown it can
-    find something in this item: dropping to a bare echo is then a regression
-    against its own work. On an item the model has never tagged, the same
-    response is the honest answer, and the `NODEBT_NER` fixture is exactly
-    that.
-
-    Deliberately any entity tag, not just `debt_instrument`. A response that
-    tagged an organization and a date and then regressed to a bare echo has
-    given up just as surely, and `prior_debt_instrument_high_water` -- which
-    asks the narrower question that drives `early_stop` -- reads zero for it.
-
-    Attempts the provider aborted are excluded, for the reason the status
-    exists at all: an abort is not the model answering, so its body is not the
-    model's work to regress against. The text on an `ABORTED` record is
-    whatever the provider had emitted before it cut, and it is tagged -- all 58
-    `content_filter` responses in the stored corpora carry between 9 and 107
-    entity tags and at least one `debt_instrument` tag, with no empty bodies.
-    Counting them turned an honest untagged echo into a rejection the model
-    cannot act on: the abort contributes no assistant turn, so "re-emit your
-    previous tagged output" names work that is not in its context, and the row
-    exhausted its budget and died FAILED. That is the regression the
-    `attempt_index > 1` gate was replaced to avoid, reached by another route.
+    Any entity tag counts, not just `debt_instrument`. Provider-aborted
+    attempts are excluded: their partial text is not the model's work, and the
+    model cannot see it. See docs/decisions/extraction.md.
     """
     return any(
         count_ner_entity_tags(attempt.response)
@@ -921,13 +823,8 @@ def prior_attempt_tagged(row_state: ExtractionRowState, stage_name: str) -> bool
 def ner_input_body(row_state: ExtractionRowState) -> str:
     """Return the exact `<body>`-wrapped text the NER stage sends the model.
 
-    Only `NERStage.preprocess` needs it now. It was introduced so that
-    `validate`'s give-up check could compare a response against precisely what
-    the model was handed, but that check asks for a tag count instead, which
-    needs no copy of the request and cannot drift from it (#176). The text is
-    wrapped unescaped, which is deliberate and load-bearing elsewhere -- an
-    item containing a bare `&` produces a response that only parses after
-    `repair_unescaped_ampersands`.
+    The text is wrapped unescaped, deliberately: an item containing a bare `&`
+    produces a response that only parses after `repair_unescaped_ampersands`.
     """
     return f"<body>{row_state.text}</body>"
 
@@ -935,11 +832,8 @@ def ner_input_body(row_state: ExtractionRowState) -> str:
 def count_debt_instrument_tags(response: str | None) -> int:
     """Count `<debt_instrument>` opening tags in one raw NER response.
 
-    Deliberately not `parse_tag_details`: the callers include failed attempts,
-    whose responses are the ones that did not parse (11 of 27 NER failures on
-    the PR #57 window were `Response is not valid XML`, #127). A truncated
-    response with an unclosed tag still tells us the model was tagging, which
-    is the only question the high-water mark asks.
+    A regex, not `parse_tag_details`, so a truncated or malformed response
+    still counts. Returns 0 for None or an empty response.
     """
     if not response:
         return 0
@@ -949,25 +843,11 @@ def count_debt_instrument_tags(response: str | None) -> int:
 def prior_debt_instrument_high_water(
     row_state: ExtractionRowState, stage_name: str
 ) -> int:
-    """Most `debt_instrument` tags any earlier attempt on this row produced.
+    """Most `debt_instrument` tags any earlier attempt of this stage produced.
 
-    `all_attempts` holds the completed attempts -- `retry` appends the outgoing
-    one before building the next -- so this never sees the response being
-    validated. `to_state_dict`/`from_state_dict` already round-trip
-    `all_attempts` in full, so the batch backend resumes with the same
-    high-water mark and needed no schema change (#176).
-
-    Attempts the provider aborted are excluded, the same way
-    `prior_attempt_tagged` excludes them. The
-    judgement here is closer than it looks, and is made deliberately rather
-    than inherited: a truncated abort that tagged four instruments really is
-    evidence the item discloses debt, so reading it would catch a give-up this
-    now misses. It is excluded anyway, because the failure it raises tells the
-    model "an earlier attempt on this item tagged N -- keep every tag you
-    found", and on an aborted call the model neither produced those tags nor
-    can see them. A guard the model cannot satisfy costs the row its whole
-    budget and publishes nothing. If this is ever reconsidered, the retry
-    message has to change with it.
+    Reads only completed attempts in `all_attempts`, never the response being
+    validated, and excludes provider-aborted ones (the retry message tells the
+    model to keep tags it must be able to see). Returns 0 when there are none.
     """
     return max(
         (
@@ -993,78 +873,29 @@ class NERStage:
         ]
 
     def validate(self, row_state: ExtractionRowState, response: str) -> list[str]:
-        """Check one NER response, and what it lost against the row's earlier ones.
+        """Return the failures for one NER response; empty means it passed.
 
-        The six structural checks below are each correct alone, and together
-        they admit the response that motivated #176: a bare
-        `<body>{input}</body>` with zero tags is well-formed, correctly rooted,
-        uses no disallowed tag, carries no attributes, has no empty tag, and
-        strips to text identical to the input. `early_stop` then reads zero
-        `debt_instrument` tags as "this filing disclosed no debt" and the row
-        publishes SUCCESS with no mentions -- indistinguishable downstream from
-        a genuine zero, and its completion record makes a re-run skip it.
+        Structural checks: well-formed XML rooted at `<body>`, only
+        `NER_ALLOWED_TAGS`, bare non-empty tags, and stripped text equal to the
+        input up to whitespace. Two cross-attempt checks reject a give-up that
+        passes all of those (an untagged echo of the input):
 
-        MPLX item 2.03 (`000119312519257376-2-03`) is the case: attempts 1 and 2
-        tagged 91 `debt_instrument` spans each and failed only the copy-fidelity
-        check, and attempt 3 returned the model's own input byte for byte,
-        passed, and published 0 mentions against six note series and a term
-        loan. `000121390026025721-1-01` is the same story at 15 spans.
+        * no entity tags at all, when an earlier attempt of this row tagged any;
+        * no `debt_instrument` tags, when an earlier attempt tagged some
+          (the high-water mark).
 
-        Two cross-attempt checks close it, because the row already held the
-        evidence to tell a give-up from a genuine zero:
-
-        * a high-water mark -- zero `debt_instrument` tags is a failure when an
-          earlier attempt on this row found some. It cannot misfire on a
-          debt-free item, which found none on attempt 1 either.
-        * a response that tags nothing at all, once an earlier attempt on this
-          row has tagged something. That is what makes a give-up a give-up: the
-          model found something here before and has now returned none of it --
-          not the attempt number it arrived on, and not the exact bytes it
-          returned. On an item the model has never tagged, an untagged response
-          is the honest answer, and the `NODEBT_NER` fixture is exactly that.
-
-          Stated as a tag count rather than as "byte-identical to the input",
-          which is what it was first written as. The copy-fidelity check below
-          already guarantees the text is the input, so "no tags" is the whole
-          of the question, and asking it that way cannot be stepped around by
-          whitespace: an echo with one extra space, a newline inside `<body>`,
-          or doubled inter-word spacing cleared the byte comparison while
-          `collapse_whitespace` let it clear copy fidelity too. It also removes
-          the need for the check to rebuild the request string, so there is no
-          second copy to keep in step with `preprocess`.
-
-          The check is deliberately not unconditional, and the corpus is why:
-          over the three stored corpora that carry attempt logs (761 attempt-1
-          NER responses in `genwindow-run-branch`, `genwindow-run-dev`,
-          `genwindow-sol-retried`), no attempt-1 response was a byte-identical
-          echo and the 63 carrying no `debt_instrument` tag all carried some
-          other tag. So rejecting every untagged echo would have bought nothing
-          and cost legitimate zero-instrument items their rows. The single echo
-          anywhere in the corpus is MPLX's attempt 3.
+        On an item never tagged before, an untagged response is accepted as a
+        genuine zero. See docs/decisions/extraction.md for the motivating case
+        and corpus measurements.
         """
         if not response or not isinstance(response, str):
             return [
                 "Model returned empty or non-text output. Even if no entities are present, return the input text."
             ]
 
-        # Compared before the ampersand repair, and against a string built by
-        # the same helper that built the request: the give-up this names is a
-        # byte-for-byte echo of what the model was sent.
-        #
-        # Gated on the model having tagged something earlier on this row, not
-        # on the attempt number. `attempt_index > 1` was a proxy for "the model
-        # has been shown its error and told to fix it", and it is the wrong
-        # one: an item that genuinely has nothing to tag, whose first attempt
-        # failed for a reason that itself tagged nothing -- malformed XML, a
-        # wrong-text wrapper -- answers honestly with a bare echo, and that was
-        # being rejected on every remaining attempt until the row died FAILED.
-        # Measured against `dev`, such a row went from SUCCESS in 2 calls to
-        # FAILED in 3, the stage's whole budget.
-        #
-        # A prior failure that *did* tag something is the opposite case and is
-        # still rejected, truncation included -- a truncated response carries
-        # opening tags, so it counts as earlier work
-        # (`test_an_echo_after_a_truncated_tagged_attempt_is_still_rejected`).
+        # Gated on earlier tagged work, not the attempt number: an item with
+        # nothing to tag may honestly echo its input after an unrelated failure.
+        # A truncated earlier attempt still carries tags, so it counts.
         if prior_attempt_tagged(row_state, self.name) and not count_ner_entity_tags(
             response
         ):
@@ -1123,13 +954,8 @@ class NERStage:
     def build_retry_message(self, failures: list[str]) -> str:
         """Build the NER retry turn, asking for a repair rather than a redo.
 
-        The version this replaces listed only what the *text* had to satisfy --
-        "return the original input text exactly", "the stripped text must match
-        the original input exactly" -- and made tagging sound optional ("only
-        add the allowed bare tags"). The cheapest response satisfying every
-        bullet was to add nothing, and on MPLX item 2.03 that is what came back
-        (#176). The preserve clause goes first so the instruction the model is
-        most likely to follow is the one it was previously missing.
+        The keep-every-tag clause comes first so that returning the input
+        untagged is never the cheapest compliant answer.
         """
         return (
             "Your previous NER output failed validation.\n"
@@ -1150,11 +976,10 @@ def validate_instrument_entry(
     obj: object,
     tag_details: dict[str, dict[str, object]],
 ) -> list[str]:
-    """Validate one instrument entry on its own.
+    """Return the failures for one instrument entry on its own; empty means valid.
 
-    Factored out of ``InstrumentIEStage.validate`` so terminal salvage (#152)
-    can keep the individually-valid entries of a response whose other entries
-    failed.
+    Per-entry so terminal salvage can keep the individually-valid entries of a
+    response whose other entries failed.
     """
     if not isinstance(obj, dict):
         return [f"Entry {index} is not a JSON object."]
@@ -1232,8 +1057,8 @@ AMOUNT_KIND_TYPE_CONFLICTS = {
 }
 
 
-# Properties of the pre-facts schema. A response that uses them is a model
-# reverting to a shape the current prompt no longer describes.
+# Properties of the pre-facts schema, which the model can still revert to; each
+# maps to the instruction naming its replacement.
 LEGACY_INSTRUMENT_PROPERTIES = {
     "status_event": "events are `dates` entries (kinds closing, amendment, retirement, ...)",
     "lenders": "parties are one `parties` list with role lender",
@@ -1259,11 +1084,7 @@ def validate_no_legacy_properties(index: int, obj: object) -> list[str]:
 
 
 def validate_cross_field_semantics(*, index: int, obj: dict[str, Any]) -> list[str]:
-    """Reject shapes the schema forbids but no single-field check can see.
-
-    Each of these is a rule the prompt states; before this check the model's
-    violation was accepted and silently rewritten downstream.
-    """
+    """Reject shapes the prompt forbids but no single-field check can see."""
     failures: list[str] = []
     dates = obj.get("dates") if isinstance(obj.get("dates"), list) else []
     amounts = obj.get("amounts") if isinstance(obj.get("amounts"), list) else []
@@ -1293,8 +1114,7 @@ def validate_cross_field_semantics(*, index: int, obj: dict[str, Any]) -> list[s
     ):
         # A repayment figure is dated by the payment event that produced it: a
         # partial paydown (`repayment`) or the retirement/exchange that paid the
-        # rest. Requiring a separate `repayment` date beside a `retirement` made
-        # the model manufacture undated placeholder events (HASI, Smith Micro).
+        # rest, so a terminal event needs no separate `repayment` date.
         failures.append(
             f"Entry {index}: a `repayment` amount is an event; add a `repayment` entry to "
             "'dates' (with `evidence` [] and `normalized_date` null when no date is stated), "
@@ -1400,7 +1220,7 @@ class InstrumentIEStage:
             return
         _, roundtrip_text, tag_details = parse_tag_details(row_state.ner_tagged_xml)
         # Published evidence offsets index the item's own text, not the model's
-        # whitespace-drifted echo of it (#154).
+        # whitespace-drifted echo of it.
         tag_details = realign_tag_details(tag_details, roundtrip_text, row_state.text)
         document_currencies = frozenset(currency_candidates_from_text(row_state.text))
         mention_entries = iter_instrument_entries(
@@ -1429,7 +1249,7 @@ class InstrumentIEStage:
             start_date_payload = select_date_payload(date_payloads, "closing")
             if start_date_payload.get("normalized_date") is None:
                 # A facility whose only stated date is its `dated as of` date
-                # started then; the old single slot read it that way too.
+                # started then.
                 start_date_payload = select_date_payload(date_payloads, "agreement")
             maturity_payload = select_date_payload(date_payloads, "maturity")
             commitment_termination_payload = select_date_payload(
@@ -1547,17 +1367,8 @@ def oriented_lineage_pair(
     obligation to the instrument that retired it, so the source is the earlier.
     When both sides carry a start date and the source sits on the wrong side of
     that order, the model has named the pair the wrong way round and the
-    pointer is flipped.
-
-    Alclear's revolver is the confirmed case: a Credit Agreement dated as of
-    2020-03-31, amended 2026-06-23 to cut commitments from $100,000,000 and
-    extend maturity from 2026-06-28 to 2031-06-23. Every figure on the
-    `$100,000,000` object is pre-amendment, yet it was the object carrying
-    `amendment_of` (#138).
-
-    The dates have to disagree for this to fire. While the prompt gave the
-    predecessor and the amended instrument the same start date there was nothing
-    to orient on, which is why the direction went unchecked.
+    pointer is flipped. Any other type, a missing side, or a missing or equal
+    start date returns the pair unchanged.
     """
     if (
         relation_type not in LINEAGE_SUCCESSOR_FIRST_TYPES
@@ -1654,7 +1465,7 @@ class InstrumentRelationStage:
             if str(relation["type"]) == "retired_by":
                 # A list, not a scalar: one obligation may be retired jointly by
                 # several instruments (a dual-tranche offering funding one
-                # redemption), and a scalar overwrote all but the last edge.
+                # redemption).
                 retirers = json.loads(str(mention.get("retired_by_json") or "[]"))
                 if target and target not in retirers:
                     retirers.append(target)
@@ -1771,10 +1582,12 @@ def pending_extract_partitions(
 
     A partition is pending when it has no completion entry, its entry is marked
     incomplete (an aborted pass), or its source fingerprint changed (ingest
-    merged late-arriving rows into it, #62). ``done_item_ids`` are rows that
-    already reached a terminal state and must not be re-paid (#49).
+    merged late-arriving rows into it). ``done_item_ids`` are rows that
+    already reached a terminal state and must not be re-paid; ``force``
+    makes every partition pending with none done.
 
-    Also returns the loaded registry so the caller can update and persist it.
+    Also returns the loaded registry (empty under ``force``) so the caller
+    can update and persist it.
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     registry = (
@@ -1834,7 +1647,7 @@ def pending_extract_partitions(
     return pending, registry
 
 
-# The rule name a synthesized prior state carries in `synthesized_by` (#203).
+# The rule name a synthesized prior state carries in `synthesized_by`.
 SYNTHESIZED_PRIOR_STATE = "prior_state"
 # The term kinds a filing can mark `prior` — the list the dates validator names.
 PRIOR_TERM_DATE_KINDS = frozenset({"agreement", "maturity", "commitment_termination"})
@@ -1873,51 +1686,27 @@ def _inherited(payload: dict[str, object]) -> dict[str, object]:
 def mint_prior_state_rows(
     rows: list[dict[str, object]], counters: dict[str, int] | None = None
 ) -> list[dict[str, object]]:
-    """Return one item's rows with a synthesized predecessor for each amended object.
+    """Return a copy of one item's rows plus a predecessor for each amended object.
 
-    An amendment 8-K extracts as **one** object: its terms as amended, plus every
-    old term the filing states marked `prior` (`instrument_ie.md`). That is the
-    shape the model gets right — asking it to emit the predecessor as its own
-    object (#81) pointed at the wrong instrument in three of five spot-checks
-    (#125). But one object leaves nothing for `amendment_of` to name, so the
-    pipeline published no amendment lineage: 537 of 542 instruments were lineage
-    heads (#170). This expands the shape in code (#203). Nothing here *chooses* a
-    predecessor; it is constructed from the object's own cited `prior` facts, so
-    #125's failure class cannot occur.
+    For each model-emitted row M carrying a `prior` commitment/principal or
+    agreement/maturity/commitment-termination claim, mint a predecessor P
+    (`synthesized_by="prior_state"`) and set M's `amendment_of` to P's id. P is
+    M with each `prior` term replacing its kind; M's current terms of kinds with
+    no `prior` claim are carried over marked `derived_from: "inherited"`;
+    parties are M's borrowers only. P's origin date is a `prior` agreement, else
+    M's current closing or agreement, dropped if it equals an `amendment` date.
 
-    The predecessor P shares every property of its successor M except the terms
-    marked `prior`, which replace their kind: a `prior` mark means "this term
-    changed", and a current term with no prior sibling of its kind is, on the
-    filing's evidence, unchanged and carried onto P marked
-    `derived_from: "inherited"`. The one failure that rule cannot see — a filing
-    stating a *new* value with no before-figure ("increased commitments **to**
-    $250M") alongside some other `prior` term — is why the marker exists.
-    Parties carry the borrower only: a joinder adds and removes lenders, so the
-    filing never states who lent under the earlier terms. The successor's
-    `amendment_of` then names P. M's own row is otherwise untouched, and
-    `amendment_of` is not hashed into its id, so no existing row re-keys.
+    No P is minted, and a `skipped_*` counter is bumped, when M has two `prior`
+    claims of one kind, no `prior` value that parsed, an existing
+    `amendment_of`, no origin candidate, or a sibling row that already is P.
+    ``counters`` (optional, mutated in place) partition the rows with a `prior`
+    claim into `minted`, `minted_shared` (P identical to one already present)
+    and `skipped_*`; `minted_no_origin` tags the subset of `minted` with no
+    start date and must not be summed with the others.
 
-    Trigger: any `prior`-marked commitment/principal or agreement/maturity/
-    commitment-termination, plus an origin date — a `prior` agreement (the
-    predecessor's own dated-as-of, the best evidence), else the current
-    `closing` or `agreement`. Measured on one 364-item window: 22 objects carry
-    a prior term, 17 mint. An origin equal to an `amendment` date is the
-    restatement's own dated-as-of (MPLX: agreement 2019-07-31 == amendment
-    2019-07-31), not the predecessor's; P is still minted, with no start date,
-    rather than carry a date the filing did not state for that state.
-
-    Every refusal increments a named counter so the rate is measurable before
-    anyone loosens the rule, and the counters partition: each object carrying a
-    `prior` claim increments exactly one of `minted`, `minted_shared`, or a
-    `skipped_*`, so those sum to the population that reached this rule.
-    `minted_no_origin` is a tag on a subset of `minted`, not a fourth outcome —
-    it records that P was minted with no start date — so it is the one counter
-    that must not be added to the others (#211). Runs at write time
-    (`published_mention_rows`) and over
-    existing partitions (`backfill_mentions`): a pure function of one item's
-    rows, no clock, no model call. Rows read back from parquet carry NaN where
-    the writer had None, so every copied field is coerced, or a mint built here
-    and one built by the backfill would hash differently.
+    Pure: the input rows are not mutated, and there is no clock or model call.
+    Fields are coerced so rows read back from parquet (NaN for None) mint the
+    same ids. See docs/decisions/extraction.md.
     """
     counts = counters if counters is not None else {}
 
@@ -1925,27 +1714,17 @@ def mint_prior_state_rows(
         counts[key] = counts.get(key, 0) + 1
 
     text = coerce_dataset_text
-    # Copy before touching anything: this function writes `amendment_of` onto
-    # the successor, and the docstring's "pure function of one item's rows" has
-    # to be true of the argument too. Both current callers happened to be safe
-    # — `published_mention_rows` copies, `backfill_mentions` owns its records —
-    # but a future caller passing `row_state.debt_instrument_mentions` directly
-    # would have persisted a minted pointer into `state.jsonl` (#211).
+    # Copy first: `amendment_of` is written onto the successor, and the
+    # caller's rows (possibly persisted row state) must not change.
     published = [dict(row) for row in rows]
     real_rows = [row for row in published if text(row.get("synthesized_by")) is None]
     known_ids = {text(row.get("debt_instrument_mention_id")) for row in published}
     for row in real_rows:
         amounts = _json_list(row, "amounts_json")
         dates = _json_list(row, "dates_json")
-        # Which kinds the filing states a before-value for, and which of those
-        # this repo could parse, are two different questions, and conflating
-        # them inverted the inheritance rule. A `prior` term whose value the
-        # parser could not resolve was invisible to the "did this kind change?"
-        # test below, so the *current* value of that kind was copied onto the
-        # predecessor marked `inherited` — asserting the post-amendment figure
-        # as the prior state's own term, which is the one thing this rule must
-        # never do. The kind sets therefore come from the claims, and only the
-        # values come from what parsed (#211).
+        # Claims (what the filing marks `prior`) decide which kinds changed;
+        # only the values come from what parsed. An unparsed before-value still
+        # means the current value must not be inherited.
         prior_amount_claims = [
             entry
             for entry in amounts
@@ -1981,10 +1760,7 @@ def mint_prior_state_rows(
             continue
         if not prior_amounts and not prior_dates:
             # The filing does state a before-value, but none of them parsed, so
-            # there is nothing to build a predecessor's terms out of. This used
-            # to fall through the combined guard above with no counter, which is
-            # why the window's "22 objects carry a prior term" did not match the
-            # counters, which summed to 21 (#211).
+            # there is nothing to build a predecessor's terms out of.
             bump("skipped_unparsed_prior")
             continue
         if text(row.get("amendment_of")) is not None:
@@ -1996,14 +1772,8 @@ def mint_prior_state_rows(
         amendment_dates = {
             entry.get("normalized_date")
             for entry in dates
-            # `isinstance` and not just truthiness: a list or dict here raises
-            # `TypeError: cannot use 'list' as a set element` and kills the
-            # whole extract or backfill run rather than one item. No model
-            # output can reach it — `standardized_date_payload` overwrites
-            # `normalized_date` with this repo's own parser output, always
-            # `str | None` — so this is hardening against a tampered or
-            # hand-edited partition, and it is the same failure class the
-            # `_borrowers` guard was just written for (#211).
+            # `isinstance`, not truthiness: a list here from a hand-edited
+            # partition would raise in the set and kill the whole run.
             if entry.get("kind") == "amendment"
             and isinstance(entry.get("normalized_date"), str)
             and entry.get("normalized_date")
@@ -2057,7 +1827,7 @@ def mint_prior_state_rows(
 
         # From the claims, not the parsed subset: an unresolvable before-figure
         # still says this term changed, so the current one must not be
-        # inherited onto the predecessor as though it had not (#211).
+        # inherited onto the predecessor as though it had not.
         prior_amount_kinds = {entry.get("kind") for entry in prior_amount_claims}
         prior_date_kinds = {entry.get("kind") for entry in prior_date_claims}
         minted_amounts: list[dict[str, object]] = []
@@ -2167,12 +1937,7 @@ def mint_prior_state_rows(
             continue
         known_ids.add(minted_id)
         published.append(minted)
-        # Here and not where the origin was resolved, so the tag really is one
-        # on a subset of `minted`: two guards still stand between that point
-        # and the append, and a row that trips either of them had no P minted
-        # for it. Bumped early, `minted_no_origin: 1` could sit beside
-        # `skipped_sibling_is_predecessor: 1` and no synthesized row at all,
-        # which reads as a mint that never happened (#211).
+        # Bumped only after the append, so the tag is a true subset of `minted`.
         if minted_without_origin:
             bump("minted_no_origin")
         bump("minted")
@@ -2180,25 +1945,11 @@ def mint_prior_state_rows(
 
 
 def published_mention_rows(row_state: ExtractionRowState) -> list[dict[str, object]]:
-    """Return the mention rows one row state publishes.
+    """Return the mention rows one row state publishes, prior states included.
 
-    The one seam between what the model returned for an item and what the
-    pipeline writes for it. Every publish path — the live loop, the batch
-    job's finalize, the in-memory `extract_tables`, and the `full.jsonl` audit
-    record — goes through here, so `mint_prior_state_rows` (#203) is applied
-    once and identically on every backend, including rows of an in-flight batch
-    job whose IE postprocess ran under older code, while `state.jsonl` keeps
-    carrying only what the model returned. The successor's `amendment_of` is
-    set on the published row and never on the persisted state, which
-    `mint_prior_state_rows` now guarantees of its own argument — so this no
-    longer copies ahead of it (#211).
-
-    No `counters`: nothing passed one, and keeping a parameter for a caller
-    that does not exist yet is the shape this module's tests forbid one
-    function over in `lineage_inference`. The mint counters are read off
-    `cdt backfill-mentions`, which is where the pre-registered yield is
-    measured; a live-path counter should arrive with the manifest field that
-    would carry it.
+    Every publish path (live loop, batch finalize, `extract_tables`, the
+    `full.jsonl` audit record) goes through here, so the prior-state mint is
+    applied identically on every backend. The row state itself is not mutated.
     """
     return mint_prior_state_rows(row_state.debt_instrument_mentions)
 
@@ -2213,18 +1964,13 @@ def backfill_mentions(
     """Re-derive the synthesized rows over every existing `mentions` partition.
 
     Drops the rows an earlier run synthesized, clears the pointers that named
-    them, and mints again from the model-emitted rows — so partitions written
-    before #203 gain their prior states with no re-extraction and no model
-    call, and running it twice is a no-op (the mint is a pure function of the
-    model-emitted rows). Returns the mint counters plus partition counts;
-    `dry_run` counts without rewriting, which is the pre-registered yield for
-    an eval.
+    them, and mints again from the model-emitted rows, with no model call;
+    running it twice is a no-op. Returns the mint counters plus `partitions`
+    and `partitions_rewritten`; `dry_run` counts without rewriting.
 
-    ``renew`` extends the caller's writer lease per rewritten partition. This
-    rewrites the whole canonical mentions dataset, so on a corpus large enough
-    to outlast the lease TTL the next orchestrator tick would legitimately
-    steal the lease and start extract/match into the same objects (#89, #211).
-    A dry run writes nothing and needs no lease.
+    ``renew`` is called before each partition rewrite to extend the caller's
+    writer lease, since rewriting the whole dataset can outlast the lease TTL.
+    A dry run writes nothing and never calls it.
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     counts: dict[str, int] = {"partitions": 0, "partitions_rewritten": 0}
@@ -2277,32 +2023,13 @@ def _mentions_partition_needs_write(
     replaced_item_ids: set[str],
     retired_item_ids: set[str],
 ) -> bool:
-    """Whether this partition has rows to add or rows to take away (#209).
+    """Whether this mentions partition has rows to add or rows to take away.
 
-    Both backends decide this, and both got it wrong in their own way, so the
-    rule lives in one place. There are two reasons to write: new mentions to
-    add, or ids to remove from what is already stored. The second is the one
-    that leaked -- an item that is still relevant, is re-extracted, and this
-    time yields *no* mentions has to have its previous rows withdrawn, or the
-    pipeline keeps publishing facts the newer pass retracted.
-
-    `retired_item_ids` cannot carry that case: it is
-    `done_item_ids - relevant_item_ids`, and the item is still relevant, so it
-    is empty while `replaced_item_ids` holds the id. The batch path tested only
-    `retired` and so skipped the merge outright. The live path tested
-    `replaced_item_ids & pending.done_item_ids`, which looks right but is empty
-    under `--force` by construction: `pending_extract_partitions` deliberately
-    sets `done_item_ids=frozenset()` for a forced partition so its rows get
-    re-extracted, which also erased the evidence that there was anything to
-    purge.
-
-    Asking the stored partition is what both were reaching for and neither
-    could express. It is also why "ids to remove" is not simply
-    `replaced_item_ids`: on a first-ever extraction that yields nothing, every
-    claimed id is `replaced` and there is no partition to purge from, and
-    writing then would create an empty parquet file where the pipeline's
-    contract is to create none
-    (`test_extract_pending_items_skips_empty_outputs_on_rerun`).
+    True when there are new mentions, or when there are replaced or retired
+    item ids and the partition already exists (a re-extracted item that now
+    yields no mentions must withdraw its old rows). Never true for a partition
+    that does not exist and would only be written empty. Shared by both
+    backends; see docs/decisions/extraction.md.
     """
     if not new_mentions.empty:
         return True
@@ -2335,12 +2062,11 @@ def _merge_mentions_partition(
 
     ``retired_item_ids`` are ids a claimed source partition used to hold and
     no longer does -- a row that stopped being relevant, or, on the 6-K path,
-    windows that merged into one snippet so their own ids ceased to exist
-    (#172). Keeping only what is absent from the source would be wrong: one
-    mentions partition holds both genres and several accessions, so anything
-    not named here must be left alone. Nothing else prunes these, and a mention
-    whose item no longer exists still publishes -- inflating the instrument's
-    counts and asserting facts from text the pipeline has stopped sending.
+    windows that merged into one snippet so their own ids ceased to exist.
+    Rows of those items are dropped; rows of items named in neither set are
+    left alone, since one mentions partition holds both genres and several
+    accessions. Nothing else prunes retired items' mentions. Returns the
+    partition path written.
     """
     target_path = date_shard_partition_path(
         MENTIONS_DATASET_NAME,
@@ -2376,15 +2102,14 @@ def collect_pending_extract_items(
     plus its originating ``(date, shard)``, and ``claimed`` maps each claimed
     classification partition to its source fingerprint and the item_ids that
     were already terminal before this job — the state finalize needs to record
-    row-outcome-keyed completion (#49) and to detect source growth (#62). Uses
-    the same selection as ``extract_pending_items`` so both backends claim the
-    same work, row by row.
+    row-outcome-keyed completion and to detect source growth. Uses the same
+    selection as ``extract_pending_items`` so both backends claim the same
+    work, row by row.
 
     ``max_rows`` stops claiming partitions once the collected row count reaches
     it (whole partitions stay the atomic claim unit, so the last claimed
-    partition may overshoot). Unclaimed partitions are simply left pending: a
-    post-backfill job holding every pending item's full text OOMs the poll
-    tick (#92), and the next job picks up the remainder.
+    partition may overshoot); None claims everything. Unclaimed partitions stay
+    pending for the next job, which bounds the full text one poll tick holds.
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     pending, _registry = pending_extract_partitions(
@@ -2489,8 +2214,8 @@ def extract_pending_items(
         ).reindex(columns=CLASSIFIED_ITEM_COLUMNS)
         relevant_items = batch_items.loc[batch_items["relevance"].fillna(False)]
         # Row-level work list: rows that already reached a terminal state in an
-        # earlier pass are never re-paid (#49); rows ingest merged in later are
-        # exactly the ones missing from done_item_ids (#62).
+        # earlier pass are never re-paid; rows ingest merged in later are
+        # exactly the ones missing from done_item_ids.
         relevant_records = [
             record
             for record in relevant_items.to_dict("records")
@@ -2556,9 +2281,7 @@ def extract_pending_items(
         mentions = pd.DataFrame(mention_rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
         # Rows this partition was extracted for last time and no longer has.
         retired_item_ids = set(pending.done_item_ids) - relevant_item_ids
-        # One condition, shared with the batch path: the three-branch form here
-        # had a middle test that disagreed with the first, and the gap between
-        # them was the `--force` leak (#209).
+        # One condition, shared with the batch path.
         if _mentions_partition_needs_write(
             resolved_root,
             data_dir=data_dir,
@@ -2764,13 +2487,8 @@ def finalize_extract_outputs(
         mentions = pd.DataFrame(mention_rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
         replaced = terminal_by_partition.get((partition_date, shard), set())
         retired = retired_by_partition.get((partition_date, shard), set())
-        # `replaced` as well as `retired`, via the predicate the live path also
-        # uses: testing `retired` alone skipped the purge for a still-relevant
-        # item re-extracted to zero mentions (#209).
-        # `_merge_mentions_partition` already handles an empty `new_mentions`
-        # beside a populated `replaced_item_ids` correctly -- it drops the
-        # replaced ids and writes what is left -- so the bug was only ever in
-        # this guard.
+        # `replaced` as well as `retired`: a still-relevant item re-extracted to
+        # zero mentions must still have its old rows purged.
         if not _mentions_partition_needs_write(
             resolved_root,
             data_dir=data_dir,
@@ -2997,14 +2715,10 @@ def handle_response(
     next stage, schedules a retry, or terminates the row. Returns the messages
     for the next LLM call, or None when the row has reached a terminal state.
 
-    Every call that reaches here is a scored attempt: the model answered, and
-    the answer is either accepted or rejected. Calls the provider aborted never
-    arrive, because both backends classify them first and re-send without
-    scoring (`is_content_filter_abort`, `ExtractionRowState.record_unbilled_abort`)
-    -- the same place and for the same reason an infrastructure error is
-    classified before it can become an attempt (#127, #135).
-
-    `max_attempts` is the budget, and it is the same for every stage.
+    Every call that reaches here is a scored attempt. Callers must divert
+    provider aborts first (`is_content_filter_abort`,
+    `ExtractionRowState.record_unbilled_abort`), as they do infrastructure
+    errors. `max_attempts` is the per-stage budget, the same for every stage.
     """
     stage = STAGE_BY_NAME[row_state.current_attempt.stage_name]
     stage_index = STAGE_INDEX[stage.name]
@@ -3024,10 +2738,8 @@ def handle_response(
 def is_content_filter_abort(completion: CompletionResult | None) -> bool:
     """Whether the provider aborted this response instead of the model ending it.
 
-    The distinction is the whole content of #135: without `finish_reason` an
-    upstream abort and a model that chose to stop look identical in the audit
-    log, and they need opposite remedies -- resend the same request, versus
-    change the request.
+    An abort is remedied by resending the same request; a model stop by
+    changing it. False for None.
     """
     return completion is not None and completion.finish_reason == "content_filter"
 
@@ -3049,36 +2761,15 @@ def count_content_filter_aborts(row_state: ExtractionRowState, stage_name: str) 
 def terminate_on_provider_aborts(
     row_state: ExtractionRowState, stage: StageSpec, aborts: int
 ) -> None:
-    """End a row the provider will not process, without blaming the model.
+    """End a row at the resend cap, without scoring the abort against the model.
 
-    Reaching `MAX_CONTENT_FILTER_RESENDS` means "stop re-sending", not "the
-    model answered badly". Scoring the abort instead -- which is what falling
-    through to `handle_response` would do -- charges the row for a call it
-    never got an answer to, grows the retry conversation with an empty
-    assistant turn plus a complaint about it, and leaves a `FAILED` attempt
-    that every cross-attempt check in #176 reads as the model having failed --
-    one abort past the cap was enough to reject the honest answer that followed
-    it.
-
-    #152's rule still applies to what the row already earned, and it applies
-    the same way `_salvage_or_fail` applies it after a scored failure: a stage
-    the provider will not run costs the item what that stage would have added,
-    not what earlier stages already validated. The two paths kept diverging on
-    `instrument_ie` -- a row with a salvageable response finished PARTIAL with
-    its mentions after three rejected answers, and FAILED with none if the
-    provider aborted instead -- so both now ask the same two questions in the
-    same order.
-
-    The note names both causes when there are two. `count_content_filter_aborts`
-    is a per-stage lifetime count with no reset, which is deliberate -- it is
-    what bounds the damage one item can do, and it survives a process exit --
-    but it means the aborts need not have been consecutive, and the note used
-    to claim they were and that "no attempt was scored". On a row that was
-    aborted, answered badly, then aborted again, both halves were false, and
-    `summarize_failure` prefers salvage notes over `validation_errors`, so the
-    model's actual error never reached the registry at all. An operator read
-    "the provider refused to serve this item" and went to the vendor while the
-    extraction defect stayed invisible.
+    Salvages like `_salvage_or_fail`, except that an `instrument_ie` salvage
+    finishes here instead of advancing: an `instrument_ie` response whose valid
+    entries yield at least one mention, or mentions already held at
+    `instrument_relation`, finish PARTIAL without lineage; otherwise FAILED.
+    The salvage note records ``aborts`` and, when scored attempts of this stage
+    also failed, the most recent validation errors, since the aborts need not
+    have been consecutive.
     """
     scored_failures = [
         attempt
@@ -3135,7 +2826,7 @@ def handle_provider_abort(
 
     Shared by both backends so the live loop and the batch fold cannot drift on
     a decision neither of them scores. Returns False when the resend cap is
-    reached and the row has been terminated (#127, #135).
+    reached and the row has been terminated.
     """
     stage = STAGE_BY_NAME[row_state.current_attempt.stage_name]
     resend = (
@@ -3167,25 +2858,9 @@ def _advance_after_stage(
 ) -> list[dict[str, str]] | None:
     """Move one row past a completed stage: finish it or start the next stage."""
     if stage.early_stop(row_state):
-        # A zero-tag NER response that got this far is the honest "this filing
-        # disclosed no debt", and it finishes SUCCESS whether or not the row
-        # needed a retry to produce it.
-        #
-        # It used to finish PARTIAL when the row had retried, on the reasoning
-        # that a model which already failed once is as likely to be giving up
-        # as reporting a genuine zero, so the outcome should be filed as a
-        # possible loss. The reasoning was sound and the remedy was not: a
-        # PARTIAL row is terminal like any other, so `terminal_ids` records it
-        # and the next run skips it (`collect_pending_extract_items`). It
-        # bought a registry entry and no re-extraction, while asserting a loss
-        # that nothing had evidence for.
-        #
-        # A give-up the row *does* hold evidence for is a validation failure
-        # instead -- `validate`'s high-water mark and give-up check both reject
-        # one -- so it retries to the stage's budget and then terminates FAILED
-        # through the ordinary path, which is both counted and re-extractable.
-        # Where there is no earlier tagging to compare against there is no
-        # evidence either way, and a clean zero is the honest reading (#176).
+        # A zero-tag NER response that passed validation is the honest "this
+        # filing disclosed no debt", retried or not; a give-up the row holds
+        # evidence for was already rejected by `NERStage.validate`.
         row_state.finish("SUCCESS")
         return None
     if stage_index == len(EXTRACTOR_STAGES) - 1:
@@ -3210,13 +2885,13 @@ def _salvage_or_fail(
     stage_index: int,
     max_attempts: int,
 ) -> list[dict[str, str]] | None:
-    """Keep what the row's final failed attempt still supports (#152).
+    """Keep what the row's final failed attempt still supports.
 
-    A whole-item drop used to be the only terminal outcome, so one invalid
-    entry cost every valid one, and a relation-stage failure discarded mentions
-    that had already passed `instrument_ie` validation. Both salvages finish the
-    row PARTIAL: mentions publish, and the failure registry records the loss.
-    NER has nothing to salvage — without tags no downstream stage can run.
+    At `instrument_ie`, the individually valid entries are kept and the row
+    advances; at `instrument_relation`, mentions already held publish without
+    lineage. Either way the row finishes PARTIAL and the failure registry
+    records the loss. Otherwise (including NER) the row finishes FAILED.
+    Returns the next messages, or None when the row is terminal.
     """
     if stage.name == InstrumentIEStage.name:
         dropped = salvage_instrument_ie_entries(row_state)
@@ -3244,10 +2919,8 @@ def _salvage_or_fail(
 def instrument_entries_from_response(response: str) -> object:
     """Parse an instrument_ie response, accepting a bare object as a one-entry list.
 
-    The model returns one object instead of a one-element array on most
-    single-instrument items (73 of 300 on the 2026-09 window, every one of them
-    recovered on retry); the object is the same entry, so it is read as such
-    rather than paid for twice.
+    Raises ``json.JSONDecodeError`` on invalid JSON; any other JSON value is
+    returned as parsed for the caller to reject.
     """
     data = json.loads(response)
     if isinstance(data, dict):
@@ -3373,16 +3046,14 @@ def realign_tag_details(
 ) -> dict[str, dict[str, object]]:
     """Rewrite tag offsets from the NER round-trip text onto the original text.
 
-    Evidence `char_start`/`char_end` must index the item's own `text` exactly —
-    that is the published contract span highlighting rests on (#154). The NER
-    stage only validates whitespace-collapsed equality, so the model may add or
-    drop whitespace anywhere; the non-whitespace characters are identical in
-    order, and each span is snapped to the original text along that alignment.
+    Evidence `char_start`/`char_end` must index the item's own `text` exactly.
+    The NER stage only validates whitespace-collapsed equality, so the model
+    may add or drop whitespace anywhere; the non-whitespace characters are
+    identical in order, and each span is snapped to the original text along
+    that alignment.
 
     Returns the input unchanged when the texts already match, and unchanged
-    when they cannot be aligned (which collapse-equality validation rules out;
-    tolerated here rather than raised so one pathological row degrades to the
-    old offsets instead of failing the item).
+    (round-trip offsets) rather than raising when they cannot be aligned.
     """
     if roundtrip_text == original_text or not tag_details:
         return tag_details
@@ -3424,21 +3095,10 @@ def realign_tag_details(
 def repair_unescaped_ampersands(text: str) -> str:
     """Escape ampersands the NER response left bare, so it can be parsed.
 
-    `NERStage.preprocess` wraps the item text in `<body>` without escaping it, so
-    an item containing `A&R Registration Rights Agreement` is handed to the model
-    as invalid XML. The response then has to satisfy two requirements at once:
-    reproduce the text exactly, and be well-formed XML. For text carrying a bare
-    ampersand those conflict unless the model escapes on its own initiative,
-    which the prompt never asks for.
-
-    Bare ampersands appear in 44 of 342 relevant items in one held-out window
-    across 37 issuers, and in 13% to 17% of relevant items in each of three
-    windows, so this is a standing tax rather than one filer's quirk. Repairing
-    the response rather than escaping the input keeps what the model sees
-    unchanged, so nothing about its tagging behaviour moves (#127).
-
-    Only `&` is repaired. A stray `<` or `>` never occurs in the source text, so
-    one in a response is a real malformation and should still be rejected.
+    The item text reaches the model unescaped (`ner_input_body`), so an item
+    containing `A&R` yields a response that reproduces the text but is not
+    well-formed XML. Only `&` not already starting an entity is repaired; a
+    stray `<` or `>` is a real malformation and is left to fail parsing.
     """
     return UNESCAPED_AMPERSAND_PATTERN.sub("&amp;", text)
 
@@ -3551,10 +3211,10 @@ def completion_result_from_batch_line(line: dict[str, object]) -> CompletionResu
     """Build one completion result from an OpenAI Batch output JSONL line.
 
     The batch route reaches OpenAI directly rather than through OpenRouter, so
-    the usage block carries token counts but no `cost`; spend has to be derived
-    from the counts. A filtered response arrives here as a normal `200` with a
-    body, so it never reaches the infrastructure-error path and today is
-    indistinguishable from ordinary bad output (#135).
+    the usage block carries token counts but no `cost`. A filtered response
+    arrives as a normal `200` with a body, so it never reaches the
+    infrastructure-error path; callers detect it by `finish_reason`
+    (`is_content_filter_abort`). Raises as ``extract_batch_response_text`` does.
     """
     text = extract_batch_response_text(line)
     response = cast(dict[str, object], line.get("response") or {})
@@ -3655,9 +3315,8 @@ def validate_amount_is_not_rate(
     if not isinstance(evidence, list):
         return []
     # The same normalization `canonical_value` applies, so the validator and
-    # `standardized_amount_payload` judge one text. Stripping whitespace instead
-    # hid the `basis point` marker and both amount guards from the predicate
-    # (#102), and it also made the quoted text in the retry message unreadable.
+    # `standardized_amount_payload` judge one text; collapsing rather than
+    # stripping whitespace keeps multi-word markers such as `basis point`.
     evidence_texts = [
         normalize_span_whitespace(str(tag_details[tag_id]["text"]))
         for tag_id in evidence
@@ -3686,7 +3345,7 @@ def validate_dates_property(
     """Validate the kind-typed dates list on one instrument entry.
 
     Every entry needs a known kind and date-typed evidence (a maturity may also
-    cite the instrument's name span or a duration span, as before). At most one
+    cite the instrument's name span or a duration span). At most one
     non-prior entry per kind: two current maturities describe two instruments,
     exactly as two principals do.
     """
@@ -3715,9 +3374,7 @@ def validate_dates_property(
             and not prior
             # `expected` is not current either: `select_date_payload` publishes
             # the entry that is neither prior nor expected, so a real closing
-            # beside a planned one is one current closing, not two. Counting the
-            # planned one rejected Costamare's 6-K, which states a 2026-04-30
-            # closing and a 2026-06-30 expected closing for one facility.
+            # beside a planned one is one current closing, not two.
             and entry.get("expected") is not True
             and kind in SINGLE_CURRENT_DATE_KINDS
         ):
@@ -3811,7 +3468,7 @@ def validate_amounts_property(
     obj: dict[str, Any],
     tag_details: dict[str, dict[str, object]],
 ) -> list[str]:
-    """Validate the kind-typed amounts list on one instrument entry (#140)."""
+    """Validate the kind-typed amounts list on one instrument entry."""
     if "amounts" not in obj:
         return []
     entries = obj["amounts"]
@@ -3897,7 +3554,7 @@ def validate_interest_rate(
     obj: dict[str, Any],
     tag_details: dict[str, dict[str, object]],
 ) -> list[str]:
-    """Validate the optional interest_rate on one instrument entry (#157)."""
+    """Validate the optional interest_rate on one instrument entry."""
     if "interest_rate" not in obj:
         return []
     value = obj["interest_rate"]
@@ -3971,8 +3628,7 @@ def rate_tokens_in_rate_span(text: str) -> list[str]:
     A prose span carries its own marker (`4.125%`, `6.5 percent`, `6 1/2%`). A
     table cell under a `COUPON PCT` header is the bare number `4.125`: the
     tagger's type is the marker, so a span that is nothing but a number is that
-    rate. FHLB consolidated-obligation schedules lost every coupon this way (47
-    mentions with kind fixed and no pct on the 2026-09 window).
+    rate. Returns an empty list when the span has neither.
     """
     marked = rate_tokens(text)
     if marked:
@@ -3987,11 +3643,12 @@ def standardized_interest_rate_payload(
     *,
     name_text: str | None,
 ) -> dict[str, object]:
-    """Return the persisted interest-rate payload for one entry (#157).
+    """Return the persisted interest-rate payload for one entry.
 
-    The model's ``rate_pct`` publishes only when a rate token in the cited
-    evidence — or, failing that, in the instrument's name — parses to the same
-    number, mirroring how amounts and dates are parser-verified.
+    The model's ``rate_pct`` publishes, in canonical numeric form, only when a
+    rate token in the cited evidence — or, failing that, in the instrument's
+    name — parses to the same number, mirroring how amounts and dates are
+    parser-verified. A non-dict ``value`` yields an all-null payload.
     """
     if not isinstance(value, dict):
         return {"kind": None, "rate_pct": None, "spans": [], "derived_from": None}
@@ -4032,12 +3689,8 @@ def standardized_interest_rate_payload(
         for candidate in evidence_rates:
             try:
                 if Decimal(candidate) == Decimal(model_rate):
-                    # Publish the canonical form, not the model's spelling.
-                    # Verification is numeric but the value used to persist
-                    # verbatim, so one rate arrived as `5`, `5.00` and `5.000`
-                    # — 141 distinct strings for 115 distinct rates on the
-                    # generalization window, which splits any group-by and
-                    # makes an equality filter miss rows.
+                    # Publish the canonical form, not the model's spelling, so
+                    # one rate is one string (`5`, not `5.00` and `5.000`).
                     verified_rate = normalize_numeric_string(Decimal(model_rate))
                     break
             except InvalidOperation:
@@ -4149,7 +3802,7 @@ def canonical_value(
 
 # The title of the contract, as opposed to a description of the obligation it
 # creates: `Amended and Restated Credit Agreement`, `Indenture`, `Note Purchase
-# Agreement`. NER now tags both for one facility (ner.md rule 11), and the
+# Agreement`. NER tags both for one facility (ner.md rule 11), and the
 # agreement title is usually the longer string.
 AGREEMENT_NAME_PATTERN = re.compile(
     r"\b(?:agreement|indenture|supplemental\s+indenture)\b", re.IGNORECASE
@@ -4170,22 +3823,11 @@ def canonical_instrument_name(
 ) -> str | None:
     """Return the name that describes the obligation, not the contract.
 
-    `ner.md` rule 11 has NER tag both the facility phrase and its agreement
-    name, and says the descriptive phrase "must never be dropped in favour of
-    the agreement name". Plain longest-span selection did exactly that on 9 of
-    the 476 multi-span names in the 2026-09 window — publishing `Second Amended
-    and Restated Credit Agreement` over `term loan B facility`, and the
-    `Super-Priority Senior Secured Priming ...` title over `DIP Facility`.
-
-    That is not only a display problem: the published name feeds the matcher's
-    `normalize_name_fingerprint`, and an amendment title is the generic,
-    near-duplicate string that `NAME_CLASS_GATE` and the identifying-name guard
-    then have to defend against. Preferring the obligation's own description
-    keeps the individuating name where those heuristics can use it.
-
-    Falls back to the longest span when every span names the contract, which is
-    the right answer for an instrument the filing only ever calls by its
-    agreement.
+    The longest span that is not an agreement title and contains an
+    obligation noun (`ner.md` rule 11); the longest span of any kind when none
+    qualifies; None for an empty cluster. The published name feeds the
+    matcher's name fingerprint, so the individuating description is preferred
+    over a generic agreement title.
     """
     values = cluster_span_texts(tag_ids, tag_details)
     if not values:
@@ -4194,12 +3836,8 @@ def canonical_instrument_name(
         value
         for value in values
         if not AGREEMENT_NAME_PATTERN.search(value)
-        # The alternative has to actually name an obligation. Preferring any
-        # non-agreement span published `Local Currency Addendums` over `Credit
-        # Agreement (2025 364-Day Facility)` and `RFA` over `receivables
-        # financing agreement` — trading the agreement-title problem for a
-        # vacuous-name one, and manufacturing the repeated template names that
-        # `NAME_CLASS_GATE` then has to defend against.
+        # The alternative has to actually name an obligation, or a defined
+        # term such as `RFA` would beat `receivables financing agreement`.
         and INSTRUMENT_NOUN_PATTERN.search(value)
     ]
     return max(described or values, key=len)
@@ -4211,11 +3849,10 @@ def canonical_amount_value(
 ) -> str | None:
     """Return the amount cluster's canonical text, preferring a parseable span.
 
-    An amount cluster often pairs the figure with the label that names it, and
-    the label is the longer span: `['$2,000,000', 'Principal Amount']` resolved
-    to `Principal Amount`, which parses to nothing, so the amount published as
-    null (#120). The rate guard reads this same text, so judging it on the span
-    the parser actually reads keeps #102/#103 pointed at the right words.
+    The longest span that parses as an amount, else the longest span; None for
+    an empty cluster. An amount cluster often pairs the figure with a longer
+    label (`['$2,000,000', 'Principal Amount']`), and the rate guard reads this
+    same text.
     """
     values = cluster_span_texts(tag_ids, tag_details)
     if not values:
@@ -4259,11 +3896,7 @@ def supported_currency_codes() -> set[str]:
 def normalize_numeric_string(value: Decimal) -> str:
     """Return one deterministic numeric string.
 
-    Decimal rather than float: `float("372246148.11")` is not that number, and
-    `f"{value:.12f}"` renders the difference as `372246148.110000014305`. That
-    string is what the model's `normalized_amount` was compared against, so
-    every amount carrying cents failed the agreement check in
-    `standardized_amount_payload` and published as null (#119).
+    Takes a Decimal rather than a float so amounts with cents render exactly.
     """
     return canonical_numeric_text(value)
 
@@ -4289,7 +3922,7 @@ def computed_sum_amount(
     tag_details: dict[str, dict[str, object]],
     model_amount: object,
 ) -> str | None:
-    """Return the model's amount when it equals the sum of the cited spans (#165).
+    """Return the model's amount when it equals the sum of the cited spans.
 
     An increase-by amendment states a prior total and an increment but often
     never the result; the sum is deterministic arithmetic anchored to the cited
@@ -4325,64 +3958,20 @@ def scaled_amount_from_sibling(
     tag_details: dict[str, dict[str, object]],
     model_amount: object,
 ) -> str | None:
-    """Return the model's amount when a sibling fact's span carries its magnitude (#213).
+    """Return the model's amount when a sibling fact's span carries its magnitude.
 
-    Filing English writes a magnitude word once, after the second of two
-    figures. Crescent Capital BDC's Loan and Security Agreement amendment
-    (`000119312526241887-1-01`) says it "increased the facility size **from
-    $400.0 to $500.0 million**": NER tags `$400.0` (tag-15, chars 654-660) and
-    `$500.0 million` (tag-16, 664-678) as two `amount` spans, the model reads
-    the shared `million` correctly and returns `400000000` for the `prior`
-    commitment — and `amounts_agree` then compares that against the parser's
-    reading of the cited span alone, which is `400`. The correct value
-    published as null with `validation_errors: []`, and because
-    `mint_prior_state_rows` builds a predecessor only out of `prior` facts that
-    carry a value, the null suppressed the whole minted row and the item landed
-    in `skipped_unparsed_prior`.
-
-    The parser can already read the phrase — `normalized_amount_from_text("$400.0
-    to $500.0 million")` is `400000000` — so the entire failure is that the
-    cited span is tighter than the phrase carrying the magnitude. This reaches
-    an answer the parser already produces rather than inventing one.
-
-    **A sibling fact's cited span is acceptable evidence** (decided 2026-09-19).
-    The span *is* cited; it is simply cited by the neighbouring amount fact
-    rather than by the one being verified, so the arithmetic stays deterministic
-    and anchored to spans the model actually pointed at. The rejected
-    alternative was an `instrument_ie` rule requiring the model to cite both
-    spans on the `prior` fact — #165's precedent, which rode a fresh-window
-    eval. The *wider* alternative, a bare "nearest magnitude-bearing `amount`
-    span in the item", was also rejected: `tag_details` is the whole item's tag
-    map, so it would need no plumbing at all, but it would admit spans that no
-    fact cites.
-
-    Refusals mirror `computed_sum_amount`'s. The two cannot both land: one
-    needs the sum of the cited spans to equal the model's value, the other
-    needs one span's reading times a factor of at least a thousand to equal it,
-    and no value satisfies both. It is the exact-product comparison that
-    separates them rather than a span count -- this takes its reading from
-    `canonical_amount_value` and so never counts the spans it was given. The
-    product must equal the model's value exactly, and the return is the model's
-    own value re-normalized, so this can only ever *confirm* the model and
-    never originate a figure.
-
-    Measured by re-deriving `data/genwindow-run-branch` from its stored
-    responses: one fact rescued of 587, moving `skipped_unparsed_prior` 1 -> 0
-    and `minted` 15 -> 16, with every other refusal counter unchanged and
-    `lineage-verify`'s amendment pointers 22 -> 23 on unchanged heads and
-    families. The rescue fires on no other fact in any stored root. #214's Blue Owl
-    `($ in thousands)` table is untouched — its magnitude lives in an untagged
-    header that no fact cites, so there is no sibling magnitude to find and
-    guard 5 refuses all 18 of them.
+    Filings write a magnitude word once, after the second of two figures
+    (`from $400.0 to $500.0 million`), so a fact citing only `$400.0` parses to
+    400 while the model correctly reports 400000000. Returns the model's value,
+    re-normalized, only when no cited span (own or sibling) is rate-like, no
+    own span carries a magnitude, the sibling spans (cited by the object's
+    other amount facts) carry exactly one distinct magnitude, and the own
+    canonical reading times that magnitude equals the model's value exactly.
+    Otherwise None, so it only ever confirms the model's figure. See
+    docs/decisions/extraction.md.
     """
-    # These first two refusals mirror `computed_sum_amount`'s and state the
-    # type contract, but mutation-testing shows neither is load-bearing *here*:
-    # `decimal_from_amount_string` is total and rejects every non-string
-    # itself, and the exact-product comparison below subsumes both, because
-    # `Decimal(...) != None` is simply True rather than a TypeError. Dropping
-    # either one, or both together, changes this function's result on no input.
-    # Kept for the contract and the symmetry with the precedent; recorded here
-    # so a later reader does not mistake them for guards that bite.
+    # Type-contract refusals mirroring `computed_sum_amount`; the exact-product
+    # comparison below would also reject these inputs.
     if not isinstance(model_amount, str):
         return None
     model_value = decimal_from_amount_string(model_amount)
@@ -4393,27 +3982,13 @@ def scaled_amount_from_sibling(
     if any(is_rate_like_amount_text(text) for text in (*own_texts, *sibling_texts)):
         return None
     # `canonical_amount_value` supplies the reading, because that is the span
-    # `amounts_agree` just disagreed with (#120 prefers a parseable span to a
-    # pure label).
+    # `amounts_agree` just disagreed with.
     own_text = canonical_amount_value(own_tag_ids, tag_details)
     base = normalized_amount_from_text(own_text)
-    # Asked of *every* own span, not just the canonical one. A span already
-    # carrying a magnitude is never rescaled: `$500.0 million` means what it
-    # says, and multiplying it again by the sibling's `million` would invent a
-    # figure six orders out. Checking only the canonical span let that happen
-    # whenever the magnitude sat on a span the selector did not pick -- a fact
-    # citing both `aggregate principal amount of $400.0` and `$500.0 million`
-    # was rescaled by a sibling's `million` while holding the magnitude in its
-    # own evidence, because the longer bare span won the selection. Reachable
-    # from model output: unlike the single `amount` property,
-    # `validate_amounts_property` never runs
-    # `validate_standardized_single_value_cardinality`, so an `amounts[*]`
-    # entry may cite several spans with distinct values and still validate.
-    #
-    # This is also why `sibling_texts` needs no filtering against `own_texts`.
-    # No own span may carry a magnitude by the time we get here, so a sibling
-    # citing one of this fact's own spans contributes nothing to `magnitudes`
-    # and cannot change the result.
+    # Asked of *every* own span, not just the canonical one: a fact whose own
+    # evidence already carries a magnitude is never rescaled, even when the
+    # canonical span is a bare figure. This also means a sibling citing one of
+    # this fact's own spans contributes nothing to `magnitudes`.
     if base is None or any(
         magnitude_in_amount_text(text) is not None for text in own_texts
     ):
@@ -4439,8 +4014,8 @@ def scaled_amount_from_sibling(
 def amounts_agree(model_amount: object, parsed_amount: str | None) -> bool:
     """Return whether the model's amount is the same value the parser read.
 
-    Compared numerically, so the model reporting `500000.00` against a parsed
-    `500000` counts as agreement rather than losing the amount (#119).
+    Compared numerically, so `500000.00` agrees with a parsed `500000`. False
+    when either side is missing or not numeric.
     """
     if not isinstance(model_amount, str) or parsed_amount is None:
         return False
@@ -4454,12 +4029,8 @@ def amounts_agree(model_amount: object, parsed_amount: str | None) -> bool:
 def magnitude_in_amount_text(text: str | None) -> int | None:
     """Return the magnitude `normalized_amount_from_text` would apply, or None.
 
-    Factored out of the parser rather than written beside it so the two cannot
-    disagree about what counts as a magnitude word. `scaled_amount_from_sibling`
-    (#213) has to ask two questions the parser answers implicitly — does this
-    span carry a magnitude of its own, and which one does the neighbouring span
-    carry — and a second copy of this loop would drift exactly the way
-    `AMOUNT_SCALE_ALTERNATION`'s own comment records `trillion` drifting.
+    The one definition of a magnitude word, shared with
+    `scaled_amount_from_sibling` so the two cannot disagree.
     """
     if not text:
         return None
@@ -4493,10 +4064,9 @@ def normalized_amount_from_name(text: str | None) -> str | None:
     """Parse a principal stated inside an instrument name into a numeric string.
 
     `$183.36 million term loan` carries its own principal, and NER tags the whole
-    phrase as one `debt_instrument`, so there is no `amount` span to cite and the
-    amount was lost (#129). A name stating more than one figure names no single
-    principal, so it parses to None rather than to whichever comes first — the
-    same rule `normalized_maturity_from_text` applies to maturities (#104).
+    phrase as one `debt_instrument`, so there is no `amount` span to cite. Only
+    currency-marked figures count; a name stating more than one distinct figure
+    names no single principal and parses to None, as maturities do.
     """
     if not text:
         return None
@@ -4529,9 +4099,8 @@ def currency_candidates_from_text(text: str | None) -> set[str]:
         return set()
     lowered = text.lower()
     candidates: set[str] = set()
-    # A qualified dollar sign is a different currency. Reading `C$300 million`
-    # as USD both mislabelled the amount and kept CAD out of the candidate set,
-    # so the model's correct currency was rejected and published as null (#121).
+    # A qualified dollar sign is a different currency: `C$300 million` is CAD,
+    # not USD.
     qualified = QUALIFIED_DOLLAR_PATTERN.findall(text)
     candidates.update(QUALIFIED_DOLLAR_CODES[prefix.upper()] for prefix in qualified)
     if (
@@ -4558,8 +4127,8 @@ def is_rate_like_amount_text(text: str | None) -> bool:
     Every number in the span has to carry a rate marker. A marker appearing
     somewhere is not enough: `500,000,000 (100% of principal)` states a
     principal and then a percentage of it, and `normalized_amount_from_text`
-    reads the first number, so treating the whole span as a rate would discard a
-    real amount (#103).
+    reads the first number. A currency marker or magnitude word means not a
+    rate.
     """
     if not text:
         return False
@@ -4575,16 +4144,12 @@ def is_rate_like_amount_text(text: str | None) -> bool:
 
 
 def normalized_date_from_text(text: str | None) -> str | None:
-    """Parse one date mention into ISO format.
+    """Parse one date mention into ISO format, or None.
 
-    The parser has to read every spelling a filing uses, because
-    `standardized_date_payload` keeps the model's date only when it matches what
-    the parser reads. A format the parser cannot read discards a date the model
-    got right: `M/D/YYYY` alone cost 67 start dates and 67 end dates on one
-    held-out window, all of them from tabular schedules (#133).
-
-    Two-digit years stay unparsed. `7/28/26` cannot be resolved without guessing
-    a century, and a null is better than a wrong decade.
+    Reads lenient ISO (`2026-7-28`), `M/D/YYYY`, `July 28, 2026` and
+    `28 July 2026`; `standardized_date_payload` keeps the model's date only when
+    it matches this reading. Two-digit years stay unparsed: a null is better
+    than a wrong decade.
     """
     if not text:
         return None
@@ -4619,10 +4184,9 @@ def normalized_date_from_text(text: str | None) -> str | None:
 def normalized_month_year_from_text(text: str | None) -> str | None:
     """Parse a month-resolution date such as `in March 2056` to the month's last day.
 
-    Only maturities accept month resolution (#164): `matures in June 2016` and
-    `legal final maturity date is in March 2056` state the maturity as precisely
-    as the filing ever will, while a start or status date at month resolution
-    would be a guess. A span naming two months names no single date.
+    Used for maturities only: `matures in June 2016` states a maturity as
+    precisely as the filing ever will, while a start or status date at month
+    resolution would be a guess. A span naming two months returns None.
     """
     if not text:
         return None
@@ -4638,7 +4202,7 @@ def dates_agree(model_date: object, parsed_date: str | None) -> bool:
     """Return whether the model's date is the same day the parser read.
 
     Compared as dates rather than as strings, so a model writing `2026-7-28`
-    against a parsed `2026-07-28` keeps its value (#133, same shape as #119).
+    agrees with a parsed `2026-07-28`. False when either side is missing.
     """
     if not isinstance(model_date, str) or parsed_date is None:
         return False
@@ -4673,7 +4237,7 @@ def normalized_maturity_from_text(text: str | None) -> str | None:
         years.update(FOUR_DIGIT_YEAR_PATTERN.findall(match.group("years")))
     if full_dates:
         # A bare alternate year alongside a full date states a second maturity
-        # too, and so does a month-year phrase for a different month (#164).
+        # too, and so does a month-year phrase for a different month.
         if len(full_dates) != 1 or years - {value[:4] for value in full_dates}:
             return None
         full_date = full_dates.pop()
@@ -4704,9 +4268,7 @@ def iso_date_from_parts(year: str, month_name: str, day: str) -> str | None:
 def iso_month_end_from_parts(year: str, month_name: str) -> str | None:
     """Return the last day of one month-year maturity such as `due April 2033`.
 
-    Month resolution is strictly better than the year-end synthetic the same
-    name would produce without the month (#164); the matcher compares
-    name-derived values at their true resolution either way.
+    None for an unknown month name.
     """
     month = MONTH_MAP.get(month_name.lower())
     if month is None:
@@ -4717,10 +4279,9 @@ def iso_month_end_from_parts(year: str, month_name: str) -> str | None:
 
 
 def tenor_from_text(text: str | None) -> tuple[int, str] | None:
-    """Parse one duration span such as `five-year` or `364-day` (#166).
+    """Parse one duration span such as `five-year` into `(number, unit)`.
 
-    A span stating more than one distinct tenor anchors nothing, mirroring how
-    coordinated maturities parse to None (#104).
+    None when the span states no tenor or more than one distinct tenor.
     """
     if not text:
         return None
@@ -4746,10 +4307,8 @@ def date_plus_tenor(start: str, tenor: tuple[int, str], *, sign: int = 1) -> str
         return None
     number, unit = tenor
     number *= sign
-    # A tenor that lands outside the representable calendar is not an answer.
-    # Raising here would unwind out of postprocess and past the driver, which
-    # catches only InfrastructureError, killing the run before the failure
-    # registry, the mentions and the audit log were written.
+    # A tenor that lands outside the representable calendar is not an answer;
+    # raising would unwind out of postprocess and kill the whole run.
     try:
         if unit == "day":
             return (anchor + timedelta(days=number)).isoformat()
@@ -4768,7 +4327,7 @@ def computed_maturity_date(
     tag_details: dict[str, dict[str, object]],
     model_date: object,
 ) -> str | None:
-    """Return the model's maturity when it equals a cited date plus or minus a tenor (#166).
+    """Return the model's maturity when it equals a cited date plus or minus a tenor.
 
     A filing that states a facility's closing date and its tenor but never the
     maturity supports exactly one arithmetic answer. The model must cite both
@@ -4832,12 +4391,11 @@ def standardized_amount_payload(
 ) -> dict[str, object]:
     """Return evidence payload plus validated normalized amount fields.
 
-    ``document_currencies`` are the currencies the whole item text evidences.
-    A table cell (`35,000,000` under a `BANK PAR ($)` header) carries no marker
-    of its own, so the model's `USD` used to be rejected and published as null
-    (59 of 901 mentions on the 2026-09 window, all FHLB schedules and one
-    private-credit filer). When the cited span shows no currency and the
-    document as a whole shows exactly one, that one is accepted.
+    The model's amount publishes only when it agrees with the parsed cited
+    span, the name-embedded principal, or the sum of the cited spans; its
+    currency only when supported and evidenced. ``document_currencies`` are the
+    currencies the whole item text evidences: when the cited span shows none
+    (a bare table cell) and the document shows exactly one, that one counts.
     """
     evidence_tag_ids = single_value_evidence_tag_ids(value)
     payload = cluster_payload(evidence_tag_ids, tag_details)
@@ -4847,7 +4405,7 @@ def standardized_amount_payload(
     derived_from = DERIVED_FROM_STATED if parsed_amount is not None else None
     if parsed_amount is None:
         # A principal stated inside the name has no `amount` span to cite, so the
-        # name is the only evidence there is (#129).
+        # name is the only evidence there is.
         name_amount = normalized_amount_from_name(name_text)
         if name_amount is not None:
             parsed_amount = name_amount
@@ -4864,7 +4422,7 @@ def standardized_amount_payload(
         parsed_currency_candidates = set()
 
     # The parser's own string is published, so a model reporting the same value
-    # with different formatting keeps its amount rather than losing it (#119).
+    # with different formatting keeps its amount.
     payload["normalized_amount"] = (
         parsed_amount if amounts_agree(model_amount, parsed_amount) else None
     )
@@ -4905,21 +4463,13 @@ def standardized_amounts_payloads(
     name_text: str | None,
     document_currencies: frozenset[str] | None = None,
 ) -> list[dict[str, object]]:
-    """Return the kind-typed amount payloads for one instrument entry (#140).
+    """Return the kind-typed amount payloads for one instrument entry.
 
-    Reads the ``amounts`` list. When it yields no principal but the
-    instrument's name embeds one, one name-derived principal entry is
-    synthesized, preserving #129.
-
-    The shared-magnitude rescue (#213) runs here as a post-pass rather than
-    inside ``standardized_amount_payload``, which receives one ``amounts[*]``
-    entry and so cannot see the fact next to it. This is the narrowest place
-    the rule is expressible: both the built payloads and their evidence lists
-    are in hand, so "cited by a sibling amount fact of *this object*" can be
-    said. ``tag_details`` is the whole item's tag map, so a rule phrased over
-    it instead — the nearest magnitude-bearing `amount` span anywhere in the
-    item — would need no plumbing at all and was rejected for being strictly
-    wider: it would admit spans that no fact cites.
+    Reads the ``amounts`` list, then rescues each unverified amount whose
+    magnitude sits on a sibling fact's span (`scaled_amount_from_sibling`; a
+    post-pass because it needs this object's other facts). When no principal
+    results but the instrument's name embeds one, a name-derived principal
+    entry is synthesized.
     """
     payloads: list[dict[str, object]] = []
     entries = obj.get("amounts")
@@ -4972,11 +4522,9 @@ def standardized_amounts_payloads(
                 payload["derived_from"] = DERIVED_FROM_SCALED
     if not select_principal_amount(payloads):
         synthesized = name_derived_principal_payload(name_text)
-        # When every stated commitment or principal is `prior`, the head's
-        # current figure is unstated — and the figure in the name is the prior
-        # one. Reading it back off the name would publish the pre-amendment
-        # figure as current, #165's stale head by a second route (#206). The
-        # honest answer is null; the minted prior state carries that figure.
+        # When every stated commitment or principal is `prior`, the figure in
+        # the name is the prior one, not the current one: publish null and let
+        # the minted prior state carry it.
         prior_values = {
             str(payload["normalized_amount"])
             for payload in payloads
@@ -4992,14 +4540,10 @@ def standardized_amounts_payloads(
 
 
 def name_derived_principal_payload(name_text: str | None) -> dict[str, object] | None:
-    """Return a principal payload read off the instrument's own name (#129).
+    """Return a principal payload read off the instrument's own name, or None.
 
-    `$183.36 million term loan` states its principal in its name and cites no
-    `amount` span, so when the entry supplies no principal-bearing amount the
-    name is the only evidence there is. There is no model value to agree with
-    here — the parser's own reading is the value — so this cannot route through
-    `standardized_amount_payload`, whose `amounts_agree` gate rejects a null
-    model amount and made the previous version of this fallback unreachable.
+    The parser's reading of the name is the value (there is no model value to
+    agree with), marked ``derived_from: "name"``.
     """
     parsed_amount = normalized_amount_from_name(name_text)
     if parsed_amount is None:
@@ -5020,8 +4564,8 @@ def name_derived_principal_payload(name_text: str | None) -> dict[str, object] |
 def select_principal_amount(payloads: list[dict[str, object]]) -> dict[str, object]:
     """Return the payload that supplies the flat principal columns.
 
-    Commitment and principal are the identity-bearing kinds the matcher keys
-    on (#140). Balances, draws, repayments, and proceeds never become the
+    The first current commitment or principal with a value; ``{}`` when there
+    is none. Balances, draws, repayments, and proceeds never become the
     headline amount.
     """
     current = [payload for payload in payloads if not payload.get("prior")]
@@ -5043,11 +4587,8 @@ def standardized_date_payload(
     """Return evidence payload plus validated normalized date field."""
     evidence_tag_ids = single_value_evidence_tag_ids(value)
     payload = cluster_payload(evidence_tag_ids, tag_details)
-    # Every cited span is a candidate reading. Checking only the longest span
-    # threw away a correct `March 2, 2026` whenever the model also cited the
-    # defined term `Redemption Date` (the longer string) as evidence for the
-    # same date; the multiple-distinct-values validator already guarantees the
-    # parseable spans agree.
+    # Every cited span is a candidate reading, so a longer defined term such as
+    # `Redemption Date` cited beside `March 2, 2026` does not hide the date.
     span_texts = cluster_span_texts(evidence_tag_ids, tag_details)
     parsed_date = parsed_date_from_spans(span_texts, normalized_date_from_text)
     derived_from = DERIVED_FROM_STATED if parsed_date is not None else None
@@ -5064,7 +4605,7 @@ def standardized_date_payload(
         derived_from = DERIVED_FROM_NAME if parsed_date is not None else None
     model_date = value.get("normalized_date") if isinstance(value, dict) else None
     # The parser's own string is published, so a model writing the same day in a
-    # different shape keeps its value rather than losing it (#133).
+    # different shape keeps its value.
     payload["normalized_date"] = (
         parsed_date if dates_agree(model_date, parsed_date) else None
     )
@@ -5125,10 +4666,10 @@ def standardized_dates_payloads(
     """Return the kind-typed date payloads for one instrument entry.
 
     Each payload carries ``kind``, ``prior``, ``precision`` and the evidence
-    fields of the single-value payloads it replaces. A maturity keeps the
-    name-derived and computed fallbacks (#128, #166); when the object states
-    no maturity at all but its name embeds one, that name-derived maturity is
-    synthesized, as before.
+    fields of a single-value date payload. A maturity falls back to computed
+    and name-derived values (`standardized_end_date_payload`); when the object
+    states no maturity at all but its name embeds one, that name-derived
+    maturity is synthesized.
     """
     payloads: list[dict[str, object]] = []
     saw_maturity = False
@@ -5184,11 +4725,11 @@ def select_date_payload(
 def mark_post_filing_events_expected(
     date_payloads: list[dict[str, object]], filing_date: str
 ) -> None:
-    """An event dated after its own filing has not happened yet.
+    """Mark, in place, every non-announcement event dated after the filing as expected.
 
     `Interest on the Notes will accrue from April 6, 2022` in a March 25 pricing
-    8-K and a bond table's settlement dates a week after filing both read as
-    completed closings to the model; the calendar says otherwise.
+    8-K reads as a completed closing to the model; the calendar says otherwise.
+    No-op when ``filing_date`` is empty.
     """
     if not filing_date:
         return
@@ -5323,23 +4864,18 @@ def standardized_end_date_payload(
 
 # Where a normalized value came from: cited evidence spans, the instrument's own
 # name, or nowhere (no value). Downstream consumers key on this — the matcher
-# treats a name-synthesized YYYY-12-31 maturity as year-resolution only (#128),
-# and the dashboard can explain a value whose evidence list is empty.
+# treats a name-synthesized YYYY-12-31 maturity as year-resolution only, and the
+# site can explain a value whose evidence list is empty.
 DERIVED_FROM_STATED = "stated"
 DERIVED_FROM_NAME = "name"
 DERIVED_FROM_COMPUTED = "computed"
 # An amount read off its own cited span and scaled by a magnitude word carried
-# by a *sibling* amount fact's cited span, because the filing wrote that word
-# once for two figures: `from $400.0 to $500.0 million` (#213). A separate
-# marker rather than `"computed"`, which means arithmetic over addends and is
-# consumed as such on the maturity side (`DERIVED_MATURITY_KINDS`,
-# `matcher/core.py`); `src/` has no amount-side consumer of `derived_from` at
-# all, so a new value costs nothing and is the more honest record of how the
-# figure was reached.
+# by a *sibling* amount fact's cited span: `from $400.0 to $500.0 million`.
+# Distinct from `"computed"`, which means arithmetic over addends.
 DERIVED_FROM_SCALED = "scaled"
 # A term carried onto a synthesized predecessor row from the amended object it
 # was minted from, because the filing marked no `prior` value for that kind and
-# so states it unchanged (#203). The spans are the successor's; the marker is
+# so states it unchanged. The spans are the successor's; the marker is
 # what lets a reader tell an inherited term from one the filing stated for this
 # state of the instrument.
 DERIVED_FROM_INHERITED = "inherited"
@@ -5353,7 +4889,7 @@ def cluster_payload(
 ) -> dict[str, object]:
     """Return the evidence spans for one cluster.
 
-    ``char_start``/``char_end`` index the item's own ``text`` exactly (#154).
+    ``char_start``/``char_end`` index the item's own ``text`` exactly.
     ``tag_id`` is retained for the relation stage's tag-to-mention mapping and
     for audit debugging; downstream consumers need only the offsets and text.
     """
@@ -5395,13 +4931,12 @@ def party_payloads_and_disclosure(
 ) -> tuple[list[dict[str, object]], str]:
     """Return every party cluster with its role and kind, plus lender disclosure.
 
-    The model already labels every cluster; the labels persist rather than only
-    steering what to drop (#150). Lender clusters carry ``role: "lender"`` and
-    the model's ``kind``; other clusters carry the model's role — including the
-    borrower, whose identity matters exactly when a subsidiary is the obligor
-    under the parent filer's 8-K — and ``kind: "named"``, since the collective
-    distinction is only elicited for lenders. ``canonical_name`` is the longest
-    span, same as instrument names.
+    Each cluster with at least one known span becomes ``canonical_name``
+    (longest span), ``role`` (the model's, or ``other`` when unknown), ``kind``
+    (the model's, or ``named`` when absent or unknown) and ``spans``. The
+    borrower is kept: its identity matters when a subsidiary is the obligor
+    under the parent filer's 8-K. The disclosure is computed from the lender
+    clusters' kinds (`lender_disclosure_for`).
     """
     parties: list[dict[str, object]] = []
     raw_parties = obj.get("parties")
@@ -5465,13 +5000,10 @@ def relation_prompt_xml(row_state: ExtractionRowState) -> str:
 def relation_instrument_manifest(row_state: ExtractionRowState) -> str:
     """List each instrument id with the terms already extracted for it.
 
-    Two objects built from one name span render as the same tagged text twice,
-    once per instrument id, so `Third Amended and Restated Loan Agreement` and
-    its predecessor are indistinguishable in the body. The amount and dates that
-    tell them apart live in the `instrument_ie` output, which this stage never
-    saw, and it was being asked to decide which one carries "the newer terms"
-    from the ids alone. Every inverted lineage pair on the held-out run was a
-    same-name pair (#138).
+    Returns an `<instruments>` block (empty string when there are none) giving
+    each id its name, amount, dates, status and `expected_retirement` flag, so
+    the relation stage can tell apart objects built from one name span, which
+    render identically in the body.
     """
     lines: list[str] = []
     for mention in row_state.debt_instrument_mentions:
@@ -5544,7 +5076,7 @@ def render_relation_body(root: ET.Element, tag_to_raw_id: dict[str, str]) -> str
 def summarize_failure(row_state: ExtractionRowState) -> str:
     """Summarize what this row lost, for its failure-registry entry.
 
-    A salvaged row (#152) is terminal-but-publishable: its last attempt often
+    A salvaged row is terminal-but-publishable: its last attempt often
     succeeded, so the attempt carries no validation errors and the generic
     "unexpected response" summary below would describe a stage that worked.
     The salvage notes are the only record of what was actually dropped, so they
