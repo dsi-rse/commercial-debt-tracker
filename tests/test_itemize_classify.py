@@ -25,7 +25,7 @@ from cdt.datasets import (
 )
 from cdt.extractor import extract_pending_items, mentions_root
 from cdt.extractor.state import ExtractionRowState
-from cdt.ingest import DOCUMENT_COLUMNS
+from cdt.ingest.core import DOCUMENT_COLUMNS
 from cdt.itemizer import core as itemizer_core
 from cdt.itemizer import itemize_pending_documents, items_root
 from cdt.storage.objects import (

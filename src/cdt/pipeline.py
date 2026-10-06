@@ -24,7 +24,7 @@ from cdt.extractor import (
     extract_pending_items,
     extracted_tables_path,
 )
-from cdt.ingest import (
+from cdt.ingest.core import (
     DEFAULT_AWS_PROFILE,
     DEFAULT_BUCKET,
     DEFAULT_S3_PREFIX,
@@ -32,9 +32,10 @@ from cdt.ingest import (
     SIXK_FORM_TYPES,
     IngestConfig,
     IngestRunResult,
-    acquire_eightk_documents,
 )
-from cdt.ingest import DEFAULT_BATCH_SIZE as DEFAULT_INGEST_BATCH_SIZE
+from cdt.ingest.core import DEFAULT_BATCH_SIZE as DEFAULT_INGEST_BATCH_SIZE
+from cdt.ingest.eightk import acquire_eightk_documents
+from cdt.ingest.sixk import acquire_scraped_sixk_documents
 from cdt.itemizer import (
     POTENTIALLY_RELEVANT_ITEM_NUMBERS,
     itemize_pending_documents,
@@ -47,7 +48,6 @@ from cdt.matcher import (
 )
 from cdt.publish import finalize_after_match
 from cdt.shared import get_logger
-from cdt.sixk.scraper import acquire_scraped_sixk_documents
 from cdt.sixk.stage import DEFAULT_CONCURRENCY as SIXK_DEFAULT_CONCURRENCY
 from cdt.sixk.stage import triage_pending_documents
 from cdt.storage.objects import ArtifactPath, read_text_artifact

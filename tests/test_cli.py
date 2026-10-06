@@ -9,7 +9,7 @@ import pandas as pd
 import pytest
 
 from cdt import cli
-from cdt.ingest import IngestRunResult
+from cdt.ingest.core import IngestRunResult
 from cdt.itemizer import POTENTIALLY_RELEVANT_ITEM_NUMBERS
 from cdt.lease import PIPELINE_WRITER_LEASE, acquire_lease
 from cdt.pipeline import PipelineRunResult

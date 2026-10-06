@@ -15,8 +15,8 @@ import pytest
 from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS, score_model
 from cdt.completion import load_completion_registry
 from cdt.datasets import run_manifest_path
-from cdt.ingest import DOCUMENT_COLUMNS, SIXK_DOCUMENT_DATASET_NAME
-from cdt.ingest import documents_root as ingest_documents_root
+from cdt.ingest.core import DOCUMENT_COLUMNS, SIXK_DOCUMENT_DATASET_NAME
+from cdt.ingest.core import documents_root as ingest_documents_root
 from cdt.sixk import stage as sixk_stage
 from cdt.sixk.documents import prose_documents
 from cdt.sixk.stage import (

@@ -22,7 +22,7 @@ from cdt.datasets import (
     resolve_artifact_root,
     run_manifest_path,
 )
-from cdt.ingest import DOCUMENT_COLUMNS, decode_document_bytes
+from cdt.ingest.core import DOCUMENT_COLUMNS, decode_document_bytes
 from cdt.itemizer.extract import DocumentText, ItemSection, extract_items_from_document
 from cdt.shared import get_logger
 from cdt.storage.columns import coerce_dataset_text

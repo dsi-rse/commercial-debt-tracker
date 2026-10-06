@@ -348,7 +348,7 @@ The OpenAI provider (`SIXK_TRIAGE_PROVIDER=openai`) exists because OpenRouter
 reserves an estimated maximum cost per in-flight request, so it is the first to
 refuse under this stage's shape: many concurrent long-prompt calls.
 
-### `cdt.sixk.scraper`: assembly fidelity
+### `cdt.ingest.sixk`: assembly fidelity
 
 Assembling a submission from the scraper's per-document objects was checked
 against EDGAR on 23 real filings from 2016 to 2026, including a 6-K/A: every

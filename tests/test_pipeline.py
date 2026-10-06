@@ -13,7 +13,7 @@ from support import FakeModel
 from cdt.classifier import core as classifier_core
 from cdt.datasets import GENRE_6K, GENRE_8K
 from cdt.extractor.state import ExtractionRowState
-from cdt.ingest import IngestRunResult
+from cdt.ingest.core import IngestRunResult
 from cdt.matcher import debt_instruments_root, mention_cluster_edges_root
 from cdt.pipeline import (
     ALL_TIME_START_DATE,

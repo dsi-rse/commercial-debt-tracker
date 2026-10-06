@@ -17,18 +17,20 @@ from cdt.datasets import (
     failure_registry_path,
     parse_date_shard_partition,
 )
-from cdt.ingest import (
+from cdt.ingest.core import (
     DOCUMENT_COLUMNS,
     SIXK_DOCUMENT_DATASET_NAME,
     IngestConfig,
     _document_shard,
     _partition_path,
-    acquire_documents,
-    acquire_documents_for_date_range,
-    acquire_eightk_documents,
     documents_root,
     iter_filings,
     normalize_accession_number,
+)
+from cdt.ingest.eightk import (
+    acquire_documents,
+    acquire_documents_for_date_range,
+    acquire_eightk_documents,
 )
 from cdt.storage.objects import list_artifacts
 from cdt.storage.tables import read_dataset, read_table, write_table
@@ -468,7 +470,8 @@ def test_ingest_without_an_injected_client_builds_one_from_the_profile(
         profiles.append(profile_name)
         return client
 
-    monkeypatch.setattr("cdt.ingest.storage_s3_client", fake_storage_client)
+    monkeypatch.setattr("cdt.ingest.core.storage_s3_client", fake_storage_client)
+    monkeypatch.setattr("cdt.ingest.eightk.storage_s3_client", fake_storage_client)
 
     _, result = acquire_eightk_documents(
         IngestConfig(
@@ -648,7 +651,7 @@ def _manifest_bytes(
 
 def test_document_shard_is_stable_across_processes() -> None:
     """Shard assignment must not depend on the per-process hash salt (#61)."""
-    from cdt.ingest import DOCUMENT_PARTITION_SHARDS, _document_shard
+    from cdt.ingest.core import DOCUMENT_PARTITION_SHARDS, _document_shard
 
     # crc32 is deterministic: pin exact values so any change to the scheme
     # (which would strand existing partitions) fails loudly.
@@ -664,7 +667,7 @@ def test_document_shard_is_stable_across_processes() -> None:
         [
             sys.executable,
             "-c",
-            "from cdt.ingest import _document_shard;"
+            "from cdt.ingest.core import _document_shard;"
             "print(_document_shard('0001437749-26-027029'))",
         ],
         capture_output=True,
@@ -676,10 +679,8 @@ def test_document_shard_is_stable_across_processes() -> None:
 
 def test_force_retries_registered_permanent_failures(tmp_path: Path) -> None:
     """--force must be able to unpoison a filing the registry marked permanent (#67)."""
-    from cdt.ingest import (
-        IngestFailureClassifier,
-        iter_document_candidates_for_date_range,
-    )
+    from cdt.ingest.core import IngestFailureClassifier
+    from cdt.ingest.eightk import iter_document_candidates_for_date_range
     from cdt.shared import FailureRegistry
 
     manifest_key = "sec/2024-01-02/8-K/320193/000114036126006577/manifest.json"
@@ -697,7 +698,7 @@ def test_force_retries_registered_permanent_failures(tmp_path: Path) -> None:
     registry = FailureRegistry(
         str(tmp_path / "failures.json"), IngestFailureClassifier()
     )
-    from cdt.ingest import IngestFailureType
+    from cdt.ingest.core import IngestFailureType
 
     registry.add(("sec-bucket", manifest_key), IngestFailureType.DOCUMENT_NOT_FOUND)
 
@@ -729,7 +730,7 @@ def test_force_retries_registered_permanent_failures(tmp_path: Path) -> None:
 
 def test_key_matches_ciks_with_multi_segment_prefix() -> None:
     """The CIK segment is found from the key's end, not a fixed index (#73)."""
-    from cdt.ingest import _key_matches_ciks
+    from cdt.ingest.core import _key_matches_ciks
 
     single = "sec/2024-01-02/8-K/320193/000114036126006577/manifest.json"
     multi = "edgar/8k/2024-01-02/8-K/320193/000114036126006577/manifest.json"
@@ -745,7 +746,7 @@ def test_filing_from_manifest_pads_the_cik() -> None:
     It previously stripped leading zeros instead, and reverting it to
     `.lstrip("0")` left the suite green because nothing asserted the CIK here.
     """
-    from cdt.ingest import _filing_from_manifest
+    from cdt.ingest.core import _filing_from_manifest
 
     filing = _filing_from_manifest(
         {
@@ -1055,7 +1056,7 @@ def test_existing_accessions_reads_only_the_windowed_partitions(
     every partition and then filtered would return the same set and be exactly
     the bug.
     """
-    from cdt import ingest
+    from cdt.ingest import core as ingest
 
     for day, accession in (
         ("2024-01-01", "000000000024000001"),
@@ -1092,7 +1093,7 @@ def test_existing_accessions_projects_away_the_document_text(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Only the key column is requested: the text column is the entire cost (#190)."""
-    from cdt import ingest
+    from cdt.ingest import core as ingest
 
     _store_document(tmp_path, "000000000024000005", "2024-01-05")
     requested: list[object] = []
@@ -1125,7 +1126,7 @@ def test_existing_accessions_scans_the_window_in_one_pass(
     time against 1.75s as a single scan. Daily mode's five-day lookback bounds
     the loop; ``--mode historical`` defaults to 1994-to-today and does not.
     """
-    from cdt import ingest
+    from cdt.ingest import core as ingest
 
     for day in ("2024-01-05", "2024-01-06", "2024-01-07"):
         _store_document(tmp_path, f"00000000002400{day[-2:]}", day)
@@ -1206,7 +1207,7 @@ def test_the_read_back_counts_the_window_without_reading_its_bodies(
     whole 12.2 GB corpus. The count must still be right, and still cover rows
     this run did not write.
     """
-    from cdt import ingest as ingest_module
+    from cdt.ingest import core as ingest_module
     from cdt.storage import tables as storage_tables
 
     _store_document(tmp_path, "000114036126006577", "2024-01-02")
