@@ -12,17 +12,9 @@ from cdt import settings
 from cdt.extractor.state import CompletionResult
 
 DEFAULT_MODEL = settings.DEFAULT_EXTRACTOR_MODEL
-
-
 DEFAULT_REASONING_EFFORT = "none"
-
-
 REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
-
-
 EXTRACTOR_TEMPERATURE = 0.0
-
-
 # Reasoning models take a reasoning_effort and reject temperature != 1, so both
 # backends must decide sampling params the same way or the same model produces
 # different output live versus in batch. Prefixes are matched against the native

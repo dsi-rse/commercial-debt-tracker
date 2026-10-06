@@ -29,8 +29,6 @@ from cdt.extractor.tags import (
 AGREEMENT_NAME_PATTERN = re.compile(
     r"\b(?:agreement|indenture|supplemental\s+indenture)\b", re.IGNORECASE
 )
-
-
 # What an obligation is called, as opposed to a defined term that merely happens
 # not to be an agreement title (`Local Currency Addendums`, `RFA`).
 INSTRUMENT_NOUN_PATTERN = re.compile(

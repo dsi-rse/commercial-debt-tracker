@@ -55,25 +55,15 @@ from cdt.storage.objects import ArtifactPath, read_text_artifact
 
 #: Genres the CLI entry points prepare unless `--genres` narrows them.
 DEFAULT_GENRES: tuple[str, ...] = (GENRE_8K, GENRE_6K)
-
-
 GENRES = DEFAULT_GENRES
 
 
 ALL_TIME_START_DATE = date(1994, 1, 1)
-
-
 # Daily mode re-scans this many days back, ending yesterday, so late or
 # repaired scraper manifests are still picked up.
 DAILY_LOOKBACK_DAYS = 5
-
-
 DEFAULT_STAGE_BATCH_SIZE = 100
-
-
 PIPELINE_MODES = ("daily", "historical")
-
-
 LOGGER = get_logger(__name__)
 
 

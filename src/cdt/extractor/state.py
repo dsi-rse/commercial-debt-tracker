@@ -14,21 +14,15 @@ from cdt.extractor.prior_state import published_mention_rows
 # One attempt budget for every stage (`--max-attempts`). See
 # docs/decisions/extraction.md before raising it.
 DEFAULT_MAX_ATTEMPTS = 3
-
-
 # Resends of a `content_filter` abort per stage call. The abort is classified
 # by the callers, before `handle_response`, so it never becomes a scored
 # attempt; the cap bounds the cost if the abort turns out to be billed.
 # `max_tokens` is deliberately unset. See docs/decisions/extraction.md.
 MAX_CONTENT_FILTER_RESENDS = 6
-
-
 # Status for an attempt the provider aborted: a call was made, but it returned
 # no answer to score. Distinct from "FAILED", which means the model answered
 # and the answer was rejected -- the difference every cross-attempt check needs.
 ABORTED_ATTEMPT_STATUS = "ABORTED"
-
-
 # PARTIAL rows publish their mentions like SUCCESS but also keep a failure
 # registry entry recording what salvage dropped.
 PUBLISHABLE_ROW_STATES = frozenset({"SUCCESS", "PARTIAL"})

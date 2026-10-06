@@ -39,8 +39,6 @@ from cdt.storage.objects import s3_client as storage_s3_client
 LOGGER = get_logger(__name__)
 
 CDT_DOCUMENT_TYPE = "COMPLETE SUBMISSION TEXT FILE"
-
-
 CDT_DOCUMENT_DESCRIPTION = "COMPLETE SUBMISSION TEXT FILE"
 
 

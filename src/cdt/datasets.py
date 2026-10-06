@@ -25,21 +25,14 @@ from cdt.storage.tables import is_orphaned_temp_artifact
 
 LOGGER = get_logger(__name__)
 
-
 # The 6-K triage stage's output dataset. Named here, not beside its writer,
 # because the extractor must name it and cannot import ``cdt.classifier.sixk``
 # (which imports ``cdt.extractor``); this module is the leaf both import.
 SIXK_SNIPPET_DATASET_NAME = "sixk-snippets"
-
-
 MATCH_SHARDS = 64
-
-
 PARTITION_PATTERN = re.compile(
     r"(?P<dataset>[a-z\-]+)/date=(?P<date>\d{4}-\d{2}-\d{2})/shard=(?P<shard>\d{4})/part-0000\.parquet$"
 )
-
-
 CIK_PARTITION_PATTERN = re.compile(
     r"(?P<dataset>[a-z\-]+)/cik_shard=(?P<cik_shard>\d{4})/part-0000\.parquet$"
 )

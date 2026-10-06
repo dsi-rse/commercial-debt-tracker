@@ -701,17 +701,11 @@ def test_ner_validate_still_rejects_a_stray_angle_bracket() -> None:
 # MPLX item 2.03 (`000119312519257376-2-03`) in miniature: one note series the
 # model tags, in an item whose verbatim reproduction it then gets wrong.
 MPLX_TEXT = "The Company issued 6.250% Senior Notes due 2022."
-
-
 MPLX_TAGGED_BUT_UNFAITHFUL = (
     "<body>The Company issued <debt_instrument>6.250% Senior Notes due "
     "2022</debt_instrument>!</body>"
 )
-
-
 MPLX_IE = json.dumps([{"name": ["tag-1"]}])
-
-
 # The same tagging with the text left exactly as it was given.
 MPLX_TAGGED = (
     "<body>The Company issued <debt_instrument>6.250% Senior Notes due "
@@ -1286,22 +1280,15 @@ def test_ner_high_water_survives_the_resumable_batch_state() -> None:
 # which is what makes it the right probe for the echo guard's rule that an
 # echo is only a give-up once the model has tagged something on this row.
 NODEBT_TEXT = "This is the extracted event text."
-
-
 NODEBT_NER = f"<body>{NODEBT_TEXT}</body>"
-
 
 # A two-instrument item, so the relation stage actually runs on it.
 MULTI_TEXT = "Company entered into a Term Loan and a Revolver on January 1, 2024."
-
-
 MULTI_NER = (
     "<body>Company entered into a <debt_instrument>Term Loan</debt_instrument> "
     "and a <debt_instrument>Revolver</debt_instrument> on "
     "<date>January 1, 2024</date>.</body>"
 )
-
-
 # One entry that validates and one that cites a tag id the NER output never
 # produced, so `instrument_ie` rejects the response as a whole while
 # `salvage_instrument_ie_entries` keeps the first entry (#152).
@@ -1320,8 +1307,6 @@ MULTI_IE_ONE_BAD = json.dumps(
         {"name": ["tag-99"]},
     ]
 )
-
-
 MULTI_IE = json.dumps(
     [
         {
@@ -1347,7 +1332,6 @@ MULTI_IE = json.dumps(
     ]
 )
 
-
 # As observed live: aborted upstream, nothing generated, nothing billed.
 # A real `content_filter` body, trimmed, from item 000114036126024567-8-01 in
 # `ie_review/runs/followups/full.jsonl` of the models repo. An abort arrives as
@@ -1359,15 +1343,11 @@ MULTI_IE = json.dumps(
 # the cross-attempt guards in #176 could read an aborted call as the model's
 # own tagged work and no test objected.
 CONTENT_FILTER_PARTIAL = "<body>Item 8.01\nOther Events.\nOn <date>June 9, 2026</date>, the <organization>Company</organization> commenced an offering of <amount>$500.0 million</amount> in aggregate principal amount of its <debt_instrument>senior secured notes due 2031</debt_instrument> (the “<debt_instrument>Notes"
-
-
 CONTENT_FILTERED = CompletionResult(
     text=CONTENT_FILTER_PARTIAL,
     finish_reason="content_filter",
     usage={"completion_tokens": 0, "prompt_tokens": 0, "cost": 0.0},
 )
-
-
 # The degenerate shape, kept so both are covered: some aborts may carry nothing.
 CONTENT_FILTERED_EMPTY = CompletionResult(
     text="",

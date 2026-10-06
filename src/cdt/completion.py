@@ -68,8 +68,6 @@ def completion_registry_path(
 # Registry shards are keyed by the source partition's year-month; why:
 # docs/decisions/storage-and-completion.md.
 _REGISTRY_SHARD_DATE_CHARS = len("YYYY-MM")
-
-
 # A key with no parseable partition date gets its own shard rather than being
 # dropped, so its completion state still round-trips.
 _UNDATED_REGISTRY_SHARD = "unknown"

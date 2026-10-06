@@ -25,11 +25,9 @@ if TYPE_CHECKING:
 
 TIKTOKEN_ENCODING_NAME = "o200k_base"
 
-
 #: Window size the shipped stage-1 model was trained on. Changing this
 #: invalidates the model and its calibrated threshold together.
 WINDOW_TOKENS = 400
-
 
 #: Cut points tried in order when a span exceeds the token budget:
 #: paragraph, then line, then sentence. A span still too long after all
@@ -39,7 +37,6 @@ _BOUNDARY_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\n"),
     re.compile(r"(?<=[.!?])\s+"),
 )
-
 
 #: Words common enough that a line containing one is almost certainly prose.
 _PROSE_MARKERS: frozenset[str] = frozenset(
@@ -76,7 +73,6 @@ _PROSE_MARKERS: frozenset[str] = frozenset(
     }
 )
 
-
 #: A line of inline-XBRL context: a namespaced tag, or a bare scalar such as a
 #: CIK, a ticker-date stem, a fiscal period, a boolean or a lone number.
 _XBRL_CONTEXT_LINE = re.compile(
@@ -92,24 +88,19 @@ _XBRL_CONTEXT_LINE = re.compile(
     """
 )
 
-
 #: A namespaced inline-XBRL tag, the signature that a block is context padding
 #: rather than a numeric table (whose lines are bare scalars too).
 _XBRL_TAG_LINE = re.compile(r"(?i)^[A-Za-z][\w-]*:[\w.-]+$")
 
-
 #: A prologue must be at least this many lines before stripping is worthwhile.
 MIN_XBRL_PROLOGUE_LINES = 20
-
 
 #: Share of prologue lines that must be namespaced tags, so that a borrowings
 #: schedule (also mostly bare numbers) is not mistaken for a prologue.
 MIN_XBRL_TAG_SHARE = 0.10
 
-
 #: Share of prologue lines that must be context facts of some kind.
 MIN_XBRL_CONTEXT_SHARE = 0.8
-
 
 #: Words a line needs before it can count as prose rather than a context fact.
 MIN_PROSE_WORDS = 5
@@ -205,7 +196,6 @@ DEBT_KEYWORDS: tuple[str, ...] = (
     "syndicated loan",
     "bond issuance",
 )
-
 
 #: Plural suffixes allowed after a keyword lemma.
 KEYWORD_PLURAL_SUFFIX = r"(?:s|es)?"
@@ -554,11 +544,9 @@ def prepare_filing(
 #: reached sooner. Chosen empirically; see docs/sixk-two-stage-triage.md.
 MIN_EXPANSION_TOKENS = 200
 
-
 #: Hard cap on the context prepended to one admitted window, for when the walk
 #: backwards finds no header or blank line (e.g. unbroken table rows).
 MAX_EXPANSION_TOKENS = 400
-
 
 #: Ceiling on the merged-window estimate, matching the largest snippet the 8-K
 #: path sends the extractor. The estimate counts the first member's context and
@@ -567,20 +555,16 @@ MAX_EXPANSION_TOKENS = 400
 #: uncounted and a merged window can exceed this ceiling.
 MAX_MERGED_TOKENS = 2_000
 
-
 #: Longest a line can be and still read as a heading rather than a sentence.
 MAX_HEADER_WORDS = 12
 
-
 #: Characters a paragraph-boundary test looks back through.
 _PARAGRAPH_LOOKBACK = 200
-
 
 #: Characters scanned per token of budget when collecting candidate stops. A
 #: bound on the search only; the token budget decides how far the walk goes.
 #: Generous because table text has far fewer characters per token than prose.
 _CHARS_PER_TOKEN_BOUND = 24
-
 
 #: An explicitly numbered heading: ``Item 5.02``, ``NOTE 12 - BORROWINGS``,
 #: ``Part II``, ``Schedule 3``. Matched before the casing rules below, because
@@ -592,7 +576,6 @@ _NUMBERED_HEADING = re.compile(
     (?:\d|[ivxlc]+\b)
     """
 )
-
 
 #: A blank line immediately before an offset, i.e. a paragraph boundary.
 _PARAGRAPH_BREAK_BEFORE = re.compile(r"\n[^\S\n]*\n\s*\Z")

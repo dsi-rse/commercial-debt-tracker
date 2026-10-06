@@ -44,10 +44,8 @@ FINAL_OUTPUT_TABLES: dict[str, tuple[Callable[..., str], ...]] = {
     "mention-cluster-edges": (mention_cluster_edges_root,),
 }
 
-
 #: Columns a published table is projected to when its datasets differ in width.
 FINAL_OUTPUT_TABLE_COLUMNS: dict[str, list[str]] = {"items": ITEM_COLUMNS}
-
 
 #: Column stamped on a unioned table's rows naming the genre they came from.
 FORM_TYPE_COLUMN = "form_type"
@@ -68,7 +66,6 @@ FINAL_SNAPSHOT_GUARD_RATIO = 0.5
 #: Pointer key holding the source digest a generation was built from. Absent
 #: means unknown, which publishes.
 PUBLISH_SOURCE_DIGEST_KEY = "source_digest"
-
 
 #: Bump whenever the publish writes something different for the same source
 #: bytes (a projection, the ``form_type`` stamp, ``normalize_snapshot_text``):

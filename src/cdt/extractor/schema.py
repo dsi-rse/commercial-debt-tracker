@@ -7,23 +7,11 @@ import json
 import re
 
 INSTRUMENT_ENTITY_TAG_TYPES = {"debt_instrument"}
-
-
 LENDER_TAG_TYPES = {"person", "organization"}
-
-
 DEFAULT_LENDER_CLUSTER_KIND = "named"
-
-
 BORROWER_PARTY_ROLE = "borrower"
-
-
 COLLECTIVE_LENDER_KIND = "collective"
-
-
 INSTRUMENT_SINGLE_VALUE_PROPERTIES = {"name": {"debt_instrument"}}
-
-
 # One mention can state several money facts about one instrument — a $2.5B
 # commitment and a $270.5M outstanding balance — so amounts are a kind-typed
 # list. The matcher keys only on commitment/principal; the other kinds are
@@ -36,11 +24,7 @@ AMOUNT_KINDS = {
     "repayment",
     "proceeds",
 }
-
-
 PRINCIPAL_AMOUNT_KINDS = ("commitment", "principal")
-
-
 # Kind-typed date facts: each stated date is recorded once and the
 # post-processor chooses the published columns (`DATE_COLUMN_KINDS`).
 DATE_KINDS = {
@@ -57,8 +41,6 @@ DATE_KINDS = {
     "exchange",  # satisfied by delivering other securities or equity
     "default",  # default, event of default, or acceleration
 }
-
-
 EVENT_DATE_KINDS = {
     "announcement",
     "closing",
@@ -69,11 +51,7 @@ EVENT_DATE_KINDS = {
     "exchange",
     "default",
 }
-
-
 TERMINAL_DATE_KINDS = {"retirement", "termination", "exchange", "default"}
-
-
 # The kinds an instrument has at most one current value of, which
 # `instrument_ie.md` advertises as "(validated)". `closing` is an event kind but
 # still singular: two current closings describe two instruments, exactly as two
@@ -84,14 +62,10 @@ SINGLE_CURRENT_DATE_KINDS = {
     "maturity",
     "commitment_termination",
 }
-
-
 # Kinds that are only meaningful with a value: a stated maturity without a
 # date is nothing, whereas `the notes were redeemed` with no date is still an
 # event the filing states.
 DATE_KINDS_REQUIRING_EVIDENCE = {"maturity", "commitment_termination", "agreement"}
-
-
 # The mention-level `status` column derived from the newest completed event.
 STATUS_FOR_DATE_KIND = {
     "announcement": "announced",
@@ -102,8 +76,6 @@ STATUS_FOR_DATE_KIND = {
     "exchange": "exchanged",
     "default": "defaulted",
 }
-
-
 # Ties among undated events resolve by how much the event says about the
 # obligation's life: its end beats a change beats its start.
 EVENT_KIND_PRECEDENCE = {
@@ -115,16 +87,10 @@ EVENT_KIND_PRECEDENCE = {
     "closing": 2,
     "announcement": 1,
 }
-
-
 DATE_KIND_EVIDENCE_TAG_TYPES = {
     "maturity": {"date", "debt_instrument", "duration"},
 }
-
-
 DEFAULT_DATE_EVIDENCE_TAG_TYPES = {"date"}
-
-
 # One `parties` list with a role per cluster; `lender_disclosure` is derived
 # from it.
 PARTY_ROLES = {
@@ -136,30 +102,18 @@ PARTY_ROLES = {
     "borrower",
     "other",
 }
-
-
 PARTY_KINDS = {"named", "collective"}
-
-
 # How completely the document identifies who holds the debt: a named-only
 # syndicate, a collective phrase present, or no named lender at all. See
 # docs/decisions/extraction.md for why this is three-valued.
 LENDER_DISCLOSURE_COMPLETE = "complete"
-
-
 LENDER_DISCLOSURE_COLLECTIVE_PRESENT = "collective_present"
-
-
 LENDER_DISCLOSURE_NONE_NAMED = "none_named"
-
-
 LENDER_DISCLOSURE_VALUES = {
     LENDER_DISCLOSURE_COMPLETE,
     LENDER_DISCLOSURE_COLLECTIVE_PRESENT,
     LENDER_DISCLOSURE_NONE_NAMED,
 }
-
-
 # Precedence for rolling several mentions of one instrument into one answer.
 # `collective_present` wins outright: one filing showing `the other lenders
 # party thereto` means holders are hidden however many other filings name some.
@@ -170,32 +124,18 @@ LENDER_DISCLOSURE_PRECEDENCE = {
     LENDER_DISCLOSURE_COMPLETE: 1,
     LENDER_DISCLOSURE_COLLECTIVE_PRESENT: 2,
 }
-
-
 # Published flat columns and the fact kind each one reads.
 DATE_COLUMN_KINDS = {
     "start_date": "closing",
     "maturity_date": "maturity",
     "commitment_termination_date": "commitment_termination",
 }
-
-
 DATE_PRECISIONS = ("day", "month", "year")
-
-
 AMOUNT_EVIDENCE_TAG_TYPES = {"amount", "debt_instrument"}
-
-
 INTEREST_RATE_KINDS = {"fixed", "floating"}
-
-
 INTEREST_RATE_EVIDENCE_TAG_TYPES = {"interest_rate", "debt_instrument"}
-
-
 # `6.5 percent senior notes` spells the marker out; it is still a rate, not an amount.
 RATE_PCT_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*(?:%|percent\b)", re.IGNORECASE)
-
-
 # The four instrument categories the site facets on; anything else stays null
 # rather than stretching a bucket.
 INSTRUMENT_TYPES = {
@@ -204,49 +144,31 @@ INSTRUMENT_TYPES = {
     "credit_line",
     "note_bond",
 }
-
-
 MATURITY_EVIDENCE_TAG_TYPES = {"debt_instrument"}
-
-
 NAME_EMBEDDED_AMOUNT_TAG_TYPES = {"debt_instrument"}
-
-
 INSTRUMENT_RELATION_TYPES = {"amendment_of", "retired_by", "split_of"}
-
-
 NUMERIC_STRING_PATTERN = re.compile(r"^\d+(?:\.\d+)?$")
-
-
 # One `due` can carry a list of maturities: `due 2028 and 2030`,
 # `due October 1, 2028 and 2030`, `due October 1, 2028 and October 1, 2030`. Each
 # is two maturities, not one.
 MATURITY_COORDINATED_YEARS = (
     r"(?:\s*(?:,|/|&|and(?:/or)?|or)\s*(?:[A-Za-z]+\s+\d{1,2},?\s+)?\d{4})*"
 )
-
-
 # Like MATURITY_COORDINATED_YEARS, but each further year may carry a bare month
 # with no day, so `due October 1, 2028 and April 2030` and `due April 2033 and
 # June 2035` both read as two maturities.
 MATURITY_MONTH_YEAR_COORDINATION = (
     r"(?:\s*(?:,|/|&|and(?:/or)?|or)\s*(?:[A-Za-z]+\s+(?:\d{1,2},?\s+)?)?\d{4})*"
 )
-
-
 MATURITY_FULL_DATE_PATTERN = re.compile(
     r"\bdue\s+(?:on\s+)?(?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2}),?\s+(?P<year>\d{4})"
     rf"(?P<more>{MATURITY_MONTH_YEAR_COORDINATION})",
     re.IGNORECASE,
 )
-
-
 MATURITY_YEAR_PATTERN = re.compile(
     rf"\bdue\s+(?:in\s+)?(?P<years>\d{{4}}{MATURITY_COORDINATED_YEARS})\b",
     re.IGNORECASE,
 )
-
-
 # A facility tenor such as `five-year` or `364-day`. Only a duration
 # span stating exactly one tenor anchors computed-maturity arithmetic.
 TENOR_WORD_NUMBERS = {
@@ -264,16 +186,12 @@ TENOR_WORD_NUMBERS = {
     "twelve": 12,
     "eighteen": 18,
 }
-
-
 TENOR_PATTERN = re.compile(
     r"\b(?P<num>\d{1,3}|"
     + "|".join(TENOR_WORD_NUMBERS)
     + r")[-\s](?P<unit>year|month|day)s?\b",
     re.IGNORECASE,
 )
-
-
 # `due April 2033` states a month-resolution maturity; it normalizes to the
 # month's last day.
 MATURITY_MONTH_YEAR_PATTERN = re.compile(
@@ -281,27 +199,17 @@ MATURITY_MONTH_YEAR_PATTERN = re.compile(
     rf"(?P<more>{MATURITY_MONTH_YEAR_COORDINATION})",
     re.IGNORECASE,
 )
-
-
 FOUR_DIGIT_YEAR_PATTERN = re.compile(r"\d{4}")
-
-
 YEAR_ONLY_MATURITY_SUFFIX = "-12-31"
-
-
 # A rate marker counts only where it sits on a number, so the value the parser
 # would read is the rate itself rather than a percentage of something else.
 AMOUNT_VALUE_PATTERN = re.compile(r"\d[\d,]*(?:\.\d+)?")
-
-
 # `bps` as well as the spelled-out marker: the abbreviation is what filings
 # actually write, and `amounts_agree` cannot catch a basis-point margin the
 # model reports as an amount, since the two figures agree.
 RATE_SUFFIX_PATTERN = re.compile(
     r"\s*(?:%|percent\b|basis\s+points?\b|bps?\b)", re.IGNORECASE
 )
-
-
 # A principal stated inside an instrument name: `$183.36 million term loan`,
 # `C$300 million notes due 2033`. The currency marker is required, so a coupon
 # rate or a maturity year in the same name cannot be read as the principal.
@@ -324,21 +232,15 @@ AMOUNT_MULTIPLIERS = {
     "trillion": 1_000_000_000_000,
     "trillions": 1_000_000_000_000,
 }
-
-
 # Built from the table above so a magnitude this pattern recognizes is always one
 # the parser can apply.
 AMOUNT_SCALE_ALTERNATION = "|".join(sorted(AMOUNT_MULTIPLIERS, key=len, reverse=True))
-
-
 NAME_EMBEDDED_AMOUNT_PATTERN = re.compile(
     r"(?P<currency>[A-Z]{0,2}\$|€|£|¥)\s?"
     r"(?P<value>\d[\d,]*(?:\.\d+)?)"
     rf"(?:\s*(?P<scale>{AMOUNT_SCALE_ALTERNATION})\b\.?)?",
     re.IGNORECASE,
 )
-
-
 ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -347,35 +249,25 @@ ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 LENIENT_ISO_DATE_PATTERN = re.compile(
     r"^(?P<year>\d{4})-(?P<month>\d{1,2})-(?P<day>\d{1,2})$"
 )
-
-
 # Filing dates come in three further spellings. The four-digit year is required:
 # `7/28/26` needs a century guessed, and a null beats a wrong decade.
 NUMERIC_DATE_PATTERN = re.compile(
     r"(?<!\d)(?P<month>\d{1,2})/(?P<day>\d{1,2})/(?P<year>\d{4})(?!\d)"
 )
-
-
 # The comma is optional, so `July 28 2026` reads the same as `July 28, 2026`.
 MONTH_FIRST_DATE_PATTERN = re.compile(
     r"(?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2}),?\s+(?P<year>\d{4})(?!\d)"
 )
-
-
 # `28 July 2026`, as non-US issuers write it.
 DAY_FIRST_DATE_PATTERN = re.compile(
     r"(?<!\d)(?P<day>\d{1,2})\s+(?P<month>[A-Za-z]+),?\s+(?P<year>\d{4})(?!\d)"
 )
-
-
 # `matures in June 2016`, `is in March 2056`: a month-resolution date outside
 # a `due` phrase. Read for maturities only (`normalized_month_year_from_text`),
 # to the month's last day.
 MONTH_YEAR_DATE_PATTERN = re.compile(
     r"(?<![A-Za-z\d])(?P<month>[A-Za-z]+),?\s+(?P<year>\d{4})(?!\d)"
 )
-
-
 MONTH_MAP = {
     "january": "01",
     "february": "02",
@@ -390,8 +282,6 @@ MONTH_MAP = {
     "november": "11",
     "december": "12",
 }
-
-
 QUALIFIED_DOLLAR_CODES = {
     "A": "AUD",
     "C": "CAD",
@@ -401,14 +291,10 @@ QUALIFIED_DOLLAR_CODES = {
     "R": "BRL",
     "S": "SGD",
 }
-
-
 QUALIFIED_DOLLAR_PATTERN = re.compile(
     rf"\b({'|'.join(sorted(QUALIFIED_DOLLAR_CODES, key=len, reverse=True))})\$",
     re.IGNORECASE,
 )
-
-
 COMMON_CURRENCY_CODES = {
     "AED",
     "AUD",
@@ -433,8 +319,6 @@ COMMON_CURRENCY_CODES = {
     "USD",
     "ZAR",
 }
-
-
 CURRENCY_CODE_LENGTH = 3
 
 
@@ -534,28 +418,18 @@ def normalize_json_text(value: object) -> str:
 # treats a name-synthesized YYYY-12-31 maturity as year-resolution only, and the
 # site can explain a value whose evidence list is empty.
 DERIVED_FROM_STATED = "stated"
-
-
 DERIVED_FROM_NAME = "name"
-
-
 DERIVED_FROM_COMPUTED = "computed"
-
-
 # An amount read off its own cited span and scaled by a magnitude word carried
 # by a *sibling* amount fact's cited span: `from $400.0 to $500.0 million`.
 # Distinct from `"computed"`, which means arithmetic over addends.
 DERIVED_FROM_SCALED = "scaled"
-
-
 # A term carried onto a synthesized predecessor row from the amended object it
 # was minted from, because the filing marked no `prior` value for that kind and
 # so states it unchanged. The spans are the successor's; the marker is
 # what lets a reader tell an inherited term from one the filing stated for this
 # state of the instrument.
 DERIVED_FROM_INHERITED = "inherited"
-
-
 # A sum needs at least two addends; one parsed span is agreement, not arithmetic.
 MINIMUM_COMPUTED_SUM_SPANS = 2
 

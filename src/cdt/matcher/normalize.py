@@ -381,8 +381,6 @@ def lender_similarity_score(left: str, right: str) -> float:
 
 
 YEAR_TEXT_LENGTH = 4
-
-
 MONTH_TEXT_LENGTH = 7
 
 

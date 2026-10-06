@@ -14,7 +14,6 @@ import pyarrow.parquet
 
 MISSING_TEXT_VALUES = frozenset({"nan", "none", "null", "<na>", "n/a"})
 
-
 # Every published column's physical type, declared rather than inferred from
 # values, so a column has the same type in every partition. Keyed by name because
 # a column name means one thing across datasets. Money and rates are exact
@@ -39,8 +38,6 @@ DECLARED_COLUMN_TYPES: dict[str, pa.DataType] = {
     "classification_score": pa.float64(),
     "match_score": pa.float64(),
 }
-
-
 # Everything not declared above is nullable text, which is the contract
 # `docs/schema.md` states.
 DEFAULT_COLUMN_TYPE = pa.string()

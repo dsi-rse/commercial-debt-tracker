@@ -14,7 +14,6 @@ from cdt.storage.objects import s3_client as storage_s3_client
 
 LOGGER = get_logger(__name__)
 
-
 ITEM_METADATA_COLUMNS = [
     "item_information",
     "extraction_status",
@@ -24,8 +23,6 @@ ITEM_METADATA_COLUMNS = [
     "end_line",
     "section_char_count",
 ]
-
-
 # The document columns an item row copies. Pinned, not derived from
 # ingest.DOCUMENT_COLUMNS: four datasets and the published items table take
 # their schema from this list.
@@ -38,18 +35,12 @@ ITEM_DOCUMENT_COLUMNS = [
     "date",
     "resource_uri",
 ]
-
-
 ITEM_COLUMNS = ["item_id", "item", *ITEM_DOCUMENT_COLUMNS, *ITEM_METADATA_COLUMNS]
-
-
 ITEM_INTEGER_COLUMNS = [
     "start_line",
     "end_line",
     "section_char_count",
 ]
-
-
 ITEM_DATASET_NAME = "items"
 
 

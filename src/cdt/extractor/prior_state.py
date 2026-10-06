@@ -22,12 +22,8 @@ if TYPE_CHECKING:
 
 # The rule name a synthesized prior state carries in `synthesized_by`.
 SYNTHESIZED_PRIOR_STATE = "prior_state"
-
-
 # The term kinds a filing can mark `prior` — the list the dates validator names.
 PRIOR_TERM_DATE_KINDS = frozenset({"agreement", "maturity", "commitment_termination"})
-
-
 # Current terms a prior state inherits when the filing marks no `prior` value
 # for the kind. Balances, draws, repayments and proceeds are dated observations
 # of the filing's own moment, not terms of the instrument, so they stay with the

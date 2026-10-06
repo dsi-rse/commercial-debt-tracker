@@ -21,21 +21,15 @@ from cdt.shared import get_logger
 
 LOGGER = get_logger(__name__)
 
-
 ArtifactPath = str | Path
 
 
 # One client and one Session per AWS profile for the whole process: construction
 # resolves credentials and endpoints, and a run issues thousands of S3 calls.
 _S3_CLIENTS: dict[str, object] = {}
-
-
 _BOTO3_SESSIONS: dict[str, boto3.Session] = {}
-
-
 # The profile ``--aws-profile`` selected; empty means the ambient credential chain.
 _CONFIGURED_S3_PROFILE = ""
-
 
 # Bounds the API call itself, not the streaming read of a returned body;
 # ``_get_object_with_body`` retries that half.
@@ -98,11 +92,7 @@ _STREAMING_READ_ERRORS = (
     BotocoreConnectionError,
     IncompleteReadError,
 )
-
-
 _GET_OBJECT_ATTEMPTS = 5
-
-
 _GET_OBJECT_BACKOFF_SECONDS = 1.0
 
 

@@ -50,19 +50,12 @@ from cdt.storage.tables import read_table, write_partition_table
 
 LOGGER = get_logger(__name__)
 
-
 ITEM_NUMBER_RE = re.compile(r"\b(\d)\s*\.\s*(\d)\s*(\d)\b")
-
-
 SECTION_SIMILARITY_THRESHOLD = 0.95
-
-
 TERMINAL_RE = re.compile(
     r"^\s*(SIGNATURES?|EXHIBIT\s+INDEX)\s*$",
     re.IGNORECASE,
 )
-
-
 NON_HEADING_PHRASES = (
     "incorporated by reference",
     "shall not be deemed",
@@ -73,7 +66,6 @@ NON_HEADING_PHRASES = (
     "of this report",
     "of this form 8-k",
 )
-
 
 ITEM_NAME_TO_NUMBER = {
     "entry into a material definitive agreement": "1.01",
@@ -111,7 +103,6 @@ ITEM_NAME_TO_NUMBER = {
     "other events": "8.01",
     "financial statements and exhibits": "9.01",
 }
-
 
 # The closed set of real 8-K item numbers; nothing else can be a heading
 # ('6.00' from a rate table cell, '2.00' from a price).
