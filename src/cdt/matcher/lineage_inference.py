@@ -10,8 +10,13 @@ This module infers such links across filings within one CIK, with one rule:
 Only a null `amendment_of_debt_instrument_id` is filled, and a child is left
 unlinked whenever the evidence does not single out one parent. Every input is
 extractor output (canonical `name`, `first_seen_filing_date`, `start_date`, and
-the borrowers in `parties_json`); filing text is never read. Rationale and
-measurements: docs/decisions/matching-and-lineage.md.
+the borrowers in `parties_json`); filing text is never read.
+
+`infer_amendment_parents` is the rule over instrument rows.
+`apply_lineage_inference_pass` runs it across the whole corpus after every shard
+has matched, rewriting the debt-instruments shards and writing an
+`infer-lineage` run manifest. Rationale and measurements:
+docs/decisions/matching-and-lineage.md.
 """
 
 from __future__ import annotations
