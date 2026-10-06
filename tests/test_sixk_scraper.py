@@ -12,7 +12,7 @@ from typing import Self
 import pytest
 
 from cdt.datasets import normalize_cik
-from cdt.ingest import (
+from cdt.ingest.core import (
     DOCUMENT_COLUMNS,
     SIXK_DOCUMENT_DATASET_NAME,
     SIXK_FORM_TYPES,
@@ -22,15 +22,15 @@ from cdt.ingest import (
     ScrapedDocument,
     ScrapedFiling,
 )
-from cdt.ingest import documents_root as ingest_documents_root
-from cdt.sixk.documents import prose_documents
-from cdt.sixk.mirror import mirror_path
-from cdt.sixk.scraper import (
+from cdt.ingest.core import documents_root as ingest_documents_root
+from cdt.ingest.mirror import mirror_path
+from cdt.ingest.sixk import (
     MalformedSubmissionError,
     acquire_scraped_sixk_documents,
     assemble_submission,
     documents_in_sequence,
 )
+from cdt.sixk.documents import prose_documents
 from cdt.storage.objects import read_json_artifact
 from cdt.storage.tables import read_dataset
 

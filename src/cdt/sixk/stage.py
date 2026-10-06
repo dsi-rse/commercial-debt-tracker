@@ -40,7 +40,7 @@ from cdt.datasets import (
     resolve_artifact_root,
     run_manifest_path,
 )
-from cdt.ingest import DOCUMENT_COLUMNS, SIXK_DOCUMENT_DATASET_NAME
+from cdt.ingest.core import DOCUMENT_COLUMNS, SIXK_DOCUMENT_DATASET_NAME
 from cdt.itemizer.core import document_text_for_record, ensure_s3_client
 from cdt.shared import get_logger
 from cdt.sixk.documents import prose_documents

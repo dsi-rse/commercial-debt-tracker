@@ -12,7 +12,7 @@ from cdt.classifier import classifications_root
 from cdt.extractor.normalize.amounts import normalized_amount_from_text
 from cdt.extractor.schema import DEBT_INSTRUMENT_MENTION_COLUMNS
 from cdt.extractor.state import ExtractionRowState
-from cdt.ingest import DOCUMENT_COLUMNS
+from cdt.ingest.core import DOCUMENT_COLUMNS
 from cdt.storage.tables import write_partition_table
 
 

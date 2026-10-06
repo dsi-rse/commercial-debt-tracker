@@ -34,7 +34,7 @@ from cdt.extractor import (
     reset_active_job,
 )
 from cdt.extractor.outputs import CLASSIFICATION_SOURCES, backfill_mentions
-from cdt.ingest import (
+from cdt.ingest.core import (
     DEFAULT_AWS_PROFILE,
     DEFAULT_BUCKET,
     DEFAULT_S3_PREFIX,
@@ -42,8 +42,10 @@ from cdt.ingest import (
     SIXK_FORM_TYPES,
     IngestConfig,
     documents_root,
-    run_ingest_pipeline,
 )
+from cdt.ingest.eightk import acquire_eightk_documents
+from cdt.ingest.mirror import mirror_root
+from cdt.ingest.sixk import acquire_scraped_sixk_documents
 from cdt.itemizer import (
     POTENTIALLY_RELEVANT_ITEM_NUMBERS,
     itemize_pending_documents,
@@ -74,8 +76,6 @@ from cdt.pipeline import (
     resolve_mode_dates,
     run_pipeline,
 )
-from cdt.sixk.mirror import mirror_root
-from cdt.sixk.scraper import acquire_scraped_sixk_documents
 from cdt.sixk.stage import DEFAULT_CONCURRENCY as SIXK_DEFAULT_CONCURRENCY
 from cdt.sixk.stage import sixk_snippets_root, triage_pending_documents
 from cdt.storage.objects import configure_s3_profile
@@ -509,7 +509,7 @@ def run_ingest(args: argparse.Namespace) -> int:
             config.batch_size,
             config.output_root,
         )
-        _, result = run_ingest_pipeline(config, ciks=read_cik_file(args.cik_file))
+        _, result = acquire_eightk_documents(config, ciks=read_cik_file(args.cik_file))
     except ValueError as exc:
         logger.error("Invalid ingest arguments: %s", exc)
         return 2

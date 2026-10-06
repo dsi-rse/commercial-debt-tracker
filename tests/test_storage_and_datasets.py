@@ -21,7 +21,7 @@ from cdt.datasets import (
     shard_for_cik,
 )
 from cdt.extractor.schema import DEBT_INSTRUMENT_MENTION_COLUMNS
-from cdt.ingest import DOCUMENT_COLUMNS
+from cdt.ingest.core import DOCUMENT_COLUMNS
 from cdt.itemizer.core import ITEM_COLUMNS
 from cdt.matcher.schema import (
     DEBT_INSTRUMENT_COLUMNS,

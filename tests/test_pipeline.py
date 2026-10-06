@@ -13,7 +13,7 @@ from support import FakeModel
 from cdt.classifier import core as classifier_core
 from cdt.datasets import GENRE_6K, GENRE_8K
 from cdt.extractor.state import ExtractionRowState
-from cdt.ingest import IngestRunResult
+from cdt.ingest.core import IngestRunResult
 from cdt.matcher import debt_instruments_root, mention_cluster_edges_root
 from cdt.pipeline import (
     ALL_TIME_START_DATE,
@@ -130,7 +130,9 @@ def test_run_pipeline_uses_stage_backed_functions(
             "debt_instrument": pd.DataFrame([{"debt_instrument_id": "instrument-1"}]),
         }
 
-    monkeypatch.setattr("cdt.pipeline.run_ingest_pipeline", fake_run_ingest_pipeline)
+    monkeypatch.setattr(
+        "cdt.pipeline.acquire_eightk_documents", fake_run_ingest_pipeline
+    )
     monkeypatch.setattr(
         "cdt.pipeline.itemize_pending_documents", fake_itemize_pending_documents
     )
@@ -214,7 +216,7 @@ def test_genres_narrow_the_run_to_one_chain(
 
         return fail
 
-    monkeypatch.setattr("cdt.pipeline.run_ingest_pipeline", unexpected("ingest"))
+    monkeypatch.setattr("cdt.pipeline.acquire_eightk_documents", unexpected("ingest"))
     monkeypatch.setattr("cdt.pipeline.itemize_pending_documents", unexpected("itemize"))
     monkeypatch.setattr("cdt.pipeline.classify_pending_items", unexpected("classify"))
     monkeypatch.setattr(
@@ -273,7 +275,7 @@ def test_the_sixk_chain_can_take_its_own_cik_list(
     asked: dict[str, set[str] | None] = {}
 
     monkeypatch.setattr(
-        "cdt.pipeline.run_ingest_pipeline",
+        "cdt.pipeline.acquire_eightk_documents",
         lambda config, **kwargs: (
             asked.__setitem__("8-K", kwargs.get("ciks")),
             (pd.DataFrame(), _sixk_ingest_result(tmp_path, kwargs.get("ciks"))),
@@ -503,7 +505,9 @@ This is the extracted event text.
         row_state.finish("SUCCESS")
         return row_state
 
-    monkeypatch.setattr("cdt.pipeline.run_ingest_pipeline", fake_run_ingest_pipeline)
+    monkeypatch.setattr(
+        "cdt.pipeline.acquire_eightk_documents", fake_run_ingest_pipeline
+    )
     monkeypatch.setattr(
         classifier_core,
         "load_training_artifacts",
@@ -847,7 +851,9 @@ def _stage_stubs(
             run_manifest=str(tmp_path / "runs" / "ingest" / "run_id=1.json"),
         )
 
-    monkeypatch.setattr("cdt.pipeline.run_ingest_pipeline", fake_run_ingest_pipeline)
+    monkeypatch.setattr(
+        "cdt.pipeline.acquire_eightk_documents", fake_run_ingest_pipeline
+    )
     monkeypatch.setattr(
         "cdt.pipeline.itemize_pending_documents",
         lambda **_: pd.DataFrame([{"item_id": "item-1"}]),

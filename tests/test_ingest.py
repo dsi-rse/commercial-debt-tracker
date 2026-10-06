@@ -17,18 +17,20 @@ from cdt.datasets import (
     failure_registry_path,
     parse_date_shard_partition,
 )
-from cdt.ingest import (
+from cdt.ingest.core import (
     DOCUMENT_COLUMNS,
     SIXK_DOCUMENT_DATASET_NAME,
     IngestConfig,
     _document_shard,
     _partition_path,
-    acquire_documents,
-    acquire_documents_for_date_range,
     documents_root,
     iter_filings,
     normalize_accession_number,
-    run_ingest_pipeline,
+)
+from cdt.ingest.eightk import (
+    acquire_documents,
+    acquire_documents_for_date_range,
+    acquire_eightk_documents,
 )
 from cdt.storage.objects import list_artifacts
 from cdt.storage.tables import read_dataset, read_table, write_table
@@ -400,10 +402,10 @@ def test_ingest_records_missing_document_failures(tmp_path: Path) -> None:
         data_dir=tmp_path,
         failure_file=tmp_path / "failures" / "ingest_failures.json",
     )
-    first, result = run_ingest_pipeline(
+    first, result = acquire_eightk_documents(
         config, ciks={"320193"}, s3_client=client, return_documents=True
     )
-    second, _ = run_ingest_pipeline(
+    second, _ = acquire_eightk_documents(
         config, ciks={"320193"}, s3_client=client, return_documents=True
     )
 
@@ -437,7 +439,7 @@ def test_ingest_records_download_failures(tmp_path: Path) -> None:
         }
     )
 
-    _, result = run_ingest_pipeline(
+    _, result = acquire_eightk_documents(
         IngestConfig(
             mode="historical",
             bucket="sec-bucket",
@@ -468,9 +470,10 @@ def test_ingest_without_an_injected_client_builds_one_from_the_profile(
         profiles.append(profile_name)
         return client
 
-    monkeypatch.setattr("cdt.ingest.storage_s3_client", fake_storage_client)
+    monkeypatch.setattr("cdt.ingest.core.storage_s3_client", fake_storage_client)
+    monkeypatch.setattr("cdt.ingest.eightk.storage_s3_client", fake_storage_client)
 
-    _, result = run_ingest_pipeline(
+    _, result = acquire_eightk_documents(
         IngestConfig(
             mode="historical",
             bucket="sec-bucket",
@@ -648,7 +651,7 @@ def _manifest_bytes(
 
 def test_document_shard_is_stable_across_processes() -> None:
     """Shard assignment must not depend on the per-process hash salt (#61)."""
-    from cdt.ingest import DOCUMENT_PARTITION_SHARDS, _document_shard
+    from cdt.ingest.core import DOCUMENT_PARTITION_SHARDS, _document_shard
 
     # crc32 is deterministic: pin exact values so any change to the scheme
     # (which would strand existing partitions) fails loudly.
@@ -664,7 +667,7 @@ def test_document_shard_is_stable_across_processes() -> None:
         [
             sys.executable,
             "-c",
-            "from cdt.ingest import _document_shard;"
+            "from cdt.ingest.core import _document_shard;"
             "print(_document_shard('0001437749-26-027029'))",
         ],
         capture_output=True,
@@ -676,10 +679,8 @@ def test_document_shard_is_stable_across_processes() -> None:
 
 def test_force_retries_registered_permanent_failures(tmp_path: Path) -> None:
     """--force must be able to unpoison a filing the registry marked permanent (#67)."""
-    from cdt.ingest import (
-        IngestFailureClassifier,
-        iter_document_candidates_for_date_range,
-    )
+    from cdt.ingest.core import IngestFailureClassifier
+    from cdt.ingest.eightk import iter_document_candidates_for_date_range
     from cdt.shared import FailureRegistry
 
     manifest_key = "sec/2024-01-02/8-K/320193/000114036126006577/manifest.json"
@@ -697,7 +698,7 @@ def test_force_retries_registered_permanent_failures(tmp_path: Path) -> None:
     registry = FailureRegistry(
         str(tmp_path / "failures.json"), IngestFailureClassifier()
     )
-    from cdt.ingest import IngestFailureType
+    from cdt.ingest.core import IngestFailureType
 
     registry.add(("sec-bucket", manifest_key), IngestFailureType.DOCUMENT_NOT_FOUND)
 
@@ -727,9 +728,73 @@ def test_force_retries_registered_permanent_failures(tmp_path: Path) -> None:
     assert persisted["entries"] == []
 
 
+@pytest.mark.parametrize(
+    ("force", "expected_accessions"),
+    [(False, []), (True, ["000114036126006577"])],
+    ids=["registered-failure-skipped", "forced-retry"],
+)
+def test_acquire_eightk_documents_passes_force_and_prefix_to_the_manifest_walk(
+    tmp_path: Path, force: bool, expected_accessions: list[str]
+) -> None:
+    """``config.s3_prefix`` picks the manifests and ``config.force`` retries permanent failures.
+
+    A filing under the default ``sec/`` prefix is a decoy: ingest must not see it.
+    """
+    from cdt.ingest.core import IngestFailureClassifier, IngestFailureType
+    from cdt.shared import FailureRegistry
+
+    manifest_key = "custom/2024-01-02/8-K/320193/000114036126006577/manifest.json"
+    client = FakeS3Client(
+        {
+            ("sec-bucket", manifest_key): _manifest_bytes(
+                "320193",
+                "0001140361-26-006577",
+                "8-K",
+                "2024-01-02",
+                "COMPLETE SUBMISSION TEXT FILE",
+                s3_key="s3://sec-bucket/custom/2024-01-02/8-K/320193/000114036126006577/document.htm",
+            ),
+            (
+                "sec-bucket",
+                "sec/2024-01-02/8-K/320193/000000000024000001/manifest.json",
+            ): _manifest_bytes(
+                "320193",
+                "0000000000-24-000001",
+                "8-K",
+                "2024-01-02",
+                "COMPLETE SUBMISSION TEXT FILE",
+                s3_key="s3://sec-bucket/sec/2024-01-02/8-K/320193/000000000024000001/document.htm",
+            ),
+        }
+    )
+    failure_file = failure_registry_path("ingest", artifact_root=tmp_path)
+    Path(failure_file).parent.mkdir(parents=True)
+    registry = FailureRegistry(failure_file, IngestFailureClassifier())
+    registry.add(("sec-bucket", manifest_key), IngestFailureType.DOCUMENT_NOT_FOUND)
+    registry.flush()
+
+    documents, _ = acquire_eightk_documents(
+        IngestConfig(
+            mode="historical",
+            bucket="sec-bucket",
+            cik_file=tmp_path / "ciks.txt",
+            start_date=date(2024, 1, 2),
+            end_date=date(2024, 1, 2),
+            data_dir=tmp_path,
+            failure_file=failure_file,
+            force=force,
+            s3_prefix="custom",
+        ),
+        s3_client=client,
+        return_documents=True,
+    )
+
+    assert documents["accession_number"].tolist() == expected_accessions
+
+
 def test_key_matches_ciks_with_multi_segment_prefix() -> None:
     """The CIK segment is found from the key's end, not a fixed index (#73)."""
-    from cdt.ingest import _key_matches_ciks
+    from cdt.ingest.core import _key_matches_ciks
 
     single = "sec/2024-01-02/8-K/320193/000114036126006577/manifest.json"
     multi = "edgar/8k/2024-01-02/8-K/320193/000114036126006577/manifest.json"
@@ -745,7 +810,7 @@ def test_filing_from_manifest_pads_the_cik() -> None:
     It previously stripped leading zeros instead, and reverting it to
     `.lstrip("0")` left the suite green because nothing asserted the CIK here.
     """
-    from cdt.ingest import _filing_from_manifest
+    from cdt.ingest.core import _filing_from_manifest
 
     filing = _filing_from_manifest(
         {
@@ -814,7 +879,7 @@ def test_ingest_routes_configured_form_types_to_their_own_dataset(
         }
     )
 
-    table, result = run_ingest_pipeline(
+    table, result = acquire_eightk_documents(
         IngestConfig(
             mode="historical",
             bucket="sec-bucket",
@@ -898,7 +963,7 @@ def test_ingesting_six_k_leaves_the_eight_k_partitions_byte_identical(
         "output_root": str(tmp_path),
     }
 
-    run_ingest_pipeline(
+    acquire_eightk_documents(
         IngestConfig(**common),
         ciks={"320193"},
         s3_client=client,
@@ -907,7 +972,7 @@ def test_ingesting_six_k_leaves_the_eight_k_partitions_byte_identical(
     before = {path: Path(path).read_bytes() for path in eightk_paths}
     assert before
 
-    run_ingest_pipeline(
+    acquire_eightk_documents(
         IngestConfig(
             **common,
             form_types=("6-K",),
@@ -978,7 +1043,7 @@ def test_partitions_written_before_the_provenance_columns_stay_readable(
             ),
         }
     )
-    run_ingest_pipeline(
+    acquire_eightk_documents(
         IngestConfig(
             mode="historical",
             bucket="sec-bucket",
@@ -1055,7 +1120,7 @@ def test_existing_accessions_reads_only_the_windowed_partitions(
     every partition and then filtered would return the same set and be exactly
     the bug.
     """
-    from cdt import ingest
+    from cdt.ingest import core as ingest
 
     for day, accession in (
         ("2024-01-01", "000000000024000001"),
@@ -1092,7 +1157,7 @@ def test_existing_accessions_projects_away_the_document_text(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Only the key column is requested: the text column is the entire cost (#190)."""
-    from cdt import ingest
+    from cdt.ingest import core as ingest
 
     _store_document(tmp_path, "000000000024000005", "2024-01-05")
     requested: list[object] = []
@@ -1125,7 +1190,7 @@ def test_existing_accessions_scans_the_window_in_one_pass(
     time against 1.75s as a single scan. Daily mode's five-day lookback bounds
     the loop; ``--mode historical`` defaults to 1994-to-today and does not.
     """
-    from cdt import ingest
+    from cdt.ingest import core as ingest
 
     for day in ("2024-01-05", "2024-01-06", "2024-01-07"):
         _store_document(tmp_path, f"00000000002400{day[-2:]}", day)
@@ -1174,7 +1239,7 @@ def test_reingest_inside_the_window_still_skips_the_download(tmp_path: Path) -> 
         }
     )
 
-    _, result = run_ingest_pipeline(
+    _, result = acquire_eightk_documents(
         IngestConfig(
             mode="historical",
             bucket="sec-bucket",
@@ -1206,7 +1271,7 @@ def test_the_read_back_counts_the_window_without_reading_its_bodies(
     whole 12.2 GB corpus. The count must still be right, and still cover rows
     this run did not write.
     """
-    from cdt import ingest as ingest_module
+    from cdt.ingest import core as ingest_module
     from cdt.storage import tables as storage_tables
 
     _store_document(tmp_path, "000114036126006577", "2024-01-02")
@@ -1240,7 +1305,7 @@ def test_the_read_back_counts_the_window_without_reading_its_bodies(
         end_date=date(2024, 1, 31),
         data_dir=tmp_path,
     )
-    table, result = run_ingest_pipeline(
+    table, result = acquire_eightk_documents(
         config, ciks={"320193"}, s3_client=FakeS3Client({})
     )
 
@@ -1250,7 +1315,7 @@ def test_the_read_back_counts_the_window_without_reading_its_bodies(
 
     monkeypatch.setattr(ingest_module, "read_partitions", real_read_partitions)
     monkeypatch.setattr(ingest_module, "read_table", storage_tables.read_table)
-    documents, result = run_ingest_pipeline(
+    documents, result = acquire_eightk_documents(
         config, ciks={"320193"}, s3_client=FakeS3Client({}), return_documents=True
     )
 

@@ -3,7 +3,7 @@
 The scraper stores a 6-K as one object per document (body, then exhibits),
 with no whole-submission object, so this source assembles the submission by
 concatenating the stored ``<DOCUMENT>`` blocks in sequence order and mirrors it
-(:mod:`cdt.sixk.mirror`). The result is EDGAR's complete submission minus the
+(:mod:`cdt.ingest.mirror`). The result is EDGAR's complete submission minus the
 ``<SEC-HEADER>`` preamble; see ``docs/sixk-two-stage-triage.md`` for how that
 was checked.
 """
@@ -18,7 +18,7 @@ from typing import Self
 import pandas as pd
 
 from cdt.datasets import default_artifact_root
-from cdt.ingest import (
+from cdt.ingest.core import (
     SIXK_FORM_TYPES,
     DocumentCandidate,
     DocumentSource,
@@ -33,8 +33,8 @@ from cdt.ingest import (
     normalize_accession_number,
     run_ingest_pipeline,
 )
+from cdt.ingest.mirror import mirror_path
 from cdt.shared import FailureRegistry, get_logger
-from cdt.sixk.mirror import mirror_path
 from cdt.storage.objects import (
     artifact_exists,
     get_object_bytes,
@@ -248,7 +248,7 @@ def acquire_scraped_sixk_documents(
 ) -> tuple[pd.DataFrame, IngestRunResult]:
     """Acquire 6-K filings from the scraper into the config's documents dataset.
 
-    Runs :func:`cdt.ingest.run_ingest_pipeline` with
+    Runs :func:`cdt.ingest.core.run_ingest_pipeline` with
     :class:`ScraperDocumentSource` as the candidate source. The frame is empty
     unless ``return_documents``.
 

@@ -1,4 +1,4 @@
-"""Acquire SEC filings from scraper-managed S3 storage."""
+"""Acquire SEC filings from scraper-managed S3 storage into document partitions, for any genre."""
 
 from __future__ import annotations
 
@@ -39,6 +39,8 @@ from cdt.storage.tables import (
 )
 
 LOGGER = get_logger(__name__)
+
+
 DOCUMENT_COLUMNS = [
     "accession_number",
     "cik",
@@ -52,27 +54,53 @@ DOCUMENT_COLUMNS = [
     "form_type",
     "source",
 ]
+
+
 # The SEC scraper's output bucket. In dev CDT writes to it too, by prefix: the
 # scraper owns `sec/`, CDT owns `processors/cdt/` and `database/cdt/`.
 DEFAULT_BUCKET = "idi-dev-ftm2j-shared-processor-storage"
+
+
 DEFAULT_AWS_PROFILE = ""
+
+
 DEFAULT_S3_PREFIX = "sec"
+
+
 CDT_FORM_TYPE = "8-K"
+
+
 DEFAULT_FORM_TYPES: tuple[str, ...] = (CDT_FORM_TYPE,)
+
+
 # The 6-K genre's forms.
 SIXK_FORM_TYPES: tuple[str, ...] = ("6-K", "6-K/A")
-CDT_DOCUMENT_TYPE = "COMPLETE SUBMISSION TEXT FILE"
-CDT_DOCUMENT_DESCRIPTION = "COMPLETE SUBMISSION TEXT FILE"
+
+
 DEFAULT_BATCH_SIZE = 100
+
+
 PROGRESS_DAY_INTERVAL = 30
+
+
 # {prefix...}/{date}/{form}/{cik}/{accession}/manifest.json — the CIK is
 # counted from the end so a multi-segment --s3-prefix cannot shift it.
 MANIFEST_KEY_CIK_INDEX_FROM_END = -3
+
+
 MIN_MANIFEST_KEY_PARTS = 5
+
+
 DEFAULT_OUTPUT_PREFIX = "processors/cdt"
+
+
 DOCUMENT_DATASET_NAME = "documents"
+
+
 # The 6-K genre's own documents dataset (see IngestConfig.dataset_name).
 SIXK_DOCUMENT_DATASET_NAME = "documents-sixk"
+
+
 DOCUMENT_PARTITION_SHARDS = 64
 
 
@@ -274,86 +302,12 @@ def normalize_accession_number(accession_number: str) -> str:
     return accession_number.replace("-", "")
 
 
-def acquire_documents(
-    bucket: str,
-    year: int,
-    ciks: set[str] | None = None,
-    *,
-    data_dir: Path | None = None,
-    s3_client: S3Client | None = None,
-    force: bool = False,
-    batch_size: int = DEFAULT_BATCH_SIZE,
-    download: bool = False,
-    form_types: tuple[str, ...] = DEFAULT_FORM_TYPES,
-    dataset_name: str = DOCUMENT_DATASET_NAME,
-) -> pd.DataFrame:
-    """Acquire matching documents for a year and update document partitions."""
-    documents, _ = run_ingest_pipeline(
-        IngestConfig(
-            mode="historical",
-            bucket=bucket,
-            cik_file=Path(),
-            start_date=date(year, 1, 1),
-            end_date=date(year, 12, 31),
-            data_dir=data_dir,
-            output_root=default_artifact_root(data_dir),
-            force=force,
-            batch_size=batch_size,
-            download=download,
-            form_types=form_types,
-            dataset_name=dataset_name,
-        ),
-        ciks=ciks,
-        s3_client=s3_client,
-        return_documents=True,
-    )
-    return documents
-
-
-def acquire_documents_for_date_range(
-    bucket: str,
-    start_date: date,
-    end_date: date,
-    ciks: set[str] | None = None,
-    *,
-    data_dir: Path | None = None,
-    s3_client: S3Client | None = None,
-    force: bool = False,
-    batch_size: int = DEFAULT_BATCH_SIZE,
-    download: bool = False,
-    form_types: tuple[str, ...] = DEFAULT_FORM_TYPES,
-    dataset_name: str = DOCUMENT_DATASET_NAME,
-) -> pd.DataFrame:
-    """Acquire matching documents for a date range and update partitions."""
-    documents, _ = run_ingest_pipeline(
-        IngestConfig(
-            mode="historical",
-            bucket=bucket,
-            cik_file=Path(),
-            start_date=start_date,
-            end_date=end_date,
-            data_dir=data_dir,
-            output_root=default_artifact_root(data_dir),
-            force=force,
-            batch_size=batch_size,
-            download=download,
-            form_types=form_types,
-            dataset_name=dataset_name,
-        ),
-        ciks=ciks,
-        s3_client=s3_client,
-        return_documents=True,
-    )
-    return documents
-
-
 def run_ingest_pipeline(
     config: IngestConfig,
     *,
     ciks: set[str] | None = None,
     s3_client: S3Client | None = None,
-    candidate_source: Callable[[FailureRegistry], DocumentCandidateSource]
-    | None = None,
+    candidate_source: Callable[[FailureRegistry], DocumentCandidateSource],
     return_documents: bool = False,
 ) -> tuple[pd.DataFrame, IngestRunResult]:
     """Ingest one date window into the config's documents dataset.
@@ -366,8 +320,9 @@ def run_ingest_pipeline(
         ciks: CIKs to keep; None keeps every filer.
         s3_client: Client to use; None builds one from ``config.aws_profile``
             when first needed.
-        candidate_source: Factory, given this run's failure registry, for a
-            source that replaces the 8-K scraper-manifest scan.
+        candidate_source: Factory, given this run's failure registry, for the
+            source of this genre's candidates (``acquire_eightk_documents`` and
+            the 6-K scraper each pass their own).
         return_documents: Read back and return the window's documents. When
             False the frame is empty and only ``total_rows`` counts them.
 
@@ -461,25 +416,7 @@ def run_ingest_pipeline(
         )
         pending_rows = []
 
-    source: DocumentCandidateSource = (
-        candidate_source(failure_registry)
-        if candidate_source is not None
-        else ListCandidateSource(
-            iter_document_candidates_for_date_range(
-                client(),
-                config.bucket,
-                config.start_date,
-                config.end_date,
-                normalized_ciks,
-                failure_registry=failure_registry,
-                s3_prefix=config.s3_prefix,
-                form_types=config.form_types,
-                # --force retries even permanently registered failures; new
-                # failures are still recorded.
-                retry_registered_failures=config.force,
-            )
-        )
-    )
+    source: DocumentCandidateSource = candidate_source(failure_registry)
     for candidate in source:
         candidates_seen += 1
         if candidate.accession_number in seen_accessions:
@@ -599,71 +536,6 @@ def run_ingest_pipeline(
     )
 
 
-def iter_document_candidates_for_date_range(
-    s3_client: S3Client,
-    bucket: str,
-    start_date: date,
-    end_date: date,
-    ciks: set[str] | None = None,
-    *,
-    failure_registry: FailureRegistry | None = None,
-    s3_prefix: str = DEFAULT_S3_PREFIX,
-    retry_registered_failures: bool = False,
-    form_types: str | Sequence[str] = DEFAULT_FORM_TYPES,
-) -> list[DocumentCandidate]:
-    """Return manifest-backed document candidates for an inclusive date range.
-
-    Args:
-        s3_client: Client for the scraper bucket.
-        bucket: The scraper bucket.
-        start_date: First filing date scanned.
-        end_date: Last filing date scanned.
-        ciks: CIKs to keep; None keeps every filer.
-        failure_registry: Where new failures are recorded and known ones looked
-            up; None records nothing.
-        s3_prefix: The scraper's key prefix.
-        retry_registered_failures: Re-attempt manifests the registry marks
-            failed, discarding the entry when one now succeeds.
-        form_types: SEC form names ("8-K", "6-K/A").
-    """
-    candidates: list[DocumentCandidate] = []
-    for manifest_key in _iter_manifest_keys(
-        s3_client,
-        bucket,
-        form_types,
-        start_date,
-        end_date,
-        ciks=_normalize_ciks(ciks),
-        s3_prefix=s3_prefix,
-    ):
-        key = _failure_key(bucket, manifest_key)
-        if (
-            not retry_registered_failures
-            and failure_registry is not None
-            and key in failure_registry
-        ):
-            LOGGER.info(
-                "Skipping known ingest failure: bucket=%s key=%s", bucket, manifest_key
-            )
-            continue
-        candidate = _candidate_from_manifest_key(
-            s3_client,
-            bucket,
-            manifest_key,
-            failure_registry=failure_registry,
-        )
-        if candidate is not None:
-            if (
-                retry_registered_failures
-                and failure_registry is not None
-                and key in failure_registry
-            ):
-                # The registered failure did not reproduce; drop it.
-                failure_registry.discard(key)
-            candidates.append(candidate)
-    return candidates
-
-
 def iter_manifest_keys_for_date_range(
     s3_client: S3Client,
     bucket: str,
@@ -732,30 +604,6 @@ def normalize_s3_uri(bucket: str, key_or_uri: str) -> str:
     return s3_uri(bucket, key_or_uri)
 
 
-def _candidate_from_filing(
-    filing: ScrapedFiling,
-    *,
-    bucket: str,
-) -> DocumentCandidate | None:
-    document = next(
-        (document for document in filing.documents if _is_cdt_document(document)),
-        None,
-    )
-    if document is None:
-        return None
-    return DocumentCandidate(
-        accession_number=normalize_accession_number(filing.accession_number),
-        cik=filing.cik,
-        company_name=filing.company_name,
-        url=document.url,
-        resource_uri=normalize_s3_uri(bucket, document.s3_key),
-        date=filing.filing_date.isoformat(),
-        # The manifest's form_type, not the key prefix, which spells "/" as "_".
-        form_type=filing.form_type,
-        source=DocumentSource.S3_MANIFEST,
-    )
-
-
 def filing_from_manifest_key(
     s3_client: S3Client,
     bucket: str,
@@ -795,38 +643,6 @@ def filing_from_manifest_key(
         LOGGER.info("Skipping failed upstream manifest %s", manifest_key)
         return None
     return filing
-
-
-def _candidate_from_manifest_key(
-    s3_client: S3Client,
-    bucket: str,
-    manifest_key: str,
-    *,
-    failure_registry: FailureRegistry | None = None,
-) -> DocumentCandidate | None:
-    filing = filing_from_manifest_key(
-        s3_client, bucket, manifest_key, failure_registry=failure_registry
-    )
-    if filing is None:
-        return None
-
-    candidate = _candidate_from_filing(filing, bucket=bucket)
-    if candidate is None:
-        LOGGER.warning("Manifest missing target CDT document: key=%s", manifest_key)
-        _record_failure(
-            failure_registry,
-            _failure_key(bucket, manifest_key),
-            IngestFailureType.DOCUMENT_NOT_FOUND,
-        )
-        return None
-    return candidate
-
-
-def _is_cdt_document(document: ScrapedDocument) -> bool:
-    return (
-        document.type.upper() == CDT_DOCUMENT_TYPE
-        or document.description.upper() == CDT_DOCUMENT_DESCRIPTION
-    )
 
 
 def _download_candidate(s3_client: S3Client, candidate: DocumentCandidate) -> str:
