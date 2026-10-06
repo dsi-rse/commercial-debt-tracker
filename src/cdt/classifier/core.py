@@ -28,11 +28,8 @@ from cdt.datasets import (
     run_manifest_path,
 )
 from cdt.itemizer.core import ITEM_COLUMNS, ITEM_DATASET_NAME
-from cdt.storage import (
-    read_table,
-    write_json_artifact,
-    write_partition_table,
-)
+from cdt.storage.objects import write_json_artifact
+from cdt.storage.tables import read_table, write_partition_table
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_TARGET_RECALL = 0.99

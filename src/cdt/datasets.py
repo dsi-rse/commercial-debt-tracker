@@ -12,16 +12,16 @@ from typing import cast
 
 from cdt import settings
 from cdt.shared import get_logger
-from cdt.storage import (
+from cdt.storage.objects import (
     ArtifactPath,
     artifact_exists,
-    is_orphaned_temp_artifact,
     join_artifact_path,
     list_artifacts,
     normalize_artifact_path,
     read_json_artifact,
     write_json_artifact,
 )
+from cdt.storage.tables import is_orphaned_temp_artifact
 
 LOGGER = get_logger(__name__)
 

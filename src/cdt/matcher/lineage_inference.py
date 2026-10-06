@@ -47,11 +47,8 @@ from cdt.matcher.schema import (
     debt_instruments_root,
     mention_cluster_edges_root,
 )
-from cdt.storage import (
-    read_dataset,
-    write_json_artifact,
-    write_partition_table,
-)
+from cdt.storage.objects import write_json_artifact
+from cdt.storage.tables import read_dataset, write_partition_table
 
 LOGGER = logging.getLogger(__name__)
 

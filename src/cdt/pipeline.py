@@ -50,10 +50,7 @@ from cdt.shared import get_logger
 from cdt.sixk.scraper import acquire_scraped_sixk_documents
 from cdt.sixk.stage import DEFAULT_CONCURRENCY as SIXK_DEFAULT_CONCURRENCY
 from cdt.sixk.stage import triage_pending_documents
-from cdt.storage import (
-    ArtifactPath,
-    read_text_artifact,
-)
+from cdt.storage.objects import ArtifactPath, read_text_artifact
 
 #: Genres the CLI entry points prepare unless `--genres` narrows them.
 DEFAULT_GENRES: tuple[str, ...] = (GENRE_8K, GENRE_6K)

@@ -32,12 +32,8 @@ from cdt.sixk.stage import (
     triage_pending_documents,
 )
 from cdt.sixk.windows import prepare_filing, strip_inline_xbrl_prologue
-from cdt.storage import (
-    list_artifacts,
-    read_dataset,
-    read_json_artifact,
-    write_partition_table,
-)
+from cdt.storage.objects import list_artifacts, read_json_artifact
+from cdt.storage.tables import read_dataset, write_partition_table
 
 # Long enough to pass the debt-vocabulary gate and window into one crop.
 DEBT_PROSE = (

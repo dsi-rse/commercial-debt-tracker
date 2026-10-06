@@ -53,7 +53,8 @@ from cdt.sixk.triage import (
     triage_filing,
 )
 from cdt.sixk.windows import TextWindow, expand_admitted_windows, prepare_filing
-from cdt.storage import read_table, write_json_artifact, write_partition_table
+from cdt.storage.objects import write_json_artifact
+from cdt.storage.tables import read_table, write_partition_table
 
 LOGGER = get_logger(__name__)
 

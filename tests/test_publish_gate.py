@@ -16,7 +16,8 @@ from cdt.publish import (
     publish_would_republish_nothing,
     write_final_output_tables,
 )
-from cdt.storage import read_json_artifact, read_table, write_partition_table
+from cdt.storage.objects import read_json_artifact
+from cdt.storage.tables import read_table, write_partition_table
 
 _PARTITION = {"date": "2022-01-02", "shard": "0001"}
 

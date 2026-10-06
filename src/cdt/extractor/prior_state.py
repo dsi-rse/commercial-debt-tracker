@@ -14,10 +14,7 @@ from cdt.extractor.schema import (
     PRINCIPAL_AMOUNT_KINDS,
     debt_instrument_mention_id_for,
 )
-from cdt.storage import (
-    coerce_dataset_text,
-    json_column,
-)
+from cdt.storage.columns import coerce_dataset_text, json_column
 
 if TYPE_CHECKING:
     from cdt.extractor.state import ExtractionRowState

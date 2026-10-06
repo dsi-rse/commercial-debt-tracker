@@ -23,19 +23,19 @@ from cdt.datasets import (
     shard_label,
 )
 from cdt.shared import FailureClassifier, FailureRegistry, get_logger
-from cdt.storage import (
-    count_partition_rows,
+from cdt.storage.objects import (
     get_object_bytes,
     join_artifact_path,
     normalize_artifact_path,
     parse_s3_uri,
+    write_json_artifact,
+)
+from cdt.storage.objects import s3_client as storage_s3_client
+from cdt.storage.tables import (
+    count_partition_rows,
     read_partitions,
     read_table,
-    write_json_artifact,
     write_partition_table,
-)
-from cdt.storage import (
-    s3_client as storage_s3_client,
 )
 
 LOGGER = get_logger(__name__)

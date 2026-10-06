@@ -41,15 +41,14 @@ from cdt.extractor.state import (
     coerce_native,
 )
 from cdt.shared import get_logger
-from cdt.storage import (
+from cdt.storage.columns import coerce_dataset_text
+from cdt.storage.objects import (
     artifact_exists,
-    coerce_dataset_text,
     list_artifacts_with_versions,
-    read_table,
     write_json_artifact,
-    write_partition_table,
     write_text_artifact,
 )
+from cdt.storage.tables import read_table, write_partition_table
 
 LOGGER = get_logger(__name__)
 

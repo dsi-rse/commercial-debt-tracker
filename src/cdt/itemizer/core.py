@@ -25,17 +25,10 @@ from cdt.datasets import (
 from cdt.ingest import DOCUMENT_COLUMNS, decode_document_bytes
 from cdt.itemizer.extract import DocumentText, ItemSection, extract_items_from_document
 from cdt.shared import get_logger
-from cdt.storage import (
-    coerce_dataset_text,
-    get_object_bytes,
-    parse_s3_uri,
-    read_table,
-    write_json_artifact,
-    write_partition_table,
-)
-from cdt.storage import (
-    s3_client as storage_s3_client,
-)
+from cdt.storage.columns import coerce_dataset_text
+from cdt.storage.objects import get_object_bytes, parse_s3_uri, write_json_artifact
+from cdt.storage.objects import s3_client as storage_s3_client
+from cdt.storage.tables import read_table, write_partition_table
 
 LOGGER = get_logger(__name__)
 POTENTIALLY_RELEVANT_ITEM_NUMBERS = (

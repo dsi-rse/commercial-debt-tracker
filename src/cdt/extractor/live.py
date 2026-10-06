@@ -40,11 +40,8 @@ from cdt.extractor.workflow import (
     run_extraction_workflow,
 )
 from cdt.shared import get_logger
-from cdt.storage import (
-    read_table,
-    write_json_artifact,
-    write_text_artifact,
-)
+from cdt.storage.objects import write_json_artifact, write_text_artifact
+from cdt.storage.tables import read_table
 
 LOGGER = get_logger(__name__)
 

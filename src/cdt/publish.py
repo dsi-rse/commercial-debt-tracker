@@ -23,20 +23,18 @@ from cdt.matcher.lineage_inference import apply_lineage_inference_pass
 from cdt.matcher.schema import MATCHER_SCHEMA_VERSION
 from cdt.shared import get_logger
 from cdt.sixk.stage import sixk_snippets_root
-from cdt.storage import (
+from cdt.storage.columns import coerce_dataset_text
+from cdt.storage.objects import (
     ArtifactPath,
     artifact_exists,
     artifact_tree_digest,
-    coerce_dataset_text,
-    count_table_rows,
     delete_artifact,
     join_artifact_path,
     list_artifacts,
-    read_dataset,
     read_json_artifact,
     write_json_artifact,
-    write_table,
 )
+from cdt.storage.tables import count_table_rows, read_dataset, write_table
 
 LOGGER = get_logger(__name__)
 

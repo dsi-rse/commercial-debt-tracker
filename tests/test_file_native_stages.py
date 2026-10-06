@@ -16,7 +16,6 @@ from botocore.exceptions import ClientError, ReadTimeoutError
 
 from cdt import completion as cdt_completion
 from cdt import datasets as cdt_datasets
-from cdt import storage as cdt_storage
 from cdt.classifier import classifications_root, classify_pending_items
 from cdt.classifier import core as classifier_core
 from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
@@ -92,16 +91,21 @@ from cdt.matcher.schema import (
 )
 from cdt.matcher.stage import _stale_schema_forces_rematch, match_tables
 from cdt.publish import normalize_snapshot_text
-from cdt.storage import (
+from cdt.storage import objects as storage_objects
+from cdt.storage.columns import (
     apply_declared_column_types,
-    artifact_exists,
     coerce_dataset_text,
     decimal_column_values,
+)
+from cdt.storage.objects import (
+    artifact_exists,
     get_object_bytes,
-    read_dataset,
     read_json_artifact,
-    read_table,
     write_json_artifact,
+)
+from cdt.storage.tables import (
+    read_dataset,
+    read_table,
     write_partition_table,
     write_table,
 )
@@ -650,7 +654,7 @@ def test_get_object_bytes_retries_streaming_read_failures(
     read; one such timeout previously ended a 2.5h itemize at partition
     13,121 of 18,113.
     """
-    monkeypatch.setattr(cdt_storage, "sleep", lambda seconds: None)
+    monkeypatch.setattr(storage_objects, "sleep", lambda seconds: None)
     client = _FlakyS3Client(b"payload", read_failures=2)
 
     assert get_object_bytes(client, "bucket", "key") == b"payload"
@@ -661,20 +665,20 @@ def test_get_object_bytes_gives_up_after_bounded_attempts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A persistent stream failure must surface, not retry forever (#112)."""
-    monkeypatch.setattr(cdt_storage, "sleep", lambda seconds: None)
+    monkeypatch.setattr(storage_objects, "sleep", lambda seconds: None)
     client = _FlakyS3Client(b"payload", read_failures=99)
 
     with pytest.raises(ReadTimeoutError):
         get_object_bytes(client, "bucket", "key")
 
-    assert client.get_object_calls == cdt_storage._GET_OBJECT_ATTEMPTS
+    assert client.get_object_calls == storage_objects._GET_OBJECT_ATTEMPTS
 
 
 def test_get_object_bytes_does_not_retry_client_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Permanent errors (NoSuchKey, AccessDenied) must propagate immediately (#112)."""
-    monkeypatch.setattr(cdt_storage, "sleep", lambda seconds: None)
+    monkeypatch.setattr(storage_objects, "sleep", lambda seconds: None)
     calls = 0
 
     class _MissingKeyClient:
@@ -6765,7 +6769,7 @@ def test_read_table_projects_columns_and_tolerates_missing_ones(
     tmp_path: Path,
 ) -> None:
     """Column projection is pushed down; absent columns reindex instead of raising (#69)."""
-    from cdt.storage import write_table
+    from cdt.storage.tables import write_table
 
     path = tmp_path / "table.parquet"
     write_table(path, pd.DataFrame({"a": [1, 2], "b": ["x", "y"]}))

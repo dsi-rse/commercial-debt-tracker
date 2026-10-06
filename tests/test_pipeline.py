@@ -22,7 +22,7 @@ from cdt.pipeline import (
     resolve_mode_dates,
     run_pipeline,
 )
-from cdt.storage import read_dataset, read_table, write_partition_table
+from cdt.storage.tables import read_dataset, read_table, write_partition_table
 
 EXPECTED_SIXK_SNIPPETS = 2
 #: Two seeded 8-K items plus the one 6-K snippet the union brings in.
@@ -734,7 +734,7 @@ def test_published_items_union_both_genres_so_every_mention_can_join(
 def test_final_snapshots_publish_atomically_with_pointer(tmp_path: Path) -> None:
     """Finalize writes immutable snapshots and one atomic latest.json pointer (#91)."""
     from cdt.publish import write_final_output_tables
-    from cdt.storage import read_json_artifact
+    from cdt.storage.objects import read_json_artifact
 
     artifact_root = tmp_path / "artifacts"
     final_root = tmp_path / "final"
@@ -779,7 +779,7 @@ def test_final_snapshot_guard_blocks_shrinkage_unless_forced(tmp_path: Path) -> 
             artifact_root=str(empty_root), final_database_root=str(final_root)
         )
     # The refused publish must not have moved the pointer.
-    from cdt.storage import read_json_artifact
+    from cdt.storage.objects import read_json_artifact
 
     pointer = read_json_artifact(str(artifact_root / "final-snapshots" / "latest.json"))
     assert pointer["tables"]["items"]["rows"] == 2
@@ -943,7 +943,7 @@ def _publish_all_four(final_root: Path) -> None:
     placeholder rows would hand the matcher mention rows it cannot parse.
     """
     from cdt.publish import FINAL_OUTPUT_TABLES
-    from cdt.storage import write_table
+    from cdt.storage.tables import write_table
 
     for table_name in FINAL_OUTPUT_TABLES:
         write_table(
@@ -965,7 +965,7 @@ def _record_published_generation(artifact_root: Path, final_root: Path) -> None:
         final_pointer_path,
         publish_source_digest,
     )
-    from cdt.storage import write_json_artifact
+    from cdt.storage.objects import write_json_artifact
 
     _publish_all_four(final_root)
     write_json_artifact(
@@ -1113,7 +1113,7 @@ def test_a_real_publish_records_the_digest_the_next_run_gates_on(
         publish_would_republish_nothing,
         write_final_output_tables,
     )
-    from cdt.storage import read_json_artifact
+    from cdt.storage.objects import read_json_artifact
 
     artifact_root = tmp_path / "artifacts"
     final_root = tmp_path / "final"
@@ -1152,7 +1152,7 @@ def test_a_pointer_with_no_recorded_digest_publishes(tmp_path: Path) -> None:
     next time.
     """
     from cdt.publish import final_pointer_path, publish_would_republish_nothing
-    from cdt.storage import write_json_artifact
+    from cdt.storage.objects import write_json_artifact
 
     artifact_root = tmp_path / "artifacts"
     final_root = tmp_path / "final"
@@ -1243,7 +1243,8 @@ def test_a_partially_published_database_root_publishes(tmp_path: Path) -> None:
         publish_source_digest,
         publish_would_republish_nothing,
     )
-    from cdt.storage import write_json_artifact, write_table
+    from cdt.storage.objects import write_json_artifact
+    from cdt.storage.tables import write_table
 
     artifact_root = tmp_path / "artifacts"
     final_root = tmp_path / "final"

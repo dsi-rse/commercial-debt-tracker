@@ -6,7 +6,11 @@ names the scraper's complete submission file.
 
 from __future__ import annotations
 
-from cdt.storage import ArtifactPath, join_artifact_path, normalize_artifact_path
+from cdt.storage.objects import (
+    ArtifactPath,
+    join_artifact_path,
+    normalize_artifact_path,
+)
 
 MIRROR_DATASET_NAME = "raw-documents"
 MIRROR_GENRE = "sixk"

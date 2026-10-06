@@ -15,10 +15,9 @@ from cdt.datasets import (
     resolve_artifact_root,
 )
 from cdt.shared import get_logger
-from cdt.storage import (
+from cdt.storage.objects import (
     ArtifactPath,
     artifact_exists,
-    is_orphaned_temp_artifact,
     join_artifact_path,
     list_artifacts,
     list_artifacts_with_versions,
@@ -28,6 +27,7 @@ from cdt.storage import (
     replace_json_artifact_if_match,
     write_json_artifact_if_absent,
 )
+from cdt.storage.tables import is_orphaned_temp_artifact
 
 LOGGER = get_logger(__name__)
 
@@ -194,7 +194,7 @@ def load_completion_registry(
 
 # Capped at botocore's default ``max_pool_connections`` (10): the GETs share one
 # client, and extra threads only queue and log "connection pool is full". Raise
-# both together, with ``S3_CLIENT_CONFIG`` in storage.py.
+# both together, with ``S3_CLIENT_CONFIG`` in storage/objects.py.
 _REGISTRY_LOAD_CONCURRENCY = 10
 
 

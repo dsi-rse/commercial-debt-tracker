@@ -28,7 +28,7 @@ from cdt.extractor.outputs import (
 from cdt.extractor.schema import DEBT_INSTRUMENT_MENTION_COLUMNS
 from cdt.extractor.state import ExtractionRowState
 from cdt.sixk.stage import SIXK_SNIPPET_COLUMNS, item_id_for
-from cdt.storage import read_dataset, write_partition_table
+from cdt.storage.tables import read_dataset, write_partition_table
 
 PARTITION = {"date": "2026-09-08", "shard": "0001"}
 EIGHTK_ACCESSION = "000114036126006577"
