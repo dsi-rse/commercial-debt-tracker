@@ -22,12 +22,12 @@ from cdt.datasets import (
 )
 from cdt.extractor.schema import DEBT_INSTRUMENT_MENTION_COLUMNS
 from cdt.ingest.core import DOCUMENT_COLUMNS
-from cdt.itemizer.core import ITEM_COLUMNS
 from cdt.matcher.schema import (
     DEBT_INSTRUMENT_COLUMNS,
     MENTION_CLUSTER_EDGE_COLUMNS,
 )
 from cdt.matcher.stage import match_tables
+from cdt.segmenter.core import ITEM_COLUMNS
 from cdt.storage import objects as storage_objects
 from cdt.storage.columns import (
     apply_declared_column_types,

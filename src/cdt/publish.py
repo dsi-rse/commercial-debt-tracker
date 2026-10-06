@@ -8,21 +8,20 @@ from pathlib import Path
 
 import pandas as pd
 
+from cdt.classifier.sixk import sixk_snippets_root
 from cdt.datasets import (
     GENRE_6K,
     GENRE_8K,
 )
 from cdt.extractor import mentions_root
-from cdt.itemizer import items_root
-from cdt.itemizer.core import ITEM_COLUMNS
 from cdt.matcher import (
     debt_instruments_root,
     mention_cluster_edges_root,
 )
 from cdt.matcher.lineage_inference import apply_lineage_inference_pass
 from cdt.matcher.schema import MATCHER_SCHEMA_VERSION
+from cdt.segmenter.core import ITEM_COLUMNS, items_root
 from cdt.shared import get_logger
-from cdt.sixk.stage import sixk_snippets_root
 from cdt.storage.columns import coerce_dataset_text
 from cdt.storage.objects import (
     ArtifactPath,

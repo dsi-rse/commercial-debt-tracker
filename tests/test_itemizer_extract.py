@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-from cdt.itemizer.extract import (
-    DocumentText,
-    extract_items_from_document,
-    primary_8k_body,
-)
+from cdt.segmenter.eightk import extract_items_from_document, primary_8k_body
+from cdt.segmenter.text import DocumentText
 
 
 def test_extract_items_from_complete_submission() -> None:
@@ -208,7 +205,7 @@ ITEM INFORMATION: Entry into a Material Definitive Agreement
 
 def test_dollar_amounts_and_non_item_numbers_are_not_headings() -> None:
     """Money figures and numbers outside the 8-K item set never register as headings."""
-    from cdt.itemizer.extract import leading_item_numbers
+    from cdt.segmenter.eightk import leading_item_numbers
 
     assert leading_item_numbers(
         "Item 8.01 Other Events. The Company issued $1.05 billion of notes."

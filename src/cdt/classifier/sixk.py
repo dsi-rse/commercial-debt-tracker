@@ -5,9 +5,9 @@ writes ``sixk-snippets``, whose rows carry the classified-item columns plus
 :data:`SIXK_EXTRA_COLUMNS`, so the extractor reads both genres with one
 projection.
 
-Per filing: window each prose document (:func:`cdt.sixk.prepare_filing`),
+Per filing: window each prose document (:func:`cdt.segmenter.sixk.prepare_filing`),
 admit windows with stage 1, expand and merge the admitted ones
-(:func:`cdt.sixk.expand_admitted_windows`), then judge them with stage 2. One
+(:func:`cdt.segmenter.sixk.expand_admitted_windows`), then judge them with stage 2. One
 row is written per snippet stage 2 judged, kept or dropped, with its verdict;
 windows stage 1 rejected are not persisted. Design notes are in
 ``docs/sixk-two-stage-triage.md``.
@@ -26,6 +26,14 @@ import pandas as pd
 
 from cdt import settings
 from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
+from cdt.classifier.triage import (
+    FilingVerdict,
+    Snippet,
+    SupportsChatCompletion,
+    load_stage1_model,
+    stage1_admit,
+    triage_filing,
+)
 from cdt.completion import (
     CompletedPartition,
     completion_registry_path,
@@ -41,18 +49,14 @@ from cdt.datasets import (
     run_manifest_path,
 )
 from cdt.ingest.core import DOCUMENT_COLUMNS, SIXK_DOCUMENT_DATASET_NAME
-from cdt.itemizer.core import document_text_for_record, ensure_s3_client
-from cdt.shared import get_logger
-from cdt.sixk.documents import prose_documents
-from cdt.sixk.triage import (
-    FilingVerdict,
-    Snippet,
-    SupportsChatCompletion,
-    load_stage1_model,
-    stage1_admit,
-    triage_filing,
+from cdt.segmenter.core import document_text_for_record, ensure_s3_client
+from cdt.segmenter.sixk import (
+    TextWindow,
+    expand_admitted_windows,
+    prepare_filing,
+    prose_documents,
 )
-from cdt.sixk.windows import TextWindow, expand_admitted_windows, prepare_filing
+from cdt.shared import get_logger
 from cdt.storage.objects import write_json_artifact
 from cdt.storage.tables import read_table, write_partition_table
 

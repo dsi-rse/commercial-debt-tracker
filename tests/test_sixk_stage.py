@@ -12,14 +12,9 @@ from typing import Self
 import pandas as pd
 import pytest
 
+from cdt.classifier import sixk as sixk_stage
 from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS, score_model
-from cdt.completion import load_completion_registry
-from cdt.datasets import run_manifest_path
-from cdt.ingest.core import DOCUMENT_COLUMNS, SIXK_DOCUMENT_DATASET_NAME
-from cdt.ingest.core import documents_root as ingest_documents_root
-from cdt.sixk import stage as sixk_stage
-from cdt.sixk.documents import prose_documents
-from cdt.sixk.stage import (
+from cdt.classifier.sixk import (
     SIXK_SNIPPET_COLUMNS,
     VERDICT_DROPPED_DUPLICATE,
     VERDICT_DROPPED_NO_DETAILS,
@@ -31,7 +26,15 @@ from cdt.sixk.stage import (
     triage_documents,
     triage_pending_documents,
 )
-from cdt.sixk.windows import prepare_filing, strip_inline_xbrl_prologue
+from cdt.completion import load_completion_registry
+from cdt.datasets import run_manifest_path
+from cdt.ingest.core import DOCUMENT_COLUMNS, SIXK_DOCUMENT_DATASET_NAME
+from cdt.ingest.core import documents_root as ingest_documents_root
+from cdt.segmenter.sixk import (
+    prepare_filing,
+    prose_documents,
+    strip_inline_xbrl_prologue,
+)
 from cdt.storage.objects import list_artifacts, read_json_artifact
 from cdt.storage.tables import read_dataset, write_partition_table
 

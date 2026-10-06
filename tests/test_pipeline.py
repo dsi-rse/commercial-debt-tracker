@@ -10,7 +10,7 @@ import pandas as pd
 import pytest
 from support import FakeModel
 
-from cdt.classifier import core as classifier_core
+from cdt.classifier import eightk as classifier_eightk
 from cdt.datasets import GENRE_6K, GENRE_8K
 from cdt.extractor.state import ExtractionRowState
 from cdt.ingest.core import IngestRunResult
@@ -509,7 +509,7 @@ This is the extracted event text.
         "cdt.pipeline.acquire_eightk_documents", fake_run_ingest_pipeline
     )
     monkeypatch.setattr(
-        classifier_core,
+        classifier_eightk,
         "load_training_artifacts",
         lambda path: (FakeModel(), 0.5, {"threshold": 0.5}),
     )
@@ -670,9 +670,9 @@ def test_published_items_union_both_genres_so_every_mention_can_join(
     nothing, and the failure is silent: the schema is intact, the join is just
     empty, so the instrument renders with no text and no link.
     """
-    from cdt.itemizer.core import ITEM_COLUMNS
+    from cdt.classifier.sixk import SIXK_SNIPPET_COLUMNS, sixk_snippets_root
     from cdt.publish import write_final_output_tables
-    from cdt.sixk.stage import SIXK_SNIPPET_COLUMNS, sixk_snippets_root
+    from cdt.segmenter.core import ITEM_COLUMNS
 
     artifact_root = tmp_path / "artifacts"
     final_root = tmp_path / "final"

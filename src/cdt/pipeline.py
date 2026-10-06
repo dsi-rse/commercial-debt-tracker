@@ -10,7 +10,10 @@ from typing import Self
 
 import pandas as pd
 
-from cdt.classifier import classify_pending_items, default_model_dir
+from cdt.classifier.core import default_model_dir
+from cdt.classifier.eightk import classify_pending_items
+from cdt.classifier.sixk import DEFAULT_CONCURRENCY as SIXK_DEFAULT_CONCURRENCY
+from cdt.classifier.sixk import triage_pending_documents
 from cdt.datasets import (
     GENRE_6K,
     GENRE_8K,
@@ -36,10 +39,6 @@ from cdt.ingest.core import (
 from cdt.ingest.core import DEFAULT_BATCH_SIZE as DEFAULT_INGEST_BATCH_SIZE
 from cdt.ingest.eightk import acquire_eightk_documents
 from cdt.ingest.sixk import acquire_scraped_sixk_documents
-from cdt.itemizer import (
-    POTENTIALLY_RELEVANT_ITEM_NUMBERS,
-    itemize_pending_documents,
-)
 from cdt.matcher import (
     DEFAULT_AMBIGUITY_MARGIN,
     DEFAULT_MEMBERSHIP_THRESHOLD,
@@ -47,9 +46,11 @@ from cdt.matcher import (
     match_pending_mentions,
 )
 from cdt.publish import finalize_after_match
+from cdt.segmenter.eightk import (
+    POTENTIALLY_RELEVANT_ITEM_NUMBERS,
+    itemize_pending_documents,
+)
 from cdt.shared import get_logger
-from cdt.sixk.stage import DEFAULT_CONCURRENCY as SIXK_DEFAULT_CONCURRENCY
-from cdt.sixk.stage import triage_pending_documents
 from cdt.storage.objects import ArtifactPath, read_text_artifact
 
 #: Genres the CLI entry points prepare unless `--genres` narrows them.

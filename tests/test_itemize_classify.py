@@ -16,8 +16,10 @@ from support import (
     seed_document_partitions_across_months,
 )
 
-from cdt.classifier import classifications_root, classify_pending_items
 from cdt.classifier import core as classifier_core
+from cdt.classifier import eightk as classifier_eightk
+from cdt.classifier.core import classifications_root
+from cdt.classifier.eightk import classify_pending_items
 from cdt.completion import completion_registry_root, load_completed_partitions
 from cdt.datasets import (
     load_row_failures,
@@ -26,8 +28,10 @@ from cdt.datasets import (
 from cdt.extractor import extract_pending_items, mentions_root
 from cdt.extractor.state import ExtractionRowState
 from cdt.ingest.core import DOCUMENT_COLUMNS
-from cdt.itemizer import core as itemizer_core
-from cdt.itemizer import itemize_pending_documents, items_root
+from cdt.segmenter import core as segmenter_core
+from cdt.segmenter import eightk as segmenter_eightk
+from cdt.segmenter.core import items_root
+from cdt.segmenter.eightk import itemize_pending_documents
 from cdt.storage.objects import (
     artifact_exists,
     read_json_artifact,
@@ -141,7 +145,7 @@ The Company issued a promissory note.
 """.strip(),
     }
 
-    sections = itemizer_core.itemize_document_record(document)
+    sections = segmenter_eightk.itemize_document_record(document)
 
     assert sections
     assert {section.company_name for section in sections} == {""}
@@ -184,9 +188,9 @@ def test_itemize_pending_documents_skips_empty_outputs_on_rerun(
         nonlocal calls
         del args, kwargs
         calls += 1
-        return pd.DataFrame(columns=itemizer_core.ITEM_COLUMNS)
+        return pd.DataFrame(columns=segmenter_core.ITEM_COLUMNS)
 
-    monkeypatch.setattr(itemizer_core, "itemize_documents", fake_itemize_documents)
+    monkeypatch.setattr(segmenter_eightk, "itemize_documents", fake_itemize_documents)
 
     first = itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
     second = itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
@@ -207,7 +211,7 @@ def test_classify_pending_items_writes_canonical_partitions(
     seed_document_partition(tmp_path)
     itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
     monkeypatch.setattr(
-        classifier_core,
+        classifier_eightk,
         "load_training_artifacts",
         lambda path: (FakeModel(), 0.5, {"threshold": 0.5}),
     )
@@ -228,7 +232,7 @@ def test_classify_pending_items_drains_all_partitions(
     seed_document_partitions(tmp_path)
     itemize_pending_documents(artifact_root=tmp_path, batch_size=1)
     monkeypatch.setattr(
-        classifier_core,
+        classifier_eightk,
         "load_training_artifacts",
         lambda path: (FakeModel(), 0.5, {"threshold": 0.5}),
     )
@@ -248,7 +252,7 @@ def test_classify_pending_items_skips_empty_outputs_on_rerun(
     seed_document_partition(tmp_path)
     itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
     monkeypatch.setattr(
-        classifier_core,
+        classifier_eightk,
         "load_training_artifacts",
         lambda path: (FakeModel(), 0.5, {"threshold": 0.5}),
     )
@@ -260,7 +264,7 @@ def test_classify_pending_items_skips_empty_outputs_on_rerun(
         calls += 1
         return pd.DataFrame(columns=classifier_core.CLASSIFIED_ITEM_COLUMNS)
 
-    monkeypatch.setattr(classifier_core, "classify_items", fake_classify_items)
+    monkeypatch.setattr(classifier_eightk, "classify_items", fake_classify_items)
 
     first = classify_pending_items(artifact_root=tmp_path, batch_size=5)
     second = classify_pending_items(artifact_root=tmp_path, batch_size=5)
@@ -335,7 +339,7 @@ def test_itemize_pending_documents_persists_progress_per_batch(
     """A crash mid-stage must lose at most one batch, not the whole run (#111)."""
     seed_document_partitions(tmp_path)
     calls = 0
-    real_itemize_documents = itemizer_core.itemize_documents
+    real_itemize_documents = segmenter_eightk.itemize_documents
 
     def failing_itemize_documents(*args: object, **kwargs: object) -> pd.DataFrame:
         nonlocal calls
@@ -345,14 +349,16 @@ def test_itemize_pending_documents_persists_progress_per_batch(
             raise TimeoutError(msg)
         return real_itemize_documents(*args, **kwargs)
 
-    monkeypatch.setattr(itemizer_core, "itemize_documents", failing_itemize_documents)
+    monkeypatch.setattr(
+        segmenter_eightk, "itemize_documents", failing_itemize_documents
+    )
 
     with pytest.raises(TimeoutError):
         itemize_pending_documents(artifact_root=tmp_path, batch_size=1)
 
     assert len(load_completed_partitions("itemize", artifact_root=tmp_path)) == 1
 
-    monkeypatch.setattr(itemizer_core, "itemize_documents", real_itemize_documents)
+    monkeypatch.setattr(segmenter_eightk, "itemize_documents", real_itemize_documents)
     resumed = itemize_pending_documents(artifact_root=tmp_path, batch_size=1)
 
     assert len(resumed) == 1
@@ -367,12 +373,12 @@ def test_classify_pending_items_persists_progress_per_batch(
     seed_document_partitions(tmp_path)
     itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
     monkeypatch.setattr(
-        classifier_core,
+        classifier_eightk,
         "load_training_artifacts",
         lambda path: (FakeModel(), 0.5, {"threshold": 0.5}),
     )
     calls = 0
-    real_classify_items = classifier_core.classify_items
+    real_classify_items = classifier_eightk.classify_items
 
     def failing_classify_items(*args: object, **kwargs: object) -> pd.DataFrame:
         nonlocal calls
@@ -382,7 +388,7 @@ def test_classify_pending_items_persists_progress_per_batch(
             raise TimeoutError(msg)
         return real_classify_items(*args, **kwargs)
 
-    monkeypatch.setattr(classifier_core, "classify_items", failing_classify_items)
+    monkeypatch.setattr(classifier_eightk, "classify_items", failing_classify_items)
 
     with pytest.raises(TimeoutError):
         classify_pending_items(artifact_root=tmp_path, batch_size=1)
@@ -407,7 +413,7 @@ def test_stage_batch_boundaries_renew_the_writer_lease(
     assert renewals.count("itemize") == 2
 
     monkeypatch.setattr(
-        classifier_core,
+        classifier_eightk,
         "load_training_artifacts",
         lambda path: (FakeModel(), 0.5, {"threshold": 0.5}),
     )
@@ -436,7 +442,7 @@ def test_extract_pending_items_writes_mentions_and_audit(
     seed_document_partition(tmp_path)
     itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
     monkeypatch.setattr(
-        classifier_core,
+        classifier_eightk,
         "load_training_artifacts",
         lambda path: (FakeModel(), 0.5, {"threshold": 0.5}),
     )
@@ -550,7 +556,7 @@ def test_extract_pending_items_drains_all_partitions(
     seed_document_partitions(tmp_path)
     itemize_pending_documents(artifact_root=tmp_path, batch_size=1)
     monkeypatch.setattr(
-        classifier_core,
+        classifier_eightk,
         "load_training_artifacts",
         lambda path: (FakeModel(), 0.5, {"threshold": 0.5}),
     )
@@ -616,7 +622,7 @@ def test_extract_pending_items_skips_empty_outputs_on_rerun(
     seed_document_partition(tmp_path)
     itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
     monkeypatch.setattr(
-        classifier_core,
+        classifier_eightk,
         "load_training_artifacts",
         lambda path: (FakeModel(), 0.5, {"threshold": 0.5}),
     )
@@ -665,7 +671,7 @@ def test_extract_failures_are_recorded_and_cleared(
     seed_document_partition(tmp_path)
     itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
     monkeypatch.setattr(
-        classifier_core,
+        classifier_eightk,
         "load_training_artifacts",
         lambda path: (FakeModel(), 0.5, {"threshold": 0.5}),
     )
@@ -766,7 +772,7 @@ def test_itemize_batch_progress_survives_a_mid_run_interruption(
     paths = seed_document_partitions_across_months(
         tmp_path, [(day, f"{index:04d}") for index, day in enumerate(days)]
     )
-    real_itemize = itemizer_core.itemize_documents
+    real_itemize = segmenter_eightk.itemize_documents
     calls: list[int] = []
 
     def count(*, fail_on: int | None) -> object:
@@ -778,7 +784,7 @@ def test_itemize_batch_progress_survives_a_mid_run_interruption(
 
         return wrapper
 
-    monkeypatch.setattr(itemizer_core, "itemize_documents", count(fail_on=4))
+    monkeypatch.setattr(segmenter_eightk, "itemize_documents", count(fail_on=4))
     with pytest.raises(RuntimeError, match="infra interruption"):
         itemize_pending_documents(artifact_root=tmp_path, batch_size=1)
 
@@ -791,7 +797,7 @@ def test_itemize_batch_progress_survives_a_mid_run_interruption(
     assert written == ["date=2024-01.json", "date=2024-02.json"]
 
     # And the resumed run pays only for what was left.
-    monkeypatch.setattr(itemizer_core, "itemize_documents", count(fail_on=None))
+    monkeypatch.setattr(segmenter_eightk, "itemize_documents", count(fail_on=None))
     calls.clear()
     itemize_pending_documents(artifact_root=tmp_path, batch_size=1)
     assert len(calls) == 2
@@ -830,7 +836,7 @@ def test_grown_document_partition_reitemizes_and_reclassifies(
             return [2.0] * len(texts)
 
     monkeypatch.setattr(
-        classifier_core,
+        classifier_eightk,
         "load_training_artifacts",
         lambda path: (SizedFakeModel(), 0.5, {"threshold": 0.5}),
     )
@@ -866,7 +872,7 @@ def test_classifier_loads_model_once_per_run(
         loads += 1
         return (FakeModel(), 0.5, {"threshold": 0.5})
 
-    monkeypatch.setattr(classifier_core, "load_training_artifacts", counting_load)
+    monkeypatch.setattr(classifier_eightk, "load_training_artifacts", counting_load)
 
     classified = classify_pending_items(artifact_root=tmp_path, batch_size=1)
 
@@ -888,7 +894,7 @@ def test_a_partial_row_publishes_its_mentions_and_registers_the_loss(
     seed_document_partition(tmp_path)
     itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
     monkeypatch.setattr(
-        classifier_core,
+        classifier_eightk,
         "load_training_artifacts",
         lambda path: (FakeModel(), 0.5, {"threshold": 0.5}),
     )

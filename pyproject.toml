@@ -83,12 +83,12 @@ convention = "google"
 [tool.pytest.ini_options]
 python_files = "test_*.py"
 # CI runs a bare `uv run pytest --cov=...` with no path argument, so testpaths is
-# what selects collection. `src/cdt/sixk` is listed so `--doctest-modules` runs
-# the doctests there; they are the clearest statement of intent in that package
-# and would otherwise rot unexecuted. Scoped rather than repo-wide because
+# what selects collection. The two 6-K modules are listed so `--doctest-modules`
+# runs their doctests; they are the clearest statement of intent there and would
+# otherwise rot unexecuted. Scoped rather than repo-wide because
 # --doctest-modules imports every module it collects, and much of `src/cdt`
 # reaches for AWS clients on import.
-testpaths = ["tests", "src/cdt/sixk"]
+testpaths = ["tests", "src/cdt/segmenter/sixk.py", "src/cdt/classifier/triage.py"]
 addopts = "--doctest-modules"
 
 [tool.uv.sources]

@@ -17,7 +17,7 @@ from cdt import completion as cdt_completion
 from cdt import datasets as cdt_datasets
 from cdt.extractor import extract_pending_items, mentions_root
 from cdt.extractor.state import ExtractionRowState
-from cdt.itemizer import itemize_pending_documents
+from cdt.segmenter.eightk import itemize_pending_documents
 from cdt.storage.tables import (
     read_dataset,
     write_partition_table,
