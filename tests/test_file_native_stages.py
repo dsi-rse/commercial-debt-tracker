@@ -14,15 +14,15 @@ import pyarrow.dataset
 import pytest
 from botocore.exceptions import ClientError, ReadTimeoutError
 
+from cdt import completion as cdt_completion
 from cdt import datasets as cdt_datasets
 from cdt import storage as cdt_storage
 from cdt.classifier import classifications_root, classify_pending_items
 from cdt.classifier import core as classifier_core
 from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
+from cdt.completion import completion_registry_root, load_completed_partitions
 from cdt.datasets import (
-    completion_registry_root,
     existing_date_shard_partition_ids,
-    load_completed_partitions,
     load_row_failures,
     normalize_cik,
     run_manifest_path,
@@ -5609,7 +5609,7 @@ def test_pending_source_partitions_skips_orphans_and_raises_on_flat_files(
     Silently dropping a mis-laid-out real file here would run the stage on
     nothing while ingest keeps counting the file's rows as ingested.
     """
-    from cdt.datasets import pending_source_partitions
+    from cdt.completion import pending_source_partitions
 
     root = tmp_path / "artifacts"
     table = pd.DataFrame({"item_id": ["a"], "text": ["x"]})
@@ -5637,7 +5637,7 @@ def test_pending_source_partitions_reprocesses_outputs_without_a_registry_entry(
     tmp_path: Path,
 ) -> None:
     """A target partition at the same coordinates does not mark its source done."""
-    from cdt.datasets import pending_source_partitions
+    from cdt.completion import pending_source_partitions
 
     root = tmp_path / "artifacts"
     partition = {"date": "2026-01-02", "shard": "0007"}
@@ -5664,7 +5664,7 @@ def test_completion_registry_saves_merge_concurrent_updates(tmp_path: Path) -> N
     item_ids), so saves overlay only the entries a run changed onto the freshest
     persisted state instead of overwriting the file with a stale snapshot.
     """
-    from cdt.datasets import (
+    from cdt.completion import (
         CompletedPartition,
         load_completion_registry,
         save_completion_registry,
@@ -5737,13 +5737,13 @@ def test_completion_registry_shards_entries_by_date_prefix(tmp_path: Path) -> No
     The single object it replaces is 56.8 MB at full corpus scale and was read
     and rewritten whole every 100 partitions, 4,400 times per itemize pass.
     """
-    from cdt.datasets import (
+    from cdt.completion import (
         CompletedPartition,
         completion_registry_shard_path,
-        date_shard_partition_path,
         load_completion_registry,
         save_completion_registry,
     )
+    from cdt.datasets import date_shard_partition_path
 
     keys = [
         date_shard_partition_path(
@@ -5791,13 +5791,13 @@ def test_completion_registry_save_rewrites_only_the_months_it_touched(
     scale. Asserted on the objects actually touched, because an assertion that
     the final state is correct passes just as well on the quadratic version.
     """
-    from cdt.datasets import (
+    from cdt.completion import (
         CompletedPartition,
         completion_registry_shard_path,
-        date_shard_partition_path,
         load_completion_registry,
         save_completion_registry,
     )
+    from cdt.datasets import date_shard_partition_path
 
     def key(day: str) -> str:
         return date_shard_partition_path(
@@ -5835,9 +5835,9 @@ def test_completion_registry_save_rewrites_only_the_months_it_touched(
             ("create", "write_json_artifact_if_absent"),
         ):
             patch.setattr(
-                cdt_datasets,
+                cdt_completion,
                 attribute,
-                record(name, getattr(cdt_datasets, attribute)),
+                record(name, getattr(cdt_completion, attribute)),
             )
         save_completion_registry("itemize", registry, artifact_root=tmp_path)
 
@@ -5859,12 +5859,12 @@ def test_completion_registry_batch_saves_do_not_resend_earlier_batches(
     removes. The single-save test above cannot see this: it never saves the
     same registry object twice, and no stage ever saves one only once.
     """
-    from cdt.datasets import (
+    from cdt.completion import (
         CompletedPartition,
         CompletionRegistry,
-        date_shard_partition_path,
         save_completion_registry,
     )
+    from cdt.datasets import date_shard_partition_path
 
     def key(day: str) -> str:
         return date_shard_partition_path(
@@ -5888,7 +5888,7 @@ def test_completion_registry_batch_saves_do_not_resend_earlier_batches(
             "write_json_artifact_if_absent",
         ):
             patch.setattr(
-                cdt_datasets, attribute, record(getattr(cdt_datasets, attribute))
+                cdt_completion, attribute, record(getattr(cdt_completion, attribute))
             )
         for day in ("2024-01-15", "2024-02-15", "2024-03-15"):
             registry[key(day)] = CompletedPartition(fingerprint="new")
@@ -5913,12 +5913,12 @@ def test_completion_registry_load_reads_its_shards_concurrently(
     """
     import threading
 
-    from cdt.datasets import (
+    from cdt.completion import (
         CompletedPartition,
-        date_shard_partition_path,
         load_completion_registry,
         save_completion_registry,
     )
+    from cdt.datasets import date_shard_partition_path
 
     for month in range(1, 7):
         save_completion_registry(
@@ -5934,7 +5934,7 @@ def test_completion_registry_load_reads_its_shards_concurrently(
             artifact_root=tmp_path,
         )
 
-    real_read = cdt_datasets.read_json_artifact
+    real_read = cdt_completion.read_json_artifact
     lock = threading.Lock()
     in_flight = 0
     peak = 0
@@ -5958,7 +5958,7 @@ def test_completion_registry_load_reads_its_shards_concurrently(
                 in_flight -= 1
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(cdt_datasets, "read_json_artifact", overlapping_read)
+        patch.setattr(cdt_completion, "read_json_artifact", overlapping_read)
         loaded = load_completion_registry("itemize", artifact_root=tmp_path)
 
     assert peak > 1, "shard reads were issued serially"
@@ -5994,10 +5994,10 @@ def test_completion_registry_load_reads_only_date_shards() -> None:
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(
-            cdt_datasets, "list_artifacts", lambda *a, **k: sorted([shard, sibling])
+            cdt_completion, "list_artifacts", lambda *a, **k: sorted([shard, sibling])
         )
-        patch.setattr(cdt_datasets, "read_json_artifact", read)
-        loaded = cdt_datasets.load_completion_registry("itemize", artifact_root=root)
+        patch.setattr(cdt_completion, "read_json_artifact", read)
+        loaded = cdt_completion.load_completion_registry("itemize", artifact_root=root)
 
     assert reads == [shard]
     assert {entry.fingerprint for entry in loaded.values()} == {"shard"}
@@ -6017,10 +6017,10 @@ def test_completion_registry_load_merges_shards_in_sorted_order(
     import threading
     import time
 
-    from cdt.datasets import load_completion_registry
+    from cdt.completion import load_completion_registry
 
     shard_root = Path(
-        cdt_datasets.completion_registry_root("itemize", artifact_root=tmp_path)
+        cdt_completion.completion_registry_root("itemize", artifact_root=tmp_path)
     )
     shard_root.mkdir(parents=True, exist_ok=True)
     key = "documents/date=2024-01-02/shard=0001/part-0000.parquet"
@@ -6038,7 +6038,7 @@ def test_completion_registry_load_merges_shards_in_sorted_order(
             )
         )
 
-    real_read = cdt_datasets.read_json_artifact
+    real_read = cdt_completion.read_json_artifact
     later_returned = threading.Event()
     finished: list[str] = []
 
@@ -6058,12 +6058,12 @@ def test_completion_registry_load_merges_shards_in_sorted_order(
         return payload
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(cdt_datasets, "read_json_artifact", reversing_read)
+        patch.setattr(cdt_completion, "read_json_artifact", reversing_read)
         loaded = load_completion_registry("itemize", artifact_root=tmp_path)
 
     # The premise: the reads really did finish out of path order.
     assert finished == ["date=2024-02.json", "date=2024-01.json"]
-    absolute = cdt_datasets.join_artifact_path(str(tmp_path), key)
+    absolute = cdt_completion.join_artifact_path(str(tmp_path), key)
     assert loaded[absolute].fingerprint == "last"
 
 
@@ -6090,7 +6090,7 @@ def test_completion_registry_keeps_undated_keys(tmp_path: Path) -> None:
 
     Dropping it would lose completion state silently.
     """
-    from cdt.datasets import (
+    from cdt.completion import (
         CompletedPartition,
         load_completion_registry,
         save_completion_registry,
@@ -6124,12 +6124,12 @@ def test_completion_registry_shard_saves_merge_a_real_race(tmp_path: Path) -> No
     has to re-read. A test where the two writers merely run in sequence proves
     nothing about the retry loop.
     """
-    from cdt.datasets import (
+    from cdt.completion import (
         CompletedPartition,
-        date_shard_partition_path,
         load_completion_registry,
         save_completion_registry,
     )
+    from cdt.datasets import date_shard_partition_path
 
     def key(shard: str) -> str:
         return date_shard_partition_path(
@@ -6147,7 +6147,7 @@ def test_completion_registry_shard_saves_merge_a_real_race(tmp_path: Path) -> No
     writer_a = load_completion_registry("itemize", artifact_root=tmp_path)
     writer_a[key("0001")] = CompletedPartition(fingerprint="a")
 
-    real_replace = cdt_datasets.replace_json_artifact_if_match
+    real_replace = cdt_completion.replace_json_artifact_if_match
     interposed: list[str] = []
 
     def replace_after_b_writes(path: object, payload: object, *, version: str) -> bool:
@@ -6162,7 +6162,7 @@ def test_completion_registry_shard_saves_merge_a_real_race(tmp_path: Path) -> No
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(
-            cdt_datasets, "replace_json_artifact_if_match", replace_after_b_writes
+            cdt_completion, "replace_json_artifact_if_match", replace_after_b_writes
         )
         save_completion_registry("itemize", writer_a, artifact_root=tmp_path)
 
@@ -6177,14 +6177,14 @@ def test_completion_registry_shard_gives_up_after_losing_every_race(
     tmp_path: Path,
 ) -> None:
     """Endless swap losses fail loudly rather than dropping the entries."""
-    from cdt.datasets import CompletedPartition, save_completion_registry
+    from cdt.completion import CompletedPartition, save_completion_registry
 
     save_completion_registry(
         "itemize", {"k": CompletedPartition(fingerprint="seed")}, artifact_root=tmp_path
     )
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(
-            cdt_datasets,
+            cdt_completion,
             "replace_json_artifact_if_match",
             lambda *args, **kwargs: False,
         )
@@ -6207,7 +6207,7 @@ def test_itemize_batch_progress_survives_a_mid_run_interruption(
     partway and assert the completed prefix is persisted and skipped next time,
     including across a month boundary where the progress spans two shards.
     """
-    from cdt.datasets import load_completed_partitions
+    from cdt.completion import load_completed_partitions
 
     days = ["2024-01-02", "2024-01-03", "2024-02-01", "2024-02-02", "2024-03-01"]
     paths = seed_document_partitions_across_months(
@@ -6264,7 +6264,7 @@ def test_registry_keys_persist_without_the_artifact_root(tmp_path: Path) -> None
     105 B without, measured over a full-corpus-shaped registry. The in-memory
     key is still the whole path, so none of the five call sites change.
     """
-    from cdt.datasets import (
+    from cdt.completion import (
         CompletedPartition,
         completion_registry_shard_path,
         load_completion_registry,
@@ -6297,7 +6297,7 @@ def test_registry_size_no_longer_depends_on_how_deep_the_root_is(
     partitions: the persisted shards must come out byte-identical in size. With
     the root in the keys the deeper root paid its whole length 20 times over.
     """
-    from cdt.datasets import (
+    from cdt.completion import (
         CompletedPartition,
         completion_registry_shard_path,
         save_completion_registry,
@@ -6338,7 +6338,7 @@ def test_registry_follows_a_copied_artifact_root(tmp_path: Path) -> None:
     """
     import shutil
 
-    from cdt.datasets import load_completed_partitions, pending_source_partitions
+    from cdt.completion import load_completed_partitions, pending_source_partitions
 
     source = tmp_path / "source"
     seed_document_partitions_across_months(
@@ -6367,7 +6367,7 @@ def test_a_v2_shard_is_normalized_on_its_next_write(tmp_path: Path) -> None:
     Both spellings surviving in one object would double-count the entry and,
     worse, let the stale copy win a later merge.
     """
-    from cdt.datasets import (
+    from cdt.completion import (
         CompletedPartition,
         completion_registry_shard_path,
         load_completion_registry,
@@ -6432,20 +6432,20 @@ def test_registry_key_prefixes_match_the_per_key_spelling(tmp_path: Path) -> Non
         "s3://bucket",
         str(tmp_path / "a" / "very" / "deeply" / "nested" / "artifact" / "root"),
     ):
-        hoisted = cdt_datasets._prepend_registry_root(  # noqa: SLF001
+        hoisted = cdt_completion._prepend_registry_root(  # noqa: SLF001
             bare,
-            cdt_datasets._registry_join_prefix(root),  # noqa: SLF001
+            cdt_completion._registry_join_prefix(root),  # noqa: SLF001
         )
-        assert hoisted == cdt_datasets.join_artifact_path(root, bare), root
+        assert hoisted == cdt_completion.join_artifact_path(root, bare), root
         # And the pair still inverts through the hoisted strip prefix.
-        stripped = cdt_datasets._strip_registry_root(  # noqa: SLF001
+        stripped = cdt_completion._strip_registry_root(  # noqa: SLF001
             hoisted,
-            cdt_datasets._registry_strip_prefix(root),  # noqa: SLF001
+            cdt_completion._registry_strip_prefix(root),  # noqa: SLF001
         )
         assert (
-            cdt_datasets._prepend_registry_root(  # noqa: SLF001
+            cdt_completion._prepend_registry_root(  # noqa: SLF001
                 stripped,
-                cdt_datasets._registry_join_prefix(root),  # noqa: SLF001
+                cdt_completion._registry_join_prefix(root),  # noqa: SLF001
             )
             == hoisted
         ), root
@@ -6467,16 +6467,16 @@ def test_registry_payload_sorts_on_the_key_without_comparing_entries() -> None:
     versus a deterministic survivor: stable sort plus insertion-ordered dicts
     means the later of the tied keys wins, every time.
     """
-    payload = cdt_datasets._registry_payload(  # noqa: SLF001
+    payload = cdt_completion._registry_payload(  # noqa: SLF001
         "itemize",
         "2024-01",
         {
             "documents/date=2024-01-02/shard=0001/part-0000.parquet": (
-                cdt_datasets.CompletedPartition(fingerprint="a")
+                cdt_completion.CompletedPartition(fingerprint="a")
             ),
             # Relativizes to the same bare key under the root below.
             "./documents/date=2024-01-02/shard=0001/part-0000.parquet": (
-                cdt_datasets.CompletedPartition(fingerprint="b")
+                cdt_completion.CompletedPartition(fingerprint="b")
             ),
         },
         artifact_root=".",
@@ -6496,11 +6496,12 @@ def test_completion_registry_root_and_its_deprecated_alias_agree(
     alias stays only until the four stage-module call sites move. Pinned so it
     cannot silently diverge from the name it forwards to while both exist.
     """
-    root = cdt_datasets.completion_registry_root("itemize", artifact_root=tmp_path)
+    root = cdt_completion.completion_registry_root("itemize", artifact_root=tmp_path)
     assert (
-        cdt_datasets.completion_registry_path("itemize", artifact_root=tmp_path) == root
+        cdt_completion.completion_registry_path("itemize", artifact_root=tmp_path)
+        == root
     )
-    shard = cdt_datasets.completion_registry_shard_path(
+    shard = cdt_completion.completion_registry_shard_path(
         "itemize", "2024-01", artifact_root=tmp_path
     )
     assert shard == str(Path(root, "date=2024-01.json"))
@@ -6534,14 +6535,14 @@ def test_registry_key_relativizing_is_invertible(tmp_path: Path) -> None:
         "bookkeeping-key",
         "P",
     ):
-        stored = cdt_datasets._relative_registry_key(key, root)  # noqa: SLF001
-        assert cdt_datasets._absolute_registry_key(stored, root) == key  # noqa: SLF001
+        stored = cdt_completion._relative_registry_key(key, root)  # noqa: SLF001
+        assert cdt_completion._absolute_registry_key(stored, root) == key  # noqa: SLF001
 
     # A bare relative canonical key is the *persisted* spelling, so it reads
     # back as that partition under the current root -- which is exactly the
     # portability the v3 keys buy.
     bare = "documents/date=2024-01-02/shard=0001/part-0000.parquet"
-    assert cdt_datasets._absolute_registry_key(bare, root) == str(  # noqa: SLF001
+    assert cdt_completion._absolute_registry_key(bare, root) == str(  # noqa: SLF001
         tmp_path / bare
     )
 
@@ -6616,7 +6617,7 @@ def test_infrastructure_error_aborts_and_preserves_progress(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A provider failure stops the run; terminal rows are never re-paid (#49)."""
-    from cdt.datasets import load_completion_registry
+    from cdt.completion import load_completion_registry
     from cdt.extractor.state import InfrastructureError
 
     _seed_classifications(tmp_path, ["a-8-01", "b-8-01"])

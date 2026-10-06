@@ -26,17 +26,19 @@ import pandas as pd
 
 from cdt import settings
 from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
-from cdt.datasets import (
-    SIXK_SNIPPET_DATASET_NAME,
+from cdt.completion import (
     CompletedPartition,
     completion_registry_path,
+    pending_source_partitions,
+    save_completion_registry,
+)
+from cdt.datasets import (
+    SIXK_SNIPPET_DATASET_NAME,
     dataset_root,
     date_shard_partition_path,
     parse_date_shard_partition,
-    pending_source_partitions,
     resolve_artifact_root,
     run_manifest_path,
-    save_completion_registry,
 )
 from cdt.ingest import DOCUMENT_COLUMNS, SIXK_DOCUMENT_DATASET_NAME
 from cdt.itemizer.core import document_text_for_record, ensure_s3_client

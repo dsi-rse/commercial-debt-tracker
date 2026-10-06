@@ -13,12 +13,12 @@ import pandas as pd
 import pytest
 
 from cdt.classifier.core import CLASSIFICATION_DATASET_NAME, CLASSIFIED_ITEM_COLUMNS
-from cdt.datasets import (
-    SIXK_SNIPPET_DATASET_NAME,
+from cdt.completion import (
     CompletedPartition,
     load_completion_registry,
     save_completion_registry,
 )
+from cdt.datasets import SIXK_SNIPPET_DATASET_NAME
 from cdt.extractor import extract_pending_items, mentions_root
 from cdt.extractor.outputs import (
     CLASSIFICATION_SOURCES,
