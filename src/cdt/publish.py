@@ -10,8 +10,7 @@ import pandas as pd
 
 from cdt.classifier.sixk import sixk_snippets_root
 from cdt.datasets import (
-    GENRE_6K,
-    GENRE_8K,
+    GENRES,
 )
 from cdt.extractor import mentions_root
 from cdt.matcher import (
@@ -52,9 +51,12 @@ FORM_TYPE_COLUMN = "form_type"
 
 
 #: Published table -> the ``form_type`` stamped on each dataset it unions,
-#: positionally matching FINAL_OUTPUT_TABLES.
+#: positionally matching FINAL_OUTPUT_TABLES. The ``items`` union takes one
+#: dataset per genre, in genre order (each genre's ``item_dataset``). Its root
+#: functions stay named rather than derived, because their names are part of
+#: the publish digest.
 FINAL_OUTPUT_TABLE_FORM_TYPES: dict[str, tuple[str, ...]] = {
-    "items": (GENRE_8K, GENRE_6K),
+    "items": tuple(GENRES),
 }
 
 

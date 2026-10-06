@@ -41,6 +41,7 @@ from cdt.completion import (
     save_completion_registry,
 )
 from cdt.datasets import (
+    SIXK_DOCUMENT_DATASET_NAME,
     SIXK_SNIPPET_DATASET_NAME,
     dataset_root,
     date_shard_partition_path,
@@ -48,7 +49,7 @@ from cdt.datasets import (
     resolve_artifact_root,
     run_manifest_path,
 )
-from cdt.ingest.core import DOCUMENT_COLUMNS, SIXK_DOCUMENT_DATASET_NAME
+from cdt.ingest.core import DOCUMENT_COLUMNS
 from cdt.segmenter.core import document_text_for_record, ensure_s3_client
 from cdt.segmenter.sixk import (
     TextWindow,

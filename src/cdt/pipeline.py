@@ -17,6 +17,9 @@ from cdt.classifier.sixk import triage_pending_documents
 from cdt.datasets import (
     GENRE_6K,
     GENRE_8K,
+    GENRES,
+    SIXK_DOCUMENT_DATASET_NAME,
+    SIXK_FORM_TYPES,
     failure_registry_path,
     resolve_artifact_root,
 )
@@ -31,8 +34,6 @@ from cdt.ingest.core import (
     DEFAULT_AWS_PROFILE,
     DEFAULT_BUCKET,
     DEFAULT_S3_PREFIX,
-    SIXK_DOCUMENT_DATASET_NAME,
-    SIXK_FORM_TYPES,
     IngestConfig,
     IngestRunResult,
 )
@@ -53,9 +54,8 @@ from cdt.segmenter.eightk import (
 from cdt.shared import get_logger
 from cdt.storage.objects import ArtifactPath, read_text_artifact
 
-#: Genres the CLI entry points prepare unless `--genres` narrows them.
-DEFAULT_GENRES: tuple[str, ...] = (GENRE_8K, GENRE_6K)
-GENRES = DEFAULT_GENRES
+#: Genres the CLI entry points prepare unless `--genres` narrows them: all of them.
+DEFAULT_GENRES: tuple[str, ...] = tuple(GENRES)
 
 
 ALL_TIME_START_DATE = date(1994, 1, 1)
@@ -223,29 +223,61 @@ class PipelineOrchestrator:
         other: a failure in the 8-K chain stops the run before 6-K starts.
         """
         outcome = _PrepareOutcome()
-        if GENRE_8K in self.config.genres:
-            outcome.ingest, outcome.items, outcome.classified = (
-                self._ingest_itemize_classify(
-                    resolved_start,
-                    resolved_end,
-                    ciks,
-                    resolved_artifact_root,
-                    renew,
+        prepare = {GENRE_8K: self._prepare_eightk, GENRE_6K: self._prepare_sixk}
+        for genre in GENRES:
+            if genre not in self.config.genres:
+                self.logger.info(
+                    "Skipping the %s chain: genres=%s", genre, self.config.genres
                 )
-            )
-            self._renew(renew)
-        else:
-            self.logger.info("Skipping the 8-K chain: genres=%s", self.config.genres)
-        if GENRE_6K in self.config.genres:
-            outcome.sixk_ingest, outcome.snippets = self._ingest_and_triage_sixk(
+                continue
+            prepare[genre](
+                outcome,
                 resolved_start,
                 resolved_end,
+                ciks,
                 resolved_artifact_root,
                 renew,
             )
-        else:
-            self.logger.info("Skipping the 6-K chain: genres=%s", self.config.genres)
         return outcome
+
+    def _prepare_eightk(
+        self: Self,
+        outcome: _PrepareOutcome,
+        resolved_start: date,
+        resolved_end: date,
+        ciks: set[str],
+        resolved_artifact_root: str,
+        renew: Callable[[], None] | None,
+    ) -> None:
+        """Run the 8-K chain into ``outcome``, then renew the writer lease."""
+        outcome.ingest, outcome.items, outcome.classified = (
+            self._ingest_itemize_classify(
+                resolved_start,
+                resolved_end,
+                ciks,
+                resolved_artifact_root,
+                renew,
+            )
+        )
+        self._renew(renew)
+
+    def _prepare_sixk(
+        self: Self,
+        outcome: _PrepareOutcome,
+        resolved_start: date,
+        resolved_end: date,
+        ciks: set[str],
+        resolved_artifact_root: str,
+        renew: Callable[[], None] | None,
+    ) -> None:
+        """Run the 6-K chain into ``outcome``; it reads its own CIK list."""
+        del ciks
+        outcome.sixk_ingest, outcome.snippets = self._ingest_and_triage_sixk(
+            resolved_start,
+            resolved_end,
+            resolved_artifact_root,
+            renew,
+        )
 
     def _ingest_and_triage_sixk(
         self: Self,

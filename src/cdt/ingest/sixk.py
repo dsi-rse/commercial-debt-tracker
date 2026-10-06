@@ -17,9 +17,8 @@ from typing import Self
 
 import pandas as pd
 
-from cdt.datasets import default_artifact_root
+from cdt.datasets import SIXK_FORM_TYPES, default_artifact_root
 from cdt.ingest.core import (
-    SIXK_FORM_TYPES,
     DocumentCandidate,
     DocumentSource,
     IngestConfig,

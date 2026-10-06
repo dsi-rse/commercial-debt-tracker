@@ -19,7 +19,12 @@ from cdt.classifier.core import (
 from cdt.classifier.eightk import classify_pending_items
 from cdt.classifier.sixk import DEFAULT_CONCURRENCY as SIXK_DEFAULT_CONCURRENCY
 from cdt.classifier.sixk import sixk_snippets_root, triage_pending_documents
-from cdt.datasets import dataset_root, default_artifact_root
+from cdt.datasets import (
+    SIXK_DOCUMENT_DATASET_NAME,
+    SIXK_FORM_TYPES,
+    dataset_root,
+    default_artifact_root,
+)
 from cdt.extractor import (
     DEFAULT_MAX_ATTEMPTS as DEFAULT_EXTRACTOR_MAX_ATTEMPTS,
 )
@@ -40,8 +45,6 @@ from cdt.ingest.core import (
     DEFAULT_AWS_PROFILE,
     DEFAULT_BUCKET,
     DEFAULT_S3_PREFIX,
-    SIXK_DOCUMENT_DATASET_NAME,
-    SIXK_FORM_TYPES,
     IngestConfig,
     documents_root,
 )

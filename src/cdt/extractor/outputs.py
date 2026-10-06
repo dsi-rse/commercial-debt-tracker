@@ -10,7 +10,7 @@ from typing import cast
 
 import pandas as pd
 
-from cdt.classifier.core import CLASSIFICATION_DATASET_NAME, CLASSIFIED_ITEM_COLUMNS
+from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
 from cdt.completion import (
     CompletedPartition,
     CompletionRegistry,
@@ -19,8 +19,8 @@ from cdt.completion import (
     save_completion_registry,
 )
 from cdt.datasets import (
+    GENRES,
     PARTITION_PATTERN,
-    SIXK_SNIPPET_DATASET_NAME,
     dataset_root,
     date_shard_partition_path,
     extractor_run_path,
@@ -52,13 +52,13 @@ from cdt.storage.tables import read_table, write_partition_table
 
 LOGGER = get_logger(__name__)
 
-#: Datasets the extractor takes work from, in claim order. Both hold rows in
-#: CLASSIFIED_ITEM_COLUMNS with a `relevance` flag — 8-K items scored by the
-#: item classifier, 6-K windows scored by the two-stage triage — so every stage
-#: below reads them identically and none of them knows which genre it has.
-CLASSIFICATION_SOURCES: tuple[str, ...] = (
-    CLASSIFICATION_DATASET_NAME,
-    SIXK_SNIPPET_DATASET_NAME,
+#: Datasets the extractor takes work from, one per genre, in genre order. Each
+#: holds rows in CLASSIFIED_ITEM_COLUMNS with a `relevance` flag — 8-K items
+#: scored by the item classifier, 6-K windows scored by the two-stage triage —
+#: so every stage below reads them identically and none of them knows which
+#: genre it has.
+CLASSIFICATION_SOURCES: tuple[str, ...] = tuple(
+    genre.classified_dataset for genre in GENRES.values()
 )
 MENTIONS_DATASET_NAME = "mentions"
 

@@ -19,6 +19,7 @@ from cdt.completion import (
     save_completion_registry,
 )
 from cdt.datasets import (
+    ITEM_DATASET_NAME,
     date_shard_partition_path,
     parse_date_shard_partition,
     resolve_artifact_root,
@@ -27,7 +28,6 @@ from cdt.datasets import (
 from cdt.ingest.core import DOCUMENT_COLUMNS
 from cdt.segmenter.core import (
     ITEM_COLUMNS,
-    ITEM_DATASET_NAME,
     document_text_for_record,
     ensure_s3_client,
     items_root,

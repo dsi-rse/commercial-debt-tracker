@@ -6,6 +6,7 @@ Prefixes are named ``*_root`` and single objects ``*_path``.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import cast
@@ -318,3 +319,49 @@ def zlib_crc32(value: str) -> int:
 #: triage; both converge at extract.
 GENRE_8K = "8-K"
 GENRE_6K = "6-K"
+
+CDT_FORM_TYPE = "8-K"
+DEFAULT_FORM_TYPES: tuple[str, ...] = (CDT_FORM_TYPE,)
+# The 6-K genre's forms.
+SIXK_FORM_TYPES: tuple[str, ...] = ("6-K", "6-K/A")
+
+DOCUMENT_DATASET_NAME = "documents"
+# The 6-K genre's own documents dataset (see IngestConfig.dataset_name).
+SIXK_DOCUMENT_DATASET_NAME = "documents-sixk"
+ITEM_DATASET_NAME = "items"
+CLASSIFICATION_DATASET_NAME = "classifications"
+
+
+@dataclass(frozen=True)
+class Genre:
+    """One filing genre: its SEC forms and the datasets its upstream stages write.
+
+    ``document_dataset`` is what ingest writes, ``item_dataset`` the rows the
+    published ``items`` table takes from this genre, and ``classified_dataset``
+    the rows the extractor reads. For 6-K the last two are the same dataset.
+    """
+
+    name: str
+    form_types: tuple[str, ...]
+    document_dataset: str
+    item_dataset: str
+    classified_dataset: str
+
+
+#: Every genre, in the order a run prepares them.
+GENRES: dict[str, Genre] = {
+    GENRE_8K: Genre(
+        name=GENRE_8K,
+        form_types=DEFAULT_FORM_TYPES,
+        document_dataset=DOCUMENT_DATASET_NAME,
+        item_dataset=ITEM_DATASET_NAME,
+        classified_dataset=CLASSIFICATION_DATASET_NAME,
+    ),
+    GENRE_6K: Genre(
+        name=GENRE_6K,
+        form_types=SIXK_FORM_TYPES,
+        document_dataset=SIXK_DOCUMENT_DATASET_NAME,
+        item_dataset=SIXK_SNIPPET_DATASET_NAME,
+        classified_dataset=SIXK_SNIPPET_DATASET_NAME,
+    ),
+}

@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 from cdt import settings
-from cdt.datasets import dataset_root
+from cdt.datasets import CLASSIFICATION_DATASET_NAME, dataset_root
 from cdt.segmenter.core import ITEM_COLUMNS
 
 LOGGER = logging.getLogger(__name__)
@@ -25,7 +25,6 @@ MIN_CV_SPLITS = 2
 MODEL_NAME = "tfidf_linear_svc"
 MODEL_FILENAME = "model.pkl"
 METADATA_FILENAME = "metadata.json"
-CLASSIFICATION_DATASET_NAME = "classifications"
 CLASSIFIED_ITEM_COLUMNS = [*ITEM_COLUMNS, "label", "relevance", "classification_score"]
 
 

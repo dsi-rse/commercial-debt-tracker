@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from cdt.datasets import dataset_root
+from cdt.datasets import ITEM_DATASET_NAME, dataset_root
 from cdt.ingest.core import decode_document_bytes
 from cdt.shared import get_logger
 from cdt.storage.objects import get_object_bytes, parse_s3_uri
@@ -41,7 +41,6 @@ ITEM_INTEGER_COLUMNS = [
     "end_line",
     "section_char_count",
 ]
-ITEM_DATASET_NAME = "items"
 
 
 def items_root(

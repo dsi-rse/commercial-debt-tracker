@@ -11,11 +11,9 @@ from typing import Self
 
 import pytest
 
-from cdt.datasets import normalize_cik
+from cdt.datasets import SIXK_DOCUMENT_DATASET_NAME, SIXK_FORM_TYPES, normalize_cik
 from cdt.ingest.core import (
     DOCUMENT_COLUMNS,
-    SIXK_DOCUMENT_DATASET_NAME,
-    SIXK_FORM_TYPES,
     IngestConfig,
     IngestFailureClassifier,
     IngestFailureType,

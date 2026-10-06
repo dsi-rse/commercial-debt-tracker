@@ -8,12 +8,14 @@ from pathlib import Path
 
 import pandas as pd
 
-from cdt.datasets import default_artifact_root
+from cdt.datasets import (
+    DEFAULT_FORM_TYPES,
+    DOCUMENT_DATASET_NAME,
+    default_artifact_root,
+)
 from cdt.ingest.core import (
     DEFAULT_BATCH_SIZE,
-    DEFAULT_FORM_TYPES,
     DEFAULT_S3_PREFIX,
-    DOCUMENT_DATASET_NAME,
     DocumentCandidate,
     DocumentCandidateSource,
     DocumentSource,
