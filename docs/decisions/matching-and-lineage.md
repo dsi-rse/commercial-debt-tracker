@@ -191,12 +191,14 @@ change must not re-score clusters.
 
 ## `_json_text`
 
-A projected read of a column that a partition predates falls back to a full
-read plus `reindex`, which fills the column with NaN. NaN breaks the
+`read_table` returns a requested column that a partition's file lacks (it
+decides from the footer schema) filled with NaN. NaN breaks the
 `str(row.get(col) or "[]")` idiom twice: it is truthy, and `str(nan)` is `nan`.
-On `data/genwindow-run-dev`, 245 mentions partitions were written before
-`retired_by_json`, `amounts_json` and `parties_json` existed. With the guard,
-`cdt match` completes there, at 679 edge rows and 572 instruments. The sites
+`_json_text`, and `_json_list` through `storage.json_column`, read such a value
+as absent; `retired_by_json` goes through `_json_list`. On
+`data/genwindow-run-dev`, 245 mentions partitions were written before
+`retired_by_json`, `amounts_json` and `parties_json` existed. With these
+guards, `cdt match` completes there, at 679 edge rows and 572 instruments. The sites
 that feed `parse_cluster_list` (parties, lender signature) produce the same
 answer with or without the guard. Over the twelve column shapes a parquet
 column can produce (NaN, None, blank, every `MISSING_TEXT_VALUES` placeholder,

@@ -2763,8 +2763,9 @@ def terminate_on_provider_aborts(
 ) -> None:
     """End a row at the resend cap, without scoring the abort against the model.
 
-    Salvages exactly as `_salvage_or_fail` does: an `instrument_ie` response
-    with individually valid entries, or mentions already held at
+    Salvages like `_salvage_or_fail`, except that an `instrument_ie` salvage
+    finishes here instead of advancing: an `instrument_ie` response whose valid
+    entries yield at least one mention, or mentions already held at
     `instrument_relation`, finish PARTIAL without lineage; otherwise FAILED.
     The salvage note records ``aborts`` and, when scored attempts of this stage
     also failed, the most recent validation errors, since the aborts need not

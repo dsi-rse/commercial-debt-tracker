@@ -546,9 +546,11 @@ MIN_EXPANSION_TOKENS = 200
 #: backwards finds no header or blank line (e.g. unbroken table rows).
 MAX_EXPANSION_TOKENS = 400
 
-#: Ceiling on one merged window, matching the largest snippet the 8-K path
-#: sends the extractor. Summed from the parts rather than measured on the join,
-#: so it is a target, not a guarantee.
+#: Ceiling on the merged-window estimate, matching the largest snippet the 8-K
+#: path sends the extractor. The estimate counts the first member's context and
+#: each member's own tokens, not the text a later member's expansion pulls in to
+#: reach the span, so each merge can add up to :data:`MAX_EXPANSION_TOKENS`
+#: uncounted and a merged window can exceed this ceiling.
 MAX_MERGED_TOKENS = 2_000
 
 #: Longest a line can be and still read as a heading rather than a sentence.
@@ -584,7 +586,8 @@ class ExpandedWindow:
     ``window`` is the text stage 2 and extraction see; its ``index`` is the
     first member's. ``member_indices`` holds the indices of every admitted
     window it covers, in document order. A merged window may exceed
-    :data:`WINDOW_TOKENS`, up to about :data:`MAX_MERGED_TOKENS`.
+    :data:`WINDOW_TOKENS`, and can exceed :data:`MAX_MERGED_TOKENS` (see
+    there).
     """
 
     window: TextWindow
@@ -817,8 +820,9 @@ def _line_at(text: str, offset: int) -> str:
 class _MergedSpan:
     """A span under construction, with a running token estimate.
 
-    The estimate sums prepended context and each member's own count rather than
-    re-measuring the join, which would make a long run quadratic.
+    The estimate sums the first member's prepended context and each member's
+    own count rather than re-measuring the join, which would make a long run
+    quadratic; context a later member brings is not counted.
     """
 
     start: int

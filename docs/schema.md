@@ -652,8 +652,8 @@ dropped. Retrying the listed rows is still manual, and still partition-granular 
 - final snapshot parquet files are derived convenience outputs, not the canonical working state
 - `cdt pipeline` writes final snapshots only when `--final-database-root` is passed
 - `cdt-orchestrator` writes final snapshots when `FINAL_DATABASE_ROOT` is set or `--final-database-root` is passed before the mode
-- stage completion is inferred from output partition presence plus stage completion registries (`runs/<stage>/completed/`) for zero-row outputs
-- `force=false` skips already-written partitions
+- stage completion is recorded per source partition in the stage's completion registry (`runs/<stage>/completed/`), keyed by the source partition's fingerprint; whether an output partition exists plays no part
+- `force=false` skips source partitions whose fingerprint is unchanged since completion was recorded
 - local runs and deployed runs use the same layout and code paths
 - the default operating model is one active writer per environment
 

@@ -68,7 +68,8 @@ that extracts within the run itself.
 
 ### The 6-K chain
 
-Every scheduled run prepares both filing genres: 8-K (ingest → itemize → classify) and
+Every `daily` and `historical` run prepares both filing genres (the hourly `poll`
+run only advances the batch extract job): 8-K (ingest → itemize → classify) and
 6-K (ingest-sixk → sixk triage). The task definition sets none of the 6-K settings, so
 the defaults below are what runs in production. Each can be set as an environment
 variable on the task, or passed as the matching flag.

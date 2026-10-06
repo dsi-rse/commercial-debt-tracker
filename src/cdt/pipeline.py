@@ -256,8 +256,9 @@ class PipelineOrchestrator:
     ) -> _PrepareOutcome:
         """Prepare every genre this run asked for, in genre order.
 
-        The chains share no datasets, so a failing genre leaves only its own
-        partitions pending.
+        Each genre writes its own documents and classification datasets, so a
+        failing genre cannot corrupt the other's. The chains run one after the
+        other: a failure in the 8-K chain stops the run before 6-K starts.
         """
         outcome = _PrepareOutcome()
         if GENRE_8K in self.config.genres:
@@ -777,7 +778,8 @@ def finalize_after_match(
 ) -> dict[str, str]:
     """Run the lineage post-pass, then publish unless the gate says skip.
 
-    Every entry point that runs match must finish through here. The lineage
+    Every entry point that runs match and publishes must finish through here;
+    ``cdt match`` runs the lineage pass itself and does not publish. The lineage
     pass is skipped when ``matched_instruments`` is empty. ``renew`` extends
     the caller's writer lease before each long step, so a stolen lease cannot
     keep publishing.

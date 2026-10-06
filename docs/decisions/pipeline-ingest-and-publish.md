@@ -106,7 +106,8 @@ and the fingerprint registries carry late merges downstream.
 
 ### `finalize_after_match`
 
-Every entry point that runs match finishes through this one function. When the
+Every entry point that runs match and publishes finishes through this one
+function (`cdt match` runs the lineage pass itself and does not publish). When the
 lineage pass was wired into only one of three entry points, production
 published 537 of 542 instruments as lineage heads (#170).
 

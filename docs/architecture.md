@@ -157,9 +157,12 @@ backend ran it:
   sent only to models that can honor it; for those it is pinned to `0.0`.
 - Reasoning effort is configured in OpenRouter's vocabulary and translated for OpenAI by
   `openai_reasoning_effort`. The two vocabularies agree except for OpenRouter's `minimal`,
-  which maps to `low`. The effort is always sent: an omitted `reasoning_effort` would leave
-  a `gpt-5` batch on the API default (`medium`) while the live backend ran with reasoning
-  off. An effort neither vocabulary accepts raises on the poll tick before a job is created.
+  which maps to `low`. When an effort is set and the model is a reasoning model, it is
+  sent translated rather than dropped: an omitted `reasoning_effort` would leave a `gpt-5`
+  batch on the API default (`medium`) while the live backend ran with reasoning off.
+  Non-reasoning models never get the field: they reject it, and one rejected request fails
+  the whole batch. An effort neither vocabulary accepts raises on the poll tick before a
+  job is created.
 
 ### The batch extract state machine
 

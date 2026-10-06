@@ -765,9 +765,9 @@ def filing_from_manifest_key(
 ) -> ScrapedFiling | None:
     """Read one manifest into a filing.
 
-    Returns None for an unreadable or invalid manifest (recorded in
-    ``failure_registry`` when given) and for one the scraper marked failed
-    (not recorded).
+    Returns None for an invalid manifest (recorded in ``failure_registry`` as
+    permanent when given), and for an unreadable manifest or one the scraper
+    marked failed (neither recorded, so the next run retries them).
     """
     try:
         manifest = _read_json_object(s3_client, bucket, manifest_key)

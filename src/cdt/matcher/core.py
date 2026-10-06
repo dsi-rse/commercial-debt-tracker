@@ -2127,7 +2127,9 @@ def name_fingerprints_are_compatible(left: str | None, right: str | None) -> boo
     - the differing tokens are not only class or tranche designators
       (`Tranche A Loan` is not a shortened `Tranche B Loan`)
 
-    False when either side is missing.
+    Unequal fingerprints with identical informative tokens (they differ only in
+    stopwords, e.g. `the senior notes due 2034` and `senior notes due 2034`)
+    are not compatible. False when either side is missing.
     """
     if not left or not right:
         return False

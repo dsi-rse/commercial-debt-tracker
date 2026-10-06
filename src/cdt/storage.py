@@ -33,8 +33,9 @@ LOGGER = get_logger(__name__)
 
 ArtifactPath = str | Path
 
-# Empty ``tmp*.parquet`` files a crash mid-write_table can leave in a partition
-# directory (the older temp naming); ``**/*.parquet`` readers must skip them.
+# Empty ``tmp*.parquet`` files left in a partition directory by a crash under
+# write_table's former temp naming; ``**/*.parquet`` readers must skip them.
+# Current writes use ``.parquet.tmp``, which this does not match.
 _ORPHANED_TEMP_RE = re.compile(r"(?:^|/)tmp[^/]*\.parquet$")
 
 # One client and one Session per AWS profile for the whole process: construction
@@ -214,7 +215,7 @@ def list_artifacts(base: ArtifactPath, *, suffix: str = "") -> list[str]:
 
 
 def is_orphaned_temp_artifact(path: ArtifactPath) -> bool:
-    """Return whether a path is a tempfile orphaned by a crash mid-write_table."""
+    """Return whether a path is a ``tmp*.parquet`` file of write_table's old naming."""
     return _ORPHANED_TEMP_RE.search(normalize_artifact_path(path)) is not None
 
 

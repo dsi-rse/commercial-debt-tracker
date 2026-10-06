@@ -88,9 +88,12 @@ generalization window's 392 admitted windows:
 - **Adjacent admitted windows merge.** An expansion reaching into the window
   before it would otherwise send the same text twice. Merging also cuts the
   snippet count, 392 admitted windows becoming 219. A run of them stops merging
-  at roughly 2,000 tokens, the largest snippet the 8-K path already sends the
-  same extractor; the generalization window has a run of 21 that would otherwise
-  reach 8,191.
+  once its estimate reaches 2,000 tokens, the largest snippet the 8-K path
+  already sends the same extractor; the generalization window has a run of 21
+  that would otherwise reach 8,191. The estimate leaves out the context each
+  later member's expansion pulls in (up to 400 tokens per merge), so a merged
+  window can be larger than 2,000 tokens: a synthetic run of alternate admitted
+  windows produced 3,665.
 
 ### What it fixes, and what it costs
 

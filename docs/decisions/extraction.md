@@ -44,7 +44,7 @@ The abort is still appended to `all_attempts`, so the audit log keeps a true rec
 
 Reaching `MAX_CONTENT_FILTER_RESENDS` means "stop resending", not "the model answered badly". Scoring the abort instead (falling through to `handle_response`) would charge the row for a call it never got an answer to, grow the retry conversation with an empty assistant turn plus a complaint, and leave a `FAILED` attempt that every cross-attempt check reads as the model having failed; one abort past the cap was enough to reject the honest answer that followed it.
 
-Salvage applies to what the row already earned exactly as `_salvage_or_fail` applies it after a scored failure: a stage the provider will not run costs the item what that stage would have added, not what earlier stages validated. The two paths had diverged on `instrument_ie` (PARTIAL with mentions after three rejected answers, FAILED with none after aborts), so both ask the same two questions in the same order.
+Salvage applies to what the row already earned as `_salvage_or_fail` applies it after a scored failure: a stage the provider will not run costs the item what that stage would have added, not what earlier stages validated. The two paths had diverged on `instrument_ie` (PARTIAL with mentions after three rejected answers, FAILED with none after aborts), so both ask the same two questions in the same order. One difference remains: an `instrument_ie` salvage here finishes PARTIAL without lineage and needs at least one mention, where `_salvage_or_fail` advances the row to `instrument_relation`.
 
 The note names both causes when there are two. `count_content_filter_aborts` is a per-stage lifetime count with no reset, deliberately (it bounds the damage one item can do and survives a process exit), so the aborts need not have been consecutive. `summarize_failure` prefers salvage notes over `validation_errors`, so a note claiming "no attempt was scored" on a row that was also answered badly would hide the model's actual error from the registry and send an operator to the vendor.
 
@@ -131,7 +131,7 @@ A three-valued disclosure replaces a boolean that was true for two different rea
 
 ### `party_payloads_and_disclosure`
 
-The model labels every cluster, and the labels persist rather than only steering what to drop (#150). The borrower's identity matters exactly when a subsidiary is the obligor under the parent filer's 8-K. The collective distinction is elicited only for lenders.
+The model labels every cluster, and the labels persist rather than only steering what to drop (#150). The borrower's identity matters exactly when a subsidiary is the obligor under the parent filer's 8-K. The model gives a `kind` for every party and the code keeps it, but only lender kinds feed `lender_disclosure`.
 
 ### `canonical_instrument_name`
 
