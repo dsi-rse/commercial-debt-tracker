@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+from support import FakeModel
 
 from cdt.classifier import core as classifier_core
 from cdt.datasets import GENRE_6K, GENRE_8K
@@ -27,15 +28,6 @@ from cdt.storage.tables import read_dataset, read_table, write_partition_table
 EXPECTED_SIXK_SNIPPETS = 2
 #: Two seeded 8-K items plus the one 6-K snippet the union brings in.
 EXPECTED_UNIONED_ITEM_ROWS = 3
-
-
-class FakeModel:
-    """Classifier stub returning one relevant score."""
-
-    def decision_function(self: FakeModel, texts: list[str]) -> list[float]:
-        """Return a strong-positive score for the seeded test document."""
-        del texts
-        return [2.0]
 
 
 def test_resolve_mode_dates_daily_requires_both_dates() -> None:
