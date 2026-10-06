@@ -143,7 +143,7 @@ The alternative must actually name an obligation (`INSTRUMENT_NOUN_PATTERN`): pr
 
 ### `DERIVED_FROM_*`
 
-Downstream consumers key on the provenance marker: the matcher treats a name-synthesized `YYYY-12-31` maturity as year-resolution only (#128), and the site can explain a value whose evidence list is empty. `scaled` is a separate marker from `computed`, which means arithmetic over addends and is consumed as such on the maturity side (`DERIVED_MATURITY_KINDS` in `matcher/core.py`); `src/` has no amount-side consumer of `derived_from`, so a new value costs nothing and records more honestly how the figure was reached. `inherited` marks a term carried onto a synthesized predecessor because the filing marked no `prior` value for that kind.
+Downstream consumers key on the provenance marker: the matcher treats a name-synthesized `YYYY-12-31` maturity as year-resolution only (#128), and the site can explain a value whose evidence list is empty. `scaled` is a separate marker from `computed`, which means arithmetic over addends and is consumed as such on the maturity side (`DERIVED_MATURITY_KINDS` in `matcher/normalize.py`); `src/` has no amount-side consumer of `derived_from`, so a new value costs nothing and records more honestly how the figure was reached. `inherited` marks a term carried onto a synthesized predecessor because the filing marked no `prior` value for that kind.
 
 ### `RATE_SUFFIX_PATTERN`
 

@@ -71,17 +71,15 @@ from cdt.matcher import (
     match_pending_mentions,
     mention_cluster_edges_root,
 )
-from cdt.matcher.core import (
+from cdt.matcher.instruments import company_names_by_cik
+from cdt.matcher.lineage_inference import apply_lineage_inference_pass
+from cdt.matcher.normalize import coerce_optional_text, lender_signature
+from cdt.matcher.schema import (
     DEBT_INSTRUMENT_COLUMNS,
     MATCHER_SCHEMA_VERSION,
     MENTION_CLUSTER_EDGE_COLUMNS,
-    _stale_schema_forces_rematch,
-    apply_lineage_inference_pass,
-    coerce_optional_text,
-    company_names_by_cik,
-    lender_signature,
-    match_tables,
 )
+from cdt.matcher.stage import _stale_schema_forces_rematch, match_tables
 from cdt.pipeline import normalize_snapshot_text
 from cdt.storage import (
     apply_declared_column_types,
@@ -1794,7 +1792,7 @@ def test_party_dedupe_trusts_the_extractors_canonical_name() -> None:
     `eqt` before choosing the longest text, so its own `Buyer Parent` alias won
     and the two clusters below stayed apart as two lenders (#203).
     """
-    from cdt.matcher.core import dedupe_party_clusters
+    from cdt.matcher.normalize import dedupe_party_clusters
 
     named_with_alias = {
         "role": "lender",
@@ -4326,7 +4324,7 @@ def test_prepare_mention_reads_an_absent_json_column_as_an_empty_payload() -> No
     erroring. That makes them invisible, which is why they are pinned here
     rather than left to the integration test above.
     """
-    from cdt.matcher.core import prepare_mention
+    from cdt.matcher.normalize import prepare_mention
 
     row = build_mention_row(
         mention_id="m-1",
@@ -7326,7 +7324,8 @@ def test_interest_rate_validation_rejects_bad_kind_and_evidence() -> None:
 
 def test_canonical_fields_record_their_source_mention() -> None:
     """Each canonical value points at the mention it came from (#151)."""
-    from cdt.matcher.core import build_debt_instrument_rows, prepare_mention
+    from cdt.matcher.instruments import build_debt_instrument_rows
+    from cdt.matcher.normalize import prepare_mention
 
     older = prepare_mention(
         build_mention_row(
@@ -7369,7 +7368,8 @@ def test_canonical_fields_record_their_source_mention() -> None:
 
 def test_lifecycle_rollup_marks_heads_and_families() -> None:
     """Amendment chains get superseded/head markers and families (#155)."""
-    from cdt.matcher.core import apply_lifecycle_rollup, prepare_mention
+    from cdt.matcher.instruments import apply_lifecycle_rollup
+    from cdt.matcher.normalize import prepare_mention
 
     predecessor = prepare_mention(
         build_mention_row(
@@ -7430,7 +7430,8 @@ def test_canonical_maturity_prefers_stated_over_name_derived() -> None:
     """A newer `due 2030` synthetic never outranks an older stated maturity (#162)."""
     import json as _json
 
-    from cdt.matcher.core import build_debt_instrument_rows, prepare_mention
+    from cdt.matcher.instruments import build_debt_instrument_rows
+    from cdt.matcher.normalize import prepare_mention
 
     closing = prepare_mention(
         build_mention_row(
@@ -7659,7 +7660,9 @@ def test_tenor_parsing_and_date_arithmetic() -> None:
 
 def test_resolve_candidates_attaches_on_name_only_tie_instead_of_seeding() -> None:
     """A mention tying two clusters on its name joins the exact-name one."""
-    from cdt.matcher.core import CandidateScore, prepare_mention, resolve_candidates
+    from cdt.matcher.normalize import prepare_mention
+    from cdt.matcher.schema import CandidateScore
+    from cdt.matcher.scoring import resolve_candidates
 
     mention = prepare_mention(
         build_mention_row(
@@ -8175,7 +8178,7 @@ def test_entry_without_parties_names_no_lender() -> None:
 
 def test_aggregate_lender_disclosure_precedence() -> None:
     """Worst-of across an instrument's mentions, `complete` beating `none_named`."""
-    from cdt.matcher.core import aggregate_lender_disclosure
+    from cdt.matcher.normalize import aggregate_lender_disclosure
 
     assert aggregate_lender_disclosure(["complete", "none_named"]) == "complete"
     assert (
@@ -9018,7 +9021,8 @@ def test_published_evidence_spans_index_the_item_text_exactly() -> None:
 
 def test_instrument_rollup_publishes_balance_and_rate_columns() -> None:
     """The seven #140/#157 instrument columns had no test at all."""
-    from cdt.matcher.core import build_debt_instrument_rows, prepare_mention
+    from cdt.matcher.instruments import build_debt_instrument_rows
+    from cdt.matcher.normalize import prepare_mention
 
     older = prepare_mention(
         build_mention_row(
@@ -9074,7 +9078,8 @@ def test_outstanding_balance_as_of_flag_tells_stated_from_substituted() -> None:
     the filing stated. It has to survive an incremental rematch too, or the
     first run to see no new balance would silently drop it.
     """
-    from cdt.matcher.core import build_debt_instrument_rows, prepare_mention
+    from cdt.matcher.instruments import build_debt_instrument_rows
+    from cdt.matcher.normalize import prepare_mention
 
     def balance_mention(mention_id: str, as_of_date: str | None) -> object:
         return prepare_mention(
@@ -9167,7 +9172,7 @@ def _rollup_row(row_id: str, **overrides: object) -> dict[str, object]:
 
 def test_lineage_family_id_is_the_lowest_member_id_not_merely_shared() -> None:
     """Asserting only that a family is *shared* let `min` become `max`."""
-    from cdt.matcher.core import apply_lifecycle_rollup
+    from cdt.matcher.instruments import apply_lifecycle_rollup
 
     rows = [
         _rollup_row("zzz-parent"),
@@ -9181,7 +9186,7 @@ def test_lineage_family_id_is_the_lowest_member_id_not_merely_shared() -> None:
 
 def test_lineage_families_span_retirement_and_split_pointers() -> None:
     """Only amendment edges were exercised, so dropping the other two passed."""
-    from cdt.matcher.core import apply_lifecycle_rollup
+    from cdt.matcher.instruments import apply_lifecycle_rollup
 
     retired = _rollup_row(
         "b-retired", retired_by_debt_instrument_ids=json.dumps(["a-retirer"])
@@ -9202,7 +9207,7 @@ def test_lineage_families_span_retirement_and_split_pointers() -> None:
 
 def test_two_amendment_children_publish_no_superseded_pointer() -> None:
     """An ambiguous inverse publishes nothing, as the parent pointers do."""
-    from cdt.matcher.core import apply_lifecycle_rollup
+    from cdt.matcher.instruments import apply_lifecycle_rollup
 
     parent = _rollup_row("p")
     rows = [
@@ -9219,7 +9224,8 @@ def test_two_amendment_children_publish_no_superseded_pointer() -> None:
 
 def test_first_and_last_seen_span_distinct_filing_dates() -> None:
     """Both fixture mentions shared a date, so a swap was invisible."""
-    from cdt.matcher.core import apply_lifecycle_rollup, prepare_mention
+    from cdt.matcher.instruments import apply_lifecycle_rollup
+    from cdt.matcher.normalize import prepare_mention
 
     def mention(mention_id: str, accession: str, date: str) -> object:
         return prepare_mention(
