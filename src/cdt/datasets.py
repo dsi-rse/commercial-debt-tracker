@@ -1,4 +1,4 @@
-"""Dataset paths, partition naming and shard assignment for CDT pipelines.
+"""Dataset paths, partition naming, shard assignment and filing genres.
 
 Prefixes are named ``*_root`` and single objects ``*_path``.
 """
@@ -319,3 +319,9 @@ def zlib_crc32(value: str) -> int:
     from zlib import crc32
 
     return int(crc32(value.encode("utf-8")))
+
+
+#: Filing genres: 8-K runs ingest → itemize → classify, 6-K runs ingest →
+#: triage; both converge at extract.
+GENRE_8K = "8-K"
+GENRE_6K = "6-K"

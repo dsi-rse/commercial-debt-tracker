@@ -91,7 +91,7 @@ from cdt.matcher.schema import (
     MENTION_CLUSTER_EDGE_COLUMNS,
 )
 from cdt.matcher.stage import _stale_schema_forces_rematch, match_tables
-from cdt.pipeline import normalize_snapshot_text
+from cdt.publish import normalize_snapshot_text
 from cdt.storage import (
     apply_declared_column_types,
     artifact_exists,

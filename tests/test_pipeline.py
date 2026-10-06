@@ -10,14 +10,13 @@ import pandas as pd
 import pytest
 
 from cdt.classifier import core as classifier_core
+from cdt.datasets import GENRE_6K, GENRE_8K
 from cdt.extractor.state import ExtractionRowState
 from cdt.ingest import IngestRunResult
 from cdt.matcher import debt_instruments_root, mention_cluster_edges_root
 from cdt.pipeline import (
     ALL_TIME_START_DATE,
     DEFAULT_GENRES,
-    GENRE_6K,
-    GENRE_8K,
     PipelineConfig,
     normalize_genres,
     resolve_mode_dates,
@@ -570,7 +569,7 @@ This is the extracted event text.
 
 def _seed_final_tables(artifact_root: Path, *, rows: int = 2) -> None:
     """Write minimal rows into every dataset finalize publishes."""
-    from cdt.pipeline import FINAL_OUTPUT_TABLES
+    from cdt.publish import FINAL_OUTPUT_TABLES
 
     for table_name, dataset_root_fns in FINAL_OUTPUT_TABLES.items():
         # The first dataset only. `items` unions a second one, and these tests
@@ -629,6 +628,7 @@ def test_match_and_finalize_runs_the_lineage_pass_after_every_match(
     like the phases around it (#89).
     """
     from cdt import pipeline as pipeline_module
+    from cdt import publish as publish_module
 
     calls: list[dict[str, object]] = []
     renewals: list[int] = []
@@ -637,7 +637,7 @@ def test_match_and_finalize_runs_the_lineage_pass_after_every_match(
         calls.append({"artifact_root": str(artifact_root), **kwargs})
         return {"links": 0, "reopened": 0, "heads_before": 0, "heads_after": 0}
 
-    monkeypatch.setattr(pipeline_module, "apply_lineage_inference_pass", fake_pass)
+    monkeypatch.setattr(publish_module, "apply_lineage_inference_pass", fake_pass)
 
     empty_root = tmp_path / "empty"
     pipeline_module.run_match_and_finalize(
@@ -675,7 +675,7 @@ def test_published_items_union_both_genres_so_every_mention_can_join(
     empty, so the instrument renders with no text and no link.
     """
     from cdt.itemizer.core import ITEM_COLUMNS
-    from cdt.pipeline import write_final_output_tables
+    from cdt.publish import write_final_output_tables
     from cdt.sixk.stage import SIXK_SNIPPET_COLUMNS, sixk_snippets_root
 
     artifact_root = tmp_path / "artifacts"
@@ -733,7 +733,7 @@ def test_published_items_union_both_genres_so_every_mention_can_join(
 
 def test_final_snapshots_publish_atomically_with_pointer(tmp_path: Path) -> None:
     """Finalize writes immutable snapshots and one atomic latest.json pointer (#91)."""
-    from cdt.pipeline import write_final_output_tables
+    from cdt.publish import write_final_output_tables
     from cdt.storage import read_json_artifact
 
     artifact_root = tmp_path / "artifacts"
@@ -764,7 +764,7 @@ def test_final_snapshots_publish_atomically_with_pointer(tmp_path: Path) -> None
 
 def test_final_snapshot_guard_blocks_shrinkage_unless_forced(tmp_path: Path) -> None:
     """A snapshot that would clobber a good one with ~nothing is refused (#91)."""
-    from cdt.pipeline import write_final_output_tables
+    from cdt.publish import write_final_output_tables
 
     artifact_root = tmp_path / "artifacts"
     empty_root = tmp_path / "empty-artifacts"
@@ -794,7 +794,7 @@ def test_final_snapshot_guard_blocks_shrinkage_unless_forced(tmp_path: Path) -> 
 
 def test_old_final_snapshots_are_pruned(tmp_path: Path) -> None:
     """Only the current and prior snapshot generations are kept (#91)."""
-    from cdt.pipeline import write_final_output_tables
+    from cdt.publish import write_final_output_tables
 
     artifact_root = tmp_path / "artifacts"
     final_root = tmp_path / "final"
@@ -901,14 +901,14 @@ def test_run_pipeline_runs_the_lineage_pass_between_match_and_publish(
     backend would have fixed. The guard matches `run_match_and_finalize`'s:
     nothing matched means three empty datasets read to write none.
     """
-    from cdt import pipeline as pipeline_module
+    from cdt import publish as publish_module
 
     cik_file = tmp_path / "ciks.txt"
     cik_file.write_text("320193\n", encoding="utf-8")
     calls: list[dict[str, object]] = []
     _stage_stubs(monkeypatch, tmp_path, instruments=instruments)
     monkeypatch.setattr(
-        pipeline_module,
+        publish_module,
         "apply_lineage_inference_pass",
         lambda artifact_root, **kwargs: (
             calls.append({"artifact_root": str(artifact_root), **kwargs}),
@@ -942,7 +942,7 @@ def _publish_all_four(final_root: Path) -> None:
     exactly these four objects, and seeding the *artifact* datasets with
     placeholder rows would hand the matcher mention rows it cannot parse.
     """
-    from cdt.pipeline import FINAL_OUTPUT_TABLES
+    from cdt.publish import FINAL_OUTPUT_TABLES
     from cdt.storage import write_table
 
     for table_name in FINAL_OUTPUT_TABLES:
@@ -960,7 +960,7 @@ def _record_published_generation(artifact_root: Path, final_root: Path) -> None:
     changed since the last publish" needs both halves seeded. Call this
     *after* the sources are in place and before changing them.
     """
-    from cdt.pipeline import (
+    from cdt.publish import (
         PUBLISH_SOURCE_DIGEST_KEY,
         final_pointer_path,
         publish_source_digest,
@@ -989,6 +989,7 @@ def test_match_and_finalize_skips_the_publish_when_no_source_partition_changed(
     at least twice.
     """
     from cdt import pipeline as pipeline_module
+    from cdt import publish as publish_module
 
     artifact_root = tmp_path / "artifacts"
     final_root = tmp_path / "final"
@@ -996,7 +997,7 @@ def test_match_and_finalize_skips_the_publish_when_no_source_partition_changed(
 
     published: list[object] = []
     monkeypatch.setattr(
-        pipeline_module,
+        publish_module,
         "write_final_output_tables",
         lambda **kwargs: published.append(kwargs) or {},
     )
@@ -1022,9 +1023,10 @@ def test_the_gate_fires_on_a_corpus_that_already_has_instruments(
     instruments and changed nothing, and must still skip.
     """
     from cdt import pipeline as pipeline_module
+    from cdt import publish as publish_module
 
     monkeypatch.setattr(
-        pipeline_module, "apply_lineage_inference_pass", lambda *a, **k: {}
+        publish_module, "apply_lineage_inference_pass", lambda *a, **k: {}
     )
     artifact_root = tmp_path / "artifacts"
     final_root = tmp_path / "final"
@@ -1044,7 +1046,7 @@ def test_the_gate_fires_on_a_corpus_that_already_has_instruments(
 
     published: list[object] = []
     monkeypatch.setattr(
-        pipeline_module,
+        publish_module,
         "write_final_output_tables",
         lambda **kwargs: published.append(kwargs) or {},
     )
@@ -1069,6 +1071,7 @@ def test_new_items_publish_even_though_match_produced_no_instruments(
     stale with nothing to warn about and nothing to repair it.
     """
     from cdt import pipeline as pipeline_module
+    from cdt import publish as publish_module
 
     artifact_root = tmp_path / "artifacts"
     final_root = tmp_path / "final"
@@ -1081,7 +1084,7 @@ def test_new_items_publish_even_though_match_produced_no_instruments(
 
     published: list[object] = []
     monkeypatch.setattr(
-        pipeline_module,
+        publish_module,
         "write_final_output_tables",
         lambda **kwargs: published.append(kwargs) or {},
     )
@@ -1104,7 +1107,7 @@ def test_a_real_publish_records_the_digest_the_next_run_gates_on(
     always-false guard this replaced. So this publishes for real, then asks the
     gate, then changes a source and asks again.
     """
-    from cdt.pipeline import (
+    from cdt.publish import (
         PUBLISH_SOURCE_DIGEST_KEY,
         final_pointer_path,
         publish_would_republish_nothing,
@@ -1148,7 +1151,7 @@ def test_a_pointer_with_no_recorded_digest_publishes(tmp_path: Path) -> None:
     answer is "unknown" and the publish goes ahead, which records a digest for
     next time.
     """
-    from cdt.pipeline import final_pointer_path, publish_would_republish_nothing
+    from cdt.publish import final_pointer_path, publish_would_republish_nothing
     from cdt.storage import write_json_artifact
 
     artifact_root = tmp_path / "artifacts"
@@ -1176,6 +1179,7 @@ def test_force_publishes_even_when_nothing_changed(
     ``force`` is the pipeline-wide flag and also disables the shrinkage guard.
     """
     from cdt import pipeline as pipeline_module
+    from cdt import publish as publish_module
 
     artifact_root = tmp_path / "artifacts"
     final_root = tmp_path / "final"
@@ -1183,7 +1187,7 @@ def test_force_publishes_even_when_nothing_changed(
 
     published: list[object] = []
     monkeypatch.setattr(
-        pipeline_module,
+        publish_module,
         "write_final_output_tables",
         lambda **kwargs: published.append(kwargs) or {},
     )
@@ -1207,12 +1211,13 @@ def test_an_unpublished_database_root_publishes_despite_unchanged_sources(
     --force.
     """
     from cdt import pipeline as pipeline_module
+    from cdt import publish as publish_module
 
     artifact_root = tmp_path / "artifacts"
 
     published: list[object] = []
     monkeypatch.setattr(
-        pipeline_module,
+        publish_module,
         "write_final_output_tables",
         lambda **kwargs: published.append(kwargs) or {},
     )
@@ -1231,7 +1236,7 @@ def test_a_partially_published_database_root_publishes(tmp_path: Path) -> None:
     The digest matches here, so the missing fourth object is the only reason
     left to publish — which is what this pins.
     """
-    from cdt.pipeline import (
+    from cdt.publish import (
         FINAL_OUTPUT_TABLES,
         PUBLISH_SOURCE_DIGEST_KEY,
         final_pointer_path,
@@ -1272,13 +1277,13 @@ def test_no_final_database_root_skips_without_listing_anything(
     reads anything in that case, so the gate answers the same and should not
     pay a listing to find out.
     """
-    from cdt import pipeline as pipeline_module
-    from cdt.pipeline import publish_would_republish_nothing
+    from cdt import publish as publish_module
+    from cdt.publish import publish_would_republish_nothing
 
     def _explode(*args: object, **kwargs: object) -> str:
         raise AssertionError("no publish target means nothing needs listing")
 
-    monkeypatch.setattr(pipeline_module, "publish_source_digest", _explode)
+    monkeypatch.setattr(publish_module, "publish_source_digest", _explode)
 
     assert publish_would_republish_nothing(
         artifact_root=str(tmp_path / "artifacts"),
@@ -1295,7 +1300,7 @@ def test_the_publish_gate_leaves_the_live_tables_untouched(tmp_path: Path) -> No
     are the only proof that nothing ran.
     """
     from cdt import pipeline as pipeline_module
-    from cdt.pipeline import FINAL_OUTPUT_TABLES
+    from cdt.publish import FINAL_OUTPUT_TABLES
 
     artifact_root = tmp_path / "artifacts"
     final_root = tmp_path / "final"
@@ -1322,7 +1327,7 @@ def test_normalize_snapshot_text_is_not_the_publish_cost(tmp_path: Path) -> None
     placeholders, which is the behaviour the dashboard depends on.
     """
     del tmp_path
-    from cdt.pipeline import normalize_snapshot_text
+    from cdt.publish import normalize_snapshot_text
 
     normalized = normalize_snapshot_text(
         pd.DataFrame([{"a": "nan", "b": "real", "c": True}])
@@ -1353,7 +1358,7 @@ def test_run_pipeline_skips_the_publish_when_nothing_changed(
     `cdt-orchestrator --extractor-backend live`, which is the shape #170 took
     when the lineage pass was wired into one path and not the others.
     """
-    from cdt import pipeline as pipeline_module
+    from cdt import publish as publish_module
 
     cik_file = tmp_path / "ciks.txt"
     cik_file.write_text("320193\n", encoding="utf-8")
@@ -1363,7 +1368,7 @@ def test_run_pipeline_skips_the_publish_when_nothing_changed(
         instruments=pd.DataFrame([{"debt_instrument_id": "instrument-1"}]),
     )
     monkeypatch.setattr(
-        pipeline_module, "apply_lineage_inference_pass", lambda *a, **k: {}
+        publish_module, "apply_lineage_inference_pass", lambda *a, **k: {}
     )
     artifact_root = tmp_path / "artifacts"
     final_root = tmp_path / "final"
@@ -1377,7 +1382,7 @@ def test_run_pipeline_skips_the_publish_when_nothing_changed(
 
     published: list[object] = []
     monkeypatch.setattr(
-        pipeline_module,
+        publish_module,
         "write_final_output_tables",
         lambda **kwargs: published.append(kwargs) or {},
     )

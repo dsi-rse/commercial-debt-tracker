@@ -7,8 +7,8 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from cdt import pipeline as pipeline_module
-from cdt.pipeline import (
+from cdt import publish as publish_module
+from cdt.publish import (
     FINAL_OUTPUT_TABLES,
     PUBLISH_SOURCE_DIGEST_KEY,
     final_pointer_path,
@@ -71,7 +71,7 @@ def test_a_publish_interrupted_after_the_pointer_publishes_again(
     assert _skips(artifact_root, final_root)
 
     _items(artifact_root, "item-2")
-    real_write_table = pipeline_module.write_table
+    real_write_table = publish_module.write_table
 
     def dies_on_the_database_root(path: object, table: pd.DataFrame) -> str:
         if str(path).startswith(str(final_root)):
@@ -79,12 +79,12 @@ def test_a_publish_interrupted_after_the_pointer_publishes_again(
             raise RuntimeError(msg)
         return real_write_table(path, table)
 
-    monkeypatch.setattr(pipeline_module, "write_table", dies_on_the_database_root)
+    monkeypatch.setattr(publish_module, "write_table", dies_on_the_database_root)
     with pytest.raises(RuntimeError, match="simulated crash"):
         write_final_output_tables(
             artifact_root=str(artifact_root), final_database_root=str(final_root)
         )
-    monkeypatch.setattr(pipeline_module, "write_table", real_write_table)
+    monkeypatch.setattr(publish_module, "write_table", real_write_table)
 
     pointer = read_json_artifact(final_pointer_path(str(artifact_root)))
     assert not pointer.get(PUBLISH_SOURCE_DIGEST_KEY)
@@ -110,7 +110,7 @@ def test_a_source_written_while_the_publish_reads_is_not_recorded_as_published(
     artifact_root = tmp_path / "artifacts"
     final_root = tmp_path / "final"
     _items(artifact_root)
-    real_read_dataset = pipeline_module.read_dataset
+    real_read_dataset = publish_module.read_dataset
     writes: list[str] = []
 
     def a_writer_lands_mid_read(*args: object, **kwargs: object) -> pd.DataFrame:
@@ -123,7 +123,7 @@ def test_a_source_written_while_the_publish_reads_is_not_recorded_as_published(
             )
         return real_read_dataset(*args, **kwargs)
 
-    monkeypatch.setattr(pipeline_module, "read_dataset", a_writer_lands_mid_read)
+    monkeypatch.setattr(publish_module, "read_dataset", a_writer_lands_mid_read)
     write_final_output_tables(
         artifact_root=str(artifact_root), final_database_root=str(final_root)
     )
@@ -152,9 +152,7 @@ def test_a_publisher_change_moves_the_digest_without_any_source_moving(
     )
     assert _skips(artifact_root, final_root)
 
-    monkeypatch.setattr(
-        pipeline_module, constant, getattr(pipeline_module, constant) + 1
-    )
+    monkeypatch.setattr(publish_module, constant, getattr(publish_module, constant) + 1)
 
     assert not _skips(artifact_root, final_root)
 
@@ -170,7 +168,7 @@ def test_rerouting_a_table_to_another_root_moves_the_digest(
         rerouted["debt-instruments"],
         rerouted["items"],
     )
-    monkeypatch.setattr(pipeline_module, "FINAL_OUTPUT_TABLES", rerouted)
+    monkeypatch.setattr(publish_module, "FINAL_OUTPUT_TABLES", rerouted)
 
     assert publish_source_digest(str(artifact_root)) != before
 

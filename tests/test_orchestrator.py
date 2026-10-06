@@ -10,9 +10,10 @@ from pathlib import Path
 import pytest
 
 import cdt.orchestrator as orch
+from cdt.datasets import GENRE_6K, GENRE_8K
 from cdt.extractor import ExtractTickResult
 from cdt.lease import acquire_lease
-from cdt.pipeline import DEFAULT_GENRES, GENRE_6K, GENRE_8K
+from cdt.pipeline import DEFAULT_GENRES
 
 
 def test_poll_finalizes_on_completion(
