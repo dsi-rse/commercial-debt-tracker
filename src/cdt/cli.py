@@ -48,7 +48,7 @@ from cdt.ingest.core import (
     IngestConfig,
     documents_root,
 )
-from cdt.ingest.eightk import acquire_eightk_documents
+from cdt.ingest.genres import ingest_genre
 from cdt.ingest.mirror import mirror_root
 from cdt.ingest.sixk import acquire_scraped_sixk_documents
 from cdt.lease import (
@@ -153,9 +153,19 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     ingest_parser = subparsers.add_parser(
-        "ingest", help="Index 8-K submission resources for CIKs."
+        "ingest", help="Acquire every selected genre's filings for CIKs."
     )
     add_artifact_root_argument(ingest_parser)
+    ingest_parser.add_argument(
+        "--genres",
+        type=normalize_genres,
+        default=DEFAULT_GENRES,
+        help=(
+            "comma-separated filing genres to acquire (default "
+            f"{','.join(DEFAULT_GENRES)}). Each genre goes to its own "
+            "documents dataset."
+        ),
+    )
     ingest_parser.add_argument("--bucket", default=DEFAULT_BUCKET)
     ingest_parser.add_argument("--force", action="store_true")
     ingest_parser.add_argument(
@@ -168,8 +178,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_logging_arguments(ingest_parser, noun="ingest")
     ingest_subparsers = ingest_parser.add_subparsers(dest="ingest_mode", required=True)
     for mode_name, help_text in (
-        ("daily", "Index 8-K filings from a daily date window."),
-        ("historical", "Index 8-K filings from the historical scraper archive."),
+        ("daily", "Acquire filings from a daily date window."),
+        ("historical", "Acquire filings from the historical scraper archive."),
     ):
         subparser = ingest_subparsers.add_parser(mode_name, help=help_text)
         subparser.add_argument(
@@ -512,7 +522,10 @@ def run_ingest(args: argparse.Namespace) -> int:
             config.batch_size,
             config.output_root,
         )
-        _, result = acquire_eightk_documents(config, ciks=read_cik_file(args.cik_file))
+        ciks = read_cik_file(args.cik_file)
+        results = [
+            (genre, ingest_genre(genre, config, ciks=ciks)[1]) for genre in args.genres
+        ]
     except ValueError as exc:
         logger.error("Invalid ingest arguments: %s", exc)
         return 2
@@ -521,13 +534,17 @@ def run_ingest(args: argparse.Namespace) -> int:
         return 1
     finally:
         release_lease(lease)
-    print(
-        f"Indexed {result.total_rows} document rows from {result.start_date} through {result.end_date}."
-    )
-    print(f"Output root: {result.output_root}.")
-    print(f"Documents dataset: {result.documents_root}.")
-    print(f"Run manifest: {result.run_manifest}.")
-    print(f"Failure registry: {result.failure_file}.")
+    for genre, result in results:
+        print(
+            f"{genre}: indexed {result.total_rows} document rows from "
+            f"{result.start_date} through {result.end_date}."
+        )
+        print(f"  Documents dataset: {result.documents_root}.")
+        print(f"  Run manifest: {result.run_manifest}.")
+        if result.failures:
+            print(f"  Filings that could not be acquired: {result.failures}.")
+    print(f"Output root: {results[0][1].output_root}.")
+    print(f"Failure registry: {results[0][1].failure_file}.")
     return 0
 
 

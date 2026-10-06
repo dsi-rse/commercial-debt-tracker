@@ -72,3 +72,29 @@ def test_normalize_genres_orders_by_the_registry_and_rejects_unknowns() -> None:
         normalize_genres("8-K,10-Q")
     with pytest.raises(ValueError, match="no genres selected"):
         normalize_genres(" , ")
+
+
+def test_every_registered_genre_has_an_ingester_and_a_narrowed_config(
+    tmp_path: Path,
+) -> None:
+    """``genre_config`` gives each genre its forms and dataset; unknowns fail."""
+    from datetime import date
+
+    from cdt.ingest.core import IngestConfig
+    from cdt.ingest.genres import genre_config, ingest_genre
+
+    config = IngestConfig(
+        mode="historical",
+        bucket="b",
+        cik_file=tmp_path / "ciks.txt",
+        start_date=date(2024, 1, 1),
+        end_date=date(2024, 1, 2),
+        download=True,
+    )
+    for name, genre in GENRES.items():
+        narrowed = genre_config(config, name)
+        assert narrowed.form_types == genre.form_types
+        assert narrowed.dataset_name == genre.document_dataset
+        assert narrowed.download is genre.inlines_bodies
+    with pytest.raises(KeyError):
+        ingest_genre("10-Q", config)

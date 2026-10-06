@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import Self
@@ -18,8 +18,6 @@ from cdt.datasets import (
     GENRE_6K,
     GENRE_8K,
     GENRES,
-    SIXK_DOCUMENT_DATASET_NAME,
-    SIXK_FORM_TYPES,
     failure_registry_path,
     resolve_artifact_root,
 )
@@ -38,8 +36,7 @@ from cdt.ingest.core import (
     IngestRunResult,
 )
 from cdt.ingest.core import DEFAULT_BATCH_SIZE as DEFAULT_INGEST_BATCH_SIZE
-from cdt.ingest.eightk import acquire_eightk_documents
-from cdt.ingest.sixk import acquire_scraped_sixk_documents
+from cdt.ingest.genres import ingest_genre
 from cdt.matcher import (
     DEFAULT_AMBIGUITY_MARGIN,
     DEFAULT_MEMBERSHIP_THRESHOLD,
@@ -102,7 +99,6 @@ class PipelineConfig:
     genres: tuple[str, ...] = (GENRE_8K,)
     #: CIKs for the 6-K genre; None means `cik_file`.
     sixk_cik_file: ArtifactPath | None = None
-    sixk_form_types: tuple[str, ...] = SIXK_FORM_TYPES
     sixk_batch_size: int = DEFAULT_STAGE_BATCH_SIZE
     sixk_concurrency: int = SIXK_DEFAULT_CONCURRENCY
 
@@ -200,6 +196,34 @@ class PipelineOrchestrator:
         self._log_config(resolved_start, resolved_end)
         return resolved_start, resolved_end, ciks, resolved_artifact_root
 
+    def _ingest_config(
+        self: Self,
+        resolved_start: date,
+        resolved_end: date,
+        resolved_artifact_root: str,
+    ) -> IngestConfig:
+        """Return this run's ingest settings; ``ingest_genre`` narrows them per genre."""
+        return IngestConfig(
+            mode=self.config.mode,
+            bucket=self.config.bucket,
+            cik_file=Path(str(self.config.cik_file)),
+            start_date=resolved_start,
+            end_date=resolved_end,
+            data_dir=self.config.data_dir,
+            output_root=resolved_artifact_root,
+            force=self.config.force,
+            batch_size=self.config.ingest_batch_size,
+            download=self.config.download,
+            failure_file=self.config.failure_file
+            or failure_registry_path(
+                "ingest",
+                artifact_root=resolved_artifact_root,
+                data_dir=self.config.data_dir,
+            ),
+            aws_profile=self.config.aws_profile,
+            s3_prefix=self.config.s3_prefix,
+        )
+
     def _renew(self: Self, renew: Callable[[], None] | None) -> None:
         """Extend the caller's writer lease at a stage boundary; no-op if None.
 
@@ -291,35 +315,17 @@ class PipelineOrchestrator:
         self._log_stage_start(
             "ingest-sixk",
             batch_size=self.config.ingest_batch_size,
-            forms=",".join(self.config.sixk_form_types),
+            forms=",".join(GENRES[GENRE_6K].form_types),
             ciks=len(sixk_ciks),
         )
-        _, sixk_ingest = acquire_scraped_sixk_documents(
-            IngestConfig(
-                mode=self.config.mode,
-                bucket=self.config.bucket,
-                cik_file=Path(str(self.config.sixk_cik_file or self.config.cik_file)),
-                start_date=resolved_start,
-                end_date=resolved_end,
-                data_dir=self.config.data_dir,
-                output_root=resolved_artifact_root,
-                force=self.config.force,
-                batch_size=self.config.ingest_batch_size,
-                # Never `download`: a 6-K row points at the mirrored
-                # submission; inlining bodies makes every read pay for them.
-                failure_file=self.config.failure_file
-                or failure_registry_path(
-                    "ingest",
-                    artifact_root=resolved_artifact_root,
-                    data_dir=self.config.data_dir,
-                ),
-                aws_profile=self.config.aws_profile,
-                s3_prefix=self.config.s3_prefix,
-                form_types=self.config.sixk_form_types,
-                dataset_name=SIXK_DOCUMENT_DATASET_NAME,
-            ),
-            ciks=sixk_ciks,
+        sixk_config = self._ingest_config(
+            resolved_start, resolved_end, resolved_artifact_root
         )
+        if self.config.sixk_cik_file:
+            sixk_config = replace(
+                sixk_config, cik_file=Path(str(self.config.sixk_cik_file))
+            )
+        _, sixk_ingest = ingest_genre(GENRE_6K, sixk_config, ciks=sixk_ciks)
         self._log_stage_complete(
             "ingest-sixk",
             rows=sixk_ingest.total_rows,
@@ -359,27 +365,9 @@ class PipelineOrchestrator:
             batch_size=self.config.ingest_batch_size,
             download=self.config.download,
         )
-        ingest_table, ingest_result = acquire_eightk_documents(
-            IngestConfig(
-                mode=self.config.mode,
-                bucket=self.config.bucket,
-                cik_file=Path(str(self.config.cik_file)),
-                start_date=resolved_start,
-                end_date=resolved_end,
-                data_dir=self.config.data_dir,
-                output_root=resolved_artifact_root,
-                force=self.config.force,
-                batch_size=self.config.ingest_batch_size,
-                download=self.config.download,
-                failure_file=self.config.failure_file
-                or failure_registry_path(
-                    "ingest",
-                    artifact_root=resolved_artifact_root,
-                    data_dir=self.config.data_dir,
-                ),
-                aws_profile=self.config.aws_profile,
-                s3_prefix=self.config.s3_prefix,
-            ),
+        ingest_table, ingest_result = ingest_genre(
+            GENRE_8K,
+            self._ingest_config(resolved_start, resolved_end, resolved_artifact_root),
             ciks=ciks,
         )
         del ingest_table

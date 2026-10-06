@@ -57,6 +57,7 @@ def test_run_pipeline_uses_stage_backed_functions(
         *,
         ciks: set[str] | None = None,
         s3_client: object | None = None,
+        return_documents: bool = False,
     ) -> tuple[pd.DataFrame, IngestRunResult]:
         del s3_client
         calls.append(("ingest", ciks))
@@ -92,6 +93,7 @@ def test_run_pipeline_uses_stage_backed_functions(
         *,
         ciks: set[str] | None = None,
         s3_client: object | None = None,
+        return_documents: bool = False,
     ) -> tuple[pd.DataFrame, IngestRunResult]:
         del s3_client
         calls.append(("ingest-sixk", ciks))
@@ -131,7 +133,7 @@ def test_run_pipeline_uses_stage_backed_functions(
         }
 
     monkeypatch.setattr(
-        "cdt.pipeline.acquire_eightk_documents", fake_run_ingest_pipeline
+        "cdt.ingest.genres.acquire_eightk_documents", fake_run_ingest_pipeline
     )
     monkeypatch.setattr(
         "cdt.pipeline.itemize_pending_documents", fake_itemize_pending_documents
@@ -140,7 +142,7 @@ def test_run_pipeline_uses_stage_backed_functions(
         "cdt.pipeline.classify_pending_items", fake_classify_pending_items
     )
     monkeypatch.setattr(
-        "cdt.pipeline.acquire_scraped_sixk_documents",
+        "cdt.ingest.genres.acquire_scraped_sixk_documents",
         fake_acquire_scraped_sixk_documents,
     )
     monkeypatch.setattr(
@@ -216,11 +218,13 @@ def test_genres_narrow_the_run_to_one_chain(
 
         return fail
 
-    monkeypatch.setattr("cdt.pipeline.acquire_eightk_documents", unexpected("ingest"))
+    monkeypatch.setattr(
+        "cdt.ingest.genres.acquire_eightk_documents", unexpected("ingest")
+    )
     monkeypatch.setattr("cdt.pipeline.itemize_pending_documents", unexpected("itemize"))
     monkeypatch.setattr("cdt.pipeline.classify_pending_items", unexpected("classify"))
     monkeypatch.setattr(
-        "cdt.pipeline.acquire_scraped_sixk_documents",
+        "cdt.ingest.genres.acquire_scraped_sixk_documents",
         lambda config, **kwargs: (
             calls.append("ingest-sixk"),
             (pd.DataFrame(), _sixk_ingest_result(tmp_path, kwargs.get("ciks"))),
@@ -275,7 +279,7 @@ def test_the_sixk_chain_can_take_its_own_cik_list(
     asked: dict[str, set[str] | None] = {}
 
     monkeypatch.setattr(
-        "cdt.pipeline.acquire_eightk_documents",
+        "cdt.ingest.genres.acquire_eightk_documents",
         lambda config, **kwargs: (
             asked.__setitem__("8-K", kwargs.get("ciks")),
             (pd.DataFrame(), _sixk_ingest_result(tmp_path, kwargs.get("ciks"))),
@@ -288,7 +292,7 @@ def test_the_sixk_chain_can_take_its_own_cik_list(
         "cdt.pipeline.classify_pending_items", lambda **kwargs: pd.DataFrame()
     )
     monkeypatch.setattr(
-        "cdt.pipeline.acquire_scraped_sixk_documents",
+        "cdt.ingest.genres.acquire_scraped_sixk_documents",
         lambda config, **kwargs: (
             asked.__setitem__("6-K", kwargs.get("ciks")),
             (pd.DataFrame(), _sixk_ingest_result(tmp_path, kwargs.get("ciks"))),
@@ -341,7 +345,7 @@ def test_a_config_that_names_no_genres_does_not_acquire_the_sixk_chain(
     def explode(**_kwargs: object) -> None:
         raise AssertionError("the 6-K chain ran without being asked for")
 
-    monkeypatch.setattr("cdt.pipeline.acquire_scraped_sixk_documents", explode)
+    monkeypatch.setattr("cdt.ingest.genres.acquire_scraped_sixk_documents", explode)
     monkeypatch.setattr("cdt.pipeline.triage_pending_documents", explode)
 
     assert PipelineConfig(mode="historical", cik_file=str(cik_file)).genres == (
@@ -427,6 +431,7 @@ def test_run_pipeline_processes_small_seeded_batch(
         *,
         ciks: set[str] | None = None,
         s3_client: object | None = None,
+        return_documents: bool = False,
     ) -> tuple[pd.DataFrame, IngestRunResult]:
         del config, s3_client
         document_rows = pd.DataFrame(
@@ -506,7 +511,7 @@ This is the extracted event text.
         return row_state
 
     monkeypatch.setattr(
-        "cdt.pipeline.acquire_eightk_documents", fake_run_ingest_pipeline
+        "cdt.ingest.genres.acquire_eightk_documents", fake_run_ingest_pipeline
     )
     monkeypatch.setattr(
         classifier_eightk,
@@ -834,7 +839,7 @@ def test_the_lease_is_renewed_between_the_eightk_and_sixk_chains(
         lambda **kwargs: (calls.append("classify"), pd.DataFrame())[1],
     )
     monkeypatch.setattr(
-        "cdt.pipeline.acquire_scraped_sixk_documents",
+        "cdt.ingest.genres.acquire_scraped_sixk_documents",
         lambda config, **kwargs: (
             calls.append("ingest-sixk"),
             (pd.DataFrame(), _sixk_ingest_result(tmp_path, kwargs.get("ciks"))),
@@ -873,6 +878,7 @@ def _stage_stubs(
         *,
         ciks: set[str] | None = None,
         s3_client: object | None = None,
+        return_documents: bool = False,
     ) -> tuple[pd.DataFrame, IngestRunResult]:
         del config, s3_client
         return pd.DataFrame([{"accession_number": "1"}]), IngestRunResult(
@@ -893,7 +899,7 @@ def _stage_stubs(
         )
 
     monkeypatch.setattr(
-        "cdt.pipeline.acquire_eightk_documents", fake_run_ingest_pipeline
+        "cdt.ingest.genres.acquire_eightk_documents", fake_run_ingest_pipeline
     )
     monkeypatch.setattr(
         "cdt.pipeline.itemize_pending_documents",
