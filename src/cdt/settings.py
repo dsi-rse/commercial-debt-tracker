@@ -30,7 +30,7 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get(
 )
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 # Single source of truth for the extractor model id, as an OpenRouter slug. The
-# batch backend strips the provider prefix (``normalize_batch_model``), so both
+# batch backend strips the provider prefix (``native_model_id``), so both
 # backends stay on the same model when only this value changes.
 #
 # Keep the id undated. OpenRouter and the OpenAI API both expose this model

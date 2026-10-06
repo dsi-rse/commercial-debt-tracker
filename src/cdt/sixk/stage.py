@@ -617,7 +617,6 @@ def triage_pending_documents(
     pending_with_fingerprints, registry = pending_source_partitions(
         STAGE_NAME,
         SIXK_DOCUMENT_DATASET_NAME,
-        SIXK_SNIPPET_DATASET_NAME,
         artifact_root=resolved_root,
         data_dir=data_dir,
         force=force,

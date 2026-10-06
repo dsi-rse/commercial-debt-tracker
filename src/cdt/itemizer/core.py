@@ -20,7 +20,7 @@ from cdt.datasets import (
     run_manifest_path,
     save_completion_registry,
 )
-from cdt.ingest import DOCUMENT_COLUMNS, decode_document_bytes, default_s3_client
+from cdt.ingest import DOCUMENT_COLUMNS, decode_document_bytes
 from cdt.itemizer.extract import DocumentText, ItemSection, extract_items_from_document
 from cdt.shared import get_logger
 from cdt.storage import (
@@ -30,6 +30,9 @@ from cdt.storage import (
     read_table,
     write_json_artifact,
     write_partition_table,
+)
+from cdt.storage import (
+    s3_client as storage_s3_client,
 )
 
 LOGGER = get_logger(__name__)
@@ -165,7 +168,6 @@ def itemize_pending_documents(
     pending_with_fingerprints, registry = pending_source_partitions(
         "itemize",
         "documents",
-        ITEM_DATASET_NAME,
         artifact_root=resolved_root,
         data_dir=data_dir,
         force=force,
@@ -412,7 +414,7 @@ def ensure_s3_client(
     for document in documents:
         resource_uri = document.get("resource_uri")
         if isinstance(resource_uri, str) and resource_uri.startswith("s3://"):
-            return default_s3_client()
+            return storage_s3_client()
     return None
 
 

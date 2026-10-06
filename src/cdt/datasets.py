@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import date
 from operator import itemgetter
 from pathlib import Path
@@ -109,8 +108,7 @@ def completion_registry_root(
 
     Named ``_root``, not ``_path``, because this module splits the two without
     exception and #220 broke that (#227): prefixes are ``*_root``
-    (``dataset_root``, ``items_root``, ``mentions_root``, ``batches_root``,
-    ``mirror_root``) and single objects are ``*_path`` (``run_manifest_path``,
+    (``dataset_root``, ``items_root``, ``mentions_root``, ``mirror_root``) and single objects are ``*_path`` (``run_manifest_path``,
     ``failure_registry_path``, ``active_job_path``, ``final_pointer_path``).
     With ``completion_registry_shard_path`` for the objects underneath it, this
     is the coherent pair.
@@ -184,9 +182,7 @@ class CompletedPartition:
     """One source partition's completion record.
 
     ``fingerprint`` is the source object's version at processing time (S3 ETag;
-    size+mtime locally); None on entries saved path-only through
-    ``save_completed_partitions``, which read as "complete as recorded,
-    reprocess if the source ever changes".
+    size+mtime locally).
     ``item_ids`` (extract only) are the content-terminal rows — SUCCESS or
     FAILED-on-validation — so re-processing a partition is row-level and never
     re-pays rows that already have a real outcome (#49, #62).
@@ -604,32 +600,9 @@ def _save_registry_shard(
     raise RuntimeError(msg)
 
 
-def save_completed_partitions(
-    stage_name: str,
-    source_partitions: set[str],
-    *,
-    artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
-) -> str:
-    """Persist completed partitions path-only, without fingerprints.
-
-    Callers that need row-aware completion should use
-    ``save_completion_registry`` directly.
-    """
-    registry = load_completion_registry(
-        stage_name, artifact_root=artifact_root, data_dir=data_dir
-    )
-    for path in source_partitions:
-        registry.setdefault(path, CompletedPartition())
-    return save_completion_registry(
-        stage_name, registry, artifact_root=artifact_root, data_dir=data_dir
-    )
-
-
 def pending_source_partitions(
     stage_name: str,
     source_dataset: str,
-    target_dataset: str,
     *,
     artifact_root: ArtifactPath | None = None,
     data_dir: Path | None = None,
@@ -641,9 +614,7 @@ def pending_source_partitions(
     pending when it has no completion entry or its source fingerprint changed —
     ingest merges late-arriving rows into partition files in place, and a
     path-level "target exists" skip silently strands those rows forever (#62).
-    Entries with no fingerprint (saved path-only, or targets that predate the
-    registry) are stamped with the current fingerprint in the returned registry so future growth is
-    detectable; the caller persists it via save_completion_registry.
+    The caller persists the returned registry via save_completion_registry.
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     registry = (
@@ -675,35 +646,12 @@ def pending_source_partitions(
             "Re-partition or remove it before running stages."
         )
         raise ValueError(msg)
-    existing_target_ids = (
-        set()
-        if force
-        else existing_date_shard_partition_ids(
-            target_dataset, artifact_root=resolved_root, data_dir=data_dir
-        )
-    )
     pending: list[tuple[str, str]] = []
     for source_path in sorted(fingerprints):
-        partition = parse_date_shard_partition(source_path)
         fingerprint = fingerprints[source_path]
         entry = registry.get(source_path)
-        if force:
+        if force or entry is None or entry.fingerprint != fingerprint:
             pending.append((source_path, fingerprint))
-            continue
-        if entry is None:
-            if (partition["date"], partition["shard"]) in existing_target_ids:
-                registry[source_path] = CompletedPartition(fingerprint=fingerprint)
-                continue
-            pending.append((source_path, fingerprint))
-            continue
-        if entry.fingerprint == fingerprint:
-            continue
-        if entry.fingerprint is None:
-            # Reassign rather than mutate so the change lands in the registry's
-            # dirty set and survives the compare-and-swap merge on save (#88).
-            registry[source_path] = replace(entry, fingerprint=fingerprint)
-            continue
-        pending.append((source_path, fingerprint))
     return pending, registry
 
 
@@ -838,15 +786,6 @@ def parse_date_shard_partition(path: ArtifactPath) -> dict[str, str]:
     return partition
 
 
-def parse_cik_shard_partition(path: ArtifactPath) -> dict[str, str]:
-    """Parse a canonical cik-shard partition path."""
-    normalized = normalize_artifact_path(path)
-    match = CIK_PARTITION_PATTERN.search(normalized)
-    if match is None:
-        raise ValueError(f"Unrecognized cik-shard partition path: {normalized}")
-    return match.groupdict()
-
-
 def iter_date_shard_partitions(
     dataset_name: str,
     *,
@@ -911,23 +850,6 @@ def existing_date_shard_partition_ids(
     }
 
 
-def iter_cik_shard_partitions(
-    dataset_name: str,
-    *,
-    artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
-) -> list[str]:
-    """List canonical cik-shard partitions for one dataset."""
-    return [
-        path
-        for path in list_artifacts(
-            dataset_root(dataset_name, artifact_root=artifact_root, data_dir=data_dir),
-            suffix=".parquet",
-        )
-        if CIK_PARTITION_PATTERN.search(path)
-    ]
-
-
 def shard_label(value: str, shard_count: int) -> str:
     """Return the canonical shard label for one key.
 
@@ -968,8 +890,3 @@ def zlib_crc32(value: str) -> int:
     from zlib import crc32
 
     return int(crc32(value.encode("utf-8")))
-
-
-def unique_preserving_order(values: Iterable[str]) -> tuple[str, ...]:
-    """Return de-duplicated values while preserving first-seen order."""
-    return tuple(dict.fromkeys(values))

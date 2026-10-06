@@ -10,7 +10,7 @@ import hashlib
 import json
 import re
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from importlib import resources
@@ -32,7 +32,6 @@ from cdt.datasets import (
     completion_registry_path,
     dataset_root,
     date_shard_partition_path,
-    existing_date_shard_partition_ids,
     extractor_run_path,
     iter_date_shard_partitions,
     load_completion_registry,
@@ -48,6 +47,7 @@ from cdt.storage import (
     artifact_exists,
     canonical_numeric_text,
     coerce_dataset_text,
+    json_column,
     list_artifacts_with_versions,
     read_table,
     write_json_artifact,
@@ -120,49 +120,10 @@ EXTRACTOR_TEMPERATURE = 0.0
 REASONING_MODEL_PREFIXES = ("gpt-5", "o1", "o3", "o4")
 INSTRUMENT_ENTITY_TAG_TYPES = {"debt_instrument"}
 LENDER_TAG_TYPES = {"person", "organization"}
-LENDER_CLUSTER_KINDS = {"named", "collective"}
 DEFAULT_LENDER_CLUSTER_KIND = "named"
-OTHER_PARTY_ROLES = {
-    "agent",
-    "trustee",
-    "underwriter",
-    "guarantor",
-    "borrower",
-    "other",
-}
-DEFAULT_OTHER_PARTY_ROLE = "other"
 BORROWER_PARTY_ROLE = "borrower"
 COLLECTIVE_LENDER_KIND = "collective"
-# The model labels every party cluster so collective lenders and the borrower can
-# be dropped here. The labels are extraction-time signals and are not persisted.
-PARTY_PROPERTY_ANNOTATIONS = {
-    "lenders": ("kind", LENDER_CLUSTER_KINDS, DEFAULT_LENDER_CLUSTER_KIND),
-    "other_interested_parties": (
-        "role",
-        OTHER_PARTY_ROLES,
-        DEFAULT_OTHER_PARTY_ROLE,
-    ),
-}
-INSTRUMENT_SINGLE_VALUE_PROPERTIES = {
-    "start_date": {"date"},
-    # NER tags maturity phrases like "notes due 2028" inside the instrument name,
-    # so maturity evidence may cite that name span instead of a standalone date.
-    "maturity_date": {"date", "debt_instrument", "duration"},
-    # When the lender's obligation to lend ends — the draw/availability window
-    # closes (#158). Distinct from the maturity so draw-period dates stop
-    # publishing as maturities.
-    "commitment_termination_date": {"date"},
-    # Pre-#158 name for maturity_date, still accepted so stored batch
-    # responses replay.
-    "end_date": {"date", "debt_instrument"},
-    # The same holds for a principal stated inside the name, as in
-    # `$183.36 million term loan`: there is no separate `amount` span to cite,
-    # and rejecting the name span lost the amount outright (#129). The bare
-    # `amount` property is the pre-#140 shape, still accepted so stored batch
-    # responses replay; the prompt now teaches `amounts`.
-    "amount": {"amount", "debt_instrument"},
-    "name": {"debt_instrument"},
-}
+INSTRUMENT_SINGLE_VALUE_PROPERTIES = {"name": {"debt_instrument"}}
 # One mention can state several money facts about one instrument — a $2.5B
 # commitment and a $270.5M outstanding balance — so amounts are a kind-typed
 # list (#140). The matcher keys only on commitment/principal; the other kinds
@@ -183,7 +144,6 @@ PRINCIPAL_AMOUNT_KINDS = ("commitment", "principal")
 DATE_KINDS = {
     "agreement",  # the instrument's own `dated as of` date
     "announcement",  # pricing, launch, or commitment-letter date
-    "expected_closing",  # stage-1 shape for `closing` + `expected: true`; replays only
     "closing",  # closing, issuance, funding, or effective date: the start
     "maturity",  # when the borrowed money must be repaid
     "commitment_termination",  # when the lender's obligation to lend ends
@@ -214,7 +174,6 @@ TERMINAL_DATE_KINDS = {"retirement", "termination", "exchange", "default"}
 SINGLE_CURRENT_DATE_KINDS = {
     "agreement",
     "closing",
-    "expected_closing",
     "maturity",
     "commitment_termination",
 }
@@ -247,8 +206,8 @@ DATE_KIND_EVIDENCE_TAG_TYPES = {
     "maturity": {"date", "debt_instrument", "duration"},
 }
 DEFAULT_DATE_EVIDENCE_TAG_TYPES = {"date"}
-# Stage 2: one `parties` list with a role per cluster replaces `lenders` +
-# `other_interested_parties`; `lender_disclosure` is derived from it.
+# One `parties` list with a role per cluster; `lender_disclosure` is derived
+# from it.
 PARTY_ROLES = {
     "lender",
     "agent",
@@ -289,13 +248,6 @@ DATE_COLUMN_KINDS = {
     "maturity_date": "maturity",
     "commitment_termination_date": "commitment_termination",
 }
-# Pre-dates[] responses replay through the same path with their kind implied.
-LEGACY_DATE_PROPERTY_KINDS = {
-    "start_date": "closing",
-    "maturity_date": "maturity",
-    "end_date": "maturity",
-    "commitment_termination_date": "commitment_termination",
-}
 DATE_PRECISIONS = ("day", "month", "year")
 AMOUNT_EVIDENCE_TAG_TYPES = {"amount", "debt_instrument"}
 # What one mention says happened to its instrument (#141). `matured` is
@@ -313,24 +265,8 @@ INSTRUMENT_TYPES = {
     "credit_line",
     "note_bond",
 }
-STATUS_EVENT_VALUES = {
-    "announced",
-    "entered_into",
-    "amended",
-    "terminated",
-    "repaid",
-    "exchanged",
-    "defaulted",
-}
 MATURITY_EVIDENCE_TAG_TYPES = {"debt_instrument"}
 NAME_EMBEDDED_AMOUNT_TAG_TYPES = {"debt_instrument"}
-STANDARDIZED_SINGLE_VALUE_PROPERTIES = {
-    "start_date",
-    "maturity_date",
-    "commitment_termination_date",
-    "end_date",
-    "amount",
-}
 INSTRUMENT_RELATION_TYPES = {"amendment_of", "retired_by", "split_of"}
 NUMERIC_STRING_PATTERN = re.compile(r"^\d+(?:\.\d+)?$")
 # One `due` can carry a list of maturities: `due 2028 and 2030`,
@@ -833,8 +769,7 @@ class ExtractionRowState:
         )
         row_state.ner_tagged_xml = cast(str | None, payload["ner_tagged_xml"])
         row_state.state = cast(str | None, payload["state"])
-        # Absent in job state written before salvage existed (#152).
-        row_state.salvage_notes = cast(list[str], payload.get("salvage_notes", []))
+        row_state.salvage_notes = cast(list[str], payload["salvage_notes"])
         row_state.current_attempt = current_attempt
         return row_state
 
@@ -1231,30 +1166,6 @@ def validate_instrument_entry(
         if property_name not in obj:
             continue
         tag_ids = single_value_evidence_tag_ids(obj[property_name])
-        if property_name in STANDARDIZED_SINGLE_VALUE_PROPERTIES:
-            failures.extend(
-                validate_standardized_single_value_shape(
-                    index=index,
-                    property_name=property_name,
-                    value=obj[property_name],
-                )
-            )
-            failures.extend(
-                validate_standardized_single_value_cardinality(
-                    index=index,
-                    property_name=property_name,
-                    value=obj[property_name],
-                    tag_details=tag_details,
-                )
-            )
-            if property_name == "amount":
-                failures.extend(
-                    validate_amount_is_not_rate(
-                        index=index,
-                        value=obj[property_name],
-                        tag_details=tag_details,
-                    )
-                )
         if not isinstance(tag_ids, list):
             failures.append(
                 f"Entry {index}: '{property_name}' evidence must be a list of tag IDs."
@@ -1297,37 +1208,16 @@ def validate_instrument_entry(
         )
     )
     failures.extend(
-        validate_status_event(
-            index=index,
-            obj=obj,
-            tag_details=tag_details,
-        )
-    )
-    failures.extend(
         validate_interest_rate(
             index=index,
             obj=obj,
             tag_details=tag_details,
         )
     )
-    for property_name in PARTY_PROPERTY_ANNOTATIONS:
-        failures.extend(
-            validate_party_property(
-                index=index,
-                property_name=property_name,
-                obj=obj,
-                tag_details=tag_details,
-            )
-        )
     failures.extend(
         validate_parties_property(index=index, obj=obj, tag_details=tag_details)
     )
-    failures.extend(
-        validate_lenders_known_incomplete(
-            index=index,
-            obj=obj,
-        )
-    )
+    failures.extend(validate_no_legacy_properties(index, obj))
     failures.extend(validate_cross_field_semantics(index=index, obj=obj))
     return failures
 
@@ -1342,9 +1232,8 @@ AMOUNT_KIND_TYPE_CONFLICTS = {
 }
 
 
-# Properties of the pre-facts schema. Stored responses replay through
-# postprocess with their old semantics; a live response that uses them is a
-# model reverting to a shape the current prompt no longer describes.
+# Properties of the pre-facts schema. A response that uses them is a model
+# reverting to a shape the current prompt no longer describes.
 LEGACY_INSTRUMENT_PROPERTIES = {
     "status_event": "events are `dates` entries (kinds closing, amendment, retirement, ...)",
     "lenders": "parties are one `parties` list with role lender",
@@ -1359,7 +1248,7 @@ LEGACY_INSTRUMENT_PROPERTIES = {
 
 
 def validate_no_legacy_properties(index: int, obj: object) -> list[str]:
-    """Reject pre-facts-schema properties on a freshly generated response."""
+    """Reject pre-facts-schema properties, naming what replaced each."""
     if not isinstance(obj, dict):
         return []
     return [
@@ -1495,7 +1384,6 @@ class InstrumentIEStage:
         failures: list[str] = []
         for index, obj in enumerate(data):
             failures.extend(validate_instrument_entry(index, obj, tag_details))
-            failures.extend(validate_no_legacy_properties(index, obj))
         return failures
 
     def postprocess(self, row_state: ExtractionRowState) -> None:
@@ -1548,11 +1436,9 @@ class InstrumentIEStage:
                 date_payloads, "commitment_termination"
             )
             status_payload = (
-                # Stage-2 responses carry events as date facts; anything older
-                # (a status_event, or no dates list at all) replays verbatim.
                 derived_status_payload(date_payloads)
-                if "dates" in obj and "status_event" not in obj
-                else standardized_status_payload(obj.get("status_event"), tag_details)
+                if "dates" in obj
+                else {"status": None, "status_date": None}
             )
             interest_rate_payload = standardized_interest_rate_payload(
                 obj.get("interest_rate"),
@@ -1888,10 +1774,7 @@ def pending_extract_partitions(
     merged late-arriving rows into it, #62). ``done_item_ids`` are rows that
     already reached a terminal state and must not be re-paid (#49).
 
-    Also returns the loaded registry so the caller can update and persist it —
-    including the opportunistic stamping this function does: legacy entries
-    (v1 lists, or partitions whose mentions predate the registry) get the
-    current fingerprint so future source growth is detectable.
+    Also returns the loaded registry so the caller can update and persist it.
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     registry = (
@@ -1904,32 +1787,21 @@ def pending_extract_partitions(
         )
     )
     fingerprints: dict[str, str | None] = {}
-    # Paths the mentions-backfill adoption below may apply to. Scoped to the 8-K
-    # source deliberately; see the comment at its use.
-    adoptable_paths: set[str] = set()
     for source in CLASSIFICATION_SOURCES:
-        source_fingerprints = {
-            path: version
-            for path, version in list_artifacts_with_versions(
-                dataset_root(
-                    source,
-                    artifact_root=resolved_root,
-                    data_dir=data_dir,
-                ),
-                suffix=".parquet",
-            ).items()
-            if PARTITION_PATTERN.search(path)
-        }
-        fingerprints.update(source_fingerprints)
-        if source == CLASSIFICATION_DATASET_NAME:
-            adoptable_paths.update(source_fingerprints)
-    existing_mention_ids = (
-        set()
-        if force
-        else existing_date_shard_partition_ids(
-            MENTIONS_DATASET_NAME, artifact_root=resolved_root, data_dir=data_dir
+        fingerprints.update(
+            {
+                path: version
+                for path, version in list_artifacts_with_versions(
+                    dataset_root(
+                        source,
+                        artifact_root=resolved_root,
+                        data_dir=data_dir,
+                    ),
+                    suffix=".parquet",
+                ).items()
+                if PARTITION_PATTERN.search(path)
+            }
         )
-    )
     pending: list[PendingExtractPartition] = []
     for classification_path in sorted(fingerprints):
         if exclude_paths and classification_path in exclude_paths:
@@ -1938,24 +1810,6 @@ def pending_extract_partitions(
         fingerprint = fingerprints[classification_path]
         entry = registry.get(classification_path)
         if force or entry is None:
-            if (
-                not force
-                and classification_path in adoptable_paths
-                and (partition["date"], partition["shard"]) in existing_mention_ids
-            ):
-                # Mentions predate the registry: complete as of this version.
-                #
-                # Only for the 8-K source. Every source writes into one mentions
-                # dataset keyed by (date, shard), so a 6-K snippet partition
-                # sharing a date and shard with already-extracted 8-K mentions
-                # would be adopted as complete here and never extracted — no
-                # error, no rows, nothing to notice. And it cannot be a genuine
-                # backfill: this adoption exists for partitions written before
-                # the registry did, which no 6-K partition can be.
-                registry[classification_path] = CompletedPartition(
-                    fingerprint=fingerprint
-                )
-                continue
             pending.append(
                 PendingExtractPartition(
                     classification_path=classification_path,
@@ -1967,12 +1821,6 @@ def pending_extract_partitions(
             )
             continue
         if entry.complete and entry.fingerprint == fingerprint:
-            continue
-        if entry.complete and entry.fingerprint is None:
-            # v1 entry: complete as recorded; stamp so future growth registers.
-            # Reassign rather than mutate so the change lands in the registry's
-            # dirty set and survives the compare-and-swap merge on save (#88).
-            registry[classification_path] = replace(entry, fingerprint=fingerprint)
             continue
         pending.append(
             PendingExtractPartition(
@@ -1989,8 +1837,6 @@ def pending_extract_partitions(
 # The rule name a synthesized prior state carries in `synthesized_by` (#203).
 SYNTHESIZED_PRIOR_STATE = "prior_state"
 # The term kinds a filing can mark `prior` — the list the dates validator names.
-# `SINGLE_CURRENT_DATE_KINDS - EVENT_DATE_KINDS` would also admit the legacy
-# `expected_closing` replay kind, which is not a term.
 PRIOR_TERM_DATE_KINDS = frozenset({"agreement", "maturity", "commitment_termination"})
 # Current terms a prior state inherits when the filing marks no `prior` value
 # for the kind. Balances, draws, repayments and proceeds are dated observations
@@ -2001,13 +1847,7 @@ INHERITED_DATE_KINDS = frozenset({"maturity", "commitment_termination"})
 
 def _json_list(row: dict[str, object], column: str) -> list[dict[str, object]]:
     """Return one JSON-array column as fresh dicts; junk and NaN read as empty."""
-    text = coerce_dataset_text(row.get(column))
-    if text is None:
-        return []
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        return []
+    payload = json_column(row, column)
     if not isinstance(payload, list):
         return []
     return [dict(entry) for entry in payload if isinstance(entry, dict)]
@@ -2015,13 +1855,7 @@ def _json_list(row: dict[str, object], column: str) -> list[dict[str, object]]:
 
 def _json_dict(row: dict[str, object], column: str) -> dict[str, object]:
     """Return one JSON-object column as a fresh dict; junk and NaN read as empty."""
-    text = coerce_dataset_text(row.get(column))
-    if text is None:
-        return {}
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        return {}
+    payload = json_column(row, column)
     return dict(payload) if isinstance(payload, dict) else {}
 
 
@@ -3390,10 +3224,6 @@ def _salvage_or_fail(
             row_state.salvage_notes.append(
                 f"instrument_ie kept the valid entries and dropped {dropped} "
                 f"invalid ones after {max_attempts} failed attempts"
-                if dropped
-                else "instrument_ie published every entry after "
-                f"{max_attempts} failed attempts; the response was rejected as a "
-                "whole but each entry validated on its own"
             )
             stage.postprocess(row_state)
             return _advance_after_stage(row_state, stage, stage_index)
@@ -3767,51 +3597,6 @@ def single_value_evidence_tag_ids(value: object) -> object:
     return value
 
 
-def validate_standardized_single_value_shape(
-    *,
-    index: int,
-    property_name: str,
-    value: object,
-) -> list[str]:
-    """Validate one standardized single-value object shape."""
-    if not isinstance(value, dict):
-        return [f"Entry {index}: '{property_name}' must be an object."]
-    evidence = value.get("evidence")
-    if not isinstance(evidence, list):
-        return [f"Entry {index}: '{property_name}.evidence' must be a list of tag IDs."]
-
-    failures: list[str] = []
-    if property_name == "amount":
-        normalized_amount = value.get("normalized_amount")
-        currency = value.get("currency")
-        if normalized_amount is not None and (
-            not isinstance(normalized_amount, str)
-            or not NUMERIC_STRING_PATTERN.fullmatch(normalized_amount)
-        ):
-            failures.append(
-                f"Entry {index}: 'amount.normalized_amount' must be a numeric string or null."
-            )
-        if currency is not None and (
-            not isinstance(currency, str)
-            or len(currency) != CURRENCY_CODE_LENGTH
-            or currency != currency.upper()
-        ):
-            failures.append(
-                f"Entry {index}: 'amount.currency' must be an uppercase 3-letter code or null."
-            )
-    else:
-        normalized_date = value.get("normalized_date")
-        if normalized_date is not None and (
-            not isinstance(normalized_date, str)
-            or not ISO_DATE_PATTERN.fullmatch(normalized_date)
-            or not is_valid_iso_date(normalized_date)
-        ):
-            failures.append(
-                f"Entry {index}: '{property_name}.normalized_date' must be YYYY-MM-DD or null."
-            )
-    return failures
-
-
 def validate_standardized_single_value_cardinality(
     *,
     index: int,
@@ -3854,68 +3639,6 @@ def validate_standardized_single_value_cardinality(
             "combining them."
         )
     ]
-
-
-def validate_party_property(
-    *,
-    index: int,
-    property_name: str,
-    obj: dict[str, Any],
-    tag_details: dict[str, dict[str, object]],
-) -> list[str]:
-    """Validate one party property against the annotated cluster shape."""
-    if property_name not in obj:
-        return []
-    value = obj[property_name]
-    annotation_key, allowed_annotations, _default = PARTY_PROPERTY_ANNOTATIONS[
-        property_name
-    ]
-    expected_annotations = ", ".join(sorted(allowed_annotations))
-    if not isinstance(value, list):
-        return [
-            f"Entry {index}: '{property_name}' must be a list of cluster objects "
-            f'shaped like {{"tag_ids": ["tag-..."], "{annotation_key}": "..."}}.'
-        ]
-    failures: list[str] = []
-    for cluster_index, cluster in enumerate(value):
-        location = f"Entry {index}: '{property_name}'[{cluster_index}]"
-        if not isinstance(cluster, dict):
-            failures.append(
-                f"{location} must be an object with 'tag_ids' and "
-                f"'{annotation_key}' keys."
-            )
-            continue
-        annotation = cluster.get(annotation_key)
-        if annotation not in allowed_annotations:
-            failures.append(
-                f"{location} '{annotation_key}' must be one of {expected_annotations}."
-            )
-        tag_ids = cluster.get("tag_ids")
-        if not isinstance(tag_ids, list):
-            failures.append(f"{location} 'tag_ids' must be a list of tag IDs.")
-            continue
-        if not all(isinstance(tag_id, str) for tag_id in tag_ids):
-            failures.append(f"{location} 'tag_ids' must contain string tag IDs only.")
-            continue
-        for tag_id in tag_ids:
-            tag_info = tag_details.get(tag_id)
-            if tag_info is None:
-                failures.append(f"{location} contains unknown tag ID {tag_id}.")
-                continue
-            if tag_info["type"] not in LENDER_TAG_TYPES:
-                failures.append(
-                    f"{location} tag {tag_id} must be person or organization."
-                )
-    return failures
-
-
-def validate_lenders_known_incomplete(*, index: int, obj: dict[str, Any]) -> list[str]:
-    """Validate the optional lenders_known_incomplete flag."""
-    if "lenders_known_incomplete" not in obj:
-        return []
-    if isinstance(obj["lenders_known_incomplete"], bool):
-        return []
-    return [f"Entry {index}: 'lenders_known_incomplete' must be true or false."]
 
 
 def validate_amount_is_not_rate(
@@ -4168,67 +3891,6 @@ def validate_amounts_property(
     return failures
 
 
-def validate_status_event(
-    *,
-    index: int,
-    obj: dict[str, Any],
-    tag_details: dict[str, dict[str, object]],
-) -> list[str]:
-    """Validate the optional status_event on one instrument entry (#141)."""
-    if "status_event" not in obj:
-        return []
-    event = obj["status_event"]
-    if not isinstance(event, dict):
-        return [f"Entry {index}: 'status_event' must be an object."]
-    failures: list[str] = []
-    status = event.get("status")
-    if status not in STATUS_EVENT_VALUES:
-        allowed = ", ".join(sorted(STATUS_EVENT_VALUES))
-        failures.append(
-            f"Entry {index}: 'status_event.status' must be one of {allowed}."
-        )
-    status_date = event.get("status_date")
-    if status_date is None:
-        return failures
-    if not isinstance(status_date, dict):
-        failures.append(
-            f"Entry {index}: 'status_event.status_date' must be an object or null."
-        )
-        return failures
-    evidence = status_date.get("evidence")
-    if not isinstance(evidence, list):
-        failures.append(
-            f"Entry {index}: 'status_event.status_date.evidence' must be a list of tag IDs."
-        )
-        return failures
-    for tag_id in evidence:
-        if not isinstance(tag_id, str):
-            failures.append(
-                f"Entry {index}: 'status_event.status_date.evidence' must contain string tag IDs only."
-            )
-            continue
-        tag_info = tag_details.get(tag_id)
-        if tag_info is None:
-            failures.append(
-                f"Entry {index}: 'status_event.status_date' contains unknown tag ID {tag_id}."
-            )
-        elif tag_info["type"] != "date":
-            failures.append(
-                f"Entry {index}: 'status_event.status_date' tag {tag_id} is type "
-                f"'{tag_info['type']}', expected date."
-            )
-    normalized_date = status_date.get("normalized_date")
-    if normalized_date is not None and (
-        not isinstance(normalized_date, str)
-        or not ISO_DATE_PATTERN.fullmatch(normalized_date)
-        or not is_valid_iso_date(normalized_date)
-    ):
-        failures.append(
-            f"Entry {index}: 'status_event.status_date.normalized_date' must be YYYY-MM-DD or null."
-        )
-    return failures
-
-
 def validate_interest_rate(
     *,
     index: int,
@@ -4383,21 +4045,6 @@ def standardized_interest_rate_payload(
     payload["rate_pct"] = verified_rate
     payload["derived_from"] = derived_from if verified_rate is not None else None
     return payload
-
-
-def standardized_status_payload(
-    value: object,
-    tag_details: dict[str, dict[str, object]],
-) -> dict[str, object]:
-    """Return the persisted status payload for one instrument entry (#141)."""
-    if not isinstance(value, dict):
-        return {"status": None, "status_date": None}
-    status = value.get("status")
-    date_payload = standardized_date_payload(value.get("status_date"), tag_details)
-    return {
-        "status": status if status in STATUS_EVENT_VALUES else None,
-        "status_date": date_payload,
-    }
 
 
 def iter_instrument_entries(
@@ -5260,10 +4907,9 @@ def standardized_amounts_payloads(
 ) -> list[dict[str, object]]:
     """Return the kind-typed amount payloads for one instrument entry (#140).
 
-    Reads the ``amounts`` list, falling back to the pre-#140 single ``amount``
-    shape (kind unknown → null) so stored batch responses replay. When neither
-    yields a value but the instrument's name embeds a principal, one
-    name-derived principal entry is synthesized, preserving #129.
+    Reads the ``amounts`` list. When it yields no principal but the
+    instrument's name embeds one, one name-derived principal entry is
+    synthesized, preserving #129.
 
     The shared-magnitude rescue (#213) runs here as a post-pass rather than
     inside ``standardized_amount_payload``, which receives one ``amounts[*]``
@@ -5324,17 +4970,6 @@ def standardized_amounts_payloads(
                 # own cited span, which is the right evidence for a currency
                 # even when the magnitude had to be borrowed.
                 payload["derived_from"] = DERIVED_FROM_SCALED
-    elif "amount" in obj:
-        payload = standardized_amount_payload(
-            obj.get("amount"),
-            tag_details,
-            name_text=name_text,
-            document_currencies=document_currencies,
-        )
-        payload["kind"] = None
-        payload["as_of_date"] = None
-        payload["prior"] = False
-        payloads.append(payload)
     if not select_principal_amount(payloads):
         synthesized = name_derived_principal_payload(name_text)
         # When every stated commitment or principal is `prior`, the head's
@@ -5386,9 +5021,8 @@ def select_principal_amount(payloads: list[dict[str, object]]) -> dict[str, obje
     """Return the payload that supplies the flat principal columns.
 
     Commitment and principal are the identity-bearing kinds the matcher keys
-    on (#140); a kind-less payload is the legacy single-amount shape, whose
-    value carried the same meaning. Balances, draws, repayments, and proceeds
-    never become the headline amount.
+    on (#140). Balances, draws, repayments, and proceeds never become the
+    headline amount.
     """
     current = [payload for payload in payloads if not payload.get("prior")]
     for payload in current:
@@ -5396,9 +5030,6 @@ def select_principal_amount(payloads: list[dict[str, object]]) -> dict[str, obje
             payload.get("normalized_amount") is not None
             and payload.get("kind") in PRINCIPAL_AMOUNT_KINDS
         ):
-            return payload
-    for payload in current:
-        if payload.get("normalized_amount") is not None and payload.get("kind") is None:
             return payload
     return {}
 
@@ -5453,37 +5084,13 @@ def parsed_date_from_spans(
 
 
 def instrument_date_entries(obj: dict[str, Any]) -> list[tuple[str, object, bool]]:
-    """Return (kind, value, prior) date entries for one instrument object.
-
-    Reads the ``dates`` list, falling back to the pre-dates[] single-value
-    properties (kind implied by the property name) so stored responses replay.
-    """
-    entries: list[tuple[str, object, bool]] = []
+    """Return (kind, value, prior) date entries for one instrument object."""
     dates = obj.get("dates")
-    if isinstance(dates, list):
-        for entry in dates:
-            if not isinstance(entry, dict) or entry.get("kind") not in DATE_KINDS:
-                continue
-            entries.append((str(entry["kind"]), entry, entry.get("prior") is True))
-        return entries
-    for property_name, kind in LEGACY_DATE_PROPERTY_KINDS.items():
-        if property_name in obj:
-            if property_name == "end_date" and "maturity_date" in obj:
-                continue
-            entries.append((kind, obj[property_name], False))
-    return entries
-
-
-LEGACY_STATUS_DATE_KINDS = {
-    status: kind for kind, status in STATUS_FOR_DATE_KIND.items()
-}
-
-
-def date_fact_is_expected(kind: str, entry: object) -> bool:
-    """Return whether a fact states a planned date rather than one that occurred."""
-    if kind == "expected_closing":
-        return True
-    return isinstance(entry, dict) and entry.get("expected") is True
+    return [
+        (str(entry["kind"]), entry, entry.get("prior") is True)
+        for entry in (dates if isinstance(dates, list) else [])
+        if isinstance(entry, dict) and entry.get("kind") in DATE_KINDS
+    ]
 
 
 def date_precision(
@@ -5533,8 +5140,8 @@ def standardized_dates_payloads(
             )
         else:
             payload = standardized_date_payload(value, tag_details)
-        payload["expected"] = date_fact_is_expected(kind, value)
-        payload["kind"] = "closing" if kind == "expected_closing" else kind
+        payload["expected"] = isinstance(value, dict) and value.get("expected") is True
+        payload["kind"] = kind
         payload["prior"] = prior
         payload["precision"] = date_precision(
             cast(str | None, payload.get("normalized_date")),
@@ -5779,41 +5386,6 @@ def payload_tag_ids(payload: object) -> list[str]:
     ]
 
 
-def annotated_party_clusters(
-    clusters: object,
-    tag_details: dict[str, dict[str, object]],
-    *,
-    property_name: str,
-) -> list[tuple[dict[str, object], str]]:
-    """Return (cluster payload, annotation) pairs for one party property.
-
-    Each payload keeps the persisted cluster shape. The annotation is the model's
-    extraction-time label, used only to decide which clusters to persist.
-    """
-    annotation_key, allowed_annotations, default_annotation = (
-        PARTY_PROPERTY_ANNOTATIONS[property_name]
-    )
-    if not isinstance(clusters, list):
-        return []
-    pairs: list[tuple[dict[str, object], str]] = []
-    for cluster in clusters:
-        if isinstance(cluster, dict):
-            tag_ids = cluster.get("tag_ids")
-            annotation = cluster.get(annotation_key)
-        else:
-            # Tolerate the legacy bare tag-id list shape when replaying old responses.
-            tag_ids = cluster
-            annotation = None
-        payload = cluster_payload(tag_ids, tag_details)
-        if not payload["spans"]:
-            continue
-        resolved = (
-            str(annotation) if annotation in allowed_annotations else default_annotation
-        )
-        pairs.append((payload, resolved))
-    return pairs
-
-
 LENDER_PARTY_ROLE = "lender"
 
 
@@ -5832,79 +5404,28 @@ def party_payloads_and_disclosure(
     span, same as instrument names.
     """
     parties: list[dict[str, object]] = []
-    lender_pairs = annotated_party_clusters(
-        obj.get("lenders", []),
-        tag_details,
-        property_name="lenders",
-    )
-    for payload, kind in lender_pairs:
+    raw_parties = obj.get("parties")
+    for cluster in raw_parties if isinstance(raw_parties, list) else []:
+        if not isinstance(cluster, dict):
+            continue
+        payload = cluster_payload(cluster.get("tag_ids"), tag_details)
+        if not payload["spans"]:
+            continue
+        role = cluster.get("role")
+        kind = cluster.get("kind")
         parties.append(
             {
                 "canonical_name": canonical_value(
                     payload_tag_ids(payload), tag_details
                 ),
-                "role": LENDER_PARTY_ROLE,
-                "kind": kind,
+                "role": role if role in PARTY_ROLES else "other",
+                "kind": kind if kind in PARTY_KINDS else DEFAULT_LENDER_CLUSTER_KIND,
                 "spans": payload["spans"],
             }
         )
-    for payload, role in annotated_party_clusters(
-        obj.get("other_interested_parties", []),
-        tag_details,
-        property_name="other_interested_parties",
-    ):
-        parties.append(
-            {
-                "canonical_name": canonical_value(
-                    payload_tag_ids(payload), tag_details
-                ),
-                "role": role,
-                "kind": DEFAULT_LENDER_CLUSTER_KIND,
-                "spans": payload["spans"],
-            }
-        )
-    # Detect the *legacy* shape positively. Inferring the current shape from the
-    # presence of `parties` or `dates` misread a perfectly ordinary current-schema
-    # entry that omitted both — the prompt tells the model to omit anything the
-    # document does not mention — and sent it down the legacy path, where it
-    # published "holders fully disclosed" beside an empty party list.
-    legacy_shape = any(
-        key in obj
-        for key in ("lenders", "other_interested_parties", "lenders_known_incomplete")
+    return parties, lender_disclosure_for(
+        [p["kind"] for p in parties if p["role"] == LENDER_PARTY_ROLE]
     )
-    if not legacy_shape:
-        # Current shape: one list, one role per cluster, disclosure derived.
-        parties = []
-        raw_parties = obj.get("parties")
-        for cluster in raw_parties if isinstance(raw_parties, list) else []:
-            if not isinstance(cluster, dict):
-                continue
-            payload = cluster_payload(cluster.get("tag_ids"), tag_details)
-            if not payload["spans"]:
-                continue
-            role = cluster.get("role")
-            kind = cluster.get("kind")
-            parties.append(
-                {
-                    "canonical_name": canonical_value(
-                        payload_tag_ids(payload), tag_details
-                    ),
-                    "role": role if role in PARTY_ROLES else "other",
-                    "kind": kind
-                    if kind in PARTY_KINDS
-                    else DEFAULT_LENDER_CLUSTER_KIND,
-                    "spans": payload["spans"],
-                }
-            )
-        return parties, lender_disclosure_for(
-            [p["kind"] for p in parties if p["role"] == LENDER_PARTY_ROLE]
-        )
-    # Legacy replay: the model declared the flag itself. A declared `true`
-    # alongside named lenders is the collective case by another name.
-    lender_kinds = [kind for payload, kind in lender_pairs]
-    if obj.get("lenders_known_incomplete") is True and lender_kinds:
-        return parties, LENDER_DISCLOSURE_COLLECTIVE_PRESENT
-    return parties, lender_disclosure_for(lender_kinds)
 
 
 def lender_disclosure_for(lender_kinds: list[object]) -> str:

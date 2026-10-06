@@ -17,7 +17,7 @@ from cdt.classifier import (
     default_model_dir,
     train_classifier_model,
 )
-from cdt.datasets import dataset_root
+from cdt.datasets import dataset_root, default_artifact_root
 from cdt.extractor import (
     DEFAULT_MAX_ATTEMPTS as DEFAULT_EXTRACTOR_MAX_ATTEMPTS,
 )
@@ -41,7 +41,6 @@ from cdt.ingest import (
     SIXK_DOCUMENT_DATASET_NAME,
     SIXK_FORM_TYPES,
     IngestConfig,
-    default_output_root,
     documents_root,
     run_ingest_pipeline,
 )
@@ -73,6 +72,7 @@ from cdt.pipeline import (
     DEFAULT_GENRES,
     PipelineConfig,
     normalize_genres,
+    read_cik_file,
     resolve_mode_dates,
     run_pipeline,
 )
@@ -493,7 +493,7 @@ def run_ingest(args: argparse.Namespace) -> int:
     """Run the ingest subcommand."""
     configure_logging(quiet=args.quiet, log_file=args.log_file)
     logger = logging.getLogger(__name__)
-    output_root = args.artifact_root or default_output_root()
+    output_root = args.artifact_root or default_artifact_root()
     lease = acquire_stage_lease(output_root, logger, "ingest")
     if lease is None:
         return 1
@@ -545,7 +545,7 @@ def run_sixk_ingest(args: argparse.Namespace) -> int:
     """Run the 6-K ingest subcommand."""
     configure_logging(quiet=args.quiet, log_file=args.log_file)
     logger = logging.getLogger(__name__)
-    output_root = args.artifact_root or default_output_root()
+    output_root = args.artifact_root or default_artifact_root()
     lease = acquire_stage_lease(output_root, logger, "6-K ingest")
     if lease is None:
         return 1
@@ -604,7 +604,7 @@ def run_itemize(args: argparse.Namespace) -> int:
     """Run the itemize subcommand."""
     configure_logging(quiet=args.quiet, log_file=args.log_file)
     logger = logging.getLogger(__name__)
-    artifact_root = args.artifact_root or default_output_root()
+    artifact_root = args.artifact_root or default_artifact_root()
     lease = acquire_stage_lease(artifact_root, logger, "itemization")
     if lease is None:
         return 1
@@ -637,7 +637,7 @@ def run_pipeline_command(args: argparse.Namespace) -> int:
     """Run the full CDT pipeline."""
     configure_logging(quiet=args.quiet, log_file=args.log_file)
     logger = logging.getLogger(__name__)
-    artifact_root = args.artifact_root or default_output_root()
+    artifact_root = args.artifact_root or default_artifact_root()
     lease = acquire_stage_lease(artifact_root, logger, "the pipeline")
     if lease is None:
         return 1
@@ -720,7 +720,7 @@ def run_sixk_stage(args: argparse.Namespace) -> int:
     """Run the 6-K triage subcommand."""
     configure_logging(quiet=args.quiet, log_file=args.log_file)
     logger = logging.getLogger(__name__)
-    artifact_root = args.artifact_root or default_output_root()
+    artifact_root = args.artifact_root or default_artifact_root()
     lease = acquire_stage_lease(artifact_root, logger, "6-K triage")
     if lease is None:
         return 1
@@ -755,7 +755,7 @@ def run_classifier(args: argparse.Namespace) -> int:
     """Run the classifier inference subcommand."""
     configure_logging(quiet=args.quiet, log_file=args.log_file)
     logger = logging.getLogger(__name__)
-    artifact_root = args.artifact_root or default_output_root()
+    artifact_root = args.artifact_root or default_artifact_root()
     resolved_model_dir = args.model_dir or default_model_dir()
     lease = acquire_stage_lease(artifact_root, logger, "classification")
     if lease is None:
@@ -818,7 +818,7 @@ def run_extractor(args: argparse.Namespace) -> int:
     """Run the LLM extractor subcommand."""
     configure_logging(quiet=args.quiet, log_file=args.log_file)
     logger = logging.getLogger(__name__)
-    artifact_root = args.artifact_root or default_output_root()
+    artifact_root = args.artifact_root or default_artifact_root()
     lease = acquire_stage_lease(artifact_root, logger, "extraction")
     if lease is None:
         return 1
@@ -862,7 +862,7 @@ def run_extractor(args: argparse.Namespace) -> int:
 def run_show_extract_job(args: argparse.Namespace) -> int:
     """Report the active batch extract job's state."""
     configure_logging(quiet=args.quiet, log_file=args.log_file)
-    artifact_root = args.artifact_root or default_output_root()
+    artifact_root = args.artifact_root or default_artifact_root()
     summary: ActiveJobSummary = describe_active_job(artifact_root)
     if summary.status == "idle":
         print("No active extract job; the next poll tick will start one.")
@@ -890,7 +890,7 @@ def run_reset_extract_job(args: argparse.Namespace) -> int:
     """Clear the active batch extract job marker under the writer lease."""
     configure_logging(quiet=args.quiet, log_file=args.log_file)
     logger = logging.getLogger(__name__)
-    artifact_root = args.artifact_root or default_output_root()
+    artifact_root = args.artifact_root or default_artifact_root()
     summary: ActiveJobSummary = describe_active_job(artifact_root)
     if summary.status == "idle":
         print("No active extract job; nothing to reset.")
@@ -938,7 +938,7 @@ def run_backfill_mentions(args: argparse.Namespace) -> int:
     """Mint prior states over existing mentions partitions, or count them."""
     configure_logging(quiet=args.quiet, log_file=args.log_file)
     logger = logging.getLogger(__name__)
-    artifact_root = args.artifact_root or default_output_root()
+    artifact_root = args.artifact_root or default_artifact_root()
     lease = None
     if not args.dry_run:
         lease = acquire_stage_lease(artifact_root, logger, "backfill")
@@ -975,7 +975,7 @@ def run_matcher(args: argparse.Namespace) -> int:
     """Run the matcher subcommand."""
     configure_logging(quiet=args.quiet, log_file=args.log_file)
     logger = logging.getLogger(__name__)
-    artifact_root = args.artifact_root or default_output_root()
+    artifact_root = args.artifact_root or default_artifact_root()
     lease = acquire_stage_lease(artifact_root, logger, "matching")
     if lease is None:
         return 1
@@ -1036,13 +1036,6 @@ def configure_logging(*, quiet: bool, log_file: Path | None = None) -> None:
         handlers=handlers,
         force=True,
     )
-
-
-def read_cik_file(path: str) -> set[str]:
-    """Read a one-CIK-per-line file."""
-    from cdt.pipeline import read_cik_file as _read_cik_file
-
-    return _read_cik_file(path)
 
 
 def resolve_ingest_dates(args: argparse.Namespace) -> tuple[date, date]:

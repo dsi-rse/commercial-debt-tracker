@@ -8,7 +8,7 @@ Text columns are normalized on the way into a snapshot: a cell whose whole value
 
 Two schema-wide contracts:
 
-- `cik` columns carry SEC's canonical 10-digit zero-padded form (#153). Snapshots pad legacy unpadded partitions on the way out, and `shard_for_cik` hashes the unpadded form so existing `cik_shard` partitions stay where they are.
+- `cik` columns carry SEC's canonical 10-digit zero-padded form (#153). `shard_for_cik` hashes the unpadded form.
 - Every evidence payload records `spans`: a list of `{tag_id, char_start, char_end, text}` whose offsets index the source item's `text` **exactly** (#154) — the extractor realigns model output whose whitespace drifted. Value-bearing payloads also record `derived_from`: `"stated"` when the value was parsed from cited evidence, `"name"` when it was derived from the instrument's own name (a `due 2028` maturity, a `$183.36 million term loan` principal, a coupon in the name), `"computed"` for arithmetic over cited spans, `"scaled"` for an amount read off its own cited span and multiplied by a magnitude word carried by a sibling amount fact's cited span, because the filing wrote that word once for two figures (`from $400.0 to $500.0 million`, #213), `"inherited"` for a term a synthesized row carries unchanged from the row it was minted from (#203), and null when there is no value (#128).
 
 ## Root Layout
@@ -71,7 +71,7 @@ Notes:
 - `documents` currently use 64 date shards
 - downstream date-partitioned datasets currently preserve whichever document shards they read
 - CIK-sharded datasets currently use 64 shards
-- Shard assignment is stable across runs and processes. It was not always: before #61, `documents` used Python's builtin `hash`, which is salted per process, so one accession landed in a different shard on every run and a forced re-ingest wrote a second copy that per-partition dedup could not see. That is fixed, not pending. `ingest.repair_document_shards` sweeps any surviving pre-#61 stray into its canonical shard on `--force`, dropping the stray copy when the canonical one was just refreshed.
+- Shard assignment is stable across runs and processes: `datasets.shard_label` hashes with crc32, never Python's per-process salted `hash`.
 
 ### What "Partition", "Shard", and "Batch" Mean
 
@@ -261,13 +261,13 @@ Columns:
 - `raw_id`: Row-local extractor identifier used inside a single item during relation extraction.
 - `name`: Canonicalized debt instrument name text extracted from the item.
 - `instrument_type`: One of `term_loan`, `revolving_credit`, `credit_line`, `note_bond`, or null when none fits or the document does not say (#156).
-- `start_date`: Normalized instrument start or issuance date when present — the current `closing` fact in `dates_json`. An instrument whose status is `announced` has not started and carries none; its projected close lives in `dates_json` as a `closing` fact marked `expected` (the stage-1 `expected_closing` kind is rewritten to that shape on the way in). The publisher's expected-start leg (`dsi-rse/commercial-debt-tracker-website#15`) is measured against it.
+- `start_date`: Normalized instrument start or issuance date when present — the current `closing` fact in `dates_json`. An instrument whose status is `announced` has not started and carries none; its projected close lives in `dates_json` as a `closing` fact marked `expected`. The publisher's expected-start leg (`dsi-rse/commercial-debt-tracker-website#15`) is measured against it.
 - `maturity_date`: Normalized final maturity or expiration of the obligation — when the borrowed money must be repaid (#158). Year-only maturities normalize to `YYYY-12-31` with `derived_from: "name"`.
 - `commitment_termination_date`: When the lender's obligation to lend ends — the close of a draw, availability, or revolving period — when the document states one distinct from the maturity (#158). Null for notes and bonds.
 - `principal_amount`: The single commitment or principal figure, as digits with at most one decimal point. Balances, draws, repayments, and proceeds never populate this column (#140).
 - `principal_currency`: ISO 4217 code for `principal_amount` when stated.
-- `principal_amount_kind`: `commitment` or `principal`; null on rows replayed from the pre-#140 single-amount shape.
-- `status`: What this mention says happened to the instrument, derived from its event facts in `dates_json`: the newest completed event wins (`retirement`→`repaid`, `termination`→`terminated`, `exchange`→`exchanged`, `default`→`defaulted`, `amendment`→`amended`, `closing`→`entered_into`, `announcement`→`announced`); an instrument whose only closing is `expected` is `announced`; a planned retirement — a `retirement` fact marked `expected` — decides nothing here and stays in `dates_json` for the publisher's cascade. Null when the mention states no event. Pre-stage-2 responses that carried a `status_event` replay it verbatim.
+- `principal_amount_kind`: `commitment` or `principal`.
+- `status`: What this mention says happened to the instrument, derived from its event facts in `dates_json`: the newest completed event wins (`retirement`→`repaid`, `termination`→`terminated`, `exchange`→`exchanged`, `default`→`defaulted`, `amendment`→`amended`, `closing`→`entered_into`, `announcement`→`announced`); an instrument whose only closing is `expected` is `announced`; a planned retirement — a `retirement` fact marked `expected` — decides nothing here and stays in `dates_json` for the publisher's cascade. Null when the mention states no event.
 - `status_date`: The date of the event that decided `status`, when stated.
 - `interest_rate_kind`: `fixed` or `floating` (#157).
 - `interest_rate_pct`: The stated fixed or all-in rate as a numeric string, parser-verified against the cited evidence or the instrument's name. Null for floating rates; benchmarks and margins are not recorded.
@@ -277,11 +277,11 @@ Columns:
 - `parties_json`: JSON array of every party cluster with `canonical_name` (longest span), `role` (`lender`, `borrower`, `agent`, `trustee`, `underwriter`, `guarantor`, `other`), `kind` (`named` or `collective`), and evidence `spans` (#150). The extractor returns one `parties` list with a role per cluster; nothing the model labels is discarded.
 - `name_json`: Evidence payload (`spans`) for `name`.
 - `start_date_json`, `maturity_date_json`, `commitment_termination_date_json`: Evidence payloads with `normalized_date` and `derived_from`.
-- `amounts_json`: JSON array of kind-typed money facts (#140): `{kind, normalized_amount, currency, as_of_date, spans, derived_from, prior}` with `kind` one of `commitment`, `principal`, `outstanding_balance`, `draw`, `repayment`, `proceeds` (null on legacy replays). `as_of_date` is normally present only on balances. `prior` is true for a figure the filing states as it stood before an amendment (`from $25,000,000 to $50,000,000`); prior facts never supply `principal_amount`.
-- `dates_json`: JSON array of kind-typed date facts: `{kind, normalized_date, precision, prior, expected, spans, derived_from}`. Kinds: `agreement` (the instrument's own dated-as-of date), `announcement`, `closing` (closing, issuance, funding, effective — the start), `amendment`, `repayment` (a payment that leaves the obligation outstanding), `retirement` (repaid in full, redeemed in whole, defeased, discharged), `termination`, `exchange`, `default`, `maturity`, `commitment_termination`. `precision` is `day`, `month` or `year` for how precisely the cited text states the date. `prior` marks a term stated as it stood before an amendment; `expected` marks a date the filing states as planned rather than occurred (an expected closing, a noticed redemption). An event the filing states without a date is a fact with `normalized_date` null. The flat `start_date`, `maturity_date` and `commitment_termination_date` columns are the current (non-prior, non-expected) `closing`, `maturity` and `commitment_termination` facts. Responses in the pre-dates[] shape replay with the kind implied by the old property name.
+- `amounts_json`: JSON array of kind-typed money facts (#140): `{kind, normalized_amount, currency, as_of_date, spans, derived_from, prior}` with `kind` one of `commitment`, `principal`, `outstanding_balance`, `draw`, `repayment`, `proceeds`. `as_of_date` is normally present only on balances. `prior` is true for a figure the filing states as it stood before an amendment (`from $25,000,000 to $50,000,000`); prior facts never supply `principal_amount`.
+- `dates_json`: JSON array of kind-typed date facts: `{kind, normalized_date, precision, prior, expected, spans, derived_from}`. Kinds: `agreement` (the instrument's own dated-as-of date), `announcement`, `closing` (closing, issuance, funding, effective — the start), `amendment`, `repayment` (a payment that leaves the obligation outstanding), `retirement` (repaid in full, redeemed in whole, defeased, discharged), `termination`, `exchange`, `default`, `maturity`, `commitment_termination`. `precision` is `day`, `month` or `year` for how precisely the cited text states the date. `prior` marks a term stated as it stood before an amendment; `expected` marks a date the filing states as planned rather than occurred (an expected closing, a noticed redemption). An event the filing states without a date is a fact with `normalized_date` null. The flat `start_date`, `maturity_date` and `commitment_termination_date` columns are the current (non-prior, non-expected) `closing`, `maturity` and `commitment_termination` facts.
 - `status_json`: `{status, status_date}` where `status_date` is a full evidence payload (#141).
 - `interest_rate_json`: `{kind, rate_pct, spans, derived_from}` (#157).
-- `lender_disclosure`: How completely this mention identifies who holds the debt, derived from the party clusters: `complete` when every `lender` cluster is `named`; `collective_present` when any is `collective` (`the other lenders party thereto`); `none_named` when the mention names no lender at all (a public-market series, a redemption notice, a syndicate where only the agent is named). Replaces the `lenders_known_incomplete` boolean, which was true for the second and third cases alike and so could not distinguish "something is undisclosed" from "nothing was disclosed here". Pre-stage-2 responses replay the flag the model declared, mapped onto these values.
+- `lender_disclosure`: How completely this mention identifies who holds the debt, derived from the party clusters: `complete` when every `lender` cluster is `named`; `collective_present` when any is `collective` (`the other lenders party thereto`); `none_named` when the mention names no lender at all (a public-market series, a redemption notice, a syndicate where only the agent is named). Replaces the `lenders_known_incomplete` boolean, which was true for the second and third cases alike and so could not distinguish "something is undisclosed" from "nothing was disclosed here".
 - `synthesized_by`: The rule that minted this row, when the extractor synthesized it rather than the model returning it (#203); null on every model-emitted row. The only value today is `prior_state`: the state of an amended instrument before the amendment, built from the `prior`-marked terms on the object that describes the amendment.
 - `synthesized_from_mention_id`: The `debt_instrument_mention_id` of the model-emitted row a synthesized row was minted from — always in the same item. Neither column is hashed into the mention id.
 
@@ -446,11 +446,6 @@ rows and a no-op when run twice.
 
 ##### Reading them safely
 
-- **Older partitions key spans as `mentions`, not `spans`.** Partitions written
-  before the evidence-shape change (#128) use the old key with the same element
-  shape. `matcher.cluster_canonical_key` carries the fallback; any new consumer
-  needs it too. This is schema versioning living inside an opaque string, where
-  neither the column types declared above nor a parquet reader can see it.
 - **A missing column does not read as a missing value.** `read_table` reindexes
   an absent column to `NaN`, and `NaN` is truthy, so the common
   `json.loads(str(value or "[]"))` idiom passes it the literal text `nan` and
@@ -597,7 +592,7 @@ The OpenAI batch extract backend keeps its resumable, file-native job state unde
 <artifact-root>/extract-batches/
   active.json                        # {"job_id": ...}; job_id is null when idle
   job_id=<run_id>/manifest.json      # static job config + claimed classification partitions
-  job_id=<run_id>/state.jsonl        # one line per item: source partition + pending request
+  job_id=<run_id>/state.jsonl.gz     # one line per item: source partition + pending request
                                      # marker + expiry resubmission counter + resumable row state
   job_id=<run_id>/batches.json       # in-flight OpenAI batches, seen batch ids, tick counter
   job_id=<run_id>/ticks/tick=<n>.json  # per-tick audit counts
@@ -611,7 +606,7 @@ locks/pipeline-writer.json           # single-writer lease: {holder, acquired_at
 
 When a job finishes, its mentions are written to the canonical `mentions` partitions and its
 audit log to `extractor-runs/run_id=<run_id>/full.jsonl`, exactly like the synchronous
-backend. `state.jsonl` and `batches.json` are working state, not canonical outputs.
+backend. `state.jsonl.gz` and `batches.json` are working state, not canonical outputs.
 
 A `job_id=<run_id>/` directory is never deleted, including when a job is abandoned as
 corrupt, so a wedged poller leaves its evidence behind. Only `active.json` decides which

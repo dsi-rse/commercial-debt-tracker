@@ -42,18 +42,6 @@ _ORPHANED_TEMP_RE = re.compile(r"(?:^|/)tmp[^/]*\.parquet$")
 # One client per AWS profile for every S3 call in the process: construction is
 # expensive (credential resolution, endpoint discovery), and the partition scans
 # issue thousands of calls per run (#83).
-#
-# Keyed by profile because there used to be two unreconciled factories. This
-# module's was a singleton built with no profile at all, so `--aws-profile`
-# reached ingest's own client and nothing else — every read_table, every
-# list_objects_v2 behind a partition scan, and every artifact write resolved
-# credentials from the ambient environment instead (#71). The other,
-# `ingest.default_s3_client`, took a profile but was uncached, so it built a
-# fresh Session per call and callers had to memoize it by hand
-# (`itemizer.core.ensure_s3_client`) — and its own default was the empty
-# profile, which is why the itemize and extract stages dropped the flag too.
-# `ingest.default_s3_client` now delegates here, leaving one cache and one
-# place that knows how a profile becomes a client.
 _S3_CLIENTS: dict[str, object] = {}
 _BOTO3_SESSIONS: dict[str, boto3.Session] = {}
 # The profile `--aws-profile` selected for this process. Empty means the
@@ -124,10 +112,6 @@ def boto3_session(profile_name: str | None = None) -> boto3.Session:
         session = boto3.Session(profile_name=resolved) if resolved else boto3.Session()
         _BOTO3_SESSIONS[resolved] = session
     return session
-
-
-def _s3_client():  # noqa: ANN202
-    return s3_client()
 
 
 # Failures a streaming body read surfaces after get_object has returned, where
@@ -212,7 +196,7 @@ def artifact_exists(path: ArtifactPath) -> bool:
     normalized = normalize_artifact_path(path)
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
-        client = _s3_client()
+        client = s3_client()
         try:
             client.head_object(Bucket=bucket, Key=key)
             return True
@@ -229,7 +213,7 @@ def list_artifacts(base: ArtifactPath, *, suffix: str = "") -> list[str]:
     normalized = normalize_artifact_path(base).rstrip("/")
     if is_s3_uri(normalized):
         bucket, prefix = parse_s3_uri(normalized)
-        paginator = _s3_client().get_paginator("list_objects_v2")
+        paginator = s3_client().get_paginator("list_objects_v2")
         results: list[str] = []
         for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
             contents = cast(list[dict[str, str]], page.get("Contents", []))
@@ -264,7 +248,7 @@ def list_artifacts_with_versions(
     normalized = normalize_artifact_path(base).rstrip("/")
     if is_s3_uri(normalized):
         bucket, prefix = parse_s3_uri(normalized)
-        paginator = _s3_client().get_paginator("list_objects_v2")
+        paginator = s3_client().get_paginator("list_objects_v2")
         results: dict[str, str] = {}
         for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
             for obj in cast(list[dict[str, str]], page.get("Contents", [])):
@@ -376,7 +360,7 @@ def read_json_artifact(path: ArtifactPath) -> dict[str, object] | list[object]:
     normalized = normalize_artifact_path(path)
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
-        body = get_object_bytes(_s3_client(), bucket, key)
+        body = get_object_bytes(s3_client(), bucket, key)
         return cast(dict[str, object] | list[object], json.loads(body.decode("utf-8")))
     return cast(
         dict[str, object] | list[object],
@@ -389,7 +373,7 @@ def read_text_artifact(path: ArtifactPath) -> str:
     normalized = normalize_artifact_path(path)
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
-        body = get_object_bytes(_s3_client(), bucket, key)
+        body = get_object_bytes(s3_client(), bucket, key)
         return body.decode("utf-8")
     return Path(normalized).read_text(encoding="utf-8")
 
@@ -417,7 +401,7 @@ def write_json_artifact_if_absent(
     normalized = normalize_artifact_path(path)
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
-        client = _s3_client()
+        client = s3_client()
         try:
             client.put_object(Bucket=bucket, Key=key, Body=body, IfNoneMatch="*")
         except client.exceptions.ClientError as error:  # type: ignore[attr-defined]
@@ -449,7 +433,7 @@ def read_json_artifact_versioned(
     normalized = normalize_artifact_path(path)
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
-        body, response = _get_object_with_body(_s3_client(), bucket, key)
+        body, response = _get_object_with_body(s3_client(), bucket, key)
         version = str(response["ETag"])
     else:
         body = Path(normalized).read_bytes()
@@ -476,7 +460,7 @@ def replace_json_artifact_if_match(
     normalized = normalize_artifact_path(path)
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
-        client = _s3_client()
+        client = s3_client()
         try:
             client.put_object(Bucket=bucket, Key=key, Body=body, IfMatch=version)
         except client.exceptions.ClientError as error:  # type: ignore[attr-defined]
@@ -505,7 +489,7 @@ def write_json_artifact(path: ArtifactPath, payload: dict[str, object]) -> str:
     normalized = normalize_artifact_path(path)
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
-        _s3_client().put_object(Bucket=bucket, Key=key, Body=body)
+        s3_client().put_object(Bucket=bucket, Key=key, Body=body)
         return normalized
     local_path = Path(normalized)
     local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -525,7 +509,7 @@ def write_text_artifact(path: ArtifactPath, body: str) -> str:
     normalized = normalize_artifact_path(path)
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
-        _s3_client().put_object(Bucket=bucket, Key=key, Body=body.encode("utf-8"))
+        s3_client().put_object(Bucket=bucket, Key=key, Body=body.encode("utf-8"))
         return normalized
     local_path = Path(normalized)
     local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -543,7 +527,7 @@ def write_bytes_artifact(path: ArtifactPath, body: bytes) -> str:
     normalized = normalize_artifact_path(path)
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
-        _s3_client().put_object(Bucket=bucket, Key=key, Body=body)
+        s3_client().put_object(Bucket=bucket, Key=key, Body=body)
         return normalized
     local_path = Path(normalized)
     local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -720,6 +704,17 @@ def coerce_dataset_text(value: object) -> str | None:
     return text or None
 
 
+def json_column(row: Mapping[str, object], column: str) -> object | None:
+    """Parse one JSON text column; None when it is absent, missing or not JSON."""
+    text = coerce_dataset_text(row.get(column))
+    if text is None:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+
 def write_gzip_text_artifact(path: ArtifactPath, body: str) -> str:
     """Write text gzip-compressed.
 
@@ -731,7 +726,7 @@ def write_gzip_text_artifact(path: ArtifactPath, body: str) -> str:
     normalized = normalize_artifact_path(path)
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
-        _s3_client().put_object(Bucket=bucket, Key=key, Body=compressed)
+        s3_client().put_object(Bucket=bucket, Key=key, Body=compressed)
         return normalized
     target = Path(normalized)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -744,7 +739,7 @@ def read_gzip_text_artifact(path: ArtifactPath) -> str:
     normalized = normalize_artifact_path(path)
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
-        body = get_object_bytes(_s3_client(), bucket, key)
+        body = get_object_bytes(s3_client(), bucket, key)
     else:
         body = Path(normalized).read_bytes()
     return gzip.decompress(body).decode("utf-8")
@@ -1033,9 +1028,9 @@ def _read_dataset_with_arrow(
     ``FileNotFoundError`` is caught alongside, and is a different story: it is
     not an ``ArrowException``, so it used to escape and kill the read outright
     where the old per-file path returned an empty frame and carried on. A
-    partition can genuinely vanish between the listing and the scan —
-    ``repair_document_shards`` and the snapshot prune both delete live
-    partitions — and the per-file fallback handles that case correctly.
+    partition can genuinely vanish between the listing and the scan — the
+    snapshot prune deletes live partitions — and the per-file fallback handles
+    that case correctly.
 
     The exception comes back with the result so the caller can say which of the
     two happened. Reporting every fallback as "pre-#187 types" was a confident
@@ -1129,7 +1124,7 @@ def write_table(path: ArtifactPath, table: pd.DataFrame) -> str:
         buffer = io.BytesIO()
         pyarrow.parquet.write_table(arrow_table, buffer)
         bucket, key = parse_s3_uri(normalized)
-        _s3_client().put_object(Bucket=bucket, Key=key, Body=buffer.getvalue())
+        s3_client().put_object(Bucket=bucket, Key=key, Body=buffer.getvalue())
         return normalized
 
     local_path = Path(normalized)
@@ -1154,29 +1149,9 @@ def delete_artifact(path: ArtifactPath) -> None:
     normalized = normalize_artifact_path(path)
     if is_s3_uri(normalized):
         bucket, key = parse_s3_uri(normalized)
-        _s3_client().delete_object(Bucket=bucket, Key=key)
+        s3_client().delete_object(Bucket=bucket, Key=key)
         return
     Path(normalized).unlink(missing_ok=True)
-
-
-def next_batch_path(directory: Path, prefix: str) -> Path:
-    """Return the next sequential Parquet batch path in a directory."""
-    directory.mkdir(parents=True, exist_ok=True)
-    pattern = re.compile(rf"^{re.escape(prefix)}-(\d+)\.parquet$")
-    highest = 0
-    for path in directory.glob(f"{prefix}-*.parquet"):
-        match = pattern.match(path.name)
-        if match is None:
-            continue
-        highest = max(highest, int(match.group(1)))
-    return directory / f"{prefix}-{highest + 1:06d}.parquet"
-
-
-def write_parquet_batch(directory: Path, prefix: str, table: pd.DataFrame) -> Path:
-    """Write a sequentially numbered Parquet batch and return its path."""
-    path = next_batch_path(directory, prefix)
-    write_table(path, table)
-    return path
 
 
 def write_partition_table(
@@ -1192,49 +1167,3 @@ def write_partition_table(
         partition_path = join_artifact_path(partition_path, f"{key}={value}")
     final_path = join_artifact_path(partition_path, filename or "part-0000.parquet")
     return write_table(final_path, table)
-
-
-def append_new_rows(
-    path: Path,
-    rows: pd.DataFrame,
-    key_columns: Sequence[str],
-    columns: Sequence[str],
-    *,
-    replace_keys: Iterable[object] | None = None,
-    replace_key_column: str | None = None,
-) -> pd.DataFrame:
-    """Append rows to a keyed Parquet table and return the full updated table."""
-    existing = read_table(path, columns)
-    existing = existing.reindex(columns=columns)
-    rows = rows.reindex(columns=columns)
-    if existing.empty and rows.empty:
-        write_table(path, existing)
-        return existing
-
-    if (
-        replace_keys is not None
-        and replace_key_column is not None
-        and not existing.empty
-    ):
-        existing = existing.loc[~existing[replace_key_column].isin(set(replace_keys))]
-
-    if rows.empty:
-        updated = existing
-    elif existing.empty:
-        updated = rows
-    else:
-        combined = pd.concat([existing, rows], ignore_index=True)
-        updated = combined.drop_duplicates(subset=list(key_columns), keep="last")
-
-    write_table(path, updated)
-    return updated
-
-
-def missing_keys(
-    existing: pd.DataFrame, candidates: Iterable[object], key_column: str
-) -> set[object]:
-    """Return candidate keys that are absent from an existing table."""
-    candidate_set = set(candidates)
-    if existing.empty or key_column not in existing:
-        return candidate_set
-    return candidate_set.difference(set(existing[key_column]))

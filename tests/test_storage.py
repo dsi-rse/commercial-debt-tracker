@@ -11,7 +11,7 @@ import pyarrow.fs
 import pyarrow.parquet as pq
 import pytest
 
-from cdt import ingest, storage
+from cdt import storage
 
 
 class FakeFrozenCredentials(NamedTuple):
@@ -77,7 +77,7 @@ def _fake_boto3_session(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_storage_clients_use_the_configured_aws_profile() -> None:
     """--aws-profile must reach this module's client, not only ingest's (#71).
 
-    ``_s3_client`` was a singleton built as ``boto3.client("s3", ...)`` with no
+    The client was once a singleton built as ``boto3.client("s3", ...)`` with no
     profile at all, so a run pointed at a non-default account read its manifests
     through the right credentials and then did every artifact read, every
     list_objects_v2 behind a partition scan and every write through whatever the
@@ -86,26 +86,27 @@ def test_storage_clients_use_the_configured_aws_profile() -> None:
     storage.configure_s3_profile("analysis")
 
     assert storage.configured_s3_profile() == "analysis"
-    assert storage._s3_client() == "s3:'analysis'"
+    assert storage.s3_client() == "s3:'analysis'"
     assert FakeSession.created == ["analysis"]
 
 
-def test_default_s3_client_without_a_profile_resolves_the_configured_one() -> None:
-    """``ensure_s3_client()`` passes no profile, and used to get the empty one (#71).
+def test_document_bodies_on_s3_resolve_through_the_configured_profile() -> None:
+    """``ensure_s3_client`` passes no profile, which must mean the configured one.
 
-    That call is how itemize and extract resolve document bodies from S3, so its
-    default silently decided the credentials for two whole stages.
+    That call is how itemize and 6-K triage resolve document bodies from S3, so its
+    default decides the credentials for two whole stages.
     """
+    from cdt.itemizer.core import ensure_s3_client
+
     storage.configure_s3_profile("analysis")
 
-    assert ingest.default_s3_client() == "s3:'analysis'"
+    assert ensure_s3_client(None, [{"resource_uri": "s3://b/k"}]) == "s3:'analysis'"
 
 
 def test_an_explicit_profile_still_wins_over_the_configured_one() -> None:
     """Ingest and the 6-K scraper keep passing ``config.aws_profile``."""
     storage.configure_s3_profile("analysis")
 
-    assert ingest.default_s3_client("other") == "s3:'other'"
     assert storage.s3_client("other") == "s3:'other'"
 
 
@@ -113,20 +114,16 @@ def test_the_empty_profile_means_the_ambient_credential_chain() -> None:
     """The CLI default is "", which must stay "no profile" (the old behaviour)."""
     storage.configure_s3_profile(None)
 
-    assert storage._s3_client() == "s3:None"
+    assert storage.s3_client() == "s3:None"
     assert FakeSession.created == [None]
 
 
 def test_clients_are_memoized_per_profile() -> None:
-    """One credentialed object per profile: construction is the #83 cost.
-
-    ``ingest.default_s3_client`` used to build a fresh Session per call, which
-    is the only reason ``itemizer.core.ensure_s3_client`` memoizes by hand.
-    """
+    """One credentialed object per profile: construction is the #83 cost."""
     storage.configure_s3_profile("analysis")
 
-    first = storage._s3_client()
-    second = ingest.default_s3_client()
+    first = storage.s3_client()
+    second = storage.s3_client()
     third = storage.s3_client("analysis")
     other = storage.s3_client("second-account")
 
