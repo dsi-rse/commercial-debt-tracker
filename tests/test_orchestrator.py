@@ -474,8 +474,6 @@ def test_scheduled_runs_prepare_both_genres_by_default(
         == 0
     )
     assert captured[0].genres == DEFAULT_GENRES
-    # Unset means "the run's CIKs", so one list covers both genres.
-    assert captured[0].sixk_cik_file is None
 
 
 def test_genres_can_be_narrowed_on_a_scheduled_run(
@@ -497,8 +495,6 @@ def test_genres_can_be_narrowed_on_a_scheduled_run(
                 str(tmp_path),
                 "--genres",
                 "6-K",
-                "--sixk-cik-file",
-                "fpi.txt",
                 "historical",
                 "--cik-file",
                 "c.txt",
@@ -511,7 +507,6 @@ def test_genres_can_be_narrowed_on_a_scheduled_run(
         == 0
     )
     assert captured[0].genres == (GENRE_6K,)
-    assert captured[0].sixk_cik_file == "fpi.txt"
 
 
 def test_genres_come_from_the_environment_when_not_passed(

@@ -76,7 +76,7 @@ make local-run
 Notes:
 
 - `cdt` is the stage-oriented CLI for local and ad hoc runs.
-- Both `cdt pipeline` and `cdt-orchestrator` prepare 8-K and 6-K filings by default; `--genres 8-K` (or `6-K`) narrows a run to one genre, and `--sixk-cik-file` gives the 6-K genre its own CIK list.
+- `cdt ingest`, `cdt pipeline` and `cdt-orchestrator` cover every genre (8-K and 6-K) by default, for one CIK list; `--genres 8-K` (or `6-K`) narrows a run to one genre. To get an issuer's 6-Ks, put it in the CIK list.
 - `cdt-orchestrator` is the deployment-oriented entrypoint used by ECS.
 - `cdt pipeline` writes final snapshots only when `--final-database-root` is passed.
 - `cdt-orchestrator` reads `FINAL_DATABASE_ROOT` from the environment, or accepts `--final-database-root` before the mode.
@@ -154,6 +154,5 @@ Optional runtime configuration:
   because triage reads a lot of text and returns a list of ids, so it is priced for
   volume; see `docs/sixk-two-stage-triage.md`. `SIXK_TRIAGE_PROVIDER` (`openrouter` default,
   or `openai`) picks the API the triage call goes to.
-- `GENRES` (default `8-K,6-K`) and `SIXK_CIK_FILE`: orchestrator defaults for
-  `--genres` and `--sixk-cik-file`
+- `GENRES` (default `8-K,6-K`): the orchestrator default for `--genres`
 

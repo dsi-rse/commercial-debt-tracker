@@ -67,11 +67,12 @@ the 6-K chain scrapes the network and calls a paid model before it does
 anything else. A caller that never mentions genres should get the stages it
 named and nothing that spends money for it.
 
-### `PipelineConfig.sixk_cik_file`
+### One CIK list for every genre
 
-The intent is a single list of issuers. A separate 6-K list exists only
-because a list chosen for 8-K coverage may contain no foreign private issuers,
-which would make the 6-K chain a no-op.
+A run searches every selected genre for the same CIK list: the caller names
+issuers, not forms. A separate 6-K list (`--sixk-cik-file`) existed because a
+list chosen for 8-K coverage may contain no foreign private issuers; it was
+removed in favour of putting those issuers in the one list (2026-10).
 
 ### `PipelineOrchestrator._setup` (genre validation)
 

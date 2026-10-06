@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from typing import Self
@@ -97,8 +97,6 @@ class PipelineConfig:
     #: Which genres to prepare. 8-K only when built in code, because the 6-K
     #: chain scrapes and calls a paid model; the CLIs pass DEFAULT_GENRES.
     genres: tuple[str, ...] = (GENRE_8K,)
-    #: CIKs for the 6-K genre; None means `cik_file`.
-    sixk_cik_file: ArtifactPath | None = None
     sixk_batch_size: int = DEFAULT_STAGE_BATCH_SIZE
     sixk_concurrency: int = SIXK_DEFAULT_CONCURRENCY
 
@@ -294,11 +292,11 @@ class PipelineOrchestrator:
         resolved_artifact_root: str,
         renew: Callable[[], None] | None,
     ) -> None:
-        """Run the 6-K chain into ``outcome``; it reads its own CIK list."""
-        del ciks
+        """Run the 6-K chain into ``outcome``."""
         outcome.sixk_ingest, outcome.snippets = self._ingest_and_triage_sixk(
             resolved_start,
             resolved_end,
+            ciks,
             resolved_artifact_root,
             renew,
         )
@@ -307,25 +305,22 @@ class PipelineOrchestrator:
         self: Self,
         resolved_start: date,
         resolved_end: date,
+        ciks: set[str],
         resolved_artifact_root: str,
         renew: Callable[[], None] | None = None,
     ) -> tuple[IngestRunResult, pd.DataFrame]:
         """Run the 6-K chain: acquire filings, then triage them into snippets."""
-        sixk_ciks = read_cik_file(self.config.sixk_cik_file or self.config.cik_file)
         self._log_stage_start(
             "ingest-sixk",
             batch_size=self.config.ingest_batch_size,
             forms=",".join(GENRES[GENRE_6K].form_types),
-            ciks=len(sixk_ciks),
+            ciks=len(ciks),
         )
-        sixk_config = self._ingest_config(
-            resolved_start, resolved_end, resolved_artifact_root
+        _, sixk_ingest = ingest_genre(
+            GENRE_6K,
+            self._ingest_config(resolved_start, resolved_end, resolved_artifact_root),
+            ciks=ciks,
         )
-        if self.config.sixk_cik_file:
-            sixk_config = replace(
-                sixk_config, cik_file=Path(str(self.config.sixk_cik_file))
-            )
-        _, sixk_ingest = ingest_genre(GENRE_6K, sixk_config, ciks=sixk_ciks)
         self._log_stage_complete(
             "ingest-sixk",
             rows=sixk_ingest.total_rows,

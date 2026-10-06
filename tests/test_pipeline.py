@@ -268,65 +268,6 @@ def test_genres_narrow_the_run_to_one_chain(
     assert result.sixk_ingest is not None
 
 
-def test_the_sixk_chain_can_take_its_own_cik_list(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A list chosen for 8-K coverage may contain no foreign private issuers."""
-    cik_file = tmp_path / "ciks.txt"
-    cik_file.write_text("320193\n", encoding="utf-8")
-    sixk_cik_file = tmp_path / "fpi-ciks.txt"
-    sixk_cik_file.write_text("1023514\n", encoding="utf-8")
-    asked: dict[str, set[str] | None] = {}
-
-    monkeypatch.setattr(
-        "cdt.ingest.genres.acquire_eightk_documents",
-        lambda config, **kwargs: (
-            asked.__setitem__("8-K", kwargs.get("ciks")),
-            (pd.DataFrame(), _sixk_ingest_result(tmp_path, kwargs.get("ciks"))),
-        )[1],
-    )
-    monkeypatch.setattr(
-        "cdt.pipeline.itemize_pending_documents", lambda **kwargs: pd.DataFrame()
-    )
-    monkeypatch.setattr(
-        "cdt.pipeline.classify_pending_items", lambda **kwargs: pd.DataFrame()
-    )
-    monkeypatch.setattr(
-        "cdt.ingest.genres.acquire_scraped_sixk_documents",
-        lambda config, **kwargs: (
-            asked.__setitem__("6-K", kwargs.get("ciks")),
-            (pd.DataFrame(), _sixk_ingest_result(tmp_path, kwargs.get("ciks"))),
-        )[1],
-    )
-    monkeypatch.setattr(
-        "cdt.pipeline.triage_pending_documents", lambda **kwargs: pd.DataFrame()
-    )
-    monkeypatch.setattr(
-        "cdt.pipeline.extract_pending_items", lambda **kwargs: pd.DataFrame()
-    )
-    monkeypatch.setattr(
-        "cdt.pipeline.match_pending_mentions",
-        lambda **kwargs: {
-            "debt_instrument_mentions": pd.DataFrame(),
-            "debt_instrument": pd.DataFrame(),
-        },
-    )
-
-    run_pipeline(
-        PipelineConfig(
-            mode="historical",
-            cik_file=str(cik_file),
-            sixk_cik_file=str(sixk_cik_file),
-            start_date=date(2026, 9, 8),
-            end_date=date(2026, 9, 8),
-            artifact_root=str(tmp_path),
-            genres=DEFAULT_GENRES,
-        )
-    )
-
-    assert asked == {"8-K": {"320193"}, "6-K": {"1023514"}}
-
-
 def test_a_config_that_names_no_genres_does_not_acquire_the_sixk_chain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

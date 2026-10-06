@@ -187,15 +187,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--sixk-cik-file",
-        default=os.environ.get("SIXK_CIK_FILE") or None,
-        help=(
-            "CIKs for the 6-K genre, if they differ from --cik-file (env "
-            "SIXK_CIK_FILE). A list chosen for 8-K coverage can contain no "
-            "foreign private issuers, which makes the 6-K chain a no-op."
-        ),
-    )
-    parser.add_argument(
         "--force",
         action="store_true",
         help=(
@@ -274,7 +265,6 @@ def _pipeline_config(args: argparse.Namespace) -> PipelineConfig:
             if isinstance(args.genres, tuple)
             else normalize_genres(args.genres)
         ),
-        sixk_cik_file=args.sixk_cik_file,
     )
 
 

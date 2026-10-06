@@ -21,7 +21,6 @@ from cdt.classifier.sixk import DEFAULT_CONCURRENCY as SIXK_DEFAULT_CONCURRENCY
 from cdt.classifier.sixk import sixk_snippets_root, triage_pending_documents
 from cdt.datasets import (
     SIXK_DOCUMENT_DATASET_NAME,
-    SIXK_FORM_TYPES,
     dataset_root,
     default_artifact_root,
 )
@@ -49,8 +48,6 @@ from cdt.ingest.core import (
     documents_root,
 )
 from cdt.ingest.genres import ingest_genre
-from cdt.ingest.mirror import mirror_root
-from cdt.ingest.sixk import acquire_scraped_sixk_documents
 from cdt.lease import (
     PIPELINE_WRITER_LEASE,
     Lease,
@@ -196,49 +193,6 @@ def build_parser() -> argparse.ArgumentParser:
             default=None if mode_name == "daily" else date.today(),
         )
         subparser.set_defaults(func=run_ingest)
-
-    sixk_ingest_parser = subparsers.add_parser(
-        "ingest-sixk",
-        help="Acquire 6-K filings from the scraper into the 6-K documents dataset.",
-    )
-    add_artifact_root_argument(sixk_ingest_parser)
-    sixk_ingest_parser.add_argument("--force", action="store_true")
-    sixk_ingest_parser.add_argument(
-        "--batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
-    )
-    sixk_ingest_parser.add_argument("--failure-file", default=None)
-    sixk_ingest_parser.add_argument(
-        "--form-types",
-        type=parse_form_types,
-        default=SIXK_FORM_TYPES,
-        help="Comma-separated SEC form names to acquire.",
-    )
-    sixk_ingest_parser.add_argument("--bucket", default=DEFAULT_BUCKET)
-    sixk_ingest_parser.add_argument("--aws-profile", default=DEFAULT_AWS_PROFILE)
-    sixk_ingest_parser.add_argument("--s3-prefix", default=DEFAULT_S3_PREFIX)
-    add_logging_arguments(sixk_ingest_parser, noun="6-K ingest")
-    sixk_ingest_subparsers = sixk_ingest_parser.add_subparsers(
-        dest="ingest_mode", required=True
-    )
-    for mode_name, help_text in (
-        ("daily", "Acquire 6-K filings from a daily date window."),
-        ("historical", "Acquire 6-K filings over an explicit date range."),
-    ):
-        sixk_subparser = sixk_ingest_subparsers.add_parser(mode_name, help=help_text)
-        sixk_subparser.add_argument(
-            "cik_file", help="Local path or s3:// URI for one-CIK-per-line input."
-        )
-        sixk_subparser.add_argument(
-            "--start-date",
-            type=parse_date,
-            default=None if mode_name == "daily" else ALL_TIME_START_DATE,
-        )
-        sixk_subparser.add_argument(
-            "--end-date",
-            type=parse_date,
-            default=None if mode_name == "daily" else date.today(),
-        )
-        sixk_subparser.set_defaults(func=run_sixk_ingest)
 
     itemize_parser = subparsers.add_parser(
         "itemize", help="Extract 8-K item sections from document partitions."
@@ -430,15 +384,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     pipeline_parser.add_argument(
-        "--sixk-cik-file",
-        default=None,
-        help=(
-            "CIKs for the 6-K genre, if they differ from the run's. Exists "
-            "because a list chosen for 8-K coverage can contain no foreign "
-            "private issuers, which makes the 6-K chain a no-op."
-        ),
-    )
-    pipeline_parser.add_argument(
         "--sixk-batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
     )
     pipeline_parser.add_argument(
@@ -548,65 +493,6 @@ def run_ingest(args: argparse.Namespace) -> int:
     return 0
 
 
-def run_sixk_ingest(args: argparse.Namespace) -> int:
-    """Run the 6-K ingest subcommand."""
-    configure_logging(quiet=args.quiet, log_file=args.log_file)
-    logger = logging.getLogger(__name__)
-    output_root = args.artifact_root or default_artifact_root()
-    lease = acquire_stage_lease(output_root, logger, "6-K ingest")
-    if lease is None:
-        return 1
-    try:
-        start_date, end_date = resolve_ingest_dates(args)
-        config = IngestConfig(
-            mode=args.ingest_mode,
-            bucket=args.bucket,
-            cik_file=Path(str(args.cik_file)),
-            start_date=start_date,
-            end_date=end_date,
-            output_root=output_root,
-            force=args.force,
-            batch_size=args.batch_size,
-            failure_file=args.failure_file,
-            aws_profile=args.aws_profile,
-            s3_prefix=args.s3_prefix,
-            form_types=args.form_types,
-            dataset_name=SIXK_DOCUMENT_DATASET_NAME,
-        )
-        logger.info(
-            "Starting 6-K ingest: mode=%s bucket=%s forms=%s start_date=%s "
-            "end_date=%s output_root=%s",
-            config.mode,
-            config.bucket,
-            ",".join(config.form_types),
-            config.start_date,
-            config.end_date,
-            config.output_root,
-        )
-        _, result = acquire_scraped_sixk_documents(
-            config, ciks=read_cik_file(args.cik_file)
-        )
-    except ValueError as exc:
-        logger.error("Invalid 6-K ingest arguments: %s", exc)
-        return 2
-    except Exception:
-        logger.exception("6-K ingest failed")
-        return 1
-    finally:
-        release_lease(lease)
-    print(
-        f"Acquired {result.total_rows} 6-K document rows from {result.start_date} "
-        f"through {result.end_date}."
-    )
-    print(f"Documents dataset: {result.documents_root}.")
-    print(f"Mirrored submissions: {mirror_root(result.output_root)}.")
-    print(f"Run manifest: {result.run_manifest}.")
-    print(f"Failure registry: {result.failure_file}.")
-    if result.failures:
-        print(f"Filings that could not be acquired: {result.failures}.")
-    return 0
-
-
 def run_itemize(args: argparse.Namespace) -> int:
     """Run the itemize subcommand."""
     configure_logging(quiet=args.quiet, log_file=args.log_file)
@@ -682,7 +568,6 @@ def run_pipeline_command(args: argparse.Namespace) -> int:
                 loose_match_threshold=args.loose_match_threshold,
                 ambiguity_margin=args.ambiguity_margin,
                 genres=args.genres,
-                sixk_cik_file=args.sixk_cik_file,
                 sixk_batch_size=args.sixk_batch_size,
                 sixk_concurrency=args.sixk_concurrency,
             )
