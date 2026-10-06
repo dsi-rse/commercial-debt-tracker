@@ -7,7 +7,7 @@ from decimal import Decimal, InvalidOperation
 
 import pandas as pd
 
-from cdt.extractor.core import normalize_numeric_string
+from cdt.extractor.normalize.amounts import normalize_numeric_string
 from cdt.matcher.normalize import (
     MONTH_TEXT_LENGTH,
     YEAR_TEXT_LENGTH,

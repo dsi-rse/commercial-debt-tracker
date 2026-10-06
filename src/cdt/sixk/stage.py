@@ -125,11 +125,11 @@ def item_id_for(
 
 
 class OpenRouterTextClient:
-    """Adapt ``extractor.core.OpenRouterChatClient`` to return text only."""
+    """Adapt ``extractor.llm.OpenRouterChatClient`` to return text only."""
 
     def __init__(self: Self, *, api_key: str | None = None) -> None:
         """Initialize the underlying extractor client."""
-        from cdt.extractor.core import OpenRouterChatClient
+        from cdt.extractor.llm import OpenRouterChatClient
 
         self._inner = OpenRouterChatClient(api_key=api_key)
 

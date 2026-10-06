@@ -20,13 +20,10 @@ from cdt.datasets import (
     save_completion_registry,
 )
 from cdt.extractor import extract_pending_items, mentions_root
-from cdt.extractor.core import (
-    CLASSIFICATION_SOURCES,
-    DEBT_INSTRUMENT_MENTION_COLUMNS,
-    ExtractionRowState,
-    collect_pending_extract_items,
-    pending_extract_partitions,
-)
+from cdt.extractor.live import collect_pending_extract_items
+from cdt.extractor.outputs import CLASSIFICATION_SOURCES, pending_extract_partitions
+from cdt.extractor.schema import DEBT_INSTRUMENT_MENTION_COLUMNS
+from cdt.extractor.state import ExtractionRowState
 from cdt.sixk.stage import SIXK_SNIPPET_COLUMNS, item_id_for
 from cdt.storage import read_dataset, write_partition_table
 
@@ -233,7 +230,7 @@ def _stub_workflow(monkeypatch: pytest.MonkeyPatch) -> None:
         return row_state
 
     monkeypatch.setattr(
-        "cdt.extractor.core.run_extraction_workflow", fake_run_extraction_workflow
+        "cdt.extractor.live.run_extraction_workflow", fake_run_extraction_workflow
     )
 
 
@@ -406,7 +403,7 @@ def _stub_workflow_with_no_mentions(monkeypatch: pytest.MonkeyPatch) -> None:
         return row_state
 
     monkeypatch.setattr(
-        "cdt.extractor.core.run_extraction_workflow", fake_run_extraction_workflow
+        "cdt.extractor.live.run_extraction_workflow", fake_run_extraction_workflow
     )
 
 

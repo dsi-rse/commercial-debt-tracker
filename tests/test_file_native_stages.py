@@ -29,34 +29,45 @@ from cdt.datasets import (
     shard_for_cik,
 )
 from cdt.extractor import extract_pending_items, mentions_root
-from cdt.extractor.core import (
-    DEBT_INSTRUMENT_MENTION_COLUMNS,
-    INSTRUMENT_RELATION_TYPES,
-    CompletionResult,
-    ExtractionRowState,
-    InstrumentIEStage,
-    InstrumentRelationStage,
-    NERStage,
-    canonical_amount_value,
-    canonical_instrument_name,
+from cdt.extractor.llm import (
     completion_result_from_batch_line,
     completion_result_from_response,
+    load_prompt,
+)
+from cdt.extractor.normalize.amounts import (
+    canonical_amount_value,
     currency_candidates_from_text,
     currency_from_name,
-    date_plus_tenor,
-    dates_agree,
     is_rate_like_amount_text,
-    load_prompt,
     name_derived_principal_payload,
     normalized_amount_from_name,
     normalized_amount_from_text,
+)
+from cdt.extractor.normalize.dates import (
+    date_plus_tenor,
+    dates_agree,
     normalized_date_from_text,
     normalized_maturity_from_text,
     normalized_month_year_from_text,
+)
+from cdt.extractor.normalize.parties import canonical_instrument_name
+from cdt.extractor.schema import (
+    DEBT_INSTRUMENT_MENTION_COLUMNS,
+    INSTRUMENT_RELATION_TYPES,
+)
+from cdt.extractor.stages import (
+    InstrumentIEStage,
+    InstrumentRelationStage,
+    NERStage,
     oriented_lineage_pair,
+)
+from cdt.extractor.state import CompletionResult, ExtractionRowState
+from cdt.extractor.tags import (
     parse_tag_details,
     realign_tag_details,
     repair_unescaped_ampersands,
+)
+from cdt.extractor.validate import (
     validate_amount_is_not_rate,
     validate_dates_property,
     validate_interest_rate,
@@ -759,7 +770,7 @@ def test_extract_pending_items_writes_mentions_and_audit(
         return row_state
 
     monkeypatch.setattr(
-        "cdt.extractor.core.run_extraction_workflow",
+        "cdt.extractor.live.run_extraction_workflow",
         fake_run_extraction_workflow,
     )
 
@@ -851,7 +862,7 @@ def test_extract_pending_items_drains_all_partitions(
         return row_state
 
     monkeypatch.setattr(
-        "cdt.extractor.core.run_extraction_workflow",
+        "cdt.extractor.live.run_extraction_workflow",
         fake_run_extraction_workflow,
     )
 
@@ -897,7 +908,7 @@ def test_extract_pending_items_skips_empty_outputs_on_rerun(
         return row_state
 
     monkeypatch.setattr(
-        "cdt.extractor.core.run_extraction_workflow",
+        "cdt.extractor.live.run_extraction_workflow",
         fake_run_extraction_workflow,
     )
 
@@ -1061,7 +1072,8 @@ def test_published_mention_rows_is_the_single_publish_seam() -> None:
     every backend at once. The helper returns a fresh list so a caller that
     extends its result cannot mutate the state persisted to `state.jsonl`.
     """
-    from cdt.extractor.core import ExtractionRowState, published_mention_rows
+    from cdt.extractor.prior_state import published_mention_rows
+    from cdt.extractor.state import ExtractionRowState
 
     row_state = ExtractionRowState(
         item_row={"item_id": "item-1"}, stage_name="instrument_ie"
@@ -1194,7 +1206,7 @@ def test_mint_builds_the_prior_state_from_the_prior_marked_terms() -> None:
     the joinder may have changed; the successor is untouched apart from the
     pointer, and its id — which never hashed `amendment_of` — is unchanged.
     """
-    from cdt.extractor.core import mint_prior_state_rows
+    from cdt.extractor.prior_state import mint_prior_state_rows
 
     successor = amended_row()
     counters: dict[str, int] = {}
@@ -1242,7 +1254,7 @@ def test_mint_builds_the_prior_state_from_the_prior_marked_terms() -> None:
 
 def test_mint_refusals_are_counted_and_leave_the_rows_alone() -> None:
     """Each way the trigger can fail is named, and nothing is minted."""
-    from cdt.extractor.core import mint_prior_state_rows
+    from cdt.extractor.prior_state import mint_prior_state_rows
 
     def run(
         rows: list[dict[str, object]],
@@ -1317,7 +1329,7 @@ def test_mint_places_the_predecessor_at_the_right_origin() -> None:
     is minted with no start date rather than a date the filing did not state
     for that state of the facility.
     """
-    from cdt.extractor.core import mint_prior_state_rows
+    from cdt.extractor.prior_state import mint_prior_state_rows
 
     restated = amended_row(
         dates=[
@@ -1400,7 +1412,7 @@ def test_minted_no_origin_is_not_counted_when_the_mint_is_then_refused() -> None
     no synthesized row anywhere — a mint that never happened, inside the
     counters this docstring calls the pre-registered yield (#211).
     """
-    from cdt.extractor.core import mint_prior_state_rows
+    from cdt.extractor.prior_state import mint_prior_state_rows
 
     successor = amended_row(
         "m-successor",
@@ -1430,7 +1442,7 @@ def test_minted_no_origin_is_not_counted_when_the_mint_is_then_refused() -> None
 
 def test_mint_from_a_prior_maturity_alone_inherits_the_amount() -> None:
     """`extended the maturity from 2029 to 2031`: the commitment is unchanged."""
-    from cdt.extractor.core import mint_prior_state_rows
+    from cdt.extractor.prior_state import mint_prior_state_rows
 
     extended = amended_row(
         amounts=[
@@ -1477,7 +1489,7 @@ def test_mint_from_a_prior_maturity_alone_inherits_the_amount() -> None:
 
 def test_two_successors_sharing_one_prior_state_point_at_one_mint() -> None:
     """Byte-identical mints collapse to one row; both pointers still land."""
-    from cdt.extractor.core import mint_prior_state_rows
+    from cdt.extractor.prior_state import mint_prior_state_rows
 
     first = amended_row("m-a", raw_id="i-1")
     second = amended_row("m-b", raw_id="i-1", interest_rate_pct="5.25")
@@ -1494,7 +1506,7 @@ def test_two_successors_sharing_one_prior_state_point_at_one_mint() -> None:
 
 def test_mint_is_id_stable_and_idempotent() -> None:
     """Model-emitted ids never change, and minting its own output adds nothing."""
-    from cdt.extractor.core import mint_prior_state_rows
+    from cdt.extractor.prior_state import mint_prior_state_rows
 
     rows = [
         amended_row(),
@@ -1520,11 +1532,9 @@ def test_backfill_mints_over_existing_partitions_and_is_a_no_op_twice(
     tmp_path: Path,
 ) -> None:
     """A partition written before #203 gains its prior states, once."""
-    from cdt.extractor.core import (
-        ExtractionRowState,
-        backfill_mentions,
-        published_mention_rows,
-    )
+    from cdt.extractor.outputs import backfill_mentions
+    from cdt.extractor.prior_state import published_mention_rows
+    from cdt.extractor.state import ExtractionRowState
 
     successor = amended_row()
     write_partition_table(
@@ -1578,7 +1588,7 @@ def test_backfill_renews_the_writer_lease_once_per_rewritten_partition(
     removed without a single failure. Same shape as the seams this branch
     exists to close — both halves pinned, the connection not (#211).
     """
-    from cdt.extractor.core import backfill_mentions
+    from cdt.extractor.outputs import backfill_mentions
 
     for date, mention_id in (("2024-06-01", "m-june"), ("2024-07-01", "m-july")):
         write_partition_table(
@@ -2562,7 +2572,7 @@ def test_ner_validate_rejects_a_zero_tag_retry_after_an_earlier_attempt_tagged()
     None
 ):
     """The high-water mark: dropping every tag on retry is a failure (#176)."""
-    from cdt.extractor.core import AttemptRecord
+    from cdt.extractor.state import AttemptRecord
 
     row_state = _ner_row(MPLX_TEXT)
     row_state.all_attempts.append(
@@ -2595,7 +2605,7 @@ def test_ner_validate_high_water_never_misfires_on_a_debt_free_item() -> None:
     unconditionally: it is a comparison against the row's own history, not a
     floor on how many tags a response must carry.
     """
-    from cdt.extractor.core import AttemptRecord
+    from cdt.extractor.state import AttemptRecord
 
     text = "Acme Corp filed this report on January 1, 2024."
     row_state = _ner_row(text)
@@ -2622,11 +2632,11 @@ def test_ner_high_water_counts_tags_in_attempts_that_never_parsed() -> None:
     XML`, so a high-water mark built on `parse_tag_details` would read zero for
     exactly the attempts that matter most.
     """
-    from cdt.extractor.core import (
-        AttemptRecord,
+    from cdt.extractor.stages import (
         count_debt_instrument_tags,
         prior_debt_instrument_high_water,
     )
+    from cdt.extractor.state import AttemptRecord
 
     truncated = (
         "<body>The Company issued <debt_instrument>6.250% Senior Notes"
@@ -2659,7 +2669,8 @@ def test_ner_validate_rejects_a_byte_identical_echo_after_the_model_tagged() -> 
     earlier attempt on this row tagged something, and only a driven row builds
     that history the way production does.
     """
-    from cdt.extractor.core import handle_response, ner_input_body
+    from cdt.extractor.stages import ner_input_body
+    from cdt.extractor.workflow import handle_response
 
     row_state = _ner_row(MPLX_TEXT)
     row_state.current_attempt.messages = NERStage().preprocess(row_state)
@@ -2682,7 +2693,7 @@ def test_ner_validate_rejects_an_echo_that_drops_non_debt_tags() -> None:
     organization and a date and then regressed to a bare echo reads zero there,
     but the model has still discarded everything it found.
     """
-    from cdt.extractor.core import handle_response
+    from cdt.extractor.workflow import handle_response
 
     text = "Acme Corp filed this report on January 1, 2024."
     row_state = _ner_row(text)
@@ -2717,7 +2728,7 @@ def test_ner_validate_accepts_an_untagged_first_attempt() -> None:
     freshly built row state sees 0, so it would pass an off-by-one guard that
     rejects every genuine first attempt.
     """
-    from cdt.extractor.core import handle_response
+    from cdt.extractor.workflow import handle_response
 
     text = "This is the extracted event text."
     row_state = _ner_row(text)
@@ -2747,11 +2758,9 @@ def test_an_untagged_echo_is_accepted_after_a_failure_that_found_nothing() -> No
     zero used to be filed as a possible loss instead; see
     `_advance_after_stage` for why that was dropped.
     """
-    from cdt.extractor.core import (
-        PUBLISHABLE_ROW_STATES,
-        handle_response,
-        published_mention_rows,
-    )
+    from cdt.extractor.prior_state import published_mention_rows
+    from cdt.extractor.state import PUBLISHABLE_ROW_STATES
+    from cdt.extractor.workflow import handle_response
 
     text = "This is the extracted event text."
     row_state = _ner_row(text)
@@ -2780,7 +2789,8 @@ def test_ner_high_water_is_the_most_any_attempt_found_not_the_least() -> None:
     guard off, and let attempt 3 publish as a clean zero, which is the defect
     #176 describes, verbatim.
     """
-    from cdt.extractor.core import AttemptRecord, prior_debt_instrument_high_water
+    from cdt.extractor.stages import prior_debt_instrument_high_water
+    from cdt.extractor.state import AttemptRecord
 
     row_state = _ner_row(MPLX_TEXT)
     row_state.all_attempts.append(
@@ -2816,7 +2826,7 @@ def test_ner_give_up_check_is_not_escaped_by_whitespace() -> None:
     `early_stop` as an accepted zero-tag response. Asking for a tag count
     instead makes the whole family unreachable rather than enumerable.
     """
-    from cdt.extractor.core import AttemptRecord
+    from cdt.extractor.state import AttemptRecord
 
     for response in (
         f"<body>{MPLX_TEXT}</body>",
@@ -2851,7 +2861,7 @@ def test_ner_high_water_accepts_a_reduced_but_nonzero_tag_count() -> None:
     that tightening this to "fewer tags than before" is a visible decision
     rather than a quiet one (#176).
     """
-    from cdt.extractor.core import AttemptRecord
+    from cdt.extractor.state import AttemptRecord
 
     text = "The Company issued 6.250% Notes due 2022 and 5.250% Notes due 2025."
     two_tags = (
@@ -2879,11 +2889,8 @@ def test_prior_attempt_tagged_reads_the_row_the_way_the_echo_guard_needs() -> No
     Mirrors `test_ner_high_water_counts_tags_in_attempts_that_never_parsed`
     for the wider any-tag question the echo check asks.
     """
-    from cdt.extractor.core import (
-        AttemptRecord,
-        count_ner_entity_tags,
-        prior_attempt_tagged,
-    )
+    from cdt.extractor.stages import count_ner_entity_tags, prior_attempt_tagged
+    from cdt.extractor.state import AttemptRecord
 
     # 1. `<body>` is the wrapper this stage supplies, not something the model
     #    found, so an untagged echo must not count as having tagged anything.
@@ -2925,7 +2932,7 @@ def test_an_echo_is_accepted_when_the_earlier_attempt_also_tagged_nothing() -> N
     gives no evidence the model can find anything in this item, so attempt 2's
     honest echo is still the honest answer.
     """
-    from cdt.extractor.core import handle_response
+    from cdt.extractor.workflow import handle_response
 
     text = "This is the extracted event text."
     row_state = _ner_row(text)
@@ -2973,7 +2980,7 @@ def test_a_give_up_is_retried_and_the_row_recovers_if_a_later_answer_passes() ->
 
 def test_an_echo_after_a_truncated_tagged_attempt_is_still_rejected() -> None:
     """A response cut mid-tag still proves the model was tagging (#176, #127)."""
-    from cdt.extractor.core import handle_response
+    from cdt.extractor.workflow import handle_response
 
     row_state = _ner_row(MPLX_TEXT)
     row_state.current_attempt.messages = NERStage().preprocess(row_state)
@@ -3009,7 +3016,7 @@ def test_mplx_untagged_echo_no_longer_publishes_as_a_clean_success() -> None:
     six note series and a term loan -- writing a completion record that makes a
     re-run skip the item.
     """
-    from cdt.extractor.core import handle_response, summarize_failure
+    from cdt.extractor.workflow import handle_response, summarize_failure
 
     row_state = _ner_row(MPLX_TEXT)
     row_state.current_attempt.messages = NERStage().preprocess(row_state)
@@ -3056,11 +3063,9 @@ def test_a_zero_tag_row_with_no_earlier_tagging_is_a_clean_zero() -> None:
     it retries and then fails for real -- see
     `test_mplx_untagged_echo_no_longer_publishes_as_a_clean_success`.
     """
-    from cdt.extractor.core import (
-        PUBLISHABLE_ROW_STATES,
-        handle_response,
-        published_mention_rows,
-    )
+    from cdt.extractor.prior_state import published_mention_rows
+    from cdt.extractor.state import PUBLISHABLE_ROW_STATES
+    from cdt.extractor.workflow import handle_response
 
     text = "Acme Corp filed this report on January 1, 2024."
     row_state = _ner_row(text)
@@ -3081,7 +3086,7 @@ def test_a_zero_tag_row_with_no_earlier_tagging_is_a_clean_zero() -> None:
 
 def test_a_genuinely_debt_free_item_still_early_stops_success() -> None:
     """The no-retry path is untouched: a clean zero stays a clean SUCCESS (#176)."""
-    from cdt.extractor.core import handle_response
+    from cdt.extractor.workflow import handle_response
 
     text = "Acme Corp filed this report on January 1, 2024."
     row_state = _ner_row(text)
@@ -3103,11 +3108,11 @@ def test_ner_high_water_survives_the_resumable_batch_state() -> None:
     A batch row can cross a process exit between its failed attempt and its
     retry, so the guard has to be rebuildable from `state.jsonl` alone (#176).
     """
-    from cdt.extractor.core import prior_debt_instrument_high_water
+    from cdt.extractor.stages import prior_debt_instrument_high_water
 
     row_state = _ner_row(MPLX_TEXT)
     row_state.current_attempt.messages = NERStage().preprocess(row_state)
-    from cdt.extractor.core import handle_response
+    from cdt.extractor.workflow import handle_response
 
     assert handle_response(row_state, MPLX_TAGGED_BUT_UNFAITHFUL, max_attempts=3)
     assert prior_debt_instrument_high_water(row_state, "ner") == 1
@@ -3249,7 +3254,7 @@ def _run_live(
     """Drive the real live loop, returning (row_state, client)."""
     import asyncio
 
-    from cdt.extractor.core import run_extraction_workflow
+    from cdt.extractor.workflow import run_extraction_workflow
 
     client = _ScriptedCompletionClient(completions)
     row_state = asyncio.run(
@@ -3273,7 +3278,7 @@ def test_every_stage_gets_the_same_attempt_budget() -> None:
     end to end rather than asserted against a helper, because the budget is
     only real if the loop stops there.
     """
-    from cdt.extractor.core import DEFAULT_MAX_ATTEMPTS
+    from cdt.extractor.state import DEFAULT_MAX_ATTEMPTS
 
     # Pinned as a literal for the same reason MAX_CONTENT_FILTER_RESENDS is:
     # the budget *is* the number, so restating the constant asserts nothing
@@ -3363,7 +3368,8 @@ def test_persistent_content_filtering_terminates_at_the_resend_cap() -> None:
     the resulting `FAILED` attempt made #176's checks read a provider abort as
     a model failure. The row now terminates instead.
     """
-    from cdt.extractor.core import MAX_CONTENT_FILTER_RESENDS, summarize_failure
+    from cdt.extractor.state import MAX_CONTENT_FILTER_RESENDS
+    from cdt.extractor.workflow import summarize_failure
 
     # Pinned as a literal: the cap bounds spend on a filtered row, so restating
     # the constant here would assert nothing about its value.
@@ -3400,7 +3406,7 @@ def test_the_abort_note_reports_the_model_failure_that_happened_too() -> None:
     model's own error never reached the registry. An operator was told to go
     and talk to the provider while the extraction defect stayed invisible.
     """
-    from cdt.extractor.core import summarize_failure
+    from cdt.extractor.workflow import summarize_failure
 
     row_state, client = _run_live(
         MPLX_TEXT,
@@ -3431,7 +3437,7 @@ def test_the_abort_note_only_reports_failures_from_the_stage_that_aborted() -> N
     its cap without ever being answered, and its note must say so -- citing
     NER's error here would send an operator to the wrong stage.
     """
-    from cdt.extractor.core import failed_stage_name, summarize_failure
+    from cdt.extractor.workflow import failed_stage_name, summarize_failure
 
     row_state, client = _run_live(
         MPLX_TEXT,
@@ -3457,7 +3463,7 @@ def test_the_abort_note_reports_the_most_recent_scored_failure() -> None:
     The model is shown its error and asked again, so the last rejection is the
     state the row actually died in; an earlier one has already been superseded.
     """
-    from cdt.extractor.core import summarize_failure
+    from cdt.extractor.workflow import summarize_failure
 
     row_state, client = _run_live(
         MPLX_TEXT,
@@ -3479,7 +3485,7 @@ def test_the_abort_note_reports_the_most_recent_scored_failure() -> None:
 
 def test_a_filtered_row_is_registered_against_the_stage_that_was_aborted() -> None:
     """An operator retrying the row needs the stage, not a generic failure (#127)."""
-    from cdt.extractor.core import failed_stage_name
+    from cdt.extractor.workflow import failed_stage_name
 
     row_state, _ = _run_live(MPLX_TEXT, [CONTENT_FILTERED] * 40)
 
@@ -3493,7 +3499,8 @@ def test_aborts_at_the_relation_stage_still_publish_the_items_mentions() -> None
     whose instruments already validated must not lose them because the
     provider refused to run the final call.
     """
-    from cdt.extractor.core import PUBLISHABLE_ROW_STATES, summarize_failure
+    from cdt.extractor.state import PUBLISHABLE_ROW_STATES
+    from cdt.extractor.workflow import summarize_failure
 
     row_state, client = _run_live(
         MULTI_TEXT,
@@ -3522,7 +3529,8 @@ def test_aborts_at_the_ie_stage_still_publish_the_entries_that_validated() -> No
     failures published them. Same loss, same remedy, so the two terminal paths
     now agree.
     """
-    from cdt.extractor.core import PUBLISHABLE_ROW_STATES, summarize_failure
+    from cdt.extractor.state import PUBLISHABLE_ROW_STATES
+    from cdt.extractor.workflow import summarize_failure
 
     row_state, client = _run_live(
         MULTI_TEXT,
@@ -3551,7 +3559,7 @@ def test_content_filter_resend_cap_survives_the_resumable_batch_state() -> None:
     The cap is read off `all_attempts` rather than a counter held by the
     caller, precisely because the batch backend folds one response per tick.
     """
-    from cdt.extractor.core import count_content_filter_aborts
+    from cdt.extractor.workflow import count_content_filter_aborts
 
     row_state = _ner_row(MPLX_TEXT)
     row_state.current_attempt.messages = NERStage().preprocess(row_state)
@@ -3607,7 +3615,7 @@ def test_the_ner_guards_do_not_read_an_aborted_calls_partial_output() -> None:
     "keep every tag you found" names work that is not in its context
     (#176, #127).
     """
-    from cdt.extractor.core import (
+    from cdt.extractor.stages import (
         count_debt_instrument_tags,
         count_ner_entity_tags,
         prior_attempt_tagged,
@@ -3657,7 +3665,7 @@ def test_abort_counts_are_kept_per_stage_not_per_row() -> None:
     earlier stage's aborts would eat the later stage's budget and terminate a
     row that still had resends coming to it.
     """
-    from cdt.extractor.core import count_content_filter_aborts
+    from cdt.extractor.workflow import count_content_filter_aborts
 
     row_state, client = _run_live(
         MULTI_TEXT,
@@ -3838,7 +3846,7 @@ def test_an_only_prior_amount_publishes_no_current_principal() -> None:
     second route (#206). The honest answer is null; the minted prior state is
     where that figure belongs.
     """
-    from cdt.extractor.core import mint_prior_state_rows
+    from cdt.extractor.prior_state import mint_prior_state_rows
 
     row_state = ExtractionRowState(
         item_row={"item_id": "item-1", "date": "2024-06-01"},
@@ -5449,7 +5457,7 @@ def test_extract_failures_are_recorded_and_cleared(
         row_state.finish("ERROR")
         return row_state
 
-    monkeypatch.setattr("cdt.extractor.core.run_extraction_workflow", failing_workflow)
+    monkeypatch.setattr("cdt.extractor.live.run_extraction_workflow", failing_workflow)
     extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
 
     # The partition is registered complete even though the row produced nothing,
@@ -5494,7 +5502,7 @@ def test_extract_failures_are_recorded_and_cleared(
         return row_state
 
     monkeypatch.setattr(
-        "cdt.extractor.core.run_extraction_workflow", succeeding_workflow
+        "cdt.extractor.live.run_extraction_workflow", succeeding_workflow
     )
     extract_pending_items(artifact_root=tmp_path, batch_size=5, force=True, client=None)
 
@@ -6579,7 +6587,7 @@ def _fake_success_workflow(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         row_state.finish("SUCCESS")
         return row_state
 
-    monkeypatch.setattr("cdt.extractor.core.run_extraction_workflow", fake_workflow)
+    monkeypatch.setattr("cdt.extractor.live.run_extraction_workflow", fake_workflow)
     return calls
 
 
@@ -6608,7 +6616,7 @@ def test_infrastructure_error_aborts_and_preserves_progress(
 ) -> None:
     """A provider failure stops the run; terminal rows are never re-paid (#49)."""
     from cdt.datasets import load_completion_registry
-    from cdt.extractor.core import InfrastructureError
+    from cdt.extractor.state import InfrastructureError
 
     _seed_classifications(tmp_path, ["a-8-01", "b-8-01"])
     calls: list[str] = []
@@ -6625,7 +6633,7 @@ def test_infrastructure_error_aborts_and_preserves_progress(
         row_state.finish("SUCCESS")
         return row_state
 
-    monkeypatch.setattr("cdt.extractor.core.run_extraction_workflow", failing_workflow)
+    monkeypatch.setattr("cdt.extractor.live.run_extraction_workflow", failing_workflow)
     with pytest.raises(InfrastructureError):
         extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
 
@@ -6651,7 +6659,7 @@ def test_infrastructure_error_aborts_and_preserves_progress(
 
 def test_infrastructure_error_classification() -> None:
     """Status- and name-shaped provider errors classify as infrastructure."""
-    from cdt.extractor.core import is_infrastructure_error
+    from cdt.extractor.state import is_infrastructure_error
 
     class PaymentRequiredResponseError(Exception):
         pass
@@ -6792,7 +6800,7 @@ def test_classifier_loads_model_once_per_run(
 
 def test_realign_tag_details_maps_offsets_onto_the_original_text() -> None:
     """Evidence offsets index the item's own text, not the model's echo (#154)."""
-    from cdt.extractor.core import realign_tag_details
+    from cdt.extractor.tags import realign_tag_details
 
     original = "The  $5,000,000\tTerm Loan closed."
     roundtrip = "The $5,000,000 Term Loan closed."
@@ -6821,7 +6829,7 @@ def test_realign_tag_details_maps_offsets_onto_the_original_text() -> None:
 
 def test_realign_tag_details_is_identity_when_texts_match() -> None:
     """The common exact-echo case pays no alignment cost."""
-    from cdt.extractor.core import realign_tag_details
+    from cdt.extractor.tags import realign_tag_details
 
     text = "A $10 note."
     details = {
@@ -6832,7 +6840,7 @@ def test_realign_tag_details_is_identity_when_texts_match() -> None:
 
 def test_realign_tag_details_handles_model_deleted_whitespace() -> None:
     """collapse-equality permits dropped whitespace; spans still land right."""
-    from cdt.extractor.core import realign_tag_details
+    from cdt.extractor.tags import realign_tag_details
 
     original = "Senior Notes due 2028\nwere issued."
     roundtrip = "Senior Notes due 2028 were issued."
@@ -6852,8 +6860,8 @@ def test_realign_tag_details_handles_model_deleted_whitespace() -> None:
 
 def test_standardized_payloads_record_where_their_values_came_from() -> None:
     """Payloads carry derived_from so consumers know a value's provenance (#128)."""
-    from cdt.extractor.core import (
-        standardized_amount_payload,
+    from cdt.extractor.normalize.amounts import standardized_amount_payload
+    from cdt.extractor.normalize.dates import (
         standardized_date_payload,
         standardized_end_date_payload,
     )
@@ -6916,7 +6924,7 @@ def test_standardized_payloads_record_where_their_values_came_from() -> None:
 
 def test_terminal_ie_failure_salvages_the_valid_entries() -> None:
     """One invalid entry no longer drops the whole item (#152)."""
-    from cdt.extractor.core import handle_response
+    from cdt.extractor.workflow import handle_response
 
     row_state = ExtractionRowState(
         item_row={"item_id": "item-1"},
@@ -6952,7 +6960,7 @@ def test_terminal_ie_failure_salvages_the_valid_entries() -> None:
 
 def test_terminal_ie_failure_drops_an_entry_with_a_retired_property() -> None:
     """Salvage applies the retired-property check per entry, like validation."""
-    from cdt.extractor.core import handle_response
+    from cdt.extractor.workflow import handle_response
 
     row_state = ExtractionRowState(
         item_row={"item_id": "item-1"},
@@ -6979,7 +6987,7 @@ def test_terminal_ie_failure_drops_an_entry_with_a_retired_property() -> None:
 
 def test_terminal_relation_failure_publishes_mentions_without_lineage() -> None:
     """A relation-stage failure keeps the already-validated mentions (#152)."""
-    from cdt.extractor.core import handle_response
+    from cdt.extractor.workflow import handle_response
 
     row_state = ExtractionRowState(
         item_row={"item_id": "item-1"},
@@ -7016,7 +7024,7 @@ def test_terminal_relation_failure_publishes_mentions_without_lineage() -> None:
 
 def test_terminal_ie_failure_with_nothing_valid_still_fails() -> None:
     """Salvage never invents output: no valid entry means FAILED as before."""
-    from cdt.extractor.core import handle_response
+    from cdt.extractor.workflow import handle_response
 
     row_state = ExtractionRowState(
         item_row={"item_id": "item-1"},
@@ -7503,7 +7511,7 @@ def test_normalized_maturity_from_text_parses_month_year_phrases() -> None:
 
 def test_computed_sum_amount_accepts_only_the_exact_sum_of_cited_spans() -> None:
     """An increase-by amendment's unstated total publishes as computed (#165)."""
-    from cdt.extractor.core import standardized_amount_payload
+    from cdt.extractor.normalize.amounts import standardized_amount_payload
 
     tag_details = {
         "tag-a-before": {
@@ -7643,7 +7651,7 @@ def test_computed_maturity_rejects_arithmetic_that_misses() -> None:
 
 def test_tenor_parsing_and_date_arithmetic() -> None:
     """Tenor spans parse conservatively; month-end days clamp (#166)."""
-    from cdt.extractor.core import date_plus_tenor, tenor_from_text
+    from cdt.extractor.normalize.dates import date_plus_tenor, tenor_from_text
 
     assert tenor_from_text("five-year") == (5, "year")
     assert tenor_from_text("364-day") == (364, "day")
@@ -7711,7 +7719,7 @@ def test_resolve_candidates_attaches_on_name_only_tie_instead_of_seeding() -> No
 
 def test_date_payload_verifies_against_every_cited_span() -> None:
     """A date co-cited with a defined term keeps its value (2026-09 window)."""
-    from cdt.extractor.core import standardized_date_payload
+    from cdt.extractor.normalize.dates import standardized_date_payload
 
     tags = {
         "tag-7": {
@@ -7736,7 +7744,7 @@ def test_date_payload_verifies_against_every_cited_span() -> None:
 
 def test_month_year_maturity_is_read_outside_due_phrases() -> None:
     """`in March 2056` is a stated month-resolution maturity, not a start date."""
-    from cdt.extractor.core import (
+    from cdt.extractor.normalize.dates import (
         normalized_date_from_text,
         normalized_month_year_from_text,
         standardized_date_payload,
@@ -7765,7 +7773,8 @@ def test_month_year_maturity_is_read_outside_due_phrases() -> None:
 
 def test_rate_spelled_percent_parses() -> None:
     """`6.5 percent` is a rate, for the rate payload and the amount guard alike."""
-    from cdt.extractor.core import RATE_PCT_PATTERN, is_rate_like_amount_text
+    from cdt.extractor.normalize.amounts import is_rate_like_amount_text
+    from cdt.extractor.schema import RATE_PCT_PATTERN
 
     assert RATE_PCT_PATTERN.findall("6.5 percent senior notes due 2028") == ["6.5"]
     assert RATE_PCT_PATTERN.findall("4.950% notes") == ["4.950"]
@@ -7774,7 +7783,7 @@ def test_rate_spelled_percent_parses() -> None:
 
 def test_computed_maturity_accepts_a_cited_date_minus_a_tenor() -> None:
     """`extended six months to September 3, 2027` anchors the prior maturity (#166)."""
-    from cdt.extractor.core import computed_maturity_date, date_plus_tenor
+    from cdt.extractor.normalize.dates import computed_maturity_date, date_plus_tenor
 
     assert date_plus_tenor("2027-09-03", (6, "month"), sign=-1) == "2027-03-03"
     tags = {
@@ -7802,7 +7811,7 @@ def test_computed_maturity_accepts_a_cited_date_minus_a_tenor() -> None:
 
 def test_instrument_ie_accepts_a_bare_object_as_one_entry() -> None:
     """A bare object is the one-instrument case, not a validation failure."""
-    from cdt.extractor.core import instrument_entries_from_response
+    from cdt.extractor.stages import instrument_entries_from_response
 
     assert instrument_entries_from_response('{"name": ["tag-1"]}') == [
         {"name": ["tag-1"]}
@@ -7856,7 +7865,10 @@ def _dates_tag_details() -> dict[str, dict[str, object]]:
 
 def test_dates_facts_publish_columns_from_current_closing_and_maturity() -> None:
     """dates[] replaces the single-value slots; prior and projected dates stay out of the columns."""
-    from cdt.extractor.core import select_date_payload, standardized_dates_payloads
+    from cdt.extractor.normalize.dates import (
+        select_date_payload,
+        standardized_dates_payloads,
+    )
 
     obj = {
         "name": ["tag-1"],
@@ -7902,7 +7914,7 @@ def test_dates_facts_publish_columns_from_current_closing_and_maturity() -> None
 
 def test_dates_facts_precision() -> None:
     """Month and year precision are read off the text."""
-    from cdt.extractor.core import standardized_dates_payloads
+    from cdt.extractor.normalize.dates import standardized_dates_payloads
 
     tags = _dates_tag_details()
     month = standardized_dates_payloads(
@@ -7932,7 +7944,7 @@ def test_dates_property_validation_rejects_bad_kind_and_two_current_maturities()
     None
 ):
     """Two current maturities are two instruments; a prior one is history."""
-    from cdt.extractor.core import validate_dates_property
+    from cdt.extractor.validate import validate_dates_property
 
     tags = _dates_tag_details()
     bad_kind = validate_dates_property(
@@ -7996,7 +8008,7 @@ def test_dates_property_validation_rejects_bad_kind_and_two_current_maturities()
 
 def test_prior_amounts_never_supply_the_principal() -> None:
     """A `prior: true` commitment is history; the current figure supplies the principal."""
-    from cdt.extractor.core import select_principal_amount
+    from cdt.extractor.normalize.amounts import select_principal_amount
 
     payloads = [
         {"kind": "commitment", "normalized_amount": "25000000", "prior": True},
@@ -8008,7 +8020,7 @@ def test_prior_amounts_never_supply_the_principal() -> None:
 
 def test_status_is_derived_from_event_date_facts() -> None:
     """Stage 2: the newest completed event decides status; expected events decide nothing."""
-    from cdt.extractor.core import (
+    from cdt.extractor.normalize.dates import (
         derived_status_payload,
         expected_retirement_in_payloads,
     )
@@ -8099,7 +8111,7 @@ def test_status_is_derived_from_event_date_facts() -> None:
 
 def test_parties_list_derives_lender_disclosure() -> None:
     """Stage 2: one parties list, and disclosure distinguishes its three states."""
-    from cdt.extractor.core import party_payloads_and_disclosure
+    from cdt.extractor.normalize.parties import party_payloads_and_disclosure
 
     tags = {
         "tag-1": {
@@ -8166,7 +8178,7 @@ def test_entry_without_parties_names_no_lender() -> None:
     The prompt tells the model to omit a property the document says nothing
     about, so `{name, instrument_type, amounts}` is an ordinary response.
     """
-    from cdt.extractor.core import party_payloads_and_disclosure
+    from cdt.extractor.normalize.parties import party_payloads_and_disclosure
 
     parties, disclosure = party_payloads_and_disclosure(
         {"name": ["tag-i-1"], "instrument_type": "revolving_credit", "amounts": []},
@@ -8196,7 +8208,7 @@ def test_aggregate_lender_disclosure_precedence() -> None:
 
 def test_post_filing_closing_is_expected_and_agreement_supplies_start() -> None:
     """Pilot fixes: a closing dated after the filing is planned; a lone agreement date is the start."""
-    from cdt.extractor.core import (
+    from cdt.extractor.normalize.dates import (
         derived_status_payload,
         mark_post_filing_events_expected,
         normalized_date_from_text,
@@ -8272,7 +8284,7 @@ def _semantic_tags() -> dict[str, dict[str, object]]:
 
 def test_semantic_validators_reject_misplaced_flags_and_kinds() -> None:
     """Stage 2: `expected` only on events, `prior` only on terms, kinds fit the type, repayments pair."""
-    from cdt.extractor.core import (
+    from cdt.extractor.validate import (
         validate_cross_field_semantics,
         validate_dates_property,
     )
@@ -8419,7 +8431,7 @@ def test_semantic_validators_reject_misplaced_flags_and_kinds() -> None:
 
 def test_validation_rejects_legacy_properties() -> None:
     """A response reverting to status_event/lenders/start_date fails validation."""
-    from cdt.extractor.core import validate_no_legacy_properties
+    from cdt.extractor.validate import validate_no_legacy_properties
 
     legacy = {
         "name": ["tag-1"],
@@ -8441,7 +8453,8 @@ def test_validation_rejects_legacy_properties() -> None:
 
 def test_relation_manifest_marks_expected_retirement() -> None:
     """The relation stage sees a planned retirement it cannot read off the body tags."""
-    from cdt.extractor.core import ExtractionRowState, relation_instrument_manifest
+    from cdt.extractor.stages import relation_instrument_manifest
+    from cdt.extractor.state import ExtractionRowState
 
     state = ExtractionRowState(
         item_row={"item_id": "item-1"}, stage_name="instrument_relation"
@@ -8476,7 +8489,7 @@ def test_relation_manifest_marks_expected_retirement() -> None:
 
 def test_repayment_amount_is_dated_by_a_terminal_event() -> None:
     """A repayment figure beside a retirement needs no separate repayment date."""
-    from cdt.extractor.core import validate_cross_field_semantics
+    from cdt.extractor.validate import validate_cross_field_semantics
 
     obj = {
         "dates": [
@@ -8499,7 +8512,7 @@ def test_repayment_amount_is_dated_by_a_terminal_event() -> None:
 
 def test_table_cells_publish_coupon_and_document_currency() -> None:
     """FHLB schedules: a bare `4.125` under COUPON PCT is the rate; `($)` in the header is the currency."""
-    from cdt.extractor.core import (
+    from cdt.extractor.normalize.amounts import (
         currency_candidates_from_text,
         standardized_amount_payload,
         standardized_interest_rate_payload,
@@ -8595,7 +8608,10 @@ def test_table_cells_publish_coupon_and_document_currency() -> None:
 
 def test_fractional_coupons_publish_as_decimal_rates() -> None:
     """`6 1/2%` and `5 7/8% Senior Notes due 2026` are 6.5 and 5.875, not missing rates."""
-    from cdt.extractor.core import rate_tokens, standardized_interest_rate_payload
+    from cdt.extractor.normalize.amounts import (
+        rate_tokens,
+        standardized_interest_rate_payload,
+    )
 
     assert rate_tokens("6 1/2%") == ["6.5"]
     assert rate_tokens("5 7/8 % senior unsecured notes due 2030") == ["5.875"]
@@ -9373,7 +9389,7 @@ def test_name_derived_principal_is_synthesized_when_no_amount_supplies_one() -> 
 
 def test_a_repayment_figure_does_not_suppress_the_name_derived_principal() -> None:
     """The old gate asked "any amount at all", so an unrelated figure hid the name."""
-    from cdt.extractor.core import standardized_amounts_payloads
+    from cdt.extractor.normalize.amounts import standardized_amounts_payloads
 
     tags = {
         "tag-i-1": {
@@ -9563,7 +9579,11 @@ def test_a_salvaged_row_registers_the_salvage_note_not_the_last_stage() -> None:
     published exactly that, so the row here keeps two mentions in order to
     advance past the stage it was salvaged at.
     """
-    from cdt.extractor.core import _failure_record, failed_stage_name, handle_response
+    from cdt.extractor.workflow import (
+        _failure_record,
+        failed_stage_name,
+        handle_response,
+    )
 
     row_state = ExtractionRowState(
         item_row={"item_id": "item-1", "accession_number": "0001", "cik": "0000320193"},
@@ -9618,7 +9638,7 @@ def test_computed_sum_needs_two_addends_even_when_no_span_matches() -> None:
     case isolates the first: two spans, neither equal to the model's figure, but
     only one of them parseable.
     """
-    from cdt.extractor.core import computed_sum_amount
+    from cdt.extractor.normalize.amounts import computed_sum_amount
 
     tags = {
         "tag-a-1": {
@@ -9699,7 +9719,7 @@ def test_a_partial_row_publishes_its_mentions_and_registers_the_loss(
         row_state.finish("SUCCESS")
         return row_state
 
-    monkeypatch.setattr("cdt.extractor.core.run_extraction_workflow", salvaged_workflow)
+    monkeypatch.setattr("cdt.extractor.live.run_extraction_workflow", salvaged_workflow)
     extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
 
     # Half one: the salvaged mentions publish, exactly like a SUCCESS row.
@@ -9840,7 +9860,7 @@ def test_an_unparsed_prior_term_suppresses_inheritance_rather_than_licensing_it(
     Incidence of this shape on the reference corpus is 0, so no published row
     was ever wrong because of it.
     """
-    from cdt.extractor.core import mint_prior_state_rows
+    from cdt.extractor.prior_state import mint_prior_state_rows
 
     counters: dict[str, int] = {}
     minted = [
@@ -9897,7 +9917,7 @@ def test_a_prior_claim_that_never_parsed_is_counted_not_silently_dropped() -> No
     `dim::5542bb4c…`, a Loan and Security Agreement whose prior commitment has
     a null amount; the counters now sum to 22 (#211).
     """
-    from cdt.extractor.core import mint_prior_state_rows
+    from cdt.extractor.prior_state import mint_prior_state_rows
 
     counters: dict[str, int] = {}
     rows = mint_prior_state_rows(
@@ -9923,7 +9943,7 @@ def test_a_prior_claim_that_never_parsed_is_counted_not_silently_dropped() -> No
 
 def test_two_before_figures_are_ambiguous_even_when_one_did_not_parse() -> None:
     """Ambiguity is judged on the claims: two stated before-values are two states."""
-    from cdt.extractor.core import mint_prior_state_rows
+    from cdt.extractor.prior_state import mint_prior_state_rows
 
     counters: dict[str, int] = {}
     rows = mint_prior_state_rows(
@@ -9953,7 +9973,7 @@ def test_mint_does_not_write_the_pointer_onto_the_rows_it_was_handed() -> None:
     A future caller passing `row_state.debt_instrument_mentions` straight in
     would have persisted a minted pointer into `state.jsonl` (#211).
     """
-    from cdt.extractor.core import mint_prior_state_rows
+    from cdt.extractor.prior_state import mint_prior_state_rows
 
     caller_rows = [amended_row()]
 
@@ -10069,7 +10089,7 @@ def test_an_unhashable_date_value_does_not_kill_the_whole_mint_pass() -> None:
     tampered or hand-edited partition, and it is the failure class the
     `_borrowers` guard was written for.
     """
-    from cdt.extractor.core import mint_prior_state_rows
+    from cdt.extractor.prior_state import mint_prior_state_rows
 
     counters: dict[str, int] = {}
     rows = mint_prior_state_rows(
@@ -10114,7 +10134,7 @@ def test_the_batch_finalize_publishes_through_the_mint_seam(tmp_path: Path) -> N
     `row_state.debt_instrument_mentions` left the whole suite green, because no
     test drove this function with a mention carrying a `prior` term.
     """
-    from cdt.extractor.core import finalize_extract_outputs
+    from cdt.extractor.outputs import finalize_extract_outputs
 
     finalize_extract_outputs(
         [(_row_state_with_a_prior_term(), "2024-06-01", "0001")],
@@ -10150,7 +10170,7 @@ def test_the_batch_finalize_purges_an_item_re_extracted_to_zero_mentions(
     partition must not be written when there is genuinely nothing to purge,
     which is the branch that survives here because `replaced` is empty too.
     """
-    from cdt.extractor.core import finalize_extract_outputs
+    from cdt.extractor.outputs import finalize_extract_outputs
 
     def row_state(mentions: list[dict[str, object]]) -> ExtractionRowState:
         state = ExtractionRowState(
@@ -10232,7 +10252,7 @@ def test_the_batch_finalize_purges_an_item_that_stopped_being_relevant(
     rewritten with `relevance` False, which is the first case.
     """
     from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
-    from cdt.extractor.core import finalize_extract_outputs
+    from cdt.extractor.outputs import finalize_extract_outputs
 
     def row_state(mentions: list[dict[str, object]]) -> ExtractionRowState:
         state = ExtractionRowState(
@@ -10303,14 +10323,14 @@ def test_extract_tables_publishes_through_the_mint_seam(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The in-memory path mints too, so a notebook sees what the pipeline writes."""
-    from cdt.extractor.core import extract_tables
+    from cdt.extractor.live import extract_tables
 
     async def fake_run_extraction_workflow(**kwargs: object) -> ExtractionRowState:
         item_row = kwargs["item_row"]
         return _row_state_with_a_prior_term(str(item_row["item_id"]))
 
     monkeypatch.setattr(
-        "cdt.extractor.core.run_extraction_workflow", fake_run_extraction_workflow
+        "cdt.extractor.live.run_extraction_workflow", fake_run_extraction_workflow
     )
 
     tables = extract_tables(
@@ -10345,7 +10365,7 @@ def test_a_prior_commitment_termination_mints_and_is_not_inherited_over() -> Non
     onto the predecessor, the second is which current dates are carried forward
     as unchanged when the filing states no before-value for them.
     """
-    from cdt.extractor.core import mint_prior_state_rows
+    from cdt.extractor.prior_state import mint_prior_state_rows
 
     counters: dict[str, int] = {}
     minted = [
@@ -10432,7 +10452,7 @@ def test_an_expected_date_is_never_inherited_onto_the_predecessor() -> None:
     No fixture carried `expected: True`, so deleting the
     `and not entry.get("expected")` guard left the suite green (#211).
     """
-    from cdt.extractor.core import mint_prior_state_rows
+    from cdt.extractor.prior_state import mint_prior_state_rows
 
     minted = [
         row
@@ -10498,11 +10518,11 @@ def test_magnitude_in_amount_text_is_the_magnitude_the_parser_applies() -> None:
     invariant that makes that safe: for every magnitude word in the table, the
     helper reports exactly the factor the parser multiplied by.
     """
-    from cdt.extractor.core import (
-        AMOUNT_MULTIPLIERS,
+    from cdt.extractor.normalize.amounts import (
         magnitude_in_amount_text,
         normalized_amount_from_text,
     )
+    from cdt.extractor.schema import AMOUNT_MULTIPLIERS
 
     for word, factor in AMOUNT_MULTIPLIERS.items():
         assert magnitude_in_amount_text(f"$1 {word}") == factor
@@ -10546,7 +10566,7 @@ def test_scaled_amount_from_sibling_refuses_everything_but_the_exact_product() -
     mutually exclusive: a sum needs `MINIMUM_COMPUTED_SUM_SPANS` parsed spans
     and this fires on one.
     """
-    from cdt.extractor.core import scaled_amount_from_sibling
+    from cdt.extractor.normalize.amounts import scaled_amount_from_sibling
 
     tags = _shared_magnitude_tags()
     own, sibling = ["tag-15"], ["tag-16"]
@@ -10654,7 +10674,7 @@ def test_a_shared_magnitude_word_publishes_the_prior_commitment() -> None:
     `mint_prior_state_rows` builds a predecessor only out of `prior` facts that
     carry a value.
     """
-    from cdt.extractor.core import standardized_amounts_payloads
+    from cdt.extractor.normalize.amounts import standardized_amounts_payloads
 
     payloads = standardized_amounts_payloads(
         {
@@ -10706,7 +10726,7 @@ def test_the_scale_rescue_leaves_an_untagged_unit_header_alone() -> None:
     this filing's amounts null, and a change that silently started rescaling
     table cells would be out of scope and unreviewed.
     """
-    from cdt.extractor.core import standardized_amounts_payloads
+    from cdt.extractor.normalize.amounts import standardized_amounts_payloads
 
     payloads = standardized_amounts_payloads(
         {
@@ -10765,7 +10785,10 @@ def test_the_scale_rescue_refuses_a_magnitude_on_any_own_span_not_just_canonical
     762 amount facts in the stored corpus, 4 cite two or more spans and 1
     carries a magnitude on a non-canonical span.
     """
-    from cdt.extractor.core import canonical_amount_value, scaled_amount_from_sibling
+    from cdt.extractor.normalize.amounts import (
+        canonical_amount_value,
+        scaled_amount_from_sibling,
+    )
 
     tags = {
         # The longer span is the bare figure, so it wins canonical selection

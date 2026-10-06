@@ -10,7 +10,7 @@ import pandas as pd
 import pytest
 
 from cdt.classifier import core as classifier_core
-from cdt.extractor.core import ExtractionRowState
+from cdt.extractor.state import ExtractionRowState
 from cdt.ingest import IngestRunResult
 from cdt.matcher import debt_instruments_root, mention_cluster_edges_root
 from cdt.pipeline import (
@@ -519,7 +519,7 @@ This is the extracted event text.
         lambda path: (FakeModel(), 0.5, {"threshold": 0.5}),
     )
     monkeypatch.setattr(
-        "cdt.extractor.core.run_extraction_workflow",
+        "cdt.extractor.live.run_extraction_workflow",
         fake_run_extraction_workflow,
     )
 
@@ -587,7 +587,7 @@ def _seed_final_tables(artifact_root: Path, *, rows: int = 2) -> None:
 
 def _mention_frame(*names: str) -> pd.DataFrame:
     """Return one mention per name, all for one issuer, as the extractor publishes."""
-    from cdt.extractor.core import DEBT_INSTRUMENT_MENTION_COLUMNS
+    from cdt.extractor.schema import DEBT_INSTRUMENT_MENTION_COLUMNS
 
     rows = []
     for index, name in enumerate(names, start=1):

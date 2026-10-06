@@ -35,10 +35,10 @@ from cdt.datasets import (
     run_manifest_path,
     shard_for_cik,
 )
-from cdt.extractor.core import (
+from cdt.extractor.outputs import MENTIONS_DATASET_NAME
+from cdt.extractor.schema import (
     DEBT_INSTRUMENT_MENTION_COLUMNS as EXTRACTED_MENTION_COLUMNS,
 )
-from cdt.extractor.core import MENTIONS_DATASET_NAME
 from cdt.matcher.instruments import apply_lifecycle_rollup, apply_observation_columns
 from cdt.matcher.normalize import coerce_optional_text, prepare_mention
 from cdt.matcher.schema import (

@@ -8,7 +8,7 @@ from difflib import SequenceMatcher
 
 import pandas as pd
 
-from cdt.extractor.core import (
+from cdt.extractor.schema import (
     LENDER_DISCLOSURE_NONE_NAMED,
     LENDER_DISCLOSURE_PRECEDENCE,
     LENDER_DISCLOSURE_VALUES,

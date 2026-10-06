@@ -45,20 +45,24 @@ from cdt.extractor.batch import (
     build_request_body,
     openai_reasoning_effort,
 )
-from cdt.extractor.core import (
+from cdt.extractor.llm import (
     EXTRACTOR_TEMPERATURE,
-    MAX_CONTENT_FILTER_RESENDS,
     REASONING_EFFORTS,
-    CompletionResult,
-    ExtractionRowState,
-    count_content_filter_aborts,
     extract_batch_response_text,
-    handle_response,
-    initial_messages,
     load_prompt,
     native_model_id,
-    run_extraction_workflow,
     sampling_params,
+)
+from cdt.extractor.state import (
+    MAX_CONTENT_FILTER_RESENDS,
+    CompletionResult,
+    ExtractionRowState,
+)
+from cdt.extractor.workflow import (
+    count_content_filter_aborts,
+    handle_response,
+    initial_messages,
+    run_extraction_workflow,
 )
 from cdt.storage import (
     artifact_exists,
@@ -1022,7 +1026,7 @@ def test_configured_default_model_is_usable_by_both_backends() -> None:
     whole batch rather than one row. The live backend needs the prefix present.
     """
     from cdt import settings
-    from cdt.extractor.core import is_reasoning_model
+    from cdt.extractor.llm import is_reasoning_model
 
     default = settings.DEFAULT_EXTRACTOR_MODEL
     assert default.startswith("openai/"), "live backend needs the OpenRouter prefix"
@@ -1552,7 +1556,7 @@ def test_stall_warning_fires_only_past_the_tick_threshold(
 
 def test_collect_pending_extract_items_caps_claimed_rows(tmp_path: Path) -> None:
     """Claiming stops at max_rows; unclaimed partitions stay pending (#92)."""
-    from cdt.extractor.core import collect_pending_extract_items
+    from cdt.extractor.live import collect_pending_extract_items
 
     for index, (date_value, shard) in enumerate(
         [("2024-01-02", "0001"), ("2024-01-03", "0002"), ("2024-01-04", "0003")],
@@ -1580,10 +1584,7 @@ def test_live_client_sends_request_timeout(monkeypatch: pytest.MonkeyPatch) -> N
     """Every live chat call carries a client-side timeout (#93)."""
     import openrouter as openrouter_module
 
-    from cdt.extractor.core import (
-        LIVE_REQUEST_TIMEOUT_SECONDS,
-        OpenRouterChatClient,
-    )
+    from cdt.extractor.llm import LIVE_REQUEST_TIMEOUT_SECONDS, OpenRouterChatClient
 
     captured: dict[str, object] = {}
 
