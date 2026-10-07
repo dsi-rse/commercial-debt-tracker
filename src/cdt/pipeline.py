@@ -23,7 +23,6 @@ from cdt.datasets import (
 )
 from cdt.extractor import (
     DEFAULT_MAX_ATTEMPTS,
-    DEFAULT_MODEL,
     DEFAULT_REASONING_EFFORT,
     extract_pending_items,
     extracted_tables_path,
@@ -89,7 +88,8 @@ class PipelineConfig:
     match_batch_size: int = DEFAULT_STAGE_BATCH_SIZE
     item_numbers: tuple[str, ...] = POTENTIALLY_RELEVANT_ITEM_NUMBERS
     classifier_model_dir: Path | None = None
-    extractor_model: str = DEFAULT_MODEL
+    #: None resolves to the EXTRACTOR_MODEL setting when extraction runs.
+    extractor_model: str | None = None
     extractor_reasoning_effort: str = DEFAULT_REASONING_EFFORT
     extractor_max_attempts: int = DEFAULT_MAX_ATTEMPTS
     strong_match_threshold: float = DEFAULT_MEMBERSHIP_THRESHOLD

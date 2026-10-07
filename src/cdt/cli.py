@@ -27,7 +27,6 @@ from cdt.datasets import (
 from cdt.extractor import (
     DEFAULT_MAX_ATTEMPTS as DEFAULT_EXTRACTOR_MAX_ATTEMPTS,
 )
-from cdt.extractor import DEFAULT_MODEL as DEFAULT_EXTRACTOR_MODEL
 from cdt.extractor import (
     DEFAULT_REASONING_EFFORT as DEFAULT_EXTRACTOR_REASONING_EFFORT,
 )
@@ -270,7 +269,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
     )
     extract_parser.add_argument("--force", action="store_true")
-    extract_parser.add_argument("--model", default=DEFAULT_EXTRACTOR_MODEL)
+    extract_parser.add_argument(
+        "--model", default=None, help="Defaults to the EXTRACTOR_MODEL setting."
+    )
     extract_parser.add_argument(
         "--reasoning-effort", default=DEFAULT_EXTRACTOR_REASONING_EFFORT
     )
@@ -396,7 +397,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=POTENTIALLY_RELEVANT_ITEM_NUMBERS,
     )
     pipeline_parser.add_argument("--model-dir", type=Path, default=None)
-    pipeline_parser.add_argument("--model", default=DEFAULT_EXTRACTOR_MODEL)
+    pipeline_parser.add_argument(
+        "--model", default=None, help="Defaults to the EXTRACTOR_MODEL setting."
+    )
     pipeline_parser.add_argument(
         "--reasoning-effort", default=DEFAULT_EXTRACTOR_REASONING_EFFORT
     )
@@ -581,7 +584,8 @@ def run_pipeline_command(args: argparse.Namespace) -> int:
                 genres=args.genres,
                 sixk_batch_size=args.sixk_batch_size,
                 sixk_concurrency=args.sixk_concurrency,
-            )
+            ),
+            renew=renewer(lease),
         )
     except ValueError as exc:
         logger.error("Invalid pipeline arguments: %s", exc)

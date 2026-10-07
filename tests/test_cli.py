@@ -8,8 +8,10 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+from support import _seed_classifications
 
-from cdt import cli
+from cdt import cli, settings
+from cdt.extractor.state import ExtractionRowState
 from cdt.ingest.core import IngestRunResult
 from cdt.lease import PIPELINE_WRITER_LEASE, acquire_lease
 from cdt.pipeline import PipelineRunResult
@@ -294,7 +296,9 @@ def test_pipeline_cli_builds_pipeline_config(
     cik_file.write_text("320193\n", encoding="utf-8")
     calls: list[dict[str, object]] = []
 
-    def fake_run_pipeline(config: cli.PipelineConfig) -> PipelineRunResult:
+    def fake_run_pipeline(
+        config: cli.PipelineConfig, *, renew: object = None
+    ) -> PipelineRunResult:
         calls.append(
             {
                 "mode": config.mode,
@@ -383,7 +387,9 @@ def test_pipeline_cli_defaults_to_source_bucket(
     cik_file.write_text("320193\n", encoding="utf-8")
     calls: list[str] = []
 
-    def fake_run_pipeline(config: cli.PipelineConfig) -> PipelineRunResult:
+    def fake_run_pipeline(
+        config: cli.PipelineConfig, *, renew: object = None
+    ) -> PipelineRunResult:
         calls.append(config.bucket)
         ingest_result = IngestRunResult(
             mode=config.mode,
@@ -1257,3 +1263,113 @@ def test_pipeline_cli_exits_non_zero_when_a_genre_failed(
     )
 
     assert status == 1
+
+
+def _empty_pipeline_result(tmp_path: Path) -> PipelineRunResult:
+    return PipelineRunResult(
+        mode="historical",
+        start_date=date(2024, 1, 1),
+        end_date=date(2024, 1, 31),
+        ingest=None,
+        itemized_rows=0,
+        classified_rows=0,
+        extracted_rows=0,
+        matched_rows=0,
+        debt_instrument_rows=0,
+        classifier_model_dir=tmp_path,
+        artifact_root=str(tmp_path),
+        extractor_run_path=str(tmp_path / "run.jsonl"),
+    )
+
+
+def _pipeline_argv(tmp_path: Path, *extra: str) -> list[str]:
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("320193\n", encoding="utf-8")
+    return [
+        "pipeline",
+        "--quiet",
+        "--artifact-root",
+        str(tmp_path),
+        *extra,
+        "historical",
+        str(cik_file),
+        "--start-date",
+        "2024-01-01",
+        "--end-date",
+        "2024-01-31",
+    ]
+
+
+def test_pipeline_cli_renews_its_lease_and_aborts_when_it_is_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`cdt pipeline` hands the pipeline a renewer; a stolen lease exits 1 (#250)."""
+    renewals: list[str] = []
+
+    def fake_run_pipeline(
+        config: cli.PipelineConfig, *, renew: object = None
+    ) -> PipelineRunResult:
+        assert callable(renew)
+        renew()
+        renewals.append("renewed")
+        return _empty_pipeline_result(tmp_path)
+
+    monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
+    assert cli.main(_pipeline_argv(tmp_path)) == 0
+    assert renewals == ["renewed"]
+
+    monkeypatch.setattr("cdt.lease.renew_lease", lambda lease: False)
+    assert cli.main(_pipeline_argv(tmp_path)) == 1
+    assert renewals == ["renewed"]
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [((), "env/model"), (("--model", "flag/model"), "flag/model")],
+)
+def test_extract_cli_model_defaults_to_the_extractor_model_setting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extra: tuple[str, ...],
+    expected: str,
+) -> None:
+    """With no --model the EXTRACTOR_MODEL setting is used; --model wins (#251)."""
+    monkeypatch.setattr(settings, "EXTRACTOR_MODEL", "env/model")
+    _seed_classifications(tmp_path, ["a-8-01"])
+    models: list[object] = []
+
+    async def fake_workflow(**kwargs: object) -> ExtractionRowState:
+        models.append(kwargs["model"])
+        row_state = ExtractionRowState(
+            item_row=kwargs["item_row"], stage_name="instrument_ie"
+        )
+        row_state.finish("SUCCESS")
+        return row_state
+
+    monkeypatch.setattr("cdt.extractor.live.run_extraction_workflow", fake_workflow)
+
+    status = cli.main(["extract", "--quiet", "--artifact-root", str(tmp_path), *extra])
+
+    assert status == 0
+    assert models == [expected]
+
+
+def test_pipeline_cli_leaves_the_model_to_the_extractor_model_setting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without --model the config carries None, which extraction resolves (#251)."""
+    models: list[str | None] = []
+
+    def fake_run_pipeline(
+        config: cli.PipelineConfig, *, renew: object = None
+    ) -> PipelineRunResult:
+        models.append(config.extractor_model)
+        return _empty_pipeline_result(tmp_path)
+
+    monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
+    assert cli.main(_pipeline_argv(tmp_path)) == 0
+    assert cli.main(_pipeline_argv(tmp_path, "--model", "flag/model")) == 0
+    assert models == [None, "flag/model"]
+    assert (
+        cli.PipelineConfig(mode="daily", cik_file=Path("c.txt")).extractor_model is None
+    )
