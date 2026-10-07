@@ -249,7 +249,7 @@ def test_the_batch_finalize_purges_an_item_that_stopped_being_relevant(
 ) -> None:
     """The batch guard's other input has to work too (#209).
 
-    `_mentions_partition_needs_write` takes two reasons to purge, and the test
+    `write_mentions_partition` takes two reasons to purge, and the test
     above only drives one of them. `replaced` is "this item was re-extracted";
     `retired` is "this item is gone from the source" -- built in this backend
     from each claim's `prior_item_ids` minus whatever the claimed classification
