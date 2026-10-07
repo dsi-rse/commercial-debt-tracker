@@ -211,7 +211,7 @@ def _document_row(
         "date": date,
         "resource_uri": None,
         "form_type": "6-K",
-        "source": "edgar",
+        "source": "s3-manifest",
     }
     if mirror:
         target = tmp_path / "raw-documents" / "sixk" / f"{accession_number}.txt.gz"

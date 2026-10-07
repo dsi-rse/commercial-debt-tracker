@@ -20,7 +20,7 @@ from cdt.classifier.core import (
 )
 from cdt.completion import (
     CompletedPartition,
-    completion_registry_path,
+    completion_registry_root,
     pending_source_partitions,
     save_completion_registry,
 )
@@ -210,7 +210,7 @@ def classify_pending_items(
             "partitions_visited": sorted(visited_item_paths),
             "partitions_written": partitions_written,
             "empty_partitions_skipped_from_write": empty_partitions,
-            "completion_registry": completion_registry_path(
+            "completion_registry": completion_registry_root(
                 "classify", artifact_root=resolved_root, data_dir=data_dir
             ),
         },

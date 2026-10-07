@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import cast
+from typing import Self, cast
 
 import pandas as pd
 
@@ -14,7 +14,7 @@ from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
 from cdt.completion import (
     CompletedPartition,
     CompletionRegistry,
-    completion_registry_path,
+    completion_registry_root,
     load_completion_registry,
     save_completion_registry,
 )
@@ -294,81 +294,6 @@ def backfill_mentions(
     return counts
 
 
-def _mentions_partition_needs_write(
-    resolved_root: str,
-    *,
-    data_dir: Path | None,
-    partition: dict[str, str],
-    new_mentions: pd.DataFrame,
-    replaced_item_ids: set[str],
-    retired_item_ids: set[str],
-) -> bool:
-    """Whether this mentions partition has rows to add or rows to take away.
-
-    True when there are new mentions, or when there are replaced or retired
-    item ids and the partition already exists (a re-extracted item that now
-    yields no mentions must withdraw its old rows). Never true for a partition
-    that does not exist and would only be written empty. Shared by both
-    backends; see docs/decisions/extraction.md.
-    """
-    if not new_mentions.empty:
-        return True
-    if not (replaced_item_ids or retired_item_ids):
-        return False
-    return artifact_exists(
-        date_shard_partition_path(
-            MENTIONS_DATASET_NAME,
-            partition_date=partition["date"],
-            shard=partition["shard"],
-            artifact_root=resolved_root,
-            data_dir=data_dir,
-        )
-    )
-
-
-def _merge_mentions_partition(
-    resolved_root: str,
-    *,
-    data_dir: Path | None,
-    partition: dict[str, str],
-    new_mentions: pd.DataFrame,
-    replaced_item_ids: set[str],
-    retired_item_ids: set[str] | None = None,
-) -> str:
-    """Merge newly extracted mentions into a partition, replacing per item.
-
-    Row-level re-processing means a target partition can already hold mentions
-    from earlier passes; overwriting it wholesale would drop them.
-
-    ``retired_item_ids`` are ids a claimed source partition used to hold and
-    no longer does -- a row that stopped being relevant, or, on the 6-K path,
-    windows that merged into one snippet so their own ids ceased to exist.
-    Rows of those items are dropped; rows of items named in neither set are
-    left alone, since one mentions partition holds both genres and several
-    accessions. Nothing else prunes retired items' mentions. Returns the
-    partition path written.
-    """
-    target_path = date_shard_partition_path(
-        MENTIONS_DATASET_NAME,
-        partition_date=partition["date"],
-        shard=partition["shard"],
-        artifact_root=resolved_root,
-        data_dir=data_dir,
-    )
-    table = new_mentions
-    if artifact_exists(target_path):
-        existing = read_table(target_path, DEBT_INSTRUMENT_MENTION_COLUMNS)
-        dropped = replaced_item_ids | (retired_item_ids or set())
-        kept = existing.loc[~existing["item_id"].astype(str).isin(dropped)]
-        table = pd.concat([kept, new_mentions], ignore_index=True)
-    write_partition_table(
-        mentions_root(resolved_root, data_dir=data_dir),
-        partition=partition,
-        table=table.reindex(columns=DEBT_INSTRUMENT_MENTION_COLUMNS),
-    )
-    return target_path
-
-
 def summarize_failure(row_state: ExtractionRowState) -> str:
     """Summarize what this row lost, for its failure-registry entry.
 
@@ -449,6 +374,151 @@ def merge_row_failures(
     return path, len(registry)
 
 
+@dataclass
+class RowOutcomes:
+    """One extract run's per-row records: audit lines, failures and successes."""
+
+    run_id: str
+    backend: str
+    audit_records: list[str] = field(default_factory=list)
+    failed_rows: dict[str, dict[str, object]] = field(default_factory=dict)
+    succeeded_item_ids: set[str] = field(default_factory=set)
+
+    def add(
+        self: Self, row_state: ExtractionRowState, *, partition_date: str, shard: str
+    ) -> list[dict[str, object]]:
+        """Record one terminal row; return the mention rows it publishes."""
+        self.audit_records.append(json.dumps(row_state.to_audit_dict(), sort_keys=True))
+        mention_rows = (
+            published_mention_rows(row_state)
+            if row_state.state in PUBLISHABLE_ROW_STATES
+            else []
+        )
+        if row_state.state == "SUCCESS":
+            self.succeeded_item_ids.add(row_state.item_id)
+        else:
+            self.failed_rows[row_state.item_id] = failure_record(
+                row_state,
+                partition_date=partition_date,
+                shard=shard,
+                run_id=self.run_id,
+                backend=self.backend,
+            )
+        return mention_rows
+
+
+def write_mentions_partition(
+    resolved_root: str,
+    *,
+    data_dir: Path | None,
+    partition: dict[str, str],
+    new_mentions: pd.DataFrame,
+    replaced_item_ids: set[str],
+    retired_item_ids: set[str],
+) -> str | None:
+    """Merge one partition's new mentions into its target, replacing per item.
+
+    The target can already hold mentions from earlier passes, both genres and
+    several accessions, so only rows of ``replaced_item_ids`` (re-extracted
+    this run) and ``retired_item_ids`` (gone from a claimed source) are
+    dropped. Replaced ids purge too, so an item re-extracted to zero mentions
+    withdraws what it published before. Returns the partition path written,
+    or None when there is nothing to add or take away; a partition that does
+    not exist is never written empty. See docs/decisions/extraction.md.
+    """
+    target_path = date_shard_partition_path(
+        MENTIONS_DATASET_NAME,
+        partition_date=partition["date"],
+        shard=partition["shard"],
+        artifact_root=resolved_root,
+        data_dir=data_dir,
+    )
+    dropped = replaced_item_ids | retired_item_ids
+    if new_mentions.empty and not dropped:
+        return None
+    exists = artifact_exists(target_path)
+    if new_mentions.empty and not exists:
+        return None
+    table = new_mentions
+    if exists:
+        existing = read_table(target_path, DEBT_INSTRUMENT_MENTION_COLUMNS)
+        kept = existing.loc[~existing["item_id"].astype(str).isin(dropped)]
+        table = pd.concat([kept, new_mentions], ignore_index=True)
+    write_partition_table(
+        mentions_root(resolved_root, data_dir=data_dir),
+        partition=partition,
+        table=table.reindex(columns=DEBT_INSTRUMENT_MENTION_COLUMNS),
+    )
+    return target_path
+
+
+def completion_entry(
+    fingerprint: str | None, terminal_ids: set[str], relevant_ids: set[str]
+) -> CompletedPartition:
+    """Return a source partition's registry entry after this run's verdicts.
+
+    Only ids the source still holds are recorded: an id whose row is gone just
+    had its mentions pruned, and keeping it would retire it again on every
+    later pass. The partition is complete once every relevant row is terminal.
+    """
+    return CompletedPartition(
+        fingerprint=fingerprint,
+        item_ids=frozenset(terminal_ids & relevant_ids),
+        complete=relevant_ids <= terminal_ids,
+    )
+
+
+def write_run_records(
+    outcomes: RowOutcomes,
+    registry: CompletionRegistry,
+    *,
+    artifact_root: str,
+    data_dir: Path | None,
+    manifest: dict[str, object],
+) -> tuple[str, str, int]:
+    """Save one extract run's registry, failures, audit log and run manifest.
+
+    ``manifest`` holds the backend's own manifest fields; the shared ones are
+    added here. Returns the audit path, the failure-registry path and the
+    failure registry's total entry count.
+    """
+    save_completion_registry(
+        "extract", registry, artifact_root=artifact_root, data_dir=data_dir
+    )
+    # The registry now marks these rows done for good, so record the ones that
+    # produced nothing before that fact is only visible in the audit log.
+    failure_registry, total_known_failures = merge_row_failures(
+        outcomes.failed_rows,
+        outcomes.succeeded_item_ids,
+        artifact_root=artifact_root,
+        data_dir=data_dir,
+    )
+    audit_path = extractor_run_path(
+        outcomes.run_id, artifact_root=artifact_root, data_dir=data_dir
+    )
+    write_text_artifact(
+        audit_path,
+        ("\n".join(outcomes.audit_records) + "\n") if outcomes.audit_records else "",
+    )
+    write_json_artifact(
+        run_manifest_path(
+            "extract", outcomes.run_id, artifact_root=artifact_root, data_dir=data_dir
+        ),
+        {
+            "artifact_root": artifact_root,
+            "stage": "extract",
+            **manifest,
+            "failure_count": len(outcomes.failed_rows),
+            "audit_path": audit_path,
+            "completion_registry": completion_registry_root(
+                "extract", artifact_root=artifact_root, data_dir=data_dir
+            ),
+            "failure_registry": failure_registry,
+        },
+    )
+    return audit_path, failure_registry, total_known_failures
+
+
 def finalize_extract_outputs(
     row_entries: list[tuple[ExtractionRowState, str, str]],
     *,
@@ -470,29 +540,14 @@ def finalize_extract_outputs(
     ``(date, shard)`` partition and merged into existing targets per item.
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    outcomes = RowOutcomes(run_id=run_id, backend="batch")
+    # Keyed even when a partition publishes nothing, so every partition the
+    # job covered is visited below.
     mentions_by_partition: dict[tuple[str, str], list[dict[str, object]]] = {}
-    audit_records: list[str] = []
-    failed_rows: dict[str, dict[str, object]] = {}
-    succeeded_item_ids: set[str] = set()
     for row_state, partition_date, shard in row_entries:
-        audit_records.append(json.dumps(row_state.to_audit_dict(), sort_keys=True))
-        if row_state.state in PUBLISHABLE_ROW_STATES:
-            mentions_by_partition.setdefault((partition_date, shard), []).extend(
-                published_mention_rows(row_state)
-            )
-        if row_state.state == "SUCCESS":
-            succeeded_item_ids.add(row_state.item_id)
-        else:
-            failed_rows[row_state.item_id] = failure_record(
-                row_state,
-                partition_date=partition_date,
-                shard=shard,
-                run_id=run_id,
-                backend="batch",
-            )
-        # Ensure a visited-but-empty partition still exists as a key so we do not
-        # lose track of which partitions the job covered.
-        mentions_by_partition.setdefault((partition_date, shard), [])
+        mentions_by_partition.setdefault((partition_date, shard), []).extend(
+            outcomes.add(row_state, partition_date=partition_date, shard=shard)
+        )
 
     terminal_by_partition: dict[tuple[str, str], set[str]] = {}
     for row_state, partition_date, shard in row_entries:
@@ -533,30 +588,18 @@ def finalize_extract_outputs(
     empty_partitions = 0
     for (partition_date, shard), mention_rows in sorted(mentions_by_partition.items()):
         mentions = pd.DataFrame(mention_rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
-        replaced = terminal_by_partition.get((partition_date, shard), set())
-        retired = retired_by_partition.get((partition_date, shard), set())
-        # `replaced` as well as `retired`: a still-relevant item re-extracted to
-        # zero mentions must still have its old rows purged.
-        if not _mentions_partition_needs_write(
+        written = write_mentions_partition(
             resolved_root,
             data_dir=data_dir,
             partition={"date": partition_date, "shard": shard},
             new_mentions=mentions,
-            replaced_item_ids=replaced,
-            retired_item_ids=retired,
-        ):
+            replaced_item_ids=terminal_by_partition.get((partition_date, shard), set()),
+            retired_item_ids=retired_by_partition.get((partition_date, shard), set()),
+        )
+        if written is None:
             empty_partitions += 1
             continue
-        partitions_written.append(
-            _merge_mentions_partition(
-                resolved_root,
-                data_dir=data_dir,
-                partition={"date": partition_date, "shard": shard},
-                new_mentions=mentions,
-                replaced_item_ids=replaced,
-                retired_item_ids=retired,
-            )
-        )
+        partitions_written.append(written)
         if mentions.empty:
             empty_partitions += 1
         else:
@@ -573,42 +616,20 @@ def finalize_extract_outputs(
         terminal = prior | terminal_by_partition.get(
             (partition["date"], partition["shard"]), set()
         )
-        relevant_ids = relevant_by_path[classification_path]
         fingerprint = claim.get("fingerprint")
-        registry[classification_path] = CompletedPartition(
-            fingerprint=str(fingerprint) if fingerprint else None,
-            # As in the synchronous path: only ids the source still holds, and
-            # only this source's — one (date, shard) can be claimed by both
-            # genres, so `terminal_by_partition` mixes them.
-            item_ids=frozenset(terminal & relevant_ids),
-            complete=relevant_ids <= terminal,
+        # Only this source's relevant ids: one (date, shard) can be claimed by
+        # both genres, so `terminal_by_partition` mixes them.
+        registry[classification_path] = completion_entry(
+            str(fingerprint) if fingerprint else None,
+            terminal,
+            relevant_by_path[classification_path],
         )
-    save_completion_registry(
-        "extract", registry, artifact_root=resolved_root, data_dir=data_dir
-    )
-    # Claiming the partitions above marks these rows done for good, so record the
-    # ones that produced nothing before that fact is only visible in the audit log.
-    failure_registry, total_known_failures = merge_row_failures(
-        failed_rows,
-        succeeded_item_ids,
+    full_jsonl_path, failure_registry, total_known_failures = write_run_records(
+        outcomes,
+        registry,
         artifact_root=resolved_root,
         data_dir=data_dir,
-    )
-
-    full_jsonl_path = extractor_run_path(
-        run_id, artifact_root=resolved_root, data_dir=data_dir
-    )
-    write_text_artifact(
-        full_jsonl_path,
-        ("\n".join(audit_records) + "\n") if audit_records else "",
-    )
-    write_json_artifact(
-        run_manifest_path(
-            "extract", run_id, artifact_root=resolved_root, data_dir=data_dir
-        ),
-        {
-            "artifact_root": resolved_root,
-            "stage": "extract",
+        manifest={
             "backend": "batch",
             "model": model,
             "reasoning_effort": reasoning_effort,
@@ -616,20 +637,14 @@ def finalize_extract_outputs(
             "partitions_completed": sorted(claimed),
             "partitions_written": partitions_written,
             "empty_partitions_skipped_from_write": empty_partitions,
-            "failure_count": len(failed_rows),
-            "audit_path": full_jsonl_path,
-            "completion_registry": completion_registry_path(
-                "extract", artifact_root=resolved_root, data_dir=data_dir
-            ),
-            "failure_registry": failure_registry,
         },
     )
     LOGGER.info(
         "Batch extractor finalize complete: rows=%s successes=%s failures=%s "
         "mentions=%s synthesized=%s audit=%s failure_registry=%s (%s total)",
         len(row_entries),
-        len(row_entries) - len(failed_rows),
-        len(failed_rows),
+        len(row_entries) - len(outcomes.failed_rows),
+        len(outcomes.failed_rows),
         sum(len(frame) for frame in processed_frames),
         sum(
             int(frame["synthesized_by"].notna().sum())

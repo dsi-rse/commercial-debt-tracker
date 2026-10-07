@@ -249,7 +249,7 @@ def test_the_batch_finalize_purges_an_item_that_stopped_being_relevant(
 ) -> None:
     """The batch guard's other input has to work too (#209).
 
-    `_mentions_partition_needs_write` takes two reasons to purge, and the test
+    `write_mentions_partition` takes two reasons to purge, and the test
     above only drives one of them. `replaced` is "this item was re-extracted";
     `retired` is "this item is gone from the source" -- built in this backend
     from each claim's `prior_item_ids` minus whatever the claimed classification
@@ -371,3 +371,107 @@ def test_extract_tables_publishes_through_the_mint_seam(
 
     rows = tables["debt_instrument_mentions"]
     assert (rows["synthesized_by"] == "prior_state").sum() == 1
+
+
+def test_a_registry_entry_keeps_only_ids_the_source_still_holds() -> None:
+    """A terminal id whose row is gone stays out of the entry.
+
+    Its mentions were just pruned; recording it would retire it again on every
+    later pass. The entry stays incomplete while a relevant row lacks a verdict.
+    """
+    from cdt.extractor.outputs import completion_entry
+
+    entry = completion_entry("fp", {"kept", "gone"}, {"kept", "pending"})
+
+    assert entry.fingerprint == "fp"
+    assert entry.item_ids == frozenset({"kept"})
+    assert entry.complete is False
+    assert completion_entry("fp", {"kept", "gone"}, {"kept"}).complete is True
+
+
+_SHARED_MANIFEST_KEYS = {
+    "artifact_root",
+    "stage",
+    "partitions_written",
+    "empty_partitions_skipped_from_write",
+    "failure_count",
+    "audit_path",
+    "completion_registry",
+    "failure_registry",
+}
+
+
+def test_the_live_run_manifest_records_its_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live manifest keeps its own fields and the shared ones."""
+    import json
+
+    _seed_classifications(tmp_path, ["a-8-01", "b-8-01"])
+
+    async def fake_workflow(**kwargs: object) -> ExtractionRowState:
+        item_row = kwargs["item_row"]
+        row_state = ExtractionRowState(item_row=item_row, stage_name="instrument_ie")
+        if item_row["item_id"] == "a-8-01":
+            row_state.debt_instrument_mentions = [
+                {"item_id": "a-8-01", "name": "Term Loan"}
+            ]
+            row_state.finish("SUCCESS")
+        else:
+            row_state.finish("FAILED")
+        return row_state
+
+    monkeypatch.setattr("cdt.extractor.live.run_extraction_workflow", fake_workflow)
+    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+
+    (manifest_path,) = (tmp_path / "runs" / "extract").glob("run_id=*.json")
+    manifest = json.loads(manifest_path.read_text())
+    assert set(manifest) == _SHARED_MANIFEST_KEYS | {
+        "batch_size",
+        "force",
+        "model",
+        "reasoning_effort",
+        "max_attempts",
+        "partitions_visited",
+        "aborted_on_infrastructure_error",
+    }
+    assert manifest["stage"] == "extract"
+    assert manifest["failure_count"] == 1
+    assert len(manifest["partitions_written"]) == 1
+    assert manifest["empty_partitions_skipped_from_write"] == 0
+    assert manifest["aborted_on_infrastructure_error"] is None
+
+
+def test_the_batch_run_manifest_records_its_fields(tmp_path: Path) -> None:
+    """The batch manifest keeps its own fields and the shared ones."""
+    import json
+
+    from cdt.datasets import run_manifest_path
+    from cdt.extractor.outputs import finalize_extract_outputs
+
+    run_id = "20240601T000000000000Z"
+    finalize_extract_outputs(
+        [(_row_state_with_a_prior_term(), "2024-06-01", "0001")],
+        claimed={},
+        run_id=run_id,
+        model="test-model",
+        reasoning_effort="none",
+        max_attempts=3,
+        artifact_root=tmp_path,
+    )
+
+    manifest = json.loads(
+        Path(run_manifest_path("extract", run_id, artifact_root=tmp_path)).read_text()
+    )
+    assert set(manifest) == _SHARED_MANIFEST_KEYS | {
+        "backend",
+        "model",
+        "reasoning_effort",
+        "max_attempts",
+        "partitions_completed",
+    }
+    assert manifest["backend"] == "batch"
+    assert manifest["model"] == "test-model"
+    assert manifest["failure_count"] == 0
+    assert len(manifest["partitions_written"]) == 1
+    assert manifest["empty_partitions_skipped_from_write"] == 0

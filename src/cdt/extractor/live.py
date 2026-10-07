@@ -12,21 +12,16 @@ import pandas as pd
 
 from cdt import settings
 from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
-from cdt.completion import (
-    CompletedPartition,
-    completion_registry_path,
-    save_completion_registry,
-)
-from cdt.datasets import extractor_run_path, resolve_artifact_root, run_manifest_path
+from cdt.datasets import extractor_run_path, resolve_artifact_root
 from cdt.extractor.batch import active_job_claimed_partition_paths
 from cdt.extractor.llm import normalize_reasoning_effort
 from cdt.extractor.outputs import (
-    _mentions_partition_needs_write,
-    _merge_mentions_partition,
-    failure_record,
-    merge_row_failures,
+    RowOutcomes,
+    completion_entry,
     pending_extract_partitions,
     summarize_failure,
+    write_mentions_partition,
+    write_run_records,
 )
 from cdt.extractor.prior_state import published_mention_rows
 from cdt.extractor.schema import DEBT_INSTRUMENT_MENTION_COLUMNS
@@ -40,7 +35,7 @@ from cdt.extractor.workflow import (
     run_extraction_workflow,
 )
 from cdt.shared import get_logger
-from cdt.storage.objects import write_json_artifact, write_text_artifact
+from cdt.storage.objects import write_text_artifact
 from cdt.storage.tables import read_table
 
 LOGGER = get_logger(__name__)
@@ -68,13 +63,8 @@ def extract_pending_items(
     resolved_reasoning = normalize_reasoning_effort(reasoning_effort)
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-    full_jsonl_path = extractor_run_path(
-        run_id, artifact_root=resolved_root, data_dir=data_dir
-    )
+    outcomes = RowOutcomes(run_id=run_id, backend="live")
     processed_frames: list[pd.DataFrame] = []
-    failed_rows: dict[str, dict[str, object]] = {}
-    succeeded_item_ids: set[str] = set()
-    audit_records: list[str] = []
     partitions_written: list[str] = []
     visited_classification_paths: set[str] = set()
     empty_partitions = 0
@@ -144,21 +134,14 @@ def extract_pending_items(
                 # the retry pays only for what never got a verdict.
                 aborted = str(exc)
                 break
-            audit_records.append(json.dumps(row_state.to_audit_dict(), sort_keys=True))
+            mention_rows.extend(
+                outcomes.add(
+                    row_state, partition_date=pending.date, shard=pending.shard
+                )
+            )
             terminal_ids.add(row_state.item_id)
             replaced_item_ids.add(row_state.item_id)
-            if row_state.state in PUBLISHABLE_ROW_STATES:
-                mention_rows.extend(published_mention_rows(row_state))
-            if row_state.state == "SUCCESS":
-                succeeded_item_ids.add(row_state.item_id)
-            else:
-                failed_rows[row_state.item_id] = failure_record(
-                    row_state,
-                    partition_date=pending.date,
-                    shard=pending.shard,
-                    run_id=run_id,
-                    backend="live",
-                )
+            if row_state.state != "SUCCESS":
                 partition_failures += 1
             if (
                 item_index == total_relevant_items
@@ -179,36 +162,22 @@ def extract_pending_items(
         mentions = pd.DataFrame(mention_rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
         # Rows this partition was extracted for last time and no longer has.
         retired_item_ids = set(pending.done_item_ids) - relevant_item_ids
-        # One condition, shared with the batch path.
-        if _mentions_partition_needs_write(
+        written = write_mentions_partition(
             resolved_root,
             data_dir=data_dir,
             partition=partition,
             new_mentions=mentions,
             replaced_item_ids=replaced_item_ids,
             retired_item_ids=retired_item_ids,
-        ):
-            partitions_written.append(
-                _merge_mentions_partition(
-                    resolved_root,
-                    data_dir=data_dir,
-                    partition=partition,
-                    new_mentions=mentions,
-                    replaced_item_ids=replaced_item_ids,
-                    retired_item_ids=retired_item_ids,
-                )
-            )
+        )
+        if written is None:
+            empty_partitions += 1
+        else:
+            partitions_written.append(written)
             if not mentions.empty:
                 processed_frames.append(mentions)
-        else:
-            empty_partitions += 1
-        registry[pending.classification_path] = CompletedPartition(
-            fingerprint=pending.fingerprint,
-            # Scoped to rows the source still holds: an id whose row is gone
-            # just had its mentions pruned, and keeping it here would retire
-            # it again on every later pass.
-            item_ids=frozenset(terminal_ids & relevant_item_ids),
-            complete=relevant_item_ids <= terminal_ids,
+        registry[pending.classification_path] = completion_entry(
+            pending.fingerprint, terminal_ids, relevant_item_ids
         )
         LOGGER.info(
             "Extraction partition complete: %s progress=%s/%s classified_items=%s relevant_items=%s mentions=%s wrote_output=%s elapsed=%.1fs",
@@ -224,33 +193,12 @@ def extract_pending_items(
         if aborted is not None:
             break
 
-    save_completion_registry(
-        "extract",
+    full_jsonl_path, failure_registry, total_known_failures = write_run_records(
+        outcomes,
         registry,
         artifact_root=resolved_root,
         data_dir=data_dir,
-    )
-    failure_registry, total_known_failures = merge_row_failures(
-        failed_rows,
-        succeeded_item_ids,
-        artifact_root=resolved_root,
-        data_dir=data_dir,
-    )
-
-    if audit_records:
-        write_text_artifact(full_jsonl_path, "\n".join(audit_records) + "\n")
-    else:
-        write_text_artifact(full_jsonl_path, "")
-    write_json_artifact(
-        run_manifest_path(
-            "extract",
-            run_id,
-            artifact_root=resolved_root,
-            data_dir=data_dir,
-        ),
-        {
-            "artifact_root": resolved_root,
-            "stage": "extract",
+        manifest={
             "batch_size": batch_size,
             "force": force,
             "model": resolved_model,
@@ -259,12 +207,6 @@ def extract_pending_items(
             "partitions_visited": sorted(visited_classification_paths),
             "partitions_written": partitions_written,
             "empty_partitions_skipped_from_write": empty_partitions,
-            "failure_count": len(failed_rows),
-            "audit_path": full_jsonl_path,
-            "completion_registry": completion_registry_path(
-                "extract", artifact_root=resolved_root, data_dir=data_dir
-            ),
-            "failure_registry": failure_registry,
             "aborted_on_infrastructure_error": aborted,
         },
     )
@@ -281,7 +223,7 @@ def extract_pending_items(
             for frame in processed_frames
             if not frame.empty
         ),
-        len(failed_rows),
+        len(outcomes.failed_rows),
         sum(len(frame) for frame in processed_frames),
         sum(
             int(frame["synthesized_by"].notna().sum())

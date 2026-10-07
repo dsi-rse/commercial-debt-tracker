@@ -132,7 +132,6 @@ class DocumentSource(StrEnum):
     """How a document row was acquired, recorded per row in ``source``."""
 
     S3_MANIFEST = "s3-manifest"
-    EDGAR = "edgar"
 
 
 @dataclass(frozen=True)
