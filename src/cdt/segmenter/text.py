@@ -7,17 +7,9 @@ import re
 from dataclasses import dataclass
 
 PREFIX = "ITEM INFORMATION:"
-
-
 DOCUMENT_RE = re.compile(r"<DOCUMENT>(.*?)</DOCUMENT>", re.IGNORECASE | re.DOTALL)
-
-
 TYPE_RE = re.compile(r"<TYPE>\s*([^\n\r<]+)", re.IGNORECASE)
-
-
 TEXT_RE = re.compile(r"<TEXT>(.*?)</TEXT>", re.IGNORECASE | re.DOTALL)
-
-
 SEC_HEADER_END = "</SEC-HEADER>"
 
 

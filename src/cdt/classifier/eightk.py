@@ -11,7 +11,6 @@ import numpy as np
 import pandas as pd
 
 from cdt.classifier.core import (
-    CLASSIFICATION_DATASET_NAME,
     CLASSIFIED_ITEM_COLUMNS,
     classifications_root,
     default_model_dir,
@@ -26,12 +25,14 @@ from cdt.completion import (
     save_completion_registry,
 )
 from cdt.datasets import (
+    CLASSIFICATION_DATASET_NAME,
+    ITEM_DATASET_NAME,
     date_shard_partition_path,
     parse_date_shard_partition,
     resolve_artifact_root,
     run_manifest_path,
 )
-from cdt.segmenter.core import ITEM_COLUMNS, ITEM_DATASET_NAME
+from cdt.segmenter.core import ITEM_COLUMNS
 from cdt.storage.objects import write_json_artifact
 from cdt.storage.tables import read_table, write_partition_table
 

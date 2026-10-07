@@ -8,22 +8,12 @@ from pathlib import Path
 from cdt.datasets import dataset_root
 
 DEFAULT_RELATED_THRESHOLD = 0.75
-
-
 DEFAULT_MEMBERSHIP_THRESHOLD = 0.90
-
-
 DEFAULT_AMBIGUITY_MARGIN = 0.05
-
-
 DEFAULT_LENDER_SUPPORT_THRESHOLD = 0.5
-
-
 # Bump when published columns or hashed mention payloads change; a root matched
 # at an older version is fully rematched (`_stale_schema_forces_rematch`).
 MATCHER_SCHEMA_VERSION = 7
-
-
 EDGE_TYPES = ("member", "related", "ambiguous_candidate")
 
 
@@ -36,8 +26,6 @@ MENTION_CLUSTER_EDGE_COLUMNS = [
     "match_via",
     "evaluated_run_id",
 ]
-
-
 DEBT_INSTRUMENT_COLUMNS = [
     "debt_instrument_id",
     "cik",
@@ -86,11 +74,7 @@ DEBT_INSTRUMENT_COLUMNS = [
     # to know.
     "synthesized_only",
 ]
-
-
 MENTION_CLUSTER_EDGE_DATASET_NAME = "mention-cluster-edges"
-
-
 DEBT_INSTRUMENT_DATASET_NAME = "debt-instruments"
 
 

@@ -27,8 +27,8 @@ from cdt.classifier.sixk import (
     triage_pending_documents,
 )
 from cdt.completion import load_completion_registry
-from cdt.datasets import run_manifest_path
-from cdt.ingest.core import DOCUMENT_COLUMNS, SIXK_DOCUMENT_DATASET_NAME
+from cdt.datasets import SIXK_DOCUMENT_DATASET_NAME, run_manifest_path
+from cdt.ingest.core import DOCUMENT_COLUMNS
 from cdt.ingest.core import documents_root as ingest_documents_root
 from cdt.segmenter.sixk import (
     prepare_filing,

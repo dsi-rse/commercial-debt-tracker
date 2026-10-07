@@ -114,8 +114,6 @@ def validate_instrument_entry(
 # Which amount kinds fit which instrument types: a facility has a commitment, a
 # security has a principal. Balances, draws, repayments and proceeds fit any.
 FACILITY_INSTRUMENT_TYPES = {"revolving_credit", "credit_line"}
-
-
 AMOUNT_KIND_TYPE_CONFLICTS = {
     ("commitment", "note_bond"),
     ("principal", "revolving_credit"),

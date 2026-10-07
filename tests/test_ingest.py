@@ -13,13 +13,13 @@ import pandas as pd
 import pytest
 
 from cdt.datasets import (
+    SIXK_DOCUMENT_DATASET_NAME,
     default_artifact_root,
     failure_registry_path,
     parse_date_shard_partition,
 )
 from cdt.ingest.core import (
     DOCUMENT_COLUMNS,
-    SIXK_DOCUMENT_DATASET_NAME,
     IngestConfig,
     _document_shard,
     _partition_path,

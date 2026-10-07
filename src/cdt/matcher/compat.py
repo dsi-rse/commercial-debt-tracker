@@ -61,19 +61,11 @@ def name_rate_tokens(fingerprint: str | None) -> frozenset[str]:
 
 
 NAME_STOPWORDS = frozenset({"the", "of", "and", "its", "new", "existing", "certain"})
-
-
 NAME_CLASS_TOKEN = re.compile(r"^(?:[a-z]|[a-z]?-?\d+[a-z]?|\d+)$")
-
-
 NAME_MATURITY_YEAR_PATTERN = re.compile(r"\b(?:19|20)\d{2}\b")
-
-
 # Above this many mentions sharing one compatible name, the name is generic for
 # that issuer and the relaxed key rule is off.
 NAME_CLASS_GATE = 2
-
-
 # The shorter of two compatible names needs this many informative tokens, so a
 # bare `note` cannot subsume every note one issuer has.
 NAME_MIN_SHARED_TOKENS = 2

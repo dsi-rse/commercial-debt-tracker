@@ -14,6 +14,8 @@ from typing import Protocol, Self, cast
 import pandas as pd
 
 from cdt.datasets import (
+    DEFAULT_FORM_TYPES,
+    DOCUMENT_DATASET_NAME,
     dataset_root,
     default_artifact_root,
     failure_registry_path,
@@ -39,8 +41,6 @@ from cdt.storage.tables import (
 )
 
 LOGGER = get_logger(__name__)
-
-
 DOCUMENT_COLUMNS = [
     "accession_number",
     "cik",
@@ -54,53 +54,20 @@ DOCUMENT_COLUMNS = [
     "form_type",
     "source",
 ]
-
-
 # The SEC scraper's output bucket. In dev CDT writes to it too, by prefix: the
 # scraper owns `sec/`, CDT owns `processors/cdt/` and `database/cdt/`.
 DEFAULT_BUCKET = "idi-dev-ftm2j-shared-processor-storage"
-
-
 DEFAULT_AWS_PROFILE = ""
-
-
 DEFAULT_S3_PREFIX = "sec"
 
 
-CDT_FORM_TYPE = "8-K"
-
-
-DEFAULT_FORM_TYPES: tuple[str, ...] = (CDT_FORM_TYPE,)
-
-
-# The 6-K genre's forms.
-SIXK_FORM_TYPES: tuple[str, ...] = ("6-K", "6-K/A")
-
-
 DEFAULT_BATCH_SIZE = 100
-
-
 PROGRESS_DAY_INTERVAL = 30
-
-
 # {prefix...}/{date}/{form}/{cik}/{accession}/manifest.json — the CIK is
 # counted from the end so a multi-segment --s3-prefix cannot shift it.
 MANIFEST_KEY_CIK_INDEX_FROM_END = -3
-
-
 MIN_MANIFEST_KEY_PARTS = 5
-
-
 DEFAULT_OUTPUT_PREFIX = "processors/cdt"
-
-
-DOCUMENT_DATASET_NAME = "documents"
-
-
-# The 6-K genre's own documents dataset (see IngestConfig.dataset_name).
-SIXK_DOCUMENT_DATASET_NAME = "documents-sixk"
-
-
 DOCUMENT_PARTITION_SHARDS = 64
 
 

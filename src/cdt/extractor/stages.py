@@ -71,11 +71,7 @@ NER_ALLOWED_TAGS = frozenset(
         "interest_rate",
     }
 )
-
-
 NER_ENTITY_TAGS = NER_ALLOWED_TAGS - {"body"}
-
-
 NER_ENTITY_OPEN_TAG_RE = re.compile(
     r"<(?:" + "|".join(sorted(NER_ENTITY_TAGS)) + r")(?:\s[^>]*)?>"
 )
@@ -430,8 +426,6 @@ class InstrumentIEStage:
 
 
 LINEAGE_SUCCESSOR_FIRST_TYPES = {"amendment_of"}
-
-
 LINEAGE_PREDECESSOR_FIRST_TYPES = {"retired_by"}
 
 
@@ -577,11 +571,7 @@ EXTRACTOR_STAGES: list[StageSpec] = [
     InstrumentIEStage(),
     InstrumentRelationStage(),
 ]
-
-
 STAGE_BY_NAME: dict[str, StageSpec] = {stage.name: stage for stage in EXTRACTOR_STAGES}
-
-
 STAGE_INDEX: dict[str, int] = {
     stage.name: index for index, stage in enumerate(EXTRACTOR_STAGES)
 }

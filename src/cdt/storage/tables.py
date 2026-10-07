@@ -70,7 +70,6 @@ def iter_partition_paths(
 # those must stay fatal rather than become a silent fallback.
 _ARROW_READ_ERRORS = (pyarrow.ArrowException, FileNotFoundError)
 
-
 # Threads for per-partition footer reads, which happen before the dataset
 # scanner (and its threads) exist. Arrow releases the GIL, so they overlap.
 _SCHEMA_WORKERS = 32

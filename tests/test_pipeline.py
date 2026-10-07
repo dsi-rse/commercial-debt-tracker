@@ -819,6 +819,47 @@ def test_resolve_mode_dates_daily_uses_lookback_window() -> None:
     assert start == today.fromordinal(today.toordinal() - DAILY_LOOKBACK_DAYS)
 
 
+def test_the_lease_is_renewed_between_the_eightk_and_sixk_chains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A long 8-K chain must not leave the 6-K chain writing on a stale lease."""
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("320193\n", encoding="utf-8")
+    calls: list[str] = []
+    _stage_stubs(
+        monkeypatch, tmp_path, instruments=pd.DataFrame(columns=["debt_instrument_id"])
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.classify_pending_items",
+        lambda **kwargs: (calls.append("classify"), pd.DataFrame())[1],
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.acquire_scraped_sixk_documents",
+        lambda config, **kwargs: (
+            calls.append("ingest-sixk"),
+            (pd.DataFrame(), _sixk_ingest_result(tmp_path, kwargs.get("ciks"))),
+        )[1],
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.triage_pending_documents", lambda **kwargs: pd.DataFrame()
+    )
+
+    run_pipeline(
+        PipelineConfig(
+            mode="historical",
+            cik_file=str(cik_file),
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 1, 31),
+            artifact_root=str(tmp_path / "artifacts"),
+            genres=DEFAULT_GENRES,
+        ),
+        renew=lambda: calls.append("renew"),
+    )
+
+    between = calls[calls.index("classify") + 1 : calls.index("ingest-sixk")]
+    assert between == ["renew"]
+
+
 def _stage_stubs(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

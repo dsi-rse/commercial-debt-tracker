@@ -43,7 +43,16 @@ can read. 8-K goes ingest → itemize → classify. 6-K goes ingest → triage: 
 has no items to itemize, so the item classifier has nothing to classify, and
 triage writes rows in the same classified-item columns. Both meet at extract.
 
-The CLIs default to both genres. A run is asked for CIKs and a date range, and
+Each genre is one record in `cdt.datasets.GENRES`: its SEC forms, and the
+datasets its upstream stages write (documents, the rows it contributes to the
+published `items` table, the rows the extractor reads). The registry lives in
+the leaf `datasets.py` and holds data only, so every stage can read it without
+importing another stage. What depends on the set of genres is derived from it
+rather than listed by hand: the extractor's `CLASSIFICATION_SOURCES`, the
+`items` table's `form_type` stamps, the CLI default and the pipeline's prepare
+loop. Adding a genre is a record, a prepare method and its stage modules.
+
+The CLIs default to every genre. A run is asked for CIKs and a date range, and
 the caller should not have to know, or keep in sync with the scraper's
 coverage, which forms those filers happened to file. `--genres` narrows the
 run when it is deliberately about one genre.
@@ -451,8 +460,8 @@ effect on behaviour.
 
 Ingest itself does not care about form type. `DEFAULT_FORM_TYPES` keeps every
 caller, CLI flag and deployed schedule on 8-K unless one asks for another
-form. The 6-K forms are defined in `cdt.ingest` because the CLI needs them as a
-default before it knows which source will run.
+form. Both form tuples are defined in `cdt.datasets` with the genre registry,
+so the CLI has them as a default before it knows which source will run.
 
 ### `DOCUMENT_COLUMNS` (`form_type`, `source`)
 
