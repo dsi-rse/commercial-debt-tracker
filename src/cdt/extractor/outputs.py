@@ -14,7 +14,7 @@ from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
 from cdt.completion import (
     CompletedPartition,
     CompletionRegistry,
-    completion_registry_path,
+    completion_registry_root,
     load_completion_registry,
     save_completion_registry,
 )
@@ -618,7 +618,7 @@ def finalize_extract_outputs(
             "empty_partitions_skipped_from_write": empty_partitions,
             "failure_count": len(failed_rows),
             "audit_path": full_jsonl_path,
-            "completion_registry": completion_registry_path(
+            "completion_registry": completion_registry_root(
                 "extract", artifact_root=resolved_root, data_dir=data_dir
             ),
             "failure_registry": failure_registry,

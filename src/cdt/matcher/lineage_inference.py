@@ -40,7 +40,7 @@ from cdt.extractor.schema import (
     DEBT_INSTRUMENT_MENTION_COLUMNS as EXTRACTED_MENTION_COLUMNS,
 )
 from cdt.matcher.instruments import apply_lifecycle_rollup, apply_observation_columns
-from cdt.matcher.normalize import coerce_optional_text, prepare_mention
+from cdt.matcher.normalize import _json_text, coerce_optional_text, prepare_mention
 from cdt.matcher.schema import (
     DEBT_INSTRUMENT_COLUMNS,
     MATCHER_SCHEMA_VERSION,
@@ -132,10 +132,7 @@ def _borrowers(row: dict[str, object]) -> set[tuple[str, ...]]:
     Placeholders in `GENERIC_BORROWER_PHRASES` are dropped. Absent, unparseable
     or non-list `parties_json` returns the empty set, meaning no borrower named.
     """
-    try:
-        parties = json.loads(str(row.get("parties_json") or "[]"))
-    except json.JSONDecodeError:
-        return set()
+    parties = json.loads(_json_text(row, "parties_json") or "[]")
     if not isinstance(parties, list):
         return set()
     keys = {

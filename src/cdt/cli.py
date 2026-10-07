@@ -967,15 +967,6 @@ def positive_int(value: str) -> int:
     return parsed
 
 
-def parse_form_types(value: str) -> tuple[str, ...]:
-    """Parse a comma-separated list of SEC form names."""
-    forms = tuple(part.strip() for part in value.split(",") if part.strip())
-    if not forms:
-        msg = "at least one form type is required"
-        raise argparse.ArgumentTypeError(msg)
-    return forms
-
-
 def parse_item_numbers(value: str) -> tuple[str, ...]:
     """Parse a comma-separated item-number list for argparse."""
     parsed = tuple(part.strip() for part in value.split(",") if part.strip())

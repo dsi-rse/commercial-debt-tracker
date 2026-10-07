@@ -50,21 +50,6 @@ def completion_registry_root(
     )
 
 
-def completion_registry_path(
-    stage_name: str,
-    *,
-    artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
-) -> str:
-    """Deprecated alias for ``completion_registry_root``; do not add callers.
-
-    Removal is tracked on #227.
-    """
-    return completion_registry_root(
-        stage_name, artifact_root=artifact_root, data_dir=data_dir
-    )
-
-
 # Registry shards are keyed by the source partition's year-month; why:
 # docs/decisions/storage-and-completion.md.
 _REGISTRY_SHARD_DATE_CHARS = len("YYYY-MM")

@@ -284,11 +284,9 @@ active revolvers at once (#170).
   `Issuer` into evidence of two different companies (#205).
 - **Silence is not disagreement.** Refusing a link whenever a party is missing
   would drop ordinary links to the many mentions that never name a borrower.
-- **Local JSON guard.** `_borrowers` parses `parties_json` itself rather than
-  calling `matcher.normalize._json_text`. That was forced when both lived in
-  one module that imported this one; since the split it is not, and the two
-  could be unified. It returns the same answer on every input the helper
-  handles.
+- **One JSON guard.** `_borrowers` reads `parties_json` through
+  `matcher.normalize._json_text`, so an absent, missing or unparseable value
+  means no borrower named.
 
 ## `infer_amendment_parents`: ordering guards
 

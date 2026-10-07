@@ -14,7 +14,7 @@ import pandas as pd
 
 from cdt.completion import (
     CompletedPartition,
-    completion_registry_path,
+    completion_registry_root,
     pending_source_partitions,
     save_completion_registry,
 )
@@ -883,7 +883,7 @@ def itemize_pending_documents(
         "partitions_visited": sorted(visited_document_paths),
         "partitions_written": processed_partitions,
         "empty_partitions_skipped_from_write": empty_partitions,
-        "completion_registry": completion_registry_path(
+        "completion_registry": completion_registry_root(
             "itemize", artifact_root=resolved_root, data_dir=data_dir
         ),
     }

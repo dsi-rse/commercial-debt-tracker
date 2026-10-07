@@ -273,14 +273,12 @@ Naming: in this module, prefixes are `*_root` (`dataset_root`, `items_root`,
 `final_pointer_path`). `completion_registry_root` and
 `completion_registry_shard_path` follow that rule (#227).
 
-### `completion_registry_path`
+### `"completion_registry"` in run manifests
 
-This is a deprecated alias, kept because four stage modules still import it
-and those files were owned by parallel branches at the time. Removing it means
-updating those four call sites and the five run manifests whose
-`"completion_registry"` key now names a directory, while the neighbouring
-`"audit_path"` and `"failure_registry"` keys still name files. This is tracked
-on #227.
+The five run manifests' `"completion_registry"` key names the registry's
+directory (`completion_registry_root`), while the neighbouring `"audit_path"`
+and `"failure_registry"` keys name files. The key keeps its name so existing
+manifests stay comparable.
 
 ### `load_completion_registry`, `_REGISTRY_LOAD_CONCURRENCY`
 

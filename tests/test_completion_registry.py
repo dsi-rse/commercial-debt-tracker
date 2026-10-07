@@ -802,21 +802,11 @@ def test_registry_payload_sorts_on_the_key_without_comparing_entries() -> None:
     }
 
 
-def test_completion_registry_root_and_its_deprecated_alias_agree(
+def test_completion_registry_shards_sit_under_the_registry_root(
     tmp_path: Path,
 ) -> None:
-    """The alias must keep delegating, and the shard must sit under the root.
-
-    `completion_registry_path` returned a prefix while keeping the `_path`
-    name, which this module otherwise reserves for single objects (#227). The
-    alias stays only until the four stage-module call sites move. Pinned so it
-    cannot silently diverge from the name it forwards to while both exist.
-    """
+    """A registry shard is one object under its stage's registry prefix."""
     root = cdt_completion.completion_registry_root("itemize", artifact_root=tmp_path)
-    assert (
-        cdt_completion.completion_registry_path("itemize", artifact_root=tmp_path)
-        == root
-    )
     shard = cdt_completion.completion_registry_shard_path(
         "itemize", "2024-01", artifact_root=tmp_path
     )
