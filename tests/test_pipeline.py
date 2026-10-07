@@ -22,6 +22,7 @@ from cdt.pipeline import (
     normalize_genres,
     resolve_mode_dates,
     run_pipeline,
+    run_prepare_stages,
 )
 from cdt.storage.tables import read_dataset, read_table, write_partition_table
 
@@ -34,6 +35,13 @@ def test_resolve_mode_dates_daily_requires_both_dates() -> None:
     """Daily mode rejects partial date ranges."""
     with pytest.raises(ValueError, match="--end-date is required"):
         resolve_mode_dates("daily", date(2024, 1, 1), None)
+
+
+@pytest.mark.parametrize("mode", ["daily", "historical"])
+def test_resolve_mode_dates_rejects_an_end_before_the_start(mode: str) -> None:
+    """A reversed range is an argument error before any stage runs."""
+    with pytest.raises(ValueError, match="is before start date"):
+        resolve_mode_dates(mode, date(2024, 2, 1), date(2024, 1, 1))
 
 
 def test_resolve_mode_dates_historical_defaults_to_all_time() -> None:
@@ -1505,6 +1513,20 @@ def test_both_chains_failing_reports_both(
     result = run_pipeline(_both_genres_config(tmp_path))
 
     assert result.failed_genres == (GENRE_8K, GENRE_6K)
+
+
+def test_a_prepare_only_run_reports_its_failed_genre(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The batch backend's prepare path carries the failure to the caller."""
+    calls: list[str] = []
+    _isolation_stubs(monkeypatch, tmp_path, calls, failing=(GENRE_6K,))
+
+    prepared = run_prepare_stages(_both_genres_config(tmp_path))
+
+    assert calls == ["ingest:8-K", "itemize", "classify", "ingest:6-K"]
+    assert prepared.artifact_root == str(tmp_path)
+    assert prepared.failed_genres == (GENRE_6K,)
 
 
 def test_a_lost_lease_in_one_chain_aborts_the_whole_run(

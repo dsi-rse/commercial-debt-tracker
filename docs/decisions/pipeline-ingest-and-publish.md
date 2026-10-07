@@ -103,11 +103,13 @@ is still a failed run. It exits nonzero and skips the daily heartbeat line, so
 the heartbeat alarm and the ECS task-failure alarm fire as before.
 `LeaseLostError` is re-raised: a run that lost its lease must stop writing.
 
-### `PipelineOrchestrator._ingest_and_triage_sixk` (never `download`)
+### `Genre.inlines_bodies` (6-K never `download`)
 
-A 6-K row points at the assembled submission in CDT's mirror. Inlining bodies
-into the documents partition would make every read of the partition pay for
-every body (#69).
+`cdt.ingest.genres.genre_config` keeps `download` only for a genre whose
+record sets `inlines_bodies`, and the 6-K record does not. A 6-K row points
+at the assembled submission in CDT's mirror. Inlining bodies into the
+documents partition would make every read of the partition pay for every
+body (#69).
 
 ### `PipelineOrchestrator._renew`
 

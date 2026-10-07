@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date
 from pathlib import Path
 
@@ -1142,6 +1143,76 @@ def test_ingest_cli_one_failing_genre_does_not_stop_the_other(
 
     assert status == 1
     assert [call[0] for call in calls] == ["6-K"]
+
+
+def test_ingest_cli_isolates_a_value_error_raised_while_acquiring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A corrupt manifest in one genre is that genre's failure, not bad arguments."""
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("320193\n", encoding="utf-8")
+    calls: list[tuple[str, tuple[str, ...], str, bool, set[str] | None]] = []
+
+    def corrupt(config: cli.IngestConfig, **kwargs: object) -> object:
+        del config, kwargs
+        raise json.JSONDecodeError("Expecting value", "", 0)
+
+    monkeypatch.setattr(
+        "cdt.ingest.genres.acquire_eightk_documents", _recording_acquirer(calls, "8-K")
+    )
+    monkeypatch.setattr("cdt.ingest.genres.acquire_scraped_sixk_documents", corrupt)
+
+    status = cli.main(
+        [
+            "ingest",
+            "--quiet",
+            "--artifact-root",
+            str(tmp_path),
+            "historical",
+            str(cik_file),
+            "--start-date",
+            "2024-01-01",
+            "--end-date",
+            "2024-01-31",
+        ]
+    )
+
+    assert status == 1
+    assert [call[0] for call in calls] == ["8-K"]
+
+
+def test_ingest_cli_rejects_an_end_before_the_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reversed range is a usage error, and no genre is acquired."""
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("320193\n", encoding="utf-8")
+    calls: list[tuple[str, tuple[str, ...], str, bool, set[str] | None]] = []
+    monkeypatch.setattr(
+        "cdt.ingest.genres.acquire_eightk_documents", _recording_acquirer(calls, "8-K")
+    )
+    monkeypatch.setattr(
+        "cdt.ingest.genres.acquire_scraped_sixk_documents",
+        _recording_acquirer(calls, "6-K"),
+    )
+
+    status = cli.main(
+        [
+            "ingest",
+            "--quiet",
+            "--artifact-root",
+            str(tmp_path),
+            "historical",
+            str(cik_file),
+            "--start-date",
+            "2024-02-01",
+            "--end-date",
+            "2024-01-01",
+        ]
+    )
+
+    assert status == ARGPARSE_USAGE_ERROR
+    assert calls == []
 
 
 def test_pipeline_cli_exits_non_zero_when_a_genre_failed(

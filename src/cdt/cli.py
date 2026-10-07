@@ -474,8 +474,6 @@ def run_ingest(args: argparse.Namespace) -> int:
         for genre in args.genres:
             try:
                 results.append((genre, ingest_genre(genre, config, ciks=ciks)[1]))
-            except ValueError:
-                raise
             except Exception:
                 # One genre failing does not stop the others.
                 logger.exception("Genre ingest failed: genre=%s", genre)

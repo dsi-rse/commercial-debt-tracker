@@ -626,22 +626,27 @@ def resolve_mode_dates(
     ending yesterday; daily with only one of them is an error.
 
     Raises:
-        ValueError: On an unknown mode, or daily with only one date given.
+        ValueError: On an unknown mode, daily with only one date given, or
+            an end date before the start date.
     """
     if mode not in PIPELINE_MODES:
         msg = f"unsupported mode {mode!r}"
         raise ValueError(msg)
     if mode == "historical":
-        return start_date or ALL_TIME_START_DATE, end_date or date.today()
-    if start_date is None and end_date is None:
+        start, end = start_date or ALL_TIME_START_DATE, end_date or date.today()
+    elif start_date is None and end_date is None:
         today = date.today()
-        yesterday = today.fromordinal(today.toordinal() - 1)
-        lookback_start = today.fromordinal(today.toordinal() - DAILY_LOOKBACK_DAYS)
-        return lookback_start, yesterday
-    if start_date is None:
+        start = today.fromordinal(today.toordinal() - DAILY_LOOKBACK_DAYS)
+        end = today.fromordinal(today.toordinal() - 1)
+    elif start_date is None:
         msg = "--start-date is required when --end-date is provided"
         raise ValueError(msg)
-    if end_date is None:
+    elif end_date is None:
         msg = "--end-date is required when --start-date is provided"
         raise ValueError(msg)
-    return start_date, end_date
+    else:
+        start, end = start_date, end_date
+    if end < start:
+        msg = f"end date {end.isoformat()} is before start date {start.isoformat()}"
+        raise ValueError(msg)
+    return start, end
