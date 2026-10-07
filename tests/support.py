@@ -8,7 +8,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from cdt.classifier import classifications_root
+from cdt.classifier.core import classifications_root
 from cdt.extractor.normalize.amounts import normalized_amount_from_text
 from cdt.extractor.schema import DEBT_INSTRUMENT_MENTION_COLUMNS
 from cdt.extractor.state import ExtractionRowState

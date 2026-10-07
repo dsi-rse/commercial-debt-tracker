@@ -8,15 +8,17 @@ from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 
-from cdt.classifier import (
+from cdt.classifier.core import (
     DEFAULT_CV_SPLITS,
     DEFAULT_RANDOM_SEED,
     DEFAULT_TARGET_RECALL,
     classifications_root,
-    classify_pending_items,
     default_model_dir,
     train_classifier_model,
 )
+from cdt.classifier.eightk import classify_pending_items
+from cdt.classifier.sixk import DEFAULT_CONCURRENCY as SIXK_DEFAULT_CONCURRENCY
+from cdt.classifier.sixk import sixk_snippets_root, triage_pending_documents
 from cdt.datasets import dataset_root, default_artifact_root
 from cdt.extractor import (
     DEFAULT_MAX_ATTEMPTS as DEFAULT_EXTRACTOR_MAX_ATTEMPTS,
@@ -46,11 +48,6 @@ from cdt.ingest.core import (
 from cdt.ingest.eightk import acquire_eightk_documents
 from cdt.ingest.mirror import mirror_root
 from cdt.ingest.sixk import acquire_scraped_sixk_documents
-from cdt.itemizer import (
-    POTENTIALLY_RELEVANT_ITEM_NUMBERS,
-    itemize_pending_documents,
-    items_root,
-)
 from cdt.lease import (
     PIPELINE_WRITER_LEASE,
     Lease,
@@ -76,8 +73,11 @@ from cdt.pipeline import (
     resolve_mode_dates,
     run_pipeline,
 )
-from cdt.sixk.stage import DEFAULT_CONCURRENCY as SIXK_DEFAULT_CONCURRENCY
-from cdt.sixk.stage import sixk_snippets_root, triage_pending_documents
+from cdt.segmenter.core import items_root
+from cdt.segmenter.eightk import (
+    POTENTIALLY_RELEVANT_ITEM_NUMBERS,
+    itemize_pending_documents,
+)
 from cdt.storage.objects import configure_s3_profile
 
 ALL_TIME_START_DATE = date(1994, 1, 1)

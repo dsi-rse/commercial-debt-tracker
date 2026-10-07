@@ -30,7 +30,7 @@ from cdt.ingest.sixk import (
     assemble_submission,
     documents_in_sequence,
 )
-from cdt.sixk.documents import prose_documents
+from cdt.segmenter.sixk import prose_documents
 from cdt.storage.objects import read_json_artifact
 from cdt.storage.tables import read_dataset
 

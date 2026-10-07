@@ -13,6 +13,7 @@ import pandas as pd
 import pytest
 
 from cdt.classifier.core import CLASSIFICATION_DATASET_NAME, CLASSIFIED_ITEM_COLUMNS
+from cdt.classifier.sixk import SIXK_SNIPPET_COLUMNS, item_id_for
 from cdt.completion import (
     CompletedPartition,
     load_completion_registry,
@@ -27,7 +28,6 @@ from cdt.extractor.outputs import (
 )
 from cdt.extractor.schema import DEBT_INSTRUMENT_MENTION_COLUMNS
 from cdt.extractor.state import ExtractionRowState
-from cdt.sixk.stage import SIXK_SNIPPET_COLUMNS, item_id_for
 from cdt.storage.tables import read_dataset, write_partition_table
 
 PARTITION = {"date": "2026-09-08", "shard": "0001"}

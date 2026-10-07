@@ -13,7 +13,7 @@ from support import (
     build_mention_row,
 )
 
-from cdt.classifier import classifications_root
+from cdt.classifier.core import classifications_root
 from cdt.extractor import extract_pending_items, mentions_root
 from cdt.extractor.schema import DEBT_INSTRUMENT_MENTION_COLUMNS
 from cdt.extractor.state import ExtractionRowState

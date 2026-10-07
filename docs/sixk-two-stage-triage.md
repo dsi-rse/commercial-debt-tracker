@@ -25,7 +25,7 @@ this is the runtime implementation.
    an instrument's amounts and dates while cutting away the noun that names it.
 6. **Stage 2: LLM over a whole filing's expanded windows at once.**
 
-Steps 1-3 are composed by `cdt.sixk.prepare_filing`, so the order is code
+Steps 1-3 are composed by `cdt.segmenter.sixk.prepare_filing`, so the order is code
 rather than prose. It matters in both directions: the gate applies to the whole
 document, so applying it per window would change the 13.4% pass rate above,
 and stripping has to come first because a prologue's tag names are themselves
@@ -187,11 +187,11 @@ Following the two patterns already in the repo rather than inventing a third:
 
 | | where | default | override |
 |---|---|---|---|
-| stage-1 artifact **path** | `cdt.sixk.default_model_dir()` | `DATA_DIR/models/sixk/stage1-tfidf-linear-svc` | `DATA_DIR`, or pass `model_dir` |
+| stage-1 artifact **path** | `cdt.classifier.triage.default_model_dir()` | `DATA_DIR/models/sixk/stage1-tfidf-linear-svc` | `DATA_DIR`, or pass `model_dir` |
 | stage-1 **threshold** | the artifact's `metadata.json` | 0.332 | retrain and recalibrate |
 | stage-2 **model id** | `settings.SIXK_TRIAGE_MODEL` | `openai/gpt-5.6-luna` | `SIXK_TRIAGE_MODEL` env |
 | stage-2 **reasoning effort** | `settings.SIXK_TRIAGE_REASONING` | `none` | `SIXK_TRIAGE_REASONING` env |
-| **expansion** minimum / cap / merge budget | `cdt.sixk.windows` constants | 200 / 400 / 2,000 tokens | pass `min_tokens`, `max_tokens`, `max_merged_tokens` |
+| **expansion** minimum / cap / merge budget | `cdt.segmenter.sixk` constants | 200 / 400 / 2,000 tokens | pass `min_tokens`, `max_tokens`, `max_merged_tokens` |
 
 Paths follow the 8-K classifier, which derives from `DATA_DIR` via
 `classifier.core.default_model_dir` rather than taking a settings entry, so one
@@ -239,7 +239,7 @@ labelled windows (231 positive) with the 500 evaluation windows held out.
 
 ## Where expansion runs
 
-Inside `cdt.sixk.stage`, between `stage1_admit` and `triage_filing` — the only
+Inside `cdt.classifier.sixk`, between `stage1_admit` and `triage_filing` — the only
 place it can run, since stage 1's threshold was calibrated on the crop and the
 extractor needs the expanded text. Admitted windows are grouped by document
 first: offsets mean nothing outside the text they index into, so expanding
@@ -261,7 +261,7 @@ tokens (1.31x), 88 of the 219 being merged groups.
 
 ## Design notes behind the code
 
-### `cdt.sixk.windows.strip_inline_xbrl_prologue`
+### `cdt.segmenter.sixk.strip_inline_xbrl_prologue`
 
 The prologue is stripped rather than the document dropped, because these
 documents carry real prose after it. Leaving it in costs twice: the NER stage
@@ -272,7 +272,7 @@ borrowings schedule is also mostly bare numbers, and stripping one would delete
 table bodies the annotation codebook rules relevant.
 
 `prepare_filing` strips idempotently: stripped text begins at prose, so a second
-pass finds no prologue. `cdt.sixk.documents.prose_documents` therefore leaves it
+pass finds no prologue. `cdt.segmenter.sixk.prose_documents` therefore leaves it
 alone, and the research harness, which stripped in both places, is still
 reproduced.
 
@@ -296,7 +296,7 @@ Header detection (`_is_section_header`) errs towards "not a header": a missed
 header lets the walk continue to its minimum and pass over it, while a false
 one stops the walk early and can leave the instrument noun outside the window.
 
-### `cdt.sixk.triage`: what stage 2 is asked
+### `cdt.classifier.triage`: what stage 2 is asked
 
 Stage 2 answers two questions that fail differently. Does the window state a
 concrete attribute of a specific instrument? Rejecting one that does not costs
@@ -314,7 +314,7 @@ the filer's discretion.
 A filing with no admitted window makes no call: it is the common case at a 5.8%
 admission rate, and an empty user message is a 400 from several providers.
 
-### `cdt.sixk.stage`: dataset and row shape
+### `cdt.classifier.sixk`: dataset and row shape
 
 `sixk-snippets` is its own dataset rather than rows in `classifications`.
 Classify owns `classifications/date=D/shard=S/part-0000.parquet` and rewrites it

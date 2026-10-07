@@ -443,7 +443,7 @@ Each genre gets its own documents dataset. Mixing forms in one dataset would
 merge new rows into partitions the 8-K path has already processed. Every
 downstream stage selects work by source-partition fingerprint (#62), so a 6-K
 backfill would make the whole 8-K corpus pending again. The name
-`documents-sixk` only matches the `cdt.sixk` package. The partition contract
+`documents-sixk` matches the old `cdt.sixk` package; the genre modules are now `*.sixk`. The partition contract
 reads a path's date and shard, never its dataset segment, so the name has no
 effect on behaviour.
 
@@ -482,7 +482,7 @@ implementation keeps them classified the same way in `failures.json`.
 Reading the same object again returns the same bytes, so a document that is
 not in dissemination format never becomes one on retry.
 
-## Itemizing 8-K text (`cdt.itemizer`)
+## Segmenting 8-K text (`cdt.segmenter`)
 
 ### `VALID_ITEM_NUMBERS` / `leading_item_numbers`
 

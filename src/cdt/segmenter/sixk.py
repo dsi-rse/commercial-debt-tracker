@@ -15,17 +15,21 @@ from dataclasses import dataclass, field
 from functools import cache, lru_cache
 from typing import TYPE_CHECKING
 
+from cdt.segmenter.text import DOCUMENT_RE, TYPE_RE, normalize_body_lines
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from tiktoken import Encoding
 
-#: Encoding used for every token count in this module.
+
 TIKTOKEN_ENCODING_NAME = "o200k_base"
+
 
 #: Window size the shipped stage-1 model was trained on. Changing this
 #: invalidates the model and its calibrated threshold together.
 WINDOW_TOKENS = 400
+
 
 #: Cut points tried in order when a span exceeds the token budget:
 #: paragraph, then line, then sentence. A span still too long after all
@@ -35,6 +39,7 @@ _BOUNDARY_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\n"),
     re.compile(r"(?<=[.!?])\s+"),
 )
+
 
 #: Words common enough that a line containing one is almost certainly prose.
 _PROSE_MARKERS: frozenset[str] = frozenset(
@@ -71,6 +76,7 @@ _PROSE_MARKERS: frozenset[str] = frozenset(
     }
 )
 
+
 #: A line of inline-XBRL context: a namespaced tag, or a bare scalar such as a
 #: CIK, a ticker-date stem, a fiscal period, a boolean or a lone number.
 _XBRL_CONTEXT_LINE = re.compile(
@@ -86,19 +92,24 @@ _XBRL_CONTEXT_LINE = re.compile(
     """
 )
 
+
 #: A namespaced inline-XBRL tag, the signature that a block is context padding
 #: rather than a numeric table (whose lines are bare scalars too).
 _XBRL_TAG_LINE = re.compile(r"(?i)^[A-Za-z][\w-]*:[\w.-]+$")
 
+
 #: A prologue must be at least this many lines before stripping is worthwhile.
 MIN_XBRL_PROLOGUE_LINES = 20
+
 
 #: Share of prologue lines that must be namespaced tags, so that a borrowings
 #: schedule (also mostly bare numbers) is not mistaken for a prologue.
 MIN_XBRL_TAG_SHARE = 0.10
 
+
 #: Share of prologue lines that must be context facts of some kind.
 MIN_XBRL_CONTEXT_SHARE = 0.8
+
 
 #: Words a line needs before it can count as prose rather than a context fact.
 MIN_PROSE_WORDS = 5
@@ -194,6 +205,7 @@ DEBT_KEYWORDS: tuple[str, ...] = (
     "syndicated loan",
     "bond issuance",
 )
+
 
 #: Plural suffixes allowed after a keyword lemma.
 KEYWORD_PLURAL_SUFFIX = r"(?:s|es)?"
@@ -542,9 +554,11 @@ def prepare_filing(
 #: reached sooner. Chosen empirically; see docs/sixk-two-stage-triage.md.
 MIN_EXPANSION_TOKENS = 200
 
+
 #: Hard cap on the context prepended to one admitted window, for when the walk
 #: backwards finds no header or blank line (e.g. unbroken table rows).
 MAX_EXPANSION_TOKENS = 400
+
 
 #: Ceiling on the merged-window estimate, matching the largest snippet the 8-K
 #: path sends the extractor. The estimate counts the first member's context and
@@ -553,16 +567,20 @@ MAX_EXPANSION_TOKENS = 400
 #: uncounted and a merged window can exceed this ceiling.
 MAX_MERGED_TOKENS = 2_000
 
+
 #: Longest a line can be and still read as a heading rather than a sentence.
 MAX_HEADER_WORDS = 12
 
+
 #: Characters a paragraph-boundary test looks back through.
 _PARAGRAPH_LOOKBACK = 200
+
 
 #: Characters scanned per token of budget when collecting candidate stops. A
 #: bound on the search only; the token budget decides how far the walk goes.
 #: Generous because table text has far fewer characters per token than prose.
 _CHARS_PER_TOKEN_BOUND = 24
+
 
 #: An explicitly numbered heading: ``Item 5.02``, ``NOTE 12 - BORROWINGS``,
 #: ``Part II``, ``Schedule 3``. Matched before the casing rules below, because
@@ -574,6 +592,7 @@ _NUMBERED_HEADING = re.compile(
     (?:\d|[ivxlc]+\b)
     """
 )
+
 
 #: A blank line immediately before an offset, i.e. a paragraph boundary.
 _PARAGRAPH_BREAK_BEFORE = re.compile(r"\n[^\S\n]*\n\s*\Z")
@@ -952,3 +971,53 @@ def _window_over(text: str, start: int, end: int, *, index: int) -> TextWindow:
         token_count=count_tokens(text[span_start:span_end]),
         source=text,
     )
+
+
+KEEP_TYPE_RE = re.compile(
+    r"^(6-K(/A)?|EX-99(\.\d+)?|EX-1(\.\d+)?|EX-4(\.\d+)?|EX-10(\.\d+)?)$",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class SixkDocument:
+    """One prose document from a 6-K submission."""
+
+    #: The submission's own ``<TYPE>`` label, e.g. ``6-K`` or ``EX-99.1``.
+    document_type: str
+    #: Flattened plain text, one line per normalized body line.
+    text: str
+
+
+def prose_documents(submission: str) -> list[SixkDocument]:
+    r"""Return the flattened prose documents of one complete submission.
+
+    Keeps documents whose ``<TYPE>`` matches :data:`KEEP_TYPE_RE` and whose
+    text is not blank, in submission order, so a document's index is a stable
+    part of a snippet's identity. The whole ``<DOCUMENT>`` block is flattened,
+    not just its ``<TEXT>``, so the text opens with the type, sequence and
+    filename lines; the triage stages were evaluated on text in that form. The
+    inline-XBRL prologue is left for :func:`cdt.segmenter.sixk.prepare_filing` to strip.
+
+    >>> submission = (
+    ...     "<DOCUMENT><TYPE>6-K\n<TEXT><p>The Company issued notes.</p></TEXT>"
+    ...     "</DOCUMENT>"
+    ...     "<DOCUMENT><TYPE>GRAPHIC\n<TEXT>begin 644 logo.jpg</TEXT></DOCUMENT>"
+    ... )
+    >>> documents = prose_documents(submission)
+    >>> [document.document_type for document in documents]
+    ['6-K']
+    >>> documents[0].text
+    '6-K\nThe Company issued notes.'
+    """
+    documents: list[SixkDocument] = []
+    for match in DOCUMENT_RE.finditer(submission):
+        block = match.group(1)
+        type_match = TYPE_RE.search(block)
+        document_type = type_match.group(1).strip() if type_match else ""
+        if not KEEP_TYPE_RE.match(document_type):
+            continue
+        text = "\n".join(line.text for line in normalize_body_lines(block))
+        if text.strip():
+            documents.append(SixkDocument(document_type=document_type, text=text))
+    return documents

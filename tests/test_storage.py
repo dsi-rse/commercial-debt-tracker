@@ -97,7 +97,7 @@ def test_document_bodies_on_s3_resolve_through_the_configured_profile() -> None:
     That call is how itemize and 6-K triage resolve document bodies from S3, so its
     default decides the credentials for two whole stages.
     """
-    from cdt.itemizer.core import ensure_s3_client
+    from cdt.segmenter.core import ensure_s3_client
 
     storage_objects.configure_s3_profile("analysis")
 

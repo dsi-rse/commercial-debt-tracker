@@ -18,8 +18,7 @@ import pandas as pd
 import pytest
 
 import cdt.extractor.batch as batch_module
-from cdt.classifier import classifications_root
-from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
+from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS, classifications_root
 from cdt.completion import load_completion_registry
 from cdt.datasets import load_row_failures
 from cdt.extractor import (
