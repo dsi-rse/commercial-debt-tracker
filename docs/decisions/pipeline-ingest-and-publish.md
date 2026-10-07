@@ -460,8 +460,8 @@ effect on behaviour.
 
 Ingest itself does not care about form type. `DEFAULT_FORM_TYPES` keeps every
 caller, CLI flag and deployed schedule on 8-K unless one asks for another
-form. The 6-K forms are defined in `cdt.ingest` because the CLI needs them as a
-default before it knows which source will run.
+form. Both form tuples are defined in `cdt.datasets` with the genre registry,
+so the CLI has them as a default before it knows which source will run.
 
 ### `DOCUMENT_COLUMNS` (`form_type`, `source`)
 
