@@ -480,7 +480,7 @@ def write_run_records(
 
     ``manifest`` holds the backend's own manifest fields; the shared ones are
     added here. Returns the audit path, the failure-registry path and the
-    registry's total entry count.
+    failure registry's total entry count.
     """
     save_completion_registry(
         "extract", registry, artifact_root=artifact_root, data_dir=data_dir

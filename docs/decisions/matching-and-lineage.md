@@ -285,8 +285,8 @@ active revolvers at once (#170).
 - **Silence is not disagreement.** Refusing a link whenever a party is missing
   would drop ordinary links to the many mentions that never name a borrower.
 - **One JSON guard.** `_borrowers` reads `parties_json` through
-  `matcher.normalize._json_text`, so an absent, missing or unparseable value
-  means no borrower named.
+  `matcher.normalize._json_list`, so an absent, missing, unparseable or
+  non-list value means no borrower named.
 
 ## `infer_amendment_parents`: ordering guards
 
