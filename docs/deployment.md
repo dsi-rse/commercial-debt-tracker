@@ -70,14 +70,13 @@ that extracts within the run itself.
 
 Every `daily` and `historical` run prepares both filing genres (the hourly `poll`
 run only advances the batch extract job): 8-K (ingest → itemize → classify) and
-6-K (ingest-sixk → sixk triage). The task definition sets none of the 6-K settings, so
+6-K (ingest → sixk triage), for the one CIK list the run is given. The task definition sets none of the 6-K settings, so
 the defaults below are what runs in production. Each can be set as an environment
 variable on the task, or passed as the matching flag.
 
 | Setting | Default | Effect |
 |---|---|---|
 | `GENRES` / `--genres` | `8-K,6-K` | Restrict a run to one genre. |
-| `SIXK_CIK_FILE` / `--sixk-cik-file` | the run's CIK file | CIKs for the 6-K chain. A CIK list chosen for 8-K coverage may contain no foreign private issuers, which makes the 6-K chain a no-op. |
 | `SIXK_TRIAGE_PROVIDER` | `openrouter` | Stage-2 triage backend: `openrouter` (uses `OPENROUTER_API_KEY`) or `openai` (uses `OPENAI_API_KEY`). |
 | `SIXK_TRIAGE_MODEL` | `openai/gpt-5.6-luna` | Stage-2 model, as an OpenRouter slug. |
 | `SIXK_TRIAGE_REASONING` | `none` | Stage-2 reasoning effort. |
@@ -241,7 +240,7 @@ alarm means and what to do:
 | Alarm | Meaning | First response |
 |---|---|---|
 | `*-poll-liveness` | No poll tick completed for 6h; extraction is stalled. | Check the poll schedule state and the latest task logs; a wedged holder shows up as repeated `locked` ticks. |
-| `*-daily-heartbeat` | No `daily` run completed for 24h. | Check the daily schedule, the task-failure alerts, and the scheduler DLQ. |
+| `*-daily-heartbeat` | No `daily` run completed for 24h. A run where one genre's prepare chain failed still publishes the others but counts as not completed (it exits nonzero without the heartbeat line). | Check the daily schedule, the task-failure alerts, and the scheduler DLQ. Search the task log for `Genre prepare failed` to see whether one genre failed. |
 | `*-task-failures` | An ECS task exited nonzero or failed to start (includes OOM kills, exit 137). | Read the task's log stream; OOM usually means a backfill outgrew `idi:memory`. |
 | `*-job-stall` | The active extract job has run ~4 days of ticks without finishing; it blocks all newer filings. | `cdt show-extract-job`; if genuinely wedged, `cdt reset-extract-job --yes` (abandons in-flight batches). |
 | `*-lease-theft` | A run died (or overran its TTL) still holding the writer lease. | Find the previous holder's logs; its partial work is recomputed by the next run, but check why it died. |

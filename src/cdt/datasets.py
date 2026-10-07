@@ -339,6 +339,9 @@ class Genre:
     ``document_dataset`` is what ingest writes, ``item_dataset`` the rows the
     published ``items`` table takes from this genre, and ``classified_dataset``
     the rows the extractor reads. For 6-K the last two are the same dataset.
+    ``inlines_bodies`` is whether ingest may store document bodies in the
+    partition (``--download``); a 6-K row instead points at the mirrored
+    submission, so every read does not pay for every body.
     """
 
     name: str
@@ -346,6 +349,7 @@ class Genre:
     document_dataset: str
     item_dataset: str
     classified_dataset: str
+    inlines_bodies: bool
 
 
 #: Every genre, in the order a run prepares them.
@@ -356,6 +360,7 @@ GENRES: dict[str, Genre] = {
         document_dataset=DOCUMENT_DATASET_NAME,
         item_dataset=ITEM_DATASET_NAME,
         classified_dataset=CLASSIFICATION_DATASET_NAME,
+        inlines_bodies=True,
     ),
     GENRE_6K: Genre(
         name=GENRE_6K,
@@ -363,5 +368,6 @@ GENRES: dict[str, Genre] = {
         document_dataset=SIXK_DOCUMENT_DATASET_NAME,
         item_dataset=SIXK_SNIPPET_DATASET_NAME,
         classified_dataset=SIXK_SNIPPET_DATASET_NAME,
+        inlines_bodies=False,
     ),
 }

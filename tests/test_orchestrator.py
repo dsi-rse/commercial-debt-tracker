@@ -13,7 +13,7 @@ import cdt.orchestrator as orch
 from cdt.datasets import GENRE_6K, GENRE_8K
 from cdt.extractor import ExtractTickResult
 from cdt.lease import acquire_lease
-from cdt.pipeline import DEFAULT_GENRES
+from cdt.pipeline import DEFAULT_GENRES, PrepareResult
 
 
 def test_poll_finalizes_on_completion(
@@ -125,13 +125,13 @@ def test_daily_batch_holds_lease_through_prepare(
     """The prepare stages run under the writer lease, serialized with poll ticks (#88)."""
     calls: list[str] = []
 
-    def fake_prepare(config: object, **kwargs: object) -> str:
+    def fake_prepare(config: object, **kwargs: object) -> PrepareResult:
         del config, kwargs
         assert (
             acquire_lease(tmp_path, orch.PIPELINE_WRITER_LEASE) is None
         ), "prepare must run while the lease is held"
         calls.append("prepare")
-        return str(tmp_path)
+        return PrepareResult(str(tmp_path))
 
     monkeypatch.setattr(orch, "run_prepare_stages", fake_prepare)
     monkeypatch.setattr(
@@ -157,7 +157,7 @@ def test_daily_batch_defers_extract(
         "run_prepare_stages",
         lambda config, **kwargs: (
             calls.append(f"prepare:{config.mode}"),
-            str(tmp_path),
+            PrepareResult(str(tmp_path)),
         )[1],
     )
     monkeypatch.setattr(
@@ -186,6 +186,7 @@ def test_daily_live_runs_full_pipeline(
 
     class Result:
         artifact_root = str(tmp_path)
+        failed_genres = ()
 
     monkeypatch.setattr(
         orch,
@@ -228,7 +229,9 @@ def test_daily_batch_warns_on_extract_batch_size(
     # main() calls basicConfig(force=True), which would drop caplog's handler.
     monkeypatch.setattr(orch, "configure_logging", lambda **kwargs: None)
     monkeypatch.setattr(
-        orch, "run_prepare_stages", lambda config, **kwargs: str(tmp_path)
+        orch,
+        "run_prepare_stages",
+        lambda config, **kwargs: PrepareResult(str(tmp_path)),
     )
     monkeypatch.setattr(orch, "run_match_and_finalize", lambda **kwargs: None)
 
@@ -266,7 +269,7 @@ def test_daily_batch_quiet_without_extract_batch_size(
         "run_prepare_stages",
         lambda config, **kwargs: (
             seen.append(config.extract_batch_size),
-            str(tmp_path),
+            PrepareResult(str(tmp_path)),
         )[1],
     )
     monkeypatch.setattr(orch, "run_match_and_finalize", lambda **kwargs: None)
@@ -293,7 +296,7 @@ def test_historical_batch_defers_extract(
         "run_prepare_stages",
         lambda config, **kwargs: (
             calls.append(f"prepare:{config.mode}"),
-            str(tmp_path),
+            PrepareResult(str(tmp_path)),
         )[1],
     )
     monkeypatch.setattr(
@@ -336,7 +339,7 @@ def test_historical_batch_passes_dates_through(
         "run_prepare_stages",
         lambda config, **kwargs: (
             seen.append((config.start_date, config.end_date)),
-            str(tmp_path),
+            PrepareResult(str(tmp_path)),
         )[1],
     )
     monkeypatch.setattr(orch, "run_match_and_finalize", lambda **kwargs: None)
@@ -368,6 +371,7 @@ def test_historical_live_runs_full_pipeline(
 
     class Result:
         artifact_root = str(tmp_path)
+        failed_genres = ()
 
     monkeypatch.setattr(
         orch,
@@ -453,7 +457,10 @@ def test_scheduled_runs_prepare_both_genres_by_default(
     monkeypatch.setattr(
         orch,
         "run_prepare_stages",
-        lambda config, **kwargs: (captured.append(config), str(tmp_path))[1],
+        lambda config, **kwargs: (
+            captured.append(config),
+            PrepareResult(str(tmp_path)),
+        )[1],
     )
     monkeypatch.setattr(orch, "run_match_and_finalize", lambda **kwargs: None)
 
@@ -474,8 +481,6 @@ def test_scheduled_runs_prepare_both_genres_by_default(
         == 0
     )
     assert captured[0].genres == DEFAULT_GENRES
-    # Unset means "the run's CIKs", so one list covers both genres.
-    assert captured[0].sixk_cik_file is None
 
 
 def test_genres_can_be_narrowed_on_a_scheduled_run(
@@ -486,7 +491,10 @@ def test_genres_can_be_narrowed_on_a_scheduled_run(
     monkeypatch.setattr(
         orch,
         "run_prepare_stages",
-        lambda config, **kwargs: (captured.append(config), str(tmp_path))[1],
+        lambda config, **kwargs: (
+            captured.append(config),
+            PrepareResult(str(tmp_path)),
+        )[1],
     )
     monkeypatch.setattr(orch, "run_match_and_finalize", lambda **kwargs: None)
 
@@ -497,8 +505,6 @@ def test_genres_can_be_narrowed_on_a_scheduled_run(
                 str(tmp_path),
                 "--genres",
                 "6-K",
-                "--sixk-cik-file",
-                "fpi.txt",
                 "historical",
                 "--cik-file",
                 "c.txt",
@@ -511,7 +517,6 @@ def test_genres_can_be_narrowed_on_a_scheduled_run(
         == 0
     )
     assert captured[0].genres == (GENRE_6K,)
-    assert captured[0].sixk_cik_file == "fpi.txt"
 
 
 def test_genres_come_from_the_environment_when_not_passed(
@@ -523,7 +528,10 @@ def test_genres_come_from_the_environment_when_not_passed(
     monkeypatch.setattr(
         orch,
         "run_prepare_stages",
-        lambda config, **kwargs: (captured.append(config), str(tmp_path))[1],
+        lambda config, **kwargs: (
+            captured.append(config),
+            PrepareResult(str(tmp_path)),
+        )[1],
     )
     monkeypatch.setattr(orch, "run_match_and_finalize", lambda **kwargs: None)
 
@@ -598,7 +606,9 @@ def test_real_secret_values_pass_the_guard(
     monkeypatch.setenv("OPENAI_API_KEY", "sk-real")
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-real")
     monkeypatch.setattr(
-        orch, "run_prepare_stages", lambda config, **kwargs: str(tmp_path)
+        orch,
+        "run_prepare_stages",
+        lambda config, **kwargs: PrepareResult(str(tmp_path)),
     )
     monkeypatch.setattr(orch, "run_match_and_finalize", lambda **kwargs: None)
 
@@ -646,6 +656,7 @@ def test_live_backend_releases_lease(
 
     class Result:
         artifact_root = str(tmp_path)
+        failed_genres = ()
 
     monkeypatch.setattr(orch, "run_pipeline", lambda config, **kwargs: Result())
 
@@ -705,7 +716,9 @@ def test_daily_batch_logs_heartbeat_literal(
     propagate_logger(orch.LOGGER)
     monkeypatch.setattr(orch, "configure_logging", lambda **kwargs: None)
     monkeypatch.setattr(
-        orch, "run_prepare_stages", lambda config, **kwargs: str(tmp_path)
+        orch,
+        "run_prepare_stages",
+        lambda config, **kwargs: PrepareResult(str(tmp_path)),
     )
     monkeypatch.setattr(orch, "run_match_and_finalize", lambda **kwargs: None)
 
@@ -743,3 +756,94 @@ def test_runtime_watchdog_defaults_per_mode() -> None:
     finally:
         timer.cancel()
     assert exits == []
+
+
+def _batch_daily(tmp_path: Path) -> list[str]:
+    return [
+        "--artifact-root",
+        str(tmp_path),
+        "daily",
+        "--cik-file",
+        "c.txt",
+        "--start-date",
+        "2026-09-08",
+        "--end-date",
+        "2026-09-08",
+    ]
+
+
+def test_a_failed_genre_still_publishes_but_fails_the_run_without_a_heartbeat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    propagate_logger: Callable[[logging.Logger], None],
+) -> None:
+    """Match and publish run over what succeeded; the daily-heartbeat alarm still fires."""
+    propagate_logger(orch.LOGGER)
+    monkeypatch.setattr(orch, "configure_logging", lambda **kwargs: None)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        orch,
+        "run_prepare_stages",
+        lambda config, **kwargs: PrepareResult(str(tmp_path), (GENRE_6K,)),
+    )
+    monkeypatch.setattr(
+        orch, "run_match_and_finalize", lambda **kwargs: calls.append("match")
+    )
+
+    with caplog.at_level("INFO"):
+        status = orch.main(_batch_daily(tmp_path))
+
+    assert status == 1
+    assert calls == ["match"]
+    assert "Run finished with failed genres: 6-K" in caplog.text
+    assert "Orchestrator run complete" not in caplog.text
+
+
+def test_a_clean_batch_run_still_logs_the_heartbeat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    propagate_logger: Callable[[logging.Logger], None],
+) -> None:
+    """No failed genre: exit 0 with the literal the daily-heartbeat alarm counts."""
+    propagate_logger(orch.LOGGER)
+    monkeypatch.setattr(orch, "configure_logging", lambda **kwargs: None)
+    monkeypatch.setattr(
+        orch,
+        "run_prepare_stages",
+        lambda config, **kwargs: PrepareResult(str(tmp_path)),
+    )
+    monkeypatch.setattr(orch, "run_match_and_finalize", lambda **kwargs: None)
+
+    with caplog.at_level("INFO"):
+        status = orch.main(_batch_daily(tmp_path))
+
+    assert status == 0
+    assert "Orchestrator run complete: mode=daily" in caplog.text
+
+
+def test_a_live_run_with_a_failed_genre_exits_non_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live backend reports a partial success as a failure too."""
+
+    class Result:
+        artifact_root = str(tmp_path)
+        failed_genres = (GENRE_8K,)
+
+    monkeypatch.setattr(orch, "run_pipeline", lambda config, **kwargs: Result())
+
+    status = orch.main(
+        [
+            "--extractor-backend",
+            "live",
+            "--artifact-root",
+            str(tmp_path),
+            "daily",
+            "--cik-file",
+            "c.txt",
+        ]
+    )
+
+    assert status == 1

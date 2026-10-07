@@ -67,11 +67,12 @@ the 6-K chain scrapes the network and calls a paid model before it does
 anything else. A caller that never mentions genres should get the stages it
 named and nothing that spends money for it.
 
-### `PipelineConfig.sixk_cik_file`
+### One CIK list for every genre
 
-The intent is a single list of issuers. A separate 6-K list exists only
-because a list chosen for 8-K coverage may contain no foreign private issuers,
-which would make the 6-K chain a no-op.
+A run searches every selected genre for the same CIK list: the caller names
+issuers, not forms. A separate 6-K list (`--sixk-cik-file`) existed because a
+list chosen for 8-K coverage may contain no foreign private issuers; it was
+removed in favour of putting those issuers in the one list (2026-10).
 
 ### `PipelineOrchestrator._setup` (genre validation)
 
@@ -95,11 +96,20 @@ source-partition fingerprint per dataset (#62). A genre that fails therefore
 cannot corrupt the other genre's state. It only leaves its own partitions
 pending for the next run.
 
-### `PipelineOrchestrator._ingest_and_triage_sixk` (never `download`)
+That is why each genre's chain runs in its own `try` (2026-10): one genre
+failing, for example the 6-K triage provider running out of credit, no longer
+takes down the other genre's prepare, extract and publish. A partial success
+is still a failed run. It exits nonzero and skips the daily heartbeat line, so
+the heartbeat alarm and the ECS task-failure alarm fire as before.
+`LeaseLostError` is re-raised: a run that lost its lease must stop writing.
 
-A 6-K row points at the assembled submission in CDT's mirror. Inlining bodies
-into the documents partition would make every read of the partition pay for
-every body (#69).
+### `Genre.inlines_bodies` (6-K never `download`)
+
+`cdt.ingest.genres.genre_config` keeps `download` only for a genre whose
+record sets `inlines_bodies`, and the 6-K record does not. A 6-K row points
+at the assembled submission in CDT's mirror. Inlining bodies into the
+documents partition would make every read of the partition pay for every
+body (#69).
 
 ### `PipelineOrchestrator._renew`
 

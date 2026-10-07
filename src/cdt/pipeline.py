@@ -18,8 +18,6 @@ from cdt.datasets import (
     GENRE_6K,
     GENRE_8K,
     GENRES,
-    SIXK_DOCUMENT_DATASET_NAME,
-    SIXK_FORM_TYPES,
     failure_registry_path,
     resolve_artifact_root,
 )
@@ -38,8 +36,8 @@ from cdt.ingest.core import (
     IngestRunResult,
 )
 from cdt.ingest.core import DEFAULT_BATCH_SIZE as DEFAULT_INGEST_BATCH_SIZE
-from cdt.ingest.eightk import acquire_eightk_documents
-from cdt.ingest.sixk import acquire_scraped_sixk_documents
+from cdt.ingest.genres import ingest_genre
+from cdt.lease import LeaseLostError
 from cdt.matcher import (
     DEFAULT_AMBIGUITY_MARGIN,
     DEFAULT_MEMBERSHIP_THRESHOLD,
@@ -100,9 +98,6 @@ class PipelineConfig:
     #: Which genres to prepare. 8-K only when built in code, because the 6-K
     #: chain scrapes and calls a paid model; the CLIs pass DEFAULT_GENRES.
     genres: tuple[str, ...] = (GENRE_8K,)
-    #: CIKs for the 6-K genre; None means `cik_file`.
-    sixk_cik_file: ArtifactPath | None = None
-    sixk_form_types: tuple[str, ...] = SIXK_FORM_TYPES
     sixk_batch_size: int = DEFAULT_STAGE_BATCH_SIZE
     sixk_concurrency: int = SIXK_DEFAULT_CONCURRENCY
 
@@ -128,6 +123,9 @@ class PipelineRunResult:
     genres: tuple[str, ...] = DEFAULT_GENRES
     sixk_ingest: IngestRunResult | None = None
     sixk_snippet_rows: int = 0
+    #: Genres whose prepare chain failed; extract, match and publish still ran
+    #: over the rest, and the caller reports the run as failed.
+    failed_genres: tuple[str, ...] = ()
 
 
 @dataclass
@@ -142,6 +140,16 @@ class _PrepareOutcome:
     classified: pd.DataFrame = field(default_factory=pd.DataFrame)
     sixk_ingest: IngestRunResult | None = None
     snippets: pd.DataFrame = field(default_factory=pd.DataFrame)
+    #: Genres whose chain raised; the others still ran.
+    failed_genres: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PrepareResult:
+    """What a prepare-only run produced: its artifact root, and any failed genre."""
+
+    artifact_root: str
+    failed_genres: tuple[str, ...] = ()
 
 
 class PipelineOrchestrator:
@@ -200,6 +208,34 @@ class PipelineOrchestrator:
         self._log_config(resolved_start, resolved_end)
         return resolved_start, resolved_end, ciks, resolved_artifact_root
 
+    def _ingest_config(
+        self: Self,
+        resolved_start: date,
+        resolved_end: date,
+        resolved_artifact_root: str,
+    ) -> IngestConfig:
+        """Return this run's ingest settings; ``ingest_genre`` narrows them per genre."""
+        return IngestConfig(
+            mode=self.config.mode,
+            bucket=self.config.bucket,
+            cik_file=Path(str(self.config.cik_file)),
+            start_date=resolved_start,
+            end_date=resolved_end,
+            data_dir=self.config.data_dir,
+            output_root=resolved_artifact_root,
+            force=self.config.force,
+            batch_size=self.config.ingest_batch_size,
+            download=self.config.download,
+            failure_file=self.config.failure_file
+            or failure_registry_path(
+                "ingest",
+                artifact_root=resolved_artifact_root,
+                data_dir=self.config.data_dir,
+            ),
+            aws_profile=self.config.aws_profile,
+            s3_prefix=self.config.s3_prefix,
+        )
+
     def _renew(self: Self, renew: Callable[[], None] | None) -> None:
         """Extend the caller's writer lease at a stage boundary; no-op if None.
 
@@ -219,8 +255,10 @@ class PipelineOrchestrator:
         """Prepare every genre this run asked for, in genre order.
 
         Each genre writes its own documents and classification datasets, so a
-        failing genre cannot corrupt the other's. The chains run one after the
-        other: a failure in the 8-K chain stops the run before 6-K starts.
+        failing genre cannot corrupt the other's. A genre whose chain raises is
+        logged and recorded in ``failed_genres`` and the next genre still runs;
+        its partitions stay pending for the next run. ``LeaseLostError`` is not
+        caught: a run that lost its lease must stop writing.
         """
         outcome = _PrepareOutcome()
         prepare = {GENRE_8K: self._prepare_eightk, GENRE_6K: self._prepare_sixk}
@@ -230,14 +268,20 @@ class PipelineOrchestrator:
                     "Skipping the %s chain: genres=%s", genre, self.config.genres
                 )
                 continue
-            prepare[genre](
-                outcome,
-                resolved_start,
-                resolved_end,
-                ciks,
-                resolved_artifact_root,
-                renew,
-            )
+            try:
+                prepare[genre](
+                    outcome,
+                    resolved_start,
+                    resolved_end,
+                    ciks,
+                    resolved_artifact_root,
+                    renew,
+                )
+            except LeaseLostError:
+                raise
+            except Exception:
+                self.logger.exception("Genre prepare failed: genre=%s", genre)
+                outcome.failed_genres.append(genre)
         return outcome
 
     def _prepare_eightk(
@@ -270,11 +314,11 @@ class PipelineOrchestrator:
         resolved_artifact_root: str,
         renew: Callable[[], None] | None,
     ) -> None:
-        """Run the 6-K chain into ``outcome``; it reads its own CIK list."""
-        del ciks
+        """Run the 6-K chain into ``outcome``."""
         outcome.sixk_ingest, outcome.snippets = self._ingest_and_triage_sixk(
             resolved_start,
             resolved_end,
+            ciks,
             resolved_artifact_root,
             renew,
         )
@@ -283,42 +327,21 @@ class PipelineOrchestrator:
         self: Self,
         resolved_start: date,
         resolved_end: date,
+        ciks: set[str],
         resolved_artifact_root: str,
         renew: Callable[[], None] | None = None,
     ) -> tuple[IngestRunResult, pd.DataFrame]:
         """Run the 6-K chain: acquire filings, then triage them into snippets."""
-        sixk_ciks = read_cik_file(self.config.sixk_cik_file or self.config.cik_file)
         self._log_stage_start(
             "ingest-sixk",
             batch_size=self.config.ingest_batch_size,
-            forms=",".join(self.config.sixk_form_types),
-            ciks=len(sixk_ciks),
+            forms=",".join(GENRES[GENRE_6K].form_types),
+            ciks=len(ciks),
         )
-        _, sixk_ingest = acquire_scraped_sixk_documents(
-            IngestConfig(
-                mode=self.config.mode,
-                bucket=self.config.bucket,
-                cik_file=Path(str(self.config.sixk_cik_file or self.config.cik_file)),
-                start_date=resolved_start,
-                end_date=resolved_end,
-                data_dir=self.config.data_dir,
-                output_root=resolved_artifact_root,
-                force=self.config.force,
-                batch_size=self.config.ingest_batch_size,
-                # Never `download`: a 6-K row points at the mirrored
-                # submission; inlining bodies makes every read pay for them.
-                failure_file=self.config.failure_file
-                or failure_registry_path(
-                    "ingest",
-                    artifact_root=resolved_artifact_root,
-                    data_dir=self.config.data_dir,
-                ),
-                aws_profile=self.config.aws_profile,
-                s3_prefix=self.config.s3_prefix,
-                form_types=self.config.sixk_form_types,
-                dataset_name=SIXK_DOCUMENT_DATASET_NAME,
-            ),
-            ciks=sixk_ciks,
+        _, sixk_ingest = ingest_genre(
+            GENRE_6K,
+            self._ingest_config(resolved_start, resolved_end, resolved_artifact_root),
+            ciks=ciks,
         )
         self._log_stage_complete(
             "ingest-sixk",
@@ -359,27 +382,9 @@ class PipelineOrchestrator:
             batch_size=self.config.ingest_batch_size,
             download=self.config.download,
         )
-        ingest_table, ingest_result = acquire_eightk_documents(
-            IngestConfig(
-                mode=self.config.mode,
-                bucket=self.config.bucket,
-                cik_file=Path(str(self.config.cik_file)),
-                start_date=resolved_start,
-                end_date=resolved_end,
-                data_dir=self.config.data_dir,
-                output_root=resolved_artifact_root,
-                force=self.config.force,
-                batch_size=self.config.ingest_batch_size,
-                download=self.config.download,
-                failure_file=self.config.failure_file
-                or failure_registry_path(
-                    "ingest",
-                    artifact_root=resolved_artifact_root,
-                    data_dir=self.config.data_dir,
-                ),
-                aws_profile=self.config.aws_profile,
-                s3_prefix=self.config.s3_prefix,
-            ),
+        ingest_table, ingest_result = ingest_genre(
+            GENRE_8K,
+            self._ingest_config(resolved_start, resolved_end, resolved_artifact_root),
             ciks=ciks,
         )
         del ingest_table
@@ -422,13 +427,15 @@ class PipelineOrchestrator:
         self._log_stage_complete("classify", rows=len(classified))
         return ingest_result, items, classified
 
-    def run_prepare(self: Self, renew: Callable[[], None] | None = None) -> str:
-        """Run only the prepare stages of each genre; return the artifact root."""
+    def run_prepare(
+        self: Self, renew: Callable[[], None] | None = None
+    ) -> PrepareResult:
+        """Run only the prepare stages of each genre."""
         resolved_start, resolved_end, ciks, resolved_artifact_root = self._setup()
-        self._prepare_genres(
+        prepared = self._prepare_genres(
             resolved_start, resolved_end, ciks, resolved_artifact_root, renew
         )
-        return resolved_artifact_root
+        return PrepareResult(resolved_artifact_root, tuple(prepared.failed_genres))
 
     def run(self: Self, renew: Callable[[], None] | None = None) -> PipelineRunResult:
         """Execute the full CDT pipeline."""
@@ -502,6 +509,7 @@ class PipelineOrchestrator:
             genres=self.config.genres,
             sixk_ingest=prepared.sixk_ingest,
             sixk_snippet_rows=len(prepared.snippets),
+            failed_genres=tuple(prepared.failed_genres),
         )
         finalize_after_match(
             matched["debt_instrument"],
@@ -527,8 +535,8 @@ def run_pipeline(
 
 def run_prepare_stages(
     config: PipelineConfig, *, renew: Callable[[], None] | None = None
-) -> str:
-    """Run only the prepare stages for a config; return the artifact root."""
+) -> PrepareResult:
+    """Run only the prepare stages for a config."""
     return PipelineOrchestrator(config).run_prepare(renew)
 
 
@@ -618,22 +626,27 @@ def resolve_mode_dates(
     ending yesterday; daily with only one of them is an error.
 
     Raises:
-        ValueError: On an unknown mode, or daily with only one date given.
+        ValueError: On an unknown mode, daily with only one date given, or
+            an end date before the start date.
     """
     if mode not in PIPELINE_MODES:
         msg = f"unsupported mode {mode!r}"
         raise ValueError(msg)
     if mode == "historical":
-        return start_date or ALL_TIME_START_DATE, end_date or date.today()
-    if start_date is None and end_date is None:
+        start, end = start_date or ALL_TIME_START_DATE, end_date or date.today()
+    elif start_date is None and end_date is None:
         today = date.today()
-        yesterday = today.fromordinal(today.toordinal() - 1)
-        lookback_start = today.fromordinal(today.toordinal() - DAILY_LOOKBACK_DAYS)
-        return lookback_start, yesterday
-    if start_date is None:
+        start = today.fromordinal(today.toordinal() - DAILY_LOOKBACK_DAYS)
+        end = today.fromordinal(today.toordinal() - 1)
+    elif start_date is None:
         msg = "--start-date is required when --end-date is provided"
         raise ValueError(msg)
-    if end_date is None:
+    elif end_date is None:
         msg = "--end-date is required when --start-date is provided"
         raise ValueError(msg)
-    return start_date, end_date
+    else:
+        start, end = start_date, end_date
+    if end < start:
+        msg = f"end date {end.isoformat()} is before start date {start.isoformat()}"
+        raise ValueError(msg)
+    return start, end

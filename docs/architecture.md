@@ -11,25 +11,23 @@ those issuers happened to file is not something the caller should have to know.
 ```
 8-K:  ingest ──── itemize ── classify ─┐
                                        ├── extract ── match ── (finalize)
-6-K:  ingest-sixk ─────────── sixk ────┘
+6-K:  ingest ──────────────── sixk ────┘
 ```
 
 1. `ingest`
-   Reads scraper-managed filing manifests from S3, selects 8-K complete submission text files for the configured CIK set, and writes canonical `documents` partitions.
+   Reads scraper-managed filing manifests from S3 for every selected genre and the run's one CIK list (`cdt ingest --genres`, default all). For 8-K it selects each filing's complete submission text file and writes `documents` partitions. For 6-K, which the scraper stores as one object per document rather than one complete submission, it assembles the submission, mirrors it under `raw-documents/sixk/`, and writes `documents-sixk` partitions. Each genre has its own documents dataset because every stage selects work by source-partition fingerprint: 6-K rows landing in 8-K partitions would make the whole 8-K corpus pending again.
 2. `itemize`
    Extracts only the 8-K items CDT cares about today: `1.01`, `1.02`, `2.03`, `2.04`, `7.01`, and `8.01`.
 3. `classify`
    Uses a local TF-IDF plus linear SVC model to mark item sections as relevant or irrelevant before any LLM call.
-4. `ingest-sixk`
-   The 6-K genre's acquisition. The scraper stores a 6-K as one object per document rather than one complete submission, so this assembles the submission and mirrors it under `raw-documents/sixk/`, writing `documents-sixk` partitions. It is a separate dataset because every stage selects work by source-partition fingerprint: 6-K rows landing in 8-K partitions would make the whole 8-K corpus pending again.
-5. `sixk`
+4. `sixk`
    The 6-K genre's triage, in place of itemize → classify: a 6-K has no items to itemize and nothing for the item classifier to classify. It windows each document, scores the windows with a local model, expands the admitted ones into the context their crop cut off, and has an LLM prune the survivors, writing `sixk-snippets` rows in the same classified-item columns `classify` produces.
-6. `extract`
+5. `extract`
    Extracts structured debt-instrument mentions from relevant rows of **both** classification sources and writes a full per-run audit log. Two backends exist: a synchronous `live` backend (OpenRouter chat completions) and the deployed `batch` backend (OpenAI Batch API). See "Extractor Design" below.
-7. `match`
+6. `match`
    Consolidates mention rows into debt instruments and writes instrument-level outputs partitioned by CIK shard. A 6-K mention consolidates against an 8-K mention for the same issuer for free: the matcher shards by CIK and never reads the genre.
 
-The stage-oriented CLI is `cdt`. The deployment-oriented entrypoint is `cdt-orchestrator`, which simply resolves defaults and runs the same pipeline code used locally. Both take `--genres` (env `GENRES` on the orchestrator) to restrict a run to one genre, and `--sixk-cik-file` (env `SIXK_CIK_FILE`) for the case where the run's CIK list contains no foreign private issuers and the 6-K chain would otherwise be a no-op.
+The stage-oriented CLI is `cdt`. The deployment-oriented entrypoint is `cdt-orchestrator`, which simply resolves defaults and runs the same pipeline code used locally. Both take `--genres` (env `GENRES` on the orchestrator) to restrict a run to one genre. Every genre is searched for the same CIK list.
 
 After matching, the pipeline can optionally materialize four final snapshot tables for downstream consumers:
 
@@ -72,7 +70,7 @@ Three execution modes exist:
 - `daily`
   Defaults to yesterday's filing date when no dates are provided. With the default
   `batch` backend it runs the prepare stages of every selected genre — 8-K's
-  ingest → itemize → classify and 6-K's ingest-sixk → sixk — and refreshes
+  ingest → itemize → classify and 6-K's ingest → sixk — and refreshes
   match/final snapshots, but does not run the LLM extract stage; extraction is
   submitted and advanced asynchronously by `poll`. Note that the 6-K triage
   stage makes its own LLM call per filing with admitted windows, so unlike the
@@ -87,6 +85,8 @@ Three execution modes exist:
   match/final snapshots, and the poller's next tick claims the pending partitions for
   extraction. `--extractor-backend live` runs the synchronous OpenRouter pipeline
   instead, so a single command produces final outputs.
+
+Genres are prepared independently. If one genre's chain fails, the run logs `Genre prepare failed: genre=<g>` with the traceback, prepares the other genres, still extracts, matches and publishes, and then exits nonzero. The failed genre's partitions stay pending for the next run. A lost writer lease is never caught this way: it stops the run.
 
 The scheduler runs `daily` (once a day) and `poll` (hourly). Historical runs are manual
 by design so wide backfills are deliberate, observable operations. Where no poll

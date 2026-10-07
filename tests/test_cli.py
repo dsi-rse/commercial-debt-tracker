@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date
 from pathlib import Path
 
@@ -31,6 +32,7 @@ def test_ingest_cli_reads_cik_file_and_calls_acquire(
         *,
         ciks: set[str] | None = None,
         s3_client: object | None = None,
+        return_documents: bool = False,
     ) -> tuple[pd.DataFrame, IngestRunResult]:
         del s3_client
         calls.append(
@@ -66,11 +68,15 @@ def test_ingest_cli_reads_cik_file_and_calls_acquire(
             run_manifest=str(tmp_path / "runs" / "ingest" / "run_id=1.json"),
         )
 
-    monkeypatch.setattr(cli, "acquire_eightk_documents", fake_run_ingest_pipeline)
+    monkeypatch.setattr(
+        "cdt.ingest.genres.acquire_eightk_documents", fake_run_ingest_pipeline
+    )
 
     status = cli.main(
         [
             "ingest",
+            "--genres",
+            "8-K",
             "--bucket",
             "test-bucket",
             "--force",
@@ -118,6 +124,7 @@ def test_ingest_cli_historical_defaults_to_all_time_date_range(
         *,
         ciks: set[str] | None = None,
         s3_client: object | None = None,
+        return_documents: bool = False,
     ) -> tuple[pd.DataFrame, IngestRunResult]:
         del ciks, s3_client
         calls.append(
@@ -146,9 +153,13 @@ def test_ingest_cli_historical_defaults_to_all_time_date_range(
             run_manifest=str(tmp_path / "runs" / "ingest" / "run_id=1.json"),
         )
 
-    monkeypatch.setattr(cli, "acquire_eightk_documents", fake_run_ingest_pipeline)
+    monkeypatch.setattr(
+        "cdt.ingest.genres.acquire_eightk_documents", fake_run_ingest_pipeline
+    )
 
-    status = cli.main(["ingest", "--quiet", "historical", str(cik_file)])
+    status = cli.main(
+        ["ingest", "--genres", "8-K", "--quiet", "historical", str(cik_file)]
+    )
 
     assert status == 0
     assert calls == [
@@ -176,6 +187,7 @@ def test_ingest_cli_daily_defaults_to_lookback_window(
         *,
         ciks: set[str] | None = None,
         s3_client: object | None = None,
+        return_documents: bool = False,
     ) -> tuple[pd.DataFrame, IngestRunResult]:
         del ciks, s3_client
         calls.append((config.start_date, config.end_date))
@@ -196,9 +208,11 @@ def test_ingest_cli_daily_defaults_to_lookback_window(
             run_manifest=str(tmp_path / "runs" / "ingest" / "run_id=1.json"),
         )
 
-    monkeypatch.setattr(cli, "acquire_eightk_documents", fake_run_ingest_pipeline)
+    monkeypatch.setattr(
+        "cdt.ingest.genres.acquire_eightk_documents", fake_run_ingest_pipeline
+    )
 
-    status = cli.main(["ingest", "--quiet", "daily", str(cik_file)])
+    status = cli.main(["ingest", "--genres", "8-K", "--quiet", "daily", str(cik_file)])
 
     from cdt.pipeline import DAILY_LOOKBACK_DAYS
 
@@ -217,6 +231,8 @@ def test_ingest_cli_daily_rejects_partial_date_range(tmp_path: Path) -> None:
     status = cli.main(
         [
             "ingest",
+            "--genres",
+            "8-K",
             "--quiet",
             "daily",
             str(cik_file),
@@ -242,15 +258,20 @@ def test_ingest_cli_logs_failures_to_file(
         *,
         ciks: set[str] | None = None,
         s3_client: object | None = None,
+        return_documents: bool = False,
     ) -> tuple[pd.DataFrame, IngestRunResult]:
         del config, ciks, s3_client
         raise RuntimeError("simulated failure")
 
-    monkeypatch.setattr(cli, "acquire_eightk_documents", fake_run_ingest_pipeline)
+    monkeypatch.setattr(
+        "cdt.ingest.genres.acquire_eightk_documents", fake_run_ingest_pipeline
+    )
 
     status = cli.main(
         [
             "ingest",
+            "--genres",
+            "8-K",
             "--quiet",
             "--log-file",
             str(log_file),
@@ -260,7 +281,7 @@ def test_ingest_cli_logs_failures_to_file(
     )
 
     assert status == 1
-    assert "Ingest failed" in log_file.read_text(encoding="utf-8")
+    assert "Genre ingest failed: genre=8-K" in log_file.read_text(encoding="utf-8")
     assert "simulated failure" in log_file.read_text(encoding="utf-8")
 
 
@@ -976,80 +997,263 @@ def test_final_database_root_only_where_honored() -> None:
         parser.parse_args(["itemize", "--final-database-root", "/final"])
 
 
-def test_ingest_sixk_reads_the_scraper_bucket(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """6-K is acquired from the bucket the 8-K path reads, with its own flags."""
-    calls: list[dict[str, object]] = []
-    cik_file = tmp_path / "ciks.txt"
-    cik_file.write_text("1023514\n")
+def _recording_acquirer(
+    calls: list[tuple[str, tuple[str, ...], str, bool, set[str] | None]],
+    label: str,
+) -> object:
+    """Fake acquire function recording the genre-narrowed config it receives."""
 
-    def fake_acquire_scraped(
+    def acquire(
         config: cli.IngestConfig,
         *,
         ciks: set[str] | None = None,
+        s3_client: object | None = None,
+        return_documents: bool = False,
     ) -> tuple[pd.DataFrame, IngestRunResult]:
+        del s3_client, return_documents
         calls.append(
-            {
-                "mode": config.mode,
-                "bucket": config.bucket,
-                "s3_prefix": config.s3_prefix,
-                "form_types": config.form_types,
-                "dataset_name": config.dataset_name,
-                "start_date": config.start_date,
-                "end_date": config.end_date,
-                "ciks": ciks,
-                # The submission is mirrored and read from resource_uri, never
-                # inlined into the partition.
-                "download": config.download,
-            }
+            (label, config.form_types, config.dataset_name, config.download, ciks)
         )
         return pd.DataFrame(), IngestRunResult(
             mode=config.mode,
             start_date=config.start_date,
             end_date=config.end_date,
-            ciks_count=len(ciks or set()),
-            candidates_seen=1,
+            ciks_count=1,
+            candidates_seen=0,
             skipped_existing=0,
             downloaded=0,
             failures=0,
-            total_rows=1,
-            output_root=str(tmp_path),
-            documents_root=str(tmp_path / "documents-sixk"),
+            total_rows=0,
+            output_root=str(config.output_root),
+            documents_root=str(config.dataset_name),
             document_partitions=(),
-            failure_file=str(tmp_path / "failures" / "ingest_failures.json"),
-            run_manifest=str(tmp_path / "runs" / "ingest" / "run_id=1.json"),
-            dataset_name="documents-sixk",
+            failure_file="failures.json",
+            run_manifest="run.json",
         )
 
-    monkeypatch.setattr(cli, "acquire_scraped_sixk_documents", fake_acquire_scraped)
+    return acquire
+
+
+def test_ingest_cli_acquires_every_genre_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One CIK list, every genre, in registry order; 6-K never inlines bodies."""
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("320193\n", encoding="utf-8")
+    calls: list[tuple[str, tuple[str, ...], str, bool, set[str] | None]] = []
+    monkeypatch.setattr(
+        "cdt.ingest.genres.acquire_eightk_documents", _recording_acquirer(calls, "8-K")
+    )
+    monkeypatch.setattr(
+        "cdt.ingest.genres.acquire_scraped_sixk_documents",
+        _recording_acquirer(calls, "6-K"),
+    )
 
     status = cli.main(
         [
-            "ingest-sixk",
+            "ingest",
+            "--download",
+            "--quiet",
             "--artifact-root",
             str(tmp_path),
-            "--quiet",
             "historical",
             str(cik_file),
             "--start-date",
-            "2026-09-08",
+            "2024-01-01",
             "--end-date",
-            "2026-09-09",
+            "2024-01-31",
         ]
     )
 
     assert status == 0
     assert calls == [
-        {
-            "mode": "historical",
-            "bucket": cli.DEFAULT_BUCKET,
-            "s3_prefix": "sec",
-            "form_types": ("6-K", "6-K/A"),
-            "dataset_name": "documents-sixk",
-            "start_date": date(2026, 9, 8),
-            "end_date": date(2026, 9, 9),
-            "ciks": {"1023514"},
-            "download": False,
-        }
+        ("8-K", ("8-K",), "documents", True, {"320193"}),
+        ("6-K", ("6-K", "6-K/A"), "documents-sixk", False, {"320193"}),
     ]
+
+
+def test_ingest_cli_genres_narrows_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--genres 6-K`` acquires 6-K filings only."""
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("1023514\n", encoding="utf-8")
+    calls: list[tuple[str, tuple[str, ...], str, bool, set[str] | None]] = []
+    monkeypatch.setattr(
+        "cdt.ingest.genres.acquire_eightk_documents", _recording_acquirer(calls, "8-K")
+    )
+    monkeypatch.setattr(
+        "cdt.ingest.genres.acquire_scraped_sixk_documents",
+        _recording_acquirer(calls, "6-K"),
+    )
+
+    status = cli.main(
+        [
+            "ingest",
+            "--genres",
+            "6-K",
+            "--quiet",
+            "--artifact-root",
+            str(tmp_path),
+            "historical",
+            str(cik_file),
+            "--start-date",
+            "2024-01-01",
+            "--end-date",
+            "2024-01-31",
+        ]
+    )
+
+    assert status == 0
+    assert [call[0] for call in calls] == ["6-K"]
+
+
+def test_ingest_cli_one_failing_genre_does_not_stop_the_other(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """6-K still ingests when 8-K raises, and the command exits non-zero."""
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("320193\n", encoding="utf-8")
+    calls: list[tuple[str, tuple[str, ...], str, bool, set[str] | None]] = []
+
+    def failing(config: cli.IngestConfig, **kwargs: object) -> object:
+        del config, kwargs
+        raise RuntimeError("simulated 8-K failure")
+
+    monkeypatch.setattr("cdt.ingest.genres.acquire_eightk_documents", failing)
+    monkeypatch.setattr(
+        "cdt.ingest.genres.acquire_scraped_sixk_documents",
+        _recording_acquirer(calls, "6-K"),
+    )
+
+    status = cli.main(
+        [
+            "ingest",
+            "--quiet",
+            "--artifact-root",
+            str(tmp_path),
+            "historical",
+            str(cik_file),
+            "--start-date",
+            "2024-01-01",
+            "--end-date",
+            "2024-01-31",
+        ]
+    )
+
+    assert status == 1
+    assert [call[0] for call in calls] == ["6-K"]
+
+
+def test_ingest_cli_isolates_a_value_error_raised_while_acquiring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A corrupt manifest in one genre is that genre's failure, not bad arguments."""
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("320193\n", encoding="utf-8")
+    calls: list[tuple[str, tuple[str, ...], str, bool, set[str] | None]] = []
+
+    def corrupt(config: cli.IngestConfig, **kwargs: object) -> object:
+        del config, kwargs
+        raise json.JSONDecodeError("Expecting value", "", 0)
+
+    monkeypatch.setattr(
+        "cdt.ingest.genres.acquire_eightk_documents", _recording_acquirer(calls, "8-K")
+    )
+    monkeypatch.setattr("cdt.ingest.genres.acquire_scraped_sixk_documents", corrupt)
+
+    status = cli.main(
+        [
+            "ingest",
+            "--quiet",
+            "--artifact-root",
+            str(tmp_path),
+            "historical",
+            str(cik_file),
+            "--start-date",
+            "2024-01-01",
+            "--end-date",
+            "2024-01-31",
+        ]
+    )
+
+    assert status == 1
+    assert [call[0] for call in calls] == ["8-K"]
+
+
+def test_ingest_cli_rejects_an_end_before_the_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reversed range is a usage error, and no genre is acquired."""
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("320193\n", encoding="utf-8")
+    calls: list[tuple[str, tuple[str, ...], str, bool, set[str] | None]] = []
+    monkeypatch.setattr(
+        "cdt.ingest.genres.acquire_eightk_documents", _recording_acquirer(calls, "8-K")
+    )
+    monkeypatch.setattr(
+        "cdt.ingest.genres.acquire_scraped_sixk_documents",
+        _recording_acquirer(calls, "6-K"),
+    )
+
+    status = cli.main(
+        [
+            "ingest",
+            "--quiet",
+            "--artifact-root",
+            str(tmp_path),
+            "historical",
+            str(cik_file),
+            "--start-date",
+            "2024-02-01",
+            "--end-date",
+            "2024-01-01",
+        ]
+    )
+
+    assert status == ARGPARSE_USAGE_ERROR
+    assert calls == []
+
+
+def test_pipeline_cli_exits_non_zero_when_a_genre_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run that published the other genre is still reported as failed."""
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("320193\n", encoding="utf-8")
+    monkeypatch.setattr(
+        cli,
+        "run_pipeline",
+        lambda config, **kwargs: PipelineRunResult(
+            mode="historical",
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 1, 31),
+            ingest=None,
+            itemized_rows=0,
+            classified_rows=0,
+            extracted_rows=0,
+            matched_rows=0,
+            debt_instrument_rows=0,
+            classifier_model_dir=tmp_path,
+            artifact_root=str(tmp_path),
+            extractor_run_path=str(tmp_path / "run.jsonl"),
+            failed_genres=("6-K",),
+        ),
+    )
+
+    status = cli.main(
+        [
+            "pipeline",
+            "--quiet",
+            "--artifact-root",
+            str(tmp_path),
+            "historical",
+            str(cik_file),
+            "--start-date",
+            "2024-01-01",
+            "--end-date",
+            "2024-01-31",
+        ]
+    )
+
+    assert status == 1

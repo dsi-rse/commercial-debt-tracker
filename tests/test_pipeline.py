@@ -22,6 +22,7 @@ from cdt.pipeline import (
     normalize_genres,
     resolve_mode_dates,
     run_pipeline,
+    run_prepare_stages,
 )
 from cdt.storage.tables import read_dataset, read_table, write_partition_table
 
@@ -34,6 +35,13 @@ def test_resolve_mode_dates_daily_requires_both_dates() -> None:
     """Daily mode rejects partial date ranges."""
     with pytest.raises(ValueError, match="--end-date is required"):
         resolve_mode_dates("daily", date(2024, 1, 1), None)
+
+
+@pytest.mark.parametrize("mode", ["daily", "historical"])
+def test_resolve_mode_dates_rejects_an_end_before_the_start(mode: str) -> None:
+    """A reversed range is an argument error before any stage runs."""
+    with pytest.raises(ValueError, match="is before start date"):
+        resolve_mode_dates(mode, date(2024, 2, 1), date(2024, 1, 1))
 
 
 def test_resolve_mode_dates_historical_defaults_to_all_time() -> None:
@@ -57,6 +65,7 @@ def test_run_pipeline_uses_stage_backed_functions(
         *,
         ciks: set[str] | None = None,
         s3_client: object | None = None,
+        return_documents: bool = False,
     ) -> tuple[pd.DataFrame, IngestRunResult]:
         del s3_client
         calls.append(("ingest", ciks))
@@ -92,6 +101,7 @@ def test_run_pipeline_uses_stage_backed_functions(
         *,
         ciks: set[str] | None = None,
         s3_client: object | None = None,
+        return_documents: bool = False,
     ) -> tuple[pd.DataFrame, IngestRunResult]:
         del s3_client
         calls.append(("ingest-sixk", ciks))
@@ -131,7 +141,7 @@ def test_run_pipeline_uses_stage_backed_functions(
         }
 
     monkeypatch.setattr(
-        "cdt.pipeline.acquire_eightk_documents", fake_run_ingest_pipeline
+        "cdt.ingest.genres.acquire_eightk_documents", fake_run_ingest_pipeline
     )
     monkeypatch.setattr(
         "cdt.pipeline.itemize_pending_documents", fake_itemize_pending_documents
@@ -140,7 +150,7 @@ def test_run_pipeline_uses_stage_backed_functions(
         "cdt.pipeline.classify_pending_items", fake_classify_pending_items
     )
     monkeypatch.setattr(
-        "cdt.pipeline.acquire_scraped_sixk_documents",
+        "cdt.ingest.genres.acquire_scraped_sixk_documents",
         fake_acquire_scraped_sixk_documents,
     )
     monkeypatch.setattr(
@@ -216,11 +226,13 @@ def test_genres_narrow_the_run_to_one_chain(
 
         return fail
 
-    monkeypatch.setattr("cdt.pipeline.acquire_eightk_documents", unexpected("ingest"))
+    monkeypatch.setattr(
+        "cdt.ingest.genres.acquire_eightk_documents", unexpected("ingest")
+    )
     monkeypatch.setattr("cdt.pipeline.itemize_pending_documents", unexpected("itemize"))
     monkeypatch.setattr("cdt.pipeline.classify_pending_items", unexpected("classify"))
     monkeypatch.setattr(
-        "cdt.pipeline.acquire_scraped_sixk_documents",
+        "cdt.ingest.genres.acquire_scraped_sixk_documents",
         lambda config, **kwargs: (
             calls.append("ingest-sixk"),
             (pd.DataFrame(), _sixk_ingest_result(tmp_path, kwargs.get("ciks"))),
@@ -264,65 +276,6 @@ def test_genres_narrow_the_run_to_one_chain(
     assert result.sixk_ingest is not None
 
 
-def test_the_sixk_chain_can_take_its_own_cik_list(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A list chosen for 8-K coverage may contain no foreign private issuers."""
-    cik_file = tmp_path / "ciks.txt"
-    cik_file.write_text("320193\n", encoding="utf-8")
-    sixk_cik_file = tmp_path / "fpi-ciks.txt"
-    sixk_cik_file.write_text("1023514\n", encoding="utf-8")
-    asked: dict[str, set[str] | None] = {}
-
-    monkeypatch.setattr(
-        "cdt.pipeline.acquire_eightk_documents",
-        lambda config, **kwargs: (
-            asked.__setitem__("8-K", kwargs.get("ciks")),
-            (pd.DataFrame(), _sixk_ingest_result(tmp_path, kwargs.get("ciks"))),
-        )[1],
-    )
-    monkeypatch.setattr(
-        "cdt.pipeline.itemize_pending_documents", lambda **kwargs: pd.DataFrame()
-    )
-    monkeypatch.setattr(
-        "cdt.pipeline.classify_pending_items", lambda **kwargs: pd.DataFrame()
-    )
-    monkeypatch.setattr(
-        "cdt.pipeline.acquire_scraped_sixk_documents",
-        lambda config, **kwargs: (
-            asked.__setitem__("6-K", kwargs.get("ciks")),
-            (pd.DataFrame(), _sixk_ingest_result(tmp_path, kwargs.get("ciks"))),
-        )[1],
-    )
-    monkeypatch.setattr(
-        "cdt.pipeline.triage_pending_documents", lambda **kwargs: pd.DataFrame()
-    )
-    monkeypatch.setattr(
-        "cdt.pipeline.extract_pending_items", lambda **kwargs: pd.DataFrame()
-    )
-    monkeypatch.setattr(
-        "cdt.pipeline.match_pending_mentions",
-        lambda **kwargs: {
-            "debt_instrument_mentions": pd.DataFrame(),
-            "debt_instrument": pd.DataFrame(),
-        },
-    )
-
-    run_pipeline(
-        PipelineConfig(
-            mode="historical",
-            cik_file=str(cik_file),
-            sixk_cik_file=str(sixk_cik_file),
-            start_date=date(2026, 9, 8),
-            end_date=date(2026, 9, 8),
-            artifact_root=str(tmp_path),
-            genres=DEFAULT_GENRES,
-        )
-    )
-
-    assert asked == {"8-K": {"320193"}, "6-K": {"1023514"}}
-
-
 def test_a_config_that_names_no_genres_does_not_acquire_the_sixk_chain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -341,7 +294,7 @@ def test_a_config_that_names_no_genres_does_not_acquire_the_sixk_chain(
     def explode(**_kwargs: object) -> None:
         raise AssertionError("the 6-K chain ran without being asked for")
 
-    monkeypatch.setattr("cdt.pipeline.acquire_scraped_sixk_documents", explode)
+    monkeypatch.setattr("cdt.ingest.genres.acquire_scraped_sixk_documents", explode)
     monkeypatch.setattr("cdt.pipeline.triage_pending_documents", explode)
 
     assert PipelineConfig(mode="historical", cik_file=str(cik_file)).genres == (
@@ -427,6 +380,7 @@ def test_run_pipeline_processes_small_seeded_batch(
         *,
         ciks: set[str] | None = None,
         s3_client: object | None = None,
+        return_documents: bool = False,
     ) -> tuple[pd.DataFrame, IngestRunResult]:
         del config, s3_client
         document_rows = pd.DataFrame(
@@ -506,7 +460,7 @@ This is the extracted event text.
         return row_state
 
     monkeypatch.setattr(
-        "cdt.pipeline.acquire_eightk_documents", fake_run_ingest_pipeline
+        "cdt.ingest.genres.acquire_eightk_documents", fake_run_ingest_pipeline
     )
     monkeypatch.setattr(
         classifier_eightk,
@@ -834,7 +788,7 @@ def test_the_lease_is_renewed_between_the_eightk_and_sixk_chains(
         lambda **kwargs: (calls.append("classify"), pd.DataFrame())[1],
     )
     monkeypatch.setattr(
-        "cdt.pipeline.acquire_scraped_sixk_documents",
+        "cdt.ingest.genres.acquire_scraped_sixk_documents",
         lambda config, **kwargs: (
             calls.append("ingest-sixk"),
             (pd.DataFrame(), _sixk_ingest_result(tmp_path, kwargs.get("ciks"))),
@@ -873,6 +827,7 @@ def _stage_stubs(
         *,
         ciks: set[str] | None = None,
         s3_client: object | None = None,
+        return_documents: bool = False,
     ) -> tuple[pd.DataFrame, IngestRunResult]:
         del config, s3_client
         return pd.DataFrame([{"accession_number": "1"}]), IngestRunResult(
@@ -893,7 +848,7 @@ def _stage_stubs(
         )
 
     monkeypatch.setattr(
-        "cdt.pipeline.acquire_eightk_documents", fake_run_ingest_pipeline
+        "cdt.ingest.genres.acquire_eightk_documents", fake_run_ingest_pipeline
     )
     monkeypatch.setattr(
         "cdt.pipeline.itemize_pending_documents",
@@ -1443,3 +1398,169 @@ def test_run_pipeline_skips_the_publish_when_nothing_changed(
     # too: only run_match_and_finalize had a force test, so this path could
     # stop passing it and nothing would fail.
     assert len(published) == expected_publishes
+
+
+def _isolation_stubs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    calls: list[str],
+    *,
+    failing: tuple[str, ...] = (),
+    error: type[Exception] = RuntimeError,
+) -> None:
+    """Stub every stage; the chains named in ``failing`` raise ``error`` at ingest."""
+
+    def ingest(genre: str) -> Callable[..., object]:
+        def acquire(config: object, **kwargs: object) -> object:
+            del config
+            calls.append(f"ingest:{genre}")
+            if genre in failing:
+                raise error(f"simulated {genre} ingest failure")
+            return pd.DataFrame(), _sixk_ingest_result(
+                tmp_path,
+                kwargs.get("ciks"),  # type: ignore[arg-type]
+            )
+
+        return acquire
+
+    monkeypatch.setattr("cdt.ingest.genres.acquire_eightk_documents", ingest(GENRE_8K))
+    monkeypatch.setattr(
+        "cdt.ingest.genres.acquire_scraped_sixk_documents", ingest(GENRE_6K)
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.itemize_pending_documents",
+        lambda **kwargs: (calls.append("itemize"), pd.DataFrame())[1],
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.classify_pending_items",
+        lambda **kwargs: (calls.append("classify"), pd.DataFrame())[1],
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.triage_pending_documents",
+        lambda **kwargs: (calls.append("sixk"), pd.DataFrame())[1],
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.extract_pending_items",
+        lambda **kwargs: (calls.append("extract"), pd.DataFrame())[1],
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.match_pending_mentions",
+        lambda **kwargs: (
+            calls.append("match"),
+            {
+                "debt_instrument_mentions": pd.DataFrame(),
+                "debt_instrument": pd.DataFrame(),
+            },
+        )[1],
+    )
+
+
+def _both_genres_config(tmp_path: Path) -> PipelineConfig:
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("320193\n", encoding="utf-8")
+    return PipelineConfig(
+        mode="historical",
+        cik_file=str(cik_file),
+        start_date=date(2026, 9, 8),
+        end_date=date(2026, 9, 8),
+        artifact_root=str(tmp_path),
+        genres=(GENRE_8K, GENRE_6K),
+    )
+
+
+def test_a_failing_sixk_chain_still_extracts_and_matches_the_eightk_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 6-K failure is recorded; the 8-K chain and the shared tail still run."""
+    calls: list[str] = []
+    _isolation_stubs(monkeypatch, tmp_path, calls, failing=(GENRE_6K,))
+
+    result = run_pipeline(_both_genres_config(tmp_path))
+
+    assert calls == [
+        "ingest:8-K",
+        "itemize",
+        "classify",
+        "ingest:6-K",
+        "extract",
+        "match",
+    ]
+    assert result.failed_genres == (GENRE_6K,)
+    assert result.ingest is not None
+    assert result.sixk_ingest is None
+
+
+def test_a_failing_eightk_chain_does_not_stop_the_sixk_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Genre order no longer decides which genres get prepared."""
+    calls: list[str] = []
+    _isolation_stubs(monkeypatch, tmp_path, calls, failing=(GENRE_8K,))
+
+    result = run_pipeline(_both_genres_config(tmp_path))
+
+    assert calls == ["ingest:8-K", "ingest:6-K", "sixk", "extract", "match"]
+    assert result.failed_genres == (GENRE_8K,)
+
+
+def test_both_chains_failing_reports_both(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every failed genre is reported, in genre order."""
+    calls: list[str] = []
+    _isolation_stubs(monkeypatch, tmp_path, calls, failing=(GENRE_8K, GENRE_6K))
+
+    result = run_pipeline(_both_genres_config(tmp_path))
+
+    assert result.failed_genres == (GENRE_8K, GENRE_6K)
+
+
+def test_a_prepare_only_run_reports_its_failed_genre(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The batch backend's prepare path carries the failure to the caller."""
+    calls: list[str] = []
+    _isolation_stubs(monkeypatch, tmp_path, calls, failing=(GENRE_6K,))
+
+    prepared = run_prepare_stages(_both_genres_config(tmp_path))
+
+    assert calls == ["ingest:8-K", "itemize", "classify", "ingest:6-K"]
+    assert prepared.artifact_root == str(tmp_path)
+    assert prepared.failed_genres == (GENRE_6K,)
+
+
+def test_a_lost_lease_in_one_chain_aborts_the_whole_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """LeaseLostError is never isolated: a run without its lease must stop writing."""
+    from cdt.lease import LeaseLostError
+
+    calls: list[str] = []
+    _isolation_stubs(
+        monkeypatch, tmp_path, calls, failing=(GENRE_8K,), error=LeaseLostError
+    )
+
+    with pytest.raises(LeaseLostError):
+        run_pipeline(_both_genres_config(tmp_path))
+    assert calls == ["ingest:8-K"]
+
+
+def test_a_failed_genre_is_logged_with_its_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    propagate_logger: Callable[..., None],
+) -> None:
+    """Operators see which genre failed and why."""
+    from cdt.shared import get_logger
+
+    propagate_logger(get_logger("PipelineOrchestrator"))
+    calls: list[str] = []
+    _isolation_stubs(monkeypatch, tmp_path, calls, failing=(GENRE_6K,))
+
+    with caplog.at_level("ERROR"):
+        run_pipeline(_both_genres_config(tmp_path))
+
+    failures = [r for r in caplog.records if "Genre prepare failed" in r.getMessage()]
+    assert {r.getMessage() for r in failures} == {"Genre prepare failed: genre=6-K"}
+    assert all(r.exc_info is not None for r in failures)
