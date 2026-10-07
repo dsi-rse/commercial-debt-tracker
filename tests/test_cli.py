@@ -8,8 +8,10 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+from support import _seed_classifications
 
-from cdt import cli
+from cdt import cli, settings
+from cdt.extractor.state import ExtractionRowState
 from cdt.ingest.core import IngestRunResult
 from cdt.lease import PIPELINE_WRITER_LEASE, acquire_lease
 from cdt.pipeline import PipelineRunResult
@@ -1319,3 +1321,55 @@ def test_pipeline_cli_renews_its_lease_and_aborts_when_it_is_lost(
     monkeypatch.setattr("cdt.lease.renew_lease", lambda lease: False)
     assert cli.main(_pipeline_argv(tmp_path)) == 1
     assert renewals == ["renewed"]
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [((), "env/model"), (("--model", "flag/model"), "flag/model")],
+)
+def test_extract_cli_model_defaults_to_the_extractor_model_setting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extra: tuple[str, ...],
+    expected: str,
+) -> None:
+    """With no --model the EXTRACTOR_MODEL setting is used; --model wins (#251)."""
+    monkeypatch.setattr(settings, "EXTRACTOR_MODEL", "env/model")
+    _seed_classifications(tmp_path, ["a-8-01"])
+    models: list[object] = []
+
+    async def fake_workflow(**kwargs: object) -> ExtractionRowState:
+        models.append(kwargs["model"])
+        row_state = ExtractionRowState(
+            item_row=kwargs["item_row"], stage_name="instrument_ie"
+        )
+        row_state.finish("SUCCESS")
+        return row_state
+
+    monkeypatch.setattr("cdt.extractor.live.run_extraction_workflow", fake_workflow)
+
+    status = cli.main(["extract", "--quiet", "--artifact-root", str(tmp_path), *extra])
+
+    assert status == 0
+    assert models == [expected]
+
+
+def test_pipeline_cli_leaves_the_model_to_the_extractor_model_setting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without --model the config carries None, which extraction resolves (#251)."""
+    models: list[str | None] = []
+
+    def fake_run_pipeline(
+        config: cli.PipelineConfig, *, renew: object = None
+    ) -> PipelineRunResult:
+        models.append(config.extractor_model)
+        return _empty_pipeline_result(tmp_path)
+
+    monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
+    assert cli.main(_pipeline_argv(tmp_path)) == 0
+    assert cli.main(_pipeline_argv(tmp_path, "--model", "flag/model")) == 0
+    assert models == [None, "flag/model"]
+    assert (
+        cli.PipelineConfig(mode="daily", cik_file=Path("c.txt")).extractor_model is None
+    )

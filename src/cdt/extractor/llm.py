@@ -11,7 +11,6 @@ from typing import cast
 from cdt import settings
 from cdt.extractor.state import CompletionResult
 
-DEFAULT_MODEL = settings.DEFAULT_EXTRACTOR_MODEL
 DEFAULT_REASONING_EFFORT = "none"
 REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 EXTRACTOR_TEMPERATURE = 0.0
