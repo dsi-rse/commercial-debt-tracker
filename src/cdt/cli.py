@@ -19,6 +19,7 @@ from cdt.classifier.core import (
 from cdt.classifier.eightk import classify_pending_items
 from cdt.classifier.sixk import DEFAULT_CONCURRENCY as SIXK_DEFAULT_CONCURRENCY
 from cdt.classifier.sixk import sixk_snippets_root, triage_pending_documents
+from cdt.cli_support import configure_logging, parse_date, positive_int
 from cdt.datasets import (
     SIXK_DOCUMENT_DATASET_NAME,
     dataset_root,
@@ -148,7 +149,21 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the top-level command parser."""
     parser = argparse.ArgumentParser(prog="cdt")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    _add_ingest_parser(subparsers)
+    _add_itemize_parser(subparsers)
+    _add_sixk_parser(subparsers)
+    _add_classify_parser(subparsers)
+    _add_extract_parser(subparsers)
+    _add_show_extract_job_parser(subparsers)
+    _add_reset_extract_job_parser(subparsers)
+    _add_backfill_mentions_parser(subparsers)
+    _add_match_parser(subparsers)
+    _add_pipeline_parser(subparsers)
+    return parser
 
+
+def _add_ingest_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Add the ``cdt ingest`` subcommand."""
     ingest_parser = subparsers.add_parser(
         "ingest", help="Acquire every selected genre's filings for CIKs."
     )
@@ -194,6 +209,9 @@ def build_parser() -> argparse.ArgumentParser:
         )
         subparser.set_defaults(func=run_ingest)
 
+
+def _add_itemize_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Add the ``cdt itemize`` subcommand."""
     itemize_parser = subparsers.add_parser(
         "itemize", help="Extract 8-K item sections from document partitions."
     )
@@ -210,6 +228,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_logging_arguments(itemize_parser, noun="itemization")
     itemize_parser.set_defaults(func=run_itemize)
 
+
+def _add_sixk_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Add the ``cdt sixk`` subcommand."""
     sixk_parser = subparsers.add_parser(
         "sixk",
         help="Window and triage 6-K documents into snippet partitions.",
@@ -234,6 +255,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_logging_arguments(sixk_parser, noun="6-K triage")
     sixk_parser.set_defaults(func=run_sixk_stage)
 
+
+def _add_classify_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Add the ``cdt classify`` subcommand."""
     classify_parser = subparsers.add_parser(
         "classify", help="Train or run binary item relevance classification."
     )
@@ -261,6 +285,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_logging_arguments(classify_train_parser, noun="training")
     classify_train_parser.set_defaults(func=run_classifier_train)
 
+
+def _add_extract_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Add the ``cdt extract`` subcommand."""
     extract_parser = subparsers.add_parser(
         "extract", help="Extract instrument mentions from classified item partitions."
     )
@@ -281,6 +308,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_logging_arguments(extract_parser, noun="extraction")
     extract_parser.set_defaults(func=run_extractor)
 
+
+def _add_show_extract_job_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Add the ``cdt show-extract-job`` subcommand."""
     show_job_parser = subparsers.add_parser(
         "show-extract-job",
         help="Show the state of the async batch extract job (read-only).",
@@ -289,6 +319,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_logging_arguments(show_job_parser, noun="inspection")
     show_job_parser.set_defaults(func=run_show_extract_job)
 
+
+def _add_reset_extract_job_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Add the ``cdt reset-extract-job`` subcommand."""
     reset_job_parser = subparsers.add_parser(
         "reset-extract-job",
         help=(
@@ -305,6 +338,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_logging_arguments(reset_job_parser, noun="reset")
     reset_job_parser.set_defaults(func=run_reset_extract_job)
 
+
+def _add_backfill_mentions_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Add the ``cdt backfill-mentions`` subcommand."""
     backfill_parser = subparsers.add_parser(
         "backfill-mentions",
         help=(
@@ -322,6 +358,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_logging_arguments(backfill_parser, noun="backfill")
     backfill_parser.set_defaults(func=run_backfill_mentions)
 
+
+def _add_match_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Add the ``cdt match`` subcommand."""
     match_parser = subparsers.add_parser(
         "match", help="Group extracted instrument mentions into debt instruments."
     )
@@ -348,6 +387,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_logging_arguments(match_parser, noun="matching")
     match_parser.set_defaults(func=run_matcher)
 
+
+def _add_pipeline_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Add the ``cdt pipeline`` subcommand."""
     pipeline_parser = subparsers.add_parser(
         "pipeline", help="Run the full CDT pipeline end-to-end."
     )
@@ -435,7 +477,6 @@ def build_parser() -> argparse.ArgumentParser:
             default=None if mode_name == "daily" else date.today(),
         )
         subparser.set_defaults(func=run_pipeline_command)
-    return parser
 
 
 def run_ingest(args: argparse.Namespace) -> int:
@@ -925,46 +966,9 @@ def run_matcher(args: argparse.Namespace) -> int:
     return 0
 
 
-def configure_logging(*, quiet: bool, log_file: Path | None = None) -> None:
-    """Configure CLI logging."""
-    level = logging.WARNING if quiet else logging.INFO
-    handlers: list[logging.Handler] = [logging.StreamHandler()]
-    if log_file is not None:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        handlers=handlers,
-        force=True,
-    )
-
-
 def resolve_ingest_dates(args: argparse.Namespace) -> tuple[date, date]:
     """Resolve ingest dates for the selected ingest mode."""
     return resolve_mode_dates(args.ingest_mode, args.start_date, args.end_date)
-
-
-def parse_date(value: str) -> date:
-    """Parse an ISO date for argparse."""
-    try:
-        return date.fromisoformat(value)
-    except ValueError as exc:
-        msg = f"expected YYYY-MM-DD, got {value!r}"
-        raise argparse.ArgumentTypeError(msg) from exc
-
-
-def positive_int(value: str) -> int:
-    """Parse a positive integer for argparse."""
-    try:
-        parsed = int(value)
-    except ValueError as exc:
-        msg = f"expected a positive integer, got {value!r}"
-        raise argparse.ArgumentTypeError(msg) from exc
-    if parsed <= 0:
-        msg = f"expected a positive integer, got {value!r}"
-        raise argparse.ArgumentTypeError(msg)
-    return parsed
 
 
 def parse_item_numbers(value: str) -> tuple[str, ...]:

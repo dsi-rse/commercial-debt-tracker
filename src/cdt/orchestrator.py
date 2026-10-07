@@ -21,7 +21,7 @@ import threading
 from collections.abc import Callable, Sequence
 from time import monotonic, sleep
 
-from cdt.cli import configure_logging, parse_date, positive_int
+from cdt.cli_support import configure_logging, parse_date, positive_int
 from cdt.datasets import resolve_artifact_root
 from cdt.extractor import DEFAULT_MAX_ATTEMPTS, OpenAIBatchClient, advance_extract_job
 from cdt.ingest.core import DEFAULT_BUCKET
