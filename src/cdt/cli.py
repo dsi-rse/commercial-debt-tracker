@@ -581,7 +581,8 @@ def run_pipeline_command(args: argparse.Namespace) -> int:
                 genres=args.genres,
                 sixk_batch_size=args.sixk_batch_size,
                 sixk_concurrency=args.sixk_concurrency,
-            )
+            ),
+            renew=renewer(lease),
         )
     except ValueError as exc:
         logger.error("Invalid pipeline arguments: %s", exc)

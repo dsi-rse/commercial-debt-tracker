@@ -294,7 +294,9 @@ def test_pipeline_cli_builds_pipeline_config(
     cik_file.write_text("320193\n", encoding="utf-8")
     calls: list[dict[str, object]] = []
 
-    def fake_run_pipeline(config: cli.PipelineConfig) -> PipelineRunResult:
+    def fake_run_pipeline(
+        config: cli.PipelineConfig, *, renew: object = None
+    ) -> PipelineRunResult:
         calls.append(
             {
                 "mode": config.mode,
@@ -383,7 +385,9 @@ def test_pipeline_cli_defaults_to_source_bucket(
     cik_file.write_text("320193\n", encoding="utf-8")
     calls: list[str] = []
 
-    def fake_run_pipeline(config: cli.PipelineConfig) -> PipelineRunResult:
+    def fake_run_pipeline(
+        config: cli.PipelineConfig, *, renew: object = None
+    ) -> PipelineRunResult:
         calls.append(config.bucket)
         ingest_result = IngestRunResult(
             mode=config.mode,
@@ -1257,3 +1261,61 @@ def test_pipeline_cli_exits_non_zero_when_a_genre_failed(
     )
 
     assert status == 1
+
+
+def _empty_pipeline_result(tmp_path: Path) -> PipelineRunResult:
+    return PipelineRunResult(
+        mode="historical",
+        start_date=date(2024, 1, 1),
+        end_date=date(2024, 1, 31),
+        ingest=None,
+        itemized_rows=0,
+        classified_rows=0,
+        extracted_rows=0,
+        matched_rows=0,
+        debt_instrument_rows=0,
+        classifier_model_dir=tmp_path,
+        artifact_root=str(tmp_path),
+        extractor_run_path=str(tmp_path / "run.jsonl"),
+    )
+
+
+def _pipeline_argv(tmp_path: Path, *extra: str) -> list[str]:
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("320193\n", encoding="utf-8")
+    return [
+        "pipeline",
+        "--quiet",
+        "--artifact-root",
+        str(tmp_path),
+        *extra,
+        "historical",
+        str(cik_file),
+        "--start-date",
+        "2024-01-01",
+        "--end-date",
+        "2024-01-31",
+    ]
+
+
+def test_pipeline_cli_renews_its_lease_and_aborts_when_it_is_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`cdt pipeline` hands the pipeline a renewer; a stolen lease exits 1 (#250)."""
+    renewals: list[str] = []
+
+    def fake_run_pipeline(
+        config: cli.PipelineConfig, *, renew: object = None
+    ) -> PipelineRunResult:
+        assert callable(renew)
+        renew()
+        renewals.append("renewed")
+        return _empty_pipeline_result(tmp_path)
+
+    monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
+    assert cli.main(_pipeline_argv(tmp_path)) == 0
+    assert renewals == ["renewed"]
+
+    monkeypatch.setattr("cdt.lease.renew_lease", lambda lease: False)
+    assert cli.main(_pipeline_argv(tmp_path)) == 1
+    assert renewals == ["renewed"]
