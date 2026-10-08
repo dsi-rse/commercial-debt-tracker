@@ -257,7 +257,9 @@ These flags are rarely needed; the defaults are what the schedules use.
 
 `--force` reprocesses partitions the completion registries already record. On a
 batch-backend `daily`/`historical` run it applies to the prepare and match stages
-only; to force a re-extract, run `cdt run poll --force` while no job is active.
+only; to force a re-extract, run `cdt run poll --force`. The request is queued,
+so every partition is re-extracted across as many jobs as `--max-rows-per-job`
+needs, starting after any job already active.
 `--force` never lowers the publish guards. To publish when no source changed, or
 past the shrinkage guard (a table falling below half its published rows), pass
 `--force-publish`, on `cdt publish` or any `cdt run` mode.

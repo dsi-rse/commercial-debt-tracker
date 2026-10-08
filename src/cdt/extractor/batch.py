@@ -47,6 +47,7 @@ from cdt.extractor.llm import (
 from cdt.extractor.outputs import (
     collect_pending_extract_items,
     finalize_extract_outputs,
+    pending_extract_partitions,
 )
 from cdt.extractor.state import (
     DEFAULT_MAX_ATTEMPTS,
@@ -86,6 +87,13 @@ DEFAULT_MAX_BATCH_BYTES = 100 * 1024 * 1024
 # A row whose batch expires without a result re-submits next tick; each round
 # costs another 24h window, so cap the rounds instead of looping forever.
 DEFAULT_MAX_RESUBMISSIONS = 3
+# Provider 429/5xx rounds a row gets in one job before the job finishes without
+# it. Not a verdict: the row stays pending and the next job retries it.
+DEFAULT_MAX_INFRASTRUCTURE_ROUNDS = 3
+# Ticks a terminal batch waits for its output file to download before its
+# rows without a result count an infrastructure failure and requeue.
+MAX_RESULT_DOWNLOAD_TICKS = 24
+FORCE_BACKLOG_FILENAME = "force-backlog.json"
 # One job's rows (item text + per-stage message histories) live in a single
 # state blob rewritten every tick; claiming every pending partition after a
 # large backfill builds a multi-GB job that OOMs the poll task. Whole
@@ -310,6 +318,10 @@ class RowEntry:
 
     ``resubmissions`` counts consecutive expired-without-result rounds; it
     resets whenever a real result folds and terminates the row at the cap.
+    ``infrastructure_rounds`` counts provider 429/5xx results and undownloadable
+    output files; at its cap the row is ``deferred``: never submitted again in
+    this job, and finalized as neither success nor failure, so its partition
+    stays incomplete and the next job claims it.
     """
 
     row_state: ExtractionRowState
@@ -317,15 +329,22 @@ class RowEntry:
     shard: str
     pending: dict[str, object] | None = None
     resubmissions: int = 0
+    infrastructure_rounds: int = 0
+    deferred: bool = False
 
 
 @dataclass
 class BatchRecord:
-    """One in-flight OpenAI batch and the item custom_ids it carries."""
+    """One in-flight OpenAI batch and the item custom_ids it carries.
+
+    ``download_failures`` counts ticks on which the batch was terminal but its
+    output file could not be read.
+    """
 
     batch_id: str
     tick: int
     custom_ids: list[str]
+    download_failures: int = 0
 
 
 @dataclass
@@ -377,6 +396,38 @@ class ActiveJobSummary:
 def active_job_path(root: str) -> str:
     """Return the path of the single-active-job marker for an artifact root."""
     return join_artifact_path(root, EXTRACT_BATCHES_DATASET, ACTIVE_JOB_FILENAME)
+
+
+def _force_backlog_path(root: str) -> str:
+    return join_artifact_path(root, EXTRACT_BATCHES_DATASET, FORCE_BACKLOG_FILENAME)
+
+
+def _read_force_backlog(root: str) -> frozenset[str]:
+    """Return the partitions a ``force`` request still has to re-extract."""
+    path = _force_backlog_path(root)
+    if not artifact_exists(path):
+        return frozenset()
+    payload = cast(dict[str, object], read_json_artifact(path))
+    return frozenset(str(item) for item in cast(list[object], payload.get("paths", [])))
+
+
+def _write_force_backlog(root: str, paths: frozenset[str]) -> None:
+    write_json_artifact(_force_backlog_path(root), {"paths": sorted(paths)})
+
+
+def _record_force_request(root: str, *, data_dir: Path | None) -> None:
+    """Queue every classification partition for a forced re-extract.
+
+    One job claims at most ``max_rows`` rows, so the request outlives the job
+    that starts it: each later job claims backlog partitions as forced until
+    none remain.
+    """
+    pending, _ = pending_extract_partitions(
+        artifact_root=root, data_dir=data_dir, force=True
+    )
+    paths = frozenset(partition.classification_path for partition in pending)
+    _write_force_backlog(root, _read_force_backlog(root) | paths)
+    LOGGER.info("Queued %s partition(s) for a forced re-extract.", len(paths))
 
 
 def _job_dir(root: str, job_id: str) -> str:
@@ -473,6 +524,8 @@ def _serialize_state_jsonl(rows: dict[str, RowEntry]) -> str:
                 "source": {"date": entry.date, "shard": entry.shard},
                 "pending": entry.pending,
                 "resubmissions": entry.resubmissions,
+                "infrastructure_rounds": entry.infrastructure_rounds,
+                "deferred": entry.deferred,
                 "row": entry.row_state.to_state_dict(),
             },
             sort_keys=True,
@@ -496,6 +549,10 @@ def _load_state_jsonl(text: str) -> dict[str, RowEntry]:
             shard=source["shard"],
             pending=cast(dict[str, object] | None, payload.get("pending")),
             resubmissions=int(cast(int, payload.get("resubmissions", 0))),
+            infrastructure_rounds=int(
+                cast(int, payload.get("infrastructure_rounds", 0))
+            ),
+            deferred=bool(payload.get("deferred", False)),
         )
     return rows
 
@@ -539,6 +596,7 @@ def _read_job_state(root: str, job_id: str) -> JobState:
             batch_id=str(record["batch_id"]),
             tick=int(cast(int, record["tick"])),
             custom_ids=[str(cid) for cid in cast(list[object], record["custom_ids"])],
+            download_failures=int(cast(int, record.get("download_failures", 0))),
         )
         for record in cast(list[dict[str, object]], batches_payload.get("batches", []))
     ]
@@ -580,6 +638,7 @@ def _save_batches(root: str, job: JobState) -> None:
                     "batch_id": record.batch_id,
                     "tick": record.tick,
                     "custom_ids": record.custom_ids,
+                    "download_failures": record.download_failures,
                 }
                 for record in job.batches
             ],
@@ -611,14 +670,22 @@ def _create_job(
     model: str,
     reasoning_effort: str,
     max_attempts: int,
-    force: bool,
     max_rows: int = DEFAULT_MAX_ROWS_PER_JOB,
 ) -> JobState | None:
-    """Start a new job from pending classification partitions, or None if idle."""
+    """Start a new job from pending classification partitions, or None if idle.
+
+    Partitions in the force backlog are claimed as forced, and leave the
+    backlog once a job holds them.
+    """
+    backlog = _read_force_backlog(root)
     entries, claimed = collect_pending_extract_items(
-        artifact_root=root, data_dir=data_dir, force=force, max_rows=max_rows
+        artifact_root=root, data_dir=data_dir, force_paths=backlog, max_rows=max_rows
     )
     if not claimed:
+        if backlog:
+            # Every existing backlog partition would have been pending, so
+            # what is left names partitions that no longer exist.
+            _write_force_backlog(root, frozenset())
         return None
     job_id = _new_job_id()
     rows: dict[str, RowEntry] = {}
@@ -659,6 +726,10 @@ def _create_job(
     )
     _save_state(root, job)
     write_json_artifact(active_job_path(root), {"job_id": job_id})
+    # After the marker: a crash between the two re-forces this job's
+    # partitions later, rather than dropping them from the request.
+    if backlog & claimed.keys():
+        _write_force_backlog(root, backlog - claimed.keys())
     LOGGER.info(
         "Started extract job %s: items=%s partitions=%s",
         job_id,
@@ -753,15 +824,38 @@ def _fold_one_response(
     )
 
 
+def _defer_after_infrastructure_failure(
+    entry: RowEntry, max_rounds: int, reason: str
+) -> None:
+    """Requeue a row whose request failed for a reason unrelated to its filing.
+
+    At ``max_rounds`` the row is deferred to the next job instead; it never
+    becomes a verdict.
+    """
+    entry.infrastructure_rounds += 1
+    if entry.infrastructure_rounds >= max_rounds:
+        entry.deferred = True
+        LOGGER.warning(
+            "Deferring %s to the next extract job after %s infrastructure "
+            "failures: %s",
+            entry.row_state.item_id,
+            entry.infrastructure_rounds,
+            reason,
+        )
+
+
 def _fold_completed_batches(
     job: JobState,
     client: SupportsBatchClient,
     *,
     max_resubmissions: int = DEFAULT_MAX_RESUBMISSIONS,
+    max_infrastructure_rounds: int = DEFAULT_MAX_INFRASTRUCTURE_ROUNDS,
 ) -> int:
     """Poll in-flight batches; fold terminal ones into row states.
 
-    Returns the number of rows advanced. Batches still running are left in place.
+    Returns the number of rows advanced. Batches still running are left in
+    place, as is a terminal batch whose output file could not be read, for
+    up to ``MAX_RESULT_DOWNLOAD_TICKS`` ticks.
     """
     folded = 0
     still_in_flight: list[BatchRecord] = []
@@ -774,14 +868,16 @@ def _fold_completed_batches(
         # failed/cancelled batch can still have an error file whose per-request
         # lines say why, which beats a generic "batch failed" on every row.
         results: dict[str, dict[str, object]] = {}
+        download_error: Exception | None = None
         for file_id in (status.output_file_id, status.error_file_id):
             if not file_id:
                 continue
             try:
                 results.update(_parse_jsonl_by_custom_id(client.download_file(file_id)))
             except Exception as exc:  # noqa: BLE001
-                # Diagnostics are best-effort: a download failure must not strand
-                # the rows this batch owns.
+                # The error file is diagnostics only; without it a row requeues.
+                if file_id == status.output_file_id:
+                    download_error = exc
                 LOGGER.warning(
                     "Could not read file %s for batch %s (%s): %s",
                     file_id,
@@ -789,6 +885,13 @@ def _fold_completed_batches(
                     status.status,
                     exc,
                 )
+        if download_error is not None:
+            # Folding now would resubmit rows whose results exist, paying for
+            # them again and counting toward their resubmission cap.
+            record.download_failures += 1
+            if record.download_failures < MAX_RESULT_DOWNLOAD_TICKS:
+                still_in_flight.append(record)
+                continue
         for custom_id in record.custom_ids:
             entry = job.rows.get(custom_id)
             if entry is None or entry.row_state.state is not None:
@@ -808,22 +911,24 @@ def _fold_completed_batches(
                 continue
             entry.pending = None
             line = results.get(custom_id)
+            if line is None and download_error is not None:
+                _defer_after_infrastructure_failure(
+                    entry,
+                    max_infrastructure_rounds,
+                    f"output file of batch {record.batch_id} unreadable for "
+                    f"{record.download_failures} ticks: {download_error}",
+                )
+                continue
             if line is not None:
                 response = cast(dict[str, object], line.get("response") or {})
                 if is_infrastructure_status(response.get("status_code")):
                     # A 5xx/throttle on this request says nothing about the
-                    # filing: requeue under the same cap as expiries instead
-                    # of recording a verdict.
-                    entry.resubmissions += 1
-                    if entry.resubmissions >= max_resubmissions:
-                        record_stage_error(
-                            entry.row_state,
-                            f"Batch request infra error persisted across "
-                            f"{entry.resubmissions} rounds: "
-                            f"{response.get('status_code')} "
-                            f"{response.get('body')}",
-                        )
-                        folded += 1
+                    # filing, so it is never a verdict.
+                    _defer_after_infrastructure_failure(
+                        entry,
+                        max_infrastructure_rounds,
+                        f"{response.get('status_code')} {response.get('body')}",
+                    )
                     continue
                 entry.resubmissions = 0
                 try:
@@ -871,11 +976,13 @@ def _fold_completed_batches(
 
 
 def _awaiting_rows(job: JobState) -> list[RowEntry]:
-    """Non-terminal rows with no outstanding batch request."""
+    """Non-terminal, non-deferred rows with no outstanding batch request."""
     return [
         entry
         for entry in job.rows.values()
-        if entry.row_state.state is None and entry.pending is None
+        if entry.row_state.state is None
+        and entry.pending is None
+        and not entry.deferred
     ]
 
 
@@ -1075,9 +1182,11 @@ def advance_extract_job(
 
     If no job is active, start one from pending classification partitions. Fold any
     completed OpenAI batches into row states, submit the next batch for rows still
-    needing a call, then persist state. When every row is terminal, write the
-    mention partitions + audit log + completion registry and clear the active-job
-    marker (match/finalize is the caller's: ``cdt.run.run_poll``).
+    needing a call, then persist state. When every row is terminal or deferred,
+    write the mention partitions + audit log + completion registry and clear the
+    active-job marker (match/finalize is the caller's: ``cdt.run.run_poll``).
+    ``force`` queues every classification partition for a forced re-extract by
+    this tick's new job, if it starts one, and the jobs after it.
 
     ``renew_lease`` runs at phase boundaries and may raise (``LeaseLostError``)
     to abort the tick when the caller's writer lease was stolen. Both
@@ -1110,6 +1219,8 @@ def advance_extract_job(
         LOGGER.error("Clearing the active extract job marker: %s", exc)
         _clear_active_job(resolved_root)
         return ExtractTickResult(status="reset")
+    if force:
+        _record_force_request(resolved_root, data_dir=data_dir)
     if active_job_id is None:
         job = _create_job(
             resolved_root,
@@ -1117,21 +1228,12 @@ def advance_extract_job(
             model=resolved_model,
             reasoning_effort=resolved_reasoning,
             max_attempts=max_attempts,
-            force=force,
             max_rows=max_rows_per_job,
         )
         if job is None:
             return ExtractTickResult(status="idle")
         folded = 0
     else:
-        if force:
-            LOGGER.warning(
-                "Ignoring force=True: extract job %s is already active and keeps the "
-                "partitions it claimed at creation. Let it finish (or clear %s) "
-                "before forcing a re-extract.",
-                active_job_id,
-                active_job_path(resolved_root),
-            )
         try:
             job = _load_job_state(resolved_root, active_job_id)
         except CorruptJobStateError as exc:
@@ -1209,7 +1311,9 @@ def advance_extract_job(
         stranded = [
             entry
             for entry in job.rows.values()
-            if entry.row_state.state is None and entry.pending is not None
+            if entry.row_state.state is None
+            and entry.pending is not None
+            and not entry.deferred
         ]
         if stranded:
             for entry in stranded:
@@ -1286,13 +1390,25 @@ def _warn_if_stalled(job: JobState, terminal_rows: int) -> None:
 def _finalize_job(root: str, job: JobState, *, data_dir: Path | None) -> None:
     """Write mentions/audit/completion for a finished job and clear the marker.
 
-    ``finalize_extract_outputs`` has already written the canonical mentions
-    partitions, so the frame it returns is only used for the summary count here;
-    callers read the mentions back from the artifact root like any other stage.
+    Deferred rows are left out, so their partitions are recorded incomplete
+    and the next job claims them again. ``finalize_extract_outputs`` has
+    already written the canonical mentions partitions, so the frame it returns
+    is only used for the summary count here; callers read the mentions back
+    from the artifact root like any other stage.
     """
     row_entries = [
-        (entry.row_state, entry.date, entry.shard) for entry in job.rows.values()
+        (entry.row_state, entry.date, entry.shard)
+        for entry in job.rows.values()
+        if not entry.deferred
     ]
+    deferred = len(job.rows) - len(row_entries)
+    if deferred:
+        LOGGER.warning(
+            "Extract job %s finishing with %s row(s) deferred after infrastructure "
+            "failures; their partitions stay pending for the next job.",
+            job.job_id,
+            deferred,
+        )
     mentions = finalize_extract_outputs(
         row_entries,
         claimed=job.claimed_state,

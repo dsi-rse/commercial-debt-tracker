@@ -330,6 +330,30 @@ lease was already stolen, which aborts the tick (#89).
 This caps the rows claimed into one job, so a job after a backfill cannot run
 the poll task out of memory. Deferred partitions form the next job (#92).
 
+### The force backlog (`extract-batches/force-backlog.json`)
+
+`--force` on a poll tick lists every classification partition into a backlog
+file. Each new job claims backlog partitions as forced (no rows counted done)
+and removes the ones it claimed, so a forced re-extract reaches every partition
+even when `--max-rows-per-job` splits it across jobs, and a force given while a
+job is active waits for that job instead of being dropped (#264). The backlog
+is updated after the new job's marker is written: a crash in between re-forces
+that job's partitions later rather than losing them from the request.
+
+### Infrastructure failures in a batch job (deferred rows)
+
+A provider 429/5xx on one request, or an output file that cannot be read, says
+nothing about the filing, so it never becomes a verdict. Treating either as an
+`ERROR` row (as the resubmission cap once did) marked the partition complete
+and lost the row for good, while the live backend left the same row pending
+(#264). An unreadable output file keeps its batch in flight, retried each tick
+for `MAX_RESULT_DOWNLOAD_TICKS`: the results exist, and resubmitting pays for
+them again. A row's 429/5xx rounds count separately from expiries. At
+`DEFAULT_MAX_INFRASTRUCTURE_ROUNDS` the row is deferred: the job finishes
+without it, its partition's registry entry is written incomplete, and the next
+job claims just that row. This is the batch form of the live backend's abort,
+except that one bad request does not hold up the rest of the job.
+
 ### `MODE_DEADLINE_HOURS` / `start_runtime_watchdog`
 
 ECS has no task-level timeout: a Fargate task runs, and bills, until its

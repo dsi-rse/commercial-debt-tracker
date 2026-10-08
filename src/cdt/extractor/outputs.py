@@ -103,6 +103,7 @@ def pending_extract_partitions(
     artifact_root: str | Path | None = None,
     data_dir: Path | None = None,
     force: bool = False,
+    force_paths: frozenset[str] = frozenset(),
     exclude_paths: set[str] | None = None,
 ) -> tuple[list[PendingExtractPartition], dict[str, CompletedPartition]]:
     """Select partitions with unextracted rows, keyed on outcomes and versions.
@@ -111,7 +112,8 @@ def pending_extract_partitions(
     incomplete (an aborted pass), or its source fingerprint changed (ingest
     merged late-arriving rows into it). ``done_item_ids`` are rows that
     already reached a terminal state and must not be re-paid; ``force``
-    makes every partition pending with none done.
+    makes every partition pending with none done, and ``force_paths`` does
+    that for the partitions it names.
 
     Also returns the loaded registry (empty under ``force``) so the caller
     can update and persist it.
@@ -149,7 +151,7 @@ def pending_extract_partitions(
         partition = parse_date_shard_partition(classification_path)
         fingerprint = fingerprints[classification_path]
         entry = registry.get(classification_path)
-        if force or entry is None:
+        if force or entry is None or classification_path in force_paths:
             pending.append(
                 PendingExtractPartition(
                     classification_path=classification_path,
@@ -179,6 +181,7 @@ def collect_pending_extract_items(
     artifact_root: str | Path | None = None,
     data_dir: Path | None = None,
     force: bool = False,
+    force_paths: frozenset[str] = frozenset(),
     max_rows: int | None = None,
 ) -> tuple[list[tuple[dict[str, str | None], str, str]], dict[str, dict[str, object]]]:
     """Collect relevant items awaiting extraction across pending partitions.
@@ -198,7 +201,10 @@ def collect_pending_extract_items(
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     pending, _registry = pending_extract_partitions(
-        artifact_root=resolved_root, data_dir=data_dir, force=force
+        artifact_root=resolved_root,
+        data_dir=data_dir,
+        force=force,
+        force_paths=force_paths,
     )
     entries: list[tuple[dict[str, str | None], str, str]] = []
     claimed: dict[str, dict[str, object]] = {}

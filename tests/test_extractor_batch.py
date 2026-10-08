@@ -1164,42 +1164,74 @@ def test_unsupported_reasoning_effort_fails_before_job_creation(
     assert not Path(active_job_path(str(tmp_path))).exists()
 
 
-def test_force_warns_when_a_job_is_already_active(
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Force only applies at job creation, so a mid-job force must not go silent."""
+def test_force_during_an_active_job_is_queued_for_the_next_job(tmp_path: Path) -> None:
+    """A force request while a job runs re-extracts once that job finishes."""
     seed_classification(tmp_path, [{"item_id": "item-multi", "text": MULTI_TEXT}])
     client = FakeBatchClient(
         {"item-multi": {"ner": MULTI_NER, "instrument_ie": MULTI_IE}}
     )
 
-    # First tick creates the job; force is honored here and must stay quiet.
-    with caplog.at_level("WARNING"):
-        created = advance_extract_job(
+    def _tick(*, force: bool = False) -> object:
+        return advance_extract_job(
             batch_client=client,
             artifact_root=tmp_path,
             model="gpt-5.4",
             reasoning_effort="none",
             max_attempts=3,
-            force=True,
+            force=force,
         )
-    assert created.status == "submitted"
-    assert "Ignoring force=True" not in caplog.text
 
-    # Second tick has an active job, so force is inert and must warn.
-    caplog.clear()
-    with caplog.at_level("WARNING"):
-        advance_extract_job(
+    first = _tick()
+    assert first.status == "submitted"
+    assert _tick(force=True).status == "submitted"
+    assert _tick().status == "completed"
+
+    # The partition is complete, but the force request still names it.
+    second = _tick()
+    assert second.status == "submitted"
+    assert second.job_id != first.job_id
+    assert _tick().status == "submitted"
+    assert _tick().status == "completed"
+    assert _tick().status == "idle"
+
+
+def test_force_reaches_every_partition_across_capped_jobs(tmp_path: Path) -> None:
+    """``force`` outlives the first job when the row cap splits the work."""
+    for shard in ("0001", "0002", "0003"):
+        seed_classification(
+            tmp_path,
+            [{"item_id": f"item-{shard}", "text": NODEBT_TEXT}],
+            shard=shard,
+        )
+    client = FakeBatchClient(
+        {f"item-{shard}": {"ner": NODEBT_NER} for shard in ("0001", "0002", "0003")}
+    )
+
+    def _tick(*, force: bool = False) -> object:
+        return advance_extract_job(
             batch_client=client,
             artifact_root=tmp_path,
             model="gpt-5.4",
             reasoning_effort="none",
             max_attempts=3,
-            force=True,
+            max_rows_per_job=1,
+            force=force,
         )
-    assert "Ignoring force=True" in caplog.text
-    assert created.job_id in caplog.text
+
+    while _tick().status != "idle":
+        pass
+    client.submitted.clear()
+
+    statuses = [_tick(force=True).status]
+    while statuses[-1] != "idle":
+        statuses.append(_tick().status)
+
+    assert sorted(ids[0] for _, ids in client.submitted) == [
+        "item-0001",
+        "item-0002",
+        "item-0003",
+    ]
+    assert statuses.count("completed") == 3
 
 
 # --------------------------------------------------------------------------- #
@@ -1550,6 +1582,82 @@ def test_per_request_server_error_requeues_instead_of_terminating(
     assert result.status == "completed"
     assert not read_dataset(mentions_root(tmp_path)).empty
     assert load_row_failures("extract", artifact_root=tmp_path) == {}
+
+
+def test_a_persistent_server_error_defers_the_row_instead_of_failing_it(
+    tmp_path: Path,
+) -> None:
+    """Repeated 500s finish the job without the row; its partition stays pending.
+
+    A 500 says nothing about the filing, so it must never become an ERROR
+    verdict that marks the partition complete.
+    """
+    from cdt.extractor.batch import DEFAULT_MAX_INFRASTRUCTURE_ROUNDS
+
+    seed_classification(
+        tmp_path,
+        [
+            {"item_id": "item-nodebt", "text": NODEBT_TEXT},
+            {"item_id": "item-multi", "text": MULTI_TEXT},
+        ],
+    )
+    client = FakeBatchClient(
+        {
+            "item-nodebt": {"ner": NODEBT_NER},
+            "item-multi": {"ner": ("status", 500)},
+        }
+    )
+
+    statuses = [_advance(tmp_path, client).status]
+    while statuses[-1] != "completed":
+        statuses.append(_advance(tmp_path, client).status)
+
+    multi_submissions = [ids for _, ids in client.submitted if "item-multi" in ids]
+    assert len(multi_submissions) == DEFAULT_MAX_INFRASTRUCTURE_ROUNDS
+    assert load_row_failures("extract", artifact_root=tmp_path) == {}
+    (entry,) = load_completion_registry("extract", artifact_root=tmp_path).values()
+    assert entry.complete is False
+    assert entry.item_ids == frozenset({"item-nodebt"})
+
+    # The next job claims only the deferred row and, once the provider
+    # recovers, extracts it.
+    client.scripts["item-multi"] = {"ner": MULTI_NER, "instrument_ie": MULTI_IE}
+    client.submitted.clear()
+    while _advance(tmp_path, client).status != "completed":
+        pass
+    assert {cid for _, ids in client.submitted for cid in ids} == {"item-multi"}
+    assert read_dataset(mentions_root(tmp_path))["name"].to_list() == ["Term Loan"]
+
+
+def test_an_unreadable_output_file_is_retried_next_tick_not_resubmitted(
+    tmp_path: Path,
+) -> None:
+    """The results exist; resubmitting would pay for them a second time."""
+    seed_classification(tmp_path, [{"item_id": "item-multi", "text": MULTI_TEXT}])
+
+    class OutputDownloadFailsOnce(FakeBatchClient):
+        failed = False
+
+        def download_file(self, file_id: str) -> str:
+            if file_id.endswith("-out") and not self.failed:
+                self.failed = True
+                raise RuntimeError("503 fetching output file")
+            return super().download_file(file_id)
+
+    client = OutputDownloadFailsOnce(
+        {"item-multi": {"ner": MULTI_NER, "instrument_ie": MULTI_IE}}
+    )
+
+    assert _advance(tmp_path, client).status == "submitted"
+    waiting = _advance(tmp_path, client)
+    assert waiting.status == "waiting"
+    assert waiting.in_flight_batches == 1
+    assert _advance(tmp_path, client).status == "submitted"
+    assert _advance(tmp_path, client).status == "completed"
+
+    # One NER and one IE submission: the failed download resubmitted nothing.
+    assert len(client.submitted) == 2
+    assert read_dataset(mentions_root(tmp_path))["name"].to_list() == ["Term Loan"]
 
 
 def test_stall_warning_fires_only_past_the_tick_threshold(
