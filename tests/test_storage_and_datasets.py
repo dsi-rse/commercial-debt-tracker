@@ -173,6 +173,60 @@ def test_existing_date_shard_partition_ids_lists_written_partitions(
     )
 
 
+class _PrefixMatchingS3Client:
+    """Lists keys the way S3 does: ``Prefix`` is a plain string match."""
+
+    def __init__(self: _PrefixMatchingS3Client, keys: list[str]) -> None:
+        self.keys = keys
+
+    def get_paginator(self: _PrefixMatchingS3Client, name: str) -> object:
+        assert name == "list_objects_v2"
+        keys = self.keys
+
+        class _Paginator:
+            def paginate(self: _Paginator, Bucket: str, Prefix: str) -> list[dict]:  # noqa: N803
+                del Bucket
+                return [
+                    {
+                        "Contents": [
+                            {"Key": key, "ETag": f'"{key}"'}
+                            for key in keys
+                            if key.startswith(Prefix)
+                        ]
+                    }
+                ]
+
+        return _Paginator()
+
+
+def test_s3_listing_excludes_a_sibling_dataset_sharing_the_name_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Listing ``documents`` must not return ``documents-sixk`` partitions."""
+    from cdt.datasets import (
+        DOCUMENT_DATASET_NAME,
+        SIXK_DOCUMENT_DATASET_NAME,
+        iter_date_shard_partitions,
+    )
+
+    partition = "date=2026-01-02/shard=0007/part-0000.parquet"
+    keys = [
+        f"root/{DOCUMENT_DATASET_NAME}/{partition}",
+        f"root/{SIXK_DOCUMENT_DATASET_NAME}/{partition}",
+    ]
+    monkeypatch.setattr(
+        storage_objects, "s3_client", lambda: _PrefixMatchingS3Client(keys)
+    )
+
+    eightk = f"s3://bucket/root/{DOCUMENT_DATASET_NAME}/{partition}"
+    assert iter_date_shard_partitions(
+        DOCUMENT_DATASET_NAME, artifact_root="s3://bucket/root"
+    ) == [eightk]
+    assert storage_objects.list_artifacts_with_versions(
+        f"s3://bucket/root/{DOCUMENT_DATASET_NAME}/"
+    ) == {eightk: f'"root/{DOCUMENT_DATASET_NAME}/{partition}"'}
+
+
 def test_iter_date_shard_partitions_skips_orphaned_tempfiles(tmp_path: Path) -> None:
     """A tempfile left by a crash between create and rename must not brick the scan (#68)."""
     from cdt.datasets import iter_date_shard_partitions
