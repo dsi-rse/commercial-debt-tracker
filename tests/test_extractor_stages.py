@@ -28,7 +28,7 @@ from cdt.extractor.state import CompletionResult, ExtractionRowState
 from cdt.extractor.tags import (
     parse_tag_details,
     realign_tag_details,
-    repair_unescaped_ampersands,
+    repair_unescaped_text,
 )
 from cdt.extractor.validate import (
     validate_amount_is_not_rate,
@@ -642,10 +642,14 @@ def test_attempt_records_provider_metadata() -> None:
     assert other.current_attempt.to_dict()["finish_reason"] is None
 
 
-def test_repair_unescaped_ampersands_leaves_real_entities_alone() -> None:
-    """A bare ampersand is escaped; anything already an entity is untouched (#127)."""
-    assert repair_unescaped_ampersands("A&R Agreement") == "A&amp;R Agreement"
-    assert repair_unescaped_ampersands("Smith & Wesson & Co") == (
+def test_repair_unescaped_text_leaves_real_entities_alone() -> None:
+    """A bare `&` or `<` is escaped; entities and tags are untouched (#127)."""
+    assert repair_unescaped_text("A&R Agreement") == "A&amp;R Agreement"
+    assert repair_unescaped_text("multiplier < 1; p<0.05") == (
+        "multiplier &lt; 1; p&lt;0.05"
+    )
+    assert repair_unescaped_text("<body><a>x</a></body>") == "<body><a>x</a></body>"
+    assert repair_unescaped_text("Smith & Wesson & Co") == (
         "Smith &amp; Wesson &amp; Co"
     )
     for already_valid in (
@@ -657,7 +661,7 @@ def test_repair_unescaped_ampersands_leaves_real_entities_alone() -> None:
         "&#8217;s",
         "&#x2019;s",
     ):
-        assert repair_unescaped_ampersands(already_valid) == already_valid
+        assert repair_unescaped_text(already_valid) == already_valid
 
 
 def test_ner_validate_accepts_a_response_carrying_a_bare_ampersand() -> None:
@@ -689,8 +693,23 @@ def test_ner_validate_accepts_a_response_carrying_a_bare_ampersand() -> None:
     ]
 
 
+def test_ner_validate_accepts_a_response_carrying_a_bare_less_than() -> None:
+    """An item with `multiplier < 1` round-trips like one with `A&R`."""
+    text = "Leveraged if multiplier > 1; deleveraged if multiplier < 1."
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1", "text": text}, stage_name="ner"
+    )
+    response = f"<body>{text}</body>"
+
+    assert NERStage().validate(row_state, response) == []
+    row_state.stage_responses["ner"] = response
+    NERStage().postprocess(row_state)
+    _, plain_text, _ = parse_tag_details(str(row_state.ner_tagged_xml))
+    assert plain_text == text
+
+
 def test_ner_validate_still_rejects_a_stray_angle_bracket() -> None:
-    """Only `&` is repaired; a malformed tag is still a failure (#127)."""
+    """A `<` that could open a tag is not repaired; it is still a failure (#127)."""
     row_state = ExtractionRowState(
         item_row={"item_id": "item-1", "text": "The Company borrowed."},
         stage_name="ner",

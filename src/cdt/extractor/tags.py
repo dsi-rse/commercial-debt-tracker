@@ -8,11 +8,13 @@ from xml.etree import ElementTree as ET
 
 from defusedxml import ElementTree as DefusedET
 
-# An ampersand that starts no entity. The NER response has to be well-formed XML
-# while reproducing text that may carry a bare `&`.
+# An ampersand that starts no entity, and a `<` that cannot start a tag
+# (`multiplier < 1`, `p<0.05`). The NER response has to be well-formed XML
+# while reproducing text that may carry either.
 UNESCAPED_AMPERSAND_PATTERN = re.compile(
     r"&(?!(?:amp|lt|gt|quot|apos);|#(?:\d+|x[0-9A-Fa-f]+);)"
 )
+UNESCAPED_LESS_THAN_PATTERN = re.compile(r"<(?![A-Za-z_/])")
 
 
 def parse_tag_details(
@@ -98,15 +100,17 @@ def realign_tag_details(
     return realigned
 
 
-def repair_unescaped_ampersands(text: str) -> str:
-    """Escape ampersands the NER response left bare, so it can be parsed.
+def repair_unescaped_text(text: str) -> str:
+    """Escape the `&` and `<` the NER response left bare, so it can be parsed.
 
     The item text reaches the model unescaped (`ner_input_body`), so an item
-    containing `A&R` yields a response that reproduces the text but is not
-    well-formed XML. Only `&` not already starting an entity is repaired; a
-    stray `<` or `>` is a real malformation and is left to fail parsing.
+    containing `A&R` or `multiplier < 1` yields a response that reproduces the
+    text but is not well-formed XML. Repaired: an `&` not already starting an
+    entity, and a `<` not followed by a letter, `_` or `/`. A `<` that could
+    open or close a tag is a real malformation and is left to fail parsing.
     """
-    return UNESCAPED_AMPERSAND_PATTERN.sub("&amp;", text)
+    text = UNESCAPED_AMPERSAND_PATTERN.sub("&amp;", text)
+    return UNESCAPED_LESS_THAN_PATTERN.sub("&lt;", text)
 
 
 def assign_tag_ids(xml_text: str) -> str:
