@@ -36,6 +36,9 @@ The deployed service is a single ECS Fargate task running `cdt run`, with:
 - infrastructure provisioned from [`pulumi/`](pulumi/)
 - a daily EventBridge Scheduler trigger that runs `cdt run daily`
 - an hourly EventBridge Scheduler trigger that runs `cdt run poll`
+- per-stack switches for both triggers (`idi:schedule_enabled`,
+  `idi:poll_schedule_enabled`); as committed, the daily schedule is disabled in
+  both stacks and the poll is enabled in `dev` only
 - manual historical backfills via `scripts/run-historical.sh` (admin-run ECS task command overrides; see [docs/deployment.md](docs/deployment.md))
 
 The deployed `daily` run does ingest → segment → classify for each genre (8-K and

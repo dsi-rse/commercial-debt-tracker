@@ -229,7 +229,22 @@ Local note: `cdt run` and `cdt publish` read `FINAL_DATABASE_ROOT`, or take
 `--final-database-root`; without either, nothing is published.
 
 The scheduler state is controlled by the Pulumi `idi:schedule_enabled` setting
-(`idi:poll_schedule_enabled` overrides it for the poll schedule alone).
+(`idi:poll_schedule_enabled` overrides it for the poll schedule alone). As
+committed, the daily schedule is disabled in both stacks and the hourly poll is
+enabled in `dev` only (`pulumi/Pulumi.<stack>.yaml`); check those before
+assuming a scheduled run happened.
+
+### Run-time limits and batch tuning
+
+These flags are rarely needed; the defaults are what the schedules use.
+
+| Flag | Applies to | Default | What it bounds |
+|---|---|---|---|
+| `--max-runtime-hours` | `cdt run daily\|historical\|poll` | poll 2, daily 12, historical 72 | Wall-clock deadline. Past it the runtime watchdog exits the task with code 70, without releasing the lease (its TTL recovers it). |
+| `--max-rows-per-job` | `cdt run poll` | 10,000 | Rows one batch extract job may claim, so the job's state fits the poll task's memory. Pending rows beyond it wait for the next job. |
+| `--max-requests-per-batch` | `cdt run poll` | 40,000 | Requests per OpenAI batch input file. |
+| `--max-batch-bytes` | `cdt run poll` | 100 MiB | Bytes per OpenAI batch input file. |
+| `--max-attempts` | `cdt run poll`, `cdt extract`, `cdt run … --extractor-backend live` | 3 | Scored attempts per extractor stage per row. |
 
 `--force` on a batch-backend `daily`/`historical` run applies to the prepare and
 match/publish stages only, and also skips the publish gate and the shrinkage guard;
@@ -297,7 +312,8 @@ launch day — but do it in order then.
    `/idi/prod/shared/dlq_name`; `pulumi-bootstrap` provisions the prod OIDC
    deploy-role pair; the `prod` GitHub environment gets `AWS_ROLE_ARN_DEPLOY`
    and `PULUMI_CONFIG_PASSPHRASE`.
-2. **Initialize the stack**: `make infra-login`, then
+2. **Initialize the stack**: `make infra-login PULUMI_STACK=prod` (each stack
+   has its own state bucket, `idi-ftm2j-<stack>-pulumi-state`), then
    `pulumi stack init prod` (creates the stack record and the
    `encryptionsalt` — until this runs, any prod deploy dies at
    `pulumi stack select prod`). Creates no AWS resources.

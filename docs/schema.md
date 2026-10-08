@@ -141,16 +141,16 @@ Practical implication:
 
 `batch_size` controls the chunk size used while draining pending work in one invocation. It does not control parquet file size.
 
-- `segment`: processes all pending `documents` (8-K) and `documents-sixk` (6-K) partitions, in chunks of up to `batch_size` partitions at a time.
-- `classify`: processes all pending `items` (8-K) and `sixk-windows` (6-K) partitions, in chunks of up to `batch_size` partitions at a time.
-- `extract`: processes all pending `classifications` partitions, in chunks of up to `batch_size` partitions at a time.
-- `match`: processes all `cik_shard` groups present in the mentions dataset, in chunks of up to `batch_size` shard groups at a time.
+- `segment`: processes all pending `documents` (8-K) and `documents-sixk` (6-K) partitions, in chunks of up to `batch_size` partitions; completion is saved and the writer lease renewed after each chunk.
+- `classify`: processes all pending `items` (8-K) and `sixk-windows` (6-K) partitions the same way.
+- `match`: processes all `cik_shard` groups present in the mentions dataset, in chunks of up to `batch_size` shard groups, renewing the lease per shard.
+- `extract` (live backend): accepts `batch_size` but does not chunk by it. It processes pending partitions one at a time and records completion once, at the end of the run. The batch backend sizes its work with `cdt run poll`'s `--max-rows-per-job`, `--max-requests-per-batch` and `--max-batch-bytes` instead.
 - `ingest`: different from the other stages; here `batch_size` is a row buffer threshold for flushing accumulated document rows to their target partitions.
 
 Examples:
 
-- if `extract_batch_size=100`, one extractor run drains all pending `date/shard` parquet partitions, processing them in chunks of up to 100 partitions
-- if `match_batch_size=100`, one matcher run drains all shard groups, processing them in chunks of up to 100 groups, though only 64 shards currently exist
+- if `segment_batch_size=100`, one segment run drains all pending `date/shard` partitions, saving completion after every 100
+- if `match_batch_size=100`, one matcher run drains all shard groups in chunks of up to 100 groups, though only 64 shards exist, so it is one chunk
 - if `ingest_batch_size=100`, ingest flushes after accumulating roughly 100 document rows, and those rows may be written into multiple `date/shard` partition files
 
 ## Dataset Schemas
@@ -202,7 +202,7 @@ Columns:
 - `date`: Filing date in `YYYY-MM-DD` format.
 - `resource_uri`: Alternate storage location for the filing text when `text` is omitted, typically a local path or `s3://` URI.
 - `form_type`: The SEC form of the filing, such as `8-K`, `8-K/A` or `6-K`. A null `form_type` is an 8-K.
-- `source`: How the row was acquired: `s3-manifest` (the SEC scraper's output) or `edgar` (fetched from EDGAR directly).
+- `source`: How the row was acquired. Always `s3-manifest`: the row comes from the SEC scraper's output.
 
 Primary key: `accession_number`
 
@@ -220,22 +220,22 @@ Columns:
 - `url`: SEC source URL copied from the parent document.
 - `text`: Extracted text for the item section only.
 - `date`: Filing date copied from the parent document.
-- `resource_uri`: Reserved pointer for externally stored item text; currently written as `null` by the itemizer.
-- `item_information`: Canonical SEC caption for the item this row covers, read from an `ITEM INFORMATION:` line in the filing's `<SEC-HEADER>` block and normalized to lowercase, such as `entry into a material definitive agreement`. This column drives the table: the itemizer reads the header's captions, maps each one to the item number in `item`, then searches the document body for the matching section. A caption the itemizer does not recognize still produces a row, with an empty `item`. Captions that repeat, or that map to an item number another caption already claimed, are dropped so that `item_id` stays unique.
-- `extraction_status`: Whether the itemizer located this item's section in the document body, and whether the headings it found were ambiguous. Not a confidence score. One of:
-  - `ok`: A body heading for `item` was found and the section boundaries resolved, either from a single heading or from several the itemizer judged benign. `duplicate_resolution` records which case applied.
-  - `duplicate_heading`: Several body headings carried `item` and their sections differ materially, so the itemizer could not tell which one the header caption meant. The first is used; treat `text` as one of several possible readings of the filing.
+- `resource_uri`: Reserved pointer for externally stored item text; currently written as `null` by the 8-K segmenter.
+- `item_information`: Canonical SEC caption for the item this row covers, read from an `ITEM INFORMATION:` line in the filing's `<SEC-HEADER>` block and normalized to lowercase, such as `entry into a material definitive agreement`. This column drives the table: the segmenter reads the header's captions, maps each one to the item number in `item`, then searches the document body for the matching section. A caption the segmenter does not recognize still produces a row, with an empty `item`. Captions that repeat, or that map to an item number another caption already claimed, are dropped so that `item_id` stays unique.
+- `extraction_status`: Whether the segmenter located this item's section in the document body, and whether the headings it found were ambiguous. Not a confidence score. One of:
+  - `ok`: A body heading for `item` was found and the section boundaries resolved, either from a single heading or from several the segmenter judged benign. `duplicate_resolution` records which case applied.
+  - `duplicate_heading`: Several body headings carried `item` and their sections differ materially, so the segmenter could not tell which one the header caption meant. The first is used; treat `text` as one of several possible readings of the filing.
   - `missing_heading`: The header declared the item but no body heading matches it. No section was extracted, so `text` and `section_heading` are empty and `start_line`, `end_line` are null.
-  - `unmapped_item_information`: `item_information` is not a caption the itemizer maps to an item number, so no extraction was attempted. `item` is empty, as are the section fields listed above.
+  - `unmapped_item_information`: `item_information` is not a caption the segmenter maps to an item number, so no extraction was attempted. `item` is empty, as are the section fields listed above.
 
   No stage downstream filters on this column, so the classifier and the extractor both see the empty-text rows produced by the last two statuses.
-- `duplicate_resolution`: How the itemizer chose between body headings carrying this item number. Populated for every row that reached extraction, not only for rows with more than one heading. Comparisons use a normalized form of each candidate section: casefolded, punctuation collapsed, and the item-number heading line itself dropped. One of:
+- `duplicate_resolution`: How the segmenter chose between body headings carrying this item number. Populated for every row that reached extraction, not only for rows with more than one heading. Comparisons use a normalized form of each candidate section: casefolded, punctuation collapsed, and the item-number heading line itself dropped. One of:
   - `single_heading`: Exactly one body heading carried the item number.
   - `benign_equivalent`: Several headings, and one candidate section is equivalent to every other, meaning either that one contains the other or that their token sets overlap by at least 0.95. That candidate is kept.
   - `benign_contained`: Several headings, and one candidate section contains every other. Rare, because the equivalence check above already covers containment for non-empty sections; this value effectively marks the case where a competing heading's section normalizes to nothing.
   - `unresolved_duplicate`: Several headings whose sections differ materially. This is the value that sets `extraction_status` to `duplicate_heading`.
   - Empty string: no extraction was attempted, so the row is `missing_heading` or `unmapped_item_information`.
-- `section_heading`: The body heading line the itemizer selected as the start of the section, verbatim from the filing and not normalized, such as `Item 1.01. Entry into a Material Definitive Agreement.`. Distinct from `item_information`, which carries SEC's own caption from the filing header rather than the text the filer wrote. Empty when no heading matched.
+- `section_heading`: The body heading line the segmenter selected as the start of the section, verbatim from the filing and not normalized, such as `Item 1.01. Entry into a Material Definitive Agreement.`. Distinct from `item_information`, which carries SEC's own caption from the filing header rather than the text the filer wrote. Empty when no heading matched.
 - `start_line`: 1-based inclusive line number where the section in `text` begins, which is the line holding `section_heading`. Line numbers index the normalized lines of the filing's primary 8-K document block, not `documents.text`, so they cannot be used to slice that column directly. Null when no section was extracted. Recorded for provenance and for debugging section boundaries; nothing downstream reads it.
 - `end_line`: 1-based inclusive line number of the last line in `text`. The section ends at whichever comes first: the line before the next body heading carrying a different item number, the line before a `SIGNATURES` or `EXHIBIT INDEX` line, or the end of the body. Indexed and nulled the same way as `start_line`.
 - `section_char_count`: Character count for the extracted section text.

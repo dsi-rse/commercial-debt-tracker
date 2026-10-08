@@ -31,8 +31,10 @@ LOCAL_RUN_ARGS ?=
 # shells, so infra targets never juggle exported temporary credentials.
 PULUMI_AWS_PROFILE ?= $(or $(AWS_PROFILE),idi-analysis)
 PULUMI_AWS_REGION ?= us-east-2
-PULUMI_STATE_BUCKET ?= idi-ftm2j-dev-pulumi-state/commercial-debt-tracker
 PULUMI_STACK ?= dev
+# One state bucket per stack, matching each GitHub environment's
+# PULUMI_STATE_BUCKET variable and scripts/run-historical.sh.
+PULUMI_STATE_BUCKET ?= idi-ftm2j-$(PULUMI_STACK)-pulumi-state/commercial-debt-tracker
 PULUMI_AWS_ENV = AWS_PROFILE=$(PULUMI_AWS_PROFILE) AWS_REGION=$(PULUMI_AWS_REGION) AWS_DEFAULT_REGION=$(PULUMI_AWS_REGION) AWS_SDK_LOAD_CONFIG=1
 PULUMI_WITH_AWS = cd pulumi && $(PULUMI_AWS_ENV) pulumi
 # PULUMI_CONFIG_PASSPHRASE decrypts stack secrets; set it in .env (from Bitwarden).

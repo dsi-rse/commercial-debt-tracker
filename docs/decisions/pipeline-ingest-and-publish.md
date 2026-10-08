@@ -500,10 +500,12 @@ effect on behaviour.
 
 ### `SIXK_FORM_TYPES` / `DEFAULT_FORM_TYPES`
 
-Ingest itself does not care about form type. `DEFAULT_FORM_TYPES` keeps every
-caller, CLI flag and deployed schedule on 8-K unless one asks for another
-form. Both form tuples are defined in `cdt.datasets` with the genre registry,
-so the CLI has them as a default before it knows which source will run.
+Ingest itself does not care about form type. `DEFAULT_FORM_TYPES` is the 8-K
+genre's forms and `SIXK_FORM_TYPES` the 6-K genre's; which genres a run covers
+is chosen by `--genres` (default every genre), and each genre's ingest narrows
+the config to its own forms (`ingest.genres.genre_config`). Both form tuples are
+defined in `cdt.datasets` with the genre registry, so an `IngestConfig` built in
+code without forms defaults to 8-K.
 
 ### `DOCUMENT_COLUMNS` (`form_type`, `source`)
 

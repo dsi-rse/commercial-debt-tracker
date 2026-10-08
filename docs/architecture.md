@@ -31,7 +31,7 @@ The command line is `cdt`, with one command per stage above (`cdt ingest`, `cdt 
 
 After matching, the pipeline can optionally materialize four final snapshot tables for downstream consumers:
 
-- `items/latest.parquet` — both genres: 8-K item sections and 6-K snippets, in the itemizer's column shape. Every mention joins to its source row here by `item_id`, and consumers read the item text, the filing's SEC URL and its accession number off it — so a genre missing from this table publishes mentions that join to nothing. A 6-K row's `item` is its snippet id (`{accession}:{document}:{window}`) where an 8-K row's is a dotted item number; the snippet's own span and stage-2 verdict stay in `sixk-snippets`. A `form_type` column (`8-K` or `6-K`) is stamped on each row as the table is published, because nothing in the itemizer's sixteen columns records which kind of filing a row came out of and the `item` column is not a reliable substitute.
+- `items/latest.parquet` — both genres: 8-K item sections and 6-K snippets, in the 8-K segmenter's column shape. Every mention joins to its source row here by `item_id`, and consumers read the item text, the filing's SEC URL and its accession number off it — so a genre missing from this table publishes mentions that join to nothing. A 6-K row's `item` is its snippet id (`{accession}:{document}:{window}`) where an 8-K row's is a dotted item number; the snippet's own span and stage-2 verdict stay in `sixk-snippets`. A `form_type` column (`8-K` or `6-K`) is stamped on each row as the table is published, because nothing in the segmenter's sixteen columns records which kind of filing a row came out of and the `item` column is not a reliable substitute.
 - `debt-instruments/latest.parquet`
 - `debt-instrument-mentions/latest.parquet`
 - `mention-cluster-edges/latest.parquet`
@@ -89,7 +89,9 @@ Three execution modes exist:
 
 Genres are prepared independently. If one genre's chain fails, the run logs `Genre prepare failed: genre=<g>` with the traceback, prepares the other genres, still extracts, matches and publishes, and then exits nonzero. The failed genre's partitions stay pending for the next run. A lost writer lease is never caught this way: it stops the run.
 
-The scheduler runs `daily` (once a day) and `poll` (hourly). Historical runs are manual
+The scheduler runs `daily` (once a day) and `poll` (hourly), each when its stack
+enables it: as committed, the daily schedule is disabled in both stacks and the
+poll is enabled in `dev` only (see [deployment.md](deployment.md)). Historical runs are manual
 by design so wide backfills are deliberate, observable operations. Where no poll
 schedule is running (e.g. a local backfill), either run `cdt run poll` by hand
 to drain extraction or use `--extractor-backend live`.
