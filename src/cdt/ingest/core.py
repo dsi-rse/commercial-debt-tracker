@@ -275,6 +275,7 @@ def run_ingest_pipeline(
     s3_client: S3Client | None = None,
     candidate_source: Callable[[FailureRegistry], DocumentCandidateSource],
     return_documents: bool = False,
+    renew: Callable[[], None] | None = None,
 ) -> tuple[pd.DataFrame, IngestRunResult]:
     """Ingest one date window into the config's documents dataset.
 
@@ -291,6 +292,8 @@ def run_ingest_pipeline(
             the 6-K scraper each pass their own).
         return_documents: Read back and return the window's documents. When
             False the frame is empty and only ``total_rows`` counts them.
+        renew: Called per candidate and after each partition flush to extend
+            the caller's writer lease; pass a :func:`cdt.lease.throttled` hook.
 
     Returns:
         The documents frame (see ``return_documents``) and the run summary.
@@ -384,6 +387,8 @@ def run_ingest_pipeline(
 
     source: DocumentCandidateSource = candidate_source(failure_registry)
     for candidate in source:
+        if renew is not None:
+            renew()
         candidates_seen += 1
         if candidate.accession_number in seen_accessions:
             continue
@@ -427,6 +432,8 @@ def run_ingest_pipeline(
         pending_rows.append(row)
         if len(pending_rows) >= config.batch_size:
             flush_pending_rows()
+            if renew is not None:
+                renew()
 
     flush_pending_rows()
     failures += source.failures
@@ -511,10 +518,12 @@ def iter_manifest_keys_for_date_range(
     *,
     ciks: set[str] | None = None,
     s3_prefix: str = DEFAULT_S3_PREFIX,
+    renew: Callable[[], None] | None = None,
 ) -> Iterator[str]:
     """Yield manifest keys for the given forms over an inclusive date range.
 
     Only the scan: no document selection and no failure-registry lookup.
+    ``renew``, when given, is called once per scanned day.
     """
     return _iter_manifest_keys(
         s3_client,
@@ -524,6 +533,7 @@ def iter_manifest_keys_for_date_range(
         end_date,
         ciks=_normalize_ciks(ciks),
         s3_prefix=s3_prefix,
+        renew=renew,
     )
 
 
@@ -679,9 +689,12 @@ def _iter_manifest_keys(
     *,
     ciks: set[str] | None = None,
     s3_prefix: str = DEFAULT_S3_PREFIX,
+    renew: Callable[[], None] | None = None,
 ) -> Iterator[str]:
     paginator = s3_client.get_paginator("list_objects_v2")
     for day_index, day in enumerate(_days_in_range(start_date, end_date), start=1):
+        if renew is not None:
+            renew()
         if day_index == 1 or day_index % PROGRESS_DAY_INTERVAL == 0:
             LOGGER.info("Scanning S3 manifest prefixes through %s", day)
         for form_type in _normalize_form_types(form_types):

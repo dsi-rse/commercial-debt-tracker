@@ -54,6 +54,7 @@ def _recording_acquirer(
         ciks: set[str] | None = None,
         s3_client: object | None = None,
         return_documents: bool = False,
+        renew: Callable[[], None] | None = None,
     ) -> tuple[pd.DataFrame, IngestRunResult]:
         del s3_client, return_documents
         calls.append((label, config, ciks))
@@ -697,6 +698,9 @@ def test_extract_calls_the_live_extractor(
     )
 
     assert status == 0
+    assert len(calls) == 1
+    # A long live run must keep the lease it took.
+    assert callable(calls[0].pop("renew"))
     assert calls == [
         {
             "artifact_root": str(tmp_path),

@@ -11,7 +11,7 @@ was checked.
 from __future__ import annotations
 
 import gzip
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Self
 
@@ -120,6 +120,8 @@ class ScraperDocumentSource:
     s3_client: S3Client
     failure_registry: FailureRegistry | None = None
     ciks: set[str] | None = None
+    #: Called per scanned day and per manifest, to extend the writer lease.
+    renew: Callable[[], None] | None = None
     _failures: int = field(default=0, init=False)
 
     @property
@@ -143,7 +145,10 @@ class ScraperDocumentSource:
             self.config.end_date,
             ciks=self.ciks,
             s3_prefix=self.config.s3_prefix,
+            renew=self.renew,
         ):
+            if self.renew is not None:
+                self.renew()
             key = (self.config.bucket, manifest_key)
             if not self.config.force and self._is_registered_failure(key):
                 LOGGER.info("Skipping known ingest failure: key=%s", manifest_key)
@@ -244,12 +249,14 @@ def acquire_scraped_sixk_documents(
     ciks: set[str] | None = None,
     s3_client: S3Client | None = None,
     return_documents: bool = False,
+    renew: Callable[[], None] | None = None,
 ) -> tuple[pd.DataFrame, IngestRunResult]:
     """Acquire 6-K filings from the scraper into the config's documents dataset.
 
     Runs :func:`cdt.ingest.core.run_ingest_pipeline` with
     :class:`ScraperDocumentSource` as the candidate source. The frame is empty
-    unless ``return_documents``.
+    unless ``return_documents``. ``renew`` is called per manifest and per
+    candidate (pass a :func:`cdt.lease.throttled` hook).
 
     Raises:
         ValueError: If ``config.download`` is set or ``config.form_types`` is
@@ -277,5 +284,7 @@ def acquire_scraped_sixk_documents(
             s3_client=client,
             failure_registry=registry,
             ciks=ciks,
+            renew=renew,
         ),
+        renew=renew,
     )

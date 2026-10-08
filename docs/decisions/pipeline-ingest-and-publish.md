@@ -119,9 +119,16 @@ body (#69).
 
 Historical runs outlast the lease TTL by hours. Renewing between stages stops
 the run from being stolen mid-write, and the hook raises `LeaseLostError` if
-the lease has already been stolen (#89). Segment, classify and match also renew
-inside the stage, once per batch of partitions; ingest and live extraction do
-not, so either one running past the 2h TTL on its own can still lose the lease.
+the lease has already been stolen (#89). Every stage also renews inside
+itself, because one stage alone can outlast the TTL. Segment, classify and
+match renew once per batch of partitions. Ingest renews per scanned day, per
+manifest and per candidate: an 8-K backfill fetches every manifest in its
+window before it writes anything. Live extraction renews before each item's
+model calls and before each partition write. Ingest and live extraction call
+their hook per item, so they wrap it in `cdt.lease.throttled`, which renews at
+most every `RENEW_INTERVAL_SECONDS` (5 minutes). A lease renewed that recently
+cannot have expired, so it cannot have been stolen, and skipping the call in
+between loses no safety.
 
 ### `DAILY_LOOKBACK_DAYS` / `resolve_mode_dates`
 

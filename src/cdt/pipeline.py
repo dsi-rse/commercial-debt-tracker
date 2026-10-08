@@ -387,6 +387,7 @@ class Pipeline:
             genre,
             self._ingest_config(resolved_start, resolved_end, resolved_artifact_root),
             ciks=ciks,
+            renew=renew,
         )
         self._log_stage_complete(
             "ingest",
@@ -467,6 +468,7 @@ class Pipeline:
             model=self.config.extractor_model,
             reasoning_effort=self.config.extractor_reasoning_effort,
             max_attempts=self.config.extractor_max_attempts,
+            renew=renew,
         )
         self._log_stage_complete("extract", rows=len(extracted))
         self._renew(renew)

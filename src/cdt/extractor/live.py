@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
@@ -34,6 +35,7 @@ from cdt.extractor.state import (
 from cdt.extractor.workflow import (
     run_extraction_workflow,
 )
+from cdt.lease import throttled
 from cdt.shared import get_logger
 from cdt.storage.objects import write_text_artifact
 from cdt.storage.tables import read_table
@@ -53,8 +55,15 @@ def extract_pending_items(
     reasoning_effort: str | None = None,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     client: SupportsChatCompletion | None = None,
+    renew: Callable[[], None] | None = None,
 ) -> pd.DataFrame:
-    """Extract instrument mentions for classified item partitions."""
+    """Extract instrument mentions for classified item partitions.
+
+    ``renew`` extends the caller's writer lease before each item's model calls
+    and before each partition write, throttled to at most every
+    :data:`cdt.lease.RENEW_INTERVAL_SECONDS`; a lost lease raises
+    ``LeaseLostError`` before anything else is written.
+    """
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
     if max_attempts <= 0:
@@ -62,6 +71,7 @@ def extract_pending_items(
     resolved_model = model or settings.EXTRACTOR_MODEL
     resolved_reasoning = normalize_reasoning_effort(reasoning_effort)
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    keep_lease = throttled(renew) if renew is not None else None
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     outcomes = RowOutcomes(run_id=run_id, backend="live")
     processed_frames: list[pd.DataFrame] = []
@@ -118,6 +128,8 @@ def extract_pending_items(
         partition_failures = 0
         total_relevant_items = len(relevant_records)
         for item_index, item_row in enumerate(relevant_records, start=1):
+            if keep_lease is not None:
+                keep_lease()
             try:
                 row_state = asyncio.run(
                     run_extraction_workflow(
@@ -162,6 +174,8 @@ def extract_pending_items(
         mentions = pd.DataFrame(mention_rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
         # Rows this partition was extracted for last time and no longer has.
         retired_item_ids = set(pending.done_item_ids) - relevant_item_ids
+        if keep_lease is not None:
+            keep_lease()
         written = write_mentions_partition(
             resolved_root,
             data_dir=data_dir,

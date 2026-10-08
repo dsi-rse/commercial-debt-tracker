@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import date
 from pathlib import Path
 
@@ -123,13 +123,15 @@ def acquire_eightk_documents(
     ciks: set[str] | None = None,
     s3_client: S3Client | None = None,
     return_documents: bool = False,
+    renew: Callable[[], None] | None = None,
 ) -> tuple[pd.DataFrame, IngestRunResult]:
     """Ingest the 8-K complete submissions the scraper's manifests list.
 
     Candidates come from ``iter_document_candidates_for_date_range`` over the
     config's window, form types and S3 prefix. ``config.force`` also retries
-    filings the failure registry marks permanent. Returns what
-    ``run_ingest_pipeline`` returns.
+    filings the failure registry marks permanent. ``renew`` is called per
+    manifest and per candidate (pass a :func:`cdt.lease.throttled` hook).
+    Returns what ``run_ingest_pipeline`` returns.
     """
 
     def manifest_source(failure_registry: FailureRegistry) -> DocumentCandidateSource:
@@ -146,6 +148,7 @@ def acquire_eightk_documents(
                 # --force retries even permanently registered failures; new
                 # failures are still recorded.
                 retry_registered_failures=config.force,
+                renew=renew,
             )
         )
 
@@ -155,6 +158,7 @@ def acquire_eightk_documents(
         s3_client=s3_client,
         candidate_source=manifest_source,
         return_documents=return_documents,
+        renew=renew,
     )
 
 
@@ -169,6 +173,7 @@ def iter_document_candidates_for_date_range(
     s3_prefix: str = DEFAULT_S3_PREFIX,
     retry_registered_failures: bool = False,
     form_types: str | Sequence[str] = DEFAULT_FORM_TYPES,
+    renew: Callable[[], None] | None = None,
 ) -> list[DocumentCandidate]:
     """Return manifest-backed document candidates for an inclusive date range.
 
@@ -184,6 +189,8 @@ def iter_document_candidates_for_date_range(
         retry_registered_failures: Re-attempt manifests the registry marks
             failed, discarding the entry when one now succeeds.
         form_types: SEC form names ("8-K", "6-K/A").
+        renew: Called per scanned day and per manifest read, to extend the
+            caller's writer lease across a scan that writes nothing.
     """
     candidates: list[DocumentCandidate] = []
     for manifest_key in _iter_manifest_keys(
@@ -194,7 +201,10 @@ def iter_document_candidates_for_date_range(
         end_date,
         ciks=_normalize_ciks(ciks),
         s3_prefix=s3_prefix,
+        renew=renew,
     ):
+        if renew is not None:
+            renew()
         key = _failure_key(bucket, manifest_key)
         if (
             not retry_registered_failures

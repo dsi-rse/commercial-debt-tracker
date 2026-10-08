@@ -705,7 +705,6 @@ def run_ingest(args: argparse.Namespace) -> int:
         return USAGE_EXIT_CODE
 
     def body(artifact_root: str, lease: Lease) -> int:
-        del lease
         mode = (
             "daily"
             if args.start_date is None and args.end_date is None
@@ -731,7 +730,11 @@ def run_ingest(args: argparse.Namespace) -> int:
         failed: list[str] = []
         for genre in args.genres:
             try:
-                results[genre] = ingest_genre(genre, config, ciks=ciks)[1]
+                results[genre] = ingest_genre(
+                    genre, config, ciks=ciks, renew=renewer(lease)
+                )[1]
+            except LeaseLostError:
+                raise
             except Exception:
                 LOGGER.exception("Genre ingest failed: genre=%s", genre)
                 failed.append(genre)
@@ -838,7 +841,6 @@ def run_extract(args: argparse.Namespace) -> int:
     """Run ``cdt extract`` (the live backend)."""
 
     def body(artifact_root: str, lease: Lease) -> int:
-        del lease
         mentions = extract_pending_items(
             artifact_root=artifact_root,
             batch_size=args.batch_size,
@@ -846,6 +848,7 @@ def run_extract(args: argparse.Namespace) -> int:
             model=args.model,
             reasoning_effort=args.reasoning_effort,
             max_attempts=args.max_attempts,
+            renew=renewer(lease),
         )
         print(
             f"Extracted {len(mentions)} mention rows into {mentions_root(artifact_root)}."

@@ -66,6 +66,7 @@ def test_run_pipeline_uses_stage_backed_functions(
         ciks: set[str] | None = None,
         s3_client: object | None = None,
         return_documents: bool = False,
+        renew: Callable[[], None] | None = None,
     ) -> tuple[pd.DataFrame, IngestRunResult]:
         del s3_client
         calls.append(("ingest", ciks))
@@ -102,6 +103,7 @@ def test_run_pipeline_uses_stage_backed_functions(
         ciks: set[str] | None = None,
         s3_client: object | None = None,
         return_documents: bool = False,
+        renew: Callable[[], None] | None = None,
     ) -> tuple[pd.DataFrame, IngestRunResult]:
         del s3_client
         calls.append(("ingest-sixk", ciks))
@@ -393,6 +395,7 @@ def test_run_pipeline_processes_small_seeded_batch(
         ciks: set[str] | None = None,
         s3_client: object | None = None,
         return_documents: bool = False,
+        renew: Callable[[], None] | None = None,
     ) -> tuple[pd.DataFrame, IngestRunResult]:
         del config, s3_client
         document_rows = pd.DataFrame(
@@ -840,6 +843,7 @@ def _stage_stubs(
         ciks: set[str] | None = None,
         s3_client: object | None = None,
         return_documents: bool = False,
+        renew: Callable[[], None] | None = None,
     ) -> tuple[pd.DataFrame, IngestRunResult]:
         del config, s3_client
         return pd.DataFrame([{"accession_number": "1"}]), IngestRunResult(

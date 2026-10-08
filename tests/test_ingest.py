@@ -1324,3 +1324,72 @@ def test_the_read_back_counts_the_window_without_reading_its_bodies(
         "000114036126006577",
         "000114036126006578",
     ]
+
+
+def _two_day_manifest_client() -> FakeS3Client:
+    """Two 8-K filings on consecutive days, each with a complete submission."""
+    objects: dict[tuple[str, str], bytes] = {}
+    for day, accession in (
+        ("2024-01-02", "0001140361-26-000001"),
+        ("2024-01-03", "0001140361-26-000002"),
+    ):
+        prefix = f"sec/{day}/8-K/320193/{accession.replace('-', '')}"
+        objects[("sec-bucket", f"{prefix}/manifest.json")] = _manifest_bytes(
+            "320193",
+            accession,
+            "8-K",
+            day,
+            "Complete submission text file",
+            s3_key=f"s3://sec-bucket/{prefix}/full.txt",
+        )
+        objects[("sec-bucket", f"{prefix}/full.txt")] = b"complete submission"
+    return FakeS3Client(objects)
+
+
+def _two_day_config(tmp_path: Path) -> IngestConfig:
+    return IngestConfig(
+        mode="historical",
+        bucket="sec-bucket",
+        cik_file=tmp_path / "ciks.txt",
+        start_date=date(2024, 1, 2),
+        end_date=date(2024, 1, 3),
+        data_dir=tmp_path,
+        output_root=str(tmp_path),
+        failure_file=tmp_path / "failures" / "ingest_failures.json",
+    )
+
+
+def test_ingest_renews_its_lease_through_the_scan_and_the_writes(
+    tmp_path: Path,
+) -> None:
+    """The scan writes nothing for hours on a backfill, so it renews as it goes."""
+    renewals: list[int] = []
+
+    _, result = acquire_eightk_documents(
+        _two_day_config(tmp_path),
+        ciks={"320193"},
+        s3_client=_two_day_manifest_client(),
+        renew=lambda: renewals.append(1),
+    )
+
+    assert result.total_rows == 2
+    # Per scanned day, per manifest read and per candidate.
+    assert len(renewals) >= 2 + 2 + 2
+
+
+def test_ingest_that_loses_its_lease_stops_before_writing(tmp_path: Path) -> None:
+    """A stolen lease raises out of the scan, and no partition is written."""
+    from cdt.lease import LeaseLostError
+
+    def lost() -> None:
+        raise LeaseLostError("stolen")
+
+    with pytest.raises(LeaseLostError):
+        acquire_eightk_documents(
+            _two_day_config(tmp_path),
+            ciks={"320193"},
+            s3_client=_two_day_manifest_client(),
+            renew=lost,
+        )
+
+    assert list_artifacts(documents_root(str(tmp_path)), suffix=".parquet") == []

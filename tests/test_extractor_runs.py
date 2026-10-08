@@ -391,3 +391,43 @@ def test_the_batch_run_manifest_records_its_fields(tmp_path: Path) -> None:
     assert manifest["failure_count"] == 0
     assert len(manifest["partitions_written"]) == 1
     assert manifest["empty_partitions_skipped_from_write"] == 0
+
+
+def test_a_live_run_renews_its_lease_per_item(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One LLM call at a time outlives the TTL, so the hook runs per item.
+
+    The hook is throttled inside the stage; the stub here makes every call
+    renew, so the count is the number of times the stage asked.
+    """
+    _seed_classifications(tmp_path, ["a-8-01", "b-8-01"])
+    _fake_success_workflow(monkeypatch)
+    monkeypatch.setattr("cdt.extractor.live.throttled", lambda renew: renew)
+    renewals: list[int] = []
+
+    extract_pending_items(
+        artifact_root=tmp_path, client=None, renew=lambda: renewals.append(1)
+    )
+
+    # Before each of the two items, and before the partition write.
+    assert len(renewals) == 3
+
+
+def test_a_live_run_that_loses_its_lease_writes_no_mentions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stolen lease stops the run before its next model call or write."""
+    from cdt.lease import LeaseLostError
+
+    _seed_classifications(tmp_path, ["a-8-01"])
+    calls = _fake_success_workflow(monkeypatch)
+
+    def lost() -> None:
+        raise LeaseLostError("stolen")
+
+    with pytest.raises(LeaseLostError):
+        extract_pending_items(artifact_root=tmp_path, client=None, renew=lost)
+
+    assert calls == []
+    assert not (tmp_path / "mentions").exists()

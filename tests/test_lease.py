@@ -212,3 +212,29 @@ def test_renewer_extends_a_held_lease(tmp_path: Path) -> None:
     renewer(held)()
 
     assert held.expires_at >= before
+
+
+def test_a_throttled_hook_renews_at_most_once_per_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-item hooks pay one storage round trip per interval, not per item."""
+    now = [1000.0]
+    monkeypatch.setattr(lease_module, "monotonic", lambda: now[0])
+    renewals: list[float] = []
+    hook = lease_module.throttled(lambda: renewals.append(now[0]), interval_seconds=60)
+
+    hook()
+    now[0] += 30
+    hook()
+    now[0] += 31
+    hook()
+    hook()
+
+    assert renewals == [1000.0, 1061.0]
+
+
+def test_a_throttled_hook_stays_well_inside_the_lease_ttl() -> None:
+    """A lease renewed within the interval cannot have expired, so cannot be stolen."""
+    assert lease_module.RENEW_INTERVAL_SECONDS * 10 <= (
+        lease_module.DEFAULT_LEASE_TTL_SECONDS
+    )
