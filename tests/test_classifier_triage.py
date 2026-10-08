@@ -464,6 +464,14 @@ def test_the_eight_k_default_model_dir_is_the_committed_artifact() -> None:
     assert (eightk_default_model_dir() / "model.pkl").exists()
 
 
+class _StatusError(Exception):
+    """A provider SDK error that exposes only its HTTP status."""
+
+    def __init__(self: Self, status_code: int) -> None:
+        super().__init__(f"HTTP {status_code}")
+        self.status_code = status_code
+
+
 @pytest.mark.parametrize(
     ("error", "infrastructure"),
     [
@@ -479,6 +487,11 @@ def test_the_eight_k_default_model_dir_is_the_committed_artifact() -> None:
             ),
             True,
         ),
+        (httpx.ConnectError("connection refused"), True),
+        (httpx.ReadError("server closed the connection"), True),
+        (httpx.RemoteProtocolError("peer closed without a response"), True),
+        (_StatusError(529), True),
+        (_StatusError(400), False),
         (ValueError("bad request body"), False),
     ],
 )

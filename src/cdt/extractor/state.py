@@ -7,6 +7,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Protocol, cast
 
+import httpx
 import pandas as pd
 
 from cdt.extractor.prior_state import published_mention_rows
@@ -39,8 +40,9 @@ class InfrastructureError(RuntimeError):
     """
 
 
-# HTTP statuses that indicate the provider, not the content.
-_INFRASTRUCTURE_STATUSES = frozenset({402, 408, 429, 500, 502, 503, 504})
+# HTTP statuses that indicate the provider, not the content (529: OpenRouter's
+# provider-overloaded status).
+_INFRASTRUCTURE_STATUSES = frozenset({402, 408, 429, 500, 502, 503, 504, 529})
 
 
 def is_infrastructure_status(status: object) -> bool:
@@ -52,7 +54,9 @@ def is_infrastructure_error(exc: BaseException) -> bool:
     """Classify an exception from a chat call as infrastructure vs content."""
     if isinstance(exc, InfrastructureError):
         return True
-    if isinstance(exc, ConnectionError | TimeoutError):
+    # The openrouter SDK re-raises httpx transport errors (connect, read,
+    # protocol) unwrapped once its own retries run out.
+    if isinstance(exc, ConnectionError | TimeoutError | httpx.TransportError):
         return True
     for attribute in ("status_code", "status"):
         value = getattr(exc, attribute, None)

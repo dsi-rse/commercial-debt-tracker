@@ -193,8 +193,11 @@ Failure is already designed for: `triage_filing` returns a `FilingVerdict` with
 direction to fail in. The stage logs and counts degraded filings in its run
 manifest rather than aborting.
 
-A provider or transport failure (`is_infrastructure_error`: 429, 5xx,
-connection, timeout) is the exception (#265). Failing open there also marked
+A provider or transport failure (`is_infrastructure_error`: 402, 408, 429, 5xx
+including OpenRouter's 529, `httpx.TransportError` and the OpenAI SDK's
+connection/timeout classes) is the exception (#265). The openrouter SDK retries
+transport errors and 5xx itself for up to an hour, then re-raises the httpx
+exception unwrapped, so only a sustained outage reaches this check. Failing open there also marked
 the partition complete, so an outage sent its filings to extraction untriaged
 and they were never triaged later. Such a filing now holds its partition:
 nothing is written, the registry entry carries no fingerprint, and the next run
