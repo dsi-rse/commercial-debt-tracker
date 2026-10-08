@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset
+import pyarrow.parquet
 import pytest
 from botocore.exceptions import ClientError, ReadTimeoutError
 from support import build_mention_row
@@ -417,6 +418,36 @@ def test_a_multi_partition_dataset_reads_with_a_standard_reader(
     assert table.num_rows == 2
     assert len(pd.read_parquet(root)) == 2
     assert len(read_dataset(root)) == 2
+
+
+def test_a_reindexed_all_null_text_column_keeps_the_text_type(tmp_path: Path) -> None:
+    """A column a reindex adds is all-NaN float, and must still publish as text.
+
+    `synthesized_by` is null on every model-emitted mention, so a partition with
+    no synthesized row held it as `double` and the next as `string`; schema
+    unification failed and every read fell back to one file at a time.
+    """
+    root = tmp_path / "mentions"
+    model_only = pd.DataFrame(
+        [{"debt_instrument_mention_id": "m-1", "item_id": "i-1"}]
+    ).reindex(columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
+    assert model_only["synthesized_by"].dtype == "float64"
+    synthesized = model_only.assign(
+        debt_instrument_mention_id="m-2",
+        synthesized_by="prior_state",
+        synthesized_from_mention_id="m-1",
+    )
+    for shard, frame in (("0001", model_only), ("0002", synthesized)):
+        write_partition_table(
+            root, partition={"date": "2026-01-02", "shard": shard}, table=frame
+        )
+
+    schemas = [
+        pyarrow.parquet.read_schema(path) for path in sorted(root.rglob("*.parquet"))
+    ]
+    assert schemas[0] == schemas[1]
+    assert schemas[0].field("synthesized_by").type == pa.string()
+    assert pyarrow.dataset.dataset(root, format="parquet").to_table().num_rows == 2
 
 
 def test_a_rewrite_may_mix_read_back_decimals_with_fresh_text(tmp_path: Path) -> None:

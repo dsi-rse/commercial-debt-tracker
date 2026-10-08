@@ -84,17 +84,21 @@ def decimal_column_values(
     return coerced
 
 
-def declared_column_type(name: str, inferred: pa.DataType) -> pa.DataType:
+def declared_column_type(
+    name: str, inferred: pa.DataType, *, all_null: bool = False
+) -> pa.DataType:
     """Return the physical type one column publishes as.
 
     A declared type wins. Otherwise an inferred ``null`` (an object column with
-    no value in this frame) becomes ``DEFAULT_COLUMN_TYPE``, and any other
+    no value in this frame) becomes ``DEFAULT_COLUMN_TYPE``, as does an
+    ``all_null`` floating column: that is the NaN a pandas reindex fills a
+    missing column with, and every real float column is declared. Any other
     inferred type, which came from a real pandas dtype, is kept.
     """
     declared = DECLARED_COLUMN_TYPES.get(name)
     if declared is not None:
         return declared
-    if pa.types.is_null(inferred):
+    if pa.types.is_null(inferred) or (all_null and pa.types.is_floating(inferred)):
         return DEFAULT_COLUMN_TYPE
     return inferred
 
@@ -116,7 +120,11 @@ def apply_declared_column_types(table: pd.DataFrame) -> pa.Table:
             )
     arrow = pa.Table.from_pandas(prepared, preserve_index=False)
     for index, field in enumerate(arrow.schema):
-        dtype = declared_column_type(field.name, field.type)
+        dtype = declared_column_type(
+            field.name,
+            field.type,
+            all_null=arrow.column(index).null_count == arrow.num_rows,
+        )
         if dtype == field.type:
             continue
         if pa.types.is_decimal(dtype):
