@@ -31,10 +31,13 @@ _BOTO3_SESSIONS: dict[str, boto3.Session] = {}
 # The profile ``--aws-profile`` selected; empty means the ambient credential chain.
 _CONFIGURED_S3_PROFILE = ""
 
+# A constant of its own because botocore rewrites a Config's ``retries`` dict
+# in place when it builds a client, dropping the ``max_attempts`` key.
+S3_MAX_ATTEMPTS = 5
 # Bounds the API call itself, not the streaming read of a returned body;
 # ``_get_object_with_body`` retries that half.
 S3_CLIENT_CONFIG = Config(
-    retries={"mode": "standard", "max_attempts": 5},
+    retries={"mode": "standard", "max_attempts": S3_MAX_ATTEMPTS},
     connect_timeout=10,
     read_timeout=60,
 )
