@@ -96,6 +96,16 @@ ITEM_NAME_TO_NUMBER = {
 # The closed set of real 8-K item numbers; nothing else can be a heading
 # ('6.00' from a rate table cell, '2.00' from a price).
 VALID_ITEM_NUMBERS = frozenset(ITEM_NAME_TO_NUMBER.values())
+# The first two words of each item's title, enough to tell '9.01 Financial
+# Statements' from a '5.06' table cell.
+ITEM_TITLE_PREFIXES = {
+    number: {
+        tuple(re.findall(r"\w+", title)[:2])
+        for title, title_number in ITEM_NAME_TO_NUMBER.items()
+        if title_number == number
+    }
+    for number in VALID_ITEM_NUMBERS
+}
 
 
 @dataclass(frozen=True)
@@ -193,12 +203,18 @@ def extract_items_from_document(document: DocumentText) -> list[ItemSection]:
         Item sections corresponding to ``ITEM INFORMATION`` header values.
     """
     lines = normalize_body_lines(primary_8k_body(document.text))
-    headings = item_headings(lines)
+    item_informations = iter_item_information_values(document.text)
+    declared_numbers = frozenset(
+        ITEM_NAME_TO_NUMBER[value]
+        for value in item_informations
+        if value in ITEM_NAME_TO_NUMBER
+    )
+    headings = item_headings(lines, bare_numbers=declared_numbers)
     rows = []
     # item_id is accession + item_number: keep only the first occurrence of
     # each, since headers can repeat a line or map two labels to one number.
     seen_keys: set[str] = set()
-    for item_information in iter_item_information_values(document.text):
+    for item_information in item_informations:
         item_number = ITEM_NAME_TO_NUMBER.get(item_information)
         key = item_number or item_information
         if key in seen_keys:
@@ -285,11 +301,17 @@ def normalize_item_number(text: str) -> str:
     return ITEM_NUMBER_RE.sub(r"\1.\2\3", text)
 
 
-def leading_item_numbers(line: str) -> tuple[str, ...]:
+def leading_item_numbers(
+    line: str, *, bare_numbers: frozenset[str] = VALID_ITEM_NUMBERS
+) -> tuple[str, ...]:
     """Return item numbers if a line looks like an item heading.
 
     Args:
         line: Normalized body line to inspect.
+        bare_numbers: Item numbers a line may name without the ``Item``
+            keyword. A bare ``5.06`` is as likely a table cell (a coupon, a
+            ratio) as a heading, so any other bare number is a heading only
+            when its item's title follows it.
 
     Returns:
         Tuple of item numbers when the line starts like an item heading.
@@ -312,8 +334,13 @@ def leading_item_numbers(line: str) -> tuple[str, ...]:
         normalized,
         re.IGNORECASE,
     )
-    if bare_match and bare_match.group("number") in VALID_ITEM_NUMBERS:
-        return (bare_match.group("number"),)
+    if bare_match:
+        number = bare_match.group("number")
+        title_words = tuple(
+            re.findall(r"\w+", normalized[bare_match.end() :].casefold())[:2]
+        )
+        if number in bare_numbers or title_words in ITEM_TITLE_PREFIXES.get(number, ()):
+            return (number,)
 
     return ()
 
@@ -338,18 +365,22 @@ def is_subitem_heading(line: str, item_number: str) -> bool:
     )
 
 
-def item_headings(lines: list[BodyLine]) -> list[Heading]:
+def item_headings(
+    lines: list[BodyLine], *, bare_numbers: frozenset[str] = VALID_ITEM_NUMBERS
+) -> list[Heading]:
     """Return item heading candidates, excluding table-of-contents entries.
 
     Args:
         lines: Normalized body lines.
+        bare_numbers: Item numbers accepted without the ``Item`` keyword; see
+            :func:`leading_item_numbers`.
 
     Returns:
         Candidate item headings after table-of-contents filtering.
     """
     headings = []
     for line_index, line in enumerate(lines):
-        numbers = leading_item_numbers(line.text)
+        numbers = leading_item_numbers(line.text, bare_numbers=bare_numbers)
         if numbers:
             headings.append(
                 Heading(
