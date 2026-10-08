@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from cdt.segmenter.eightk import extract_items_from_document, primary_8k_body
-from cdt.segmenter.text import DocumentText
+from cdt.segmenter.text import DocumentText, normalize_body_lines
 
 
 def test_extract_items_from_complete_submission() -> None:
@@ -278,3 +278,17 @@ def test_dollar_amounts_and_non_item_numbers_are_not_headings() -> None:
     assert leading_item_numbers("Item 1.05 Material Cybersecurity Incidents.") == (
         "1.05",
     )
+
+
+def test_escaped_angle_brackets_in_text_survive_the_tag_strip() -> None:
+    """``&lt;`` and ``&gt;`` are text; unescaping them first made them a tag."""
+    lines = normalize_body_lines(
+        "<p>multiplier &gt; 1 = leveraged; multiplier &lt; 1</p>"
+    )
+
+    assert [line.text for line in lines] == [
+        "multiplier > 1 = leveraged; multiplier < 1"
+    ]
+    assert [
+        line.text for line in normalize_body_lines("<td>x &lt; 5 and y &gt; 3</td>")
+    ] == ["x < 5 and y > 3"]
