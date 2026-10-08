@@ -18,6 +18,8 @@ from cdt.extractor.schema import (
     DERIVED_FROM_STATED,
     INTEREST_RATE_KINDS,
     ISO_DATE_PATTERN,
+    LETTER_AMOUNT_MAGNITUDE_PATTERN,
+    LETTER_AMOUNT_MULTIPLIERS,
     MINIMUM_COMPUTED_SUM_SPANS,
     NAME_EMBEDDED_AMOUNT_PATTERN,
     NUMERIC_STRING_PATTERN,
@@ -316,7 +318,9 @@ def magnitude_in_amount_text(text: str | None) -> int | None:
     """Return the magnitude `normalized_amount_from_text` would apply, or None.
 
     The one definition of a magnitude word, shared with
-    `scaled_amount_from_sibling` so the two cannot disagree.
+    `scaled_amount_from_sibling` so the two cannot disagree. A spelled or
+    abbreviated word (`million`, `mm`, `bn`) wins over a single letter
+    (`$250M`, see `LETTER_AMOUNT_MAGNITUDE_PATTERN`).
     """
     if not text:
         return None
@@ -326,6 +330,11 @@ def magnitude_in_amount_text(text: str | None) -> int | None:
         # `$500 mm`, while `million` still cannot match inside a longer word.
         if re.search(rf"(?<![a-z]){word}\b", lowered):
             return AMOUNT_MULTIPLIERS[word]
+    letter = LETTER_AMOUNT_MAGNITUDE_PATTERN.search(text.replace(",", ""))
+    if letter is not None:
+        return LETTER_AMOUNT_MULTIPLIERS[
+            (letter.group("upper") or letter.group("lower")).lower()
+        ]
     return None
 
 
