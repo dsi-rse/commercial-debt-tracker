@@ -14,7 +14,7 @@ from defusedxml import ElementTree as DefusedET
 UNESCAPED_AMPERSAND_PATTERN = re.compile(
     r"&(?!(?:amp|lt|gt|quot|apos);|#(?:\d+|x[0-9A-Fa-f]+);)"
 )
-UNESCAPED_LESS_THAN_PATTERN = re.compile(r"<(?![A-Za-z_/])")
+UNESCAPED_LESS_THAN_PATTERN = re.compile(r"<(?![A-Za-z_/!?])")
 
 
 def parse_tag_details(
@@ -106,8 +106,9 @@ def repair_unescaped_text(text: str) -> str:
     The item text reaches the model unescaped (`ner_input_body`), so an item
     containing `A&R` or `multiplier < 1` yields a response that reproduces the
     text but is not well-formed XML. Repaired: an `&` not already starting an
-    entity, and a `<` not followed by a letter, `_` or `/`. A `<` that could
-    open or close a tag is a real malformation and is left to fail parsing.
+    entity, and a `<` that cannot start markup (not followed by a letter, `_`,
+    `/`, `!` or `?`). A `<` that could is a real malformation and is left to
+    fail parsing.
     """
     text = UNESCAPED_AMPERSAND_PATTERN.sub("&amp;", text)
     return UNESCAPED_LESS_THAN_PATTERN.sub("&lt;", text)

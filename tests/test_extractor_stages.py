@@ -648,7 +648,8 @@ def test_repair_unescaped_text_leaves_real_entities_alone() -> None:
     assert repair_unescaped_text("multiplier < 1; p<0.05") == (
         "multiplier &lt; 1; p&lt;0.05"
     )
-    assert repair_unescaped_text("<body><a>x</a></body>") == "<body><a>x</a></body>"
+    for markup in ("<body><a>x</a></body>", "<?xml version='1.0'?>", "<!-- c -->"):
+        assert repair_unescaped_text(markup) == markup
     assert repair_unescaped_text("Smith & Wesson & Co") == (
         "Smith &amp; Wesson &amp; Co"
     )
