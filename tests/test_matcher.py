@@ -1278,6 +1278,63 @@ def test_two_extracted_parents_refuse_rather_than_fall_back_to_a_guess() -> None
     assert links["m-a"]["amendment_inferred_by"] is None
 
 
+def _cycle_links(dated_parents: dict[str, tuple[str, str]]) -> dict[str, dict]:
+    """Derive links for one-mention instruments: id -> (filing date, parent id)."""
+    mentions = {
+        mention_id: prepare_mention(
+            mention_row(
+                debt_instrument_mention_id=mention_id,
+                date=date,
+                amendment_of=parent,
+            )
+        )
+        for mention_id, (date, parent) in dated_parents.items()
+    }
+    return derive_parent_links(
+        {mention_id: [mention_id] for mention_id in mentions},
+        mentions,
+        {mention_id: mention_id for mention_id in mentions},
+    )
+
+
+def _heads(links: dict[str, dict]) -> list[str]:
+    from cdt.matcher.instruments import apply_lifecycle_rollup
+
+    rows = [{"debt_instrument_id": key, **value} for key, value in links.items()]
+    apply_lifecycle_rollup(rows, member_groups={}, mention_index={})
+    return [str(row["debt_instrument_id"]) for row in rows if row["is_lineage_head"]]
+
+
+def test_a_two_instrument_amendment_cycle_keeps_one_head() -> None:
+    """A amends B and B amends A: the pointer to the later instrument goes.
+
+    Left in place, neither row is a head, so the family drops out of every
+    head-only view.
+    """
+    links = _cycle_links({"m-a": ("2024-01-01", "m-b"), "m-b": ("2024-06-01", "m-a")})
+
+    assert links["m-a"]["amendment_of_debt_instrument_id"] is None
+    assert links["m-b"]["amendment_of_debt_instrument_id"] == "m-a"
+    assert _heads(links) == ["m-b"]
+
+
+def test_a_longer_amendment_cycle_is_broken_at_its_newest_instrument() -> None:
+    """Only the pointer into the newest member goes; the chain otherwise stands."""
+    links = _cycle_links(
+        {
+            "m-a": ("2024-01-01", "m-c"),
+            "m-b": ("2024-06-01", "m-a"),
+            "m-c": ("2024-03-01", "m-b"),
+        }
+    )
+
+    # Newest is m-b, so m-c's pointer to it is dropped.
+    assert links["m-c"]["amendment_of_debt_instrument_id"] is None
+    assert links["m-a"]["amendment_of_debt_instrument_id"] == "m-c"
+    assert links["m-b"]["amendment_of_debt_instrument_id"] == "m-a"
+    assert _heads(links) == ["m-b"]
+
+
 def test_name_class_sizes_survives_a_cik_whose_mentions_are_all_synthesized() -> None:
     """The `by_cik.get` default guards a reachable KeyError, not a hypothetical (#211).
 
