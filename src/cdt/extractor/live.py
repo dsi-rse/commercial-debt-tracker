@@ -7,21 +7,24 @@ import json
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from time import perf_counter
+from time import monotonic, perf_counter
 
 import pandas as pd
 
 from cdt import settings
 from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
+from cdt.completion import CHECKPOINT_INTERVAL_SECONDS
 from cdt.datasets import extractor_run_path, resolve_artifact_root
 from cdt.extractor.batch import active_job_claimed_partition_paths
 from cdt.extractor.llm import normalize_reasoning_effort
 from cdt.extractor.outputs import (
     RowOutcomes,
+    checkpoint_audit_path,
     completion_entry,
     pending_extract_partitions,
     summarize_failure,
     write_mentions_partition,
+    write_run_checkpoint,
     write_run_records,
 )
 from cdt.extractor.prior_state import published_mention_rows
@@ -37,7 +40,7 @@ from cdt.extractor.workflow import (
 )
 from cdt.lease import throttled
 from cdt.shared import get_logger
-from cdt.storage.objects import write_text_artifact
+from cdt.storage.objects import delete_artifact, write_text_artifact
 from cdt.storage.tables import read_table
 
 LOGGER = get_logger(__name__)
@@ -58,6 +61,14 @@ def extract_pending_items(
 ) -> pd.DataFrame:
     """Extract instrument mentions for classified item partitions.
 
+    What a run has paid for is committed as it goes, at most every
+    :data:`cdt.completion.CHECKPOINT_INTERVAL_SECONDS` and at every partition
+    end: the mentions so far (a partition part-way through included), then the
+    failure registry, the completion registry and the audit records since the
+    last commit. So an interruption of any kind (a crash, a kill, a lost lease)
+    loses at most one interval of work, and the next run resumes at the rows
+    with no verdict.
+
     ``renew`` extends the caller's writer lease before each item's model calls
     and before each partition write, throttled to at most every
     :data:`cdt.lease.RENEW_INTERVAL_SECONDS`; a lost lease raises
@@ -69,6 +80,9 @@ def extract_pending_items(
     resolved_reasoning = normalize_reasoning_effort(reasoning_effort)
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     keep_lease = throttled(renew) if renew is not None else None
+    last_commit = monotonic()
+    checkpoint_paths: list[str] = []
+    audit_offset = 0
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     outcomes = RowOutcomes(run_id=run_id, backend="live")
     processed_frames: list[pd.DataFrame] = []
@@ -96,6 +110,29 @@ def extract_pending_items(
         force=force,
         exclude_paths=claimed_by_batch_job,
     )
+
+    def commit() -> None:
+        """Persist failures, registry and new audit records; restart the interval."""
+        nonlocal last_commit, audit_offset
+        index = len(checkpoint_paths)
+        audit_offset = write_run_checkpoint(
+            outcomes,
+            registry,
+            artifact_root=resolved_root,
+            data_dir=data_dir,
+            index=index,
+            audit_offset=audit_offset,
+        )
+        checkpoint_paths.append(
+            checkpoint_audit_path(
+                run_id, index, artifact_root=resolved_root, data_dir=data_dir
+            )
+        )
+        last_commit = monotonic()
+
+    def commit_due() -> bool:
+        return monotonic() - last_commit >= CHECKPOINT_INTERVAL_SECONDS
+
     aborted: str | None = None
     total_partitions = len(pending_partitions)
     for partition_index, pending in enumerate(pending_partitions, start=1):
@@ -152,6 +189,25 @@ def extract_pending_items(
             replaced_item_ids.add(row_state.item_id)
             if row_state.state != "SUCCESS":
                 partition_failures += 1
+            if commit_due() and item_index < total_relevant_items:
+                # Commit the partition so far: its rows' mentions, then an
+                # incomplete registry entry naming only the rows now terminal.
+                if keep_lease is not None:
+                    keep_lease()
+                write_mentions_partition(
+                    resolved_root,
+                    data_dir=data_dir,
+                    partition=partition,
+                    new_mentions=pd.DataFrame(
+                        mention_rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS
+                    ),
+                    replaced_item_ids=replaced_item_ids,
+                    retired_item_ids=set(),
+                )
+                registry[pending.classification_path] = completion_entry(
+                    pending.fingerprint, terminal_ids, relevant_item_ids
+                )
+                commit()
             if (
                 item_index == total_relevant_items
                 or item_index % EXTRACTOR_PROGRESS_LOG_INTERVAL == 0
@@ -190,6 +246,8 @@ def extract_pending_items(
         registry[pending.classification_path] = completion_entry(
             pending.fingerprint, terminal_ids, relevant_item_ids
         )
+        if commit_due():
+            commit()
         LOGGER.info(
             "Extraction partition complete: %s progress=%s/%s classified_items=%s relevant_items=%s mentions=%s wrote_output=%s elapsed=%.1fs",
             partition_label,
@@ -218,8 +276,12 @@ def extract_pending_items(
             "partitions_written": partitions_written,
             "empty_partitions_skipped_from_write": empty_partitions,
             "aborted_on_infrastructure_error": aborted,
+            "checkpoints": len(checkpoint_paths),
         },
     )
+    # full.jsonl now holds every record the checkpoint files did.
+    for path in checkpoint_paths:
+        delete_artifact(path)
     if aborted is not None:
         # Persisted everything first (registry, mentions, audit, failures), so
         # the retry resumes from exactly the rows that never got a verdict.

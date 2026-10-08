@@ -146,10 +146,13 @@ of partitions:
 - `segment` and `classify` (both genres): completion is saved at most every
   `cdt.completion.CHECKPOINT_INTERVAL_SECONDS` (300 s) and once at the end. The
   writer lease is renewed per partition, throttled to the same interval.
-- `extract` (live backend): processes pending partitions one at a time, writes
-  each partition's mentions as it finishes, and records completion once, at the
-  end of the run. The batch backend persists every row's state at each tick and
-  sizes its work with `cdt run poll`'s `--max-rows-per-job`,
+- `extract` (live backend): commits what it has paid for at most every
+  `CHECKPOINT_INTERVAL_SECONDS` and at every partition end. That is the mentions
+  so far (a partition part-way through included), then the failure registry, the
+  completion registry (an incomplete entry names the rows already terminal), and
+  the audit records since the last commit. A resumed run pays only for rows with
+  no verdict. The batch backend persists every row's state at each tick and sizes
+  its work with `cdt run poll`'s `--max-rows-per-job`,
   `--max-requests-per-batch` and `--max-batch-bytes`.
 - `match`: processes every `cik_shard` group in turn, renewing the lease per
   shard. It keeps no completion registry: each run re-matches every shard.
@@ -597,7 +600,13 @@ Extractor writes a per-run manifest and a matching full audit log:
 ```text
 <artifact-root>/runs/extract/run_id=<run_id>.json
 <artifact-root>/extractor-runs/run_id=<run_id>/full.jsonl
+<artifact-root>/extractor-runs/run_id=<run_id>/checkpoint-NNNN.jsonl
 ```
+
+A live run writes each commit's audit records to a `checkpoint-NNNN.jsonl`. When
+the run finishes it writes `full.jsonl` with every record and deletes the
+checkpoint files. A run that was interrupted has no `full.jsonl`; its checkpoint
+files are its audit, up to its last commit.
 
 ### Extract batch job state
 

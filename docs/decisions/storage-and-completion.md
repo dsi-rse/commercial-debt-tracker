@@ -342,9 +342,12 @@ Each shard's compare-and-swap is independent, which keeps the checkpointed
 saves from #111 durable: if a save is interrupted after three of five shards,
 those three stay saved. The segment and classify stages of both genres
 checkpoint every `CHECKPOINT_INTERVAL_SECONDS` (they share
-`cdt.partition_stage.run_partition_stage`). Live extract saves only after its
-partition loop (#227), so an interruption loses the whole run's registry
-progress, and that one save may span about 400 shards.
+`cdt.partition_stage.run_partition_stage`). Live extract commits on the same
+interval and at every partition end. Each commit writes the mentions so far,
+then the failure registry, then the registry, in that order. The registry never
+marks a row done before its mentions, or its failure record, is on disk. An
+incomplete entry carries the rows already terminal, so an interrupted run's
+successor pays only for the rest.
 
 The dirty set is cleared shard by shard. Without clearing, the dirty set would
 grow to the whole run's write set, so batch k would rewrite every shard that

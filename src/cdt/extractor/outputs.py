@@ -41,6 +41,7 @@ from cdt.extractor.state import (
 from cdt.shared import get_logger
 from cdt.storage.objects import (
     artifact_exists,
+    join_artifact_path,
     list_artifacts_with_versions,
     write_json_artifact,
     write_text_artifact,
@@ -419,16 +420,16 @@ def write_run_records(
     added here. Returns the audit path, the failure-registry path and the
     failure registry's total entry count.
     """
-    save_completion_registry(
-        "extract", registry, artifact_root=artifact_root, data_dir=data_dir
-    )
-    # The registry now marks these rows done for good, so record the ones that
-    # produced nothing before that fact is only visible in the audit log.
+    # Failures first: once the registry marks a row done it is never retried,
+    # so a row that produced nothing must already be on record when it does.
     failure_registry, total_known_failures = merge_row_failures(
         outcomes.failed_rows,
         outcomes.succeeded_item_ids,
         artifact_root=artifact_root,
         data_dir=data_dir,
+    )
+    save_completion_registry(
+        "extract", registry, artifact_root=artifact_root, data_dir=data_dir
     )
     audit_path = extractor_run_path(
         outcomes.run_id, artifact_root=artifact_root, data_dir=data_dir
@@ -454,6 +455,55 @@ def write_run_records(
         },
     )
     return audit_path, failure_registry, total_known_failures
+
+
+def checkpoint_audit_path(
+    run_id: str, index: int, *, artifact_root: str, data_dir: Path | None
+) -> str:
+    """Return the path of one checkpoint's audit records, beside ``full.jsonl``."""
+    return join_artifact_path(
+        resolve_artifact_root(artifact_root, data_dir=data_dir),
+        "extractor-runs",
+        f"run_id={run_id}",
+        f"checkpoint-{index:04d}.jsonl",
+    )
+
+
+def write_run_checkpoint(
+    outcomes: RowOutcomes,
+    registry: CompletionRegistry,
+    *,
+    artifact_root: str,
+    data_dir: Path | None,
+    index: int,
+    audit_offset: int,
+) -> int:
+    """Persist what a running extract has finished so far; return the new audit offset.
+
+    Merges the failures so far, saves the registry, and writes the audit
+    records from ``audit_offset`` on to checkpoint ``index``'s file. The run's
+    final :func:`write_run_records` writes ``full.jsonl``, after which its
+    caller deletes the checkpoint files; a run that never got that far leaves
+    them as its audit.
+    """
+    merge_row_failures(
+        outcomes.failed_rows,
+        outcomes.succeeded_item_ids,
+        artifact_root=artifact_root,
+        data_dir=data_dir,
+    )
+    save_completion_registry(
+        "extract", registry, artifact_root=artifact_root, data_dir=data_dir
+    )
+    records = outcomes.audit_records[audit_offset:]
+    if records:
+        write_text_artifact(
+            checkpoint_audit_path(
+                outcomes.run_id, index, artifact_root=artifact_root, data_dir=data_dir
+            ),
+            "\n".join(records) + "\n",
+        )
+    return len(outcomes.audit_records)
 
 
 def finalize_extract_outputs(

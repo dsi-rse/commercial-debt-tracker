@@ -349,6 +349,7 @@ def test_the_live_run_manifest_records_its_fields(
         "max_attempts",
         "partitions_visited",
         "aborted_on_infrastructure_error",
+        "checkpoints",
     }
     assert manifest["stage"] == "extract"
     assert manifest["failure_count"] == 1
@@ -430,3 +431,113 @@ def test_a_live_run_that_loses_its_lease_writes_no_mentions(
 
     assert calls == []
     assert not (tmp_path / "mentions").exists()
+
+
+def _commit_after_every_item(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Advance the live backend's clock a full interval per reading."""
+    from cdt.completion import CHECKPOINT_INTERVAL_SECONDS
+
+    clock = [0.0]
+
+    def tick() -> float:
+        clock[0] += CHECKPOINT_INTERVAL_SECONDS
+        return clock[0]
+
+    monkeypatch.setattr("cdt.extractor.live.monotonic", tick)
+
+
+def test_a_crashed_live_run_keeps_what_it_committed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash part-way through a partition loses at most one commit interval.
+
+    The resumed run pays only for the rows with no verdict: the committed
+    rows' mentions and registry entry survive the crash.
+    """
+    from cdt.completion import load_completion_registry
+
+    _seed_classifications(tmp_path, ["a-8-01", "b-8-01", "c-8-01"])
+    _commit_after_every_item(monkeypatch)
+    calls = _fake_success_workflow(monkeypatch)
+    from cdt.extractor import live as live_module
+
+    succeed = live_module.run_extraction_workflow
+
+    async def crash_on_c(**kwargs: object) -> ExtractionRowState:
+        if kwargs["item_row"]["item_id"] == "c-8-01":
+            raise RuntimeError("killed")
+        return await succeed(**kwargs)
+
+    monkeypatch.setattr(live_module, "run_extraction_workflow", crash_on_c)
+    with pytest.raises(RuntimeError, match="killed"):
+        extract_pending_items(artifact_root=tmp_path, client=None)
+
+    assert sorted(read_dataset(mentions_root(tmp_path))["item_id"]) == [
+        "a-8-01",
+        "b-8-01",
+    ]
+    (entry,) = load_completion_registry("extract", artifact_root=tmp_path).values()
+    assert not entry.complete
+    assert set(entry.item_ids) == {"a-8-01", "b-8-01"}
+    # The checkpoint's audit survives as the crashed run's audit.
+    assert list((tmp_path / "extractor-runs").glob("run_id=*/checkpoint-*.jsonl"))
+
+    calls.clear()
+    monkeypatch.setattr(live_module, "run_extraction_workflow", succeed)
+    extract_pending_items(artifact_root=tmp_path, client=None)
+
+    assert calls == ["c-8-01"]
+    assert sorted(read_dataset(mentions_root(tmp_path))["item_id"]) == [
+        "a-8-01",
+        "b-8-01",
+        "c-8-01",
+    ]
+
+
+def test_a_clean_live_run_leaves_one_full_audit_and_no_checkpoint_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """full.jsonl holds every record; the checkpoint files are removed."""
+    import json
+
+    _seed_classifications(tmp_path, ["a-8-01", "b-8-01", "c-8-01"])
+    _commit_after_every_item(monkeypatch)
+    _fake_success_workflow(monkeypatch)
+
+    extract_pending_items(artifact_root=tmp_path, client=None)
+
+    (run_dir,) = (tmp_path / "extractor-runs").glob("run_id=*")
+    assert [path.name for path in run_dir.iterdir()] == ["full.jsonl"]
+    lines = (run_dir / "full.jsonl").read_text().splitlines()
+    assert sorted(json.loads(line)["item_id"] for line in lines) == [
+        "a-8-01",
+        "b-8-01",
+        "c-8-01",
+    ]
+
+
+def test_a_live_run_that_loses_its_lease_keeps_its_committed_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lease is checked before each item; what was committed stays committed."""
+    from cdt.completion import load_completion_registry
+    from cdt.lease import LeaseLostError
+
+    _seed_classifications(tmp_path, ["a-8-01", "b-8-01", "c-8-01"])
+    _commit_after_every_item(monkeypatch)
+    calls = _fake_success_workflow(monkeypatch)
+    monkeypatch.setattr("cdt.extractor.live.throttled", lambda renew: renew)
+    checks: list[int] = []
+
+    def renew() -> None:
+        checks.append(1)
+        # Lost just before the third item's model calls.
+        if len(checks) == 5:  # noqa: PLR2004
+            raise LeaseLostError("stolen")
+
+    with pytest.raises(LeaseLostError):
+        extract_pending_items(artifact_root=tmp_path, client=None, renew=renew)
+
+    assert calls == ["a-8-01", "b-8-01"]
+    (entry,) = load_completion_registry("extract", artifact_root=tmp_path).values()
+    assert set(entry.item_ids) == {"a-8-01", "b-8-01"}
