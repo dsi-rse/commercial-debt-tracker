@@ -407,7 +407,19 @@ def _read_force_backlog(root: str) -> frozenset[str]:
     path = _force_backlog_path(root)
     if not artifact_exists(path):
         return frozenset()
-    payload = cast(dict[str, object], read_json_artifact(path))
+    try:
+        payload = cast(dict[str, object], read_json_artifact(path))
+    except json.JSONDecodeError as exc:
+        # Every idle tick reads the backlog, so an unreadable one would wedge
+        # job creation; drop the request instead and say how to repeat it.
+        LOGGER.warning(
+            "Discarding an unreadable force backlog %s (%s); re-run with --force "
+            "to queue the re-extract again.",
+            path,
+            exc,
+        )
+        _write_force_backlog(root, frozenset())
+        return frozenset()
     return frozenset(str(item) for item in cast(list[object], payload.get("paths", [])))
 
 
@@ -491,6 +503,33 @@ def active_job_claimed_partition_paths(
         str(path)
         for path in cast(list[object], manifest.get("claimed_partitions") or [])
     }
+
+
+def _abandon_job(root: str, job_id: str) -> None:
+    """Clear the marker of a job that will not finish, keeping its force request.
+
+    The forced partitions left the backlog when the job claimed them; they go
+    back so the next job re-extracts them instead of skipping their complete
+    registry entries. A manifest that cannot be read requeues nothing.
+    """
+    try:
+        manifest = cast(
+            dict[str, object], read_json_artifact(_manifest_path(root, job_id))
+        )
+    except (json.JSONDecodeError, FileNotFoundError):
+        manifest = {}
+    forced = frozenset(
+        str(path)
+        for path in cast(list[object], manifest.get("forced_partitions") or [])
+    )
+    if forced:
+        _write_force_backlog(root, _read_force_backlog(root) | forced)
+        LOGGER.warning(
+            "Re-queued %s forced partition(s) from abandoned extract job %s.",
+            len(forced),
+            job_id,
+        )
+    _clear_active_job(root)
 
 
 def _clear_active_job(root: str) -> None:
@@ -722,6 +761,7 @@ def _create_job(
             "max_attempts": max_attempts,
             "claimed_partitions": job.claimed_partitions,
             "claimed_state": job.claimed_state,
+            "forced_partitions": sorted(backlog & claimed.keys()),
         },
     )
     _save_state(root, job)
@@ -1153,7 +1193,7 @@ def reset_active_job(
             expected_job_id,
         )
         return None
-    _clear_active_job(resolved_root)
+    _abandon_job(resolved_root, job_id)
     LOGGER.warning(
         "Cleared the active extract job marker for %s; its state remains under %s. "
         "The next poll tick starts a fresh job from unclaimed partitions.",
@@ -1211,6 +1251,8 @@ def advance_extract_job(
             translated_reasoning or "<model default>",
         )
 
+    if force:
+        _record_force_request(resolved_root, data_dir=data_dir)
     try:
         active_job_id = _read_active_job(resolved_root)
     except CorruptJobStateError as exc:
@@ -1219,8 +1261,6 @@ def advance_extract_job(
         LOGGER.error("Clearing the active extract job marker: %s", exc)
         _clear_active_job(resolved_root)
         return ExtractTickResult(status="reset")
-    if force:
-        _record_force_request(resolved_root, data_dir=data_dir)
     if active_job_id is None:
         job = _create_job(
             resolved_root,
@@ -1250,7 +1290,7 @@ def advance_extract_job(
                 exc,
                 active_job_id,
             )
-            _clear_active_job(resolved_root)
+            _abandon_job(resolved_root, active_job_id)
             return ExtractTickResult(status="reset", job_id=active_job_id)
         _reconcile_orphans(resolved_root, job, batch_client)
         folded = _fold_completed_batches(

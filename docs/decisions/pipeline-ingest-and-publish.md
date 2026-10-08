@@ -338,7 +338,12 @@ and removes the ones it claimed, so a forced re-extract reaches every partition
 even when `--max-rows-per-job` splits it across jobs, and a force given while a
 job is active waits for that job instead of being dropped (#264). The backlog
 is updated after the new job's marker is written: a crash in between re-forces
-that job's partitions later rather than losing them from the request.
+that job's partitions later rather than losing them from the request. The job
+manifest lists the partitions it claimed as forced, and abandoning the job
+(`cdt extract job reset`, or a tick's self-heal from a corrupt job directory)
+puts them back in the backlog: by then their registry entries say complete, so
+nothing else would re-extract them. An unreadable backlog is discarded with a
+warning rather than failing every idle tick; the operator re-runs `--force`.
 
 ### Infrastructure failures in a batch job (deferred rows)
 

@@ -626,11 +626,12 @@ default batch backend). The `cdt extract job reset` admin command rewrites
 <artifact-root>/extract-batches/
   active.json                        # {"job_id": ...}; job_id null (or file absent) when idle
   force-backlog.json                 # {"paths": [...]}: partitions a --force request still has to re-extract
-  job_id=<run_id>/manifest.json      # static job config + claimed classification partitions
+  job_id=<run_id>/manifest.json      # static job config + claimed (and forced) classification partitions
   job_id=<run_id>/state.jsonl.gz     # gzipped; one line per item: source partition + pending
                                      # request marker + expiry and infrastructure counters + deferred flag
                                      # + resumable row state
-  job_id=<run_id>/batches.json       # in-flight OpenAI batches, seen batch ids, tick counter
+  job_id=<run_id>/batches.json       # in-flight OpenAI batches (+ output-download failure ticks),
+                                     # seen batch ids, tick counter
   job_id=<run_id>/ticks/tick=<n>.json  # per-tick audit counts
 ```
 

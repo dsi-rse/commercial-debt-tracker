@@ -198,6 +198,9 @@ def collect_pending_extract_items(
     it (whole partitions stay the atomic claim unit, so the last claimed
     partition may overshoot); None claims everything. Unclaimed partitions stay
     pending for the next job, which bounds the full text one poll tick holds.
+
+    ``force_paths`` names partitions to claim as forced (no row counted done),
+    as ``pending_extract_partitions`` does.
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     pending, _registry = pending_extract_partitions(

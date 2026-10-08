@@ -447,6 +447,16 @@ def _advance(tmp_path: Path, client: FakeBatchClient) -> object:
     )
 
 
+def _advance_until(status: str, tick: object, *, limit: int = 20) -> list[str]:
+    """Tick until ``status``; fail rather than hang if it never arrives."""
+    statuses: list[str] = []
+    for _ in range(limit):
+        statuses.append(tick().status)
+        if statuses[-1] == status:
+            return statuses
+    raise AssertionError(f"no {status!r} tick within {limit}: {statuses}")
+
+
 def test_job_lifecycle_completes_and_writes_mentions(tmp_path: Path) -> None:
     """A two-item job advances across ticks and finalizes mentions."""
     seed_classification(
@@ -1218,13 +1228,10 @@ def test_force_reaches_every_partition_across_capped_jobs(tmp_path: Path) -> Non
             force=force,
         )
 
-    while _tick().status != "idle":
-        pass
+    _advance_until("idle", _tick)
     client.submitted.clear()
 
-    statuses = [_tick(force=True).status]
-    while statuses[-1] != "idle":
-        statuses.append(_tick().status)
+    statuses = [_tick(force=True).status, *_advance_until("idle", _tick)]
 
     assert sorted(ids[0] for _, ids in client.submitted) == [
         "item-0001",
@@ -1608,9 +1615,7 @@ def test_a_persistent_server_error_defers_the_row_instead_of_failing_it(
         }
     )
 
-    statuses = [_advance(tmp_path, client).status]
-    while statuses[-1] != "completed":
-        statuses.append(_advance(tmp_path, client).status)
+    _advance_until("completed", lambda: _advance(tmp_path, client))
 
     multi_submissions = [ids for _, ids in client.submitted if "item-multi" in ids]
     assert len(multi_submissions) == DEFAULT_MAX_INFRASTRUCTURE_ROUNDS
@@ -1623,8 +1628,7 @@ def test_a_persistent_server_error_defers_the_row_instead_of_failing_it(
     # recovers, extracts it.
     client.scripts["item-multi"] = {"ner": MULTI_NER, "instrument_ie": MULTI_IE}
     client.submitted.clear()
-    while _advance(tmp_path, client).status != "completed":
-        pass
+    _advance_until("completed", lambda: _advance(tmp_path, client))
     assert {cid for _, ids in client.submitted for cid in ids} == {"item-multi"}
     assert read_dataset(mentions_root(tmp_path))["name"].to_list() == ["Term Loan"]
 
@@ -1658,6 +1662,97 @@ def test_an_unreadable_output_file_is_retried_next_tick_not_resubmitted(
     # One NER and one IE submission: the failed download resubmitted nothing.
     assert len(client.submitted) == 2
     assert read_dataset(mentions_root(tmp_path))["name"].to_list() == ["Term Loan"]
+
+
+def test_an_output_file_unreadable_past_the_cap_defers_its_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A batch whose output never downloads stops holding the job.
+
+    Each cap costs the row one infrastructure round; once those run out the
+    row is deferred, never failed.
+    """
+    from cdt.extractor.batch import DEFAULT_MAX_INFRASTRUCTURE_ROUNDS
+
+    monkeypatch.setattr(batch_module, "MAX_RESULT_DOWNLOAD_TICKS", 2)
+    seed_classification(tmp_path, [{"item_id": "item-multi", "text": MULTI_TEXT}])
+
+    class OutputNeverDownloads(FakeBatchClient):
+        def download_file(self, file_id: str) -> str:
+            if file_id.endswith("-out"):
+                raise RuntimeError("503 fetching output file")
+            return super().download_file(file_id)
+
+    client = OutputNeverDownloads(
+        {"item-multi": {"ner": MULTI_NER, "instrument_ie": MULTI_IE}}
+    )
+
+    assert _advance(tmp_path, client).status == "submitted"
+    # The first failure holds the batch; the second reaches the cap.
+    assert _advance(tmp_path, client).status == "waiting"
+    statuses = _advance_until("completed", lambda: _advance(tmp_path, client))
+
+    assert "submitted" in statuses
+    assert len(client.submitted) == DEFAULT_MAX_INFRASTRUCTURE_ROUNDS
+    assert load_row_failures("extract", artifact_root=tmp_path) == {}
+    (entry,) = load_completion_registry("extract", artifact_root=tmp_path).values()
+    assert entry.complete is False
+
+
+def test_an_unreadable_force_backlog_is_discarded_not_fatal(tmp_path: Path) -> None:
+    """A truncated backlog must not wedge every idle tick."""
+    from cdt.extractor.batch import _force_backlog_path
+
+    seed_classification(tmp_path, [{"item_id": "item-nodebt", "text": NODEBT_TEXT}])
+    path = Path(_force_backlog_path(str(tmp_path)))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"paths": ["clas')
+    client = FakeBatchClient({"item-nodebt": {"ner": NODEBT_NER}})
+
+    assert _advance(tmp_path, client).status == "submitted"
+    assert json.loads(path.read_text()) == {"paths": []}
+
+
+def test_a_backlog_naming_no_pending_partition_is_cleared(tmp_path: Path) -> None:
+    """Backlog paths that no longer exist are dropped on an idle tick."""
+    from cdt.extractor.batch import _force_backlog_path
+
+    path = Path(_force_backlog_path(str(tmp_path)))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"paths": ["classifications/date=2000-01-01"]}))
+
+    assert _advance(tmp_path, FakeBatchClient({})).status == "idle"
+    assert json.loads(path.read_text()) == {"paths": []}
+
+
+def test_resetting_a_forced_job_requeues_its_forced_partitions(
+    tmp_path: Path,
+) -> None:
+    """An abandoned forced job leaves its partitions in the force request."""
+    seed_classification(tmp_path, [{"item_id": "item-nodebt", "text": NODEBT_TEXT}])
+    client = FakeBatchClient({"item-nodebt": {"ner": NODEBT_NER}})
+    _advance_until("idle", lambda: _advance(tmp_path, client))
+    client.submitted.clear()
+
+    def _tick(*, force: bool = False) -> object:
+        return advance_extract_job(
+            batch_client=client,
+            artifact_root=tmp_path,
+            model="gpt-5.4",
+            reasoning_effort="none",
+            max_attempts=3,
+            force=force,
+        )
+
+    first = _tick(force=True)
+    assert first.status == "submitted"
+    assert reset_active_job(tmp_path) == first.job_id
+
+    second = _tick()
+    assert second.status == "submitted"
+    assert second.job_id != first.job_id
+    _advance_until("idle", _tick)
+    assert [ids for _, ids in client.submitted] == [["item-nodebt"], ["item-nodebt"]]
 
 
 def test_stall_warning_fires_only_past_the_tick_threshold(
