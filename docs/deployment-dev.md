@@ -25,7 +25,7 @@ These are the current recommended `dev` values:
 aws:region = us-east-2
 idi:artifact_prefix = processors/cdt
 idi:final_database_prefix = database/cdt
-idi:default_cik_key = processors/cdt/inputs/ciks/beta-1k.txt
+idi:cik_scope = processors/cdt/inputs/ciks/beta-1k.txt
 idi:cpu = 1024
 idi:memory = 4096
 idi:ecr_image_retention_count = 5
@@ -107,16 +107,19 @@ cd ..
 
 ## Upload the Beta CIK File
 
-For the first `dev` deploy, use the local `data/ciks/1000-ciks.txt` file as the default run scope. CIK
-universes live under `data/ciks/`, which is gitignored, so fetch or regenerate the file if it is absent:
+`idi:cik_scope` is the run scope a scheduled or historical run uses when it is
+given no `--cik-file`: the bucket-relative key of a one-CIK-per-line file, or
+`all` for every filer. The beta lists are already in S3 under
+`processors/cdt/inputs/ciks/` (`beta-1k.txt` is the beta default). To scope a
+new stack to a list of your own, upload it there first:
 
 ```bash
-aws s3 cp \
-  data/ciks/1000-ciks.txt \
-  s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/inputs/ciks/beta-1k.txt
+aws s3 cp my-ciks.txt \
+  s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/inputs/ciks/my-ciks.txt
 ```
 
-The deployed daily job and any manual historical run can override the CIK file, but this path is the default `dev` value.
+The task role can read only the file `idi:cik_scope` names. A manual historical
+run can pass a different `--cik-file`, as long as the task role can read it.
 
 ## Create and Configure the Pulumi Stack
 
@@ -300,4 +303,4 @@ pulumi config set idi:schedule_enabled true
 uv run pulumi up
 ```
 
-At that point the scheduler will run `daily` mode automatically using the default CIK file configured in `idi:default_cik_key`.
+At that point the scheduler will run `daily` mode automatically over the scope configured in `idi:cik_scope`.

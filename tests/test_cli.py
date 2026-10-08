@@ -1048,3 +1048,37 @@ def test_run_force_does_not_lower_the_publish_guards() -> None:
 
     assert (plain.force, plain.force_publish) == (True, False)
     assert (both.force, both.force_publish) == (True, True)
+
+
+def test_ingest_all_ciks_passes_no_cik_filter(
+    tmp_path: Path, ingest_calls: list[IngestCall]
+) -> None:
+    """`--cik-file all` is an explicit choice of every filer: no filter, no file read."""
+    status = cli.main(
+        ["ingest", "--quiet", "--artifact-root", str(tmp_path), "--cik-file", "all"]
+    )
+
+    assert status == 0
+    assert [ciks for _, _, ciks in ingest_calls] == [None, None]
+
+
+def test_ingest_all_ciks_from_the_environment(
+    tmp_path: Path, ingest_calls: list[IngestCall], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stack scoped to every filer sets CDT_DEFAULT_CIK_FILE=all."""
+    monkeypatch.setenv("CDT_DEFAULT_CIK_FILE", "all")
+
+    assert cli.main(["ingest", "--quiet", "--artifact-root", str(tmp_path)]) == 0
+    assert [ciks for _, _, ciks in ingest_calls] == [None, None]
+
+
+def test_the_committed_cik_list_is_the_local_default() -> None:
+    """A fresh clone has a CIK list to run on: Makefile and script both name it."""
+    from cdt import settings
+
+    committed = settings.PROJECT_ROOT / "data" / "ciks" / "smoke-10.txt"
+    lines = committed.read_text(encoding="utf-8").split()
+    assert len(lines) == 10
+    assert all(line.isdigit() for line in lines)
+    for path in ("Makefile", "scripts/local-pipeline.sh"):
+        assert "data/ciks/smoke-10.txt" in (settings.PROJECT_ROOT / path).read_text()

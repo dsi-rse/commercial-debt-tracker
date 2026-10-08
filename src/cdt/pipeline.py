@@ -60,6 +60,8 @@ ALL_TIME_START_DATE = date(1994, 1, 1)
 # repaired scraper manifests are still picked up.
 DAILY_LOOKBACK_DAYS = 5
 DEFAULT_STAGE_BATCH_SIZE = 100
+#: The CIK-file value that selects every filer (see :func:`read_cik_file`).
+ALL_CIKS = "all"
 PIPELINE_MODES = ("daily", "historical")
 LOGGER = get_logger(__name__)
 
@@ -265,7 +267,7 @@ class Pipeline:
     def _log_stage_complete(self: Self, stage_name: str, **details: object) -> None:
         log_stage_complete(self.logger, stage_name, **details)
 
-    def _setup(self: Self) -> tuple[date, date, set[str], str]:
+    def _setup(self: Self) -> tuple[date, date, set[str] | None, str]:
         """Resolve dates, CIKs, and the artifact root and emit the run banner."""
         # A config built in code skips the CLI's parsing; validate here.
         normalize_genres(self.config.genres)
@@ -325,7 +327,7 @@ class Pipeline:
         self: Self,
         resolved_start: date,
         resolved_end: date,
-        ciks: set[str],
+        ciks: set[str] | None,
         resolved_artifact_root: str,
         renew: Callable[[], None] | None = None,
     ) -> _PrepareOutcome:
@@ -366,7 +368,7 @@ class Pipeline:
         genre: str,
         resolved_start: date,
         resolved_end: date,
-        ciks: set[str],
+        ciks: set[str] | None,
         resolved_artifact_root: str,
         renew: Callable[[], None] | None,
     ) -> GenreResult:
@@ -375,7 +377,7 @@ class Pipeline:
             "ingest",
             genre=genre,
             batch_size=self.config.ingest_batch_size,
-            ciks=len(ciks),
+            ciks=ALL_CIKS if ciks is None else len(ciks),
         )
         _, ingest_result = ingest_genre(
             genre,
@@ -611,8 +613,18 @@ def normalize_genres(values: str | Sequence[str]) -> tuple[str, ...]:
     return tuple(genre for genre in GENRES if genre.upper() in selected)
 
 
-def read_cik_file(path: ArtifactPath) -> set[str]:
-    """Read a one-CIK-per-line file from local storage or S3."""
+def read_cik_file(path: ArtifactPath) -> set[str] | None:
+    """Read a one-CIK-per-line file from local storage or S3.
+
+    The value :data:`ALL_CIKS` reads nothing and returns None: no CIK filter, so
+    a run covers every filer. It is an explicit choice, never a fallback: a run
+    given no CIK file at all is an error, not a run over the whole SEC universe.
+
+    >>> read_cik_file("all") is None
+    True
+    """
+    if str(path) == ALL_CIKS:
+        return None
     return {
         line.strip() for line in read_text_artifact(path).splitlines() if line.strip()
     }

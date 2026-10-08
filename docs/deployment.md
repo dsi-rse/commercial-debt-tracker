@@ -153,7 +153,13 @@ launch — no deploy needed. Both keys also belong in the Core Facility Bitwarde
 **Committed `idi:` config** in `pulumi/Pulumi.dev.yaml` and `pulumi/Pulumi.prod.yaml`.
 Required:
 
-- `default_cik_key` — bucket-relative key of the default CIK universe
+- `cik_scope`: what a run covers when no `--cik-file` is given. Either the
+  bucket-relative key of a one-CIK-per-line file, or `all` for every filer.
+  It is required, so a stack can never default to `all` by omission. During
+  the beta both stacks use `processors/cdt/inputs/ciks/beta-1k.txt`. At the
+  production launch prod moves to `all` and dev keeps a beta list; after
+  that the beta lists can be deleted from S3, because nothing in the code
+  names them.
 
 Optional:
 
@@ -191,7 +197,9 @@ s3://<output_bucket_name or processor bucket>/<artifact_prefix>
 s3://<output_bucket_name or processor bucket>/<final_database_prefix>
 ```
 
-and the default CIK file is `s3://<processor bucket>/<default_cik_key>`.
+and the default CIK file (`CDT_DEFAULT_CIK_FILE` on the task) is
+`s3://<processor bucket>/<cik_scope>`, or `all` when `cik_scope` is `all`. The task
+role gets a read grant on that one file, and none when the scope is `all`.
 
 ## Daily Operations
 
@@ -346,6 +354,11 @@ launch day — but do it in order then.
    watch a few ticks (the poller alone drains extraction), then
    `idi:schedule_enabled: "true"` for the daily run. Confirm the poll-liveness
    and daily-heartbeat alarms settle into OK.
+8. **Leave the beta scope**: when prod should cover every filer, set
+   `idi:cik_scope: all` in `Pulumi.prod.yaml` and deploy. The task then reads
+   no CIK file and loses its read grant on the beta list. Size the first run
+   on all filers deliberately: run a bounded `run-historical.sh` backfill
+   first rather than letting the daily schedule discover the new scope.
 
 ## Dev First-Deploy Walkthrough
 

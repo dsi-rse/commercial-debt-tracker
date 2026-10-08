@@ -79,11 +79,16 @@ cdt publish    the four latest.parquet tables                         (cdt.publi
 cdt run daily | historical | poll                                     (cdt.run)
 ```
 
-Examples (the CIK file is not in git; supply your own one-CIK-per-line file):
+Every run is scoped by a CIK file: a one-CIK-per-line file (local or `s3://`),
+or `all` for every filer. There is no implicit default: without `--cik-file` or
+`CDT_DEFAULT_CIK_FILE` a run is an error, never a run over every filer. The repo
+commits one small list, `data/ciks/smoke-10.txt` (ten large filers); the beta
+lists live in S3 under `s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/inputs/ciks/`
+(`beta-1k.txt`, `beta-10k.txt`, `beta-50k.txt`, `beta-100k.txt`).
 
 ```bash
 uv run cdt run historical --extractor-backend live --artifact-root ./data/local \
-  --final-database-root ./data/database --cik-file ./ciks.txt \
+  --final-database-root ./data/database --cik-file data/ciks/smoke-10.txt \
   --start-date 2024-01-01 --end-date 2024-01-31
 uv run cdt segment --genres 8-K --artifact-root ./data/local
 make local-run
@@ -133,7 +138,7 @@ To test the processor and dashboard together on your machine:
 
 1. Set the same `DATA_DIR` in both repos' `.env` files.
 2. Run CDT locally against your target date range. The scripts default `LOCAL_CIK_FILE` to
-   `data/ciks/1000-ciks.txt`, which is not in git: create it or point `LOCAL_CIK_FILE` at your own file.
+   the committed `data/ciks/smoke-10.txt`; point it at a larger list (e.g. a beta list in S3) for a wider run.
 
 ```bash
 ./scripts/local-pipeline.sh historical --start-date 2020-01-01 --end-date 2021-12-31

@@ -1643,3 +1643,12 @@ def test_plain_force_keeps_the_shrinkage_guard(tmp_path: Path) -> None:
             final_database_root=str(final_root),
             force=True,
         )
+
+
+def test_read_cik_file_all_means_no_filter_and_reads_nothing(tmp_path: Path) -> None:
+    """`all` selects every filer; any other value is a file that must exist."""
+    from cdt.pipeline import ALL_CIKS, read_cik_file
+
+    assert read_cik_file(ALL_CIKS) is None
+    with pytest.raises(FileNotFoundError):
+        read_cik_file(tmp_path / "all")

@@ -198,8 +198,8 @@ def _filing_window_options(*, dates_required: bool) -> argparse.ArgumentParser:
     parser.add_argument(
         "--cik-file",
         default=_env_default("--cik-file"),
-        help="one-CIK-per-line file, a local path or s3:// URI "
-        "(env CDT_DEFAULT_CIK_FILE)",
+        help="one-CIK-per-line file, a local path or s3:// URI, or 'all' for "
+        "every filer (env CDT_DEFAULT_CIK_FILE; required)",
     )
     window = "required" if dates_required else "default: the daily window"
     parser.add_argument(

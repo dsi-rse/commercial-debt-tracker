@@ -28,13 +28,21 @@ final_database_prefix = config.get("final_database_prefix") or "database/cdt"
 # Pulumi cannot import the package, so the two are coupled by convention. If they
 # drift, the task role denies every GetObject ingest attempts.
 source_prefix = config.get("source_prefix") or "sec"
-# Bucket-relative so the bucket name stays out of the committed stack files;
-# the orchestrator wants a full s3:// URI. The key is kept separately because the
-# task role grants GetObject on it explicitly — reads on the shared bucket are
-# otherwise scoped to the scraper's source prefix, so the CIK file would become
-# unreadable the day output_bucket_name diverges from the shared bucket.
-default_cik_key = config.require("default_cik_key")
-default_cik_file = f"s3://{bucket_name}/{default_cik_key}"
+# Which filers a scheduled or historical run covers when no --cik-file is given:
+# either ALL_CIKS (every filer, no CIK filter) or the bucket-relative key of a
+# one-CIK-per-line file. Required, so a stack can never fall back to "all" by
+# omission. The key is bucket-relative so the bucket name stays out of the
+# committed stack files, and kept separately because the task role grants
+# GetObject on it explicitly: reads on the shared bucket are otherwise scoped to
+# the scraper's source prefix.
+cik_scope = config.require("cik_scope")
+# cdt.pipeline.ALL_CIKS; Pulumi cannot import the package, so the literals are
+# coupled by convention.
+ALL_CIKS = "all"
+default_cik_key = None if cik_scope == ALL_CIKS else cik_scope
+default_cik_file = (
+    ALL_CIKS if default_cik_key is None else f"s3://{bucket_name}/{default_cik_key}"
+)
 shared_dlq_name = aws.ssm.get_parameter(name=f"/idi/{stack_name}/shared/dlq_name").value
 cpu = config.get("cpu") or "1024"
 memory = config.get("memory") or "4096"

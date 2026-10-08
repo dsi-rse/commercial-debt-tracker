@@ -152,6 +152,11 @@ venv.bak/
 # minor (#109).
 data/*
 !data/models/
+# The one committed CIK list: ten large filers, so a fresh clone's local run
+# has a scope without AWS access. Every other CIK list lives in S3.
+!data/ciks/
+data/ciks/*
+!data/ciks/smoke-10.txt
 
 scripts/*
 !scripts/local-pipeline.sh
