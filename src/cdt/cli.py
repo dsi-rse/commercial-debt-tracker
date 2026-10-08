@@ -40,9 +40,6 @@ from cdt.extractor import (
     DEFAULT_MAX_ATTEMPTS as DEFAULT_EXTRACTOR_MAX_ATTEMPTS,
 )
 from cdt.extractor import (
-    DEFAULT_REASONING_EFFORT as DEFAULT_EXTRACTOR_REASONING_EFFORT,
-)
-from cdt.extractor import (
     ActiveJobSummary,
     describe_active_job,
     extract_pending_items,
@@ -90,6 +87,7 @@ from cdt.run import (
     EXTRACTOR_BACKENDS,
     MODE_DEADLINE_HOURS,
     WATCHDOG_EXIT_CODE,
+    advance_batch_extract,
     reject_placeholder_secrets,
     run_live,
     run_poll,
@@ -107,6 +105,7 @@ ENVIRONMENT_DEFAULTS: dict[str, str] = {
     "--cik-file": "CDT_DEFAULT_CIK_FILE",
     "--genres": "GENRES",
     "--extractor-backend": "EXTRACTOR_BACKEND",
+    "--backend": "EXTRACTOR_BACKEND",
 }
 
 #: Exit code for invalid arguments, as argparse uses.
@@ -294,18 +293,46 @@ def _classify_options() -> argparse.ArgumentParser:
 def _extract_options() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument(
-        "--model", default=None, help="extractor model (env EXTRACTOR_MODEL)"
+        "--model",
+        default=None,
+        help="extractor model (default: env EXTRACTOR_MODEL live, "
+        "EXTRACTOR_BATCH_MODEL batch)",
     )
     parser.add_argument(
         "--reasoning-effort",
-        default=DEFAULT_EXTRACTOR_REASONING_EFFORT,
-        help=f"reasoning effort (default {DEFAULT_EXTRACTOR_REASONING_EFFORT})",
+        default=None,
+        help="reasoning effort (default: env EXTRACTOR_REASONING live, "
+        "EXTRACTOR_BATCH_REASONING batch)",
     )
     parser.add_argument(
         "--max-attempts",
         type=positive_int,
         default=DEFAULT_EXTRACTOR_MAX_ATTEMPTS,
         help=f"scored attempts per stage (default {DEFAULT_EXTRACTOR_MAX_ATTEMPTS})",
+    )
+    return parser
+
+
+def _batch_tick_options() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--max-requests-per-batch",
+        type=positive_int,
+        default=None,
+        help="requests per OpenAI batch file (default: the backend's limit)",
+    )
+    parser.add_argument(
+        "--max-batch-bytes",
+        type=positive_int,
+        default=None,
+        help="bytes per OpenAI batch file (default: the backend's limit)",
+    )
+    parser.add_argument(
+        "--max-rows-per-job",
+        type=positive_int,
+        default=None,
+        help="rows one job may claim, so its state fits the task's memory "
+        "(default: the backend's limit)",
     )
     return parser
 
@@ -464,10 +491,23 @@ def _add_extract(commands: argparse._SubParsersAction) -> None:
         "extract",
         parents=[
             _common_options(),
-            _force_option("re-extract partitions already extracted"),
+            _force_option(
+                "re-extract partitions already extracted (batch: when this "
+                "tick starts a new job)"
+            ),
             _extract_options(),
+            _batch_tick_options(),
         ],
-        help="extract debt-instrument mentions from classified rows (live backend)",
+        help="extract debt-instrument mentions from classified rows; batch "
+        "(default) advances the OpenAI batch job one tick",
+    )
+    extract.add_argument(
+        "--backend",
+        choices=EXTRACTOR_BACKENDS,
+        default=_env_default("--backend", "batch"),
+        help="'batch' (env EXTRACTOR_BACKEND; default) advances the OpenAI batch "
+        "job by one tick and prints its status; 'live' extracts every pending row "
+        "synchronously",
     )
     extract.set_defaults(func=run_extract)
     nested = extract.add_subparsers(dest="extract_command")
@@ -569,6 +609,7 @@ def _add_run(commands: argparse._SubParsersAction) -> None:
                 "when this tick starts a new job, claim partitions already extracted"
             ),
             _force_publish_option(),
+            _batch_tick_options(),
         ],
         help="advance the batch extract job one tick; match and publish when it "
         "completes",
@@ -578,25 +619,6 @@ def _add_run(commands: argparse._SubParsersAction) -> None:
         type=positive_int,
         default=DEFAULT_EXTRACTOR_MAX_ATTEMPTS,
         help=f"scored attempts per stage (default {DEFAULT_EXTRACTOR_MAX_ATTEMPTS})",
-    )
-    poll.add_argument(
-        "--max-requests-per-batch",
-        type=positive_int,
-        default=None,
-        help="requests per OpenAI batch file (default: the backend's limit)",
-    )
-    poll.add_argument(
-        "--max-batch-bytes",
-        type=positive_int,
-        default=None,
-        help="bytes per OpenAI batch file (default: the backend's limit)",
-    )
-    poll.add_argument(
-        "--max-rows-per-job",
-        type=positive_int,
-        default=None,
-        help="rows one job may claim, so its state fits the task's memory "
-        "(default: the backend's limit)",
     )
     poll.set_defaults(func=run_run)
 
@@ -814,7 +836,30 @@ def run_classify_train(args: argparse.Namespace) -> int:
 
 
 def run_extract(args: argparse.Namespace) -> int:
-    """Run ``cdt extract`` (the live backend)."""
+    """Run ``cdt extract``: one batch tick (default), or a live run."""
+
+    def batch_tick(artifact_root: str, lease: Lease) -> int:
+        result = advance_batch_extract(
+            artifact_root=artifact_root,
+            force=args.force,
+            model=args.model,
+            reasoning_effort=args.reasoning_effort,
+            max_attempts=args.max_attempts,
+            max_requests_per_batch=args.max_requests_per_batch,
+            max_batch_bytes=args.max_batch_bytes,
+            max_rows_per_job=args.max_rows_per_job,
+            renew=renewer(lease),
+        )
+        print(
+            f"Batch extract job {result.job_id or '-'}: {result.status} "
+            f"(submitted {result.submitted_batches}, in flight "
+            f"{result.in_flight_batches}, terminal rows {result.terminal_rows})."
+        )
+        if result.status == "completed":
+            print(
+                f"Wrote mentions into {mentions_root(artifact_root)}; run `cdt match`."
+            )
+        return 0
 
     def body(artifact_root: str, lease: Lease) -> int:
         mentions = extract_pending_items(
@@ -831,6 +876,8 @@ def run_extract(args: argparse.Namespace) -> int:
         print(f"Audit log under {extracted_tables_path(artifact_root)}.")
         return 0
 
+    if args.backend == "batch":
+        return _with_writer_lease(args, "extract", batch_tick)
     return _with_writer_lease(args, "extract", body)
 
 

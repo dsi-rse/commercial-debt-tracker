@@ -20,7 +20,12 @@ from collections.abc import Callable
 from time import monotonic, sleep
 
 from cdt.datasets import resolve_artifact_root
-from cdt.extractor import DEFAULT_MAX_ATTEMPTS, OpenAIBatchClient, advance_extract_job
+from cdt.extractor import (
+    DEFAULT_MAX_ATTEMPTS,
+    ExtractTickResult,
+    OpenAIBatchClient,
+    advance_extract_job,
+)
 from cdt.lease import (
     PIPELINE_WRITER_LEASE,
     Lease,
@@ -232,6 +237,47 @@ def run_live(config: PipelineConfig) -> tuple[int, PipelineRunResult | None]:
     return 0, result
 
 
+def advance_batch_extract(
+    *,
+    artifact_root: str,
+    force: bool = False,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    max_requests_per_batch: int | None = None,
+    max_batch_bytes: int | None = None,
+    max_rows_per_job: int | None = None,
+    renew: Callable[[], None] | None = None,
+) -> ExtractTickResult:
+    """Advance the OpenAI batch extract job by one tick, against the real API.
+
+    The caller holds the writer lease; ``renew`` extends it at the tick's
+    phase boundaries and raises ``LeaseLostError`` if it was stolen. ``force``,
+    ``model`` and ``reasoning_effort`` apply when the tick starts a new job
+    (None: the ``EXTRACTOR_BATCH_*`` settings). A ``max_*`` limit left None is
+    the batch backend's own.
+    """
+    limits = {
+        name: value
+        for name, value in (
+            ("max_requests_per_batch", max_requests_per_batch),
+            ("max_batch_bytes", max_batch_bytes),
+            ("max_rows_per_job", max_rows_per_job),
+        )
+        if value is not None
+    }
+    return advance_extract_job(
+        batch_client=OpenAIBatchClient(),
+        artifact_root=artifact_root,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        max_attempts=max_attempts,
+        force=force,
+        renew_lease=renew,
+        **limits,
+    )
+
+
 def run_poll(
     *,
     artifact_root: ArtifactPath | None,
@@ -261,24 +307,15 @@ def run_poll(
         print("locked")
         return 0
     renew = renewer(lease)
-    limits = {
-        name: value
-        for name, value in (
-            ("max_requests_per_batch", max_requests_per_batch),
-            ("max_batch_bytes", max_batch_bytes),
-            ("max_rows_per_job", max_rows_per_job),
-        )
-        if value is not None
-    }
     try:
-        result = advance_extract_job(
-            batch_client=OpenAIBatchClient(),
+        result = advance_batch_extract(
             artifact_root=resolved_root,
-            max_attempts=max_attempts,
             force=force,
-            # Renewed at phase boundaries; raises LeaseLostError if stolen.
-            renew_lease=renew,
-            **limits,
+            max_attempts=max_attempts,
+            max_requests_per_batch=max_requests_per_batch,
+            max_batch_bytes=max_batch_bytes,
+            max_rows_per_job=max_rows_per_job,
+            renew=renew,
         )
         LOGGER.info(
             POLL_TICK_COMPLETE_MESSAGE,

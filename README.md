@@ -73,7 +73,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for how to contribute changes.
 cdt ingest     acquire each genre's filings for a CIK list            (cdt.ingest)
 cdt segment    8-K item sections and 6-K window spans                 (cdt.segmenter)
 cdt classify   8-K item relevance and 6-K triage; `classify train`    (cdt.classifier)
-cdt extract    live LLM extraction; `extract job show|reset`          (cdt.extractor)
+cdt extract    a batch tick (default) or `--backend live`; `extract job`  (cdt.extractor)
 cdt match      instruments and lineage                                (cdt.matcher)
 cdt publish    the four latest.parquet tables                         (cdt.publish)
 cdt run daily | historical | poll                                     (cdt.run)

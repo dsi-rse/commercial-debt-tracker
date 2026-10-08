@@ -146,10 +146,13 @@ The stage objects (`preprocess`/`validate`/`postprocess`/`early_stop`/`build_ret
 are pure and backend-agnostic. Two backends drive them:
 
 - The `live` backend (`OpenRouterChatClient`) runs the workflow synchronously, one item
-  and one LLM call at a time. It is used by `cdt extract` and by
+  and one LLM call at a time. It is used by `cdt extract --backend live` and by
   `cdt run daily|historical --extractor-backend live`.
 - The `batch` backend (`OpenAIBatchClient`) drives the same stages asynchronously through
-  OpenAI's Batch API (~50% cheaper, up to 24h per round). This is the deployed default.
+  OpenAI's Batch API (~50% cheaper, up to 24h per round). It is the default
+  everywhere (`EXTRACTOR_BACKEND`): `cdt extract` advances its job by one tick and
+  prints the job's status, and `cdt run poll` is that tick plus match and publish
+  when the job completes.
 
 Because the two backends talk to different APIs, the request parameters they share are
 resolved in one place so the same model cannot behave differently depending on which

@@ -13,6 +13,7 @@ from support import _seed_classifications
 
 from cdt import cli, settings
 from cdt.datasets import GENRE_6K, GENRE_8K
+from cdt.extractor import ExtractTickResult
 from cdt.extractor.state import ExtractionRowState
 from cdt.ingest.core import IngestConfig, IngestRunResult
 from cdt.lease import PIPELINE_WRITER_LEASE, acquire_lease
@@ -673,6 +674,8 @@ def test_extract_calls_the_live_extractor(
     status = cli.main(
         [
             "extract",
+            "--backend",
+            "live",
             "--artifact-root",
             str(tmp_path),
             "--force",
@@ -726,7 +729,17 @@ def test_extract_model_defaults_to_the_extractor_model_setting(
 
     monkeypatch.setattr("cdt.extractor.live.run_extraction_workflow", fake_workflow)
 
-    status = cli.main(["extract", "--quiet", "--artifact-root", str(tmp_path), *extra])
+    status = cli.main(
+        [
+            "extract",
+            "--backend",
+            "live",
+            "--quiet",
+            "--artifact-root",
+            str(tmp_path),
+            *extra,
+        ]
+    )
 
     assert status == 0
     assert models == [expected]
@@ -1067,3 +1080,66 @@ def test_the_committed_cik_list_is_the_local_default() -> None:
     assert all(line.isdigit() for line in lines)
     for path in ("Makefile", "scripts/local-pipeline.sh"):
         assert "data/ciks/smoke-10.txt" in (settings.PROJECT_ROOT / path).read_text()
+
+
+def test_extract_defaults_to_one_batch_tick(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``cdt extract`` with no backend advances the batch job, under the lease."""
+    calls: list[dict[str, object]] = []
+
+    def fake_tick(**kwargs: object) -> ExtractTickResult:
+        assert acquire_lease(tmp_path, PIPELINE_WRITER_LEASE) is None
+        calls.append(kwargs)
+        return ExtractTickResult(status="submitted", job_id="J", submitted_batches=1)
+
+    monkeypatch.setattr(cli, "advance_batch_extract", fake_tick)
+    monkeypatch.setattr(
+        cli,
+        "extract_pending_items",
+        lambda **kwargs: pytest.fail("the live backend must not run by default"),
+    )
+
+    status = cli.main(
+        [
+            "extract",
+            "--quiet",
+            "--artifact-root",
+            str(tmp_path),
+            "--max-rows-per-job",
+            "7",
+            "--force",
+        ]
+    )
+
+    assert status == 0
+    [kwargs] = calls
+    assert kwargs["max_rows_per_job"] == 7  # noqa: PLR2004
+    assert kwargs["force"] is True
+    # Unset, so the batch backend's own EXTRACTOR_BATCH_* settings apply.
+    assert (kwargs["model"], kwargs["reasoning_effort"]) == (None, None)
+    assert callable(kwargs["renew"])
+    assert "Batch extract job J: submitted" in capsys.readouterr().out
+
+
+def test_extract_backend_comes_from_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """EXTRACTOR_BACKEND picks the default for ``cdt extract`` as for ``cdt run``."""
+    monkeypatch.setenv("EXTRACTOR_BACKEND", "live")
+    ran: list[str] = []
+    monkeypatch.setattr(
+        cli,
+        "extract_pending_items",
+        lambda **kwargs: (ran.append("live"), pd.DataFrame())[1],
+    )
+    monkeypatch.setattr(
+        cli,
+        "advance_batch_extract",
+        lambda **kwargs: pytest.fail("EXTRACTOR_BACKEND=live must run live"),
+    )
+
+    assert cli.main(["extract", "--quiet", "--artifact-root", str(tmp_path)]) == 0
+    assert ran == ["live"]
