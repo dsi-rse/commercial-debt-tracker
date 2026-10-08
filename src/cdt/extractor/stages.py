@@ -46,7 +46,7 @@ from cdt.extractor.tags import (
     realign_tag_details,
     repair_unescaped_ampersands,
 )
-from cdt.extractor.validate import validate_instrument_entry
+from cdt.extractor.validate import is_one_of, validate_instrument_entry
 from cdt.storage.columns import coerce_dataset_text
 
 # A regex rather than a parse: the high-water check counts tags in earlier,
@@ -501,7 +501,7 @@ class InstrumentRelationStage:
             if not isinstance(rel_from, str) or not isinstance(rel_to, str):
                 failures.append("'from' and 'to' must be strings.")
                 continue
-            if rel_type not in INSTRUMENT_RELATION_TYPES:
+            if not is_one_of(rel_type, INSTRUMENT_RELATION_TYPES):
                 failures.append(
                     f"Invalid relation type: {rel_type}. Must be amendment_of, retired_by, or split_of."
                 )

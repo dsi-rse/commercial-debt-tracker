@@ -483,6 +483,47 @@ def test_job_lifecycle_completes_and_writes_mentions(tmp_path: Path) -> None:
     assert idle.status == "idle"
 
 
+def test_a_fold_that_raises_errors_its_row_and_the_job_still_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exception folding one row's response must not wedge the job.
+
+    The batch is still in ``job.batches`` while it folds, so an escaping
+    exception would re-fold the same response and crash on every tick.
+    """
+    seed_classification(
+        tmp_path,
+        [
+            {"item_id": "item-nodebt", "text": NODEBT_TEXT},
+            {"item_id": "item-multi", "text": MULTI_TEXT},
+        ],
+    )
+    client = FakeBatchClient(
+        {
+            "item-nodebt": {"ner": NODEBT_NER},
+            "item-multi": {"ner": MULTI_NER, "instrument_ie": MULTI_IE},
+        }
+    )
+    fold = batch_module._fold_one_response
+
+    def _raise_for_nodebt(entry: RowEntry, *args: object) -> None:
+        if entry.row_state.item_id == "item-nodebt":
+            raise TypeError("cannot use 'list' as a set element")
+        fold(entry, *args)
+
+    monkeypatch.setattr(batch_module, "_fold_one_response", _raise_for_nodebt)
+
+    statuses = [_advance(tmp_path, client).status for _ in range(3)]
+
+    assert statuses == ["submitted", "submitted", "completed"]
+    assert read_dataset(mentions_root(tmp_path))["name"].to_list() == ["Term Loan"]
+    audit = list((tmp_path / "extractor-runs").glob("run_id=*/full.jsonl"))
+    records = [json.loads(line) for line in audit[0].read_text().splitlines()]
+    errored = [record for record in records if record["state"] == "ERROR"]
+    assert [record["item_id"] for record in errored] == ["item-nodebt"]
+    assert "TypeError" in json.dumps(errored[0]["attempts"])
+
+
 def test_empty_job_finalizes_immediately(tmp_path: Path) -> None:
     """A partition with no relevant items completes in one tick with no batch."""
     seed_classification(

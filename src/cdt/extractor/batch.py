@@ -828,10 +828,13 @@ def _fold_completed_batches(
                 entry.resubmissions = 0
                 try:
                     completion = completion_result_from_batch_line(line)
-                except Exception as exc:  # noqa: BLE001
-                    record_stage_error(entry.row_state, str(exc))
-                else:
                     _fold_one_response(entry, completion, job.max_attempts)
+                except Exception as exc:  # noqa: BLE001
+                    # Contained per row: the fold runs before the batch leaves
+                    # job.batches, so a raise here would re-fold the same
+                    # response, and crash, on every tick.
+                    LOGGER.exception("Folding %s from %s", custom_id, record.batch_id)
+                    record_stage_error(entry.row_state, f"{type(exc).__name__}: {exc}")
                 folded += 1
             else:
                 # No result line: the batch failed wholesale, was cancelled, or

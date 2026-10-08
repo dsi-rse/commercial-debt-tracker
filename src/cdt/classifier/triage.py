@@ -225,9 +225,15 @@ def validate_verdict(verdict: object, expected: int) -> list[str]:
     >>> drop = [{"id": 1, "reason": "no_details"}] * 2
     >>> validate_verdict({"keep": [], "drop": drop}, 1)
     ['snippet 1 appears more than once in drop']
+    >>> validate_verdict({"keep": 1, "drop": []}, 1)
+    ["'keep' must be a list of snippet ids"]
     """
     if not isinstance(verdict, dict):
         return ["response was not a JSON object"]
+    if not isinstance(verdict.get("keep", []), list):
+        return ["'keep' must be a list of snippet ids"]
+    if not isinstance(verdict.get("drop", []), list):
+        return ["'drop' must be a list of objects"]
     keep = {int(value) for value in verdict.get("keep", []) if _is_index(value)}
     entries = [
         entry
@@ -258,7 +264,8 @@ def validate_verdict(verdict: object, expected: int) -> list[str]:
         f"snippet {entry['id']} dropped with unrecognised reason "
         f"{entry.get('reason')!r}; expected one of {allowed_reasons}"
         for entry in entries
-        if entry.get("reason") not in DROP_REASONS
+        if not isinstance(entry.get("reason"), str)
+        or entry["reason"] not in DROP_REASONS
     ]
     failures += [
         f"snippet {entry['id']} dropped as a duplicate without a covered_by id"
@@ -287,10 +294,10 @@ def _is_index(value: object) -> bool:
     Returns:
         ``True`` when it parses as a positive integer.
 
-    >>> _is_index(3), _is_index("3"), _is_index("x"), _is_index(None)
-    (True, True, False, False)
+    >>> _is_index(3), _is_index("3"), _is_index("x"), _is_index(None), _is_index("²")
+    (True, True, False, False, False)
     """
-    return str(value).strip().isdigit()
+    return str(value).strip().isdecimal()
 
 
 def build_retry_message(failures: list[str], expected: int) -> str:

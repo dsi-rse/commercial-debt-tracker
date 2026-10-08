@@ -33,6 +33,7 @@ from cdt.extractor.tags import (
 from cdt.extractor.validate import (
     validate_amount_is_not_rate,
     validate_dates_property,
+    validate_instrument_entry,
     validate_interest_rate,
     validate_parties_property,
 )
@@ -3432,3 +3433,74 @@ def test_a_salvaged_row_registers_the_salvage_note_not_the_last_stage() -> None:
     assert "Unexpected response" not in str(record["error"])
     assert record["error"] == "; ".join(row_state.salvage_notes)
     assert "dropped 1" in str(record["error"])
+
+
+_WRONG_TYPE_VALUES: tuple[object, ...] = (["term_loan"], {"kind": "x"}, 7, None, True)
+
+
+def _with_each_value_replaced(value: object) -> list[object]:
+    """Copies of ``value`` with one nested value at a time swapped for a wrong type."""
+    variants: list[object] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            for replacement in (*_WRONG_TYPE_VALUES, *_with_each_value_replaced(child)):
+                variants.append({**value, key: replacement})
+    elif isinstance(value, list):
+        for position, child in enumerate(value):
+            for replacement in (*_WRONG_TYPE_VALUES, *_with_each_value_replaced(child)):
+                variants.append(
+                    [*value[:position], replacement, *value[position + 1 :]]
+                )
+    return variants
+
+
+def test_wrong_type_model_json_is_a_validation_failure_not_an_exception() -> None:
+    """A list or object where the schema wants a string must fail validation.
+
+    Testing an unhashable value against a set raises TypeError, which no caller
+    catches: live extract would die before saving completion and the batch fold
+    would re-crash on the same response every tick.
+    """
+    tag_details = {
+        "tag-i-1": {"type": "debt_instrument", "text": "Term Loan"},
+        "tag-a-1": {"type": "amount", "text": "$5.5 million"},
+        "tag-d-1": {"type": "date", "text": "March 17, 2025"},
+        "tag-r-1": {"type": "interest_rate", "text": "5.25%"},
+        "tag-o-1": {"type": "organization", "text": "EGT 11 LLC"},
+    }
+    entry = {
+        "name": ["tag-i-1"],
+        "instrument_type": "term_loan",
+        "amounts": [
+            {"kind": "principal", "evidence": ["tag-a-1"], "prior": False},
+            {"kind": "repayment", "evidence": ["tag-a-1"]},
+        ],
+        "dates": [
+            {"kind": "closing", "evidence": ["tag-d-1"], "expected": False},
+            {"kind": "repayment", "evidence": []},
+        ],
+        "interest_rate": {"kind": "fixed", "rate_pct": "5.25", "evidence": ["tag-r-1"]},
+        "parties": [{"tag_ids": ["tag-o-1"], "role": "lender", "kind": "named"}],
+    }
+    assert validate_instrument_entry(0, entry, tag_details) == []
+
+    variants = _with_each_value_replaced(entry)
+    assert len(variants) > 100
+    for variant in variants:
+        assert isinstance(validate_instrument_entry(0, variant, tag_details), list)
+    assert validate_instrument_entry(
+        0, {**entry, "instrument_type": ["term_loan"]}, tag_details
+    )
+
+
+def test_relation_stage_rejects_a_non_string_relation_type() -> None:
+    """A list ``type`` is a validation failure, not a TypeError."""
+    row_state = ExtractionRowState(
+        item_row={"item_id": "item-1"}, stage_name="instrument_relation"
+    )
+    row_state.debt_instrument_mentions = [{"raw_id": "a"}, {"raw_id": "b"}]
+    response = json.dumps([{"from": "a", "to": "b", "type": ["amendment_of"]}])
+
+    failures = InstrumentRelationStage().validate(row_state, response)
+
+    assert any("Invalid relation type" in failure for failure in failures)

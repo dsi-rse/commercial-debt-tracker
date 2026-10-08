@@ -175,6 +175,29 @@ def test_triage_retries_a_malformed_verdict() -> None:
     assert "not usable" in client.calls[1][-1]["content"]
 
 
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {"keep": 1, "drop": []},
+        {"keep": "12", "drop": []},
+        {"keep": [1], "drop": {"id": 2}},
+        {"keep": [1], "drop": [{"id": 2, "reason": ["no_details"]}]},
+        {"keep": ["²"], "drop": [{"id": 2, "reason": "no_details"}]},
+    ],
+)
+def test_triage_retries_a_wrong_type_verdict(malformed: dict) -> None:
+    """A wrong-type field is a validation failure that retries, not an exception."""
+    client = FakeClient(
+        [
+            json.dumps(malformed),
+            json.dumps({"keep": [1, 2], "drop": []}),
+        ]
+    )
+    verdict = asyncio.run(triage_filing(client, "acc-1", _snippets(2)))
+    assert verdict.kept == ["s1", "s2"]
+    assert verdict.attempts == 2
+
+
 def test_triage_defaults_the_model_and_effort_to_the_built_in_values() -> None:
     """With nothing configured, the call carries the documented defaults."""
     client = FakeClient([json.dumps({"keep": [1], "drop": []})])
