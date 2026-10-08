@@ -317,8 +317,9 @@ def zlib_crc32(value: str) -> int:
     return int(crc32(value.encode("utf-8")))
 
 
-#: Filing genres: 8-K runs ingest → itemize → classify, 6-K runs ingest →
-#: triage; both converge at extract.
+#: Filing genres. Each runs ingest → segment → classify (8-K: items and the
+#: item classifier; 6-K: window spans and the two-stage triage); both converge
+#: at extract.
 GENRE_8K = "8-K"
 GENRE_6K = "6-K"
 

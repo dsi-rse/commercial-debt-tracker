@@ -610,13 +610,17 @@ Extractor writes a per-run manifest and a matching full audit log:
 A live run writes each commit's audit records to a `checkpoint-NNNN.jsonl`. When
 the run finishes it writes `full.jsonl` with every record and deletes the
 checkpoint files. A run that was interrupted has no `full.jsonl`; its checkpoint
-files are its audit, up to its last commit.
+files are its audit, up to its last commit. If a run is killed between writing
+`full.jsonl` and deleting them, `full.jsonl` supersedes whatever checkpoint
+files remain beside it.
 
 ### Extract batch job state
 
 The OpenAI batch extract backend keeps its resumable, file-native job state under
-`extract-batches/`. The hourly `poll` run is the only writer, apart from the
-`cdt extract job reset` admin command, which rewrites `active.json` under the same lease.
+`extract-batches/`. Two commands advance it, both by one tick under the
+`pipeline-writer` lease: `cdt run poll` (hourly, scheduled) and `cdt extract` (its
+default batch backend). The `cdt extract job reset` admin command rewrites
+`active.json` under the same lease.
 
 ```text
 <artifact-root>/extract-batches/

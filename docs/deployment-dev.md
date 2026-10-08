@@ -31,6 +31,7 @@ idi:memory = 4096
 idi:ecr_image_retention_count = 5
 idi:cron = cron(0 7 * * ? *)
 idi:schedule_enabled = false
+idi:poll_schedule_enabled = true
 ```
 
 These are already committed in `pulumi/Pulumi.dev.yaml`; the bucket and DLQ names
@@ -118,8 +119,10 @@ aws s3 cp my-ciks.txt \
   s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/inputs/ciks/my-ciks.txt
 ```
 
-The task role can read only the file `idi:cik_scope` names. A manual historical
-run can pass a different `--cik-file`, as long as the task role can read it.
+The task role reads the shared bucket under `sec/`, `processors/cdt/` (it also
+writes there) and `database/cdt/`, plus the one file `idi:cik_scope` names when
+that file lives elsewhere. A manual historical run can pass a different
+`--cik-file` anywhere under `processors/cdt/`, such as the beta lists.
 
 ## Create and Configure the Pulumi Stack
 
@@ -181,7 +184,7 @@ cdt run daily
 
 It does not run `historical`.
 
-Because `idi:schedule_enabled` should be `false` for the first deploy, nothing runs automatically until you enable the schedule and deploy again.
+With the committed values, the daily schedule is off (`idi:schedule_enabled: false`) but the hourly poll is on (`idi:poll_schedule_enabled: true`). So after the first deploy, `cdt run poll` starts every hour. It is cheap while there is nothing to extract, and it drains the batch job a manual historical run leaves behind. Nothing else runs automatically until you enable the daily schedule and deploy again.
 
 ## Run a Historical Backfill Manually
 

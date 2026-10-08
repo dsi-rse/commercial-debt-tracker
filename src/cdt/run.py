@@ -46,7 +46,6 @@ from cdt.storage.objects import ArtifactPath
 
 LOGGER = get_logger(__name__)
 
-RUN_MODES = ("daily", "historical", "poll")
 EXTRACTOR_BACKENDS = ("batch", "live")
 
 # How long daily/historical wait for a lease held by a poll tick before failing.

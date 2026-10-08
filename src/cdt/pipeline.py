@@ -251,12 +251,6 @@ class Pipeline:
         for key, value in config_values.items():
             self.logger.info("%s: %s", key, value)
 
-    def _log_stage_start(self: Self, stage_name: str, **details: object) -> None:
-        log_stage_start(self.logger, stage_name, **details)
-
-    def _log_stage_complete(self: Self, stage_name: str, **details: object) -> None:
-        log_stage_complete(self.logger, stage_name, **details)
-
     def _setup(self: Self) -> tuple[date, date, set[str] | None, str]:
         """Resolve dates, CIKs, and the artifact root and emit the run banner."""
         # A config built in code skips the CLI's parsing; validate here.
@@ -363,7 +357,8 @@ class Pipeline:
         renew: Callable[[], None] | None,
     ) -> GenreResult:
         """Run one genre's ingest → segment → classify, renewing between stages."""
-        self._log_stage_start(
+        log_stage_start(
+            self.logger,
             "ingest",
             genre=genre,
             flush_rows=self.config.ingest_flush_rows,
@@ -375,7 +370,8 @@ class Pipeline:
             ciks=ciks,
             renew=renew,
         )
-        self._log_stage_complete(
+        log_stage_complete(
+            self.logger,
             "ingest",
             genre=genre,
             rows=ingest_result.total_rows,
@@ -385,7 +381,7 @@ class Pipeline:
         )
         self._renew(renew)
 
-        self._log_stage_start("segment", genre=genre)
+        log_stage_start(self.logger, "segment", genre=genre)
         segmented = segment_genre(
             genre,
             artifact_root=resolved_artifact_root,
@@ -394,10 +390,10 @@ class Pipeline:
             item_numbers=self.config.item_numbers,
             renew=renew,
         )
-        self._log_stage_complete("segment", genre=genre, rows=len(segmented))
+        log_stage_complete(self.logger, "segment", genre=genre, rows=len(segmented))
         self._renew(renew)
 
-        self._log_stage_start("classify", genre=genre)
+        log_stage_start(self.logger, "classify", genre=genre)
         classified = classify_genre(
             genre,
             artifact_root=resolved_artifact_root,
@@ -408,7 +404,7 @@ class Pipeline:
             sixk_concurrency=self.config.sixk_concurrency,
             renew=renew,
         )
-        self._log_stage_complete("classify", genre=genre, rows=len(classified))
+        log_stage_complete(self.logger, "classify", genre=genre, rows=len(classified))
         self._renew(renew)
         return GenreResult(
             ingest=ingest_result,
@@ -435,7 +431,8 @@ class Pipeline:
         )
         self._renew(renew)
 
-        self._log_stage_start(
+        log_stage_start(
+            self.logger,
             "extract",
             model=self.config.extractor_model,
         )
@@ -448,10 +445,10 @@ class Pipeline:
             max_attempts=self.config.extractor_max_attempts,
             renew=renew,
         )
-        self._log_stage_complete("extract", rows=len(extracted))
+        log_stage_complete(self.logger, "extract", rows=len(extracted))
         self._renew(renew)
 
-        self._log_stage_start("match")
+        log_stage_start(self.logger, "match")
         matched = match_pending_mentions(
             artifact_root=resolved_artifact_root,
             data_dir=self.config.data_dir,
@@ -461,7 +458,8 @@ class Pipeline:
             ambiguity_margin=self.config.ambiguity_margin,
             renew=renew,
         )
-        self._log_stage_complete(
+        log_stage_complete(
+            self.logger,
             "match",
             edge_rows=len(matched["debt_instrument_mentions"]),
             debt_instruments=len(matched["debt_instrument"]),
@@ -536,7 +534,7 @@ def run_match_and_finalize(
 ) -> dict[str, str]:
     """Run match on existing mentions, then finalize; idempotent.
 
-    ``force`` re-matches every shard; ``force_publish`` publishes past the
+    ``force`` rebuilds every shard from scratch; ``force_publish`` publishes past the
     skip gate and the shrinkage guard. ``renew`` extends the caller's writer
     lease per matched shard and before the publish, so a stolen lease cannot
     keep publishing.

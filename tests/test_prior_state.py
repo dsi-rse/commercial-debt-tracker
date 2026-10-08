@@ -549,10 +549,8 @@ def test_two_before_figures_are_ambiguous_even_when_one_did_not_parse() -> None:
 def test_mint_does_not_write_the_pointer_onto_the_rows_it_was_handed() -> None:
     """`amendment_of` belongs on the published row, never on the persisted state.
 
-    Both callers happened to be safe — `published_mention_rows` copies and
-    `backfill_mentions` owns its records — so this was latent rather than live.
-    A future caller passing `row_state.debt_instrument_mentions` straight in
-    would have persisted a minted pointer into `state.jsonl` (#211).
+    A caller passing `row_state.debt_instrument_mentions` straight in would
+    otherwise persist a minted pointer into `state.jsonl`.
     """
     from cdt.extractor.prior_state import mint_prior_state_rows
 
@@ -572,7 +570,7 @@ def test_mint_does_not_write_the_pointer_onto_the_rows_it_was_handed() -> None:
 
 
 def test_an_unhashable_date_value_does_not_kill_the_whole_mint_pass() -> None:
-    """One malformed partition row must not abort an extract or a backfill (#211).
+    """One malformed partition row must not abort an extract.
 
     `{"kind": "amendment", "normalized_date": ["2020-01-01"]}` raised
     `TypeError: cannot use 'list' as a set element` out of the amendment-date

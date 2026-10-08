@@ -1188,7 +1188,7 @@ def test_existing_accessions_scans_the_window_in_one_pass(
     it forgoes the parallel Arrow scan the same change added — measured on
     data/genwindow-eval-apr/documents, 1,640 partitions are 26.45s one at a
     time against 1.75s as a single scan. Daily mode's five-day lookback bounds
-    the loop; ``--mode historical`` defaults to 1994-to-today and does not.
+    the loop; ``cdt ingest`` given only ``--end-date`` starts at 1994 and does not.
     """
     from cdt.ingest import core as ingest
 

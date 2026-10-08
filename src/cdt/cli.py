@@ -550,7 +550,10 @@ def _add_match(commands: argparse._SubParsersAction) -> None:
         "match",
         parents=[
             _common_options(),
-            _force_option("re-match every shard"),
+            _force_option(
+                "rebuild every shard from scratch instead of extending its "
+                "existing instruments"
+            ),
             _match_options(),
         ],
         help="group mentions into debt instruments, then infer lineage",

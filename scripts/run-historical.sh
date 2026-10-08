@@ -19,7 +19,7 @@ Usage: scripts/run-historical.sh --start-date YYYY-MM-DD --end-date YYYY-MM-DD \
          [--extractor-backend batch|live]
 
 The task role can only read the shared bucket under sec/, processors/cdt/,
-database/cdt/, and the committed default CIK key -- s3:// CIK paths elsewhere
+database/cdt/, and the stack's idi:cik_scope file -- s3:// CIK paths elsewhere
 fail with AccessDenied. `batch` defers extraction to the hourly poll schedule;
 `live` extracts synchronously within the task via OpenRouter.
 EOF

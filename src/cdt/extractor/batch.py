@@ -18,9 +18,10 @@ Layout under ``{artifact_root}/extract-batches/``::
     job_id=<id>/batches.json    # in-flight batches, seen batch ids, tick counter
     job_id=<id>/ticks/tick=<n>.json  # per-tick audit counts
 
-Only ``cdt run poll`` ever mutates this state, and it runs each
-poll tick under the single ``pipeline-writer`` lease (``cdt.lease``), so
-overlapping ticks and the ``daily`` schedule's match/finalize cannot race it.
+Two commands mutate this state, each by one tick, ``cdt run poll`` and
+``cdt extract`` (batch backend), and both hold the single ``pipeline-writer``
+lease (``cdt.lease``), so overlapping ticks and every other writer cannot race
+it.
 """
 
 # ruff: noqa: ANN101, ANN102, D102, D105, D107

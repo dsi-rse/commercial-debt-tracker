@@ -1,4 +1,4 @@
-"""Tests for extraction runs end to end: backfill, partition growth and finalize."""
+"""Tests for extraction runs end to end: checkpoints, partition growth and finalize."""
 
 from __future__ import annotations
 

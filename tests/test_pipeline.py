@@ -985,7 +985,7 @@ def test_match_and_finalize_skips_the_publish_when_no_source_partition_changed(
     Measured in production: publishing a delta of 14 documents took 25 minutes
     and 21,214 sequential GETs at ~70 ms — the cost is request count, not bytes,
     and it was paid whether or not the run produced anything. Both
-    ``run_batch_backend`` and ``run_poll`` finalize, so one batch cycle paid it
+    ``run.run_prepare_then_publish`` and ``run.run_poll`` finalize, so one batch cycle paid it
     at least twice.
     """
     from cdt import pipeline as pipeline_module

@@ -36,8 +36,9 @@ LOGGER = get_logger(__name__)
 
 # Sized well above a normal tick (minutes); it only gates recovery after a crash.
 DEFAULT_LEASE_TTL_SECONDS = 2 * 60 * 60
-# The one lease every writer of extract job state and match/final snapshots
-# holds: poll ticks, daily's match/finalize, and the admin reset command.
+# The one lease every writer of the artifact root holds: every stage command
+# (`cdt ingest` through `cdt publish`, and `cdt extract job reset`) and every
+# `cdt run` mode.
 PIPELINE_WRITER_LEASE = "pipeline-writer"
 _EXPIRED = "1970-01-01T00:00:00+00:00"
 

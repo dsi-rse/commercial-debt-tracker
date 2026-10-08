@@ -201,7 +201,7 @@ The publish is the most expensive step in the pipeline, and its cost is set by
 request count, not bytes. Measured in production, publishing a delta of 14
 documents took 25 minutes and 21,214 sequential GETs at about 70 ms each. The
 publish pays that whether or not the run produced anything, and it runs twice
-per batch cycle, because both `run_batch_backend` and `run_poll` finalize.
+per batch cycle, because both `run.run_prepare_then_publish` and `run.run_poll` finalize.
 
 The gate asks whether anything the publish reads has changed since the
 generation the pointer names. It compares a digest of the source dataset roots
@@ -474,8 +474,8 @@ uniqueness guarantee. Uniqueness within a partition comes from
 The set is built with one parallel `read_partitions` scan, not a `read_table`
 per partition. Measured on `data/genwindow-eval-apr/documents`, 1,640
 partitions took 26.45 s one at a time and 1.75 s as one scan, for the same
-9,077 accessions. Daily mode's five-day window bounds the loop, but
-`--mode historical` defaults to 1994 through today, which is the whole corpus.
+9,077 accessions. The daily five-day window bounds the loop, but `cdt ingest`
+given only `--end-date` starts at 1994, which is the whole corpus.
 
 ### `_write_document_partitions`
 

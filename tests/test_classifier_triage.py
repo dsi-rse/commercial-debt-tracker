@@ -427,3 +427,13 @@ def test_triage_retries_an_unrecognised_drop_reason() -> None:
     assert verdict.kept == ["s1"]
     assert verdict.dropped_no_details == ["s2"]
     assert "unrecognised reason" in client.calls[1][-1]["content"]
+
+
+def test_the_eight_k_default_model_dir_is_the_committed_artifact() -> None:
+    """The 8-K classifier resolves to the repo's model, not to DATA_DIR's."""
+    from cdt.classifier.core import default_model_dir as eightk_default_model_dir
+
+    assert eightk_default_model_dir() == (
+        settings.PROJECT_ROOT / "data" / "models" / "classifier" / "tfidf-linear-svc"
+    )
+    assert (eightk_default_model_dir() / "model.pkl").exists()
