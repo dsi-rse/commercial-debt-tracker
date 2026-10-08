@@ -273,8 +273,8 @@ consecutive dates, and therefore one or two shards. Each cycle then touches
 about 0.2 to 0.5 MB.
 
 The legacy single object is neither read nor migrated: nothing in that format
-is kept during beta. On S3 the shard prefix also matches the legacy key, so
-the loader reads only `date=` files.
+is kept during beta. It sits beside the shard directory, not in it, so the
+listing never returns it.
 
 Naming: in this module, prefixes are `*_root` (`dataset_root`, `items_root`,
 `mentions_root`, `mirror_root`) and single objects are `*_path`
