@@ -1298,6 +1298,35 @@ def test_truncated_manifest_self_heals(tmp_path: Path) -> None:
     assert _advance(tmp_path, client).status == "reset"
 
 
+def test_a_missing_manifest_on_s3_still_self_heals_and_resets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Abandoning a job survives the error S3 raises for a missing manifest.
+
+    S3 reports a missing key as botocore's NoSuchKey, not FileNotFoundError,
+    and the self-heal and `extract job reset` both re-read the manifest.
+    """
+    from botocore.exceptions import ClientError
+
+    client = FakeBatchClient({"item-multi": {"ner": MULTI_NER}})
+    job_id = _seed_active_job(tmp_path, client)
+    (tmp_path / "extract-batches" / f"job_id={job_id}" / "manifest.json").unlink()
+    read_json = batch_module.read_json_artifact
+
+    def read_like_s3(path: str) -> object:
+        if path.endswith("manifest.json"):
+            raise ClientError(
+                {"Error": {"Code": "NoSuchKey", "Message": "missing"}}, "GetObject"
+            )
+        return read_json(path)
+
+    monkeypatch.setattr(batch_module, "read_json_artifact", read_like_s3)
+
+    assert _advance(tmp_path, client).status == "reset"
+    assert _advance(tmp_path, client).status == "submitted"
+    assert reset_active_job(tmp_path) is not None
+
+
 def test_unparseable_state_jsonl_self_heals(tmp_path: Path) -> None:
     """Garbage in state.jsonl is recoverable rather than permanent."""
     client = FakeBatchClient({"item-multi": {"ner": MULTI_NER}})

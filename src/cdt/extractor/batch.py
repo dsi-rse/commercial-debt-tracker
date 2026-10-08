@@ -409,7 +409,7 @@ def _read_force_backlog(root: str) -> frozenset[str]:
         return frozenset()
     try:
         payload = cast(dict[str, object], read_json_artifact(path))
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         # Every idle tick reads the backlog, so an unreadable one would wedge
         # job creation; drop the request instead and say how to repeat it.
         LOGGER.warning(
@@ -516,12 +516,22 @@ def _abandon_job(root: str, job_id: str) -> None:
         manifest = cast(
             dict[str, object], read_json_artifact(_manifest_path(root, job_id))
         )
-    except (json.JSONDecodeError, FileNotFoundError):
-        manifest = {}
-    forced = frozenset(
-        str(path)
-        for path in cast(list[object], manifest.get("forced_partitions") or [])
-    )
+        forced = frozenset(
+            str(path)
+            for path in cast(list[object], manifest.get("forced_partitions") or [])
+        )
+    except Exception as exc:
+        # This is the recovery path for a job directory that is missing or
+        # partly written, so no read failure (S3 raises NoSuchKey, not
+        # FileNotFoundError) may stop it from clearing the marker.
+        LOGGER.warning(
+            "Could not read the manifest of abandoned extract job %s (%s: %s); "
+            "if it was forced, re-run with --force.",
+            job_id,
+            type(exc).__name__,
+            exc,
+        )
+        forced = frozenset()
     if forced:
         _write_force_backlog(root, _read_force_backlog(root) | forced)
         LOGGER.warning(
