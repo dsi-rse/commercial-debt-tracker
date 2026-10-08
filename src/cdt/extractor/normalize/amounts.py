@@ -338,15 +338,51 @@ def magnitude_in_amount_text(text: str | None) -> int | None:
     return None
 
 
+# A figure with its separators, ending on a digit.
+_SEPARATED_FIGURE = re.compile(r"\d(?:[\d.,]*\d)?")
+_DOT_THOUSANDS_FIGURE = re.compile(r"\d{1,3}(?:\.\d{3}){2,}")
+
+
+def _figure_with_unambiguous_separators(text: str) -> str | None:
+    """Return the first figure as plain digits when its separators decide it.
+
+    Two shapes read the same in every convention: `.` before exactly three
+    digits more than once is a thousands separator (`20.877.777`), and when
+    both `.` and `,` appear the last is the decimal point (`1.234.567,89`,
+    `1,234,567.89`). None for every other figure, including the ambiguous
+    `30.000`, which the caller reads in the US convention.
+    """
+    match = _SEPARATED_FIGURE.search(text)
+    if match is None:
+        return None
+    figure = match.group(0)
+    if _DOT_THOUSANDS_FIGURE.fullmatch(figure):
+        return figure.replace(".", "")
+    if "." in figure and "," in figure:
+        decimal = "." if figure.rfind(".") > figure.rfind(",") else ","
+        thousands = "," if decimal == "." else "."
+        whole, _, fraction = figure.replace(thousands, "").rpartition(decimal)
+        if decimal in whole:
+            return None
+        return f"{whole}.{fraction}"
+    return None
+
+
 def normalized_amount_from_text(text: str | None) -> str | None:
-    """Parse one amount mention into a normalized numeric string."""
+    """Parse one amount mention into a normalized numeric string.
+
+    Separators are read in the US convention unless the figure's own shape
+    decides them (see `_figure_with_unambiguous_separators`).
+    """
     if not text:
         return None
-    lowered = text.lower().replace(",", "")
-    match = re.search(r"\d+(?:\.\d+)?", lowered)
-    if not match:
-        return None
-    amount = decimal_from_amount_string(match.group(0))
+    figure = _figure_with_unambiguous_separators(text)
+    if figure is None:
+        match = re.search(r"\d+(?:\.\d+)?", text.lower().replace(",", ""))
+        if not match:
+            return None
+        figure = match.group(0)
+    amount = decimal_from_amount_string(figure)
     if amount is None:
         return None
     magnitude = magnitude_in_amount_text(text)

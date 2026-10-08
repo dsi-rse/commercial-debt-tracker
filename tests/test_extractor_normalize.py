@@ -1351,6 +1351,29 @@ def test_abbreviated_magnitudes_parse_to_full_amounts() -> None:
     assert normalized_amount_from_text("$5 millions") == "5000000"
 
 
+def test_separators_a_figure_s_shape_decides_are_read_in_any_convention() -> None:
+    """`20.877.777` is twenty million in every convention, not 20.877.
+
+    Grupo Supervielle, a 6-K filer, cites it. Repeated three-digit `.` groups
+    are thousands separators, and with both `.` and `,` the last is the
+    decimal point. A single group (`30.000`) is ambiguous and keeps the US
+    reading.
+    """
+    assert normalized_amount_from_text("20.877.777") == "20877777"
+    assert normalized_amount_from_text("$20.877.777") == "20877777"
+    assert normalized_amount_from_text("U$S 1.000.000") == "1000000"
+    assert normalized_amount_from_text("1.234.567,89") == "1234567.89"
+    assert normalized_amount_from_text("1.234,5") == "1234.5"
+    assert normalized_amount_from_text("€2.500.000.000") == "2500000000"
+    assert normalized_amount_from_name("R$1.500.000.000 debentures") == "1500000000"
+    # Unchanged: the US convention and the ambiguous single group.
+    assert normalized_amount_from_text("20,877,777") == "20877777"
+    assert normalized_amount_from_text("1,234,567.89") == "1234567.89"
+    assert normalized_amount_from_text("$500.5 million") == "500500000"
+    assert normalized_amount_from_text("30.000") == "30"
+    assert normalized_amount_from_text("12.03.2024") == "12.03"
+
+
 def test_single_letter_magnitudes_parse_to_full_amounts() -> None:
     """`$250M` is 250 million, on a cited span and inside a name.
 

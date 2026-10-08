@@ -252,7 +252,7 @@ LETTER_AMOUNT_MAGNITUDE_PATTERN = re.compile(
 AMOUNT_SCALE_ALTERNATION = "|".join(sorted(AMOUNT_MULTIPLIERS, key=len, reverse=True))
 NAME_EMBEDDED_AMOUNT_PATTERN = re.compile(
     r"(?P<currency>[A-Z]{0,2}\$|€|£|¥)\s?"
-    r"(?P<value>\d[\d,]*(?:\.\d+)?)"
+    r"(?P<value>\d(?:[\d.,]*\d)?)"
     rf"(?:\s*(?P<scale>{AMOUNT_SCALE_ALTERNATION})\b\.?"
     r"|(?-i:(?P<letter>MM|mm|[KMBkmb]))(?![A-Za-z]))?",
     re.IGNORECASE,
