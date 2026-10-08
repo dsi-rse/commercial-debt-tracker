@@ -11,6 +11,7 @@ from cdt.matcher.compat import (
     NAME_CLASS_GATE,
     end_dates_are_compatible,
     name_class_sizes,
+    name_fingerprints_are_compatible,
     name_rate_tokens,
     name_rates_are_compatible,
 )
@@ -1276,6 +1277,26 @@ def test_two_extracted_parents_refuse_rather_than_fall_back_to_a_guess() -> None
 
     assert links["m-a"]["amendment_of_debt_instrument_id"] is None
     assert links["m-a"]["amendment_inferred_by"] is None
+
+
+def test_names_differing_only_by_a_stopword_are_compatible() -> None:
+    """`the 2034 Notes` and `2034 Notes` name one instrument.
+
+    The informative tokens are identical, so the class-designator check (which
+    refuses `Tranche A Loan` against `Tranche B Loan`) has nothing to judge and
+    must not refuse the pair.
+    """
+    fp = normalize_name_fingerprint
+
+    assert name_fingerprints_are_compatible(
+        fp("The Senior Notes due 2034"), fp("Senior Notes due 2034")
+    )
+    assert name_fingerprints_are_compatible(
+        fp("New 7.5% Senior Notes due 2034"), fp("7.5% Senior Notes due 2034")
+    )
+    assert not name_fingerprints_are_compatible(
+        fp("Tranche A Term Loan"), fp("Tranche B Term Loan")
+    )
 
 
 def _cycle_links(dated_parents: dict[str, tuple[str, str]]) -> dict[str, dict]:
