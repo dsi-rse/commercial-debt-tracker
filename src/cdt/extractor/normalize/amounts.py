@@ -28,6 +28,7 @@ from cdt.extractor.schema import (
     QUALIFIED_DOLLAR_PATTERN,
     RATE_PCT_PATTERN,
     RATE_SUFFIX_PATTERN,
+    SEPARATED_FIGURE_PATTERN,
 )
 from cdt.extractor.tags import (
     cluster_payload,
@@ -330,16 +331,22 @@ def magnitude_in_amount_text(text: str | None) -> int | None:
         # `$500 mm`, while `million` still cannot match inside a longer word.
         if re.search(rf"(?<![a-z]){word}\b", lowered):
             return AMOUNT_MULTIPLIERS[word]
-    letter = LETTER_AMOUNT_MAGNITUDE_PATTERN.search(text.replace(",", ""))
-    if letter is not None:
-        return LETTER_AMOUNT_MULTIPLIERS[
-            (letter.group("upper") or letter.group("lower")).lower()
-        ]
-    return None
+    # A letter counts only on the figure the parser reads, so `$500,000 (Tranche
+    # 1B)` is not read as billions.
+    figure = SEPARATED_FIGURE_PATTERN.search(text)
+    if figure is None:
+        return None
+    letter = LETTER_AMOUNT_MAGNITUDE_PATTERN.match(text, figure.end())
+    if letter is None:
+        return None
+    if letter.group(0).islower() and not _CURRENCY_BEFORE_FIGURE.search(
+        text, 0, figure.start()
+    ):
+        return None
+    return LETTER_AMOUNT_MULTIPLIERS[letter.group(0).lower()]
 
 
-# A figure with its separators, ending on a digit.
-_SEPARATED_FIGURE = re.compile(r"\d(?:[\d.,]*\d)?")
+_CURRENCY_BEFORE_FIGURE = re.compile(r"[$€£¥]\s?$")
 _DOT_THOUSANDS_FIGURE = re.compile(r"\d{1,3}(?:\.\d{3}){2,}")
 
 
@@ -352,7 +359,7 @@ def _figure_with_unambiguous_separators(text: str) -> str | None:
     `1,234,567.89`). None for every other figure, including the ambiguous
     `30.000`, which the caller reads in the US convention.
     """
-    match = _SEPARATED_FIGURE.search(text)
+    match = SEPARATED_FIGURE_PATTERN.search(text)
     if match is None:
         return None
     figure = match.group(0)

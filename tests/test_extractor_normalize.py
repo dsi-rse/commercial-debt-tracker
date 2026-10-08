@@ -1396,6 +1396,8 @@ def test_single_letter_magnitudes_parse_to_full_amounts() -> None:
     assert normalized_amount_from_text("250m") == "250"
     assert normalized_amount_from_text("$250MMBtu") == "250"
     assert normalized_amount_from_text("$250 Mortgage") == "250"
+    # The letter must sit on the figure the parser reads.
+    assert normalized_amount_from_text("$500,000 (Tranche 1B)") == "500000"
 
 
 def test_magnitude_in_amount_text_is_the_magnitude_the_parser_applies() -> None:
