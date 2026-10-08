@@ -480,12 +480,21 @@ def write_run_checkpoint(
 ) -> int:
     """Persist what a running extract has finished so far; return the new audit offset.
 
-    Merges the failures so far, saves the registry, and writes the audit
-    records from ``audit_offset`` on to checkpoint ``index``'s file. The run's
-    final :func:`write_run_records` writes ``full.jsonl``, after which its
-    caller deletes the checkpoint files; a run that never got that far leaves
-    them as its audit.
+    Writes the audit records from ``audit_offset`` on to checkpoint ``index``'s
+    file, merges the failures so far, then saves the registry: a row the
+    registry marks done already has its audit record and, if it failed, its
+    failure record. The run's final :func:`write_run_records` writes
+    ``full.jsonl``, after which its caller deletes the checkpoint files; a run
+    that never got that far leaves them as its audit.
     """
+    records = outcomes.audit_records[audit_offset:]
+    if records:
+        write_text_artifact(
+            checkpoint_audit_path(
+                outcomes.run_id, index, artifact_root=artifact_root, data_dir=data_dir
+            ),
+            "\n".join(records) + "\n",
+        )
     merge_row_failures(
         outcomes.failed_rows,
         outcomes.succeeded_item_ids,
@@ -495,14 +504,6 @@ def write_run_checkpoint(
     save_completion_registry(
         "extract", registry, artifact_root=artifact_root, data_dir=data_dir
     )
-    records = outcomes.audit_records[audit_offset:]
-    if records:
-        write_text_artifact(
-            checkpoint_audit_path(
-                outcomes.run_id, index, artifact_root=artifact_root, data_dir=data_dir
-            ),
-            "\n".join(records) + "\n",
-        )
     return len(outcomes.audit_records)
 
 

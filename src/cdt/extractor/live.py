@@ -61,11 +61,12 @@ def extract_pending_items(
 ) -> pd.DataFrame:
     """Extract instrument mentions for classified item partitions.
 
-    What a run has paid for is committed as it goes, at most every
-    :data:`cdt.completion.CHECKPOINT_INTERVAL_SECONDS` and at every partition
-    end: the mentions so far (a partition part-way through included), then the
-    failure registry, the completion registry and the audit records since the
-    last commit. So an interruption of any kind (a crash, a kill, a lost lease)
+    What a run has paid for is committed as it goes: at every partition end,
+    and within a partition whenever :data:`cdt.completion.CHECKPOINT_INTERVAL_SECONDS`
+    has passed since the last commit. A commit writes the partition's mentions
+    so far, then the audit records since the last commit, the failure registry
+    and last the completion registry, so the registry never marks a row done
+    before its mentions and its failure record are on disk. So an interruption of any kind (a crash, a kill, a lost lease)
     loses at most one interval of work, and the next run resumes at the rows
     with no verdict.
 
@@ -156,6 +157,10 @@ def extract_pending_items(
         relevant_item_ids = {
             str(value) for value in relevant_items["item_id"].astype(str)
         }
+        # Rows this partition was extracted for last time and no longer has.
+        # Pruned by every write of the partition, mid-partition commits
+        # included: the registry entry a commit saves already forgets them.
+        retired_item_ids = set(pending.done_item_ids) - relevant_item_ids
         terminal_ids = set(pending.done_item_ids)
         mention_rows: list[dict[str, object]] = []
         replaced_item_ids: set[str] = set()
@@ -202,7 +207,7 @@ def extract_pending_items(
                         mention_rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS
                     ),
                     replaced_item_ids=replaced_item_ids,
-                    retired_item_ids=set(),
+                    retired_item_ids=retired_item_ids,
                 )
                 registry[pending.classification_path] = completion_entry(
                     pending.fingerprint, terminal_ids, relevant_item_ids
@@ -225,8 +230,6 @@ def extract_pending_items(
                 )
 
         mentions = pd.DataFrame(mention_rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
-        # Rows this partition was extracted for last time and no longer has.
-        retired_item_ids = set(pending.done_item_ids) - relevant_item_ids
         if keep_lease is not None:
             keep_lease()
         written = write_mentions_partition(
@@ -246,8 +249,7 @@ def extract_pending_items(
         registry[pending.classification_path] = completion_entry(
             pending.fingerprint, terminal_ids, relevant_item_ids
         )
-        if commit_due():
-            commit()
+        commit()
         LOGGER.info(
             "Extraction partition complete: %s progress=%s/%s classified_items=%s relevant_items=%s mentions=%s wrote_output=%s elapsed=%.1fs",
             partition_label,

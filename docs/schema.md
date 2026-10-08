@@ -146,12 +146,16 @@ of partitions:
 - `segment` and `classify` (both genres): completion is saved at most every
   `cdt.completion.CHECKPOINT_INTERVAL_SECONDS` (300 s) and once at the end. The
   writer lease is renewed per partition, throttled to the same interval.
-- `extract` (live backend): commits what it has paid for at most every
-  `CHECKPOINT_INTERVAL_SECONDS` and at every partition end. That is the mentions
-  so far (a partition part-way through included), then the failure registry, the
-  completion registry (an incomplete entry names the rows already terminal), and
-  the audit records since the last commit. A resumed run pays only for rows with
-  no verdict. The batch backend persists every row's state at each tick and sizes
+- `extract` (live backend): commits what it has paid for at every partition end,
+  and within a partition once `CHECKPOINT_INTERVAL_SECONDS` has passed since the
+  last commit. A commit writes, in order:
+  1. the partition's mentions so far, with rows that left the source pruned;
+  2. the audit records since the last commit;
+  3. the failure registry;
+  4. the completion registry, where an incomplete entry names the rows already
+     terminal.
+
+  A resumed run pays only for rows with no verdict. The batch backend persists every row's state at each tick and sizes
   its work with `cdt run poll`'s `--max-rows-per-job`,
   `--max-requests-per-batch` and `--max-batch-bytes`.
 - `match`: processes every `cik_shard` group in turn, renewing the lease per

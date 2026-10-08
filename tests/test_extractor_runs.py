@@ -541,3 +541,121 @@ def test_a_live_run_that_loses_its_lease_keeps_its_committed_rows(
     assert calls == ["a-8-01", "b-8-01"]
     (entry,) = load_completion_registry("extract", artifact_root=tmp_path).values()
     assert set(entry.item_ids) == {"a-8-01", "b-8-01"}
+
+
+def test_a_crash_after_a_mid_partition_commit_still_prunes_departed_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row that left the source loses its mentions even if the run then dies.
+
+    The mid-partition commit saves a registry entry that no longer names the
+    departed row, so its write must already prune it: no later run would.
+    """
+    from cdt.extractor import live as live_module
+
+    _seed_classifications(tmp_path, ["a-8-01", "x-8-01"])
+    _fake_success_workflow(monkeypatch)
+    extract_pending_items(artifact_root=tmp_path, client=None)
+    # x leaves the source; c, d and e arrive.
+    _seed_classifications(tmp_path, ["a-8-01", "c-8-01", "d-8-01", "e-8-01"])
+    _commit_after_every_item(monkeypatch)
+    succeed = live_module.run_extraction_workflow
+
+    async def crash_on_e(**kwargs: object) -> ExtractionRowState:
+        if kwargs["item_row"]["item_id"] == "e-8-01":
+            raise RuntimeError("killed")
+        return await succeed(**kwargs)
+
+    monkeypatch.setattr(live_module, "run_extraction_workflow", crash_on_e)
+    with pytest.raises(RuntimeError, match="killed"):
+        extract_pending_items(artifact_root=tmp_path, client=None)
+    assert "x-8-01" not in set(read_dataset(mentions_root(tmp_path))["item_id"])
+
+    monkeypatch.setattr(live_module, "run_extraction_workflow", succeed)
+    extract_pending_items(artifact_root=tmp_path, client=None)
+    assert sorted(read_dataset(mentions_root(tmp_path))["item_id"]) == [
+        "a-8-01",
+        "c-8-01",
+        "d-8-01",
+        "e-8-01",
+    ]
+
+
+def test_every_partition_end_commits_even_inside_one_interval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash in the second partition keeps the first one's completion."""
+    from cdt.completion import load_completion_registry
+    from cdt.extractor import live as live_module
+
+    _seed_classifications(tmp_path, ["a-8-01"], date="2024-01-02")
+    _seed_classifications(tmp_path, ["b-8-01"], date="2024-01-03")
+    calls = _fake_success_workflow(monkeypatch)
+    # The clock never moves, so no interval ever elapses.
+    monkeypatch.setattr(live_module, "monotonic", lambda: 0.0)
+    succeed = live_module.run_extraction_workflow
+
+    async def crash_on_b(**kwargs: object) -> ExtractionRowState:
+        if kwargs["item_row"]["item_id"] == "b-8-01":
+            raise RuntimeError("killed")
+        return await succeed(**kwargs)
+
+    monkeypatch.setattr(live_module, "run_extraction_workflow", crash_on_b)
+    with pytest.raises(RuntimeError, match="killed"):
+        extract_pending_items(artifact_root=tmp_path, client=None)
+
+    registry = load_completion_registry("extract", artifact_root=tmp_path)
+    assert [set(entry.item_ids) for entry in registry.values()] == [{"a-8-01"}]
+
+    calls.clear()
+    monkeypatch.setattr(live_module, "run_extraction_workflow", succeed)
+    extract_pending_items(artifact_root=tmp_path, client=None)
+    assert calls == ["b-8-01"]
+
+
+def test_a_commit_records_mentions_and_failures_before_the_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the registry save dies, nothing it would have marked done is unrecorded."""
+    from cdt.datasets import load_row_failures
+    from cdt.extractor import live as live_module
+    from cdt.extractor import outputs as outputs_module
+
+    _seed_classifications(tmp_path, ["a-8-01", "f-8-01", "c-8-01"])
+    _commit_after_every_item(monkeypatch)
+
+    async def fail_f(**kwargs: object) -> ExtractionRowState:
+        item_row = kwargs["item_row"]
+        row_state = ExtractionRowState(item_row=item_row, stage_name="instrument_ie")
+        if item_row["item_id"] == "f-8-01":
+            row_state.finish("FAILED")
+        else:
+            row_state.debt_instrument_mentions = [
+                {"item_id": str(item_row["item_id"]), "name": "Term Loan"}
+            ]
+            row_state.finish("SUCCESS")
+        return row_state
+
+    monkeypatch.setattr(live_module, "run_extraction_workflow", fail_f)
+    saves: list[int] = []
+
+    def registry_save_dies_on_the_second_commit(
+        *args: object, **kwargs: object
+    ) -> None:
+        saves.append(1)
+        if len(saves) == 2:  # noqa: PLR2004
+            raise OSError("storage down")
+
+    monkeypatch.setattr(
+        outputs_module,
+        "save_completion_registry",
+        registry_save_dies_on_the_second_commit,
+    )
+    with pytest.raises(OSError, match="storage down"):
+        extract_pending_items(artifact_root=tmp_path, client=None)
+
+    # The second commit covered a and f: both are on disk although the
+    # registry save that would have marked them done never happened.
+    assert set(read_dataset(mentions_root(tmp_path))["item_id"]) == {"a-8-01"}
+    assert set(load_row_failures("extract", artifact_root=tmp_path)) == {"f-8-01"}
+    assert list((tmp_path / "extractor-runs").glob("run_id=*/checkpoint-0001.jsonl"))
