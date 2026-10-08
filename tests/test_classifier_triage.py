@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Self
 
 import dotenv
+import httpx
+import openai
 import pytest
 
 from cdt import settings
@@ -460,3 +462,38 @@ def test_the_eight_k_default_model_dir_is_the_committed_artifact() -> None:
         settings.PROJECT_ROOT / "data" / "models" / "classifier" / "tfidf-linear-svc"
     )
     assert (eightk_default_model_dir() / "model.pkl").exists()
+
+
+@pytest.mark.parametrize(
+    ("error", "infrastructure"),
+    [
+        (
+            openai.APIConnectionError(
+                request=httpx.Request("POST", "https://api.openai.com")
+            ),
+            True,
+        ),
+        (
+            openai.APITimeoutError(
+                request=httpx.Request("POST", "https://api.openai.com")
+            ),
+            True,
+        ),
+        (ValueError("bad request body"), False),
+    ],
+)
+def test_a_client_error_records_whether_it_was_infrastructure(
+    error: Exception, infrastructure: bool
+) -> None:
+    """The stage holds a partition on a transport failure, not on a 400-like one."""
+
+    class RaisingClient:
+        async def complete(self: Self, **kwargs: object) -> str:
+            del kwargs
+            raise error
+
+    verdict = asyncio.run(triage_filing(RaisingClient(), "acc-1", _snippets(1)))
+
+    assert verdict.kept == ["s1"]
+    assert verdict.error is not None
+    assert verdict.infrastructure_error is infrastructure

@@ -23,6 +23,7 @@ from cdt.classifier.core import (
     score_model,
 )
 from cdt.extractor.llm import normalize_reasoning_effort
+from cdt.extractor.state import is_infrastructure_error
 from cdt.shared import get_logger
 
 if TYPE_CHECKING:
@@ -133,6 +134,9 @@ class FilingVerdict:
 
     ``dropped_duplicate`` holds ``(dropped_id, covered_by_id)`` pairs. ``error``
     is ``None`` on success; when set, ``kept`` holds every snippet.
+    ``infrastructure_error`` marks an ``error`` from the provider or transport
+    (see :func:`cdt.extractor.state.is_infrastructure_error`) rather than from
+    the model's answers.
     """
 
     accession_number: str
@@ -141,6 +145,7 @@ class FilingVerdict:
     dropped_duplicate: list[tuple[str, str]] = field(default_factory=list)
     attempts: int = 1
     error: str | None = None
+    infrastructure_error: bool = False
 
 
 def default_model_dir() -> Path:
@@ -414,6 +419,7 @@ async def triage_filing(
                 kept=[snippet.snippet_id for snippet in snippets],
                 attempts=attempt,
                 error=repr(error),
+                infrastructure_error=is_infrastructure_error(error),
             )
         try:
             verdict = json.loads(text)

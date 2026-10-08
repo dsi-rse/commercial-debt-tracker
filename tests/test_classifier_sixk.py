@@ -140,6 +140,15 @@ class RecordingStage1(FakeStage1):
         return super().decision_function(texts)
 
 
+class _ProviderError(RuntimeError):
+    """An SDK-style error carrying the HTTP status of a failed call."""
+
+    def __init__(self: Self, status_code: int) -> None:
+        """Remember the status."""
+        super().__init__(f"HTTP {status_code}")
+        self.status_code = status_code
+
+
 class FakeChatClient:
     """A stage-2 stand-in returning canned verdicts, or raising."""
 
@@ -484,10 +493,11 @@ def test_triage_needs_no_api_key_when_nothing_is_admitted(tmp_path: Path) -> Non
 def test_triage_degrades_to_stage_one_output_when_stage_two_fails(
     tmp_path: Path,
 ) -> None:
-    """A stage-2 outage keeps every admitted window rather than losing data.
+    """A stage-2 call the provider rejects keeps every admitted window.
 
-    Costs roughly twice as much extraction for that filing and loses no recall,
-    which is the right direction to fail in.
+    A 400 will not succeed on retry, so the filing fails open: roughly twice
+    as much extraction for it and no recall lost, the right direction to fail
+    in. A provider outage instead holds the partition (see below).
     """
     documents = pd.DataFrame(
         [
@@ -500,7 +510,7 @@ def test_triage_degrades_to_stage_one_output_when_stage_two_fails(
         ],
         columns=DOCUMENT_COLUMNS,
     )
-    client = FakeChatClient(error=RuntimeError("provider down"))
+    client = FakeChatClient(error=_ProviderError(400))
 
     snippets = triage_documents(
         documents, artifacts=(FakeStage1(), 0.332), client=client
@@ -760,6 +770,69 @@ def test_stage_skips_a_partition_it_has_already_triaged(tmp_path: Path) -> None:
     assert first_client.calls
     assert second_client.calls == []
     assert again.empty
+
+
+def test_a_stage_two_outage_leaves_the_partition_pending(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A 503 writes nothing and records no completion, so the next run re-triages.
+
+    Failing open here would send the filing to extraction untriaged and mark
+    the partition complete, so it would never be triaged.
+    """
+    _write_documents(
+        tmp_path,
+        [
+            _document_row(
+                tmp_path, submission=_submission(("6-K", f"<p>{DEBT_PROSE}</p>"))
+            )
+        ],
+    )
+
+    with caplog.at_level("WARNING"):
+        held = segment_and_classify_pending(
+            artifact_root=str(tmp_path),
+            client=FakeChatClient(error=_ProviderError(503)),
+        )
+
+    assert held.empty
+    assert list_artifacts(sixk_snippets_root(str(tmp_path)), suffix=".parquet") == []
+    # Recorded with no fingerprint, so it matches nothing and stays pending.
+    registry = load_completion_registry("sixk-classify", artifact_root=str(tmp_path))
+    assert [entry.fingerprint for entry in registry.values()] == [None]
+    assert "left pending after stage-2 provider failures" in caplog.text
+
+    recovered = segment_and_classify_pending(
+        artifact_root=str(tmp_path), client=FakeChatClient(keep_all=True)
+    )
+
+    assert set(recovered["sixk_verdict"]) == {VERDICT_KEPT}
+    registry = load_completion_registry("sixk-classify", artifact_root=str(tmp_path))
+    assert [entry.fingerprint is not None for entry in registry.values()] == [True]
+
+
+def test_exhausted_stage_two_validation_still_completes_the_partition(
+    tmp_path: Path,
+) -> None:
+    """A model that never returns a usable verdict fails open, as before."""
+    _write_documents(
+        tmp_path,
+        [
+            _document_row(
+                tmp_path, submission=_submission(("6-K", f"<p>{DEBT_PROSE}</p>"))
+            )
+        ],
+    )
+
+    snippets = segment_and_classify_pending(
+        artifact_root=str(tmp_path),
+        client=FakeChatClient(responses=["not json"] * 3),
+        max_attempts=3,
+    )
+
+    assert set(snippets["sixk_verdict"]) == {VERDICT_KEPT_DEGRADED}
+    registry = load_completion_registry("sixk-classify", artifact_root=str(tmp_path))
+    assert [entry.fingerprint is not None for entry in registry.values()] == [True]
 
 
 def test_stage_retriages_a_partition_ingest_grew(tmp_path: Path) -> None:

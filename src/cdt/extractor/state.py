@@ -58,11 +58,18 @@ def is_infrastructure_error(exc: BaseException) -> bool:
         value = getattr(exc, attribute, None)
         if isinstance(value, int) and value in _INFRASTRUCTURE_STATUSES:
             return True
-    # Provider SDKs name their billing/rate errors without exposing a status.
+    # Provider SDKs name their billing/rate/transport errors without exposing a
+    # status (openai's APIConnectionError and APITimeoutError among them).
     name = type(exc).__name__.casefold()
     return any(
         marker in name
-        for marker in ("paymentrequired", "ratelimit", "serviceunavailable")
+        for marker in (
+            "paymentrequired",
+            "ratelimit",
+            "serviceunavailable",
+            "connectionerror",
+            "timeout",
+        )
     )
 
 
