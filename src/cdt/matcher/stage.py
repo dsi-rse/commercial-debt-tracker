@@ -93,7 +93,6 @@ def match_pending_mentions(
     *,
     artifact_root: str | Path | None = None,
     data_dir: Path | None = None,
-    batch_size: int = 100,
     force: bool = False,
     strong_match_threshold: float = DEFAULT_MEMBERSHIP_THRESHOLD,
     loose_match_threshold: float = DEFAULT_RELATED_THRESHOLD,
@@ -108,12 +107,7 @@ def match_pending_mentions(
     rewritten and must raise if the writer lease has been lost. Returns
     ``{"debt_instrument_mentions": edges, "debt_instrument": instruments}``
     for every shard written (empty frames when there are no mentions).
-
-    Raises:
-        ValueError: ``batch_size`` is not positive.
     """
-    if batch_size <= 0:
-        raise ValueError(f"batch_size must be positive, got {batch_size}")
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     if not force:
         force = _stale_schema_forces_rematch(resolved_root, data_dir=data_dir)
@@ -140,71 +134,69 @@ def match_pending_mentions(
     partitions_written: list[str] = []
     shard_groups = list(mention_rows.groupby("cik_shard"))
     total_partitions = len(shard_groups)
-    for chunk_start in range(0, total_partitions, batch_size):
-        chunk_groups = shard_groups[chunk_start : chunk_start + batch_size]
-        for partition_index, (cik_shard, shard_mentions) in enumerate(
-            chunk_groups, start=chunk_start + 1
-        ):
-            if renew is not None:
-                renew()
-            partition_start = perf_counter()
-            if force:
-                existing_edges = pd.DataFrame(columns=MENTION_CLUSTER_EDGE_COLUMNS)
-                existing_instruments = pd.DataFrame(columns=DEBT_INSTRUMENT_COLUMNS)
-            else:
-                existing_edges = read_dataset(
-                    mention_cluster_edges_root(resolved_root, data_dir=data_dir),
-                    partition_filter={"cik_shard": str(cik_shard)},
-                )
-                existing_instruments = read_dataset(
-                    debt_instruments_root(resolved_root, data_dir=data_dir),
-                    partition_filter={"cik_shard": str(cik_shard)},
-                )
-            tables = match_tables(
-                shard_mentions.drop(columns=["cik_shard"]),
-                existing_edges=existing_edges,
-                existing_instruments=existing_instruments,
-                strong_match_threshold=strong_match_threshold,
-                loose_match_threshold=loose_match_threshold,
-                ambiguity_margin=ambiguity_margin,
-                company_names=company_names,
-            )
-            mention_cluster_edges = tables["debt_instrument_mentions"].reindex(
-                columns=MENTION_CLUSTER_EDGE_COLUMNS
-            )
-            debt_instruments = tables["debt_instrument"].reindex(
-                columns=DEBT_INSTRUMENT_COLUMNS
-            )
-            write_partition_table(
+    for partition_index, (cik_shard, shard_mentions) in enumerate(
+        shard_groups, start=1
+    ):
+        if renew is not None:
+            renew()
+        partition_start = perf_counter()
+        if force:
+            existing_edges = pd.DataFrame(columns=MENTION_CLUSTER_EDGE_COLUMNS)
+            existing_instruments = pd.DataFrame(columns=DEBT_INSTRUMENT_COLUMNS)
+        else:
+            existing_edges = read_dataset(
                 mention_cluster_edges_root(resolved_root, data_dir=data_dir),
-                partition={"cik_shard": str(cik_shard)},
-                table=mention_cluster_edges,
+                partition_filter={"cik_shard": str(cik_shard)},
             )
-            write_partition_table(
+            existing_instruments = read_dataset(
                 debt_instruments_root(resolved_root, data_dir=data_dir),
-                partition={"cik_shard": str(cik_shard)},
-                table=debt_instruments,
+                partition_filter={"cik_shard": str(cik_shard)},
             )
-            edge_frames.append(mention_cluster_edges)
-            instrument_frames.append(debt_instruments)
-            partitions_written.append(
-                cik_shard_partition_path(
-                    DEBT_INSTRUMENT_DATASET_NAME,
-                    cik_shard=str(cik_shard),
-                    artifact_root=resolved_root,
-                    data_dir=data_dir,
-                )
+        tables = match_tables(
+            shard_mentions.drop(columns=["cik_shard"]),
+            existing_edges=existing_edges,
+            existing_instruments=existing_instruments,
+            strong_match_threshold=strong_match_threshold,
+            loose_match_threshold=loose_match_threshold,
+            ambiguity_margin=ambiguity_margin,
+            company_names=company_names,
+        )
+        mention_cluster_edges = tables["debt_instrument_mentions"].reindex(
+            columns=MENTION_CLUSTER_EDGE_COLUMNS
+        )
+        debt_instruments = tables["debt_instrument"].reindex(
+            columns=DEBT_INSTRUMENT_COLUMNS
+        )
+        write_partition_table(
+            mention_cluster_edges_root(resolved_root, data_dir=data_dir),
+            partition={"cik_shard": str(cik_shard)},
+            table=mention_cluster_edges,
+        )
+        write_partition_table(
+            debt_instruments_root(resolved_root, data_dir=data_dir),
+            partition={"cik_shard": str(cik_shard)},
+            table=debt_instruments,
+        )
+        edge_frames.append(mention_cluster_edges)
+        instrument_frames.append(debt_instruments)
+        partitions_written.append(
+            cik_shard_partition_path(
+                DEBT_INSTRUMENT_DATASET_NAME,
+                cik_shard=str(cik_shard),
+                artifact_root=resolved_root,
+                data_dir=data_dir,
             )
-            LOGGER.info(
-                "Matcher partition complete: cik_shard=%s progress=%s/%s mentions=%s edge_rows=%s debt_instruments=%s elapsed=%.1fs",
-                cik_shard,
-                partition_index,
-                total_partitions,
-                len(shard_mentions),
-                len(mention_cluster_edges),
-                len(debt_instruments),
-                perf_counter() - partition_start,
-            )
+        )
+        LOGGER.info(
+            "Matcher partition complete: cik_shard=%s progress=%s/%s mentions=%s edge_rows=%s debt_instruments=%s elapsed=%.1fs",
+            cik_shard,
+            partition_index,
+            total_partitions,
+            len(shard_mentions),
+            len(mention_cluster_edges),
+            len(debt_instruments),
+            perf_counter() - partition_start,
+        )
     write_json_artifact(
         run_manifest_path(
             "match",
@@ -215,7 +207,6 @@ def match_pending_mentions(
         {
             "artifact_root": resolved_root,
             "stage": "match",
-            "batch_size": batch_size,
             "partitions_written": partitions_written,
             "membership_threshold": strong_match_threshold,
             "related_threshold": loose_match_threshold,

@@ -61,7 +61,7 @@ DEFAULT_AWS_PROFILE = ""
 DEFAULT_S3_PREFIX = "sec"
 
 
-DEFAULT_BATCH_SIZE = 100
+DEFAULT_FLUSH_ROWS = 100
 PROGRESS_DAY_INTERVAL = 30
 # {prefix...}/{date}/{form}/{cik}/{accession}/manifest.json — the CIK is
 # counted from the end so a multi-segment --s3-prefix cannot shift it.
@@ -219,7 +219,9 @@ class IngestConfig:
     data_dir: Path | None = None
     output_root: str | None = None
     force: bool = False
-    batch_size: int = DEFAULT_BATCH_SIZE
+    #: Document rows buffered before each write. Each write rewrites the
+    #: partitions its rows land in, so a larger buffer means fewer rewrites.
+    flush_rows: int = DEFAULT_FLUSH_ROWS
     download: bool = False
     failure_file: str | Path | None = None
     aws_profile: str = DEFAULT_AWS_PROFILE
@@ -299,10 +301,10 @@ def run_ingest_pipeline(
         The documents frame (see ``return_documents``) and the run summary.
 
     Raises:
-        ValueError: If ``config.batch_size`` is not positive.
+        ValueError: If ``config.flush_rows`` is not positive.
     """
-    if config.batch_size <= 0:
-        msg = f"batch_size must be positive, got {config.batch_size}"
+    if config.flush_rows <= 0:
+        msg = f"flush_rows must be positive, got {config.flush_rows}"
         raise ValueError(msg)
 
     # Built on demand: a run that never touches S3 must not need a profile.
@@ -334,14 +336,14 @@ def run_ingest_pipeline(
 
     LOGGER.info(
         "Starting ingest: mode=%s bucket=%s forms=%s dataset=%s start_date=%s "
-        "end_date=%s batch_size=%s download=%s",
+        "end_date=%s flush_rows=%s download=%s",
         config.mode,
         config.bucket,
         ",".join(config.form_types),
         config.dataset_name,
         config.start_date,
         config.end_date,
-        config.batch_size,
+        config.flush_rows,
         config.download,
     )
 
@@ -430,7 +432,7 @@ def run_ingest_pipeline(
                 failure_registry.discard(_failure_key_for_candidate(candidate))
 
         pending_rows.append(row)
-        if len(pending_rows) >= config.batch_size:
+        if len(pending_rows) >= config.flush_rows:
             flush_pending_rows()
             if renew is not None:
                 renew()

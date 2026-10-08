@@ -29,11 +29,11 @@ from cdt.extractor import (
 from cdt.ingest.core import (
     DEFAULT_AWS_PROFILE,
     DEFAULT_BUCKET,
+    DEFAULT_FLUSH_ROWS,
     DEFAULT_S3_PREFIX,
     IngestConfig,
     IngestRunResult,
 )
-from cdt.ingest.core import DEFAULT_BATCH_SIZE as DEFAULT_INGEST_BATCH_SIZE
 from cdt.ingest.genres import ingest_genre
 from cdt.lease import LeaseLostError
 from cdt.matcher import (
@@ -59,7 +59,6 @@ ALL_TIME_START_DATE = date(1994, 1, 1)
 # Daily mode re-scans this many days back, ending yesterday, so late or
 # repaired scraper manifests are still picked up.
 DAILY_LOOKBACK_DAYS = 5
-DEFAULT_STAGE_BATCH_SIZE = 100
 #: The CIK-file value that selects every filer (see :func:`read_cik_file`).
 ALL_CIKS = "all"
 PIPELINE_MODES = ("daily", "historical")
@@ -87,11 +86,8 @@ class PipelineConfig:
     failure_file: ArtifactPath | None = None
     aws_profile: str = DEFAULT_AWS_PROFILE
     s3_prefix: str = DEFAULT_S3_PREFIX
-    ingest_batch_size: int = DEFAULT_INGEST_BATCH_SIZE
-    segment_batch_size: int = DEFAULT_STAGE_BATCH_SIZE
-    classify_batch_size: int = DEFAULT_STAGE_BATCH_SIZE
-    extract_batch_size: int = DEFAULT_STAGE_BATCH_SIZE
-    match_batch_size: int = DEFAULT_STAGE_BATCH_SIZE
+    #: Document rows ingest buffers before each partition write.
+    ingest_flush_rows: int = DEFAULT_FLUSH_ROWS
     item_numbers: tuple[str, ...] = POTENTIALLY_RELEVANT_ITEM_NUMBERS
     #: The 8-K item classifier's artifact directory; None is the committed one.
     classifier_model_dir: Path | None = None
@@ -163,7 +159,6 @@ def segment_genre(
     *,
     artifact_root: ArtifactPath | None = None,
     data_dir: Path | None = None,
-    batch_size: int = DEFAULT_STAGE_BATCH_SIZE,
     force: bool = False,
     item_numbers: tuple[str, ...] = POTENTIALLY_RELEVANT_ITEM_NUMBERS,
     renew: Callable[[], None] | None = None,
@@ -179,7 +174,6 @@ def segment_genre(
         return segment_pending_eightk_documents(
             artifact_root=artifact_root,
             data_dir=data_dir,
-            batch_size=batch_size,
             force=force,
             item_numbers=item_numbers,
             renew=renew,
@@ -188,7 +182,6 @@ def segment_genre(
         return segment_pending_sixk_documents(
             artifact_root=artifact_root,
             data_dir=data_dir,
-            batch_size=batch_size,
             force=force,
             renew=renew,
         )
@@ -200,7 +193,6 @@ def classify_genre(
     *,
     artifact_root: ArtifactPath | None = None,
     data_dir: Path | None = None,
-    batch_size: int = DEFAULT_STAGE_BATCH_SIZE,
     force: bool = False,
     model_dir: Path | None = None,
     sixk_model_dir: Path | None = None,
@@ -220,7 +212,6 @@ def classify_genre(
             artifact_root=artifact_root,
             data_dir=data_dir,
             model_dir=model_dir,
-            batch_size=batch_size,
             force=force,
             renew=renew,
         )
@@ -228,7 +219,6 @@ def classify_genre(
         return triage_pending_windows(
             artifact_root=artifact_root,
             data_dir=data_dir,
-            batch_size=batch_size,
             force=force,
             model_dir=sixk_model_dir,
             concurrency=sixk_concurrency,
@@ -303,7 +293,7 @@ class Pipeline:
             data_dir=self.config.data_dir,
             output_root=resolved_artifact_root,
             force=self.config.force,
-            batch_size=self.config.ingest_batch_size,
+            flush_rows=self.config.ingest_flush_rows,
             download=self.config.download,
             failure_file=self.config.failure_file
             or failure_registry_path(
@@ -376,7 +366,7 @@ class Pipeline:
         self._log_stage_start(
             "ingest",
             genre=genre,
-            batch_size=self.config.ingest_batch_size,
+            flush_rows=self.config.ingest_flush_rows,
             ciks=ALL_CIKS if ciks is None else len(ciks),
         )
         _, ingest_result = ingest_genre(
@@ -395,14 +385,11 @@ class Pipeline:
         )
         self._renew(renew)
 
-        self._log_stage_start(
-            "segment", genre=genre, batch_size=self.config.segment_batch_size
-        )
+        self._log_stage_start("segment", genre=genre)
         segmented = segment_genre(
             genre,
             artifact_root=resolved_artifact_root,
             data_dir=self.config.data_dir,
-            batch_size=self.config.segment_batch_size,
             force=self.config.force,
             item_numbers=self.config.item_numbers,
             renew=renew,
@@ -410,14 +397,11 @@ class Pipeline:
         self._log_stage_complete("segment", genre=genre, rows=len(segmented))
         self._renew(renew)
 
-        self._log_stage_start(
-            "classify", genre=genre, batch_size=self.config.classify_batch_size
-        )
+        self._log_stage_start("classify", genre=genre)
         classified = classify_genre(
             genre,
             artifact_root=resolved_artifact_root,
             data_dir=self.config.data_dir,
-            batch_size=self.config.classify_batch_size,
             force=self.config.force,
             model_dir=self.config.classifier_model_dir,
             sixk_model_dir=self.config.sixk_model_dir,
@@ -453,13 +437,11 @@ class Pipeline:
 
         self._log_stage_start(
             "extract",
-            batch_size=self.config.extract_batch_size,
             model=self.config.extractor_model,
         )
         extracted = extract_pending_items(
             artifact_root=resolved_artifact_root,
             data_dir=self.config.data_dir,
-            batch_size=self.config.extract_batch_size,
             force=self.config.force,
             model=self.config.extractor_model,
             reasoning_effort=self.config.extractor_reasoning_effort,
@@ -469,14 +451,10 @@ class Pipeline:
         self._log_stage_complete("extract", rows=len(extracted))
         self._renew(renew)
 
-        self._log_stage_start(
-            "match",
-            batch_size=self.config.match_batch_size,
-        )
+        self._log_stage_start("match")
         matched = match_pending_mentions(
             artifact_root=resolved_artifact_root,
             data_dir=self.config.data_dir,
-            batch_size=self.config.match_batch_size,
             force=self.config.force,
             strong_match_threshold=self.config.strong_match_threshold,
             loose_match_threshold=self.config.loose_match_threshold,
@@ -549,7 +527,6 @@ def run_match_and_finalize(
     artifact_root: ArtifactPath,
     final_database_root: ArtifactPath | None = None,
     data_dir: Path | None = None,
-    batch_size: int = DEFAULT_STAGE_BATCH_SIZE,
     force: bool = False,
     force_publish: bool = False,
     strong_match_threshold: float = DEFAULT_MEMBERSHIP_THRESHOLD,
@@ -560,8 +537,9 @@ def run_match_and_finalize(
     """Run match on existing mentions, then finalize; idempotent.
 
     ``force`` re-matches every shard; ``force_publish`` publishes past the
-    skip gate and the shrinkage guard. ``renew`` extends the caller's writer lease per matched shard and before
-    the publish, so a stolen lease cannot keep publishing.
+    skip gate and the shrinkage guard. ``renew`` extends the caller's writer
+    lease per matched shard and before the publish, so a stolen lease cannot
+    keep publishing.
 
     Returns:
         Published table name -> snapshot path; empty when nothing was published.
@@ -570,7 +548,6 @@ def run_match_and_finalize(
     tables = match_pending_mentions(
         artifact_root=resolved_root,
         data_dir=data_dir,
-        batch_size=batch_size,
         force=force,
         strong_match_threshold=strong_match_threshold,
         loose_match_threshold=loose_match_threshold,

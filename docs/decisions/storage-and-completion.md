@@ -338,15 +338,13 @@ since this run loaded its copy, and losing some of those entries silently
 strands partitions or marks them complete when they are not. So only the
 dirty entries are written, overlaid on the freshest saved state.
 
-Each shard's compare-and-swap is independent, which keeps the per-batch save
-from #111 durable for the stages that save every batch: if a save is
-interrupted after three of five shards, those three stay saved. The segment
-and classify stages of both genres save at every batch boundary (they share
-`cdt.partition_stage.run_partition_stage`). Extract does not (#227):
-`extract_pending_items` accepts `batch_size`, but the value only reaches the
-run manifest and the partition loop is never chunked. Its only save is after
-the loop, so an interruption still loses the whole run's registry progress,
-and that one save may span about 400 shards.
+Each shard's compare-and-swap is independent, which keeps the checkpointed
+saves from #111 durable: if a save is interrupted after three of five shards,
+those three stay saved. The segment and classify stages of both genres
+checkpoint every `CHECKPOINT_INTERVAL_SECONDS` (they share
+`cdt.partition_stage.run_partition_stage`). Live extract saves only after its
+partition loop (#227), so an interruption loses the whole run's registry
+progress, and that one save may span about 400 shards.
 
 The dirty set is cleared shard by shard. Without clearing, the dirty set would
 grow to the whole run's write set, so batch k would rewrite every shard that

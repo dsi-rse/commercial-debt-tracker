@@ -15,7 +15,6 @@ from cdt.extractor import ExtractTickResult
 from cdt.lease import PIPELINE_WRITER_LEASE, acquire_lease
 from cdt.pipeline import (
     DEFAULT_GENRES,
-    DEFAULT_STAGE_BATCH_SIZE,
     PipelineConfig,
     PipelineRunResult,
     PrepareResult,
@@ -404,67 +403,31 @@ def test_the_artifact_root_comes_from_the_environment(
     assert configs[0].artifact_root == str(tmp_path / "from-env")
 
 
-def test_daily_batch_warns_on_extract_batch_size(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-    keep_caplog: None,
-) -> None:
-    """--extract-batch-size is inert under the batch backend, so it must warn."""
-    _patch_prepare(monkeypatch, tmp_path)
-
-    with caplog.at_level("WARNING"):
-        assert cli.main(_daily(tmp_path, "--extract-batch-size", "25")) == 0
-
-    assert "Ignoring --extract-batch-size=25" in caplog.text
-
-
-def test_daily_batch_quiet_without_extract_batch_size(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-    keep_caplog: None,
-) -> None:
-    """The unset default must not warn, and still reaches the pipeline config."""
-    configs: list[PipelineConfig] = []
-    _patch_prepare(monkeypatch, tmp_path, configs)
-
-    with caplog.at_level("WARNING"):
-        assert cli.main(_daily(tmp_path)) == 0
-
-    assert configs[0].extract_batch_size == DEFAULT_STAGE_BATCH_SIZE
-    assert "--extract-batch-size" not in caplog.text
-
-
-def test_stage_batch_sizes_reach_the_config(
+def test_ingest_flush_rows_reaches_the_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Each stage's batch size flag lands on its own config field."""
+    """Ingest's write buffer is the one sizing flag a run takes."""
     configs: list[PipelineConfig] = []
     _patch_prepare(monkeypatch, tmp_path, configs)
 
-    status = cli.main(
-        _daily(
-            tmp_path,
-            "--ingest-batch-size",
-            "3",
-            "--segment-batch-size",
-            "4",
-            "--classify-batch-size",
-            "5",
-            "--match-batch-size",
-            "6",
-        )
-    )
+    assert cli.main(_daily(tmp_path, "--ingest-flush-rows", "3")) == 0
+    assert configs[0].ingest_flush_rows == 3  # noqa: PLR2004
 
-    assert status == 0
-    config = configs[0]
-    assert (
-        config.ingest_batch_size,
-        config.segment_batch_size,
-        config.classify_batch_size,
-        config.match_batch_size,
-    ) == (3, 4, 5, 6)
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--extract-batch-size",
+        "--match-batch-size",
+        "--segment-batch-size",
+        "--classify-batch-size",
+        "--ingest-batch-size",
+    ],
+)
+def test_runs_take_no_stage_batch_size(flag: str) -> None:
+    """Stages checkpoint by time, so a run has no per-stage batch size to set."""
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["run", "daily", "--cik-file", "c", flag, "5"])
 
 
 # --- genres -------------------------------------------------------------------
@@ -741,8 +704,6 @@ def test_live_backend_builds_the_whole_pipeline_config(
             "2",
             "--model",
             "flag/model",
-            "--extract-batch-size",
-            "9",
             "--final-database-root",
             str(tmp_path / "final"),
         )
@@ -757,7 +718,6 @@ def test_live_backend_builds_the_whole_pipeline_config(
     assert config.sixk_model_dir == tmp_path / "sixk-model"
     assert config.sixk_concurrency == 2  # noqa: PLR2004
     assert config.extractor_model == "flag/model"
-    assert config.extract_batch_size == 9  # noqa: PLR2004
     assert config.final_database_root == str(tmp_path / "final")
 
 

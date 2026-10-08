@@ -121,7 +121,7 @@ Historical runs outlast the lease TTL by hours. Renewing between stages stops
 the run from being stolen mid-write, and the hook raises `LeaseLostError` if
 the lease has already been stolen (#89). Every stage also renews inside
 itself, because one stage alone can outlast the TTL. Segment, classify and
-match renew once per batch of partitions. Ingest renews per scanned day, per
+match renew per partition (or per shard). Ingest renews per scanned day, per
 manifest and per candidate: an 8-K backfill fetches every manifest in its
 window before it writes anything. Live extraction renews before each item's
 model calls and before each partition write. Ingest and live extraction call
@@ -310,9 +310,6 @@ After prepare, the run publishes from whatever mentions already exist, and the
 in-flight batch job publishes again when it completes. Prepare can outlast the
 TTL, so the run renews before match. If the lease was stolen, the snapshots
 belong to another run.
-
-`--extract-batch-size` defaults to None so this path can tell an explicit
-value, which it warns about, from the unset default.
 
 ### `LEASE_WAIT_SECONDS`
 
@@ -583,12 +580,17 @@ row-level diffing is not worth the complexity (#62). A stage can report a
 partition incomplete (`PartitionOutput.complete`), which writes nothing and
 records no completion, so the next run retries it.
 
-Completion is saved at every batch boundary. When the registry was written only
-at stage end, any interruption threw away the whole run's progress: up to 2.5 h
-of itemizing on the real corpus (#111). Repeated saves are cheap and safe under
-concurrency, because only dirty entries are merged, by compare-and-swap (#88).
-The lease is renewed at the same boundary, because a stage that outlasts the
-TTL would otherwise be stolen mid-run (#111).
+Completion is checkpointed by time: saved at most every
+`CHECKPOINT_INTERVAL_SECONDS` (300 s) and once at the end. When the registry was
+written only at stage end, any interruption threw away the whole run's progress:
+up to 2.5 h of itemizing on the real corpus (#111). A count of partitions is the
+wrong unit for the interval, because what a partition costs varies by stage and
+will vary by partition layout. A time interval bounds the loss directly. A save
+is a few S3 requests, so at 300 s it costs nothing worth measuring. Repeated
+saves are safe under concurrency, because only dirty entries are merged, by
+compare-and-swap (#88). The lease is renewed after every partition, throttled
+to `RENEW_INTERVAL_SECONDS`, because a stage that outlasts the TTL would
+otherwise be stolen mid-run.
 
 ## The classifier (`cdt.classifier`)
 

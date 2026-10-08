@@ -137,21 +137,28 @@ Practical implication:
 - rows from many filing dates can coexist in the same `cik_shard` parquet
 - this lets the matcher compare debt mentions across time for the same issuer
 
-### How `batch_size` Works
+### Checkpoints and buffers
 
-`batch_size` controls the chunk size used while draining pending work in one invocation. It does not control parquet file size.
+No stage has a batch size. Each one drains every pending partition in one
+invocation, and what an interruption can lose is bounded by time, not by a count
+of partitions:
 
-- `segment`: processes all pending `documents` (8-K) and `documents-sixk` (6-K) partitions, in chunks of up to `batch_size` partitions; completion is saved and the writer lease renewed after each chunk.
-- `classify`: processes all pending `items` (8-K) and `sixk-windows` (6-K) partitions the same way.
-- `match`: processes all `cik_shard` groups present in the mentions dataset, in chunks of up to `batch_size` shard groups, renewing the lease per shard.
-- `extract` (live backend): accepts `batch_size` but does not chunk by it. It processes pending partitions one at a time and records completion once, at the end of the run. The batch backend sizes its work with `cdt run poll`'s `--max-rows-per-job`, `--max-requests-per-batch` and `--max-batch-bytes` instead.
-- `ingest`: different from the other stages; here `batch_size` is a row buffer threshold for flushing accumulated document rows to their target partitions.
+- `segment` and `classify` (both genres): completion is saved at most every
+  `cdt.completion.CHECKPOINT_INTERVAL_SECONDS` (300 s) and once at the end. The
+  writer lease is renewed per partition, throttled to the same interval.
+- `extract` (live backend): processes pending partitions one at a time, writes
+  each partition's mentions as it finishes, and records completion once, at the
+  end of the run. The batch backend persists every row's state at each tick and
+  sizes its work with `cdt run poll`'s `--max-rows-per-job`,
+  `--max-requests-per-batch` and `--max-batch-bytes`.
+- `match`: processes every `cik_shard` group in turn, renewing the lease per
+  shard. It keeps no completion registry: each run re-matches every shard.
+- `ingest`: `--flush-rows` (`cdt run`: `--ingest-flush-rows`, default 100) is a
+  write buffer, not a checkpoint. Ingest flushes accumulated document rows after
+  that many, and each flush rewrites the `date/shard` partitions its rows land
+  in. A larger buffer means fewer rewrites and more memory.
 
-Examples:
-
-- if `segment_batch_size=100`, one segment run drains all pending `date/shard` partitions, saving completion after every 100
-- if `match_batch_size=100`, one matcher run drains all shard groups in chunks of up to 100 groups, though only 64 shards exist, so it is one chunk
-- if `ingest_batch_size=100`, ingest flushes after accumulating roughly 100 document rows, and those rows may be written into multiple `date/shard` partition files
+None of these settings controls parquet file size.
 
 ## Dataset Schemas
 
@@ -561,7 +568,7 @@ These stages overwrite a `latest` manifest, named by their completion-registry s
 ```
 
 The four segment and classify manifests share one shape (`cdt.partition_stage`):
-`stage`, `artifact_root`, `batch_size`, `force`, `source_rows_processed`,
+`stage`, `artifact_root`, `force`, `source_rows_processed`,
 `partitions_visited`, `partitions_written`, `empty_partitions_skipped_from_write`,
 `partitions_held` (source partitions left pending, such as 6-K windows whose
 spans no longer match their text) and `completion_registry`, plus stage-specific

@@ -660,7 +660,7 @@ def test_registry_follows_a_copied_artifact_root(tmp_path: Path) -> None:
     seed_document_partitions_across_months(
         source, [("2024-01-02", "0000"), ("2024-02-05", "0001")]
     )
-    segment_pending_eightk_documents(artifact_root=source, batch_size=5)
+    segment_pending_eightk_documents(artifact_root=source)
     assert len(load_completed_partitions("itemize", artifact_root=source)) == 2
 
     copy = tmp_path / "copy"
@@ -877,7 +877,7 @@ def test_infrastructure_error_aborts_and_preserves_progress(
 
     monkeypatch.setattr("cdt.extractor.live.run_extraction_workflow", failing_workflow)
     with pytest.raises(InfrastructureError):
-        extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+        extract_pending_items(artifact_root=tmp_path, client=None)
 
     registry = load_completion_registry("extract", artifact_root=tmp_path)
     (entry,) = registry.values()
@@ -888,7 +888,7 @@ def test_infrastructure_error_aborts_and_preserves_progress(
 
     # Recovery: a healthy run pays only for the row that never got a verdict.
     recovery_calls = _fake_success_workflow(monkeypatch)
-    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+    extract_pending_items(artifact_root=tmp_path, client=None)
     assert recovery_calls == ["b-8-01"]
     registry = load_completion_registry("extract", artifact_root=tmp_path)
     (entry,) = registry.values()

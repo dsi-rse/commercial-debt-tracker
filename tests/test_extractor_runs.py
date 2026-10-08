@@ -29,12 +29,12 @@ def test_late_arriving_rows_extract_after_partition_grows(
     _seed_classifications(tmp_path, ["a-8-01"])
     calls = _fake_success_workflow(monkeypatch)
 
-    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+    extract_pending_items(artifact_root=tmp_path, client=None)
     assert calls == ["a-8-01"]
 
     # Ingest-style in-place merge: the partition object grows a new row.
     _seed_classifications(tmp_path, ["a-8-01", "b-8-01"])
-    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+    extract_pending_items(artifact_root=tmp_path, client=None)
 
     # Only the new row is paid for, and the target holds both rows' mentions.
     assert calls == ["a-8-01", "b-8-01"]
@@ -338,12 +338,11 @@ def test_the_live_run_manifest_records_its_fields(
         return row_state
 
     monkeypatch.setattr("cdt.extractor.live.run_extraction_workflow", fake_workflow)
-    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+    extract_pending_items(artifact_root=tmp_path, client=None)
 
     (manifest_path,) = (tmp_path / "runs" / "extract").glob("run_id=*.json")
     manifest = json.loads(manifest_path.read_text())
     assert set(manifest) == _SHARED_MANIFEST_KEYS | {
-        "batch_size",
         "force",
         "model",
         "reasoning_effort",

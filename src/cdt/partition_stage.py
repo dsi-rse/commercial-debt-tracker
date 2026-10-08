@@ -16,6 +16,7 @@ from time import perf_counter
 import pandas as pd
 
 from cdt.completion import (
+    CHECKPOINT_INTERVAL_SECONDS,
     CompletedPartition,
     completion_registry_root,
     pending_source_partitions,
@@ -28,6 +29,7 @@ from cdt.datasets import (
     resolve_artifact_root,
     run_manifest_path,
 )
+from cdt.lease import throttled
 from cdt.shared import get_logger
 from cdt.storage.objects import write_json_artifact
 from cdt.storage.tables import write_partition_table
@@ -70,7 +72,6 @@ def run_partition_stage(
     process: Callable[[str, dict[str, str]], PartitionOutput],
     artifact_root: str | Path | None = None,
     data_dir: Path | None = None,
-    batch_size: int = 100,
     force: bool = False,
     renew: Callable[[], None] | None = None,
     manifest_extra: dict[str, object] | None = None,
@@ -80,17 +81,12 @@ def run_partition_stage(
     ``process`` receives the source partition path and its ``{date, shard}``
     and returns that partition's output. Non-empty output is written to the
     same date/shard of ``output_dataset``; empty output writes nothing and
-    still completes the partition. Completion is saved and ``renew`` called
-    after every ``batch_size`` partitions, so an interruption keeps finished
-    batches and a long stage keeps its lease. A run manifest is written at
-    ``runs/<stage_name>/run_id=latest.json``.
-
-    Raises:
-        ValueError: If ``batch_size`` is not positive.
+    still completes the partition. Completion is saved at most every
+    :data:`cdt.completion.CHECKPOINT_INTERVAL_SECONDS` and once at the end, so
+    an interruption loses at most that much finished work; ``renew`` is called
+    after every partition, throttled (:func:`cdt.lease.throttled`). A run
+    manifest is written at ``runs/<stage_name>/run_id=latest.json``.
     """
-    if batch_size <= 0:
-        msg = f"batch_size must be positive, got {batch_size}"
-        raise ValueError(msg)
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     pending, registry = pending_source_partitions(
         stage_name,
@@ -102,59 +98,63 @@ def run_partition_stage(
     output_root = dataset_root(
         output_dataset, artifact_root=resolved_root, data_dir=data_dir
     )
-    result = PartitionStageResult(rows=pd.DataFrame(columns=output_columns))
-    frames: list[pd.DataFrame] = []
-    total = len(pending)
-    for chunk_start in range(0, total, batch_size):
-        chunk = pending[chunk_start : chunk_start + batch_size]
-        for index, (source_path, fingerprint) in enumerate(
-            chunk, start=chunk_start + 1
-        ):
-            partition = parse_date_shard_partition(source_path)
-            started = perf_counter()
-            output = process(source_path, partition)
-            result.source_rows += output.source_rows
-            if not output.complete:
-                result.held_partitions.append(source_path)
-            elif output.rows.empty:
-                result.empty_partitions += 1
-            else:
-                write_partition_table(
-                    output_root,
-                    partition={"date": partition["date"], "shard": partition["shard"]},
-                    table=output.rows.reindex(columns=output_columns),
-                )
-                frames.append(output.rows)
-                result.partitions_written.append(
-                    date_shard_partition_path(
-                        output_dataset,
-                        partition_date=partition["date"],
-                        shard=partition["shard"],
-                        artifact_root=resolved_root,
-                        data_dir=data_dir,
-                    )
-                )
-            if output.complete:
-                registry[source_path] = CompletedPartition(fingerprint=fingerprint)
-            LOGGER.info(
-                "%s partition complete: date=%s shard=%s progress=%s/%s "
-                "source_rows=%s rows=%s wrote_output=%s held=%s elapsed=%.1fs",
-                stage_name,
-                partition["date"],
-                partition["shard"],
-                index,
-                total,
-                output.source_rows,
-                len(output.rows),
-                output.complete and not output.rows.empty,
-                not output.complete,
-                perf_counter() - started,
-            )
+
+    def save() -> None:
         save_completion_registry(
             stage_name, registry, artifact_root=resolved_root, data_dir=data_dir
         )
-        if renew is not None:
-            renew()
+
+    checkpoint = throttled(save, interval_seconds=CHECKPOINT_INTERVAL_SECONDS)
+    keep_lease = throttled(renew) if renew is not None else None
+    result = PartitionStageResult(rows=pd.DataFrame(columns=output_columns))
+    frames: list[pd.DataFrame] = []
+    total = len(pending)
+    for index, (source_path, fingerprint) in enumerate(pending, start=1):
+        partition = parse_date_shard_partition(source_path)
+        started = perf_counter()
+        output = process(source_path, partition)
+        result.source_rows += output.source_rows
+        if not output.complete:
+            result.held_partitions.append(source_path)
+        elif output.rows.empty:
+            result.empty_partitions += 1
+        else:
+            write_partition_table(
+                output_root,
+                partition={"date": partition["date"], "shard": partition["shard"]},
+                table=output.rows.reindex(columns=output_columns),
+            )
+            frames.append(output.rows)
+            result.partitions_written.append(
+                date_shard_partition_path(
+                    output_dataset,
+                    partition_date=partition["date"],
+                    shard=partition["shard"],
+                    artifact_root=resolved_root,
+                    data_dir=data_dir,
+                )
+            )
+        if output.complete:
+            registry[source_path] = CompletedPartition(fingerprint=fingerprint)
+        LOGGER.info(
+            "%s partition complete: date=%s shard=%s progress=%s/%s "
+            "source_rows=%s rows=%s wrote_output=%s held=%s elapsed=%.1fs",
+            stage_name,
+            partition["date"],
+            partition["shard"],
+            index,
+            total,
+            output.source_rows,
+            len(output.rows),
+            output.complete and not output.rows.empty,
+            not output.complete,
+            perf_counter() - started,
+        )
+        checkpoint()
+        if keep_lease is not None:
+            keep_lease()
+    if pending:
+        save()
 
     write_json_artifact(
         run_manifest_path(
@@ -163,7 +163,6 @@ def run_partition_stage(
         {
             "artifact_root": resolved_root,
             "stage": stage_name,
-            "batch_size": batch_size,
             "force": force,
             **(manifest_extra or {}),
             "source_rows_processed": result.source_rows,

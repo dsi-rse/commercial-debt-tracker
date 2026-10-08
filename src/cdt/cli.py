@@ -52,6 +52,7 @@ from cdt.extractor import (
 )
 from cdt.ingest.core import (
     DEFAULT_BUCKET,
+    DEFAULT_FLUSH_ROWS,
     DEFAULT_S3_PREFIX,
     IngestConfig,
     IngestRunResult,
@@ -76,7 +77,6 @@ from cdt.matcher import (
 from cdt.matcher.lineage_inference import apply_lineage_inference_pass
 from cdt.pipeline import (
     DEFAULT_GENRES,
-    DEFAULT_STAGE_BATCH_SIZE,
     PipelineConfig,
     PipelineRunResult,
     classify_genre,
@@ -255,18 +255,6 @@ def _force_publish_option() -> argparse.ArgumentParser:
     return parser
 
 
-def _batch_size_option() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument(
-        "--batch-size",
-        type=positive_int,
-        default=DEFAULT_STAGE_BATCH_SIZE,
-        help="partitions per completion save and lease renewal "
-        f"(default {DEFAULT_STAGE_BATCH_SIZE})",
-    )
-    return parser
-
-
 def _segment_options() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument(
@@ -402,11 +390,11 @@ def _add_ingest(commands: argparse._SubParsersAction) -> None:
         help="acquire each genre's filings for a CIK list into its documents dataset",
     )
     ingest.add_argument(
-        "--batch-size",
+        "--flush-rows",
         type=positive_int,
-        default=DEFAULT_STAGE_BATCH_SIZE,
-        help="document rows buffered per partition flush "
-        f"(default {DEFAULT_STAGE_BATCH_SIZE})",
+        default=DEFAULT_FLUSH_ROWS,
+        help="document rows buffered before each partition write; each write "
+        f"rewrites the partitions its rows land in (default {DEFAULT_FLUSH_ROWS})",
     )
     ingest.set_defaults(func=run_ingest)
 
@@ -417,7 +405,6 @@ def _add_segment(commands: argparse._SubParsersAction) -> None:
         parents=[
             _common_options(),
             _genre_options(),
-            _batch_size_option(),
             _force_option("re-segment partitions already segmented"),
             _segment_options(),
         ],
@@ -432,7 +419,6 @@ def _add_classify(commands: argparse._SubParsersAction) -> None:
         parents=[
             _common_options(),
             _genre_options(),
-            _batch_size_option(),
             _force_option("re-classify partitions already classified"),
             _classify_options(),
         ],
@@ -478,7 +464,6 @@ def _add_extract(commands: argparse._SubParsersAction) -> None:
         "extract",
         parents=[
             _common_options(),
-            _batch_size_option(),
             _force_option("re-extract partitions already extracted"),
             _extract_options(),
         ],
@@ -513,7 +498,6 @@ def _add_match(commands: argparse._SubParsersAction) -> None:
         "match",
         parents=[
             _common_options(),
-            _batch_size_option(),
             _force_option("re-match every shard"),
             _match_options(),
         ],
@@ -566,20 +550,12 @@ def _add_run(commands: argparse._SubParsersAction) -> None:
             help="'batch' (env EXTRACTOR_BACKEND; default) leaves extraction to "
             "`cdt run poll`; 'live' extracts synchronously in this run",
         )
-        for stage in ("ingest", "segment", "classify", "match"):
-            prepare.add_argument(
-                f"--{stage}-batch-size",
-                type=positive_int,
-                default=DEFAULT_STAGE_BATCH_SIZE,
-                help=f"{stage} batch size (default {DEFAULT_STAGE_BATCH_SIZE})",
-            )
-        # None, so the batch backend can warn about an explicit value.
         prepare.add_argument(
-            "--extract-batch-size",
+            "--ingest-flush-rows",
             type=positive_int,
-            default=None,
-            help="extract batch size; live backend only (default "
-            f"{DEFAULT_STAGE_BATCH_SIZE})",
+            default=DEFAULT_FLUSH_ROWS,
+            help="document rows ingest buffers before each partition write "
+            f"(default {DEFAULT_FLUSH_ROWS})",
         )
         prepare.set_defaults(func=run_run)
 
@@ -621,12 +597,6 @@ def _add_run(commands: argparse._SubParsersAction) -> None:
         default=None,
         help="rows one job may claim, so its state fits the task's memory "
         "(default: the backend's limit)",
-    )
-    poll.add_argument(
-        "--match-batch-size",
-        type=positive_int,
-        default=DEFAULT_STAGE_BATCH_SIZE,
-        help=f"match batch size (default {DEFAULT_STAGE_BATCH_SIZE})",
     )
     poll.set_defaults(func=run_run)
 
@@ -727,7 +697,7 @@ def run_ingest(args: argparse.Namespace) -> int:
             end_date=end_date,
             output_root=artifact_root,
             force=args.force,
-            batch_size=args.batch_size,
+            flush_rows=args.flush_rows,
             download=args.download,
             failure_file=args.failure_file,
             aws_profile=args.aws_profile,
@@ -774,7 +744,6 @@ def run_segment(args: argparse.Namespace) -> int:
             lambda genre: segment_genre(
                 genre,
                 artifact_root=artifact_root,
-                batch_size=args.batch_size,
                 force=args.force,
                 item_numbers=args.item_numbers,
                 renew=renewer(lease),
@@ -802,7 +771,6 @@ def run_classify(args: argparse.Namespace) -> int:
             lambda genre: classify_genre(
                 genre,
                 artifact_root=artifact_root,
-                batch_size=args.batch_size,
                 force=args.force,
                 model_dir=args.model_dir,
                 sixk_model_dir=args.sixk_model_dir,
@@ -851,7 +819,6 @@ def run_extract(args: argparse.Namespace) -> int:
     def body(artifact_root: str, lease: Lease) -> int:
         mentions = extract_pending_items(
             artifact_root=artifact_root,
-            batch_size=args.batch_size,
             force=args.force,
             model=args.model,
             reasoning_effort=args.reasoning_effort,
@@ -939,7 +906,6 @@ def run_match(args: argparse.Namespace) -> int:
     def body(artifact_root: str, lease: Lease) -> int:
         tables = match_pending_mentions(
             artifact_root=artifact_root,
-            batch_size=args.batch_size,
             force=args.force,
             renew=renewer(lease),
             strong_match_threshold=args.strong_match_threshold,
@@ -1004,7 +970,6 @@ def run_run(args: argparse.Namespace) -> int:
             max_requests_per_batch=args.max_requests_per_batch,
             max_batch_bytes=args.max_batch_bytes,
             max_rows_per_job=args.max_rows_per_job,
-            match_batch_size=args.match_batch_size,
         )
     if not args.cik_file:
         LOGGER.error("--cik-file (or CDT_DEFAULT_CIK_FILE) is required")
@@ -1015,9 +980,7 @@ def run_run(args: argparse.Namespace) -> int:
         LOGGER.error("Invalid run arguments: %s", exc)
         return USAGE_EXIT_CODE
     if args.extractor_backend == "batch":
-        return run_prepare_then_publish(
-            config, extract_batch_size_given=args.extract_batch_size is not None
-        )
+        return run_prepare_then_publish(config)
     code, result = run_live(config)
     if result is not None:
         _print_run_summary(result)
@@ -1047,11 +1010,7 @@ def _pipeline_config(args: argparse.Namespace) -> PipelineConfig:
         failure_file=args.failure_file,
         aws_profile=args.aws_profile,
         s3_prefix=args.s3_prefix,
-        ingest_batch_size=args.ingest_batch_size,
-        segment_batch_size=args.segment_batch_size,
-        classify_batch_size=args.classify_batch_size,
-        extract_batch_size=args.extract_batch_size or DEFAULT_STAGE_BATCH_SIZE,
-        match_batch_size=args.match_batch_size,
+        ingest_flush_rows=args.ingest_flush_rows,
         item_numbers=args.item_numbers,
         classifier_model_dir=args.model_dir,
         sixk_model_dir=args.sixk_model_dir,

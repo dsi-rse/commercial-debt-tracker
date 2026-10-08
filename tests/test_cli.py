@@ -117,7 +117,7 @@ def test_ingest_builds_its_config_from_the_flags(
             "--bucket",
             "test-bucket",
             "--force",
-            "--batch-size",
+            "--flush-rows",
             "25",
             "--download",
             "--start-date",
@@ -137,7 +137,7 @@ def test_ingest_builds_its_config_from_the_flags(
         config.start_date,
         config.end_date,
         config.force,
-        config.batch_size,
+        config.flush_rows,
         config.download,
         config.aws_profile,
         config.s3_prefix,
@@ -383,8 +383,6 @@ def test_segment_genres_8k_is_the_8k_only_itemizer(
             str(tmp_path),
             "--genres",
             "8-K",
-            "--batch-size",
-            "25",
             "--force",
         ]
     )
@@ -393,7 +391,6 @@ def test_segment_genres_8k_is_the_8k_only_itemizer(
     [(genre, kwargs)] = segment_calls
     assert genre == GENRE_8K
     assert kwargs["artifact_root"] == str(tmp_path)
-    assert kwargs["batch_size"] == 25  # noqa: PLR2004
     assert kwargs["force"] is True
     assert kwargs["item_numbers"] == POTENTIALLY_RELEVANT_ITEM_NUMBERS
     # A stage that can run long renews the lease it holds.
@@ -572,8 +569,6 @@ def test_classify_genres_8k_is_the_8k_only_classifier(
             str(tmp_path),
             "--genres",
             "8-K",
-            "--batch-size",
-            "25",
             "--force",
         ]
     )
@@ -581,11 +576,7 @@ def test_classify_genres_8k_is_the_8k_only_classifier(
     assert status == 0
     [(genre, kwargs)] = classify_calls
     assert genre == GENRE_8K
-    assert (kwargs["batch_size"], kwargs["force"], kwargs["model_dir"]) == (
-        25,
-        True,
-        None,
-    )
+    assert (kwargs["force"], kwargs["model_dir"]) == (True, None)
     assert callable(kwargs["renew"])
 
 
@@ -684,8 +675,6 @@ def test_extract_calls_the_live_extractor(
             "extract",
             "--artifact-root",
             str(tmp_path),
-            "--batch-size",
-            "25",
             "--force",
             "--model",
             "anthropic/claude-sonnet-4",
@@ -704,7 +693,6 @@ def test_extract_calls_the_live_extractor(
     assert calls == [
         {
             "artifact_root": str(tmp_path),
-            "batch_size": 25,
             "force": True,
             "model": "anthropic/claude-sonnet-4",
             "reasoning_effort": "high",
@@ -916,8 +904,6 @@ def test_match_matches_then_infers_lineage_both_renewing(
             "--quiet",
             "--artifact-root",
             str(tmp_path),
-            "--batch-size",
-            "25",
             "--force",
         ]
     )
@@ -925,12 +911,11 @@ def test_match_matches_then_infers_lineage_both_renewing(
     assert status == 0
     [kwargs] = calls
     assert (
-        kwargs["batch_size"],
         kwargs["force"],
         kwargs["strong_match_threshold"],
         kwargs["loose_match_threshold"],
         kwargs["ambiguity_margin"],
-    ) == (25, True, 0.9, 0.75, 0.05)
+    ) == (True, 0.9, 0.75, 0.05)
     assert callable(kwargs["renew"])
     [lineage] = lineage_calls
     assert lineage["root"] == str(tmp_path)

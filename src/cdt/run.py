@@ -30,7 +30,6 @@ from cdt.lease import (
     renewer,
 )
 from cdt.pipeline import (
-    DEFAULT_STAGE_BATCH_SIZE,
     PipelineConfig,
     PipelineRunResult,
     run_match_and_finalize,
@@ -148,24 +147,13 @@ def _acquire_or_report(artifact_root: str, noun: str) -> Lease | None:
     return lease
 
 
-def run_prepare_then_publish(
-    config: PipelineConfig, *, extract_batch_size_given: bool = False
-) -> int:
+def run_prepare_then_publish(config: PipelineConfig) -> int:
     """Run a batch-backend ``daily``/``historical``: prepare, then match and publish.
 
-    Extraction is left to ``poll``. ``extract_batch_size_given`` says the caller
-    passed an extract batch size, which this backend cannot use. Returns the
-    exit code: 1 when the lease cannot be acquired or is lost, or a genre
-    failed; else 0, after logging RUN_COMPLETE_MESSAGE and printing the
-    artifact root.
+    Extraction is left to ``poll``. Returns the exit code: 1 when the lease
+    cannot be acquired or is lost, or a genre failed; else 0, after logging
+    RUN_COMPLETE_MESSAGE and printing the artifact root.
     """
-    if extract_batch_size_given:
-        LOGGER.warning(
-            "Ignoring --extract-batch-size=%s: the batch backend defers extraction "
-            "to poll, which chunks by --max-requests-per-batch/--max-batch-bytes. "
-            "Use --extractor-backend live to size synchronous extract batches.",
-            config.extract_batch_size,
-        )
     if config.force:
         LOGGER.warning(
             "--force applies to the prepare and match stages only under the "
@@ -192,7 +180,6 @@ def run_prepare_then_publish(
         run_match_and_finalize(
             artifact_root=artifact_root,
             final_database_root=config.final_database_root,
-            batch_size=config.match_batch_size,
             force=config.force,
             force_publish=config.force_publish,
             renew=renew,
@@ -255,7 +242,6 @@ def run_poll(
     max_requests_per_batch: int | None = None,
     max_batch_bytes: int | None = None,
     max_rows_per_job: int | None = None,
-    match_batch_size: int = DEFAULT_STAGE_BATCH_SIZE,
 ) -> int:
     """Advance the OpenAI batch extract job by one tick; publish on completion.
 
@@ -308,7 +294,6 @@ def run_poll(
             run_match_and_finalize(
                 artifact_root=resolved_root,
                 final_database_root=final_database_root,
-                batch_size=match_batch_size,
                 force_publish=force_publish,
                 renew=renew,
             )

@@ -70,7 +70,6 @@ def classify_pending_items(
     artifact_root: str | Path | None = None,
     data_dir: Path | None = None,
     model_dir: Path | None = None,
-    batch_size: int = 100,
     force: bool = False,
     renew: Callable[[], None] | None = None,
 ) -> pd.DataFrame:
@@ -78,13 +77,10 @@ def classify_pending_items(
 
     A partition is pending when its fingerprint differs from the completion
     registry's (or always, with ``force``) and is recomputed whole. Completion
-    is saved and ``renew`` called after every ``batch_size`` partitions.
+    is checkpointed and ``renew`` called as :func:`run_partition_stage` does.
 
     Returns:
         The classified rows written this run, in CLASSIFIED_ITEM_COLUMNS order.
-
-    Raises:
-        ValueError: If ``batch_size`` is not positive.
     """
     # Unpickled on the first pending partition, once per run.
     artifacts: tuple[object, float] | None = None
@@ -110,7 +106,6 @@ def classify_pending_items(
         process=process,
         artifact_root=artifact_root,
         data_dir=data_dir,
-        batch_size=batch_size,
         force=force,
         renew=renew,
     ).rows

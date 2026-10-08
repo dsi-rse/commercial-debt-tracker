@@ -49,7 +49,6 @@ def extract_pending_items(
     *,
     artifact_root: str | Path | None = None,
     data_dir: Path | None = None,
-    batch_size: int = 100,
     force: bool = False,
     model: str | None = None,
     reasoning_effort: str | None = None,
@@ -64,8 +63,6 @@ def extract_pending_items(
     :data:`cdt.lease.RENEW_INTERVAL_SECONDS`; a lost lease raises
     ``LeaseLostError`` before anything else is written.
     """
-    if batch_size <= 0:
-        raise ValueError(f"batch_size must be positive, got {batch_size}")
     if max_attempts <= 0:
         raise ValueError(f"max_attempts must be positive, got {max_attempts}")
     resolved_model = model or settings.EXTRACTOR_MODEL
@@ -213,7 +210,6 @@ def extract_pending_items(
         artifact_root=resolved_root,
         data_dir=data_dir,
         manifest={
-            "batch_size": batch_size,
             "force": force,
             "model": resolved_model,
             "reasoning_effort": resolved_reasoning,

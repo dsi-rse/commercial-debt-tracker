@@ -90,11 +90,11 @@ def test_run_pipeline_uses_stage_backed_functions(
         )
 
     def fake_segment_pending_eightk_documents(**kwargs: object) -> pd.DataFrame:
-        calls.append(("segment", kwargs["batch_size"]))
+        calls.append(("segment", None))
         return pd.DataFrame([{"item_id": "item-1"}])
 
     def fake_classify_pending_items(**kwargs: object) -> pd.DataFrame:
-        calls.append(("classify", kwargs["batch_size"]))
+        calls.append(("classify", None))
         return pd.DataFrame([{"item_id": "item-1", "relevance": True}])
 
     def fake_acquire_scraped_sixk_documents(
@@ -126,19 +126,19 @@ def test_run_pipeline_uses_stage_backed_functions(
         )
 
     def fake_segment_pending_sixk_documents(**kwargs: object) -> pd.DataFrame:
-        calls.append(("segment-sixk", kwargs["batch_size"]))
+        calls.append(("segment-sixk", None))
         return pd.DataFrame([{"accession_number": "2"}])
 
     def fake_triage_pending_windows(**kwargs: object) -> pd.DataFrame:
-        calls.append(("classify-sixk", kwargs["batch_size"]))
+        calls.append(("classify-sixk", None))
         return pd.DataFrame([{"item_id": "snippet-1"}, {"item_id": "snippet-2"}])
 
     def fake_extract_pending_items(**kwargs: object) -> pd.DataFrame:
-        calls.append(("extract", kwargs["batch_size"]))
+        calls.append(("extract", None))
         return pd.DataFrame([{"debt_instrument_mention_id": "mention-1"}])
 
     def fake_match_pending_mentions(**kwargs: object) -> dict[str, pd.DataFrame]:
-        calls.append(("match", kwargs["batch_size"]))
+        calls.append(("match", None))
         return {
             "debt_instrument_mentions": pd.DataFrame(
                 [{"debt_instrument_mention_id": "mention-1"}]
@@ -180,11 +180,7 @@ def test_run_pipeline_uses_stage_backed_functions(
             start_date=date(2024, 1, 1),
             end_date=date(2024, 1, 31),
             download=True,
-            ingest_batch_size=10,
-            segment_batch_size=11,
-            classify_batch_size=12,
-            extract_batch_size=13,
-            match_batch_size=14,
+            ingest_flush_rows=10,
             genres=DEFAULT_GENRES,
         )
     )
@@ -207,13 +203,13 @@ def test_run_pipeline_uses_stage_backed_functions(
     assert result.genres == DEFAULT_GENRES
     assert calls == [
         ("ingest", {"320193"}),
-        ("segment", 11),
-        ("classify", 12),
+        ("segment", None),
+        ("classify", None),
         ("ingest-sixk", {"320193"}),
-        ("segment-sixk", 11),
-        ("classify-sixk", 12),
-        ("extract", 13),
-        ("match", 14),
+        ("segment-sixk", None),
+        ("classify-sixk", None),
+        ("extract", None),
+        ("match", None),
     ]
 
 
@@ -494,11 +490,7 @@ This is the extracted event text.
             start_date=date(2024, 1, 1),
             end_date=date(2024, 1, 31),
             download=True,
-            ingest_batch_size=1,
-            segment_batch_size=1,
-            classify_batch_size=1,
-            extract_batch_size=1,
-            match_batch_size=1,
+            ingest_flush_rows=1,
             artifact_root=str(tmp_path),
             final_database_root=str(tmp_path / "database" / "cdt"),
             genres=(GENRE_8K,),

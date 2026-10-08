@@ -745,7 +745,6 @@ def segment_pending_eightk_documents(
     *,
     artifact_root: str | Path | None = None,
     data_dir: Path | None = None,
-    batch_size: int = 100,
     force: bool = False,
     s3_client: object | None = None,
     item_numbers: tuple[str, ...] | None = None,
@@ -755,13 +754,10 @@ def segment_pending_eightk_documents(
 
     A partition is pending when its fingerprint differs from the completion
     registry's (or always, with ``force``) and is recomputed whole. Completion
-    is saved and ``renew`` called after every ``batch_size`` partitions.
+    is checkpointed and ``renew`` called as :func:`run_partition_stage` does.
 
     Returns:
         The item rows written this run, in ITEM_COLUMNS order.
-
-    Raises:
-        ValueError: If ``batch_size`` is not positive.
     """
     selected_item_numbers = normalize_item_numbers(item_numbers)
     shared_client = s3_client
@@ -789,7 +785,6 @@ def segment_pending_eightk_documents(
         process=process,
         artifact_root=artifact_root,
         data_dir=data_dir,
-        batch_size=batch_size,
         force=force,
         renew=renew,
         manifest_extra={"item_numbers": list(selected_item_numbers)},

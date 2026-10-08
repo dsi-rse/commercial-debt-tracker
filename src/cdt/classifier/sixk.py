@@ -593,7 +593,6 @@ def triage_pending_windows(
     *,
     artifact_root: str | Path | None = None,
     data_dir: Path | None = None,
-    batch_size: int = 100,
     force: bool = False,
     model_dir: Path | None = None,
     client: SupportsChatCompletion | None = None,
@@ -612,7 +611,7 @@ def triage_pending_windows(
     unwritten. Returns the snippet rows written this run.
 
     Raises:
-        ValueError: If ``batch_size`` or ``concurrency`` is not positive.
+        ValueError: If ``concurrency`` is not positive.
         StaleSegmentationError: After every other partition is processed, if
             any partition was left pending for stale spans.
     """
@@ -670,7 +669,6 @@ def triage_pending_windows(
         process=process,
         artifact_root=resolved_root,
         data_dir=data_dir,
-        batch_size=batch_size,
         force=force,
         renew=renew,
         manifest_extra={

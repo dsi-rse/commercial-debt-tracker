@@ -260,7 +260,7 @@ def test_acquire_documents_writes_downloads_in_batches_when_requested(
         {"320193"},
         data_dir=tmp_path,
         s3_client=client,
-        batch_size=2,
+        flush_rows=2,
         download=True,
     )
 
