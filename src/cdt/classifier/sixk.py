@@ -238,6 +238,15 @@ class _FilingPlan:
     candidates: list[_Candidate]
 
 
+#: What to do when stored spans no longer match their text. A plain segment
+#: run re-windows every documents partition that changed; --force is needed
+#: only when the segmenter itself changed, and re-windows every partition.
+RESEGMENT_ADVICE = (
+    "Run `cdt segment --genres 6-K`, adding --force only if the segmenter "
+    "code changed."
+)
+
+
 class StaleSegmentationError(RuntimeError):
     """Window spans no longer index the text their source submission yields."""
 
@@ -306,10 +315,12 @@ def triage_windows(
         plans.append(_FilingPlan(document=document, candidates=candidates))
     if stale:
         LOGGER.error(
-            "6-K window spans do not match their source text; rerun "
-            "`cdt segment --genres 6-K --force`: accessions=%s",
+            "6-K window spans do not match their source text: accessions=%s. %s",
             ",".join(stale),
+            RESEGMENT_ADVICE,
         )
+        # The partition is held whole, so stage 2 would be paid for nothing.
+        return TriageOutput(rows=_empty_snippets(), stale_accessions=tuple(stale))
     windowed = sum(len(plan.candidates) for plan in plans)
 
     admitted_by_filing = [
@@ -680,8 +691,8 @@ def triage_pending_windows(
     if result.held_partitions:
         msg = (
             f"{len(result.held_partitions)} 6-K windows partition(s) hold spans that "
-            "no longer match their source text and were left pending; rerun "
-            "`cdt segment --genres 6-K --force`: " + ", ".join(result.held_partitions)
+            f"no longer match their source text and were left pending. "
+            f"{RESEGMENT_ADVICE} Partitions: " + ", ".join(result.held_partitions)
         )
         raise StaleSegmentationError(msg)
     return result.rows

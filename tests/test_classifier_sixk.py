@@ -927,4 +927,105 @@ def test_classify_holds_a_partition_whose_spans_no_longer_match_their_text(
 
     assert client.calls == []
     assert list_artifacts(sixk_snippets_root(str(tmp_path)), suffix=".parquet") == []
-    assert load_completion_registry("sixk-classify", artifact_root=str(tmp_path)) == {}
+    # Recorded with no fingerprint, so it matches nothing and stays pending.
+    registry = load_completion_registry("sixk-classify", artifact_root=str(tmp_path))
+    assert [entry.fingerprint for entry in registry.values()] == [None]
+
+
+def test_a_filing_gated_out_on_resegment_cascades_to_its_mentions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An emptied windows partition is overwritten, so classify and extract follow.
+
+    Left in place, the old spans would fail the digest on every run; deleted,
+    nothing downstream would notice, and the snippet's mentions would stay
+    published. Overwritten empty, each stage sees a changed source partition
+    with no rows and drops what it derived from the old one.
+    """
+    from support import _fake_success_workflow
+
+    from cdt.extractor import extract_pending_items, mentions_root
+
+    row = _document_row(
+        tmp_path, submission=_submission(("6-K", f"<p>{DEBT_PROSE}</p>"))
+    )
+    _write_documents(tmp_path, [row])
+    segment_and_classify_pending(
+        artifact_root=str(tmp_path), client=FakeChatClient(keep_all=True)
+    )
+    _fake_success_workflow(monkeypatch)
+    extract_pending_items(artifact_root=str(tmp_path), client=None)
+    assert len(read_dataset(mentions_root(str(tmp_path)))) == 1
+
+    # The filing's text changes so the keyword gate now rejects it.
+    row["text"] = _submission(("6-K", "<p>A quarterly dividend of $0.10.</p>"))
+    _write_documents(tmp_path, [row])
+    segment_pending_sixk_documents(artifact_root=str(tmp_path))
+    client = FakeChatClient(keep_all=True)
+    triage_pending_windows(artifact_root=str(tmp_path), client=client)
+    extract_pending_items(artifact_root=str(tmp_path), client=None)
+
+    assert client.calls == []
+    windows_root = dataset_root(SIXK_WINDOW_DATASET_NAME, artifact_root=str(tmp_path))
+    assert read_dataset(windows_root, columns=SIXK_WINDOW_COLUMNS).empty
+    assert read_dataset(
+        sixk_snippets_root(str(tmp_path)), columns=SIXK_SNIPPET_COLUMNS
+    ).empty
+    assert read_dataset(mentions_root(str(tmp_path))).empty
+
+
+def test_a_forced_classify_that_holds_a_partition_leaves_it_pending(
+    tmp_path: Path,
+) -> None:
+    """The held entry matches nothing, so a later plain run retries the partition.
+
+    Under --force the registry starts empty, and the save merges onto the
+    stored shard: without a held entry, the earlier successful entry would
+    survive and mark the stale partition done.
+    """
+    row = _document_row(
+        tmp_path, submission=_submission(("6-K", f"<p>{DEBT_PROSE}</p>"))
+    )
+    _write_documents(tmp_path, [row])
+    segment_and_classify_pending(
+        artifact_root=str(tmp_path), client=FakeChatClient(keep_all=True)
+    )
+    # The text moves under the stored spans without a re-segment.
+    row["text"] = _submission(("6-K", f"<p>Revised. {DEBT_PROSE}</p>"))
+    _write_documents(tmp_path, [row])
+
+    with pytest.raises(StaleSegmentationError):
+        triage_pending_windows(
+            artifact_root=str(tmp_path),
+            force=True,
+            client=FakeChatClient(keep_all=True),
+        )
+    with pytest.raises(StaleSegmentationError):
+        triage_pending_windows(
+            artifact_root=str(tmp_path), client=FakeChatClient(keep_all=True)
+        )
+
+
+def test_a_partition_with_one_stale_filing_pays_for_no_stage_two_call(
+    tmp_path: Path,
+) -> None:
+    """The whole partition is held, so its good filing's call would be wasted."""
+    good = _document_row(
+        tmp_path, submission=_submission(("6-K", f"<p>{DEBT_PROSE}</p>"))
+    )
+    stale = _document_row(
+        tmp_path,
+        accession_number="000000000026000002",
+        submission=_submission(("6-K", f"<p>{DEBT_PROSE}</p>")),
+    )
+    _write_documents(tmp_path, [good, stale])
+    segment_pending_sixk_documents(artifact_root=str(tmp_path))
+    stale["text"] = _submission(("6-K", f"<p>Revised. {DEBT_PROSE}</p>"))
+    _write_documents(tmp_path, [good, stale])
+    client = FakeChatClient(keep_all=True)
+
+    with pytest.raises(StaleSegmentationError, match="cdt segment --genres 6-K"):
+        triage_pending_windows(artifact_root=str(tmp_path), client=client)
+
+    assert client.calls == []
+    assert list_artifacts(sixk_snippets_root(str(tmp_path)), suffix=".parquet") == []

@@ -268,11 +268,18 @@ extra read of the mirror per gate-passing filing.
 The coupling is guarded rather than assumed. Each span row carries
 `source_sha256`, the digest of the body it indexes. If the rebuilt body's digest
 differs — the flattening code changed between the two stages, or the document
-is missing — classify judges none of that filing's windows, writes nothing for
-its partition and records no completion for it, so the partition stays
-pending. After processing every other partition it raises
-`StaleSegmentationError`, naming the held partitions and telling the operator
-to rerun `cdt segment --genres 6-K --force`.
+is missing — classify holds the whole partition. It makes no stage-2 call for
+any of its filings and writes nothing for it. It records an entry that matches
+no fingerprint, so the partition stays pending, even under `--force` with an
+earlier entry stored. After processing every other partition it raises
+`StaleSegmentationError`, naming the held partitions. The advice is to rerun
+`cdt segment --genres 6-K`, which re-windows every documents partition that
+changed, and to add `--force` only if the segmenter code itself changed.
+
+A re-segment that leaves a partition with no windows at all, because the gate
+now rejects its only filing, overwrites that windows partition with an empty
+table. Classify then sees the partition change, writes an empty snippets
+partition over the old one, and extract prunes the mentions that came from it.
 
 ## Where expansion runs
 

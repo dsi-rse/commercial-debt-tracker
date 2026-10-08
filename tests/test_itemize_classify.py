@@ -969,3 +969,19 @@ def test_the_stage_driver_checkpoints_by_time_not_by_partition_count(
     # The first partition's checkpoint, then the final save; the second
     # partition fell inside the interval.
     assert len(saves) == 2
+
+
+def test_a_rerun_that_yields_no_items_overwrites_the_old_items(
+    tmp_path: Path,
+) -> None:
+    """A forced segment that now keeps nothing must not leave the old items behind."""
+    from cdt.storage.tables import read_dataset as read_items
+
+    seed_document_partitions(tmp_path)
+    assert not segment_pending_eightk_documents(artifact_root=tmp_path).empty
+
+    segment_pending_eightk_documents(
+        artifact_root=tmp_path, force=True, item_numbers=("9.99",)
+    )
+
+    assert read_items(items_root(tmp_path)).empty

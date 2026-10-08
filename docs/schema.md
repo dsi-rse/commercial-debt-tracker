@@ -114,7 +114,7 @@ Practical implication:
 - one parquet file usually represents "one filing date, one shard bucket"
 - the number of rows in that file is variable and depends on how many filings hashed into that bucket
 - downstream stages preserve the partition shape rather than reshuffling by a new key
-- stages may mark a source partition completed without writing an output parquet when that partition produces zero downstream rows
+- a source partition that produces zero downstream rows is marked completed without writing an output parquet. If an earlier run did write one, it is overwritten with an empty table instead, so the next stage sees that partition change and drops what it derived from the old rows
 
 ### CIK-Sharded Stages
 

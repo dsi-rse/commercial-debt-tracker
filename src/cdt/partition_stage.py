@@ -31,7 +31,7 @@ from cdt.datasets import (
 )
 from cdt.lease import throttled
 from cdt.shared import get_logger
-from cdt.storage.objects import write_json_artifact
+from cdt.storage.objects import artifact_exists, write_json_artifact
 from cdt.storage.tables import write_partition_table
 
 LOGGER = get_logger(__name__)
@@ -79,13 +79,17 @@ def run_partition_stage(
     """Run ``process`` over every pending source partition of ``source_dataset``.
 
     ``process`` receives the source partition path and its ``{date, shard}``
-    and returns that partition's output. Non-empty output is written to the
-    same date/shard of ``output_dataset``; empty output writes nothing and
-    still completes the partition. Completion is saved at most every
+    and returns that partition's output, which is written to the same
+    date/shard of ``output_dataset``. Empty output completes the partition and
+    writes nothing, unless an earlier run's output is there, which is then
+    overwritten empty so later stages see the rows go. A held partition (output
+    ``complete`` False) writes nothing and stays pending.
+
+    Completion is saved at most every
     :data:`cdt.completion.CHECKPOINT_INTERVAL_SECONDS` and once at the end, so
-    an interruption loses at most that much finished work; ``renew`` is called
-    after every partition, throttled (:func:`cdt.lease.throttled`). A run
-    manifest is written at ``runs/<stage_name>/run_id=latest.json``.
+    an interruption loses at most that much finished work. ``renew`` is called
+    before each partition's write, throttled (:func:`cdt.lease.throttled`). A
+    run manifest is written at ``runs/<stage_name>/run_id=latest.json``.
     """
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     pending, registry = pending_source_partitions(
@@ -113,29 +117,39 @@ def run_partition_stage(
         partition = parse_date_shard_partition(source_path)
         started = perf_counter()
         output = process(source_path, partition)
+        # Before writing: a writer that lost its lease must not write again.
+        if keep_lease is not None:
+            keep_lease()
         result.source_rows += output.source_rows
+        output_path = date_shard_partition_path(
+            output_dataset,
+            partition_date=partition["date"],
+            shard=partition["shard"],
+            artifact_root=resolved_root,
+            data_dir=data_dir,
+        )
         if not output.complete:
             result.held_partitions.append(source_path)
-        elif output.rows.empty:
-            result.empty_partitions += 1
-        else:
+        elif not output.rows.empty or artifact_exists(output_path):
+            # An emptied partition is overwritten, not left or deleted: its
+            # new fingerprint is what tells the next stage to drop the rows it
+            # derived from the old ones. With no earlier output, an empty
+            # partition writes no file at all.
             write_partition_table(
                 output_root,
                 partition={"date": partition["date"], "shard": partition["shard"]},
                 table=output.rows.reindex(columns=output_columns),
             )
-            frames.append(output.rows)
-            result.partitions_written.append(
-                date_shard_partition_path(
-                    output_dataset,
-                    partition_date=partition["date"],
-                    shard=partition["shard"],
-                    artifact_root=resolved_root,
-                    data_dir=data_dir,
-                )
-            )
-        if output.complete:
-            registry[source_path] = CompletedPartition(fingerprint=fingerprint)
+            if not output.rows.empty:
+                frames.append(output.rows)
+            result.partitions_written.append(output_path)
+        else:
+            result.empty_partitions += 1
+        # A held partition gets an entry that matches no fingerprint, so it stays
+        # pending even when an earlier run's entry for it is still stored.
+        registry[source_path] = CompletedPartition(
+            fingerprint=fingerprint if output.complete else None
+        )
         LOGGER.info(
             "%s partition complete: date=%s shard=%s progress=%s/%s "
             "source_rows=%s rows=%s wrote_output=%s held=%s elapsed=%.1fs",
@@ -146,13 +160,11 @@ def run_partition_stage(
             total,
             output.source_rows,
             len(output.rows),
-            output.complete and not output.rows.empty,
+            output_path in result.partitions_written,
             not output.complete,
             perf_counter() - started,
         )
         checkpoint()
-        if keep_lease is not None:
-            keep_lease()
     if pending:
         save()
 
