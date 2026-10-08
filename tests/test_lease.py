@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -89,7 +88,6 @@ def test_ttl_written_into_payload(tmp_path: Path) -> None:
 def test_normal_handoff_does_not_warn(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
-    propagate_logger: Callable[[logging.Logger], None],
 ) -> None:
     """Consecutive released-then-reacquired ticks must stay quiet.
 
@@ -98,8 +96,6 @@ def test_normal_handoff_does_not_warn(
     Warning there produced ~24 false alarms a day on the hourly poller and made a
     real crash-recovery steal indistinguishable from routine operation.
     """
-    propagate_logger(lease_module.LOGGER)
-
     with caplog.at_level(logging.DEBUG, logger=lease_module.LOGGER.name):
         for _ in range(3):
             lease = acquire_lease(tmp_path, "writer")
@@ -113,10 +109,8 @@ def test_normal_handoff_does_not_warn(
 def test_crashed_holder_still_warns(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
-    propagate_logger: Callable[[logging.Logger], None],
 ) -> None:
     """Taking over from a holder that never released is still a WARNING."""
-    propagate_logger(lease_module.LOGGER)
     crashed = acquire_lease(tmp_path, "writer", ttl_seconds=0)
     assert crashed is not None  # never released: simulates a died-mid-tick run
 
@@ -141,10 +135,8 @@ def test_crashed_holder_still_warns(
 def test_corrupt_lease_warns(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
-    propagate_logger: Callable[[logging.Logger], None],
 ) -> None:
     """Unreadable lock state is reported, not silently taken over."""
-    propagate_logger(lease_module.LOGGER)
     path = Path(lease_path(tmp_path, "writer"))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"holder": "old", "expires_at": "not a date"}))
@@ -158,10 +150,8 @@ def test_corrupt_lease_warns(
 def test_corrupt_lock_file_is_stealable(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
-    propagate_logger: Callable[[logging.Logger], None],
 ) -> None:
     """A truncated lock file reads as corrupt-and-stealable, not a crash."""
-    propagate_logger(lease_module.LOGGER)
     path = Path(lease_path(tmp_path, "writer"))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text('{"holder": "old", "expires_at": "2099')  # killed mid-write

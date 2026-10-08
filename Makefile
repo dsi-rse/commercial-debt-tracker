@@ -56,7 +56,7 @@ local-run:
 	BUCKET_NAME="$(LOCAL_BUCKET_NAME)" \
 	AWS_PROFILE="$(LOCAL_AWS_PROFILE)" \
 	CDT_DEFAULT_CIK_FILE="$(LOCAL_CIK_FILE)" \
-	uv run cdt-orchestrator --aws-profile "$(LOCAL_AWS_PROFILE)" $(LOCAL_MODE) $(LOCAL_RUN_ARGS)
+	uv run cdt run $(LOCAL_MODE) --aws-profile "$(LOCAL_AWS_PROFILE)" $(LOCAL_RUN_ARGS)
 
 local-pipeline:
 	bash scripts/local-pipeline.sh

@@ -12,7 +12,7 @@ from cdt.segmenter.eightk import (
     item_id_for,
     itemize_document_record,
     itemize_documents,
-    itemize_pending_documents,
+    segment_pending_eightk_documents,
 )
 from cdt.segmenter.text import DocumentText
 
@@ -24,6 +24,6 @@ __all__ = [
     "item_id_for",
     "itemize_document_record",
     "itemize_documents",
-    "itemize_pending_documents",
+    "segment_pending_eightk_documents",
     "items_root",
 ]

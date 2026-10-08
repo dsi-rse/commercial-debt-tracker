@@ -15,95 +15,11 @@ from support import (
 
 from cdt.classifier.core import classifications_root
 from cdt.extractor import extract_pending_items, mentions_root
-from cdt.extractor.schema import DEBT_INSTRUMENT_MENTION_COLUMNS
 from cdt.extractor.state import ExtractionRowState
 from cdt.storage.tables import (
     read_dataset,
     write_partition_table,
 )
-
-
-def test_backfill_mints_over_existing_partitions_and_is_a_no_op_twice(
-    tmp_path: Path,
-) -> None:
-    """A partition written before #203 gains its prior states, once."""
-    from cdt.extractor.outputs import backfill_mentions
-    from cdt.extractor.prior_state import published_mention_rows
-    from cdt.extractor.state import ExtractionRowState
-
-    successor = amended_row()
-    write_partition_table(
-        tmp_path / "mentions",
-        partition={"date": "2024-06-01", "shard": "0001"},
-        table=pd.DataFrame([successor], columns=DEBT_INSTRUMENT_MENTION_COLUMNS),
-    )
-
-    dry = backfill_mentions(tmp_path, dry_run=True)
-    assert dry == {"partitions": 1, "partitions_rewritten": 0, "minted": 1}
-    assert len(read_dataset(tmp_path / "mentions")) == 1
-
-    first = backfill_mentions(tmp_path)
-    assert first == {"partitions": 1, "partitions_rewritten": 1, "minted": 1}
-    published = read_dataset(tmp_path / "mentions").sort_values(
-        "debt_instrument_mention_id"
-    )
-    assert len(published) == 2
-    assert published["synthesized_by"].notna().sum() == 1
-
-    second = backfill_mentions(tmp_path)
-    assert second["minted"] == 1
-    again = read_dataset(tmp_path / "mentions").sort_values(
-        "debt_instrument_mention_id"
-    )
-    pd.testing.assert_frame_equal(
-        published.reset_index(drop=True), again.reset_index(drop=True)
-    )
-
-    # A mint built at write time and one built from the parquet round trip
-    # must be the same row: parquet reads None back as NaN, and every copied
-    # field is coerced so the hash does not notice.
-    row_state = ExtractionRowState(
-        item_row={"item_id": "item-1"}, stage_name="instrument_ie"
-    )
-    row_state.debt_instrument_mentions = [successor]
-    write_time = {
-        r["debt_instrument_mention_id"] for r in published_mention_rows(row_state)
-    }
-    assert write_time == set(published["debt_instrument_mention_id"])
-
-
-def test_backfill_renews_the_writer_lease_once_per_rewritten_partition(
-    tmp_path: Path,
-) -> None:
-    """A whole-dataset rewrite must keep renewing, or it outlives its lease.
-
-    The CLI hands `backfill_mentions` a renewal callback, and a test pins that
-    it does. Nothing pinned that the function ever calls it: deleting the
-    `renew()` block left the whole suite green, so the #89 guard could be
-    removed without a single failure. Same shape as the seams this branch
-    exists to close — both halves pinned, the connection not (#211).
-    """
-    from cdt.extractor.outputs import backfill_mentions
-
-    for date, mention_id in (("2024-06-01", "m-june"), ("2024-07-01", "m-july")):
-        write_partition_table(
-            tmp_path / "mentions",
-            partition={"date": date, "shard": "0001"},
-            table=pd.DataFrame(
-                [amended_row(mention_id)], columns=DEBT_INSTRUMENT_MENTION_COLUMNS
-            ),
-        )
-
-    # A dry run writes nothing, so it takes no lease and must not renew one.
-    renewals: list[int] = []
-    dry = backfill_mentions(tmp_path, dry_run=True, renew=lambda: renewals.append(1))
-    assert dry["partitions_rewritten"] == 0
-    assert renewals == []
-
-    counts = backfill_mentions(tmp_path, renew=lambda: renewals.append(1))
-
-    assert counts["partitions_rewritten"] == 2
-    assert len(renewals) == counts["partitions_rewritten"]
 
 
 def test_late_arriving_rows_extract_after_partition_grows(

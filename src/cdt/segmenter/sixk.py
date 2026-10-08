@@ -1,24 +1,38 @@
-"""Windowing for Form 6-K documents ahead of the two-stage triage.
+"""Form 6-K segmentation: windows ahead of the two-stage triage, and its stage.
 
-Before stage 1, :func:`prepare_filing` strips the inline-XBRL prologue, gates
-the document on debt vocabulary, and cuts it into :data:`WINDOW_TOKENS`-token
-windows. After stage 1, :func:`expand_admitted_windows` prepends context to the
-admitted windows and merges adjacent ones. Window size, gate vocabulary and
+:func:`prepare_filing` strips the inline-XBRL prologue, gates the document on
+debt vocabulary, and cuts it into :data:`WINDOW_TOKENS`-token windows; the
+segment stage (:func:`segment_pending_sixk_documents`) persists those windows as
+spans in ``sixk-windows``. After stage 1, :func:`expand_admitted_windows`
+prepends context to the admitted windows and merges adjacent ones. Window size, gate vocabulary and
 expansion limits were chosen against labelled data; see
 ``docs/sixk-two-stage-triage.md``.
 """
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass, field
 from functools import cache, lru_cache
+from pathlib import Path
 from typing import TYPE_CHECKING
 
+import pandas as pd
+
+from cdt.datasets import (
+    SIXK_DOCUMENT_DATASET_NAME,
+    SIXK_WINDOW_DATASET_NAME,
+    resolve_artifact_root,
+)
+from cdt.ingest.core import DOCUMENT_COLUMNS
+from cdt.partition_stage import PartitionOutput, run_partition_stage
+from cdt.segmenter.core import document_text_for_record, ensure_s3_client
 from cdt.segmenter.text import DOCUMENT_RE, TYPE_RE, normalize_body_lines
+from cdt.storage.tables import read_table
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from tiktoken import Encoding
 
@@ -529,10 +543,51 @@ def prepare_filing(
     >>> prepare_filing("The Company declared a quarterly dividend of $0.10.")
     []
     """
-    body = strip_inline_xbrl_prologue(text)
-    if not has_debt_keyword(body, keywords=keywords):
+    body = gated_body(text, keywords=keywords)
+    if body is None:
         return []
     return split_into_windows(body, target_tokens=target_tokens)
+
+
+def gated_body(text: str, *, keywords: tuple[str, ...] = DEBT_KEYWORDS) -> str | None:
+    """Return the prologue-stripped text windows index into, or None if gated out.
+
+    >>> gated_body("The Company issued senior notes due 2030 today.")
+    'The Company issued senior notes due 2030 today.'
+    >>> gated_body("The Company declared a quarterly dividend of $0.10.") is None
+    True
+    """
+    body = strip_inline_xbrl_prologue(text)
+    if not has_debt_keyword(body, keywords=keywords):
+        return None
+    return body
+
+
+def body_digest(body: str) -> str:
+    """Return the SHA-256 hex digest of the text a document's windows index into.
+
+    Stored with each window span, so a reader that rebuilds the text can tell
+    whether it rebuilt the same text the spans were cut from.
+    """
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def window_from_span(
+    body: str, *, index: int, start: int, end: int, token_count: int
+) -> TextWindow:
+    """Rebuild a stored window span over the text it was cut from.
+
+    >>> window_from_span("abc def", index=0, start=4, end=7, token_count=1).text
+    'def'
+    """
+    return TextWindow(
+        index=index,
+        text=body[start:end],
+        start=start,
+        end=end,
+        token_count=token_count,
+        source=body,
+    )
 
 
 # --- Post-admission expansion -------------------------------------------------
@@ -1004,3 +1059,136 @@ def prose_documents(submission: str) -> list[SixkDocument]:
         if text.strip():
             documents.append(SixkDocument(document_type=document_type, text=text))
     return documents
+
+
+# --- The segment stage --------------------------------------------------------
+#
+# Persists each gated document's windows as spans: no text. The classify stage
+# rebuilds the text from the source submission, which it reads anyway to expand
+# admitted windows, and checks ``source_sha256`` to know it rebuilt the text
+# the spans were cut from.
+
+#: Completion-registry and run-manifest name of the 6-K segment stage.
+SEGMENT_STAGE_NAME = "sixk-segment"
+
+SIXK_WINDOW_COLUMNS = [
+    "accession_number",
+    "cik",
+    "date",
+    # Position among the submission's prose documents (prose_documents order).
+    "document_index",
+    # The document's own <TYPE>: 6-K, EX-99.1, ...
+    "document_type",
+    "window",
+    # Character offsets into the document's gated body (gated_body).
+    "start",
+    "end",
+    "token_count",
+    # body_digest of that gated body.
+    "source_sha256",
+]
+SIXK_WINDOW_INTEGER_COLUMNS = [
+    "document_index",
+    "window",
+    "start",
+    "end",
+    "token_count",
+]
+
+
+def window_rows_for_submission(
+    document: dict[str, object], submission: str
+) -> list[dict[str, object]]:
+    """Return one span row per window of a submission's gated prose documents.
+
+    ``document`` is the filing's documents row; a document the keyword gate
+    rejects contributes no rows.
+    """
+    rows: list[dict[str, object]] = []
+    for document_index, prose in enumerate(prose_documents(submission)):
+        body = gated_body(prose.text)
+        if body is None:
+            continue
+        digest = body_digest(body)
+        for window in split_into_windows(body):
+            rows.append(
+                {
+                    "accession_number": document["accession_number"],
+                    "cik": document.get("cik"),
+                    "date": document.get("date"),
+                    "document_index": document_index,
+                    "document_type": prose.document_type,
+                    "window": window.index,
+                    "start": window.start,
+                    "end": window.end,
+                    "token_count": window.token_count,
+                    "source_sha256": digest,
+                }
+            )
+    return rows
+
+
+def window_documents(
+    documents: pd.DataFrame,
+    *,
+    data_dir: Path | None = None,
+    s3_client: object | None = None,
+) -> pd.DataFrame:
+    """Window in-memory 6-K document rows into span rows (SIXK_WINDOW_COLUMNS)."""
+    rows: list[dict[str, object]] = []
+    for record in documents.to_dict("records"):
+        submission = document_text_for_record(
+            record, data_dir=data_dir, s3_client=s3_client
+        )
+        rows.extend(window_rows_for_submission(record, submission))
+    table = pd.DataFrame(rows, columns=SIXK_WINDOW_COLUMNS)
+    for column in SIXK_WINDOW_INTEGER_COLUMNS:
+        table[column] = pd.to_numeric(table[column]).astype("Int64")
+    return table
+
+
+def segment_pending_sixk_documents(
+    *,
+    artifact_root: str | Path | None = None,
+    data_dir: Path | None = None,
+    batch_size: int = 100,
+    force: bool = False,
+    s3_client: object | None = None,
+    renew: Callable[[], None] | None = None,
+) -> pd.DataFrame:
+    """Window pending 6-K documents partitions into ``sixk-windows`` partitions.
+
+    A documents partition is pending when its fingerprint changed since it was
+    last segmented, or always with ``force``, and is recomputed whole. Returns
+    the span rows written this run.
+    """
+    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    shared_client = s3_client
+
+    def process(source_path: str, partition: dict[str, str]) -> PartitionOutput:
+        nonlocal shared_client
+        del partition
+        documents = read_table(source_path, DOCUMENT_COLUMNS).reindex(
+            columns=DOCUMENT_COLUMNS
+        )
+        shared_client = ensure_s3_client(shared_client, documents.to_dict("records"))
+        return PartitionOutput(
+            rows=window_documents(
+                documents, data_dir=data_dir, s3_client=shared_client
+            ),
+            source_rows=len(documents),
+        )
+
+    return run_partition_stage(
+        SEGMENT_STAGE_NAME,
+        source_dataset=SIXK_DOCUMENT_DATASET_NAME,
+        output_dataset=SIXK_WINDOW_DATASET_NAME,
+        output_columns=SIXK_WINDOW_COLUMNS,
+        process=process,
+        artifact_root=resolved_root,
+        data_dir=data_dir,
+        batch_size=batch_size,
+        force=force,
+        renew=renew,
+        manifest_extra={"window_tokens": WINDOW_TOKENS},
+    ).rows

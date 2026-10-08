@@ -18,7 +18,7 @@ Layout under ``{artifact_root}/extract-batches/``::
     job_id=<id>/batches.json    # in-flight batches, seen batch ids, tick counter
     job_id=<id>/ticks/tick=<n>.json  # per-tick audit counts
 
-Only the ``poll`` mode ever mutates this state, and the orchestrator runs each
+Only ``cdt run poll`` ever mutates this state, and it runs each
 poll tick under the single ``pipeline-writer`` lease (``cdt.lease``), so
 overlapping ticks and the ``daily`` schedule's match/finalize cannot race it.
 """
@@ -1073,7 +1073,7 @@ def advance_extract_job(
     completed OpenAI batches into row states, submit the next batch for rows still
     needing a call, then persist state. When every row is terminal, write the
     mention partitions + audit log + completion registry and clear the active-job
-    marker (match/finalize is the orchestrator's responsibility).
+    marker (match/finalize is the caller's: ``cdt.run.run_poll``).
 
     ``renew_lease`` runs at phase boundaries and may raise (``LeaseLostError``)
     to abort the tick when the caller's writer lease was stolen. Both
@@ -1269,8 +1269,8 @@ def _warn_if_stalled(job: JobState, terminal_rows: int) -> None:
         return
     LOGGER.warning(
         "Extract job stalled: job=%s tick=%s terminal=%s/%s — still unfinished "
-        "after %s hourly ticks. Inspect with `cdt show-extract-job`; a job that "
-        "cannot finish can be cleared with `cdt reset-extract-job --yes`.",
+        "after %s hourly ticks. Inspect with `cdt extract job show`; a job that "
+        "cannot finish can be cleared with `cdt extract job reset --yes`.",
         job.job_id,
         job.tick,
         terminal_rows,

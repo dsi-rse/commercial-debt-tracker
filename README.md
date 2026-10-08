@@ -3,8 +3,7 @@
 Commercial Debt Tracker (CDT) processes SEC 8-K and 6-K filings to build a file-native history of debt instruments. It:
 
 - ingests complete submission text files for a configured CIK universe
-- itemizes the 8-K sections most likely to contain debt disclosures, and classifies them for debt relevance
-- triages 6-K filings into debt-relevant snippets (see [docs/sixk-two-stage-triage.md](docs/sixk-two-stage-triage.md))
+- segments each filing (8-K item sections, 6-K windows) and classifies the segments for debt relevance (6-K: see [docs/sixk-two-stage-triage.md](docs/sixk-two-stage-triage.md))
 - uses an LLM-backed extractor to produce structured debt-instrument mentions
 - matches mentions into instrument-level histories
 - optionally writes dashboard-facing final parquet snapshots
@@ -23,7 +22,7 @@ CDT is intentionally file-native. Canonical state lives under one artifact root 
 
 This avoids a mutable database dependency and keeps reruns deterministic:
 
-- date-partitioned stages write `documents`, `items`, `classifications`, and `mentions`
+- date-partitioned stages write `documents`, `items`, `classifications`, and `mentions` (and their 6-K counterparts `documents-sixk`, `sixk-windows`, `sixk-snippets`)
 - CIK-sharded matcher outputs write `mention-cluster-edges` and `debt-instruments`
 - stage manifests and extractor audit logs are written alongside those datasets
 
@@ -31,16 +30,16 @@ See [docs/schema.md](docs/schema.md) for the concrete layout, including the opti
 
 ## Deployment Summary
 
-The deployed service is a single ECS Fargate task running `cdt-orchestrator`, with:
+The deployed service is a single ECS Fargate task running `cdt run`, with:
 
-- a container image built from [dockerfiles/Dockerfile.orchestrator](dockerfiles/Dockerfile.orchestrator)
+- a container image built from [dockerfiles/Dockerfile.orchestrator](dockerfiles/Dockerfile.orchestrator), whose entrypoint is `cdt`
 - infrastructure provisioned from [`pulumi/`](pulumi/)
-- a daily EventBridge Scheduler trigger that runs `cdt-orchestrator daily`
-- an hourly EventBridge Scheduler trigger that runs `cdt-orchestrator poll`
+- a daily EventBridge Scheduler trigger that runs `cdt run daily`
+- an hourly EventBridge Scheduler trigger that runs `cdt run poll`
 - manual historical backfills via `scripts/run-historical.sh` (admin-run ECS task command overrides; see [docs/deployment.md](docs/deployment.md))
 
-The deployed `daily` run does ingest → itemize → classify for 8-K and ingest → triage
-for 6-K, and refreshes match/final snapshots, but hands the expensive LLM extract stage to OpenAI's Batch API. The hourly
+The deployed `daily` run does ingest → segment → classify for each genre (8-K and
+6-K), and refreshes match/final snapshots, but hands the expensive LLM extract stage to OpenAI's Batch API. The hourly
 `poll` run advances that asynchronous batch job one step at a time and re-runs match +
 finalize when it completes. See [docs/architecture.md](docs/architecture.md) for the
 extract state machine.
@@ -64,24 +63,45 @@ uv run pytest -v
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for how to contribute changes.
 
-Main local entrypoints:
+`cdt` is the one command line. Each stage command is named after the module it runs, and
+`cdt run` runs the whole pipeline the way ECS does:
+
+```text
+cdt ingest     acquire each genre's filings for a CIK list            (cdt.ingest)
+cdt segment    8-K item sections and 6-K window spans                 (cdt.segmenter)
+cdt classify   8-K item relevance and 6-K triage; `classify train`    (cdt.classifier)
+cdt extract    live LLM extraction; `extract job show|reset`          (cdt.extractor)
+cdt match      instruments and lineage                                (cdt.matcher)
+cdt publish    the four latest.parquet tables                         (cdt.publish)
+cdt run daily | historical | poll                                     (cdt.run)
+```
+
+Examples (the CIK file is not in git; supply your own one-CIK-per-line file):
 
 ```bash
-uv run cdt pipeline --artifact-root ./data historical ./data/ciks/1000-ciks.txt --start-date 2024-01-01 --end-date 2024-01-31
-uv run cdt-orchestrator --artifact-root ./data/local daily --cik-file ./data/ciks/1000-ciks.txt
+uv run cdt run historical --extractor-backend live --artifact-root ./data/local \
+  --final-database-root ./data/database --cik-file ./ciks.txt \
+  --start-date 2024-01-01 --end-date 2024-01-31
+uv run cdt segment --genres 8-K --artifact-root ./data/local
 make local-run
 ./scripts/local-pipeline.sh historical --start-date 2024-01-01 --end-date 2024-01-31
 ```
 
 Notes:
 
-- `cdt` is the stage-oriented CLI for local and ad hoc runs.
-- `cdt ingest`, `cdt pipeline` and `cdt-orchestrator` cover every genre (8-K and 6-K) by default, for one CIK list; `--genres 8-K` (or `6-K`) narrows a run to one genre. To get an issuer's 6-Ks, put it in the CIK list.
-- `cdt-orchestrator` is the deployment-oriented entrypoint used by ECS.
-- `cdt pipeline` writes final snapshots only when `--final-database-root` is passed.
-- `cdt-orchestrator` reads `FINAL_DATABASE_ROOT` from the environment, or accepts `--final-database-root` before the mode.
-- `make local-run` and `./scripts/local-pipeline.sh` exercise the orchestrator with deployment-like environment variables from `.env`.
-- `cdt show-extract-job` inspects the async batch extract job; `cdt reset-extract-job --yes`
+- Every option defaults from the flag, then its environment variable (`ARTIFACT_ROOT`,
+  `FINAL_DATABASE_ROOT`, `BUCKET_NAME`, `CDT_DEFAULT_CIK_FILE`, `GENRES`,
+  `EXTRACTOR_BACKEND`), then the built-in default, the same for every command.
+  `--artifact-root` falls back to `DATA_DIR`.
+- `--genres` defaults to `8-K,6-K` on `ingest`, `segment`, `classify` and `run daily|historical`;
+  `--genres 8-K` (or `6-K`) narrows a command to one genre. To get an issuer's 6-Ks, put it in the
+  CIK list. `extract`, `match` and `publish` read every genre's output.
+- `cdt ingest` and `cdt run daily` default to the daily window (the 5 days ending yesterday) when
+  no dates are given.
+- The classifier models default to the committed artifacts under `data/models/`, not `DATA_DIR`.
+- Final snapshots are written only when `--final-database-root` (or `FINAL_DATABASE_ROOT`) is set.
+- `make local-run` and `./scripts/local-pipeline.sh` run `cdt run` with deployment-like environment variables from `.env`.
+- `cdt extract job show` inspects the async batch extract job; `cdt extract job reset --yes`
   clears a wedged one. See [docs/architecture.md](docs/architecture.md).
 - The shared local convention is `DATA_DIR/commercial-debt-tracker/local` for canonical artifacts and `DATA_DIR/commercial-debt-tracker/database/cdt` for dashboard-consumable `latest.parquet` outputs.
 
@@ -109,7 +129,8 @@ This mirrors the cloud contract: in deployment, CDT writes the same final snapsh
 To test the processor and dashboard together on your machine:
 
 1. Set the same `DATA_DIR` in both repos' `.env` files.
-2. Run CDT locally against your target date range and optional CIK file:
+2. Run CDT locally against your target date range. The scripts default `LOCAL_CIK_FILE` to
+   `data/ciks/1000-ciks.txt`, which is not in git: create it or point `LOCAL_CIK_FILE` at your own file.
 
 ```bash
 ./scripts/local-pipeline.sh historical --start-date 2020-01-01 --end-date 2021-12-31
@@ -134,7 +155,7 @@ Deployed runs require:
 - `BUCKET_NAME`
 - `CDT_DEFAULT_CIK_FILE`
 - `OPENAI_API_KEY` (used by the deployed batch extract poller)
-- `OPENROUTER_API_KEY` (used by the synchronous `live` extract backend)
+- `OPENROUTER_API_KEY` (used by the synchronous `live` extract backend, and by default by the 6-K stage-2 triage)
 
 Optional runtime configuration:
 
@@ -148,11 +169,12 @@ Optional runtime configuration:
   is configured in OpenRouter's vocabulary for both backends; the vocabularies align
   except for `minimal`, which is translated to OpenAI's `low`.
 - `EXTRACTOR_BACKEND` (`batch` default, or `live`) — also settable per run with
-  `cdt-orchestrator --extractor-backend {live,batch} daily`
+  `cdt run daily --extractor-backend {live,batch}`
 - `SIXK_TRIAGE_MODEL` (default `openai/gpt-5.6-luna`) and `SIXK_TRIAGE_REASONING`
   (default `none`) for the Form 6-K stage-2 triage. Separate from `EXTRACTOR_MODEL`
   because triage reads a lot of text and returns a list of ids, so it is priced for
   volume; see `docs/sixk-two-stage-triage.md`. `SIXK_TRIAGE_PROVIDER` (`openrouter` default,
   or `openai`) picks the API the triage call goes to.
-- `GENRES` (default `8-K,6-K`): the orchestrator default for `--genres`
+- `GENRES` (default `8-K,6-K`): the default for `--genres`
+- `FINAL_DATABASE_ROOT`: where `cdt run` and `cdt publish` publish the final snapshots
 

@@ -19,6 +19,7 @@ Two schema-wide contracts:
   documents-sixk/
   raw-documents/sixk/
   items/
+  sixk-windows/
   classifications/
   sixk-snippets/
   mentions/
@@ -32,7 +33,7 @@ Two schema-wide contracts:
   locks/
 ```
 
-`documents-sixk` holds Form 6-K documents (same columns as `documents`), `raw-documents/sixk` is CDT's own gzipped copy of each 6-K submission, and `sixk-snippets` holds the 6-K triage output: the 6-K counterpart of `classifications`. Extract reads `classifications` and `sixk-snippets` through one projection and writes both genres' mentions into `mentions`.
+`documents-sixk` holds Form 6-K documents (same columns as `documents`), `raw-documents/sixk` is CDT's own gzipped copy of each 6-K submission, `sixk-windows` holds the 6-K segment output (window spans, no text): the 6-K counterpart of `items`, and `sixk-snippets` holds the 6-K classify (triage) output: the 6-K counterpart of `classifications`. Extract reads `classifications` and `sixk-snippets` through one projection and writes both genres' mentions into `mentions`.
 
 Optional final snapshot layout:
 
@@ -51,7 +52,7 @@ Optional final snapshot layout:
 Date-partitioned datasets:
 
 - `documents`, `documents-sixk`
-- `items`
+- `items`, `sixk-windows`
 - `classifications`, `sixk-snippets`
 - `mentions`
 
@@ -104,7 +105,8 @@ How rows land there:
 - `documents`: rows are grouped by filing `date`, then by `crc32(accession_number) % 64`.
 - `items`: each item row is written to the same `date` and `shard` partition as its parent document partition.
 - `classifications`: each classified row is written to the same `date` and `shard` partition as its source item partition.
-- `sixk-snippets`: each snippet row is written to the same `date` and `shard` partition as its source `documents-sixk` partition.
+- `sixk-windows`: each window row is written to the same `date` and `shard` partition as its source `documents-sixk` partition.
+- `sixk-snippets`: each snippet row is written to the same `date` and `shard` partition as its source `sixk-windows` partition (and so its `documents-sixk` partition).
 - `mentions`: each extracted mention row is written to the same `date` and `shard` partition as its source classification or snippet partition.
 
 Practical implication:
@@ -139,8 +141,8 @@ Practical implication:
 
 `batch_size` controls the chunk size used while draining pending work in one invocation. It does not control parquet file size.
 
-- `itemize`: processes all pending `documents` partitions, in chunks of up to `batch_size` partitions at a time.
-- `classify`: processes all pending `items` partitions, in chunks of up to `batch_size` partitions at a time.
+- `segment`: processes all pending `documents` (8-K) and `documents-sixk` (6-K) partitions, in chunks of up to `batch_size` partitions at a time.
+- `classify`: processes all pending `items` (8-K) and `sixk-windows` (6-K) partitions, in chunks of up to `batch_size` partitions at a time.
 - `extract`: processes all pending `classifications` partitions, in chunks of up to `batch_size` partitions at a time.
 - `match`: processes all `cik_shard` groups present in the mentions dataset, in chunks of up to `batch_size` shard groups at a time.
 - `ingest`: different from the other stages; here `batch_size` is a row buffer threshold for flushing accumulated document rows to their target partitions.
@@ -252,6 +254,22 @@ A `sixk-snippets` row (`form_type` `6-K` in the snapshot) fills the same columns
 - `resource_uri`: the parent document's.
 
 The snippet's own span and triage verdict (`sixk_window_start`, `sixk_window_end`, `sixk_token_count`, `sixk_verdict`, `sixk_duplicate_of`, `sixk_member_windows`) stay in `sixk-snippets` and are not published.
+
+### `sixk-windows`
+
+The 6-K segment output: one row per window of each 6-K prose document that passes the debt-vocabulary gate, as a **span only**. The text is not stored; the classify stage rebuilds it from the filing's submission (see [sixk-two-stage-triage.md](sixk-two-stage-triage.md)). A filing the gate rejects writes no rows.
+
+Columns:
+
+- `accession_number`, `cik`, `date`: the filing's, from its `documents-sixk` row.
+- `document_index` (`int64`): the document's position among the submission's prose documents (`cdt.segmenter.sixk.prose_documents` order).
+- `document_type`: the document's own `<TYPE>`, such as `6-K` or `EX-99.1`.
+- `window` (`int64`): the window's position within its document, from 0.
+- `start`, `end` (`int64`): character offsets of the window into the document's gated body — the flattened text with its inline-XBRL prologue stripped (`cdt.segmenter.sixk.gated_body`).
+- `token_count` (`int64`): the window's `o200k_base` token count.
+- `source_sha256`: SHA-256 hex digest of that gated body. The classify stage refuses a filing whose rebuilt body has a different digest, and leaves its whole partition pending.
+
+Primary key: `accession_number`, `document_index`, `window`
 
 ### `classifications`
 
@@ -458,9 +476,8 @@ does not change (`amendment_of` and the `synthesized_*` columns are not
 hashed). Downstream, the matcher never lets a synthesized member supply a
 cluster's canonical fields or widen its name class, may borrow the successor's
 lender signature for scoring only, and publishes `synthesized_only` on an
-instrument whose every member is synthesized. `cdt backfill-mentions`
-re-derives the synthesized rows over every existing `mentions` partition; it is
-a pure function of the model-emitted rows and a no-op when run twice.
+instrument whose every member is synthesized. The synthesized rows are a pure
+function of the model-emitted rows, minted when the item's mentions are written.
 
 ##### Reading them safely
 
@@ -495,7 +512,7 @@ Columns:
 - `amendment_of_debt_instrument_id`: Parent instrument ID when this instrument is an amendment lineage child. Every lineage pointer on this table carries a relation the **extractor** asserted and cited, except where `amendment_inferred_by` says otherwise; the matcher resolves the `raw_id` to an instrument ID but never invents the relation. A pointer that records a matcher inference rather than an extracted fact needs a provenance column alongside it, documented here, and that column has to survive an incremental rematch — see the stage boundary in `docs/architecture.md`.
 - `retired_by_debt_instrument_ids`: JSON array of IDs of the instruments that retired this one, set on the retired instrument's own row (null when none).
 - `split_of_debt_instrument_id`: Parent instrument ID when this instrument is a split lineage child.
-- `amendment_inferred_by`: Which rule inferred `amendment_of_debt_instrument_id`, when the matcher filled it rather than the extractor: `ordinal_chain` (the amend-and-restate ordinal in the name) is the only value. Null means the pointer came from an extracted, cited relation — including the pointer from an amended instrument to the prior state the extractor minted for it — so an inferred pointer is never mistaken for an extracted one. Set by the lineage pass, which runs after every match — in `cdt match`, in the pipeline's match-and-finalize step, and in `PipelineOrchestrator.run` (`cdt pipeline` and the live extractor backend) alike — and which clears and re-derives every inferred pointer on each run.
+- `amendment_inferred_by`: Which rule inferred `amendment_of_debt_instrument_id`, when the matcher filled it rather than the extractor: `ordinal_chain` (the amend-and-restate ordinal in the name) is the only value. Null means the pointer came from an extracted, cited relation — including the pointer from an amended instrument to the prior state the extractor minted for it — so an inferred pointer is never mistaken for an extracted one. Set by the lineage pass, which runs after every match — in `cdt match`, in the pipeline's match-and-finalize step, and in `Pipeline.run` (`cdt run daily|historical --extractor-backend live`) alike — and which clears and re-derives every inferred pointer on each run.
 - `superseded_by_debt_instrument_id`: The amendment child that replaced this state, when exactly one exists. A row with this set is a superseded state, not a live obligation.
 - `lineage_family_id`: One ID per connected lineage component over amendment, split, and retirement pointers — every state of one obligation history shares it. Singleton instruments use their own ID.
 - `is_lineage_head`: True when no amendment child supersedes this row; the browse index should show heads and collapse the rest of the family beneath them.
@@ -530,16 +547,26 @@ Ingest writes one manifest per run with a generated timestamp-based run ID:
 <artifact-root>/runs/ingest/run_id=<run_id>.json
 ```
 
-### Itemize, classify, and match manifests
+### Segment, classify, and match manifests
 
-These stages currently overwrite a `latest` manifest:
+These stages overwrite a `latest` manifest, named by their completion-registry stage name:
 
 ```text
-<artifact-root>/runs/itemize/run_id=latest.json
-<artifact-root>/runs/classify/run_id=latest.json
+<artifact-root>/runs/itemize/run_id=latest.json        # 8-K segment
+<artifact-root>/runs/sixk-segment/run_id=latest.json   # 6-K segment
+<artifact-root>/runs/classify/run_id=latest.json       # 8-K classify
+<artifact-root>/runs/sixk-classify/run_id=latest.json  # 6-K classify (triage)
 <artifact-root>/runs/match/run_id=latest.json
 <artifact-root>/runs/infer-lineage/run_id=latest.json
 ```
+
+The four segment and classify manifests share one shape (`cdt.partition_stage`):
+`stage`, `artifact_root`, `batch_size`, `force`, `source_rows_processed`,
+`partitions_visited`, `partitions_written`, `empty_partitions_skipped_from_write`,
+`partitions_held` (source partitions left pending, such as 6-K windows whose
+spans no longer match their text) and `completion_registry`, plus stage-specific
+settings (`item_numbers`; `window_tokens`; `concurrency`, `stage2_model`,
+`stage2_provider`).
 
 `infer-lineage` is the amendment-lineage post-pass. It runs after every match
 and rewrites every `debt-instruments` partition the match manifest just listed,
@@ -569,7 +596,7 @@ Extractor writes a per-run manifest and a matching full audit log:
 
 The OpenAI batch extract backend keeps its resumable, file-native job state under
 `extract-batches/`. The hourly `poll` run is the only writer, apart from the
-`cdt reset-extract-job` admin command, which rewrites `active.json` under the same lease.
+`cdt extract job reset` admin command, which rewrites `active.json` under the same lease.
 
 ```text
 <artifact-root>/extract-batches/
@@ -581,7 +608,7 @@ The OpenAI batch extract backend keeps its resumable, file-native job state unde
   job_id=<run_id>/ticks/tick=<n>.json  # per-tick audit counts
 ```
 
-The orchestrator also keeps advisory locks directly under the artifact root:
+Every writing command also takes an advisory lock directly under the artifact root:
 
 ```text
 locks/pipeline-writer.json           # single-writer lease: {holder, acquired_at, expires_at}
@@ -650,8 +677,7 @@ dropped. Retrying the listed rows is still manual, and still partition-granular 
 
 - canonical truth is the partition data, not the run manifest
 - final snapshot parquet files are derived convenience outputs, not the canonical working state
-- `cdt pipeline` writes final snapshots only when `--final-database-root` is passed
-- `cdt-orchestrator` writes final snapshots when `FINAL_DATABASE_ROOT` is set or `--final-database-root` is passed before the mode
+- `cdt run` and `cdt publish` write final snapshots only when `--final-database-root` is passed or `FINAL_DATABASE_ROOT` is set
 - stage completion is recorded per source partition in the stage's completion registry (`runs/<stage>/completed/`), keyed by the source partition's fingerprint; whether an output partition exists plays no part
 - `force=false` skips source partitions whose fingerprint is unchanged since completion was recorded
 - local runs and deployed runs use the same layout and code paths

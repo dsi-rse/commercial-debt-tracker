@@ -6,10 +6,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import re
 import shutil
-from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -1128,10 +1126,8 @@ def test_unsupported_reasoning_effort_fails_before_job_creation(
 def test_force_warns_when_a_job_is_already_active(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
-    propagate_logger: Callable[[logging.Logger], None],
 ) -> None:
     """Force only applies at job creation, so a mid-job force must not go silent."""
-    propagate_logger(batch_module.LOGGER)
     seed_classification(tmp_path, [{"item_id": "item-multi", "text": MULTI_TEXT}])
     client = FakeBatchClient(
         {"item-multi": {"ner": MULTI_NER, "instrument_ie": MULTI_IE}}
@@ -1188,10 +1184,8 @@ def _seed_active_job(tmp_path: Path, client: FakeBatchClient) -> str:
 def test_missing_job_directory_self_heals(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
-    propagate_logger: Callable[[logging.Logger], None],
 ) -> None:
     """A deleted job directory clears the marker instead of wedging every tick."""
-    propagate_logger(batch_module.LOGGER)
     client = FakeBatchClient(
         {"item-multi": {"ner": MULTI_NER, "instrument_ie": MULTI_IE}}
     )
@@ -1519,17 +1513,14 @@ def test_per_request_server_error_requeues_instead_of_terminating(
 
 def test_stall_warning_fires_only_past_the_tick_threshold(
     caplog: pytest.LogCaptureFixture,
-    propagate_logger: Callable[[logging.Logger], None],
 ) -> None:
     """The stall literal appears once a job outlives STALL_WARNING_TICKS (#85)."""
-    from cdt.extractor.batch import LOGGER as batch_logger
     from cdt.extractor.batch import (
         STALL_WARNING_TICKS,
         JobState,
         _warn_if_stalled,
     )
 
-    propagate_logger(batch_logger)
     job = JobState(
         job_id="J",
         model="m",

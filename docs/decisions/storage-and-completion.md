@@ -340,8 +340,9 @@ dirty entries are written, overlaid on the freshest saved state.
 
 Each shard's compare-and-swap is independent, which keeps the per-batch save
 from #111 durable for the stages that save every batch: if a save is
-interrupted after three of five shards, those three stay saved. Itemize,
-classify and 6-K triage save at every batch boundary. Extract does not (#227):
+interrupted after three of five shards, those three stay saved. The segment
+and classify stages of both genres save at every batch boundary (they share
+`cdt.partition_stage.run_partition_stage`). Extract does not (#227):
 `extract_pending_items` accepts `batch_size`, but the value only reaches the
 run manifest and the partition loop is never chunked. Its only save is after
 the loop, so an interruption still loses the whole run's registry progress,

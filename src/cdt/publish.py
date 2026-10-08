@@ -177,7 +177,7 @@ def publish_would_republish_nothing(
 
 
 def _ignore_stage(*args: object, **kwargs: object) -> None:
-    """Swallow a stage log line: only the orchestrator reports stages."""
+    """Swallow a stage log line: only a whole run reports stages."""
 
 
 def finalize_after_match(
@@ -193,8 +193,8 @@ def finalize_after_match(
 ) -> dict[str, str]:
     """Run the lineage post-pass, then publish unless the gate says skip.
 
-    Every entry point that runs match and publishes must finish through here;
-    ``cdt match`` runs the lineage pass itself and does not publish. The lineage
+    Every whole run that matches and publishes finishes through here; ``cdt
+    match`` runs the lineage pass itself and ``cdt publish`` only publishes. The lineage
     pass is skipped when ``matched_instruments`` is empty. ``renew`` extends
     the caller's writer lease before each long step, so a stolen lease cannot
     keep publishing.
@@ -210,6 +210,36 @@ def finalize_after_match(
             artifact_root, data_dir=data_dir, renew=renew
         )
         log_stage_complete("infer-lineage", **lineage_stats)
+    return publish_final_tables(
+        artifact_root=artifact_root,
+        final_database_root=final_database_root,
+        data_dir=data_dir,
+        force=force,
+        renew=renew,
+        log_stage_start=log_stage_start,
+        log_stage_complete=log_stage_complete,
+    )
+
+
+def publish_final_tables(
+    *,
+    artifact_root: ArtifactPath,
+    final_database_root: ArtifactPath | None,
+    data_dir: Path | None = None,
+    force: bool = False,
+    renew: Callable[[], None] | None = None,
+    log_stage_start: Callable[..., None] = _ignore_stage,
+    log_stage_complete: Callable[..., None] = _ignore_stage,
+) -> dict[str, str]:
+    """Publish the four final tables from the canonical datasets, unless the gate says skip.
+
+    Reads whatever ``match`` (and its lineage pass) last wrote; ``cdt publish``
+    calls this directly, every whole run through :func:`finalize_after_match`.
+    ``renew`` extends the caller's writer lease before the write.
+
+    Returns:
+        Published table name -> snapshot path; empty when nothing was published.
+    """
     log_stage_start("finalize", output_root=final_database_root)
     # After lineage (which writes debt-instruments), before the publish reads.
     source_digest = (

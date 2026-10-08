@@ -12,10 +12,10 @@ The `dev` stack provisions:
 - an ECS Fargate cluster and task definition
 - IAM roles for ECS execution and runtime access
 - a CloudWatch log group
-- two EventBridge Scheduler schedules: a daily `cdt-orchestrator daily` and an hourly `cdt-orchestrator poll`
+- two EventBridge Scheduler schedules: a daily `cdt run daily` and an hourly `cdt run poll`
 - SSM SecureString parameters holding `OPENAI_API_KEY` and `OPENROUTER_API_KEY` under `/idi/dev/cdt/secrets/`
 
-The daily task runs `cdt-orchestrator daily`; the hourly task runs `cdt-orchestrator poll` to advance the OpenAI batch extract job. Historical runs are manual ECS task invocations with a container command override.
+The daily task runs `cdt run daily`; the hourly task runs `cdt run poll` to advance the OpenAI batch extract job. Historical runs are manual ECS task invocations with a container command override.
 
 ## Dev Values
 
@@ -146,7 +146,7 @@ The OpenAI key powers the deployed batch extract poller and is required. The
 optional `idi:poll_cron` (default `cron(30 * * * ? *)`) controls the hourly poll
 schedule.
 
-This processor stack does not publish Cloudflare R2 JSON. It writes final parquet snapshots under `idi:final_database_prefix`; the dashboard publisher stack in `../commercial-debt-tracker-dashboard` reads those snapshots and updates R2.
+This processor stack does not publish Cloudflare R2 JSON. It writes final parquet snapshots under `idi:final_database_prefix`; the website publisher ([dsi-rse/commercial-debt-tracker-website](https://github.com/dsi-rse/commercial-debt-tracker-website)) reads those snapshots and updates R2.
 
 ## Preview and Deploy
 
@@ -173,7 +173,7 @@ pulumi stack output log_group_name
 The EventBridge schedule runs the container with:
 
 ```bash
-cdt-orchestrator daily
+cdt run daily
 ```
 
 It does not run `historical`.
@@ -211,9 +211,9 @@ aws ecs run-task \
   --overrides '{
     "containerOverrides": [
       {
-        "name": "cdt-orchestrator",
+        "name": "cdt",
         "command": [
-          "historical",
+          "run", "historical",
           "--cik-file", "s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/inputs/ciks/beta-1k.txt",
           "--start-date", "2024-01-01",
           "--end-date", "2024-01-31"
@@ -249,9 +249,9 @@ aws ecs run-task \
   --overrides "{
     \"containerOverrides\": [
       {
-        \"name\": \"cdt-orchestrator\",
+        \"name\": \"cdt\",
         \"command\": [
-          \"historical\",
+          \"run\", \"historical\",
           \"--cik-file\", \"s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/inputs/ciks/beta-50k.txt\",
           \"--start-date\", \"2016-01-01\",
           \"--end-date\", \"$(date +%F)\"
@@ -273,8 +273,11 @@ Expected `dev` artifacts:
 
 ```text
 s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/documents/...
+s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/documents-sixk/...
 s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/items/...
+s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/sixk-windows/...
 s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/classifications/...
+s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/sixk-snippets/...
 s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/mentions/...
 s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/mention-cluster-edges/...
 s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/debt-instruments/...

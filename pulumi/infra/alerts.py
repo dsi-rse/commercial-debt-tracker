@@ -7,7 +7,7 @@ launches and then crashes or is OOM-killed notifies nobody; and a stolen lease
 means a run died mid-write. Each alarm below covers one of those blind spots:
 
 - **Poll liveness** — no "Poll tick complete" line for six hours.
-- **Daily heartbeat** — no "Orchestrator run complete: mode=daily" line for a
+- **Daily heartbeat** — no "Run complete: mode=daily" line for a
   day (crashed, wedged, or never-launched daily run).
 - **Task failures** — an EventBridge rule on ECS Task State Change for tasks
   that stop with a nonzero exit code or fail to start (covers OOM kills, which
@@ -96,8 +96,7 @@ if config.alerts_enabled:
         "cdt-task-failure-rule",
         name=f"{config.name_prefix}-task-failures",
         description=(
-            "A CDT orchestrator ECS task stopped with a nonzero exit code or "
-            "failed to start."
+            "A CDT ECS task stopped with a nonzero exit code or " "failed to start."
         ),
         event_pattern=pulumi.Output.json_dumps(
             {
@@ -183,7 +182,7 @@ if config.alerts_enabled:
         alarm_description=(
             "The active batch extract job has not finished after ~4 days of "
             "hourly ticks; it is blocking all newer filings. Inspect with "
-            "`cdt show-extract-job`; clear with `cdt reset-extract-job --yes`."
+            "`cdt extract job show`; clear with `cdt extract job reset --yes`."
         ),
         namespace="CDT",
         metric_name=_job_stall_metric,
@@ -257,14 +256,14 @@ if config.alerts_enabled:
         _daily_metric = _log_count_metric(
             "cdt-daily-heartbeat-metric",
             "daily-completions",
-            '"Orchestrator run complete: mode=daily"',
+            '"Run complete: mode=daily"',
         )
         daily_heartbeat_alarm = aws.cloudwatch.MetricAlarm(
             "cdt-daily-heartbeat-alarm",
             name=f"{config.name_prefix}-daily-heartbeat",
             alarm_description=(
-                "No daily orchestrator run has completed for 24 hours; the run "
-                "crashed, wedged, or never launched. Ingest/itemize/classify "
+                "No `cdt run daily` has completed for 24 hours; the run "
+                "crashed, wedged, or never launched. Ingest/segment/classify "
                 "are not advancing."
             ),
             namespace="CDT",

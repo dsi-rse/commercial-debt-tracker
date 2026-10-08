@@ -26,10 +26,12 @@ from cdt.storage.tables import is_orphaned_temp_artifact
 
 LOGGER = get_logger(__name__)
 
-# The 6-K triage stage's output dataset. Named here, not beside its writer,
+# The 6-K classify stage's output dataset. Named here, not beside its writer,
 # because the extractor must name it and cannot import ``cdt.classifier.sixk``
 # (which imports ``cdt.extractor``); this module is the leaf both import.
 SIXK_SNIPPET_DATASET_NAME = "sixk-snippets"
+# The 6-K segment stage's output: window spans, no text.
+SIXK_WINDOW_DATASET_NAME = "sixk-windows"
 MATCH_SHARDS = 64
 PARTITION_PATTERN = re.compile(
     r"(?P<dataset>[a-z\-]+)/date=(?P<date>\d{4}-\d{2}-\d{2})/shard=(?P<shard>\d{4})/part-0000\.parquet$"
@@ -336,9 +338,11 @@ CLASSIFICATION_DATASET_NAME = "classifications"
 class Genre:
     """One filing genre: its SEC forms and the datasets its upstream stages write.
 
-    ``document_dataset`` is what ingest writes, ``item_dataset`` the rows the
-    published ``items`` table takes from this genre, and ``classified_dataset``
-    the rows the extractor reads. For 6-K the last two are the same dataset.
+    ``document_dataset`` is what ingest writes, ``segment_dataset`` what segment
+    writes, ``item_dataset`` the rows the published ``items`` table takes from
+    this genre, and ``classified_dataset`` the rows the extractor reads. For 8-K
+    the segments are the items; for 6-K the published items are the classified
+    snippets.
     ``inlines_bodies`` is whether ingest may store document bodies in the
     partition (``--download``); a 6-K row instead points at the mirrored
     submission, so every read does not pay for every body.
@@ -347,6 +351,7 @@ class Genre:
     name: str
     form_types: tuple[str, ...]
     document_dataset: str
+    segment_dataset: str
     item_dataset: str
     classified_dataset: str
     inlines_bodies: bool
@@ -358,6 +363,7 @@ GENRES: dict[str, Genre] = {
         name=GENRE_8K,
         form_types=DEFAULT_FORM_TYPES,
         document_dataset=DOCUMENT_DATASET_NAME,
+        segment_dataset=ITEM_DATASET_NAME,
         item_dataset=ITEM_DATASET_NAME,
         classified_dataset=CLASSIFICATION_DATASET_NAME,
         inlines_bodies=True,
@@ -366,6 +372,7 @@ GENRES: dict[str, Genre] = {
         name=GENRE_6K,
         form_types=SIXK_FORM_TYPES,
         document_dataset=SIXK_DOCUMENT_DATASET_NAME,
+        segment_dataset=SIXK_WINDOW_DATASET_NAME,
         item_dataset=SIXK_SNIPPET_DATASET_NAME,
         classified_dataset=SIXK_SNIPPET_DATASET_NAME,
         inlines_bodies=False,

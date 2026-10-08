@@ -9,25 +9,25 @@ range, and prepares **both** genres unless `--genres` narrows it: which forms
 those issuers happened to file is not something the caller should have to know.
 
 ```
-8-K:  ingest ──── itemize ── classify ─┐
-                                       ├── extract ── match ── (finalize)
-6-K:  ingest ──────────────── sixk ────┘
+8-K:  ingest ── segment (items) ──────── classify (item classifier) ─┐
+                                                                     ├── extract ── match ── (publish)
+6-K:  ingest ── segment (window spans) ─ classify (two-stage triage) ┘
 ```
 
 1. `ingest`
    Reads scraper-managed filing manifests from S3 for every selected genre and the run's one CIK list (`cdt ingest --genres`, default all). For 8-K it selects each filing's complete submission text file and writes `documents` partitions. For 6-K, which the scraper stores as one object per document rather than one complete submission, it assembles the submission, mirrors it under `raw-documents/sixk/`, and writes `documents-sixk` partitions. Each genre has its own documents dataset because every stage selects work by source-partition fingerprint: 6-K rows landing in 8-K partitions would make the whole 8-K corpus pending again.
-2. `itemize`
-   Extracts only the 8-K items CDT cares about today: `1.01`, `1.02`, `2.03`, `2.04`, `7.01`, and `8.01`.
+2. `segment`
+   Cuts each document into the rows the classifier reads. For 8-K it extracts only the items CDT cares about today (`1.01`, `1.02`, `2.03`, `2.04`, `7.01`, `8.01`) into `items`. For 6-K, which has no item structure, it strips the inline-XBRL prologue, gates each document on debt vocabulary, and cuts the survivors into 400-token windows, written to `sixk-windows` as spans only (offsets and a digest of the text they index, no text; see [sixk-two-stage-triage.md](sixk-two-stage-triage.md)).
 3. `classify`
-   Uses a local TF-IDF plus linear SVC model to mark item sections as relevant or irrelevant before any LLM call.
-4. `sixk`
-   The 6-K genre's triage, in place of itemize → classify: a 6-K has no items to itemize and nothing for the item classifier to classify. It windows each document, scores the windows with a local model, expands the admitted ones into the context their crop cut off, and has an LLM prune the survivors, writing `sixk-snippets` rows in the same classified-item columns `classify` produces.
-5. `extract`
+   Decides which segments reach the LLM. For 8-K a local TF-IDF plus linear SVC model marks item sections relevant or irrelevant. For 6-K it rebuilds each window's text from the mirrored submission, scores the windows with a local model, expands the admitted ones into the context their crop cut off, and has an LLM prune the survivors, writing `sixk-snippets` rows in the same classified-item columns the 8-K classifier produces.
+4. `extract`
    Extracts structured debt-instrument mentions from relevant rows of **both** classification sources and writes a full per-run audit log. Two backends exist: a synchronous `live` backend (OpenRouter chat completions) and the deployed `batch` backend (OpenAI Batch API). See "Extractor Design" below.
-6. `match`
-   Consolidates mention rows into debt instruments and writes instrument-level outputs partitioned by CIK shard. A 6-K mention consolidates against an 8-K mention for the same issuer for free: the matcher shards by CIK and never reads the genre.
+5. `match`
+   Consolidates mention rows into debt instruments and writes instrument-level outputs partitioned by CIK shard, then runs the lineage pass. A 6-K mention consolidates against an 8-K mention for the same issuer for free: the matcher shards by CIK and never reads the genre.
+6. `publish`
+   Writes the four final snapshot tables below, when a final database root is configured.
 
-The stage-oriented CLI is `cdt`. The deployment-oriented entrypoint is `cdt-orchestrator`, which simply resolves defaults and runs the same pipeline code used locally. Both take `--genres` (env `GENRES` on the orchestrator) to restrict a run to one genre. Every genre is searched for the same CIK list.
+The command line is `cdt`, with one command per stage above (`cdt ingest`, `cdt segment`, `cdt classify`, `cdt extract`, `cdt match`, `cdt publish`) and `cdt run daily|historical|poll` for whole runs, which is what ECS executes. `--genres` (default every genre, env `GENRES`) narrows `ingest`, `segment`, `classify` and `run daily|historical` to one genre; `--genres 8-K` is the 8-K-only pipeline. Every genre is searched for the same CIK list.
 
 After matching, the pipeline can optionally materialize four final snapshot tables for downstream consumers:
 
@@ -58,8 +58,8 @@ The final snapshot parquet files are intentionally not used as pipeline inputs. 
 The stage boundaries are mostly cost and recovery boundaries.
 
 - `ingest` is pure acquisition and can be rerun without recomputing extraction.
-- `itemize` reduces each filing to the sections the downstream pipeline cares about.
-- `classify` keeps LLM cost under control by filtering out obviously irrelevant items first.
+- `segment` reduces each filing to the sections (8-K) or windows (6-K) the downstream pipeline cares about.
+- `classify` keeps LLM cost under control by filtering out obviously irrelevant segments first. Splitting 6-K windowing from 6-K scoring means retuning stage 1 reruns only `classify`.
 - `extract` is isolated because it is the most expensive and least deterministic stage; it also records `extractor-runs/run_id=.../full.jsonl` for auditability.
 - `match` is deterministic and cheap enough to rerun from mention outputs.
 
@@ -68,11 +68,12 @@ The stage boundaries are mostly cost and recovery boundaries.
 Three execution modes exist:
 
 - `daily`
-  Defaults to yesterday's filing date when no dates are provided. With the default
-  `batch` backend it runs the prepare stages of every selected genre — 8-K's
-  ingest → itemize → classify and 6-K's ingest → sixk — and refreshes
+  Defaults to the five filing dates ending yesterday when no dates are provided, so
+  late scraper manifests are still picked up. With the default
+  `batch` backend it runs the prepare stages of every selected genre — ingest →
+  segment → classify — and refreshes
   match/final snapshots, but does not run the LLM extract stage; extraction is
-  submitted and advanced asynchronously by `poll`. Note that the 6-K triage
+  submitted and advanced asynchronously by `poll`. Note that the 6-K classify
   stage makes its own LLM call per filing with admitted windows, so unlike the
   8-K prepare chain it is not free to run.
 - `poll`
@@ -90,7 +91,7 @@ Genres are prepared independently. If one genre's chain fails, the run logs `Gen
 
 The scheduler runs `daily` (once a day) and `poll` (hourly). Historical runs are manual
 by design so wide backfills are deliberate, observable operations. Where no poll
-schedule is running (e.g. a local backfill), either run `cdt-orchestrator poll` by hand
+schedule is running (e.g. a local backfill), either run `cdt run poll` by hand
 to drain extraction or use `--extractor-backend live`.
 
 ### Known tradeoff: one active job (head-of-line blocking)
@@ -143,8 +144,8 @@ The stage objects (`preprocess`/`validate`/`postprocess`/`early_stop`/`build_ret
 are pure and backend-agnostic. Two backends drive them:
 
 - The `live` backend (`OpenRouterChatClient`) runs the workflow synchronously, one item
-  and one LLM call at a time. It is used for local development, `cdt extract`,
-  `cdt pipeline`, and `historical` runs.
+  and one LLM call at a time. It is used by `cdt extract` and by
+  `cdt run daily|historical --extractor-backend live`.
 - The `batch` backend (`OpenAIBatchClient`) drives the same stages asynchronously through
   OpenAI's Batch API (~50% cheaper, up to 24h per round). This is the deployed default.
 
@@ -172,7 +173,8 @@ for days, extraction is a resumable, file-native state machine advanced by the h
 `poll` tick. Every poll tick runs under a single `pipeline-writer` lease (`cdt.lease`,
 built on S3 conditional writes), so a tick that outlives its hour — or an EventBridge
 retry — cannot overlap the next one, and `daily`'s match/finalize cannot interleave with a
-completing poll's; a run that finds the lease held reports `locked` and skips its turn.
+completing poll's. A poll tick that finds the lease held reports `locked` and skips its
+turn; `daily` and `historical` instead wait up to 15 minutes for it, then exit 1.
 
 Each tick:
 
@@ -207,10 +209,10 @@ spend — orphan reconciliation is scoped per job, so a new job will not adopt i
 
 Two `cdt` commands cover the same ground manually:
 
-- `cdt show-extract-job` reports the active job (rows, terminal rows, in-flight batches,
+- `cdt extract job show` reports the active job (rows, terminal rows, in-flight batches,
   claimed partitions), or `corrupt` with the reason. Read-only, and exits non-zero on a
   corrupt job so a health check fails loudly.
-- `cdt reset-extract-job --yes` clears the marker immediately, taking the
+- `cdt extract job reset --yes` clears the marker immediately, taking the
   `pipeline-writer` lease first so it cannot race a running tick. Without `--yes` it only
   reports what a reset would abandon. The job directory is left in place for inspection.
 

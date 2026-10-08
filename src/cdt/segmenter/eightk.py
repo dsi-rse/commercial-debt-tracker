@@ -7,30 +7,17 @@ from collections import Counter
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from time import perf_counter
 from typing import Any, Self
 
 import pandas as pd
 
-from cdt.completion import (
-    CompletedPartition,
-    completion_registry_root,
-    pending_source_partitions,
-    save_completion_registry,
-)
-from cdt.datasets import (
-    ITEM_DATASET_NAME,
-    date_shard_partition_path,
-    parse_date_shard_partition,
-    resolve_artifact_root,
-    run_manifest_path,
-)
+from cdt.datasets import DOCUMENT_DATASET_NAME, ITEM_DATASET_NAME
 from cdt.ingest.core import DOCUMENT_COLUMNS
+from cdt.partition_stage import PartitionOutput, run_partition_stage
 from cdt.segmenter.core import (
     ITEM_COLUMNS,
     document_text_for_record,
     ensure_s3_client,
-    items_root,
     normalize_item_table,
 )
 from cdt.segmenter.text import (
@@ -45,10 +32,12 @@ from cdt.segmenter.text import (
 )
 from cdt.shared import get_logger
 from cdt.storage.columns import coerce_dataset_text
-from cdt.storage.objects import write_json_artifact
-from cdt.storage.tables import read_table, write_partition_table
+from cdt.storage.tables import read_table
 
 LOGGER = get_logger(__name__)
+
+#: Completion-registry and run-manifest name of the 8-K segment stage.
+STAGE_NAME = "itemize"
 
 ITEM_NUMBER_RE = re.compile(r"\b(\d)\s*\.\s*(\d)\s*(\d)\b")
 SECTION_SIMILARITY_THRESHOLD = 0.95
@@ -752,7 +741,7 @@ def itemize_documents(
     return table
 
 
-def itemize_pending_documents(
+def segment_pending_eightk_documents(
     *,
     artifact_root: str | Path | None = None,
     data_dir: Path | None = None,
@@ -774,132 +763,37 @@ def itemize_pending_documents(
     Raises:
         ValueError: If ``batch_size`` is not positive.
     """
-    if batch_size <= 0:
-        msg = f"batch_size must be positive, got {batch_size}"
-        raise ValueError(msg)
-
-    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     selected_item_numbers = normalize_item_numbers(item_numbers)
-    processed_frames: list[pd.DataFrame] = []
-    processed_partitions: list[str] = []
-    visited_document_paths: set[str] = set()
-    total_documents = 0
-    empty_partitions = 0
-    shared_s3_client = s3_client
-    pending_with_fingerprints, registry = pending_source_partitions(
-        "itemize",
-        "documents",
-        artifact_root=resolved_root,
-        data_dir=data_dir,
-        force=force,
-    )
-    pending_document_paths = [path for path, _ in pending_with_fingerprints]
-    source_fingerprints = dict(pending_with_fingerprints)
+    shared_client = s3_client
 
-    total_partitions = len(pending_document_paths)
-    for chunk_start in range(0, total_partitions, batch_size):
-        chunk_paths = pending_document_paths[chunk_start : chunk_start + batch_size]
-        for partition_index, document_path in enumerate(
-            chunk_paths, start=chunk_start + 1
-        ):
-            partition = parse_date_shard_partition(document_path)
-            partition_label = f"date={partition['date']} shard={partition['shard']}"
-            partition_start = perf_counter()
-            visited_document_paths.add(document_path)
-            documents = read_table(document_path, DOCUMENT_COLUMNS).reindex(
-                columns=DOCUMENT_COLUMNS
-            )
-            total_documents += len(documents)
-            shared_s3_client = ensure_s3_client(
-                shared_s3_client,
-                documents.to_dict("records"),
-            )
-            items = itemize_documents(
-                documents,
-                data_dir=data_dir,
-                s3_client=shared_s3_client,
-                item_numbers=selected_item_numbers,
-            )
-            if items.empty:
-                empty_partitions += 1
-            else:
-                write_partition_table(
-                    items_root(resolved_root, data_dir=data_dir),
-                    partition={"date": partition["date"], "shard": partition["shard"]},
-                    table=items.reindex(columns=ITEM_COLUMNS),
-                )
-                processed_frames.append(items)
-                processed_partitions.append(
-                    date_shard_partition_path(
-                        ITEM_DATASET_NAME,
-                        partition_date=partition["date"],
-                        shard=partition["shard"],
-                        artifact_root=resolved_root,
-                        data_dir=data_dir,
-                    )
-                )
-            LOGGER.info(
-                "Itemize partition complete: %s progress=%s/%s documents=%s items=%s wrote_output=%s elapsed=%.1fs",
-                partition_label,
-                partition_index,
-                total_partitions,
-                len(documents),
-                len(items),
-                not items.empty,
-                perf_counter() - partition_start,
-            )
-
-        # Save completion and renew the lease at every batch boundary, so an
-        # interruption keeps finished batches and a long stage is not stolen.
-        for document_path in chunk_paths:
-            registry[document_path] = CompletedPartition(
-                fingerprint=source_fingerprints.get(document_path)
-            )
-        save_completion_registry(
-            "itemize",
-            registry,
-            artifact_root=resolved_root,
-            data_dir=data_dir,
+    def process(source_path: str, partition: dict[str, str]) -> PartitionOutput:
+        nonlocal shared_client
+        del partition
+        documents = read_table(source_path, DOCUMENT_COLUMNS).reindex(
+            columns=DOCUMENT_COLUMNS
         )
-        if renew is not None:
-            renew()
-
-    # Save once more: pending_source_partitions can dirty entries even when
-    # nothing was pending.
-    save_completion_registry(
-        "itemize",
-        registry,
-        artifact_root=resolved_root,
-        data_dir=data_dir,
-    )
-
-    manifest = {
-        "artifact_root": resolved_root,
-        "stage": "itemize",
-        "batch_size": batch_size,
-        "force": force,
-        "item_numbers": list(selected_item_numbers),
-        "documents_processed": total_documents,
-        "partitions_visited": sorted(visited_document_paths),
-        "partitions_written": processed_partitions,
-        "empty_partitions_skipped_from_write": empty_partitions,
-        "completion_registry": completion_registry_root(
-            "itemize", artifact_root=resolved_root, data_dir=data_dir
-        ),
-    }
-    write_json_artifact(
-        run_manifest_path(
-            "itemize",
-            "latest",
-            artifact_root=resolved_root,
+        shared_client = ensure_s3_client(shared_client, documents.to_dict("records"))
+        items = itemize_documents(
+            documents,
             data_dir=data_dir,
-        ),
-        manifest,
-    )
-    if not processed_frames:
-        return pd.DataFrame(columns=ITEM_COLUMNS)
-    LOGGER.info("Itemized %s source documents", total_documents)
-    return pd.concat(processed_frames, ignore_index=True).reindex(columns=ITEM_COLUMNS)
+            s3_client=shared_client,
+            item_numbers=selected_item_numbers,
+        )
+        return PartitionOutput(rows=items, source_rows=len(documents))
+
+    return run_partition_stage(
+        STAGE_NAME,
+        source_dataset=DOCUMENT_DATASET_NAME,
+        output_dataset=ITEM_DATASET_NAME,
+        output_columns=ITEM_COLUMNS,
+        process=process,
+        artifact_root=artifact_root,
+        data_dir=data_dir,
+        batch_size=batch_size,
+        force=force,
+        renew=renew,
+        manifest_extra={"item_numbers": list(selected_item_numbers)},
+    ).rows
 
 
 def itemize_document_record(

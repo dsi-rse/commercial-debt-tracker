@@ -35,4 +35,4 @@ FINAL_DATABASE_ROOT="${local_final_database_root}" \
 BUCKET_NAME="${local_bucket_name}" \
 AWS_PROFILE="${local_aws_profile}" \
 CDT_DEFAULT_CIK_FILE="${local_cik_file}" \
-uv run cdt-orchestrator --aws-profile "${local_aws_profile}" "${mode}" "$@"
+uv run cdt run "${mode}" --aws-profile "${local_aws_profile}" "$@"

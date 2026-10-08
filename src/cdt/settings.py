@@ -7,6 +7,9 @@ from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
+# The committed model artifacts. Not under DATA_DIR: DATA_DIR is where a
+# developer's artifacts live, and the models are part of the code.
+MODELS_DIR = PROJECT_ROOT / "data" / "models"
 
 
 def resolve_path(path: Path) -> Path:

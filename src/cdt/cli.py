@@ -1,30 +1,41 @@
-"""Command-line interface for Commercial Debt Tracker."""
+"""The ``cdt`` command line: one command per pipeline module, and ``cdt run``.
+
+Stage commands, each named after the module it runs::
+
+    cdt ingest | segment | classify [train] | extract [job show|reset] | match | publish
+
+Whole runs, as deployed (see :mod:`cdt.run`)::
+
+    cdt run daily | historical | poll
+
+``--genres`` (default every genre) narrows ``ingest``, ``segment``, ``classify``
+and ``run daily|historical``: ``--genres 8-K`` is the 8-K-only pipeline.
+``extract``, ``match`` and ``publish`` read every genre's output.
+
+An option's default resolves in order: the flag, the environment variable in
+:data:`ENVIRONMENT_DEFAULTS`, then the built-in default.
+"""
 
 from __future__ import annotations
 
 import argparse
 import logging
-from collections.abc import Sequence
-from datetime import date
+import os
+from collections.abc import Callable, Sequence
 from pathlib import Path
+
+import pandas as pd
 
 from cdt.classifier.core import (
     DEFAULT_CV_SPLITS,
     DEFAULT_RANDOM_SEED,
     DEFAULT_TARGET_RECALL,
-    classifications_root,
     default_model_dir,
     train_classifier_model,
 )
-from cdt.classifier.eightk import classify_pending_items
 from cdt.classifier.sixk import DEFAULT_CONCURRENCY as SIXK_DEFAULT_CONCURRENCY
-from cdt.classifier.sixk import sixk_snippets_root, triage_pending_documents
 from cdt.cli_support import configure_logging, parse_date, positive_int
-from cdt.datasets import (
-    SIXK_DOCUMENT_DATASET_NAME,
-    dataset_root,
-    default_artifact_root,
-)
+from cdt.datasets import GENRES, dataset_root, resolve_artifact_root
 from cdt.extractor import (
     DEFAULT_MAX_ATTEMPTS as DEFAULT_EXTRACTOR_MAX_ATTEMPTS,
 )
@@ -39,19 +50,17 @@ from cdt.extractor import (
     mentions_root,
     reset_active_job,
 )
-from cdt.extractor.outputs import CLASSIFICATION_SOURCES, backfill_mentions
 from cdt.ingest.core import (
-    DEFAULT_AWS_PROFILE,
     DEFAULT_BUCKET,
     DEFAULT_S3_PREFIX,
     IngestConfig,
     IngestRunResult,
-    documents_root,
 )
 from cdt.ingest.genres import ingest_genre
 from cdt.lease import (
     PIPELINE_WRITER_LEASE,
     Lease,
+    LeaseLostError,
     acquire_lease,
     release_lease,
     renewer,
@@ -65,437 +74,651 @@ from cdt.matcher import (
     mention_cluster_edges_root,
 )
 from cdt.matcher.lineage_inference import apply_lineage_inference_pass
-from cdt.pipeline import ALL_TIME_START_DATE as PIPELINE_ALL_TIME_START_DATE
 from cdt.pipeline import (
     DEFAULT_GENRES,
+    DEFAULT_STAGE_BATCH_SIZE,
     PipelineConfig,
+    PipelineRunResult,
+    classify_genre,
     normalize_genres,
     read_cik_file,
     resolve_mode_dates,
-    run_pipeline,
+    segment_genre,
 )
-from cdt.segmenter.core import items_root
-from cdt.segmenter.eightk import (
-    POTENTIALLY_RELEVANT_ITEM_NUMBERS,
-    itemize_pending_documents,
+from cdt.publish import publish_final_tables
+from cdt.run import (
+    EXTRACTOR_BACKENDS,
+    MODE_DEADLINE_HOURS,
+    WATCHDOG_EXIT_CODE,
+    reject_placeholder_secrets,
+    run_live,
+    run_poll,
+    run_prepare_then_publish,
+    start_runtime_watchdog,
 )
+from cdt.segmenter.eightk import POTENTIALLY_RELEVANT_ITEM_NUMBERS
 from cdt.storage.objects import configure_s3_profile
 
-ALL_TIME_START_DATE = date(1994, 1, 1)
-DEFAULT_BATCH_SIZE = 100
+#: Option → the environment variable that supplies its default.
+ENVIRONMENT_DEFAULTS: dict[str, str] = {
+    "--artifact-root": "ARTIFACT_ROOT",
+    "--final-database-root": "FINAL_DATABASE_ROOT",
+    "--bucket": "BUCKET_NAME",
+    "--cik-file": "CDT_DEFAULT_CIK_FILE",
+    "--genres": "GENRES",
+    "--extractor-backend": "EXTRACTOR_BACKEND",
+}
+
+#: Exit code for invalid arguments, as argparse uses.
+USAGE_EXIT_CODE = 2
+
+LOGGER = logging.getLogger(__name__)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the cdt command-line interface."""
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    # Process-wide, so every S3 client any subcommand builds uses the profile.
-    configure_s3_profile(getattr(args, "aws_profile", None))
+    args = build_parser().parse_args(argv)
+    # Process-wide, so every S3 client any command builds uses the profile.
+    configure_s3_profile(args.aws_profile)
+    configure_logging(quiet=args.quiet, log_file=args.log_file)
     return int(args.func(args))
 
 
-def add_artifact_root_argument(parser: argparse.ArgumentParser) -> None:
-    """Add a shared artifact-root CLI argument."""
+def _env_default(flag: str, fallback: object = None) -> object:
+    """Return ``flag``'s environment default (ENVIRONMENT_DEFAULTS), else ``fallback``."""
+    return os.environ.get(ENVIRONMENT_DEFAULTS[flag]) or fallback
+
+
+def _genres(value: str) -> tuple[str, ...]:
+    try:
+        return normalize_genres(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _item_numbers(value: str) -> tuple[str, ...]:
+    parsed = tuple(part.strip() for part in value.split(",") if part.strip())
+    if not parsed:
+        msg = "expected a comma-separated list of item numbers"
+        raise argparse.ArgumentTypeError(msg)
+    return parsed
+
+
+# --- Option groups ------------------------------------------------------------
+#
+# Each is a parent parser. ``suppress`` builds one whose defaults are not set,
+# for a nested command (``classify train``, ``extract job show``) whose parent
+# command already defines the same option: a nested parser's defaults would
+# otherwise overwrite a value given before the nested command's name.
+
+
+def _common_options(*, suppress: bool = False) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument(
         "--artifact-root",
-        default=None,
-        help="Artifact root as a local path or s3:// URI. Defaults to DATA_DIR.",
+        default=argparse.SUPPRESS if suppress else _env_default("--artifact-root"),
+        help="artifact root, a local path or s3:// URI (env ARTIFACT_ROOT; "
+        "default DATA_DIR)",
     )
-
-
-def add_final_database_root_argument(parser: argparse.ArgumentParser) -> None:
-    """Add --final-database-root; only for commands that publish final tables."""
     parser.add_argument(
-        "--final-database-root",
-        default=None,
-        help=(
-            "Optional final table root as a local path or s3:// URI. "
-            "When set, writes latest.parquet files under {root}/{table}/."
-        ),
+        "--aws-profile",
+        default=argparse.SUPPRESS if suppress else "",
+        help="AWS profile for every S3 client (default: the ambient credential chain)",
     )
-
-
-def add_logging_arguments(parser: argparse.ArgumentParser, *, noun: str) -> None:
-    """Add quiet/log-file arguments to a parser."""
     parser.add_argument(
-        "--quiet", action="store_true", help="Suppress progress logging."
+        "--quiet",
+        action="store_true",
+        default=argparse.SUPPRESS if suppress else False,
+        help="log warnings and errors only",
     )
     parser.add_argument(
         "--log-file",
         type=Path,
-        default=None,
-        help=f"Optional path to write {noun} logs.",
+        default=argparse.SUPPRESS if suppress else None,
+        help="also write the log to this file",
     )
+    return parser
 
 
-def acquire_stage_lease(
-    artifact_root: str, logger: logging.Logger, noun: str
-) -> Lease | None:
-    """Take the pipeline-writer lease for one stage run.
+def _genre_options() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--genres",
+        type=_genres,
+        # A string, so argparse parses it with ``type`` and reports a bad GENRES.
+        default=str(_env_default("--genres", ",".join(DEFAULT_GENRES))),
+        help=f"comma-separated filing genres (env GENRES; default "
+        f"{','.join(DEFAULT_GENRES)})",
+    )
+    return parser
 
-    Returns None, after logging an error naming ``noun``, when the lease is held.
-    """
-    lease = acquire_lease(artifact_root, PIPELINE_WRITER_LEASE)
-    if lease is None:
-        logger.error(
-            "Pipeline-writer lease is held (a scheduled run or poll tick is "
-            "active); not starting %s. Retry when it finishes.",
-            noun,
-        )
-    return lease
+
+def _filing_window_options(*, dates_required: bool) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--cik-file",
+        default=_env_default("--cik-file"),
+        help="one-CIK-per-line file, a local path or s3:// URI "
+        "(env CDT_DEFAULT_CIK_FILE)",
+    )
+    window = "required" if dates_required else "default: the daily window"
+    parser.add_argument(
+        "--start-date",
+        type=parse_date,
+        required=dates_required,
+        help=f"first filing date, YYYY-MM-DD ({window})",
+    )
+    parser.add_argument(
+        "--end-date",
+        type=parse_date,
+        required=dates_required,
+        help=f"last filing date, YYYY-MM-DD ({window})",
+    )
+    parser.add_argument(
+        "--bucket",
+        default=_env_default("--bucket", DEFAULT_BUCKET),
+        help=f"scraper bucket (env BUCKET_NAME; default {DEFAULT_BUCKET})",
+    )
+    parser.add_argument(
+        "--s3-prefix",
+        default=DEFAULT_S3_PREFIX,
+        help=f"scraper key prefix (default {DEFAULT_S3_PREFIX})",
+    )
+    parser.add_argument(
+        "--download",
+        action="store_true",
+        help="store 8-K document bodies in the documents partitions",
+    )
+    parser.add_argument(
+        "--failure-file",
+        default=None,
+        help="ingest failure registry (default failures/ingest/failures.json "
+        "under the artifact root)",
+    )
+    return parser
+
+
+def _force_option(help_text: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--force", action="store_true", help=help_text)
+    return parser
+
+
+def _batch_size_option() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--batch-size",
+        type=positive_int,
+        default=DEFAULT_STAGE_BATCH_SIZE,
+        help="partitions per completion save and lease renewal "
+        f"(default {DEFAULT_STAGE_BATCH_SIZE})",
+    )
+    return parser
+
+
+def _segment_options() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--item-numbers",
+        type=_item_numbers,
+        default=POTENTIALLY_RELEVANT_ITEM_NUMBERS,
+        help="8-K items to keep (default "
+        f"{','.join(POTENTIALLY_RELEVANT_ITEM_NUMBERS)})",
+    )
+    return parser
+
+
+def _classify_options() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--model-dir",
+        type=Path,
+        default=None,
+        help="8-K classifier artifact directory (default: the committed model)",
+    )
+    parser.add_argument(
+        "--sixk-model-dir",
+        type=Path,
+        default=None,
+        help="6-K stage-1 artifact directory (default: the committed model)",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=positive_int,
+        default=SIXK_DEFAULT_CONCURRENCY,
+        help="6-K filings whose stage-2 calls may be in flight at once "
+        f"(default {SIXK_DEFAULT_CONCURRENCY})",
+    )
+    return parser
+
+
+def _extract_options() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--model", default=None, help="extractor model (env EXTRACTOR_MODEL)"
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        default=DEFAULT_EXTRACTOR_REASONING_EFFORT,
+        help=f"reasoning effort (default {DEFAULT_EXTRACTOR_REASONING_EFFORT})",
+    )
+    parser.add_argument(
+        "--max-attempts",
+        type=positive_int,
+        default=DEFAULT_EXTRACTOR_MAX_ATTEMPTS,
+        help=f"scored attempts per stage (default {DEFAULT_EXTRACTOR_MAX_ATTEMPTS})",
+    )
+    return parser
+
+
+def _match_options() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--strong-match-threshold",
+        type=float,
+        default=DEFAULT_MEMBERSHIP_THRESHOLD,
+        help=f"membership score (default {DEFAULT_MEMBERSHIP_THRESHOLD})",
+    )
+    parser.add_argument(
+        "--loose-match-threshold",
+        type=float,
+        default=DEFAULT_RELATED_THRESHOLD,
+        help=f"related-edge score (default {DEFAULT_RELATED_THRESHOLD})",
+    )
+    parser.add_argument(
+        "--ambiguity-margin",
+        type=float,
+        default=DEFAULT_AMBIGUITY_MARGIN,
+        help="score gap that separates two candidates (default "
+        f"{DEFAULT_AMBIGUITY_MARGIN})",
+    )
+    return parser
+
+
+def _final_database_root_option() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--final-database-root",
+        default=_env_default("--final-database-root"),
+        help="where the four latest.parquet tables are published, a local path "
+        "or s3:// URI (env FINAL_DATABASE_ROOT; unset publishes nothing)",
+    )
+    return parser
+
+
+def _runtime_option() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--max-runtime-hours",
+        type=float,
+        default=None,
+        help=f"wall-clock deadline before the run exits {WATCHDOG_EXIT_CODE}; "
+        f"defaults per mode: {MODE_DEADLINE_HOURS}",
+    )
+    return parser
+
+
+# --- Parser -------------------------------------------------------------------
 
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the top-level command parser."""
-    parser = argparse.ArgumentParser(prog="cdt")
-    subparsers = parser.add_subparsers(dest="command", required=True)
-    _add_ingest_parser(subparsers)
-    _add_itemize_parser(subparsers)
-    _add_sixk_parser(subparsers)
-    _add_classify_parser(subparsers)
-    _add_extract_parser(subparsers)
-    _add_show_extract_job_parser(subparsers)
-    _add_reset_extract_job_parser(subparsers)
-    _add_backfill_mentions_parser(subparsers)
-    _add_match_parser(subparsers)
-    _add_pipeline_parser(subparsers)
+    parser = argparse.ArgumentParser(
+        prog="cdt",
+        description="Commercial Debt Tracker: SEC 8-K and 6-K filings to debt "
+        "instrument histories.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    _add_ingest(commands)
+    _add_segment(commands)
+    _add_classify(commands)
+    _add_extract(commands)
+    _add_match(commands)
+    _add_publish(commands)
+    _add_run(commands)
     return parser
 
 
-def _add_ingest_parser(subparsers: argparse._SubParsersAction) -> None:
-    """Add the ``cdt ingest`` subcommand."""
-    ingest_parser = subparsers.add_parser(
-        "ingest", help="Acquire every selected genre's filings for CIKs."
+def _add_ingest(commands: argparse._SubParsersAction) -> None:
+    ingest = commands.add_parser(
+        "ingest",
+        parents=[
+            _common_options(),
+            _genre_options(),
+            _filing_window_options(dates_required=False),
+            _force_option("re-acquire filings already in the documents datasets"),
+        ],
+        help="acquire each genre's filings for a CIK list into its documents dataset",
     )
-    add_artifact_root_argument(ingest_parser)
-    ingest_parser.add_argument(
-        "--genres",
-        type=normalize_genres,
-        default=DEFAULT_GENRES,
-        help=(
-            "comma-separated filing genres to acquire (default "
-            f"{','.join(DEFAULT_GENRES)}). Each genre goes to its own "
-            "documents dataset."
-        ),
+    ingest.add_argument(
+        "--batch-size",
+        type=positive_int,
+        default=DEFAULT_STAGE_BATCH_SIZE,
+        help="document rows buffered per partition flush "
+        f"(default {DEFAULT_STAGE_BATCH_SIZE})",
     )
-    ingest_parser.add_argument("--bucket", default=DEFAULT_BUCKET)
-    ingest_parser.add_argument("--force", action="store_true")
-    ingest_parser.add_argument(
-        "--batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
-    )
-    ingest_parser.add_argument("--download", action="store_true")
-    ingest_parser.add_argument("--failure-file", default=None)
-    ingest_parser.add_argument("--aws-profile", default=DEFAULT_AWS_PROFILE)
-    ingest_parser.add_argument("--s3-prefix", default=DEFAULT_S3_PREFIX)
-    add_logging_arguments(ingest_parser, noun="ingest")
-    ingest_subparsers = ingest_parser.add_subparsers(dest="ingest_mode", required=True)
-    for mode_name, help_text in (
-        ("daily", "Acquire filings from a daily date window."),
-        ("historical", "Acquire filings from the historical scraper archive."),
-    ):
-        subparser = ingest_subparsers.add_parser(mode_name, help=help_text)
-        subparser.add_argument(
-            "cik_file", help="Local path or s3:// URI for one-CIK-per-line input."
-        )
-        subparser.add_argument(
-            "--start-date",
-            type=parse_date,
-            default=None if mode_name == "daily" else ALL_TIME_START_DATE,
-        )
-        subparser.add_argument(
-            "--end-date",
-            type=parse_date,
-            default=None if mode_name == "daily" else date.today(),
-        )
-        subparser.set_defaults(func=run_ingest)
+    ingest.set_defaults(func=run_ingest)
 
 
-def _add_itemize_parser(subparsers: argparse._SubParsersAction) -> None:
-    """Add the ``cdt itemize`` subcommand."""
-    itemize_parser = subparsers.add_parser(
-        "itemize", help="Extract 8-K item sections from document partitions."
+def _add_segment(commands: argparse._SubParsersAction) -> None:
+    segment = commands.add_parser(
+        "segment",
+        parents=[
+            _common_options(),
+            _genre_options(),
+            _batch_size_option(),
+            _force_option("re-segment partitions already segmented"),
+            _segment_options(),
+        ],
+        help="cut documents into 8-K items and 6-K window spans",
     )
-    add_artifact_root_argument(itemize_parser)
-    itemize_parser.add_argument(
-        "--batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
-    )
-    itemize_parser.add_argument("--force", action="store_true")
-    itemize_parser.add_argument(
-        "--item-numbers",
-        type=parse_item_numbers,
-        default=POTENTIALLY_RELEVANT_ITEM_NUMBERS,
-    )
-    add_logging_arguments(itemize_parser, noun="itemization")
-    itemize_parser.set_defaults(func=run_itemize)
+    segment.set_defaults(func=run_segment)
 
 
-def _add_sixk_parser(subparsers: argparse._SubParsersAction) -> None:
-    """Add the ``cdt sixk`` subcommand."""
-    sixk_parser = subparsers.add_parser(
-        "sixk",
-        help="Window and triage 6-K documents into snippet partitions.",
+def _add_classify(commands: argparse._SubParsersAction) -> None:
+    classify = commands.add_parser(
+        "classify",
+        parents=[
+            _common_options(),
+            _genre_options(),
+            _batch_size_option(),
+            _force_option("re-classify partitions already classified"),
+            _classify_options(),
+        ],
+        help="decide which 8-K items and 6-K windows reach the extractor",
     )
-    add_artifact_root_argument(sixk_parser)
-    sixk_parser.add_argument(
-        "--batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
+    classify.set_defaults(func=run_classify)
+    nested = classify.add_subparsers(dest="classify_command")
+    train = nested.add_parser(
+        "train",
+        parents=[_common_options(suppress=True)],
+        help="train the 8-K item classifier from a labelled CSV",
     )
-    sixk_parser.add_argument("--force", action="store_true")
-    sixk_parser.add_argument(
+    train.add_argument("--train-csv", type=Path, required=True, help="labelled rows")
+    train.add_argument(
         "--model-dir",
         type=Path,
-        default=None,
-        help="Stage-1 artifact directory; defaults to DATA_DIR/models/sixk/...",
+        default=argparse.SUPPRESS,
+        help="where to write the artifacts (default: the committed model's directory)",
     )
-    sixk_parser.add_argument(
-        "--concurrency",
+    train.add_argument(
+        "--target-recall",
+        type=float,
+        default=DEFAULT_TARGET_RECALL,
+        help=f"recall the threshold is chosen for (default {DEFAULT_TARGET_RECALL})",
+    )
+    train.add_argument(
+        "--cv-splits",
         type=positive_int,
-        default=SIXK_DEFAULT_CONCURRENCY,
-        help="Filings whose stage-2 calls may be in flight at once.",
+        default=DEFAULT_CV_SPLITS,
+        help=f"cross-validation folds (default {DEFAULT_CV_SPLITS})",
     )
-    add_logging_arguments(sixk_parser, noun="6-K triage")
-    sixk_parser.set_defaults(func=run_sixk_stage)
+    train.add_argument(
+        "--random-seed",
+        type=int,
+        default=DEFAULT_RANDOM_SEED,
+        help=f"seed (default {DEFAULT_RANDOM_SEED})",
+    )
+    train.set_defaults(func=run_classify_train)
 
 
-def _add_classify_parser(subparsers: argparse._SubParsersAction) -> None:
-    """Add the ``cdt classify`` subcommand."""
-    classify_parser = subparsers.add_parser(
-        "classify", help="Train or run binary item relevance classification."
+def _add_extract(commands: argparse._SubParsersAction) -> None:
+    extract = commands.add_parser(
+        "extract",
+        parents=[
+            _common_options(),
+            _batch_size_option(),
+            _force_option("re-extract partitions already extracted"),
+            _extract_options(),
+        ],
+        help="extract debt-instrument mentions from classified rows (live backend)",
     )
-    add_artifact_root_argument(classify_parser)
-    classify_parser.add_argument(
-        "--batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
+    extract.set_defaults(func=run_extract)
+    nested = extract.add_subparsers(dest="extract_command")
+    job = nested.add_parser("job", help="inspect or clear the batch extract job")
+    job_commands = job.add_subparsers(dest="job_command", required=True)
+    show = job_commands.add_parser(
+        "show",
+        parents=[_common_options(suppress=True)],
+        help="show the active batch extract job (read-only)",
     )
-    classify_parser.add_argument("--force", action="store_true")
-    classify_parser.add_argument("--model-dir", type=Path, default=None)
-    add_logging_arguments(classify_parser, noun="classification")
-    classify_parser.set_defaults(func=run_classifier)
-    classify_subparsers = classify_parser.add_subparsers(dest="classify_command")
-    classify_train_parser = classify_subparsers.add_parser("train")
-    classify_train_parser.add_argument("--train-csv", type=Path, required=True)
-    classify_train_parser.add_argument("--model-dir", type=Path, default=None)
-    classify_train_parser.add_argument(
-        "--target-recall", type=float, default=DEFAULT_TARGET_RECALL
+    show.set_defaults(func=run_extract_job_show)
+    reset = job_commands.add_parser(
+        "reset",
+        parents=[_common_options(suppress=True)],
+        help="clear the active batch extract job so the next poll tick starts "
+        "fresh; abandons any batch still in flight",
     )
-    classify_train_parser.add_argument(
-        "--cv-splits", type=positive_int, default=DEFAULT_CV_SPLITS
-    )
-    classify_train_parser.add_argument(
-        "--random-seed", type=int, default=DEFAULT_RANDOM_SEED
-    )
-    add_logging_arguments(classify_train_parser, noun="training")
-    classify_train_parser.set_defaults(func=run_classifier_train)
-
-
-def _add_extract_parser(subparsers: argparse._SubParsersAction) -> None:
-    """Add the ``cdt extract`` subcommand."""
-    extract_parser = subparsers.add_parser(
-        "extract", help="Extract instrument mentions from classified item partitions."
-    )
-    add_artifact_root_argument(extract_parser)
-    extract_parser.add_argument(
-        "--batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
-    )
-    extract_parser.add_argument("--force", action="store_true")
-    extract_parser.add_argument(
-        "--model", default=None, help="Defaults to the EXTRACTOR_MODEL setting."
-    )
-    extract_parser.add_argument(
-        "--reasoning-effort", default=DEFAULT_EXTRACTOR_REASONING_EFFORT
-    )
-    extract_parser.add_argument(
-        "--max-attempts", type=positive_int, default=DEFAULT_EXTRACTOR_MAX_ATTEMPTS
-    )
-    add_logging_arguments(extract_parser, noun="extraction")
-    extract_parser.set_defaults(func=run_extractor)
-
-
-def _add_show_extract_job_parser(subparsers: argparse._SubParsersAction) -> None:
-    """Add the ``cdt show-extract-job`` subcommand."""
-    show_job_parser = subparsers.add_parser(
-        "show-extract-job",
-        help="Show the state of the async batch extract job (read-only).",
-    )
-    add_artifact_root_argument(show_job_parser)
-    add_logging_arguments(show_job_parser, noun="inspection")
-    show_job_parser.set_defaults(func=run_show_extract_job)
-
-
-def _add_reset_extract_job_parser(subparsers: argparse._SubParsersAction) -> None:
-    """Add the ``cdt reset-extract-job`` subcommand."""
-    reset_job_parser = subparsers.add_parser(
-        "reset-extract-job",
-        help=(
-            "Clear the active batch extract job marker so the next poll tick "
-            "starts fresh. Abandons any batch still in flight."
-        ),
-    )
-    add_artifact_root_argument(reset_job_parser)
-    reset_job_parser.add_argument(
+    reset.add_argument(
         "--yes",
         action="store_true",
-        help="Required to actually clear the marker; without it, only reports.",
+        help="clear the marker; without it, only report what would be abandoned",
     )
-    add_logging_arguments(reset_job_parser, noun="reset")
-    reset_job_parser.set_defaults(func=run_reset_extract_job)
+    reset.set_defaults(func=run_extract_job_reset)
 
 
-def _add_backfill_mentions_parser(subparsers: argparse._SubParsersAction) -> None:
-    """Add the ``cdt backfill-mentions`` subcommand."""
-    backfill_parser = subparsers.add_parser(
-        "backfill-mentions",
-        help=(
-            "Re-derive the extractor's synthesized rows over every existing "
-            "mentions partition: mint each amended instrument's prior state "
-            "(#203). No model calls; running it twice is a no-op."
-        ),
+def _add_match(commands: argparse._SubParsersAction) -> None:
+    match = commands.add_parser(
+        "match",
+        parents=[
+            _common_options(),
+            _batch_size_option(),
+            _force_option("re-match every shard"),
+            _match_options(),
+        ],
+        help="group mentions into debt instruments, then infer lineage",
     )
-    add_artifact_root_argument(backfill_parser)
-    backfill_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Report what would be minted and skipped without rewriting anything.",
-    )
-    add_logging_arguments(backfill_parser, noun="backfill")
-    backfill_parser.set_defaults(func=run_backfill_mentions)
+    match.set_defaults(func=run_match)
 
 
-def _add_match_parser(subparsers: argparse._SubParsersAction) -> None:
-    """Add the ``cdt match`` subcommand."""
-    match_parser = subparsers.add_parser(
-        "match", help="Group extracted instrument mentions into debt instruments."
+def _add_publish(commands: argparse._SubParsersAction) -> None:
+    publish = commands.add_parser(
+        "publish",
+        parents=[
+            _common_options(),
+            _final_database_root_option(),
+            _force_option(
+                "publish even when no source changed, and skip the shrinkage guard"
+            ),
+        ],
+        help="write the four latest.parquet tables from the current datasets",
     )
-    add_artifact_root_argument(match_parser)
-    match_parser.add_argument(
-        "--batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
-    )
-    match_parser.add_argument("--force", action="store_true")
-    match_parser.add_argument(
-        "--strong-match-threshold",
-        type=float,
-        default=DEFAULT_MEMBERSHIP_THRESHOLD,
-    )
-    match_parser.add_argument(
-        "--loose-match-threshold",
-        type=float,
-        default=DEFAULT_RELATED_THRESHOLD,
-    )
-    match_parser.add_argument(
-        "--ambiguity-margin",
-        type=float,
-        default=DEFAULT_AMBIGUITY_MARGIN,
-    )
-    add_logging_arguments(match_parser, noun="matching")
-    match_parser.set_defaults(func=run_matcher)
+    publish.set_defaults(func=run_publish)
 
 
-def _add_pipeline_parser(subparsers: argparse._SubParsersAction) -> None:
-    """Add the ``cdt pipeline`` subcommand."""
-    pipeline_parser = subparsers.add_parser(
-        "pipeline", help="Run the full CDT pipeline end-to-end."
-    )
-    add_artifact_root_argument(pipeline_parser)
-    add_final_database_root_argument(pipeline_parser)
-    pipeline_parser.add_argument("--bucket", default=DEFAULT_BUCKET)
-    pipeline_parser.add_argument("--force", action="store_true")
-    pipeline_parser.add_argument("--download", action="store_true")
-    pipeline_parser.add_argument("--failure-file", default=None)
-    pipeline_parser.add_argument("--aws-profile", default=DEFAULT_AWS_PROFILE)
-    pipeline_parser.add_argument("--s3-prefix", default="sec")
-    pipeline_parser.add_argument(
-        "--ingest-batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
-    )
-    pipeline_parser.add_argument(
-        "--itemize-batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
-    )
-    pipeline_parser.add_argument(
-        "--classify-batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
-    )
-    pipeline_parser.add_argument(
-        "--extract-batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
-    )
-    pipeline_parser.add_argument(
-        "--match-batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
-    )
-    pipeline_parser.add_argument(
-        "--genres",
-        type=normalize_genres,
-        default=DEFAULT_GENRES,
-        help=(
-            "comma-separated filing genres to prepare (default "
-            f"{','.join(DEFAULT_GENRES)}). A run acquires every genre unless "
-            "narrowed; extract, match and finalize run once over whichever "
-            "genres produced rows."
-        ),
-    )
-    pipeline_parser.add_argument(
-        "--sixk-batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE
-    )
-    pipeline_parser.add_argument(
-        "--sixk-concurrency", type=positive_int, default=SIXK_DEFAULT_CONCURRENCY
-    )
-    pipeline_parser.add_argument(
-        "--item-numbers",
-        type=parse_item_numbers,
-        default=POTENTIALLY_RELEVANT_ITEM_NUMBERS,
-    )
-    pipeline_parser.add_argument("--model-dir", type=Path, default=None)
-    pipeline_parser.add_argument(
-        "--model", default=None, help="Defaults to the EXTRACTOR_MODEL setting."
-    )
-    pipeline_parser.add_argument(
-        "--reasoning-effort", default=DEFAULT_EXTRACTOR_REASONING_EFFORT
-    )
-    pipeline_parser.add_argument(
-        "--max-attempts", type=positive_int, default=DEFAULT_EXTRACTOR_MAX_ATTEMPTS
-    )
-    pipeline_parser.add_argument(
-        "--strong-match-threshold", type=float, default=DEFAULT_MEMBERSHIP_THRESHOLD
-    )
-    pipeline_parser.add_argument(
-        "--loose-match-threshold", type=float, default=DEFAULT_RELATED_THRESHOLD
-    )
-    pipeline_parser.add_argument(
-        "--ambiguity-margin", type=float, default=DEFAULT_AMBIGUITY_MARGIN
-    )
-    add_logging_arguments(pipeline_parser, noun="pipeline")
-    pipeline_subparsers = pipeline_parser.add_subparsers(
-        dest="pipeline_mode", required=True
-    )
-    for mode_name in ("daily", "historical"):
-        subparser = pipeline_subparsers.add_parser(mode_name)
-        subparser.add_argument(
-            "cik_file", help="Local path or s3:// URI for one-CIK-per-line input."
+def _add_run(commands: argparse._SubParsersAction) -> None:
+    run = commands.add_parser("run", help="run the whole pipeline, as deployed")
+    modes = run.add_subparsers(dest="run_mode", required=True)
+    for mode, help_text in (
+        ("daily", "prepare the daily window, then match and publish"),
+        ("historical", "prepare a date range, then match and publish"),
+    ):
+        prepare = modes.add_parser(
+            mode,
+            parents=[
+                _common_options(),
+                _genre_options(),
+                _filing_window_options(dates_required=mode == "historical"),
+                _force_option(
+                    "reprocess partitions already recorded complete, and skip "
+                    "the publish gate and shrinkage guard"
+                ),
+                _final_database_root_option(),
+                _runtime_option(),
+                _segment_options(),
+                _classify_options(),
+                _extract_options(),
+                _match_options(),
+            ],
+            help=help_text,
         )
-        subparser.add_argument(
-            "--start-date",
-            type=parse_date,
-            default=None if mode_name == "daily" else PIPELINE_ALL_TIME_START_DATE,
+        prepare.add_argument(
+            "--extractor-backend",
+            choices=EXTRACTOR_BACKENDS,
+            default=_env_default("--extractor-backend", "batch"),
+            help="'batch' (env EXTRACTOR_BACKEND; default) leaves extraction to "
+            "`cdt run poll`; 'live' extracts synchronously in this run",
         )
-        subparser.add_argument(
-            "--end-date",
-            type=parse_date,
-            default=None if mode_name == "daily" else date.today(),
+        for stage in ("ingest", "segment", "classify", "match"):
+            prepare.add_argument(
+                f"--{stage}-batch-size",
+                type=positive_int,
+                default=DEFAULT_STAGE_BATCH_SIZE,
+                help=f"{stage} batch size (default {DEFAULT_STAGE_BATCH_SIZE})",
+            )
+        # None, so the batch backend can warn about an explicit value.
+        prepare.add_argument(
+            "--extract-batch-size",
+            type=positive_int,
+            default=None,
+            help="extract batch size; live backend only (default "
+            f"{DEFAULT_STAGE_BATCH_SIZE})",
         )
-        subparser.set_defaults(func=run_pipeline_command)
+        prepare.set_defaults(func=run_run)
+
+    poll = modes.add_parser(
+        "poll",
+        parents=[
+            _common_options(),
+            _final_database_root_option(),
+            _runtime_option(),
+            _force_option(
+                "when this tick starts a new job, claim partitions already extracted"
+            ),
+        ],
+        help="advance the batch extract job one tick; match and publish when it "
+        "completes",
+    )
+    poll.add_argument(
+        "--max-attempts",
+        type=positive_int,
+        default=DEFAULT_EXTRACTOR_MAX_ATTEMPTS,
+        help=f"scored attempts per stage (default {DEFAULT_EXTRACTOR_MAX_ATTEMPTS})",
+    )
+    poll.add_argument(
+        "--max-requests-per-batch",
+        type=positive_int,
+        default=None,
+        help="requests per OpenAI batch file (default: the backend's limit)",
+    )
+    poll.add_argument(
+        "--max-batch-bytes",
+        type=positive_int,
+        default=None,
+        help="bytes per OpenAI batch file (default: the backend's limit)",
+    )
+    poll.add_argument(
+        "--max-rows-per-job",
+        type=positive_int,
+        default=None,
+        help="rows one job may claim, so its state fits the task's memory "
+        "(default: the backend's limit)",
+    )
+    poll.add_argument(
+        "--match-batch-size",
+        type=positive_int,
+        default=DEFAULT_STAGE_BATCH_SIZE,
+        help=f"match batch size (default {DEFAULT_STAGE_BATCH_SIZE})",
+    )
+    poll.set_defaults(func=run_run)
+
+
+# --- Shared command plumbing --------------------------------------------------
+
+
+def _artifact_root(args: argparse.Namespace) -> str:
+    return resolve_artifact_root(args.artifact_root)
+
+
+def _with_writer_lease(
+    args: argparse.Namespace, noun: str, body: Callable[[str, Lease], int]
+) -> int:
+    """Run ``body(artifact_root, lease)`` under the pipeline-writer lease.
+
+    Exit 1 without running when the lease is held, 1 when ``body`` raises
+    (logged), 2 when it raises ValueError (an invalid argument).
+    """
+    artifact_root = _artifact_root(args)
+    lease = acquire_lease(artifact_root, PIPELINE_WRITER_LEASE)
+    if lease is None:
+        LOGGER.error(
+            "Pipeline-writer lease is held (a scheduled run or poll tick is "
+            "active); not starting %s. Retry when it finishes.",
+            noun,
+        )
+        return 1
+    try:
+        return body(artifact_root, lease)
+    except LeaseLostError as exc:
+        LOGGER.error("Aborting %s: %s", noun, exc)
+        return 1
+    except ValueError as exc:
+        LOGGER.error("Invalid %s arguments: %s", noun, exc)
+        return USAGE_EXIT_CODE
+    except Exception:
+        LOGGER.exception("%s failed", noun)
+        return 1
+    finally:
+        release_lease(lease)
+
+
+def _per_genre(
+    genres: Sequence[str], noun: str, stage: Callable[[str], pd.DataFrame]
+) -> tuple[dict[str, pd.DataFrame], list[str]]:
+    """Run ``stage`` per genre; a genre that raises is logged and the rest still run.
+
+    ``LeaseLostError`` is not caught: a command that lost its lease stops.
+    """
+    results: dict[str, pd.DataFrame] = {}
+    failed: list[str] = []
+    for genre in genres:
+        try:
+            results[genre] = stage(genre)
+        except LeaseLostError:
+            raise
+        except Exception:
+            LOGGER.exception("Genre %s failed: genre=%s", noun, genre)
+            failed.append(genre)
+    return results, failed
+
+
+def _report_genres(
+    results: dict[str, pd.DataFrame],
+    failed: list[str],
+    describe: Callable[[str, pd.DataFrame], str],
+) -> int:
+    for genre, rows in results.items():
+        print(describe(genre, rows))
+    if failed:
+        print(f"Failed genres: {','.join(failed)}; see the log.")
+        return 1
+    return 0
+
+
+# --- Stage commands -----------------------------------------------------------
 
 
 def run_ingest(args: argparse.Namespace) -> int:
-    """Run the ingest subcommand."""
-    configure_logging(quiet=args.quiet, log_file=args.log_file)
-    logger = logging.getLogger(__name__)
-    output_root = args.artifact_root or default_artifact_root()
-    lease = acquire_stage_lease(output_root, logger, "ingest")
-    if lease is None:
-        return 1
-    try:
-        start_date, end_date = resolve_ingest_dates(args)
+    """Run ``cdt ingest``."""
+    if not args.cik_file:
+        LOGGER.error("--cik-file (or CDT_DEFAULT_CIK_FILE) is required")
+        return USAGE_EXIT_CODE
+
+    def body(artifact_root: str, lease: Lease) -> int:
+        del lease
+        mode = (
+            "daily"
+            if args.start_date is None and args.end_date is None
+            else "historical"
+        )
+        start_date, end_date = resolve_mode_dates(mode, args.start_date, args.end_date)
         config = IngestConfig(
-            mode=args.ingest_mode,
+            mode=mode,
             bucket=args.bucket,
             cik_file=Path(str(args.cik_file)),
             start_date=start_date,
             end_date=end_date,
-            output_root=output_root,
+            output_root=artifact_root,
             force=args.force,
             batch_size=args.batch_size,
             download=args.download,
@@ -503,292 +726,119 @@ def run_ingest(args: argparse.Namespace) -> int:
             aws_profile=args.aws_profile,
             s3_prefix=args.s3_prefix,
         )
-        logger.info(
-            "Starting ingest: mode=%s bucket=%s start_date=%s end_date=%s batch_size=%s output_root=%s",
-            config.mode,
-            config.bucket,
-            config.start_date,
-            config.end_date,
-            config.batch_size,
-            config.output_root,
-        )
         ciks = read_cik_file(args.cik_file)
-        results: list[tuple[str, IngestRunResult]] = []
+        results: dict[str, IngestRunResult] = {}
         failed: list[str] = []
         for genre in args.genres:
             try:
-                results.append((genre, ingest_genre(genre, config, ciks=ciks)[1]))
+                results[genre] = ingest_genre(genre, config, ciks=ciks)[1]
             except Exception:
-                # One genre failing does not stop the others.
-                logger.exception("Genre ingest failed: genre=%s", genre)
+                LOGGER.exception("Genre ingest failed: genre=%s", genre)
                 failed.append(genre)
-    except ValueError as exc:
-        logger.error("Invalid ingest arguments: %s", exc)
-        return 2
-    except Exception:
-        logger.exception("Ingest failed")
-        return 1
-    finally:
-        release_lease(lease)
-    for genre, result in results:
-        print(
-            f"{genre}: indexed {result.total_rows} document rows from "
-            f"{result.start_date} through {result.end_date}."
-        )
-        print(f"  Documents dataset: {result.documents_root}.")
-        print(f"  Run manifest: {result.run_manifest}.")
-        if result.failures:
-            print(f"  Filings that could not be acquired: {result.failures}.")
-    if results:
-        print(f"Output root: {results[0][1].output_root}.")
-        print(f"Failure registry: {results[0][1].failure_file}.")
-    if failed:
-        print(f"Failed genres: {','.join(failed)}; see the log.")
-        return 1
-    return 0
+        for genre, result in results.items():
+            print(
+                f"{genre}: indexed {result.total_rows} document rows from "
+                f"{result.start_date} through {result.end_date} into "
+                f"{result.documents_root}."
+            )
+            if result.failures:
+                print(f"  Filings that could not be acquired: {result.failures}.")
+        if results:
+            print(f"Failure registry: {next(iter(results.values())).failure_file}.")
+        if failed:
+            print(f"Failed genres: {','.join(failed)}; see the log.")
+            return 1
+        return 0
+
+    return _with_writer_lease(args, "ingest", body)
 
 
-def run_itemize(args: argparse.Namespace) -> int:
-    """Run the itemize subcommand."""
-    configure_logging(quiet=args.quiet, log_file=args.log_file)
-    logger = logging.getLogger(__name__)
-    artifact_root = args.artifact_root or default_artifact_root()
-    lease = acquire_stage_lease(artifact_root, logger, "itemization")
-    if lease is None:
-        return 1
-    try:
-        logger.info(
-            "Starting itemization: batch_size=%s force=%s item_numbers=%s documents=%s output=%s",
-            args.batch_size,
-            args.force,
-            ",".join(args.item_numbers),
-            documents_root(artifact_root),
-            items_root(artifact_root),
-        )
-        items = itemize_pending_documents(
-            artifact_root=artifact_root,
-            batch_size=args.batch_size,
-            force=args.force,
-            item_numbers=args.item_numbers,
-        )
-    except Exception:
-        logger.exception("Itemization failed")
-        return 1
-    finally:
-        release_lease(lease)
-    print(f"Itemized {len(items)} item rows.")
-    print(f"Wrote item partitions to {items_root(artifact_root)}.")
-    return 0
+def run_segment(args: argparse.Namespace) -> int:
+    """Run ``cdt segment``."""
 
-
-def run_pipeline_command(args: argparse.Namespace) -> int:
-    """Run the full CDT pipeline."""
-    configure_logging(quiet=args.quiet, log_file=args.log_file)
-    logger = logging.getLogger(__name__)
-    artifact_root = args.artifact_root or default_artifact_root()
-    lease = acquire_stage_lease(artifact_root, logger, "the pipeline")
-    if lease is None:
-        return 1
-    try:
-        start_date, end_date = resolve_mode_dates(
-            args.pipeline_mode,
-            args.start_date,
-            args.end_date,
-        )
-        result = run_pipeline(
-            PipelineConfig(
-                mode=args.pipeline_mode,
-                cik_file=args.cik_file,
-                bucket=args.bucket,
-                start_date=start_date,
-                end_date=end_date,
-                artifact_root=args.artifact_root,
-                final_database_root=args.final_database_root,
+    def body(artifact_root: str, lease: Lease) -> int:
+        results, failed = _per_genre(
+            args.genres,
+            "segment",
+            lambda genre: segment_genre(
+                genre,
+                artifact_root=artifact_root,
+                batch_size=args.batch_size,
                 force=args.force,
-                download=args.download,
-                failure_file=args.failure_file,
-                aws_profile=args.aws_profile,
-                s3_prefix=args.s3_prefix,
-                ingest_batch_size=args.ingest_batch_size,
-                itemize_batch_size=args.itemize_batch_size,
-                classify_batch_size=args.classify_batch_size,
-                extract_batch_size=args.extract_batch_size,
-                match_batch_size=args.match_batch_size,
                 item_numbers=args.item_numbers,
-                classifier_model_dir=args.model_dir,
-                extractor_model=args.model,
-                extractor_reasoning_effort=args.reasoning_effort,
-                extractor_max_attempts=args.max_attempts,
-                strong_match_threshold=args.strong_match_threshold,
-                loose_match_threshold=args.loose_match_threshold,
-                ambiguity_margin=args.ambiguity_margin,
-                genres=args.genres,
-                sixk_batch_size=args.sixk_batch_size,
-                sixk_concurrency=args.sixk_concurrency,
+                renew=renewer(lease),
             ),
-            renew=renewer(lease),
         )
-    except ValueError as exc:
-        logger.error("Invalid pipeline arguments: %s", exc)
-        return 2
-    except Exception:
-        logger.exception("Pipeline failed")
-        return 1
-    finally:
-        release_lease(lease)
 
-    print(
-        f"Ran pipeline from {result.start_date} through {result.end_date} "
-        f"over genres {','.join(result.genres)}."
-    )
-    if result.ingest is not None:
-        print(
-            f"8-K: ingest indexed {result.ingest.total_rows} rows, itemized "
-            f"{result.itemized_rows}, classified {result.classified_rows}."
-        )
-    if result.sixk_ingest is not None:
-        print(
-            f"6-K: ingest acquired {result.sixk_ingest.total_rows} rows, "
-            f"triaged {result.sixk_snippet_rows} snippets."
-        )
-    print(
-        f"Extracted {result.extracted_rows} and matched {result.matched_rows} mentions."
-    )
-    print(
-        f"Artifact root: {result.artifact_root}. Debt instruments: {debt_instruments_root(result.artifact_root)}."
-    )
-    if result.failed_genres:
-        print(f"Failed genres: {','.join(result.failed_genres)}; see the log.")
-        return 1
-    print(f"Extractor runs: {result.extractor_run_path}.")
-    registry = result.ingest or result.sixk_ingest
-    if registry is not None:
-        print(f"Failure registry: {registry.failure_file}.")
-    return 0
+        def describe(genre: str, rows: pd.DataFrame) -> str:
+            target = dataset_root(
+                GENRES[genre].segment_dataset, artifact_root=artifact_root
+            )
+            return f"{genre}: segmented {len(rows)} rows into {target}."
+
+        return _report_genres(results, failed, describe)
+
+    return _with_writer_lease(args, "segment", body)
 
 
-def run_sixk_stage(args: argparse.Namespace) -> int:
-    """Run the 6-K triage subcommand."""
-    configure_logging(quiet=args.quiet, log_file=args.log_file)
-    logger = logging.getLogger(__name__)
-    artifact_root = args.artifact_root or default_artifact_root()
-    lease = acquire_stage_lease(artifact_root, logger, "6-K triage")
-    if lease is None:
-        return 1
+def run_classify(args: argparse.Namespace) -> int:
+    """Run ``cdt classify``."""
+
+    def body(artifact_root: str, lease: Lease) -> int:
+        results, failed = _per_genre(
+            args.genres,
+            "classify",
+            lambda genre: classify_genre(
+                genre,
+                artifact_root=artifact_root,
+                batch_size=args.batch_size,
+                force=args.force,
+                model_dir=args.model_dir,
+                sixk_model_dir=args.sixk_model_dir,
+                sixk_concurrency=args.concurrency,
+                renew=renewer(lease),
+            ),
+        )
+
+        def describe(genre: str, rows: pd.DataFrame) -> str:
+            relevant = int(rows["relevance"].fillna(False).sum()) if len(rows) else 0
+            target = dataset_root(
+                GENRES[genre].classified_dataset, artifact_root=artifact_root
+            )
+            return (
+                f"{genre}: classified {len(rows)} rows, {relevant} relevant, "
+                f"into {target}."
+            )
+
+        return _report_genres(results, failed, describe)
+
+    return _with_writer_lease(args, "classify", body)
+
+
+def run_classify_train(args: argparse.Namespace) -> int:
+    """Run ``cdt classify train``."""
+    model_dir = getattr(args, "model_dir", None) or default_model_dir()
     try:
-        logger.info(
-            "Starting 6-K triage: batch_size=%s concurrency=%s force=%s documents=%s output=%s",
-            args.batch_size,
-            args.concurrency,
-            args.force,
-            documents_root(artifact_root, dataset_name=SIXK_DOCUMENT_DATASET_NAME),
-            sixk_snippets_root(artifact_root),
-        )
-        snippets = triage_pending_documents(
-            artifact_root=artifact_root,
-            batch_size=args.batch_size,
-            force=args.force,
-            model_dir=args.model_dir,
-            concurrency=args.concurrency,
-        )
-    except Exception:
-        logger.exception("6-K triage failed")
-        return 1
-    finally:
-        release_lease(lease)
-    relevant = int(snippets["relevance"].fillna(False).sum()) if len(snippets) else 0
-    print(f"Triaged {len(snippets)} admitted 6-K snippets; {relevant} kept.")
-    print(f"Wrote snippet partitions to {sixk_snippets_root(artifact_root)}.")
-    return 0
-
-
-def run_classifier(args: argparse.Namespace) -> int:
-    """Run the classifier inference subcommand."""
-    configure_logging(quiet=args.quiet, log_file=args.log_file)
-    logger = logging.getLogger(__name__)
-    artifact_root = args.artifact_root or default_artifact_root()
-    resolved_model_dir = args.model_dir or default_model_dir()
-    lease = acquire_stage_lease(artifact_root, logger, "classification")
-    if lease is None:
-        return 1
-    try:
-        logger.info(
-            "Starting classification: batch_size=%s force=%s input=%s output=%s model_dir=%s",
-            args.batch_size,
-            args.force,
-            items_root(artifact_root),
-            classifications_root(artifact_root),
-            resolved_model_dir,
-        )
-        items = classify_pending_items(
-            artifact_root=artifact_root,
-            batch_size=args.batch_size,
-            force=args.force,
-            model_dir=args.model_dir,
-        )
-    except Exception:
-        logger.exception("Classification failed")
-        return 1
-    finally:
-        release_lease(lease)
-    print(f"Classified {len(items)} item rows.")
-    print(f"Wrote classification partitions to {classifications_root(artifact_root)}.")
-    return 0
-
-
-def run_classifier_train(args: argparse.Namespace) -> int:
-    """Run the classifier training subcommand."""
-    configure_logging(quiet=args.quiet, log_file=args.log_file)
-    logger = logging.getLogger(__name__)
-    resolved_model_dir = args.model_dir or default_model_dir()
-    try:
-        logger.info(
-            "Starting classifier training: train_csv=%s model_dir=%s target_recall=%s cv_splits=%s random_seed=%s",
-            args.train_csv,
-            resolved_model_dir,
-            args.target_recall,
-            args.cv_splits,
-            args.random_seed,
-        )
         metadata = train_classifier_model(
             train_csv=args.train_csv,
-            model_dir=resolved_model_dir,
+            model_dir=model_dir,
             target_recall=args.target_recall,
             cv_splits=args.cv_splits,
             random_seed=args.random_seed,
         )
     except Exception:
-        logger.exception("Classifier training failed")
+        LOGGER.exception("Classifier training failed")
         return 1
     print(f"Trained classifier on {metadata['training_row_count']} labeled rows.")
-    print(f"Wrote model artifacts to {resolved_model_dir}.")
+    print(f"Wrote model artifacts to {model_dir}.")
     return 0
 
 
-def run_extractor(args: argparse.Namespace) -> int:
-    """Run the LLM extractor subcommand."""
-    configure_logging(quiet=args.quiet, log_file=args.log_file)
-    logger = logging.getLogger(__name__)
-    artifact_root = args.artifact_root or default_artifact_root()
-    lease = acquire_stage_lease(artifact_root, logger, "extraction")
-    if lease is None:
-        return 1
-    try:
-        logger.info(
-            "Starting extraction: batch_size=%s force=%s inputs=%s output=%s model=%s reasoning_effort=%s max_attempts=%s audit=%s",
-            args.batch_size,
-            args.force,
-            # Both genres' sources; extraction claims from either.
-            ",".join(
-                dataset_root(source, artifact_root=artifact_root)
-                for source in CLASSIFICATION_SOURCES
-            ),
-            mentions_root(artifact_root),
-            args.model,
-            args.reasoning_effort,
-            args.max_attempts,
-            extracted_tables_path(artifact_root),
-        )
+def run_extract(args: argparse.Namespace) -> int:
+    """Run ``cdt extract`` (the live backend)."""
+
+    def body(artifact_root: str, lease: Lease) -> int:
+        del lease
         mentions = extract_pending_items(
             artifact_root=artifact_root,
             batch_size=args.batch_size,
@@ -797,24 +847,18 @@ def run_extractor(args: argparse.Namespace) -> int:
             reasoning_effort=args.reasoning_effort,
             max_attempts=args.max_attempts,
         )
-    except Exception:
-        logger.exception("Extraction failed")
-        return 1
-    finally:
-        release_lease(lease)
-    print(f"Extracted {len(mentions)} instrument mention rows.")
-    print(f"Wrote canonical mentions to {mentions_root(artifact_root)}.")
-    print(
-        f"Wrote full.jsonl audit output under {extracted_tables_path(artifact_root)}."
-    )
-    return 0
+        print(
+            f"Extracted {len(mentions)} mention rows into {mentions_root(artifact_root)}."
+        )
+        print(f"Audit log under {extracted_tables_path(artifact_root)}.")
+        return 0
+
+    return _with_writer_lease(args, "extract", body)
 
 
-def run_show_extract_job(args: argparse.Namespace) -> int:
-    """Report the active batch extract job's state."""
-    configure_logging(quiet=args.quiet, log_file=args.log_file)
-    artifact_root = args.artifact_root or default_artifact_root()
-    summary: ActiveJobSummary = describe_active_job(artifact_root)
+def run_extract_job_show(args: argparse.Namespace) -> int:
+    """Run ``cdt extract job show``: report the active batch job, read-only."""
+    summary: ActiveJobSummary = describe_active_job(_artifact_root(args))
     if summary.status == "idle":
         print("No active extract job; the next poll tick will start one.")
         return 0
@@ -822,7 +866,7 @@ def run_show_extract_job(args: argparse.Namespace) -> int:
         print(f"Active job {summary.job_id} is unusable: {summary.detail}")
         print(
             "The next poll tick clears this automatically. To clear it now, run "
-            "`cdt reset-extract-job --yes`."
+            "`cdt extract job reset --yes`."
         )
         return 1
     print(f"Active job {summary.job_id} (tick {summary.tick}):")
@@ -837,12 +881,9 @@ def run_show_extract_job(args: argparse.Namespace) -> int:
     return 0
 
 
-def run_reset_extract_job(args: argparse.Namespace) -> int:
-    """Clear the active batch extract job marker under the writer lease."""
-    configure_logging(quiet=args.quiet, log_file=args.log_file)
-    logger = logging.getLogger(__name__)
-    artifact_root = args.artifact_root or default_artifact_root()
-    summary: ActiveJobSummary = describe_active_job(artifact_root)
+def run_extract_job_reset(args: argparse.Namespace) -> int:
+    """Run ``cdt extract job reset``: clear the active batch job's marker."""
+    summary: ActiveJobSummary = describe_active_job(_artifact_root(args))
     if summary.status == "idle":
         print("No active extract job; nothing to reset.")
         return 0
@@ -860,78 +901,31 @@ def run_reset_extract_job(args: argparse.Namespace) -> int:
             "Re-run with --yes to proceed."
         )
         return 0
-    # Take the same lease a poll tick holds, so a running tick cannot rewrite the
-    # marker underneath the reset.
-    lease = acquire_lease(artifact_root, PIPELINE_WRITER_LEASE)
-    if lease is None:
-        logger.error(
-            "Pipeline-writer lease is held (a poll tick is running); not resetting."
-        )
-        return 1
-    try:
+
+    def body(artifact_root: str, lease: Lease) -> int:
+        del lease
         # Pin the clear to the job shown above: if a poll tick completed it and
         # started another in between, abort instead of abandoning the new job.
         job_id = reset_active_job(artifact_root, expected_job_id=summary.job_id)
-    finally:
-        release_lease(lease)
-    if job_id is None:
-        print(
-            "Not reset: the active job changed (or completed) since inspection. "
-            "Re-run to inspect the current state."
-        )
-        return 1
-    print(f"Cleared the active extract job marker for {job_id}.")
-    print("The next poll tick starts a fresh job from unclaimed partitions.")
-    return 0
-
-
-def run_backfill_mentions(args: argparse.Namespace) -> int:
-    """Mint prior states over existing mentions partitions, or count them."""
-    configure_logging(quiet=args.quiet, log_file=args.log_file)
-    logger = logging.getLogger(__name__)
-    artifact_root = args.artifact_root or default_artifact_root()
-    lease = None
-    if not args.dry_run:
-        lease = acquire_stage_lease(artifact_root, logger, "backfill")
-        if lease is None:
+        if job_id is None:
+            print(
+                "Not reset: the active job changed (or completed) since inspection. "
+                "Re-run to inspect the current state."
+            )
             return 1
-    try:
-        # A whole-dataset rewrite: renew, or a TTL-expired lease could be
-        # stolen and another writer would overwrite the same partitions.
-        counts = backfill_mentions(
-            artifact_root,
-            dry_run=args.dry_run,
-            renew=renewer(lease) if lease is not None else None,
-        )
-    except Exception:
-        logger.exception("Mentions backfill failed")
-        return 1
-    finally:
-        if lease is not None:
-            release_lease(lease)
-    print("Mentions backfill" + (" (dry run):" if args.dry_run else ":"))
-    for key in sorted(counts):
-        print(f"  {key + ':':<32}{counts[key]}")
-    return 0
+        print(f"Cleared the active extract job marker for {job_id}.")
+        print("The next poll tick starts a fresh job from unclaimed partitions.")
+        return 0
+
+    # The lease a poll tick holds, so a running tick cannot rewrite the marker
+    # underneath the reset.
+    return _with_writer_lease(args, "the extract job reset", body)
 
 
-def run_matcher(args: argparse.Namespace) -> int:
-    """Run the matcher subcommand."""
-    configure_logging(quiet=args.quiet, log_file=args.log_file)
-    logger = logging.getLogger(__name__)
-    artifact_root = args.artifact_root or default_artifact_root()
-    lease = acquire_stage_lease(artifact_root, logger, "matching")
-    if lease is None:
-        return 1
-    try:
-        logger.info(
-            "Starting matcher: batch_size=%s force=%s input=%s mention_cluster_edges=%s debt_instruments=%s",
-            args.batch_size,
-            args.force,
-            mentions_root(artifact_root),
-            mention_cluster_edges_root(artifact_root),
-            debt_instruments_root(artifact_root),
-        )
+def run_match(args: argparse.Namespace) -> int:
+    """Run ``cdt match``: match, then the lineage pass over every shard."""
+
+    def body(artifact_root: str, lease: Lease) -> int:
         tables = match_pending_mentions(
             artifact_root=artifact_root,
             batch_size=args.batch_size,
@@ -941,43 +935,142 @@ def run_matcher(args: argparse.Namespace) -> int:
             loose_match_threshold=args.loose_match_threshold,
             ambiguity_margin=args.ambiguity_margin,
         )
-        # Always, as the pipeline does: lineage spans filings, so it is a
-        # post-pass over every shard.
+        # Lineage spans filings, so it is a post-pass over every shard.
         stats = apply_lineage_inference_pass(artifact_root, renew=renewer(lease))
-        logger.info(
+        LOGGER.info(
             "Lineage inference: %s links (%s re-opened), lineage heads %s -> %s",
             stats["links"],
             stats["reopened"],
             stats["heads_before"],
             stats["heads_after"],
         )
-    except Exception:
-        logger.exception("Matcher failed")
-        return 1
-    finally:
-        release_lease(lease)
-    print(
-        f"Matched {len(tables['debt_instrument_mentions'])} mention-cluster edge rows."
+        print(
+            f"Matched {len(tables['debt_instrument_mentions'])} mention-cluster "
+            f"edge rows into {mention_cluster_edges_root(artifact_root)} and "
+            f"{debt_instruments_root(artifact_root)}."
+        )
+        return 0
+
+    return _with_writer_lease(args, "match", body)
+
+
+def run_publish(args: argparse.Namespace) -> int:
+    """Run ``cdt publish``."""
+    if not args.final_database_root:
+        LOGGER.error("--final-database-root (or FINAL_DATABASE_ROOT) is required")
+        return USAGE_EXIT_CODE
+
+    def body(artifact_root: str, lease: Lease) -> int:
+        published = publish_final_tables(
+            artifact_root=artifact_root,
+            final_database_root=args.final_database_root,
+            force=args.force,
+            renew=renewer(lease),
+        )
+        if not published:
+            print("Nothing to publish: no source changed since the last publish.")
+        for table, path in published.items():
+            print(f"Published {table}: {path}")
+        return 0
+
+    return _with_writer_lease(args, "publish", body)
+
+
+# --- cdt run ------------------------------------------------------------------
+
+
+def run_run(args: argparse.Namespace) -> int:
+    """Run ``cdt run daily|historical|poll``."""
+    reject_placeholder_secrets()
+    start_runtime_watchdog(args.run_mode, args.max_runtime_hours)
+    if args.run_mode == "poll":
+        return run_poll(
+            artifact_root=args.artifact_root,
+            final_database_root=args.final_database_root,
+            force=args.force,
+            max_attempts=args.max_attempts,
+            max_requests_per_batch=args.max_requests_per_batch,
+            max_batch_bytes=args.max_batch_bytes,
+            max_rows_per_job=args.max_rows_per_job,
+            match_batch_size=args.match_batch_size,
+        )
+    if not args.cik_file:
+        LOGGER.error("--cik-file (or CDT_DEFAULT_CIK_FILE) is required")
+        return USAGE_EXIT_CODE
+    try:
+        config = _pipeline_config(args)
+    except ValueError as exc:
+        LOGGER.error("Invalid run arguments: %s", exc)
+        return USAGE_EXIT_CODE
+    if args.extractor_backend == "batch":
+        return run_prepare_then_publish(
+            config, extract_batch_size_given=args.extract_batch_size is not None
+        )
+    code, result = run_live(config)
+    if result is not None:
+        _print_run_summary(result)
+    return code
+
+
+def _pipeline_config(args: argparse.Namespace) -> PipelineConfig:
+    """Build a daily/historical run's config, resolving its dates.
+
+    Raises:
+        ValueError: On an invalid date window.
+    """
+    start_date, end_date = resolve_mode_dates(
+        args.run_mode, args.start_date, args.end_date
     )
-    print(
-        f"Wrote mention-cluster edges to {mention_cluster_edges_root(artifact_root)}."
+    return PipelineConfig(
+        mode=args.run_mode,
+        cik_file=args.cik_file,
+        bucket=args.bucket,
+        start_date=start_date,
+        end_date=end_date,
+        artifact_root=args.artifact_root,
+        final_database_root=args.final_database_root,
+        force=args.force,
+        download=args.download,
+        failure_file=args.failure_file,
+        aws_profile=args.aws_profile,
+        s3_prefix=args.s3_prefix,
+        ingest_batch_size=args.ingest_batch_size,
+        segment_batch_size=args.segment_batch_size,
+        classify_batch_size=args.classify_batch_size,
+        extract_batch_size=args.extract_batch_size or DEFAULT_STAGE_BATCH_SIZE,
+        match_batch_size=args.match_batch_size,
+        item_numbers=args.item_numbers,
+        classifier_model_dir=args.model_dir,
+        sixk_model_dir=args.sixk_model_dir,
+        sixk_concurrency=args.concurrency,
+        extractor_model=args.model,
+        extractor_reasoning_effort=args.reasoning_effort,
+        extractor_max_attempts=args.max_attempts,
+        strong_match_threshold=args.strong_match_threshold,
+        loose_match_threshold=args.loose_match_threshold,
+        ambiguity_margin=args.ambiguity_margin,
+        genres=args.genres,
     )
-    print(f"Wrote debt instruments to {debt_instruments_root(artifact_root)}.")
-    return 0
 
 
-def resolve_ingest_dates(args: argparse.Namespace) -> tuple[date, date]:
-    """Resolve ingest dates for the selected ingest mode."""
-    return resolve_mode_dates(args.ingest_mode, args.start_date, args.end_date)
-
-
-def parse_item_numbers(value: str) -> tuple[str, ...]:
-    """Parse a comma-separated item-number list for argparse."""
-    parsed = tuple(part.strip() for part in value.split(",") if part.strip())
-    if not parsed:
-        msg = "expected a comma-separated list of item numbers"
-        raise argparse.ArgumentTypeError(msg)
-    return parsed
+def _print_run_summary(result: PipelineRunResult) -> None:
+    print(
+        f"Ran {result.mode} from {result.start_date} through {result.end_date} "
+        f"over genres {','.join(result.genres)}."
+    )
+    for genre, genre_result in result.genre_results.items():
+        print(
+            f"{genre}: ingested {genre_result.ingest.total_rows} documents, "
+            f"segmented {genre_result.segmented_rows}, classified "
+            f"{genre_result.classified_rows}."
+        )
+    print(
+        f"Extracted {result.extracted_rows} and matched {result.matched_rows} "
+        f"mentions into {result.debt_instrument_rows} debt instruments."
+    )
+    print(f"Artifact root: {result.artifact_root}.")
+    if result.failed_genres:
+        print(f"Failed genres: {','.join(result.failed_genres)}; see the log.")
 
 
 if __name__ == "__main__":

@@ -88,8 +88,8 @@ def test_run_pipeline_uses_stage_backed_functions(
             run_manifest=str(tmp_path / "runs" / "ingest" / "run_id=1.json"),
         )
 
-    def fake_itemize_pending_documents(**kwargs: object) -> pd.DataFrame:
-        calls.append(("itemize", kwargs["batch_size"]))
+    def fake_segment_pending_eightk_documents(**kwargs: object) -> pd.DataFrame:
+        calls.append(("segment", kwargs["batch_size"]))
         return pd.DataFrame([{"item_id": "item-1"}])
 
     def fake_classify_pending_items(**kwargs: object) -> pd.DataFrame:
@@ -123,8 +123,12 @@ def test_run_pipeline_uses_stage_backed_functions(
             dataset_name="documents-sixk",
         )
 
-    def fake_triage_pending_documents(**kwargs: object) -> pd.DataFrame:
-        calls.append(("sixk", kwargs["batch_size"]))
+    def fake_segment_pending_sixk_documents(**kwargs: object) -> pd.DataFrame:
+        calls.append(("segment-sixk", kwargs["batch_size"]))
+        return pd.DataFrame([{"accession_number": "2"}])
+
+    def fake_triage_pending_windows(**kwargs: object) -> pd.DataFrame:
+        calls.append(("classify-sixk", kwargs["batch_size"]))
         return pd.DataFrame([{"item_id": "snippet-1"}, {"item_id": "snippet-2"}])
 
     def fake_extract_pending_items(**kwargs: object) -> pd.DataFrame:
@@ -144,7 +148,8 @@ def test_run_pipeline_uses_stage_backed_functions(
         "cdt.ingest.genres.acquire_eightk_documents", fake_run_ingest_pipeline
     )
     monkeypatch.setattr(
-        "cdt.pipeline.itemize_pending_documents", fake_itemize_pending_documents
+        "cdt.pipeline.segment_pending_eightk_documents",
+        fake_segment_pending_eightk_documents,
     )
     monkeypatch.setattr(
         "cdt.pipeline.classify_pending_items", fake_classify_pending_items
@@ -154,7 +159,11 @@ def test_run_pipeline_uses_stage_backed_functions(
         fake_acquire_scraped_sixk_documents,
     )
     monkeypatch.setattr(
-        "cdt.pipeline.triage_pending_documents", fake_triage_pending_documents
+        "cdt.pipeline.segment_pending_sixk_documents",
+        fake_segment_pending_sixk_documents,
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.triage_pending_windows", fake_triage_pending_windows
     )
     monkeypatch.setattr(
         "cdt.pipeline.extract_pending_items", fake_extract_pending_items
@@ -170,36 +179,37 @@ def test_run_pipeline_uses_stage_backed_functions(
             end_date=date(2024, 1, 31),
             download=True,
             ingest_batch_size=10,
-            itemize_batch_size=11,
+            segment_batch_size=11,
             classify_batch_size=12,
             extract_batch_size=13,
             match_batch_size=14,
-            sixk_batch_size=15,
             genres=DEFAULT_GENRES,
         )
     )
 
-    assert result.ingest is not None
-    assert result.ingest.total_rows == 1
-    assert result.itemized_rows == 1
-    assert result.classified_rows == 1
-    assert result.sixk_ingest is not None
-    assert result.sixk_ingest.total_rows == 2
-    assert result.sixk_snippet_rows == EXPECTED_SIXK_SNIPPETS
+    eightk = result.genre_results[GENRE_8K]
+    assert eightk.ingest.total_rows == 1
+    assert eightk.segmented_rows == 1
+    assert eightk.classified_rows == 1
+    sixk = result.genre_results[GENRE_6K]
+    assert sixk.ingest.total_rows == 2
+    assert sixk.segmented_rows == 1
+    assert sixk.classified_rows == EXPECTED_SIXK_SNIPPETS
     assert result.extracted_rows == 1
     assert result.matched_rows == 1
     assert result.debt_instrument_rows == 1
     # Both genres when asked for both, and the same CIKs asked of each: the
     # caller says which issuers and which dates, not which forms those issuers
-    # filed. What a scheduled run defaults to is pinned on the orchestrator, in
+    # filed. What a scheduled run defaults to is pinned on `cdt run`, in
     # `test_scheduled_runs_prepare_both_genres_by_default`.
     assert result.genres == DEFAULT_GENRES
     assert calls == [
         ("ingest", {"320193"}),
-        ("itemize", 11),
+        ("segment", 11),
         ("classify", 12),
         ("ingest-sixk", {"320193"}),
-        ("sixk", 15),
+        ("segment-sixk", 11),
+        ("classify-sixk", 12),
         ("extract", 13),
         ("match", 14),
     ]
@@ -229,7 +239,9 @@ def test_genres_narrow_the_run_to_one_chain(
     monkeypatch.setattr(
         "cdt.ingest.genres.acquire_eightk_documents", unexpected("ingest")
     )
-    monkeypatch.setattr("cdt.pipeline.itemize_pending_documents", unexpected("itemize"))
+    monkeypatch.setattr(
+        "cdt.pipeline.segment_pending_eightk_documents", unexpected("segment")
+    )
     monkeypatch.setattr("cdt.pipeline.classify_pending_items", unexpected("classify"))
     monkeypatch.setattr(
         "cdt.ingest.genres.acquire_scraped_sixk_documents",
@@ -239,7 +251,7 @@ def test_genres_narrow_the_run_to_one_chain(
         )[1],
     )
     monkeypatch.setattr(
-        "cdt.pipeline.triage_pending_documents",
+        "cdt.pipeline.triage_pending_windows",
         lambda **kwargs: (calls.append("sixk"), pd.DataFrame())[1],
     )
     monkeypatch.setattr(
@@ -272,8 +284,8 @@ def test_genres_narrow_the_run_to_one_chain(
     assert result.genres == (GENRE_6K,)
     # Absent, not empty: the 8-K chain did not run, which a zero-row result
     # would not distinguish from a run that found no filings.
-    assert result.ingest is None
-    assert result.sixk_ingest is not None
+    assert GENRE_8K not in result.genre_results
+    assert GENRE_6K in result.genre_results
 
 
 def test_a_config_that_names_no_genres_does_not_acquire_the_sixk_chain(
@@ -295,7 +307,7 @@ def test_a_config_that_names_no_genres_does_not_acquire_the_sixk_chain(
         raise AssertionError("the 6-K chain ran without being asked for")
 
     monkeypatch.setattr("cdt.ingest.genres.acquire_scraped_sixk_documents", explode)
-    monkeypatch.setattr("cdt.pipeline.triage_pending_documents", explode)
+    monkeypatch.setattr("cdt.pipeline.triage_pending_windows", explode)
 
     assert PipelineConfig(mode="historical", cik_file=str(cik_file)).genres == (
         GENRE_8K,
@@ -480,7 +492,7 @@ This is the extracted event text.
             end_date=date(2024, 1, 31),
             download=True,
             ingest_batch_size=1,
-            itemize_batch_size=1,
+            segment_batch_size=1,
             classify_batch_size=1,
             extract_batch_size=1,
             match_batch_size=1,
@@ -502,8 +514,8 @@ This is the extracted event text.
     final_instruments = read_table(
         tmp_path / "database" / "cdt" / "debt-instruments" / "latest.parquet"
     )
-    assert result.itemized_rows == 1
-    assert result.classified_rows == 1
+    assert result.genre_results[GENRE_8K].segmented_rows == 1
+    assert result.genre_results[GENRE_8K].classified_rows == 1
     assert result.extracted_rows == 1
     assert result.matched_rows == 1
     assert written_matches["edge_type"].to_list() == ["member"]
@@ -795,7 +807,7 @@ def test_the_lease_is_renewed_between_the_eightk_and_sixk_chains(
         )[1],
     )
     monkeypatch.setattr(
-        "cdt.pipeline.triage_pending_documents", lambda **kwargs: pd.DataFrame()
+        "cdt.pipeline.triage_pending_windows", lambda **kwargs: pd.DataFrame()
     )
 
     run_pipeline(
@@ -851,7 +863,7 @@ def _stage_stubs(
         "cdt.ingest.genres.acquire_eightk_documents", fake_run_ingest_pipeline
     )
     monkeypatch.setattr(
-        "cdt.pipeline.itemize_pending_documents",
+        "cdt.pipeline.segment_pending_eightk_documents",
         lambda **_: pd.DataFrame([{"item_id": "item-1"}]),
     )
     monkeypatch.setattr(
@@ -887,13 +899,10 @@ def test_run_pipeline_runs_the_lineage_pass_between_match_and_publish(
     instruments: pd.DataFrame,
     expected_calls: int,
 ) -> None:
-    """`cdt pipeline` and the live backend must infer lineage before publishing.
+    """A live run infers lineage before publishing, as the batch backend does.
 
-    The pass was wired into `run_match_and_finalize` and `cdt match` only, so
-    `cdt pipeline` and `cdt-orchestrator --extractor-backend live` still
-    published the un-inferred lineage #170 describes, on a root the batch
-    backend would have fixed. The guard matches `run_match_and_finalize`'s:
-    nothing matched means three empty datasets read to write none.
+    The guard matches `run_match_and_finalize`'s: nothing matched means three
+    empty datasets read to write none.
     """
     from cdt import publish as publish_module
 
@@ -1267,7 +1276,7 @@ def test_no_final_database_root_skips_without_listing_anything(
     """The default configuration has nowhere to publish to (#110).
 
     ``final_database_root`` defaults to None on both ``PipelineConfig`` and
-    ``run_match_and_finalize``, which is what `cdt pipeline` gets without
+    ``run_match_and_finalize``, which is what a live run gets without
     ``--final-database-root``. ``write_final_output_tables`` returns before it
     reads anything in that case, so the gate answers the same and should not
     pay a listing to find out.
@@ -1345,13 +1354,10 @@ def test_run_pipeline_skips_the_publish_when_nothing_changed(
     force: bool,
     expected_publishes: int,
 ) -> None:
-    """`cdt pipeline` and the live backend pay the same publish, so same gate (#110).
+    """A live run pays the same publish as the batch backend, so the same gate.
 
-    ``run_match_and_finalize`` is the batch backend's path; this is the other
-    two entry points. Gating only one of them would leave the identical
-    25-minute no-op publish in place for `cdt pipeline` and
-    `cdt-orchestrator --extractor-backend live`, which is the shape #170 took
-    when the lineage pass was wired into one path and not the others.
+    ``run_match_and_finalize`` is the batch backend's path; this is the live
+    one. Gating only one would leave a no-op publish in place for the other.
     """
     from cdt import publish as publish_module
 
@@ -1428,7 +1434,7 @@ def _isolation_stubs(
         "cdt.ingest.genres.acquire_scraped_sixk_documents", ingest(GENRE_6K)
     )
     monkeypatch.setattr(
-        "cdt.pipeline.itemize_pending_documents",
+        "cdt.pipeline.segment_pending_eightk_documents",
         lambda **kwargs: (calls.append("itemize"), pd.DataFrame())[1],
     )
     monkeypatch.setattr(
@@ -1436,7 +1442,7 @@ def _isolation_stubs(
         lambda **kwargs: (calls.append("classify"), pd.DataFrame())[1],
     )
     monkeypatch.setattr(
-        "cdt.pipeline.triage_pending_documents",
+        "cdt.pipeline.triage_pending_windows",
         lambda **kwargs: (calls.append("sixk"), pd.DataFrame())[1],
     )
     monkeypatch.setattr(
@@ -1486,8 +1492,8 @@ def test_a_failing_sixk_chain_still_extracts_and_matches_the_eightk_chain(
         "match",
     ]
     assert result.failed_genres == (GENRE_6K,)
-    assert result.ingest is not None
-    assert result.sixk_ingest is None
+    assert GENRE_8K in result.genre_results
+    assert GENRE_6K not in result.genre_results
 
 
 def test_a_failing_eightk_chain_does_not_stop_the_sixk_chain(
@@ -1549,12 +1555,8 @@ def test_a_failed_genre_is_logged_with_its_traceback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-    propagate_logger: Callable[..., None],
 ) -> None:
     """Operators see which genre failed and why."""
-    from cdt.shared import get_logger
-
-    propagate_logger(get_logger("PipelineOrchestrator"))
     calls: list[str] = []
     _isolation_stubs(monkeypatch, tmp_path, calls, failing=(GENRE_6K,))
 

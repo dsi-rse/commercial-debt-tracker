@@ -31,7 +31,7 @@ from cdt.ingest.core import DOCUMENT_COLUMNS
 from cdt.segmenter import core as segmenter_core
 from cdt.segmenter import eightk as segmenter_eightk
 from cdt.segmenter.core import items_root
-from cdt.segmenter.eightk import itemize_pending_documents
+from cdt.segmenter.eightk import segment_pending_eightk_documents
 from cdt.storage.objects import (
     artifact_exists,
     read_json_artifact,
@@ -151,22 +151,24 @@ The Company issued a promissory note.
     assert {section.company_name for section in sections} == {""}
 
 
-def test_itemize_pending_documents_writes_canonical_partitions(tmp_path: Path) -> None:
+def test_segment_pending_eightk_documents_writes_canonical_partitions(
+    tmp_path: Path,
+) -> None:
     """Itemization should consume document partitions and write item partitions."""
     seed_document_partition(tmp_path)
 
-    items = itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
+    items = segment_pending_eightk_documents(artifact_root=tmp_path, batch_size=5)
 
     written = read_dataset(items_root(tmp_path))
     assert len(items) == 1
     assert written["item_id"].to_list() == ["000114036126006577-8-01"]
 
 
-def test_itemize_pending_documents_drains_all_partitions(tmp_path: Path) -> None:
+def test_segment_pending_eightk_documents_drains_all_partitions(tmp_path: Path) -> None:
     """Itemization should process all pending partitions across chunks."""
     seed_document_partitions(tmp_path)
 
-    items = itemize_pending_documents(artifact_root=tmp_path, batch_size=1)
+    items = segment_pending_eightk_documents(artifact_root=tmp_path, batch_size=1)
 
     written = read_dataset(items_root(tmp_path))
     assert len(items) == 2
@@ -176,7 +178,7 @@ def test_itemize_pending_documents_drains_all_partitions(tmp_path: Path) -> None
     ]
 
 
-def test_itemize_pending_documents_skips_empty_outputs_on_rerun(
+def test_segment_pending_eightk_documents_skips_empty_outputs_on_rerun(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -192,8 +194,8 @@ def test_itemize_pending_documents_skips_empty_outputs_on_rerun(
 
     monkeypatch.setattr(segmenter_eightk, "itemize_documents", fake_itemize_documents)
 
-    first = itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
-    second = itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
+    first = segment_pending_eightk_documents(artifact_root=tmp_path, batch_size=5)
+    second = segment_pending_eightk_documents(artifact_root=tmp_path, batch_size=5)
 
     assert first.empty
     assert second.empty
@@ -209,7 +211,7 @@ def test_classify_pending_items_writes_canonical_partitions(
 ) -> None:
     """Classification should consume item partitions and write classification partitions."""
     seed_document_partition(tmp_path)
-    itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
+    segment_pending_eightk_documents(artifact_root=tmp_path, batch_size=5)
     monkeypatch.setattr(
         classifier_eightk,
         "load_training_artifacts",
@@ -230,7 +232,7 @@ def test_classify_pending_items_drains_all_partitions(
 ) -> None:
     """Classification should process all pending partitions across chunks."""
     seed_document_partitions(tmp_path)
-    itemize_pending_documents(artifact_root=tmp_path, batch_size=1)
+    segment_pending_eightk_documents(artifact_root=tmp_path, batch_size=1)
     monkeypatch.setattr(
         classifier_eightk,
         "load_training_artifacts",
@@ -250,7 +252,7 @@ def test_classify_pending_items_skips_empty_outputs_on_rerun(
 ) -> None:
     """Empty classifier results should not write parquet and should not rerun."""
     seed_document_partition(tmp_path)
-    itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
+    segment_pending_eightk_documents(artifact_root=tmp_path, batch_size=5)
     monkeypatch.setattr(
         classifier_eightk,
         "load_training_artifacts",
@@ -332,7 +334,7 @@ def test_load_training_artifacts_warns_without_recorded_version(
     assert any("sklearn_version" in record.getMessage() for record in caplog.records)
 
 
-def test_itemize_pending_documents_persists_progress_per_batch(
+def test_segment_pending_eightk_documents_persists_progress_per_batch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -354,12 +356,12 @@ def test_itemize_pending_documents_persists_progress_per_batch(
     )
 
     with pytest.raises(TimeoutError):
-        itemize_pending_documents(artifact_root=tmp_path, batch_size=1)
+        segment_pending_eightk_documents(artifact_root=tmp_path, batch_size=1)
 
     assert len(load_completed_partitions("itemize", artifact_root=tmp_path)) == 1
 
     monkeypatch.setattr(segmenter_eightk, "itemize_documents", real_itemize_documents)
-    resumed = itemize_pending_documents(artifact_root=tmp_path, batch_size=1)
+    resumed = segment_pending_eightk_documents(artifact_root=tmp_path, batch_size=1)
 
     assert len(resumed) == 1
     assert len(load_completed_partitions("itemize", artifact_root=tmp_path)) == 2
@@ -371,7 +373,7 @@ def test_classify_pending_items_persists_progress_per_batch(
 ) -> None:
     """A crash mid-stage must lose at most one batch, not the whole run (#111)."""
     seed_document_partitions(tmp_path)
-    itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
+    segment_pending_eightk_documents(artifact_root=tmp_path, batch_size=5)
     monkeypatch.setattr(
         classifier_eightk,
         "load_training_artifacts",
@@ -404,7 +406,7 @@ def test_stage_batch_boundaries_renew_the_writer_lease(
     seed_document_partitions(tmp_path)
     renewals: list[str] = []
 
-    itemize_pending_documents(
+    segment_pending_eightk_documents(
         artifact_root=tmp_path,
         batch_size=1,
         renew=lambda: renewals.append("itemize"),
@@ -440,7 +442,7 @@ def test_extract_pending_items_writes_mentions_and_audit(
     swapped back to `row_state.debt_instrument_mentions` with a green suite.
     """
     seed_document_partition(tmp_path)
-    itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
+    segment_pending_eightk_documents(artifact_root=tmp_path, batch_size=5)
     monkeypatch.setattr(
         classifier_eightk,
         "load_training_artifacts",
@@ -554,7 +556,7 @@ def test_extract_pending_items_drains_all_partitions(
 ) -> None:
     """Extraction should process all pending partitions across chunks."""
     seed_document_partitions(tmp_path)
-    itemize_pending_documents(artifact_root=tmp_path, batch_size=1)
+    segment_pending_eightk_documents(artifact_root=tmp_path, batch_size=1)
     monkeypatch.setattr(
         classifier_eightk,
         "load_training_artifacts",
@@ -620,7 +622,7 @@ def test_extract_pending_items_skips_empty_outputs_on_rerun(
 ) -> None:
     """Empty extraction results should not write parquet and should not rerun."""
     seed_document_partition(tmp_path)
-    itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
+    segment_pending_eightk_documents(artifact_root=tmp_path, batch_size=5)
     monkeypatch.setattr(
         classifier_eightk,
         "load_training_artifacts",
@@ -669,7 +671,7 @@ def test_extract_failures_are_recorded_and_cleared(
 ) -> None:
     """A dropped row lands in the failure registry; a later success clears it."""
     seed_document_partition(tmp_path)
-    itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
+    segment_pending_eightk_documents(artifact_root=tmp_path, batch_size=5)
     monkeypatch.setattr(
         classifier_eightk,
         "load_training_artifacts",
@@ -745,7 +747,7 @@ def test_stage_manifest_points_at_the_registry_prefix(tmp_path: Path) -> None:
     path that no longer exists.
     """
     seed_document_partition(tmp_path)
-    itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
+    segment_pending_eightk_documents(artifact_root=tmp_path, batch_size=5)
 
     manifest = read_json_artifact(
         run_manifest_path("itemize", "latest", artifact_root=tmp_path)
@@ -786,7 +788,7 @@ def test_itemize_batch_progress_survives_a_mid_run_interruption(
 
     monkeypatch.setattr(segmenter_eightk, "itemize_documents", count(fail_on=4))
     with pytest.raises(RuntimeError, match="infra interruption"):
-        itemize_pending_documents(artifact_root=tmp_path, batch_size=1)
+        segment_pending_eightk_documents(artifact_root=tmp_path, batch_size=1)
 
     # Three partitions finished; their completion is durable, in two shards.
     completed = load_completed_partitions("itemize", artifact_root=tmp_path)
@@ -799,7 +801,7 @@ def test_itemize_batch_progress_survives_a_mid_run_interruption(
     # And the resumed run pays only for what was left.
     monkeypatch.setattr(segmenter_eightk, "itemize_documents", count(fail_on=None))
     calls.clear()
-    itemize_pending_documents(artifact_root=tmp_path, batch_size=1)
+    segment_pending_eightk_documents(artifact_root=tmp_path, batch_size=1)
     assert len(calls) == 2
     assert load_completed_partitions("itemize", artifact_root=tmp_path) == set(paths)
 
@@ -842,13 +844,13 @@ def test_grown_document_partition_reitemizes_and_reclassifies(
     )
 
     _write_documents(["000114036126006577"])
-    itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
+    segment_pending_eightk_documents(artifact_root=tmp_path, batch_size=5)
     classify_pending_items(artifact_root=tmp_path, batch_size=5)
     assert len(read_dataset(classifications_root(tmp_path))) == 1
 
     # Ingest-style merge: the same partition object grows a second filing.
     _write_documents(["000114036126006577", "000114036126009999"])
-    itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
+    segment_pending_eightk_documents(artifact_root=tmp_path, batch_size=5)
     classify_pending_items(artifact_root=tmp_path, batch_size=5)
 
     classified = read_dataset(classifications_root(tmp_path))
@@ -863,7 +865,7 @@ def test_classifier_loads_model_once_per_run(
 ) -> None:
     """The pickled model is deserialized once, not once per partition (#76)."""
     seed_document_partitions(tmp_path)
-    itemize_pending_documents(artifact_root=tmp_path, batch_size=1)
+    segment_pending_eightk_documents(artifact_root=tmp_path, batch_size=1)
     loads = 0
 
     def counting_load(path: object) -> tuple[FakeModel, float, dict[str, float]]:
@@ -892,7 +894,7 @@ def test_a_partial_row_publishes_its_mentions_and_registers_the_loss(
     mentions) both left the suite green.
     """
     seed_document_partition(tmp_path)
-    itemize_pending_documents(artifact_root=tmp_path, batch_size=5)
+    segment_pending_eightk_documents(artifact_root=tmp_path, batch_size=5)
     monkeypatch.setattr(
         classifier_eightk,
         "load_training_artifacts",
