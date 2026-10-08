@@ -20,20 +20,29 @@ from cdt.classifier.sixk import (
     VERDICT_DROPPED_NO_DETAILS,
     VERDICT_KEPT,
     VERDICT_KEPT_DEGRADED,
+    StaleSegmentationError,
     item_id_for,
     sixk_snippets_root,
     snippet_id_for,
-    triage_documents,
-    triage_pending_documents,
+    triage_pending_windows,
+    triage_windows,
 )
 from cdt.completion import load_completion_registry
-from cdt.datasets import SIXK_DOCUMENT_DATASET_NAME, run_manifest_path
+from cdt.datasets import (
+    SIXK_DOCUMENT_DATASET_NAME,
+    SIXK_WINDOW_DATASET_NAME,
+    dataset_root,
+    run_manifest_path,
+)
 from cdt.ingest.core import DOCUMENT_COLUMNS
 from cdt.ingest.core import documents_root as ingest_documents_root
 from cdt.segmenter.sixk import (
+    SIXK_WINDOW_COLUMNS,
     prepare_filing,
     prose_documents,
+    segment_pending_sixk_documents,
     strip_inline_xbrl_prologue,
+    window_documents,
 )
 from cdt.storage.objects import list_artifacts, read_json_artifact
 from cdt.storage.tables import read_dataset, write_partition_table
@@ -182,8 +191,7 @@ class FakeChatClient:
 def _stub_stage1(monkeypatch: pytest.MonkeyPatch) -> None:
     """Serve a keyword-scoring stand-in for the fitted stage-1 artifact.
 
-    The committed artifact lives under the real DATA_DIR, which conftest
-    redirects per test; loading it would also make these tests depend on the
+    Loading the committed artifact would make these tests depend on the
     model's actual scores rather than on the stage's behaviour.
     """
     monkeypatch.setattr(
@@ -191,6 +199,22 @@ def _stub_stage1(monkeypatch: pytest.MonkeyPatch) -> None:
         "load_stage1_model",
         lambda model_dir=None: (FakeStage1(), 0.332),
     )
+
+
+def triage_documents(
+    documents: pd.DataFrame, *, data_dir: Path | None = None, **kwargs: object
+) -> pd.DataFrame:
+    """Segment then classify in-memory document rows, as the two stages do."""
+    windows = window_documents(documents, data_dir=data_dir)
+    return triage_windows(windows, documents, data_dir=data_dir, **kwargs).rows
+
+
+def segment_and_classify_pending(
+    *, artifact_root: str, force: bool = False, **kwargs: object
+) -> pd.DataFrame:
+    """Run the 6-K segment stage, then the classify stage, over an artifact root."""
+    segment_pending_sixk_documents(artifact_root=artifact_root, force=force)
+    return triage_pending_windows(artifact_root=artifact_root, force=force, **kwargs)
 
 
 def _document_row(
@@ -695,7 +719,7 @@ def test_stage_writes_snippet_partitions_and_records_completion(
         ],
     )
 
-    snippets = triage_pending_documents(
+    snippets = segment_and_classify_pending(
         artifact_root=str(tmp_path),
         client=FakeChatClient(keep_all=True),
     )
@@ -705,14 +729,14 @@ def test_stage_writes_snippet_partitions_and_records_completion(
         sixk_snippets_root(str(tmp_path)), columns=SIXK_SNIPPET_COLUMNS
     )
     assert len(persisted) == 1
-    registry = load_completion_registry("sixk", artifact_root=str(tmp_path))
+    registry = load_completion_registry("sixk-classify", artifact_root=str(tmp_path))
     assert len(registry) == 1
     manifest = read_json_artifact(
-        run_manifest_path("sixk", "latest", artifact_root=str(tmp_path))
+        run_manifest_path("sixk-classify", "latest", artifact_root=str(tmp_path))
     )
     assert isinstance(manifest, dict)
-    assert manifest["stage"] == "sixk"
-    assert manifest["documents_processed"] == 1
+    assert manifest["stage"] == "sixk-classify"
+    assert manifest["source_rows_processed"] == 1
 
 
 def test_stage_skips_a_partition_it_has_already_triaged(tmp_path: Path) -> None:
@@ -726,10 +750,12 @@ def test_stage_skips_a_partition_it_has_already_triaged(tmp_path: Path) -> None:
         ],
     )
     first_client = FakeChatClient(keep_all=True)
-    triage_pending_documents(artifact_root=str(tmp_path), client=first_client)
+    segment_and_classify_pending(artifact_root=str(tmp_path), client=first_client)
 
     second_client = FakeChatClient(keep_all=True)
-    again = triage_pending_documents(artifact_root=str(tmp_path), client=second_client)
+    again = segment_and_classify_pending(
+        artifact_root=str(tmp_path), client=second_client
+    )
 
     assert first_client.calls
     assert second_client.calls == []
@@ -742,7 +768,7 @@ def test_stage_retriages_a_partition_ingest_grew(tmp_path: Path) -> None:
         tmp_path, submission=_submission(("6-K", f"<p>{DEBT_PROSE}</p>"))
     )
     _write_documents(tmp_path, [first_row])
-    triage_pending_documents(
+    segment_and_classify_pending(
         artifact_root=str(tmp_path), client=FakeChatClient(keep_all=True)
     )
 
@@ -753,7 +779,7 @@ def test_stage_retriages_a_partition_ingest_grew(tmp_path: Path) -> None:
     )
     _write_documents(tmp_path, [first_row, second_row])
     client = FakeChatClient(keep_all=True)
-    snippets = triage_pending_documents(artifact_root=str(tmp_path), client=client)
+    snippets = segment_and_classify_pending(artifact_root=str(tmp_path), client=client)
 
     assert len(client.calls) == 2
     assert set(snippets["accession_number"]) == {
@@ -779,7 +805,7 @@ def test_snippets_land_in_their_source_documents_partition(tmp_path: Path) -> No
         ],
     )
 
-    triage_pending_documents(
+    segment_and_classify_pending(
         artifact_root=str(tmp_path), client=FakeChatClient(keep_all=True)
     )
 
@@ -824,3 +850,182 @@ def test_windows_of_one_document_are_numbered_consecutively() -> None:
 
     assert [window.index for window in windows] == list(range(len(windows)))
     assert len(windows) > 1
+
+
+def test_segment_persists_window_spans_without_text(tmp_path: Path) -> None:
+    """The windows dataset is a segmentation: offsets and a digest, no text."""
+    _write_documents(
+        tmp_path,
+        [
+            _document_row(
+                tmp_path, submission=_submission(("6-K", f"<p>{DEBT_PROSE}</p>"))
+            )
+        ],
+    )
+
+    windows = segment_pending_sixk_documents(artifact_root=str(tmp_path))
+
+    assert list(windows.columns) == SIXK_WINDOW_COLUMNS
+    assert "text" not in windows.columns
+    assert len(windows) == 1
+    persisted = read_dataset(
+        dataset_root(SIXK_WINDOW_DATASET_NAME, artifact_root=str(tmp_path)),
+        columns=SIXK_WINDOW_COLUMNS,
+    )
+    assert len(persisted) == 1
+    assert (
+        len(load_completion_registry("sixk-segment", artifact_root=str(tmp_path))) == 1
+    )
+
+
+def test_segment_writes_nothing_for_a_filing_the_gate_rejects(tmp_path: Path) -> None:
+    """A filing with no debt vocabulary yields no window rows to store."""
+    _write_documents(
+        tmp_path,
+        [
+            _document_row(
+                tmp_path,
+                submission=_submission(
+                    ("6-K", "<p>A quarterly dividend of $0.10.</p>")
+                ),
+            )
+        ],
+    )
+
+    windows = segment_pending_sixk_documents(artifact_root=str(tmp_path))
+
+    assert windows.empty
+    assert (
+        list_artifacts(
+            dataset_root(SIXK_WINDOW_DATASET_NAME, artifact_root=str(tmp_path)),
+            suffix=".parquet",
+        )
+        == []
+    )
+    assert (
+        len(load_completion_registry("sixk-segment", artifact_root=str(tmp_path))) == 1
+    )
+
+
+def test_classify_holds_a_partition_whose_spans_no_longer_match_their_text(
+    tmp_path: Path,
+) -> None:
+    """Spans cut from different text are refused, and their partition stays pending."""
+    row = _document_row(
+        tmp_path, submission=_submission(("6-K", f"<p>{DEBT_PROSE}</p>"))
+    )
+    _write_documents(tmp_path, [row])
+    segment_pending_sixk_documents(artifact_root=str(tmp_path))
+    # The source text changes under the stored spans, as if the segmenter's
+    # flattening had changed between the two stages.
+    row["text"] = _submission(("6-K", f"<p>Revised. {DEBT_PROSE}</p>"))
+    _write_documents(tmp_path, [row])
+    client = FakeChatClient(keep_all=True)
+
+    with pytest.raises(StaleSegmentationError, match="cdt segment --genres 6-K"):
+        triage_pending_windows(artifact_root=str(tmp_path), client=client)
+
+    assert client.calls == []
+    assert list_artifacts(sixk_snippets_root(str(tmp_path)), suffix=".parquet") == []
+    # Recorded with no fingerprint, so it matches nothing and stays pending.
+    registry = load_completion_registry("sixk-classify", artifact_root=str(tmp_path))
+    assert [entry.fingerprint for entry in registry.values()] == [None]
+
+
+def test_a_filing_gated_out_on_resegment_cascades_to_its_mentions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An emptied windows partition is overwritten, so classify and extract follow.
+
+    Left in place, the old spans would fail the digest on every run; deleted,
+    nothing downstream would notice, and the snippet's mentions would stay
+    published. Overwritten empty, each stage sees a changed source partition
+    with no rows and drops what it derived from the old one.
+    """
+    from support import _fake_success_workflow
+
+    from cdt.extractor import extract_pending_items, mentions_root
+
+    row = _document_row(
+        tmp_path, submission=_submission(("6-K", f"<p>{DEBT_PROSE}</p>"))
+    )
+    _write_documents(tmp_path, [row])
+    segment_and_classify_pending(
+        artifact_root=str(tmp_path), client=FakeChatClient(keep_all=True)
+    )
+    _fake_success_workflow(monkeypatch)
+    extract_pending_items(artifact_root=str(tmp_path), client=None)
+    assert len(read_dataset(mentions_root(str(tmp_path)))) == 1
+
+    # The filing's text changes so the keyword gate now rejects it.
+    row["text"] = _submission(("6-K", "<p>A quarterly dividend of $0.10.</p>"))
+    _write_documents(tmp_path, [row])
+    segment_pending_sixk_documents(artifact_root=str(tmp_path))
+    client = FakeChatClient(keep_all=True)
+    triage_pending_windows(artifact_root=str(tmp_path), client=client)
+    extract_pending_items(artifact_root=str(tmp_path), client=None)
+
+    assert client.calls == []
+    windows_root = dataset_root(SIXK_WINDOW_DATASET_NAME, artifact_root=str(tmp_path))
+    assert read_dataset(windows_root, columns=SIXK_WINDOW_COLUMNS).empty
+    assert read_dataset(
+        sixk_snippets_root(str(tmp_path)), columns=SIXK_SNIPPET_COLUMNS
+    ).empty
+    assert read_dataset(mentions_root(str(tmp_path))).empty
+
+
+def test_a_forced_classify_that_holds_a_partition_leaves_it_pending(
+    tmp_path: Path,
+) -> None:
+    """The held entry matches nothing, so a later plain run retries the partition.
+
+    Under --force the registry starts empty, and the save merges onto the
+    stored shard: without a held entry, the earlier successful entry would
+    survive and mark the stale partition done.
+    """
+    row = _document_row(
+        tmp_path, submission=_submission(("6-K", f"<p>{DEBT_PROSE}</p>"))
+    )
+    _write_documents(tmp_path, [row])
+    segment_and_classify_pending(
+        artifact_root=str(tmp_path), client=FakeChatClient(keep_all=True)
+    )
+    # The text moves under the stored spans without a re-segment.
+    row["text"] = _submission(("6-K", f"<p>Revised. {DEBT_PROSE}</p>"))
+    _write_documents(tmp_path, [row])
+
+    with pytest.raises(StaleSegmentationError):
+        triage_pending_windows(
+            artifact_root=str(tmp_path),
+            force=True,
+            client=FakeChatClient(keep_all=True),
+        )
+    with pytest.raises(StaleSegmentationError):
+        triage_pending_windows(
+            artifact_root=str(tmp_path), client=FakeChatClient(keep_all=True)
+        )
+
+
+def test_a_partition_with_one_stale_filing_pays_for_no_stage_two_call(
+    tmp_path: Path,
+) -> None:
+    """The whole partition is held, so its good filing's call would be wasted."""
+    good = _document_row(
+        tmp_path, submission=_submission(("6-K", f"<p>{DEBT_PROSE}</p>"))
+    )
+    stale = _document_row(
+        tmp_path,
+        accession_number="000000000026000002",
+        submission=_submission(("6-K", f"<p>{DEBT_PROSE}</p>")),
+    )
+    _write_documents(tmp_path, [good, stale])
+    segment_pending_sixk_documents(artifact_root=str(tmp_path))
+    stale["text"] = _submission(("6-K", f"<p>Revised. {DEBT_PROSE}</p>"))
+    _write_documents(tmp_path, [good, stale])
+    client = FakeChatClient(keep_all=True)
+
+    with pytest.raises(StaleSegmentationError, match="cdt segment --genres 6-K"):
+        triage_pending_windows(artifact_root=str(tmp_path), client=client)
+
+    assert client.calls == []
+    assert list_artifacts(sixk_snippets_root(str(tmp_path)), suffix=".parquet") == []

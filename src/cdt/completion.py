@@ -428,6 +428,12 @@ def _save_registry_shard(
     raise RuntimeError(msg)
 
 
+#: How often a long stage saves its completion registry, on top of one save at
+#: the end: what an interruption can lose at most. A save is a few S3 requests;
+#: at this interval its cost is negligible next to the work it protects.
+CHECKPOINT_INTERVAL_SECONDS = 5 * 60
+
+
 def pending_source_partitions(
     stage_name: str,
     source_dataset: str,

@@ -269,15 +269,11 @@ Kind sets come from the *claims*, values from what *parsed*. Using the parsed su
 
 The function copies its input: it writes `amendment_of` onto the successor, and a caller passing `row_state.debt_instrument_mentions` directly would otherwise persist a minted pointer into `state.jsonl`.
 
-Runs at write time (`published_mention_rows`) and over existing partitions (`backfill_mentions`). Rows read back from parquet carry NaN where the writer had None, so every copied field is coerced, or a mint built at write time and one built by the backfill would hash differently.
+Runs at write time, through `published_mention_rows`. Every copied field is coerced, so a row that came back from parquet (NaN where the writer had None) mints the same hash as one built in memory.
 
 ### `published_mention_rows`
 
-The one seam between what the model returned for an item and what the pipeline writes. Every publish path (the live loop, the batch finalize, `extract_tables`, the `full.jsonl` audit record) goes through it, so the prior-state mint applies identically on every backend, including rows of an in-flight batch job whose IE postprocess ran under older code, while `state.jsonl` keeps only what the model returned. It takes no `counters`: the mint counters are read off `cdt backfill-mentions`, where the pre-registered yield is measured; a live-path counter should arrive with the manifest field that would carry it.
-
-### `backfill_mentions`
-
-Re-derives synthesized rows over existing partitions, so partitions written before the prior-state mint gain prior states with no re-extraction. `renew` extends the writer lease per rewritten partition: the job rewrites the whole canonical mentions dataset, and on a corpus that outlasts the lease TTL the next orchestrator tick would otherwise legitimately steal the lease and start extract/match into the same objects (#89).
+The one seam between what the model returned for an item and what the pipeline writes. Every publish path (the live loop, the batch finalize, `extract_tables`, the `full.jsonl` audit record) goes through it, so the prior-state mint applies identically on every backend, including rows of an in-flight batch job whose IE postprocess ran under older code, while `state.jsonl` keeps only what the model returned. It takes no `counters`; a live-path mint counter should arrive with the manifest field that would carry it.
 
 ## Writing mentions (live and batch backends)
 

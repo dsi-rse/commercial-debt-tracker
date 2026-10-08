@@ -148,11 +148,9 @@ def test_a_profile_set_by_an_earlier_test_does_not_leak_into_this_one() -> None:
     """Process-global profile state must not survive a test (#71).
 
     ``configure_s3_profile`` writes a module global and is called
-    unconditionally by ``cli.main`` and ``orchestrator.main``, which the suite
-    invokes for real dozens of times — and the orchestrator's flag defaults to
-    ``os.environ.get("AWS_PROFILE", "")``. Without the reset in the root
-    conftest, a developer or CI runner with AWS_PROFILE exported would hand
-    real credentials to every later test. The reset is infrastructure, so the
+    unconditionally by ``cli.main``, which the suite invokes for real dozens
+    of times. Without the reset in the root conftest, one test's profile would
+    reach every later test. The reset is infrastructure, so the
     only way to test it is to pollute deliberately and check the next test is
     clean.
     """
@@ -168,25 +166,41 @@ def test_cli_main_configures_the_profile_from_the_flag(
     seen: list[str | None] = []
     monkeypatch.setattr(cli, "configure_s3_profile", seen.append)
     monkeypatch.setattr(
-        cli, "build_parser", _parser_returning(aws_profile="analysis", exit_code=0)
+        cli,
+        "build_parser",
+        _parser_returning(
+            aws_profile="analysis", quiet=True, log_file=None, exit_code=0
+        ),
     )
 
     assert cli.main([]) == 0
     assert seen == ["analysis"]
 
 
-def test_cli_main_tolerates_a_subcommand_without_the_flag(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Most subcommands never grew an --aws-profile; they must still run."""
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["ingest"],
+        ["segment"],
+        ["classify"],
+        ["classify", "train", "--train-csv", "x.csv"],
+        ["extract"],
+        ["extract", "job", "show"],
+        ["extract", "job", "reset"],
+        ["match"],
+        ["publish"],
+        ["run", "daily"],
+        ["run", "historical", "--start-date", "2024-01-01", "--end-date", "2024-01-02"],
+        ["run", "poll"],
+    ],
+)
+def test_every_command_takes_the_profile_flag(argv: list[str]) -> None:
+    """The flag is honored for every command, so none falls back to ambient creds."""
     from cdt import cli
 
-    seen: list[str | None] = []
-    monkeypatch.setattr(cli, "configure_s3_profile", seen.append)
-    monkeypatch.setattr(cli, "build_parser", _parser_returning(exit_code=0))
+    args = cli.build_parser().parse_args([*argv, "--aws-profile", "analysis"])
 
-    assert cli.main([]) == 0
-    assert seen == [None]
+    assert args.aws_profile == "analysis"
 
 
 def _parser_returning(*, exit_code: int = 0, **attrs: object):  # noqa: ANN202

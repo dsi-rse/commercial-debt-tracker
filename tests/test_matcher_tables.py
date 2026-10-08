@@ -105,7 +105,7 @@ def test_match_pending_mentions_carries_lender_disclosure(tmp_path: Path) -> Non
         table=mention_rows,
     )
 
-    match_pending_mentions(artifact_root=tmp_path, batch_size=5)
+    match_pending_mentions(artifact_root=tmp_path)
 
     written_instruments = read_dataset(debt_instruments_root(tmp_path))
     assert written_instruments["lender_disclosure"].to_list() == ["collective_present"]
@@ -157,7 +157,7 @@ def test_match_reads_a_partition_written_before_a_json_column_existed(
     )
     assert not set(absent) & set(stored.columns)
 
-    tables = match_pending_mentions(artifact_root=tmp_path, batch_size=5)
+    tables = match_pending_mentions(artifact_root=tmp_path)
 
     assert tables["debt_instrument"]["debt_instrument_id"].to_list() == ["m-1"]
     # The literal text `nan` must not have reached a published payload.
@@ -222,7 +222,7 @@ def test_match_pending_mentions_writes_match_datasets(tmp_path: Path) -> None:
         table=mention_rows,
     )
 
-    tables = match_pending_mentions(artifact_root=tmp_path, batch_size=5)
+    tables = match_pending_mentions(artifact_root=tmp_path)
 
     written_matches = read_dataset(mention_cluster_edges_root(tmp_path))
     written_instruments = read_dataset(debt_instruments_root(tmp_path))
@@ -357,7 +357,7 @@ def _ordinal_chain_root(tmp_path: Path, **mention_overrides: object) -> Path:
         partition={"date": "2024-01-02", "shard": "0001"},
         table=rows,
     )
-    match_pending_mentions(artifact_root=tmp_path, batch_size=5)
+    match_pending_mentions(artifact_root=tmp_path)
     return tmp_path
 
 
@@ -447,7 +447,7 @@ def test_lineage_pass_never_reopens_an_extracted_pointer(tmp_path: Path) -> None
         partition={"date": "2024-01-02", "shard": "0001"},
         table=rows,
     )
-    match_pending_mentions(artifact_root=tmp_path, batch_size=5)
+    match_pending_mentions(artifact_root=tmp_path)
     before = _published_instruments(tmp_path)
     assert before["m-new"]["amendment_of_debt_instrument_id"] == "m-old"
     assert before["m-new"]["amendment_inferred_by"] is None
@@ -542,7 +542,7 @@ def test_lineage_inference_pass_writes_pointers_and_rederives_the_rollup(
         partition={"date": "2024-01-02", "shard": "0001"},
         table=rows,
     )
-    match_pending_mentions(artifact_root=tmp_path, batch_size=5)
+    match_pending_mentions(artifact_root=tmp_path)
     stats = apply_lineage_inference_pass(str(tmp_path))
 
     published = {
@@ -562,7 +562,7 @@ def test_lineage_inference_pass_writes_pointers_and_rederives_the_rollup(
 
     # An ordinary rematch keeps the pointer, so it must keep the provenance too:
     # a guess that reads as an extracted relation is worse than no guess (#184).
-    match_pending_mentions(artifact_root=tmp_path, batch_size=5)
+    match_pending_mentions(artifact_root=tmp_path)
     after = {
         str(row["debt_instrument_id"]): row
         for row in read_dataset(debt_instruments_root(tmp_path)).to_dict("records")
@@ -572,7 +572,7 @@ def test_lineage_inference_pass_writes_pointers_and_rederives_the_rollup(
     assert after["m-1"]["is_lineage_head"] is False
 
     # --force drops both together: no pointer, no stale provenance.
-    match_pending_mentions(artifact_root=tmp_path, batch_size=5, force=True)
+    match_pending_mentions(artifact_root=tmp_path, force=True)
     forced = {
         str(row["debt_instrument_id"]): row
         for row in read_dataset(debt_instruments_root(tmp_path)).to_dict("records")
@@ -620,7 +620,7 @@ def test_match_pending_mentions_drains_all_shards(tmp_path: Path) -> None:
         table=mention_rows.iloc[[1]],
     )
 
-    tables = match_pending_mentions(artifact_root=tmp_path, batch_size=1)
+    tables = match_pending_mentions(artifact_root=tmp_path)
 
     written_matches = read_dataset(mention_cluster_edges_root(tmp_path))
     written_instruments = read_dataset(debt_instruments_root(tmp_path))
@@ -676,7 +676,6 @@ def test_match_pending_mentions_force_rebuilds_existing_memberships(
 
     first = match_pending_mentions(
         artifact_root=tmp_path,
-        batch_size=5,
         strong_match_threshold=0.75,
         loose_match_threshold=0.75,
     )
@@ -689,7 +688,6 @@ def test_match_pending_mentions_force_rebuilds_existing_memberships(
 
     second = match_pending_mentions(
         artifact_root=tmp_path,
-        batch_size=5,
         force=True,
         strong_match_threshold=0.90,
         loose_match_threshold=0.75,
@@ -1286,9 +1284,7 @@ def test_match_pending_mentions_renews_lease_per_shard(tmp_path: Path) -> None:
         )
     renewals: list[int] = []
 
-    match_pending_mentions(
-        artifact_root=tmp_path, batch_size=5, renew=lambda: renewals.append(1)
-    )
+    match_pending_mentions(artifact_root=tmp_path, renew=lambda: renewals.append(1))
 
     assert len(renewals) == 2
 
@@ -1883,7 +1879,7 @@ def test_a_root_matched_under_an_older_schema_forces_a_full_rematch(
         partition={"date": "2024-01-02", "shard": "0001"},
         table=rows,
     )
-    match_pending_mentions(artifact_root=tmp_path, batch_size=5)
+    match_pending_mentions(artifact_root=tmp_path)
     apply_lineage_inference_pass(str(tmp_path))
 
     manifest_path = run_manifest_path("match", "latest", artifact_root=str(tmp_path))
@@ -1904,7 +1900,7 @@ def test_a_root_matched_under_an_older_schema_forces_a_full_rematch(
     # The plain call now behaves as `--force` does: the guessed pointer and its
     # provenance are dropped together rather than surviving into a corpus whose
     # identity has moved underneath them.
-    match_pending_mentions(artifact_root=tmp_path, batch_size=5)
+    match_pending_mentions(artifact_root=tmp_path)
     published = {
         str(row["debt_instrument_id"]): row
         for row in read_dataset(debt_instruments_root(tmp_path)).to_dict("records")

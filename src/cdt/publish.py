@@ -20,7 +20,7 @@ from cdt.matcher import (
 from cdt.matcher.lineage_inference import apply_lineage_inference_pass
 from cdt.matcher.schema import MATCHER_SCHEMA_VERSION
 from cdt.segmenter.core import ITEM_COLUMNS, items_root
-from cdt.shared import get_logger
+from cdt.shared import get_logger, log_stage_complete, log_stage_start
 from cdt.storage.columns import coerce_dataset_text
 from cdt.storage.objects import (
     ArtifactPath,
@@ -61,7 +61,7 @@ FINAL_OUTPUT_TABLE_FORM_TYPES: dict[str, tuple[str, ...]] = {
 
 
 # A table shrinking below this fraction of its published row count blocks the
-# publish unless forced.
+# publish unless ``force_publish``.
 FINAL_SNAPSHOT_GUARD_RATIO = 0.5
 
 
@@ -121,19 +121,19 @@ def publish_would_republish_nothing(
     artifact_root: ArtifactPath,
     final_database_root: ArtifactPath | None,
     data_dir: Path | None = None,
-    force: bool = False,
+    force_publish: bool = False,
     source_digest: str | None = None,
 ) -> bool:
     """Return whether the publish can be skipped because its sources are unchanged.
 
     True when there is no final database root, or when the pointer's recorded
     source digest equals the current one and every published table's
-    ``latest.parquet`` exists. False when ``force`` is set, the pointer or its
+    ``latest.parquet`` exists. False when ``force_publish`` is set, the pointer or its
     digest is missing, the digest differs, or a published table is missing.
     ``source_digest`` is the caller's ``publish_source_digest`` if already
     computed; None computes it here.
     """
-    if force:
+    if force_publish:
         return False
     if final_database_root is None:
         return True
@@ -170,14 +170,10 @@ def publish_would_republish_nothing(
     LOGGER.info(
         "Skipping final publish: no partition under the published datasets has "
         "changed since generation %s, so the published snapshot is already "
-        "current. Use --force to publish anyway.",
+        "current. Use --force-publish to publish anyway.",
         pointer.get("run_id", "unknown"),
     )
     return True
-
-
-def _ignore_stage(*args: object, **kwargs: object) -> None:
-    """Swallow a stage log line: only the orchestrator reports stages."""
 
 
 def finalize_after_match(
@@ -186,18 +182,17 @@ def finalize_after_match(
     artifact_root: ArtifactPath,
     final_database_root: ArtifactPath | None,
     data_dir: Path | None = None,
-    force: bool = False,
+    force_publish: bool = False,
     renew: Callable[[], None] | None = None,
-    log_stage_start: Callable[..., None] = _ignore_stage,
-    log_stage_complete: Callable[..., None] = _ignore_stage,
 ) -> dict[str, str]:
     """Run the lineage post-pass, then publish unless the gate says skip.
 
-    Every entry point that runs match and publishes must finish through here;
-    ``cdt match`` runs the lineage pass itself and does not publish. The lineage
+    Every whole run that matches and publishes finishes through here; ``cdt
+    match`` runs the lineage pass itself and ``cdt publish`` only publishes. The lineage
     pass is skipped when ``matched_instruments`` is empty. ``renew`` extends
     the caller's writer lease before each long step, so a stolen lease cannot
-    keep publishing.
+    keep publishing. Each step logs its ``Starting stage``/``Completed stage``
+    lines, whichever entry point called it.
 
     Returns:
         Published table name -> snapshot path; empty when nothing was published.
@@ -205,12 +200,38 @@ def finalize_after_match(
     if not matched_instruments.empty:
         if renew is not None:
             renew()
-        log_stage_start("infer-lineage")
+        log_stage_start(LOGGER, "infer-lineage")
         lineage_stats = apply_lineage_inference_pass(
             artifact_root, data_dir=data_dir, renew=renew
         )
-        log_stage_complete("infer-lineage", **lineage_stats)
-    log_stage_start("finalize", output_root=final_database_root)
+        log_stage_complete(LOGGER, "infer-lineage", **lineage_stats)
+    return publish_final_tables(
+        artifact_root=artifact_root,
+        final_database_root=final_database_root,
+        data_dir=data_dir,
+        force_publish=force_publish,
+        renew=renew,
+    )
+
+
+def publish_final_tables(
+    *,
+    artifact_root: ArtifactPath,
+    final_database_root: ArtifactPath | None,
+    data_dir: Path | None = None,
+    force_publish: bool = False,
+    renew: Callable[[], None] | None = None,
+) -> dict[str, str]:
+    """Publish the four final tables from the canonical datasets, unless the gate says skip.
+
+    Reads whatever ``match`` (and its lineage pass) last wrote; ``cdt publish``
+    calls this directly, every whole run through :func:`finalize_after_match`.
+    ``renew`` extends the caller's writer lease before the write.
+
+    Returns:
+        Published table name -> snapshot path; empty when nothing was published.
+    """
+    log_stage_start(LOGGER, "finalize", output_root=final_database_root)
     # After lineage (which writes debt-instruments), before the publish reads.
     source_digest = (
         None
@@ -221,10 +242,12 @@ def finalize_after_match(
         artifact_root=artifact_root,
         final_database_root=final_database_root,
         data_dir=data_dir,
-        force=force,
+        force_publish=force_publish,
         source_digest=source_digest,
     ):
-        log_stage_complete("finalize", tables=0, output_root=final_database_root)
+        log_stage_complete(
+            LOGGER, "finalize", tables=0, output_root=final_database_root
+        )
         return {}
     if renew is not None:
         renew()
@@ -232,11 +255,11 @@ def finalize_after_match(
         artifact_root=artifact_root,
         final_database_root=final_database_root,
         data_dir=data_dir,
-        force=force,
+        force_publish=force_publish,
         source_digest=source_digest,
     )
     log_stage_complete(
-        "finalize", tables=len(final_outputs), output_root=final_database_root
+        LOGGER, "finalize", tables=len(final_outputs), output_root=final_database_root
     )
     return final_outputs
 
@@ -256,7 +279,7 @@ def write_final_output_tables(
     artifact_root: ArtifactPath,
     final_database_root: ArtifactPath | None,
     data_dir: Path | None = None,
-    force: bool = False,
+    force_publish: bool = False,
     source_digest: str | None = None,
 ) -> dict[str, str]:
     """Publish the final tables as one generation behind an atomic pointer.
@@ -271,7 +294,7 @@ def write_final_output_tables(
         Published table name -> snapshot path.
 
     Raises:
-        ValueError: Unless ``force``, if a published table would shrink below
+        PublishGuardError: Unless ``force_publish``, if a published table would shrink below
             FINAL_SNAPSHOT_GUARD_RATIO of its current row count.
     """
     if final_database_root is None:
@@ -315,7 +338,7 @@ def write_final_output_tables(
         )
         is not None
     }
-    _guard_against_shrinkage(tables, previous_counts, force=force)
+    _guard_against_shrinkage(tables, previous_counts, force_publish=force_publish)
 
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     snapshots_root = final_snapshots_root(artifact_root)
@@ -412,12 +435,12 @@ def _guard_against_shrinkage(
     tables: dict[str, pd.DataFrame],
     previous_counts: dict[str, int],
     *,
-    force: bool,
+    force_publish: bool,
 ) -> None:
-    """Refuse to publish a table shrinking below the guard ratio, unless forced.
+    """Refuse to publish a table shrinking below the guard ratio, unless ``force_publish``.
 
     Raises:
-        ValueError: If any table regressed and ``force`` is False.
+        PublishGuardError: If any table regressed and ``force_publish`` is False.
     """
     regressions: list[str] = []
     for table_name, table in tables.items():
@@ -428,7 +451,7 @@ def _guard_against_shrinkage(
             regressions.append(f"{table_name}: {prior_rows} -> {len(table)} rows")
     if not regressions:
         return
-    if force:
+    if force_publish:
         LOGGER.warning(
             "Publishing snapshot despite row-count regressions (forced): %s",
             "; ".join(regressions),
@@ -437,9 +460,13 @@ def _guard_against_shrinkage(
     msg = (
         "Refusing to publish a final snapshot with large row-count regressions "
         f"({'; '.join(regressions)}). This usually means a bug or a half-built "
-        "artifact root; re-run with force=True to publish anyway."
+        "artifact root; re-run with --force-publish to publish anyway."
     )
-    raise ValueError(msg)
+    raise PublishGuardError(msg)
+
+
+class PublishGuardError(RuntimeError):
+    """The publish was refused because a table would shrink past the guard ratio."""
 
 
 def _prune_old_snapshots(snapshots_root: str, *, keep_run_ids: set[str]) -> None:

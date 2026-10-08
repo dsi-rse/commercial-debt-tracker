@@ -143,18 +143,9 @@ class FilingVerdict:
     error: str | None = None
 
 
-def default_model_dir(data_dir: Path | None = None) -> Path:
-    """Return the default stage-1 artifact directory, under ``DATA_DIR``.
-
-    Args:
-        data_dir: Root to resolve against; defaults to ``settings.DATA_DIR``.
-
-    Returns:
-        Directory expected to hold :data:`MODEL_FILENAME`.
-    """
-    return (
-        (data_dir or settings.DATA_DIR) / "models" / "sixk" / "stage1-tfidf-linear-svc"
-    )
+def default_model_dir() -> Path:
+    """Return the committed stage-1 artifact directory, holding :data:`MODEL_FILENAME`."""
+    return settings.MODELS_DIR / "sixk" / "stage1-tfidf-linear-svc"
 
 
 def load_stage1_model(

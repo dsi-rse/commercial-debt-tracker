@@ -273,10 +273,10 @@ def test_triage_keeps_everything_when_the_provider_fails() -> None:
     assert "provider down" in (verdict.error or "")
 
 
-def test_default_model_dir_sits_under_the_data_dir(tmp_path: Path) -> None:
-    """The stage-1 path derives from DATA_DIR, as the 8-K classifier's does."""
-    assert default_model_dir(tmp_path) == (
-        tmp_path / "models" / "sixk" / "stage1-tfidf-linear-svc"
+def test_default_model_dir_is_the_committed_artifact() -> None:
+    """The stage-1 path is the repo's, not DATA_DIR's, as the 8-K classifier's is."""
+    assert default_model_dir() == (
+        settings.PROJECT_ROOT / "data" / "models" / "sixk" / "stage1-tfidf-linear-svc"
     )
 
 
@@ -287,14 +287,8 @@ def test_load_stage1_model_reports_a_missing_artifact(tmp_path: Path) -> None:
 
 
 def test_shipped_artifact_loads_with_its_calibrated_threshold() -> None:
-    """The committed stage-1 artifact carries the threshold it was tuned with.
-
-    Reads the repo path directly: conftest points ``settings.DATA_DIR`` at a tmp
-    directory for every test, so ``default_model_dir()`` would not find it.
-    """
-    model, threshold = load_stage1_model(
-        default_model_dir(settings.PROJECT_ROOT / "data")
-    )
+    """The committed stage-1 artifact carries the threshold it was tuned with."""
+    model, threshold = load_stage1_model()
     assert threshold == DEFAULT_STAGE1_THRESHOLD
     assert hasattr(model, "decision_function")
 
@@ -433,3 +427,13 @@ def test_triage_retries_an_unrecognised_drop_reason() -> None:
     assert verdict.kept == ["s1"]
     assert verdict.dropped_no_details == ["s2"]
     assert "unrecognised reason" in client.calls[1][-1]["content"]
+
+
+def test_the_eight_k_default_model_dir_is_the_committed_artifact() -> None:
+    """The 8-K classifier resolves to the repo's model, not to DATA_DIR's."""
+    from cdt.classifier.core import default_model_dir as eightk_default_model_dir
+
+    assert eightk_default_model_dir() == (
+        settings.PROJECT_ROOT / "data" / "models" / "classifier" / "tfidf-linear-svc"
+    )
+    assert (eightk_default_model_dir() / "model.pkl").exists()

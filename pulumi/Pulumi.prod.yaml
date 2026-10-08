@@ -10,7 +10,9 @@ config:
   aws:region: us-east-2
   idi:artifact_prefix: processors/cdt
   idi:final_database_prefix: database/cdt
-  idi:default_cik_key: processors/cdt/inputs/ciks/beta-1k.txt
+  # Filers a run covers when no --cik-file is given: "all", or a bucket-relative
+  # CIK file. The beta runs on the beta list; prod moves to "all" at launch.
+  idi:cik_scope: processors/cdt/inputs/ciks/beta-1k.txt
   idi:cpu: "1024"
   idi:memory: "4096"
   idi:ecr_image_retention_count: "5"

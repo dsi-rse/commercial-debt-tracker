@@ -10,10 +10,10 @@ The deployed stack contains:
 - one ECS cluster and Fargate task definition
 - task execution and runtime IAM roles
 - a CloudWatch log group
-- two EventBridge Scheduler schedules: a daily `cdt-orchestrator daily` and an hourly `cdt-orchestrator poll`
+- two EventBridge Scheduler schedules: a daily `cdt run daily` and an hourly `cdt run poll`
 - SSM SecureString parameters holding `OPENAI_API_KEY` and `OPENROUTER_API_KEY` under `/idi/<env>/cdt/secrets/`
 
-The ECS task runs the `cdt-orchestrator` console script from [dockerfiles/Dockerfile.orchestrator](../dockerfiles/Dockerfile.orchestrator).
+The ECS task runs the `cdt` console script (the image's entrypoint) from [dockerfiles/Dockerfile.orchestrator](../dockerfiles/Dockerfile.orchestrator); its container is named `cdt`. The image and ECR repository keep the name `orchestrator`.
 
 ### Task role S3 scope
 
@@ -51,26 +51,31 @@ task definition:
 - `OPENAI_API_KEY`
 - `OPENROUTER_API_KEY`
 
-The daily scheduler target overrides the container command to `daily`, and the hourly
-poll scheduler target overrides it to `poll`. Scheduled production runs are therefore
+The daily scheduler target overrides the container command to `run daily`, and the hourly
+poll scheduler target overrides it to `run poll`. Scheduled production runs are therefore
 equivalent to:
 
 ```bash
-cdt-orchestrator daily   # daily schedule: prepare both genres + match/finalize, submits no extract
-cdt-orchestrator poll    # hourly schedule: advances the OpenAI batch extract job one step
+cdt run daily   # daily schedule: prepare both genres + match/publish, submits no extract
+cdt run poll    # hourly schedule: advances the OpenAI batch extract job one step
 ```
+
+Every `cdt` option defaults from its flag, then the environment variable above
+(`ARTIFACT_ROOT`, `FINAL_DATABASE_ROOT`, `BUCKET_NAME`, `CDT_DEFAULT_CIK_FILE`, and
+optionally `GENRES` and `EXTRACTOR_BACKEND`), then the built-in default.
 
 `daily` and `historical` both use the OpenAI batch extract backend by default and
 defer extraction to the poller — a historical backfill's classified items are claimed
 by the next poll tick. Historical runs are never scheduled automatically. Pass
-`--extractor-backend live` (before the mode) for the synchronous OpenRouter pipeline
+`--extractor-backend live` for the synchronous OpenRouter pipeline
 that extracts within the run itself.
 
 ### The 6-K chain
 
 Every `daily` and `historical` run prepares both filing genres (the hourly `poll`
-run only advances the batch extract job): 8-K (ingest → itemize → classify) and
-6-K (ingest → sixk triage), for the one CIK list the run is given. The task definition sets none of the 6-K settings, so
+run only advances the batch extract job), each as ingest → segment → classify, for
+the one CIK list the run is given. For 6-K, segment writes window spans and
+classify is the two-stage triage. The task definition sets none of the 6-K settings, so
 the defaults below are what runs in production. Each can be set as an environment
 variable on the task, or passed as the matching flag.
 
@@ -81,7 +86,7 @@ variable on the task, or passed as the matching flag.
 | `SIXK_TRIAGE_MODEL` | `openai/gpt-5.6-luna` | Stage-2 model, as an OpenRouter slug. |
 | `SIXK_TRIAGE_REASONING` | `none` | Stage-2 reasoning effort. |
 
-**Cost:** unlike the 8-K prepare chain, 6-K triage is not free. The `daily` run makes one
+**Cost:** unlike the 8-K prepare chain, 6-K classify is not free. The `daily` run makes one
 synchronous LLM call per 6-K filing that has windows admitted by the local stage-1 model.
 That call is billed to the triage provider's account, outside the OpenAI batch discount.
 See [sixk-two-stage-triage.md](sixk-two-stage-triage.md) for measured cost per filing.
@@ -89,7 +94,7 @@ Set `GENRES=8-K` to turn the chain off.
 
 ## CI/CD Flow
 
-GitHub Actions defines three operational workflows. The first two are thin callers
+GitHub Actions defines two operational workflows, both thin callers
 of the shared compositions in
 [dsi-rse/idi-ftm2j-shared](https://github.com/dsi-rse/idi-ftm2j-shared), pinned to
 an exact release tag; upgrading the pipeline means bumping that one `@vX.Y.Z` pin.
@@ -148,7 +153,13 @@ launch — no deploy needed. Both keys also belong in the Core Facility Bitwarde
 **Committed `idi:` config** in `pulumi/Pulumi.dev.yaml` and `pulumi/Pulumi.prod.yaml`.
 Required:
 
-- `default_cik_key` — bucket-relative key of the default CIK universe
+- `cik_scope`: what a run covers when no `--cik-file` is given. Either the
+  bucket-relative key of a one-CIK-per-line file, or `all` for every filer.
+  It is required, so a stack can never default to `all` by omission. During
+  the beta both stacks use `processors/cdt/inputs/ciks/beta-1k.txt`. At the
+  production launch prod moves to `all` and dev keeps a beta list; after
+  that the beta lists can be deleted from S3, because nothing in the code
+  names them.
 
 Optional:
 
@@ -174,8 +185,9 @@ Optional:
   that notify nobody)
 
 CDT does not publish Cloudflare R2 JSON, and no longer carries R2 config: it writes
-final parquet snapshots under `final_database_prefix`, and the publisher stack in
-`../commercial-debt-tracker-dashboard` reads those and updates R2.
+final parquet snapshots under `final_database_prefix`, and the website publisher
+([dsi-rse/commercial-debt-tracker-website](https://github.com/dsi-rse/commercial-debt-tracker-website))
+reads those and updates R2.
 
 The container's ingest source bucket is the SSM `processor_bucket_name` value. The
 artifact and final-database roots are derived:
@@ -185,17 +197,19 @@ s3://<output_bucket_name or processor bucket>/<artifact_prefix>
 s3://<output_bucket_name or processor bucket>/<final_database_prefix>
 ```
 
-and the default CIK file is `s3://<processor bucket>/<default_cik_key>`.
+and the default CIK file (`CDT_DEFAULT_CIK_FILE` on the task) is
+`s3://<processor bucket>/<cik_scope>`, or `all` when `cik_scope` is `all`. The task
+role gets a read grant on that one file, and none when the scope is `all`.
 
 ## Daily Operations
 
 Normal daily processing is:
 
 1. GitHub deploys code and infrastructure
-2. the daily EventBridge Scheduler runs one ECS task that executes `cdt-orchestrator daily`:
-   ingest → itemize → classify, then match + finalize on existing mentions. It submits no
-   extract batch itself.
-3. the hourly EventBridge Scheduler runs `cdt-orchestrator poll`, which starts an OpenAI
+2. the daily EventBridge Scheduler runs one ECS task that executes `cdt run daily`:
+   ingest → segment → classify for both genres over the 5 filing dates ending yesterday,
+   then match + publish on existing mentions. It submits no extract batch itself.
+3. the hourly EventBridge Scheduler runs `cdt run poll`, which starts an OpenAI
    batch extract job when classified work is pending and advances it one step per tick
    (extraction can span multiple hours/days per its 24h batch windows)
 4. when an extract job completes, that poll tick writes new `mentions` partitions and
@@ -211,7 +225,7 @@ Normal daily processing is:
    object is individually atomic but the set is not consistent mid-publish. A publish
    that would shrink a table below half its prior row count (or empty it) is refused
    unless forced. Only the current and prior generations are retained.
-6. the dashboard publisher in `../commercial-debt-tracker-dashboard` reads the final
+6. the website publisher ([dsi-rse/commercial-debt-tracker-website](https://github.com/dsi-rse/commercial-debt-tracker-website)) reads the final
    database root's parquet and publishes `generated/*` JSON to R2; if it needs
    cross-table consistency, it should resolve the `latest.json` pointer instead.
 
@@ -219,17 +233,34 @@ Because extraction is asynchronous, final snapshots for a given filing date can 
 daily run by up to a few days. The daily run still refreshes match/final outputs from
 whatever mentions already exist, so previously extracted instruments stay current.
 
-Local note:
-
-- `cdt pipeline` does not read `FINAL_DATABASE_ROOT`; pass `--final-database-root` to write final snapshots from that CLI.
-- `cdt-orchestrator` reads `FINAL_DATABASE_ROOT`, and also accepts `--final-database-root` as a top-level option before `daily` or `historical`.
+Local note: `cdt run` and `cdt publish` read `FINAL_DATABASE_ROOT`, or take
+`--final-database-root`; without either, nothing is published.
 
 The scheduler state is controlled by the Pulumi `idi:schedule_enabled` setting
-(`idi:poll_schedule_enabled` overrides it for the poll schedule alone).
+(`idi:poll_schedule_enabled` overrides it for the poll schedule alone). As
+committed, the daily schedule is disabled in both stacks and the hourly poll is
+enabled in `dev` only (`pulumi/Pulumi.<stack>.yaml`); check those before
+assuming a scheduled run happened.
 
-`--force` on a batch-backend `daily`/`historical` run applies to the prepare and
-match/finalize stages only; to force a re-extract, run a poll tick with
-`--force` while no job is active.
+### Run-time limits and batch tuning
+
+These flags are rarely needed; the defaults are what the schedules use.
+
+| Flag | Applies to | Default | What it bounds |
+|---|---|---|---|
+| `--max-runtime-hours` | `cdt run daily\|historical\|poll` | poll 2, daily 12, historical 72 | Wall-clock deadline. Past it the runtime watchdog exits the task with code 70, without releasing the lease (its TTL recovers it). |
+| `--max-rows-per-job` | `cdt run poll`, `cdt extract` (batch) | 10,000 | Rows one batch extract job may claim, so the job's state fits the poll task's memory. Pending rows beyond it wait for the next job. |
+| `--max-requests-per-batch` | `cdt run poll`, `cdt extract` (batch) | 40,000 | Requests per OpenAI batch input file. |
+| `--max-batch-bytes` | `cdt run poll`, `cdt extract` (batch) | 100 MiB | Bytes per OpenAI batch input file. |
+| `--flush-rows` (`ingest`), `--ingest-flush-rows` (`cdt run daily\|historical`) | ingest | 100 | Document rows buffered before each partition write; each write rewrites the partitions its rows land in. |
+| `--max-attempts` | `cdt run poll`, `cdt extract`, `cdt run daily\|historical` (live backend only) | 3 | Scored attempts per extractor stage per row. Under the batch backend, `cdt run daily\|historical` warns that it ignores this, `--model` and `--reasoning-effort`: extraction happens in `cdt run poll`. |
+
+`--force` reprocesses partitions the completion registries already record. On a
+batch-backend `daily`/`historical` run it applies to the prepare and match stages
+only; to force a re-extract, run `cdt run poll --force` while no job is active.
+`--force` never lowers the publish guards. To publish when no source changed, or
+past the shrinkage guard (a table falling below half its published rows), pass
+`--force-publish`, on `cdt publish` or any `cdt run` mode.
 
 ## Monitoring and Response
 
@@ -241,13 +272,13 @@ alarm means and what to do:
 |---|---|---|
 | `*-poll-liveness` | No poll tick completed for 6h; extraction is stalled. | Check the poll schedule state and the latest task logs; a wedged holder shows up as repeated `locked` ticks. |
 | `*-daily-heartbeat` | No `daily` run completed for 24h. A run where one genre's prepare chain failed still publishes the others but counts as not completed (it exits nonzero without the heartbeat line). | Check the daily schedule, the task-failure alerts, and the scheduler DLQ. Search the task log for `Genre prepare failed` to see whether one genre failed. |
-| `*-task-failures` | An ECS task exited nonzero or failed to start (includes OOM kills, exit 137). | Read the task's log stream; OOM usually means a backfill outgrew `idi:memory`. |
-| `*-job-stall` | The active extract job has run ~4 days of ticks without finishing; it blocks all newer filings. | `cdt show-extract-job`; if genuinely wedged, `cdt reset-extract-job --yes` (abandons in-flight batches). |
+| `*-task-failures` | An ECS task exited nonzero or failed to start (includes OOM kills, exit 137, and the runtime watchdog's exit 70: a run past its deadline of 2h poll, 12h daily, 72h historical). | Read the task's log stream; OOM usually means a backfill outgrew `idi:memory`; exit 70 logs `Runtime watchdog expired` — find what the run was stuck on, or split a long historical run. |
+| `*-job-stall` | The active extract job has run ~4 days of ticks without finishing; it blocks all newer filings. | `cdt extract job show`; if genuinely wedged, `cdt extract job reset --yes` (abandons in-flight batches). |
 | `*-lease-theft` | A run died (or overran its TTL) still holding the writer lease. | Find the previous holder's logs; its partial work is recomputed by the next run, but check why it died. |
 | `*-dlq-depth` | The shared scheduler DLQ has messages: a RunTask invocation failed after retries. | Inspect the queue; the message may belong to another processor sharing the DLQ. |
 
 The log-literal → metric-filter couplings ("Poll tick complete",
-"Orchestrator run complete: mode=daily", "Extract job stalled", "Stole lease")
+"Run complete: mode=daily", "Extract job stalled", "Stole lease")
 are annotated at both ends; change them together.
 
 ## Historical Backfills
@@ -280,6 +311,9 @@ run-task` pattern the script wraps.
 - Treat the configured default CIK file as the environment's normal run scope.
 - Use a smaller CIK file and narrow date range for first backfills.
 - Prefer `--force` only when intentionally recomputing existing partitions.
+- Reserve `--force-publish` for a deliberate overwrite of the published tables,
+  after checking why the shrinkage guard refused; `run-historical.sh` never
+  passes it.
 
 ## Prod Launch Checklist
 
@@ -293,7 +327,8 @@ launch day — but do it in order then.
    `/idi/prod/shared/dlq_name`; `pulumi-bootstrap` provisions the prod OIDC
    deploy-role pair; the `prod` GitHub environment gets `AWS_ROLE_ARN_DEPLOY`
    and `PULUMI_CONFIG_PASSPHRASE`.
-2. **Initialize the stack**: `make infra-login`, then
+2. **Initialize the stack**: `make infra-login PULUMI_STACK=prod` (each stack
+   has its own state bucket, `idi-ftm2j-<stack>-pulumi-state`), then
    `pulumi stack init prod` (creates the stack record and the
    `encryptionsalt` — until this runs, any prod deploy dies at
    `pulumi stack select prod`). Creates no AWS resources.
@@ -320,6 +355,11 @@ launch day — but do it in order then.
    watch a few ticks (the poller alone drains extraction), then
    `idi:schedule_enabled: "true"` for the daily run. Confirm the poll-liveness
    and daily-heartbeat alarms settle into OK.
+8. **Leave the beta scope**: when prod should cover every filer, set
+   `idi:cik_scope: all` in `Pulumi.prod.yaml` and deploy. The task then reads
+   no CIK file and loses its read grant on the beta list. Size the first run
+   on all filers deliberately: run a bounded `run-historical.sh` backfill
+   first rather than letting the daily schedule discover the new scope.
 
 ## Dev First-Deploy Walkthrough
 

@@ -249,7 +249,7 @@ def test_extract_writes_both_genres_mentions_into_one_partition(
     _write_snippets(tmp_path)
     _stub_workflow(monkeypatch)
 
-    mentions = extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+    mentions = extract_pending_items(artifact_root=tmp_path, client=None)
 
     written = read_dataset(mentions_root(tmp_path))
     assert sorted(written["item_id"].astype(str)) == sorted(
@@ -290,7 +290,7 @@ def test_a_regrouped_snippet_is_re_extracted_and_its_retired_mentions_pruned(
         ),
     )
     _stub_workflow(monkeypatch)
-    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+    extract_pending_items(artifact_root=tmp_path, client=None)
 
     before = read_dataset(mentions_root(tmp_path))
     assert sorted(before["item_id"].astype(str)) == sorted(
@@ -308,7 +308,7 @@ def test_a_regrouped_snippet_is_re_extracted_and_its_retired_mentions_pruned(
         ),
     )
 
-    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+    extract_pending_items(artifact_root=tmp_path, client=None)
 
     written = read_dataset(mentions_root(tmp_path))
     item_ids = sorted(written["item_id"].astype(str))
@@ -334,7 +334,7 @@ def test_a_snippet_that_stops_being_relevant_loses_its_mentions(
     _write_classifications(tmp_path)
     _write_snippets(tmp_path)
     _stub_workflow(monkeypatch)
-    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+    extract_pending_items(artifact_root=tmp_path, client=None)
     assert SIXK_ITEM_ID in set(read_dataset(mentions_root(tmp_path))["item_id"])
 
     dropped = _snippet_row(SIXK_ITEM_ID, SIXK_ACCESSION)
@@ -347,7 +347,7 @@ def test_a_snippet_that_stops_being_relevant_loses_its_mentions(
         table=pd.DataFrame([dropped], columns=SIXK_SNIPPET_COLUMNS),
     )
 
-    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+    extract_pending_items(artifact_root=tmp_path, client=None)
 
     written = read_dataset(mentions_root(tmp_path))
     assert sorted(written["item_id"].astype(str)) == [EIGHTK_ITEM_ID]
@@ -366,7 +366,7 @@ def test_new_snippets_merge_without_dropping_the_other_genres_mentions(
     _write_classifications(tmp_path)
     _write_snippets(tmp_path)
     _stub_workflow(monkeypatch)
-    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+    extract_pending_items(artifact_root=tmp_path, client=None)
 
     # Ingest merged another 6-K filing into the source documents partition, so
     # the triage stage rewrote this snippets partition with an extra row.
@@ -384,7 +384,7 @@ def test_new_snippets_merge_without_dropping_the_other_genres_mentions(
         ),
     )
 
-    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+    extract_pending_items(artifact_root=tmp_path, client=None)
 
     written = read_dataset(mentions_root(tmp_path))
     assert sorted(written["item_id"].astype(str)) == sorted(
@@ -433,7 +433,7 @@ def test_a_still_relevant_item_re_extracted_to_zero_mentions_is_purged(
     """
     _write_classifications(tmp_path)
     _stub_workflow(monkeypatch)
-    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+    extract_pending_items(artifact_root=tmp_path, client=None)
     assert read_dataset(mentions_root(tmp_path))["item_id"].astype(str).to_list() == [
         EIGHTK_ITEM_ID
     ]
@@ -442,7 +442,7 @@ def test_a_still_relevant_item_re_extracted_to_zero_mentions_is_purged(
     # makes extract claim an item it has already completed, so the leak is only
     # reachable this way -- and `force` is also what empties `done_item_ids`.
     _stub_workflow_with_no_mentions(monkeypatch)
-    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None, force=True)
+    extract_pending_items(artifact_root=tmp_path, client=None, force=True)
 
     written = read_dataset(mentions_root(tmp_path))
     assert written.empty, f"stale mentions survived: {written['item_id'].to_list()}"

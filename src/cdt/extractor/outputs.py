@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Self, cast
@@ -24,14 +23,13 @@ from cdt.datasets import (
     dataset_root,
     date_shard_partition_path,
     extractor_run_path,
-    iter_date_shard_partitions,
     load_row_failures,
     parse_date_shard_partition,
     resolve_artifact_root,
     run_manifest_path,
     save_row_failures,
 )
-from cdt.extractor.prior_state import mint_prior_state_rows, published_mention_rows
+from cdt.extractor.prior_state import published_mention_rows
 from cdt.extractor.schema import DEBT_INSTRUMENT_MENTION_COLUMNS
 from cdt.extractor.stages import EXTRACTOR_STAGES
 from cdt.extractor.state import (
@@ -41,9 +39,9 @@ from cdt.extractor.state import (
     coerce_native,
 )
 from cdt.shared import get_logger
-from cdt.storage.columns import coerce_dataset_text
 from cdt.storage.objects import (
     artifact_exists,
+    join_artifact_path,
     list_artifacts_with_versions,
     write_json_artifact,
     write_text_artifact,
@@ -234,66 +232,6 @@ def collect_pending_extract_items(
     return entries, claimed
 
 
-def backfill_mentions(
-    artifact_root: str | Path | None = None,
-    *,
-    data_dir: Path | None = None,
-    dry_run: bool = False,
-    renew: Callable[[], None] | None = None,
-) -> dict[str, int]:
-    """Re-derive the synthesized rows over every existing `mentions` partition.
-
-    Drops the rows an earlier run synthesized, clears the pointers that named
-    them, and mints again from the model-emitted rows, with no model call;
-    running it twice is a no-op. Returns the mint counters plus `partitions`
-    and `partitions_rewritten`; `dry_run` counts without rewriting.
-
-    ``renew`` is called before each partition rewrite to extend the caller's
-    writer lease, since rewriting the whole dataset can outlast the lease TTL.
-    A dry run writes nothing and never calls it.
-    """
-    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
-    counts: dict[str, int] = {"partitions": 0, "partitions_rewritten": 0}
-    for path in iter_date_shard_partitions(
-        MENTIONS_DATASET_NAME, artifact_root=resolved_root, data_dir=data_dir
-    ):
-        table = read_table(path)
-        if table.empty:
-            continue
-        counts["partitions"] += 1
-        records = table.to_dict("records")
-        synthesized_ids = {
-            coerce_dataset_text(record.get("debt_instrument_mention_id"))
-            for record in records
-            if coerce_dataset_text(record.get("synthesized_by")) is not None
-        }
-        real: dict[str, list[dict[str, object]]] = {}
-        for record in records:
-            if coerce_dataset_text(record.get("synthesized_by")) is not None:
-                continue
-            if coerce_dataset_text(record.get("amendment_of")) in synthesized_ids:
-                record["amendment_of"] = None
-            real.setdefault(
-                coerce_dataset_text(record.get("item_id")) or "", []
-            ).append(record)
-        published: list[dict[str, object]] = []
-        for item_rows in real.values():
-            published.extend(mint_prior_state_rows(item_rows, counts))
-        if dry_run:
-            continue
-        if renew is not None:
-            renew()
-        partition = parse_date_shard_partition(path)
-        write_partition_table(
-            mentions_root(resolved_root, data_dir=data_dir),
-            partition={"date": partition["date"], "shard": partition["shard"]},
-            table=pd.DataFrame(published, columns=DEBT_INSTRUMENT_MENTION_COLUMNS),
-        )
-        counts["partitions_rewritten"] += 1
-    LOGGER.info("Mentions backfill%s: %s", " (dry run)" if dry_run else "", counts)
-    return counts
-
-
 def summarize_failure(row_state: ExtractionRowState) -> str:
     """Summarize what this row lost, for its failure-registry entry.
 
@@ -482,16 +420,16 @@ def write_run_records(
     added here. Returns the audit path, the failure-registry path and the
     failure registry's total entry count.
     """
-    save_completion_registry(
-        "extract", registry, artifact_root=artifact_root, data_dir=data_dir
-    )
-    # The registry now marks these rows done for good, so record the ones that
-    # produced nothing before that fact is only visible in the audit log.
+    # Failures first: once the registry marks a row done it is never retried,
+    # so a row that produced nothing must already be on record when it does.
     failure_registry, total_known_failures = merge_row_failures(
         outcomes.failed_rows,
         outcomes.succeeded_item_ids,
         artifact_root=artifact_root,
         data_dir=data_dir,
+    )
+    save_completion_registry(
+        "extract", registry, artifact_root=artifact_root, data_dir=data_dir
     )
     audit_path = extractor_run_path(
         outcomes.run_id, artifact_root=artifact_root, data_dir=data_dir
@@ -517,6 +455,56 @@ def write_run_records(
         },
     )
     return audit_path, failure_registry, total_known_failures
+
+
+def checkpoint_audit_path(
+    run_id: str, index: int, *, artifact_root: str, data_dir: Path | None
+) -> str:
+    """Return the path of one checkpoint's audit records, beside ``full.jsonl``."""
+    return join_artifact_path(
+        resolve_artifact_root(artifact_root, data_dir=data_dir),
+        "extractor-runs",
+        f"run_id={run_id}",
+        f"checkpoint-{index:04d}.jsonl",
+    )
+
+
+def write_run_checkpoint(
+    outcomes: RowOutcomes,
+    registry: CompletionRegistry,
+    *,
+    artifact_root: str,
+    data_dir: Path | None,
+    index: int,
+    audit_offset: int,
+) -> int:
+    """Persist what a running extract has finished so far; return the new audit offset.
+
+    Writes the audit records from ``audit_offset`` on to checkpoint ``index``'s
+    file, merges the failures so far, then saves the registry: a row the
+    registry marks done already has its audit record and, if it failed, its
+    failure record. The run's final :func:`write_run_records` writes
+    ``full.jsonl``, after which its caller deletes the checkpoint files; a run
+    that never got that far leaves them as its audit.
+    """
+    records = outcomes.audit_records[audit_offset:]
+    if records:
+        write_text_artifact(
+            checkpoint_audit_path(
+                outcomes.run_id, index, artifact_root=artifact_root, data_dir=data_dir
+            ),
+            "\n".join(records) + "\n",
+        )
+    merge_row_failures(
+        outcomes.failed_rows,
+        outcomes.succeeded_item_ids,
+        artifact_root=artifact_root,
+        data_dir=data_dir,
+    )
+    save_completion_registry(
+        "extract", registry, artifact_root=artifact_root, data_dir=data_dir
+    )
+    return len(outcomes.audit_records)
 
 
 def finalize_extract_outputs(

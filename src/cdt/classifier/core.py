@@ -50,11 +50,9 @@ class SupportsFit(Protocol):
         """Fit the estimator."""
 
 
-def default_model_dir(data_dir: Path | None = None) -> Path:
-    """Return the default model artifact directory."""
-    return (
-        (data_dir or settings.DATA_DIR) / "models" / "classifier" / "tfidf-linear-svc"
-    )
+def default_model_dir() -> Path:
+    """Return the committed 8-K classifier artifact directory."""
+    return settings.MODELS_DIR / "classifier" / "tfidf-linear-svc"
 
 
 def classifications_root(

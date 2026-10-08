@@ -1,4 +1,4 @@
-"""Tests for extraction runs end to end: backfill, partition growth and finalize."""
+"""Tests for extraction runs end to end: checkpoints, partition growth and finalize."""
 
 from __future__ import annotations
 
@@ -15,95 +15,11 @@ from support import (
 
 from cdt.classifier.core import classifications_root
 from cdt.extractor import extract_pending_items, mentions_root
-from cdt.extractor.schema import DEBT_INSTRUMENT_MENTION_COLUMNS
 from cdt.extractor.state import ExtractionRowState
 from cdt.storage.tables import (
     read_dataset,
     write_partition_table,
 )
-
-
-def test_backfill_mints_over_existing_partitions_and_is_a_no_op_twice(
-    tmp_path: Path,
-) -> None:
-    """A partition written before #203 gains its prior states, once."""
-    from cdt.extractor.outputs import backfill_mentions
-    from cdt.extractor.prior_state import published_mention_rows
-    from cdt.extractor.state import ExtractionRowState
-
-    successor = amended_row()
-    write_partition_table(
-        tmp_path / "mentions",
-        partition={"date": "2024-06-01", "shard": "0001"},
-        table=pd.DataFrame([successor], columns=DEBT_INSTRUMENT_MENTION_COLUMNS),
-    )
-
-    dry = backfill_mentions(tmp_path, dry_run=True)
-    assert dry == {"partitions": 1, "partitions_rewritten": 0, "minted": 1}
-    assert len(read_dataset(tmp_path / "mentions")) == 1
-
-    first = backfill_mentions(tmp_path)
-    assert first == {"partitions": 1, "partitions_rewritten": 1, "minted": 1}
-    published = read_dataset(tmp_path / "mentions").sort_values(
-        "debt_instrument_mention_id"
-    )
-    assert len(published) == 2
-    assert published["synthesized_by"].notna().sum() == 1
-
-    second = backfill_mentions(tmp_path)
-    assert second["minted"] == 1
-    again = read_dataset(tmp_path / "mentions").sort_values(
-        "debt_instrument_mention_id"
-    )
-    pd.testing.assert_frame_equal(
-        published.reset_index(drop=True), again.reset_index(drop=True)
-    )
-
-    # A mint built at write time and one built from the parquet round trip
-    # must be the same row: parquet reads None back as NaN, and every copied
-    # field is coerced so the hash does not notice.
-    row_state = ExtractionRowState(
-        item_row={"item_id": "item-1"}, stage_name="instrument_ie"
-    )
-    row_state.debt_instrument_mentions = [successor]
-    write_time = {
-        r["debt_instrument_mention_id"] for r in published_mention_rows(row_state)
-    }
-    assert write_time == set(published["debt_instrument_mention_id"])
-
-
-def test_backfill_renews_the_writer_lease_once_per_rewritten_partition(
-    tmp_path: Path,
-) -> None:
-    """A whole-dataset rewrite must keep renewing, or it outlives its lease.
-
-    The CLI hands `backfill_mentions` a renewal callback, and a test pins that
-    it does. Nothing pinned that the function ever calls it: deleting the
-    `renew()` block left the whole suite green, so the #89 guard could be
-    removed without a single failure. Same shape as the seams this branch
-    exists to close — both halves pinned, the connection not (#211).
-    """
-    from cdt.extractor.outputs import backfill_mentions
-
-    for date, mention_id in (("2024-06-01", "m-june"), ("2024-07-01", "m-july")):
-        write_partition_table(
-            tmp_path / "mentions",
-            partition={"date": date, "shard": "0001"},
-            table=pd.DataFrame(
-                [amended_row(mention_id)], columns=DEBT_INSTRUMENT_MENTION_COLUMNS
-            ),
-        )
-
-    # A dry run writes nothing, so it takes no lease and must not renew one.
-    renewals: list[int] = []
-    dry = backfill_mentions(tmp_path, dry_run=True, renew=lambda: renewals.append(1))
-    assert dry["partitions_rewritten"] == 0
-    assert renewals == []
-
-    counts = backfill_mentions(tmp_path, renew=lambda: renewals.append(1))
-
-    assert counts["partitions_rewritten"] == 2
-    assert len(renewals) == counts["partitions_rewritten"]
 
 
 def test_late_arriving_rows_extract_after_partition_grows(
@@ -113,12 +29,12 @@ def test_late_arriving_rows_extract_after_partition_grows(
     _seed_classifications(tmp_path, ["a-8-01"])
     calls = _fake_success_workflow(monkeypatch)
 
-    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+    extract_pending_items(artifact_root=tmp_path, client=None)
     assert calls == ["a-8-01"]
 
     # Ingest-style in-place merge: the partition object grows a new row.
     _seed_classifications(tmp_path, ["a-8-01", "b-8-01"])
-    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+    extract_pending_items(artifact_root=tmp_path, client=None)
 
     # Only the new row is paid for, and the target holds both rows' mentions.
     assert calls == ["a-8-01", "b-8-01"]
@@ -422,18 +338,18 @@ def test_the_live_run_manifest_records_its_fields(
         return row_state
 
     monkeypatch.setattr("cdt.extractor.live.run_extraction_workflow", fake_workflow)
-    extract_pending_items(artifact_root=tmp_path, batch_size=5, client=None)
+    extract_pending_items(artifact_root=tmp_path, client=None)
 
     (manifest_path,) = (tmp_path / "runs" / "extract").glob("run_id=*.json")
     manifest = json.loads(manifest_path.read_text())
     assert set(manifest) == _SHARED_MANIFEST_KEYS | {
-        "batch_size",
         "force",
         "model",
         "reasoning_effort",
         "max_attempts",
         "partitions_visited",
         "aborted_on_infrastructure_error",
+        "checkpoints",
     }
     assert manifest["stage"] == "extract"
     assert manifest["failure_count"] == 1
@@ -475,3 +391,271 @@ def test_the_batch_run_manifest_records_its_fields(tmp_path: Path) -> None:
     assert manifest["failure_count"] == 0
     assert len(manifest["partitions_written"]) == 1
     assert manifest["empty_partitions_skipped_from_write"] == 0
+
+
+def test_a_live_run_renews_its_lease_per_item(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One LLM call at a time outlives the TTL, so the hook runs per item.
+
+    The hook is throttled inside the stage; the stub here makes every call
+    renew, so the count is the number of times the stage asked.
+    """
+    _seed_classifications(tmp_path, ["a-8-01", "b-8-01"])
+    _fake_success_workflow(monkeypatch)
+    monkeypatch.setattr("cdt.extractor.live.throttled", lambda renew: renew)
+    renewals: list[int] = []
+
+    extract_pending_items(
+        artifact_root=tmp_path, client=None, renew=lambda: renewals.append(1)
+    )
+
+    # Before each of the two items, and before the partition write.
+    assert len(renewals) == 3
+
+
+def test_a_live_run_that_loses_its_lease_writes_no_mentions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stolen lease stops the run before its next model call or write."""
+    from cdt.lease import LeaseLostError
+
+    _seed_classifications(tmp_path, ["a-8-01"])
+    calls = _fake_success_workflow(monkeypatch)
+
+    def lost() -> None:
+        raise LeaseLostError("stolen")
+
+    with pytest.raises(LeaseLostError):
+        extract_pending_items(artifact_root=tmp_path, client=None, renew=lost)
+
+    assert calls == []
+    assert not (tmp_path / "mentions").exists()
+
+
+def _commit_after_every_item(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Advance the live backend's clock a full interval per reading."""
+    from cdt.completion import CHECKPOINT_INTERVAL_SECONDS
+
+    clock = [0.0]
+
+    def tick() -> float:
+        clock[0] += CHECKPOINT_INTERVAL_SECONDS
+        return clock[0]
+
+    monkeypatch.setattr("cdt.extractor.live.monotonic", tick)
+
+
+def test_a_crashed_live_run_keeps_what_it_committed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash part-way through a partition loses at most one commit interval.
+
+    The resumed run pays only for the rows with no verdict: the committed
+    rows' mentions and registry entry survive the crash.
+    """
+    from cdt.completion import load_completion_registry
+
+    _seed_classifications(tmp_path, ["a-8-01", "b-8-01", "c-8-01"])
+    _commit_after_every_item(monkeypatch)
+    calls = _fake_success_workflow(monkeypatch)
+    from cdt.extractor import live as live_module
+
+    succeed = live_module.run_extraction_workflow
+
+    async def crash_on_c(**kwargs: object) -> ExtractionRowState:
+        if kwargs["item_row"]["item_id"] == "c-8-01":
+            raise RuntimeError("killed")
+        return await succeed(**kwargs)
+
+    monkeypatch.setattr(live_module, "run_extraction_workflow", crash_on_c)
+    with pytest.raises(RuntimeError, match="killed"):
+        extract_pending_items(artifact_root=tmp_path, client=None)
+
+    assert sorted(read_dataset(mentions_root(tmp_path))["item_id"]) == [
+        "a-8-01",
+        "b-8-01",
+    ]
+    (entry,) = load_completion_registry("extract", artifact_root=tmp_path).values()
+    assert not entry.complete
+    assert set(entry.item_ids) == {"a-8-01", "b-8-01"}
+    # The checkpoint's audit survives as the crashed run's audit.
+    assert list((tmp_path / "extractor-runs").glob("run_id=*/checkpoint-*.jsonl"))
+
+    calls.clear()
+    monkeypatch.setattr(live_module, "run_extraction_workflow", succeed)
+    extract_pending_items(artifact_root=tmp_path, client=None)
+
+    assert calls == ["c-8-01"]
+    assert sorted(read_dataset(mentions_root(tmp_path))["item_id"]) == [
+        "a-8-01",
+        "b-8-01",
+        "c-8-01",
+    ]
+
+
+def test_a_clean_live_run_leaves_one_full_audit_and_no_checkpoint_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """full.jsonl holds every record; the checkpoint files are removed."""
+    import json
+
+    _seed_classifications(tmp_path, ["a-8-01", "b-8-01", "c-8-01"])
+    _commit_after_every_item(monkeypatch)
+    _fake_success_workflow(monkeypatch)
+
+    extract_pending_items(artifact_root=tmp_path, client=None)
+
+    (run_dir,) = (tmp_path / "extractor-runs").glob("run_id=*")
+    assert [path.name for path in run_dir.iterdir()] == ["full.jsonl"]
+    lines = (run_dir / "full.jsonl").read_text().splitlines()
+    assert sorted(json.loads(line)["item_id"] for line in lines) == [
+        "a-8-01",
+        "b-8-01",
+        "c-8-01",
+    ]
+
+
+def test_a_live_run_that_loses_its_lease_keeps_its_committed_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lease is checked before each item; what was committed stays committed."""
+    from cdt.completion import load_completion_registry
+    from cdt.lease import LeaseLostError
+
+    _seed_classifications(tmp_path, ["a-8-01", "b-8-01", "c-8-01"])
+    _commit_after_every_item(monkeypatch)
+    calls = _fake_success_workflow(monkeypatch)
+    monkeypatch.setattr("cdt.extractor.live.throttled", lambda renew: renew)
+    checks: list[int] = []
+
+    def renew() -> None:
+        checks.append(1)
+        # Lost just before the third item's model calls.
+        if len(checks) == 5:  # noqa: PLR2004
+            raise LeaseLostError("stolen")
+
+    with pytest.raises(LeaseLostError):
+        extract_pending_items(artifact_root=tmp_path, client=None, renew=renew)
+
+    assert calls == ["a-8-01", "b-8-01"]
+    (entry,) = load_completion_registry("extract", artifact_root=tmp_path).values()
+    assert set(entry.item_ids) == {"a-8-01", "b-8-01"}
+
+
+def test_a_crash_after_a_mid_partition_commit_still_prunes_departed_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row that left the source loses its mentions even if the run then dies.
+
+    The mid-partition commit saves a registry entry that no longer names the
+    departed row, so its write must already prune it: no later run would.
+    """
+    from cdt.extractor import live as live_module
+
+    _seed_classifications(tmp_path, ["a-8-01", "x-8-01"])
+    _fake_success_workflow(monkeypatch)
+    extract_pending_items(artifact_root=tmp_path, client=None)
+    # x leaves the source; c, d and e arrive.
+    _seed_classifications(tmp_path, ["a-8-01", "c-8-01", "d-8-01", "e-8-01"])
+    _commit_after_every_item(monkeypatch)
+    succeed = live_module.run_extraction_workflow
+
+    async def crash_on_e(**kwargs: object) -> ExtractionRowState:
+        if kwargs["item_row"]["item_id"] == "e-8-01":
+            raise RuntimeError("killed")
+        return await succeed(**kwargs)
+
+    monkeypatch.setattr(live_module, "run_extraction_workflow", crash_on_e)
+    with pytest.raises(RuntimeError, match="killed"):
+        extract_pending_items(artifact_root=tmp_path, client=None)
+    assert "x-8-01" not in set(read_dataset(mentions_root(tmp_path))["item_id"])
+
+    monkeypatch.setattr(live_module, "run_extraction_workflow", succeed)
+    extract_pending_items(artifact_root=tmp_path, client=None)
+    assert sorted(read_dataset(mentions_root(tmp_path))["item_id"]) == [
+        "a-8-01",
+        "c-8-01",
+        "d-8-01",
+        "e-8-01",
+    ]
+
+
+def test_every_partition_end_commits_even_inside_one_interval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash in the second partition keeps the first one's completion."""
+    from cdt.completion import load_completion_registry
+    from cdt.extractor import live as live_module
+
+    _seed_classifications(tmp_path, ["a-8-01"], date="2024-01-02")
+    _seed_classifications(tmp_path, ["b-8-01"], date="2024-01-03")
+    calls = _fake_success_workflow(monkeypatch)
+    # The clock never moves, so no interval ever elapses.
+    monkeypatch.setattr(live_module, "monotonic", lambda: 0.0)
+    succeed = live_module.run_extraction_workflow
+
+    async def crash_on_b(**kwargs: object) -> ExtractionRowState:
+        if kwargs["item_row"]["item_id"] == "b-8-01":
+            raise RuntimeError("killed")
+        return await succeed(**kwargs)
+
+    monkeypatch.setattr(live_module, "run_extraction_workflow", crash_on_b)
+    with pytest.raises(RuntimeError, match="killed"):
+        extract_pending_items(artifact_root=tmp_path, client=None)
+
+    registry = load_completion_registry("extract", artifact_root=tmp_path)
+    assert [set(entry.item_ids) for entry in registry.values()] == [{"a-8-01"}]
+
+    calls.clear()
+    monkeypatch.setattr(live_module, "run_extraction_workflow", succeed)
+    extract_pending_items(artifact_root=tmp_path, client=None)
+    assert calls == ["b-8-01"]
+
+
+def test_a_commit_records_mentions_and_failures_before_the_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the registry save dies, nothing it would have marked done is unrecorded."""
+    from cdt.datasets import load_row_failures
+    from cdt.extractor import live as live_module
+    from cdt.extractor import outputs as outputs_module
+
+    _seed_classifications(tmp_path, ["a-8-01", "f-8-01", "c-8-01"])
+    _commit_after_every_item(monkeypatch)
+
+    async def fail_f(**kwargs: object) -> ExtractionRowState:
+        item_row = kwargs["item_row"]
+        row_state = ExtractionRowState(item_row=item_row, stage_name="instrument_ie")
+        if item_row["item_id"] == "f-8-01":
+            row_state.finish("FAILED")
+        else:
+            row_state.debt_instrument_mentions = [
+                {"item_id": str(item_row["item_id"]), "name": "Term Loan"}
+            ]
+            row_state.finish("SUCCESS")
+        return row_state
+
+    monkeypatch.setattr(live_module, "run_extraction_workflow", fail_f)
+    saves: list[int] = []
+
+    def registry_save_dies_on_the_second_commit(
+        *args: object, **kwargs: object
+    ) -> None:
+        saves.append(1)
+        if len(saves) == 2:  # noqa: PLR2004
+            raise OSError("storage down")
+
+    monkeypatch.setattr(
+        outputs_module,
+        "save_completion_registry",
+        registry_save_dies_on_the_second_commit,
+    )
+    with pytest.raises(OSError, match="storage down"):
+        extract_pending_items(artifact_root=tmp_path, client=None)
+
+    # The second commit covered a and f: both are on disk although the
+    # registry save that would have marked them done never happened.
+    assert set(read_dataset(mentions_root(tmp_path))["item_id"]) == {"a-8-01"}
+    assert set(load_row_failures("extract", artifact_root=tmp_path)) == {"f-8-01"}
+    assert list((tmp_path / "extractor-runs").glob("run_id=*/checkpoint-0001.jsonl"))

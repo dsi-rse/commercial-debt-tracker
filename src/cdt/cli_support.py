@@ -1,4 +1,4 @@
-"""Argument and logging helpers shared by the ``cdt`` and ``cdt-orchestrator`` CLIs."""
+"""Argument-parsing and logging helpers for the ``cdt`` CLI."""
 
 from __future__ import annotations
 

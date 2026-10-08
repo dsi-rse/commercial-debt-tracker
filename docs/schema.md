@@ -19,6 +19,7 @@ Two schema-wide contracts:
   documents-sixk/
   raw-documents/sixk/
   items/
+  sixk-windows/
   classifications/
   sixk-snippets/
   mentions/
@@ -32,7 +33,7 @@ Two schema-wide contracts:
   locks/
 ```
 
-`documents-sixk` holds Form 6-K documents (same columns as `documents`), `raw-documents/sixk` is CDT's own gzipped copy of each 6-K submission, and `sixk-snippets` holds the 6-K triage output: the 6-K counterpart of `classifications`. Extract reads `classifications` and `sixk-snippets` through one projection and writes both genres' mentions into `mentions`.
+`documents-sixk` holds Form 6-K documents (same columns as `documents`), `raw-documents/sixk` is CDT's own gzipped copy of each 6-K submission, `sixk-windows` holds the 6-K segment output (window spans, no text): the 6-K counterpart of `items`, and `sixk-snippets` holds the 6-K classify (triage) output: the 6-K counterpart of `classifications`. Extract reads `classifications` and `sixk-snippets` through one projection and writes both genres' mentions into `mentions`.
 
 Optional final snapshot layout:
 
@@ -51,7 +52,7 @@ Optional final snapshot layout:
 Date-partitioned datasets:
 
 - `documents`, `documents-sixk`
-- `items`
+- `items`, `sixk-windows`
 - `classifications`, `sixk-snippets`
 - `mentions`
 
@@ -104,7 +105,8 @@ How rows land there:
 - `documents`: rows are grouped by filing `date`, then by `crc32(accession_number) % 64`.
 - `items`: each item row is written to the same `date` and `shard` partition as its parent document partition.
 - `classifications`: each classified row is written to the same `date` and `shard` partition as its source item partition.
-- `sixk-snippets`: each snippet row is written to the same `date` and `shard` partition as its source `documents-sixk` partition.
+- `sixk-windows`: each window row is written to the same `date` and `shard` partition as its source `documents-sixk` partition.
+- `sixk-snippets`: each snippet row is written to the same `date` and `shard` partition as its source `sixk-windows` partition (and so its `documents-sixk` partition).
 - `mentions`: each extracted mention row is written to the same `date` and `shard` partition as its source classification or snippet partition.
 
 Practical implication:
@@ -112,7 +114,7 @@ Practical implication:
 - one parquet file usually represents "one filing date, one shard bucket"
 - the number of rows in that file is variable and depends on how many filings hashed into that bucket
 - downstream stages preserve the partition shape rather than reshuffling by a new key
-- stages may mark a source partition completed without writing an output parquet when that partition produces zero downstream rows
+- a source partition that produces zero downstream rows is marked completed without writing an output parquet. If an earlier run did write one, it is overwritten with an empty table instead, so the next stage sees that partition change and drops what it derived from the old rows
 
 ### CIK-Sharded Stages
 
@@ -135,21 +137,35 @@ Practical implication:
 - rows from many filing dates can coexist in the same `cik_shard` parquet
 - this lets the matcher compare debt mentions across time for the same issuer
 
-### How `batch_size` Works
+### Checkpoints and buffers
 
-`batch_size` controls the chunk size used while draining pending work in one invocation. It does not control parquet file size.
+No stage has a batch size. Each one drains every pending partition in one
+invocation, and what an interruption can lose is bounded by time, not by a count
+of partitions:
 
-- `itemize`: processes all pending `documents` partitions, in chunks of up to `batch_size` partitions at a time.
-- `classify`: processes all pending `items` partitions, in chunks of up to `batch_size` partitions at a time.
-- `extract`: processes all pending `classifications` partitions, in chunks of up to `batch_size` partitions at a time.
-- `match`: processes all `cik_shard` groups present in the mentions dataset, in chunks of up to `batch_size` shard groups at a time.
-- `ingest`: different from the other stages; here `batch_size` is a row buffer threshold for flushing accumulated document rows to their target partitions.
+- `segment` and `classify` (both genres): completion is saved at most every
+  `cdt.completion.CHECKPOINT_INTERVAL_SECONDS` (300 s) and once at the end. The
+  writer lease is renewed per partition, throttled to the same interval.
+- `extract` (live backend): commits what it has paid for at every partition end,
+  and within a partition once `CHECKPOINT_INTERVAL_SECONDS` has passed since the
+  last commit. A commit writes, in order:
+  1. the partition's mentions so far, with rows that left the source pruned;
+  2. the audit records since the last commit;
+  3. the failure registry;
+  4. the completion registry, where an incomplete entry names the rows already
+     terminal.
 
-Examples:
+  A resumed run pays only for rows with no verdict. The batch backend persists every row's state at each tick and sizes
+  its work with `cdt run poll`'s `--max-rows-per-job`,
+  `--max-requests-per-batch` and `--max-batch-bytes`.
+- `match`: processes every `cik_shard` group in turn, renewing the lease per
+  shard. It keeps no completion registry: each run re-matches every shard.
+- `ingest`: `--flush-rows` (`cdt run`: `--ingest-flush-rows`, default 100) is a
+  write buffer, not a checkpoint. Ingest flushes accumulated document rows after
+  that many, and each flush rewrites the `date/shard` partitions its rows land
+  in. A larger buffer means fewer rewrites and more memory.
 
-- if `extract_batch_size=100`, one extractor run drains all pending `date/shard` parquet partitions, processing them in chunks of up to 100 partitions
-- if `match_batch_size=100`, one matcher run drains all shard groups, processing them in chunks of up to 100 groups, though only 64 shards currently exist
-- if `ingest_batch_size=100`, ingest flushes after accumulating roughly 100 document rows, and those rows may be written into multiple `date/shard` partition files
+None of these settings controls parquet file size.
 
 ## Dataset Schemas
 
@@ -200,7 +216,7 @@ Columns:
 - `date`: Filing date in `YYYY-MM-DD` format.
 - `resource_uri`: Alternate storage location for the filing text when `text` is omitted, typically a local path or `s3://` URI.
 - `form_type`: The SEC form of the filing, such as `8-K`, `8-K/A` or `6-K`. A null `form_type` is an 8-K.
-- `source`: How the row was acquired: `s3-manifest` (the SEC scraper's output) or `edgar` (fetched from EDGAR directly).
+- `source`: How the row was acquired. Always `s3-manifest`: the row comes from the SEC scraper's output.
 
 Primary key: `accession_number`
 
@@ -218,22 +234,22 @@ Columns:
 - `url`: SEC source URL copied from the parent document.
 - `text`: Extracted text for the item section only.
 - `date`: Filing date copied from the parent document.
-- `resource_uri`: Reserved pointer for externally stored item text; currently written as `null` by the itemizer.
-- `item_information`: Canonical SEC caption for the item this row covers, read from an `ITEM INFORMATION:` line in the filing's `<SEC-HEADER>` block and normalized to lowercase, such as `entry into a material definitive agreement`. This column drives the table: the itemizer reads the header's captions, maps each one to the item number in `item`, then searches the document body for the matching section. A caption the itemizer does not recognize still produces a row, with an empty `item`. Captions that repeat, or that map to an item number another caption already claimed, are dropped so that `item_id` stays unique.
-- `extraction_status`: Whether the itemizer located this item's section in the document body, and whether the headings it found were ambiguous. Not a confidence score. One of:
-  - `ok`: A body heading for `item` was found and the section boundaries resolved, either from a single heading or from several the itemizer judged benign. `duplicate_resolution` records which case applied.
-  - `duplicate_heading`: Several body headings carried `item` and their sections differ materially, so the itemizer could not tell which one the header caption meant. The first is used; treat `text` as one of several possible readings of the filing.
+- `resource_uri`: Reserved pointer for externally stored item text; currently written as `null` by the 8-K segmenter.
+- `item_information`: Canonical SEC caption for the item this row covers, read from an `ITEM INFORMATION:` line in the filing's `<SEC-HEADER>` block and normalized to lowercase, such as `entry into a material definitive agreement`. This column drives the table: the segmenter reads the header's captions, maps each one to the item number in `item`, then searches the document body for the matching section. A caption the segmenter does not recognize still produces a row, with an empty `item`. Captions that repeat, or that map to an item number another caption already claimed, are dropped so that `item_id` stays unique.
+- `extraction_status`: Whether the segmenter located this item's section in the document body, and whether the headings it found were ambiguous. Not a confidence score. One of:
+  - `ok`: A body heading for `item` was found and the section boundaries resolved, either from a single heading or from several the segmenter judged benign. `duplicate_resolution` records which case applied.
+  - `duplicate_heading`: Several body headings carried `item` and their sections differ materially, so the segmenter could not tell which one the header caption meant. The first is used; treat `text` as one of several possible readings of the filing.
   - `missing_heading`: The header declared the item but no body heading matches it. No section was extracted, so `text` and `section_heading` are empty and `start_line`, `end_line` are null.
-  - `unmapped_item_information`: `item_information` is not a caption the itemizer maps to an item number, so no extraction was attempted. `item` is empty, as are the section fields listed above.
+  - `unmapped_item_information`: `item_information` is not a caption the segmenter maps to an item number, so no extraction was attempted. `item` is empty, as are the section fields listed above.
 
   No stage downstream filters on this column, so the classifier and the extractor both see the empty-text rows produced by the last two statuses.
-- `duplicate_resolution`: How the itemizer chose between body headings carrying this item number. Populated for every row that reached extraction, not only for rows with more than one heading. Comparisons use a normalized form of each candidate section: casefolded, punctuation collapsed, and the item-number heading line itself dropped. One of:
+- `duplicate_resolution`: How the segmenter chose between body headings carrying this item number. Populated for every row that reached extraction, not only for rows with more than one heading. Comparisons use a normalized form of each candidate section: casefolded, punctuation collapsed, and the item-number heading line itself dropped. One of:
   - `single_heading`: Exactly one body heading carried the item number.
   - `benign_equivalent`: Several headings, and one candidate section is equivalent to every other, meaning either that one contains the other or that their token sets overlap by at least 0.95. That candidate is kept.
   - `benign_contained`: Several headings, and one candidate section contains every other. Rare, because the equivalence check above already covers containment for non-empty sections; this value effectively marks the case where a competing heading's section normalizes to nothing.
   - `unresolved_duplicate`: Several headings whose sections differ materially. This is the value that sets `extraction_status` to `duplicate_heading`.
   - Empty string: no extraction was attempted, so the row is `missing_heading` or `unmapped_item_information`.
-- `section_heading`: The body heading line the itemizer selected as the start of the section, verbatim from the filing and not normalized, such as `Item 1.01. Entry into a Material Definitive Agreement.`. Distinct from `item_information`, which carries SEC's own caption from the filing header rather than the text the filer wrote. Empty when no heading matched.
+- `section_heading`: The body heading line the segmenter selected as the start of the section, verbatim from the filing and not normalized, such as `Item 1.01. Entry into a Material Definitive Agreement.`. Distinct from `item_information`, which carries SEC's own caption from the filing header rather than the text the filer wrote. Empty when no heading matched.
 - `start_line`: 1-based inclusive line number where the section in `text` begins, which is the line holding `section_heading`. Line numbers index the normalized lines of the filing's primary 8-K document block, not `documents.text`, so they cannot be used to slice that column directly. Null when no section was extracted. Recorded for provenance and for debugging section boundaries; nothing downstream reads it.
 - `end_line`: 1-based inclusive line number of the last line in `text`. The section ends at whichever comes first: the line before the next body heading carrying a different item number, the line before a `SIGNATURES` or `EXHIBIT INDEX` line, or the end of the body. Indexed and nulled the same way as `start_line`.
 - `section_char_count`: Character count for the extracted section text.
@@ -252,6 +268,22 @@ A `sixk-snippets` row (`form_type` `6-K` in the snapshot) fills the same columns
 - `resource_uri`: the parent document's.
 
 The snippet's own span and triage verdict (`sixk_window_start`, `sixk_window_end`, `sixk_token_count`, `sixk_verdict`, `sixk_duplicate_of`, `sixk_member_windows`) stay in `sixk-snippets` and are not published.
+
+### `sixk-windows`
+
+The 6-K segment output: one row per window of each 6-K prose document that passes the debt-vocabulary gate, as a **span only**. The text is not stored; the classify stage rebuilds it from the filing's submission (see [sixk-two-stage-triage.md](sixk-two-stage-triage.md)). A filing the gate rejects writes no rows.
+
+Columns:
+
+- `accession_number`, `cik`, `date`: the filing's, from its `documents-sixk` row.
+- `document_index` (`int64`): the document's position among the submission's prose documents (`cdt.segmenter.sixk.prose_documents` order).
+- `document_type`: the document's own `<TYPE>`, such as `6-K` or `EX-99.1`.
+- `window` (`int64`): the window's position within its document, from 0.
+- `start`, `end` (`int64`): character offsets of the window into the document's gated body — the flattened text with its inline-XBRL prologue stripped (`cdt.segmenter.sixk.gated_body`).
+- `token_count` (`int64`): the window's `o200k_base` token count.
+- `source_sha256`: SHA-256 hex digest of that gated body. The classify stage refuses a filing whose rebuilt body has a different digest, and leaves its whole partition pending.
+
+Primary key: `accession_number`, `document_index`, `window`
 
 ### `classifications`
 
@@ -458,9 +490,8 @@ does not change (`amendment_of` and the `synthesized_*` columns are not
 hashed). Downstream, the matcher never lets a synthesized member supply a
 cluster's canonical fields or widen its name class, may borrow the successor's
 lender signature for scoring only, and publishes `synthesized_only` on an
-instrument whose every member is synthesized. `cdt backfill-mentions`
-re-derives the synthesized rows over every existing `mentions` partition; it is
-a pure function of the model-emitted rows and a no-op when run twice.
+instrument whose every member is synthesized. The synthesized rows are a pure
+function of the model-emitted rows, minted when the item's mentions are written.
 
 ##### Reading them safely
 
@@ -495,7 +526,7 @@ Columns:
 - `amendment_of_debt_instrument_id`: Parent instrument ID when this instrument is an amendment lineage child. Every lineage pointer on this table carries a relation the **extractor** asserted and cited, except where `amendment_inferred_by` says otherwise; the matcher resolves the `raw_id` to an instrument ID but never invents the relation. A pointer that records a matcher inference rather than an extracted fact needs a provenance column alongside it, documented here, and that column has to survive an incremental rematch — see the stage boundary in `docs/architecture.md`.
 - `retired_by_debt_instrument_ids`: JSON array of IDs of the instruments that retired this one, set on the retired instrument's own row (null when none).
 - `split_of_debt_instrument_id`: Parent instrument ID when this instrument is a split lineage child.
-- `amendment_inferred_by`: Which rule inferred `amendment_of_debt_instrument_id`, when the matcher filled it rather than the extractor: `ordinal_chain` (the amend-and-restate ordinal in the name) is the only value. Null means the pointer came from an extracted, cited relation — including the pointer from an amended instrument to the prior state the extractor minted for it — so an inferred pointer is never mistaken for an extracted one. Set by the lineage pass, which runs after every match — in `cdt match`, in the pipeline's match-and-finalize step, and in `PipelineOrchestrator.run` (`cdt pipeline` and the live extractor backend) alike — and which clears and re-derives every inferred pointer on each run.
+- `amendment_inferred_by`: Which rule inferred `amendment_of_debt_instrument_id`, when the matcher filled it rather than the extractor: `ordinal_chain` (the amend-and-restate ordinal in the name) is the only value. Null means the pointer came from an extracted, cited relation — including the pointer from an amended instrument to the prior state the extractor minted for it — so an inferred pointer is never mistaken for an extracted one. Set by the lineage pass, which runs after every match — in `cdt match`, in the pipeline's match-and-finalize step, and in `Pipeline.run` (`cdt run daily|historical --extractor-backend live`) alike — and which clears and re-derives every inferred pointer on each run.
 - `superseded_by_debt_instrument_id`: The amendment child that replaced this state, when exactly one exists. A row with this set is a superseded state, not a live obligation.
 - `lineage_family_id`: One ID per connected lineage component over amendment, split, and retirement pointers — every state of one obligation history shares it. Singleton instruments use their own ID.
 - `is_lineage_head`: True when no amendment child supersedes this row; the browse index should show heads and collapse the rest of the family beneath them.
@@ -530,16 +561,26 @@ Ingest writes one manifest per run with a generated timestamp-based run ID:
 <artifact-root>/runs/ingest/run_id=<run_id>.json
 ```
 
-### Itemize, classify, and match manifests
+### Segment, classify, and match manifests
 
-These stages currently overwrite a `latest` manifest:
+These stages overwrite a `latest` manifest, named by their completion-registry stage name:
 
 ```text
-<artifact-root>/runs/itemize/run_id=latest.json
-<artifact-root>/runs/classify/run_id=latest.json
+<artifact-root>/runs/itemize/run_id=latest.json        # 8-K segment
+<artifact-root>/runs/sixk-segment/run_id=latest.json   # 6-K segment
+<artifact-root>/runs/classify/run_id=latest.json       # 8-K classify
+<artifact-root>/runs/sixk-classify/run_id=latest.json  # 6-K classify (triage)
 <artifact-root>/runs/match/run_id=latest.json
 <artifact-root>/runs/infer-lineage/run_id=latest.json
 ```
+
+The four segment and classify manifests share one shape (`cdt.partition_stage`):
+`stage`, `artifact_root`, `force`, `source_rows_processed`,
+`partitions_visited`, `partitions_written`, `empty_partitions_skipped_from_write`,
+`partitions_held` (source partitions left pending, such as 6-K windows whose
+spans no longer match their text) and `completion_registry`, plus stage-specific
+settings (`item_numbers`; `window_tokens`; `concurrency`, `stage2_model`,
+`stage2_provider`).
 
 `infer-lineage` is the amendment-lineage post-pass. It runs after every match
 and rewrites every `debt-instruments` partition the match manifest just listed,
@@ -563,13 +604,23 @@ Extractor writes a per-run manifest and a matching full audit log:
 ```text
 <artifact-root>/runs/extract/run_id=<run_id>.json
 <artifact-root>/extractor-runs/run_id=<run_id>/full.jsonl
+<artifact-root>/extractor-runs/run_id=<run_id>/checkpoint-NNNN.jsonl
 ```
+
+A live run writes each commit's audit records to a `checkpoint-NNNN.jsonl`. When
+the run finishes it writes `full.jsonl` with every record and deletes the
+checkpoint files. A run that was interrupted has no `full.jsonl`; its checkpoint
+files are its audit, up to its last commit. If a run is killed between writing
+`full.jsonl` and deleting them, `full.jsonl` supersedes whatever checkpoint
+files remain beside it.
 
 ### Extract batch job state
 
 The OpenAI batch extract backend keeps its resumable, file-native job state under
-`extract-batches/`. The hourly `poll` run is the only writer, apart from the
-`cdt reset-extract-job` admin command, which rewrites `active.json` under the same lease.
+`extract-batches/`. Two commands advance it, both by one tick under the
+`pipeline-writer` lease: `cdt run poll` (hourly, scheduled) and `cdt extract` (its
+default batch backend). The `cdt extract job reset` admin command rewrites
+`active.json` under the same lease.
 
 ```text
 <artifact-root>/extract-batches/
@@ -581,7 +632,7 @@ The OpenAI batch extract backend keeps its resumable, file-native job state unde
   job_id=<run_id>/ticks/tick=<n>.json  # per-tick audit counts
 ```
 
-The orchestrator also keeps advisory locks directly under the artifact root:
+Every writing command also takes an advisory lock directly under the artifact root:
 
 ```text
 locks/pipeline-writer.json           # single-writer lease: {holder, acquired_at, expires_at}
@@ -650,8 +701,7 @@ dropped. Retrying the listed rows is still manual, and still partition-granular 
 
 - canonical truth is the partition data, not the run manifest
 - final snapshot parquet files are derived convenience outputs, not the canonical working state
-- `cdt pipeline` writes final snapshots only when `--final-database-root` is passed
-- `cdt-orchestrator` writes final snapshots when `FINAL_DATABASE_ROOT` is set or `--final-database-root` is passed before the mode
+- `cdt run` and `cdt publish` write final snapshots only when `--final-database-root` is passed or `FINAL_DATABASE_ROOT` is set
 - stage completion is recorded per source partition in the stage's completion registry (`runs/<stage>/completed/`), keyed by the source partition's fingerprint; whether an output partition exists plays no part
 - `force=false` skips source partitions whose fingerprint is unchanged since completion was recorded
 - local runs and deployed runs use the same layout and code paths

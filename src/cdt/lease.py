@@ -19,6 +19,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from time import monotonic
 from typing import cast
 
 from cdt.shared import get_logger
@@ -35,8 +36,9 @@ LOGGER = get_logger(__name__)
 
 # Sized well above a normal tick (minutes); it only gates recovery after a crash.
 DEFAULT_LEASE_TTL_SECONDS = 2 * 60 * 60
-# The one lease every writer of extract job state and match/final snapshots
-# holds: poll ticks, daily's match/finalize, and the admin reset command.
+# The one lease every writer of the artifact root holds: every stage command
+# (`cdt ingest` through `cdt publish`, and `cdt extract job reset`) and every
+# `cdt run` mode.
 PIPELINE_WRITER_LEASE = "pipeline-writer"
 _EXPIRED = "1970-01-01T00:00:00+00:00"
 
@@ -167,6 +169,32 @@ def renewer(lease: Lease) -> Callable[[], None]:
             raise LeaseLostError(msg)
 
     return renew
+
+
+#: How often a :func:`throttled` hook actually renews. Far under the TTL, so a
+#: lease renewed this recently cannot have expired, and so cannot be stolen.
+RENEW_INTERVAL_SECONDS = 5 * 60
+
+
+def throttled(
+    renew: Callable[[], None], *, interval_seconds: float = RENEW_INTERVAL_SECONDS
+) -> Callable[[], None]:
+    """Return ``renew`` limited to one call per ``interval_seconds``.
+
+    For work that calls its hook per item (a manifest, an LLM call) rather than
+    per batch: the first call renews, later calls within the interval return
+    without touching storage.
+    """
+    last_renewed: list[float] = []
+
+    def renew_at_most_every_interval() -> None:
+        now = monotonic()
+        if last_renewed and now - last_renewed[0] < interval_seconds:
+            return
+        renew()
+        last_renewed[:] = [now]
+
+    return renew_at_most_every_interval
 
 
 def release_lease(lease: Lease) -> None:

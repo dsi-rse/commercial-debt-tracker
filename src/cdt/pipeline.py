@@ -1,4 +1,4 @@
-"""File-native orchestration for the full CDT pipeline."""
+"""The full CDT pipeline: every genre's prepare chain, then extract, match and publish."""
 
 from __future__ import annotations
 
@@ -10,10 +10,9 @@ from typing import Self
 
 import pandas as pd
 
-from cdt.classifier.core import default_model_dir
 from cdt.classifier.eightk import classify_pending_items
 from cdt.classifier.sixk import DEFAULT_CONCURRENCY as SIXK_DEFAULT_CONCURRENCY
-from cdt.classifier.sixk import triage_pending_documents
+from cdt.classifier.sixk import triage_pending_windows
 from cdt.datasets import (
     GENRE_6K,
     GENRE_8K,
@@ -23,18 +22,17 @@ from cdt.datasets import (
 )
 from cdt.extractor import (
     DEFAULT_MAX_ATTEMPTS,
-    DEFAULT_REASONING_EFFORT,
     extract_pending_items,
     extracted_tables_path,
 )
 from cdt.ingest.core import (
     DEFAULT_AWS_PROFILE,
     DEFAULT_BUCKET,
+    DEFAULT_FLUSH_ROWS,
     DEFAULT_S3_PREFIX,
     IngestConfig,
     IngestRunResult,
 )
-from cdt.ingest.core import DEFAULT_BATCH_SIZE as DEFAULT_INGEST_BATCH_SIZE
 from cdt.ingest.genres import ingest_genre
 from cdt.lease import LeaseLostError
 from cdt.matcher import (
@@ -46,9 +44,10 @@ from cdt.matcher import (
 from cdt.publish import finalize_after_match
 from cdt.segmenter.eightk import (
     POTENTIALLY_RELEVANT_ITEM_NUMBERS,
-    itemize_pending_documents,
+    segment_pending_eightk_documents,
 )
-from cdt.shared import get_logger
+from cdt.segmenter.sixk import segment_pending_sixk_documents
+from cdt.shared import get_logger, log_stage_complete, log_stage_start
 from cdt.storage.objects import ArtifactPath, read_text_artifact
 
 #: Genres the CLI entry points prepare unless `--genres` narrows them: all of them.
@@ -59,7 +58,8 @@ ALL_TIME_START_DATE = date(1994, 1, 1)
 # Daily mode re-scans this many days back, ending yesterday, so late or
 # repaired scraper manifests are still picked up.
 DAILY_LOOKBACK_DAYS = 5
-DEFAULT_STAGE_BATCH_SIZE = 100
+#: The CIK-file value that selects every filer (see :func:`read_cik_file`).
+ALL_CIKS = "all"
 PIPELINE_MODES = ("daily", "historical")
 LOGGER = get_logger(__name__)
 
@@ -76,30 +76,44 @@ class PipelineConfig:
     data_dir: Path | None = None
     artifact_root: ArtifactPath | None = None
     final_database_root: ArtifactPath | None = None
+    #: Reprocess partitions the completion registries already record.
     force: bool = False
+    #: Publish even when no source changed, and past the shrinkage guard.
+    #: Separate from ``force``: reprocessing must not lower the publish guards.
+    force_publish: bool = False
     download: bool = False
     failure_file: ArtifactPath | None = None
     aws_profile: str = DEFAULT_AWS_PROFILE
     s3_prefix: str = DEFAULT_S3_PREFIX
-    ingest_batch_size: int = DEFAULT_INGEST_BATCH_SIZE
-    itemize_batch_size: int = DEFAULT_STAGE_BATCH_SIZE
-    classify_batch_size: int = DEFAULT_STAGE_BATCH_SIZE
-    extract_batch_size: int = DEFAULT_STAGE_BATCH_SIZE
-    match_batch_size: int = DEFAULT_STAGE_BATCH_SIZE
+    #: Document rows ingest buffers before each partition write.
+    ingest_flush_rows: int = DEFAULT_FLUSH_ROWS
     item_numbers: tuple[str, ...] = POTENTIALLY_RELEVANT_ITEM_NUMBERS
+    #: The 8-K item classifier's artifact directory; None is the committed one.
     classifier_model_dir: Path | None = None
+    #: The 6-K stage-1 artifact directory; None is the committed one.
+    sixk_model_dir: Path | None = None
+    #: Filings whose 6-K stage-2 calls may be in flight at once.
+    sixk_concurrency: int = SIXK_DEFAULT_CONCURRENCY
     #: None resolves to the EXTRACTOR_MODEL setting when extraction runs.
     extractor_model: str | None = None
-    extractor_reasoning_effort: str = DEFAULT_REASONING_EFFORT
+    #: None resolves to the EXTRACTOR_REASONING setting when extraction runs.
+    extractor_reasoning_effort: str | None = None
     extractor_max_attempts: int = DEFAULT_MAX_ATTEMPTS
     strong_match_threshold: float = DEFAULT_MEMBERSHIP_THRESHOLD
     loose_match_threshold: float = DEFAULT_RELATED_THRESHOLD
     ambiguity_margin: float = DEFAULT_AMBIGUITY_MARGIN
     #: Which genres to prepare. 8-K only when built in code, because the 6-K
-    #: chain scrapes and calls a paid model; the CLIs pass DEFAULT_GENRES.
+    #: chain scrapes and calls a paid model; the CLI passes DEFAULT_GENRES.
     genres: tuple[str, ...] = (GENRE_8K,)
-    sixk_batch_size: int = DEFAULT_STAGE_BATCH_SIZE
-    sixk_concurrency: int = SIXK_DEFAULT_CONCURRENCY
+
+
+@dataclass(frozen=True)
+class GenreResult:
+    """What one genre's prepare chain produced: ingest, segment, classify."""
+
+    ingest: IngestRunResult
+    segmented_rows: int
+    classified_rows: int
 
 
 @dataclass(frozen=True)
@@ -109,20 +123,15 @@ class PipelineRunResult:
     mode: str
     start_date: date
     end_date: date
-    #: None when the run did not prepare that genre; a genre that ran and
-    #: found nothing has a result with zeroes.
-    ingest: IngestRunResult | None
-    itemized_rows: int
-    classified_rows: int
     extracted_rows: int
     matched_rows: int
     debt_instrument_rows: int
-    classifier_model_dir: Path
     artifact_root: str
     extractor_run_path: str
     genres: tuple[str, ...] = DEFAULT_GENRES
-    sixk_ingest: IngestRunResult | None = None
-    sixk_snippet_rows: int = 0
+    #: Per genre whose chain completed; a genre that was not selected, or
+    #: whose chain failed, has no entry.
+    genre_results: dict[str, GenreResult] = field(default_factory=dict)
     #: Genres whose prepare chain failed; extract, match and publish still ran
     #: over the rest, and the caller reports the run as failed.
     failed_genres: tuple[str, ...] = ()
@@ -130,16 +139,9 @@ class PipelineRunResult:
 
 @dataclass
 class _PrepareOutcome:
-    """What the prepare phases produced, per genre.
+    """What the prepare phases produced, per genre."""
 
-    An ``*_ingest`` of None means that genre's chain did not run.
-    """
-
-    ingest: IngestRunResult | None = None
-    items: pd.DataFrame = field(default_factory=pd.DataFrame)
-    classified: pd.DataFrame = field(default_factory=pd.DataFrame)
-    sixk_ingest: IngestRunResult | None = None
-    snippets: pd.DataFrame = field(default_factory=pd.DataFrame)
+    genre_results: dict[str, GenreResult] = field(default_factory=dict)
     #: Genres whose chain raised; the others still ran.
     failed_genres: list[str] = field(default_factory=list)
 
@@ -152,11 +154,88 @@ class PrepareResult:
     failed_genres: tuple[str, ...] = ()
 
 
-class PipelineOrchestrator:
+def segment_genre(
+    genre: str,
+    *,
+    artifact_root: ArtifactPath | None = None,
+    data_dir: Path | None = None,
+    force: bool = False,
+    item_numbers: tuple[str, ...] = POTENTIALLY_RELEVANT_ITEM_NUMBERS,
+    renew: Callable[[], None] | None = None,
+) -> pd.DataFrame:
+    """Run one genre's segment stage: 8-K items, or 6-K window spans.
+
+    ``item_numbers`` applies to 8-K only. Returns the rows written.
+
+    Raises:
+        ValueError: If ``genre`` is not one of GENRES.
+    """
+    if genre == GENRE_8K:
+        return segment_pending_eightk_documents(
+            artifact_root=artifact_root,
+            data_dir=data_dir,
+            force=force,
+            item_numbers=item_numbers,
+            renew=renew,
+        )
+    if genre == GENRE_6K:
+        return segment_pending_sixk_documents(
+            artifact_root=artifact_root,
+            data_dir=data_dir,
+            force=force,
+            renew=renew,
+        )
+    raise ValueError(_unknown_genre(genre))
+
+
+def classify_genre(
+    genre: str,
+    *,
+    artifact_root: ArtifactPath | None = None,
+    data_dir: Path | None = None,
+    force: bool = False,
+    model_dir: Path | None = None,
+    sixk_model_dir: Path | None = None,
+    sixk_concurrency: int = SIXK_DEFAULT_CONCURRENCY,
+    renew: Callable[[], None] | None = None,
+) -> pd.DataFrame:
+    """Run one genre's classify stage: 8-K item relevance, or 6-K triage.
+
+    ``model_dir`` is the 8-K classifier's, ``sixk_model_dir`` and
+    ``sixk_concurrency`` the 6-K triage's. Returns the rows written.
+
+    Raises:
+        ValueError: If ``genre`` is not one of GENRES.
+    """
+    if genre == GENRE_8K:
+        return classify_pending_items(
+            artifact_root=artifact_root,
+            data_dir=data_dir,
+            model_dir=model_dir,
+            force=force,
+            renew=renew,
+        )
+    if genre == GENRE_6K:
+        return triage_pending_windows(
+            artifact_root=artifact_root,
+            data_dir=data_dir,
+            force=force,
+            model_dir=sixk_model_dir,
+            concurrency=sixk_concurrency,
+            renew=renew,
+        )
+    raise ValueError(_unknown_genre(genre))
+
+
+def _unknown_genre(genre: str) -> str:
+    return f"unknown genre {genre!r}; expected one of {', '.join(GENRES)}"
+
+
+class Pipeline:
     """Run the full CDT pipeline with structured logging."""
 
     def __init__(self: Self, config: PipelineConfig) -> None:
-        """Initialize the orchestrator."""
+        """Hold the run's config."""
         self.config = config
         self.logger = get_logger(type(self).__name__)
 
@@ -172,23 +251,7 @@ class PipelineOrchestrator:
         for key, value in config_values.items():
             self.logger.info("%s: %s", key, value)
 
-    def _log_stage_start(self: Self, stage_name: str, **details: object) -> None:
-        detail_text = " ".join(f"{key}={value}" for key, value in details.items())
-        self.logger.info(
-            "Starting stage: %s%s",
-            stage_name,
-            f" | {detail_text}" if detail_text else "",
-        )
-
-    def _log_stage_complete(self: Self, stage_name: str, **details: object) -> None:
-        detail_text = " ".join(f"{key}={value}" for key, value in details.items())
-        self.logger.info(
-            "Completed stage: %s%s",
-            stage_name,
-            f" | {detail_text}" if detail_text else "",
-        )
-
-    def _setup(self: Self) -> tuple[date, date, set[str], str]:
+    def _setup(self: Self) -> tuple[date, date, set[str] | None, str]:
         """Resolve dates, CIKs, and the artifact root and emit the run banner."""
         # A config built in code skips the CLI's parsing; validate here.
         normalize_genres(self.config.genres)
@@ -224,7 +287,7 @@ class PipelineOrchestrator:
             data_dir=self.config.data_dir,
             output_root=resolved_artifact_root,
             force=self.config.force,
-            batch_size=self.config.ingest_batch_size,
+            flush_rows=self.config.ingest_flush_rows,
             download=self.config.download,
             failure_file=self.config.failure_file
             or failure_registry_path(
@@ -248,20 +311,20 @@ class PipelineOrchestrator:
         self: Self,
         resolved_start: date,
         resolved_end: date,
-        ciks: set[str],
+        ciks: set[str] | None,
         resolved_artifact_root: str,
         renew: Callable[[], None] | None = None,
     ) -> _PrepareOutcome:
         """Prepare every genre this run asked for, in genre order.
 
-        Each genre writes its own documents and classification datasets, so a
-        failing genre cannot corrupt the other's. A genre whose chain raises is
-        logged and recorded in ``failed_genres`` and the next genre still runs;
-        its partitions stay pending for the next run. ``LeaseLostError`` is not
-        caught: a run that lost its lease must stop writing.
+        Each genre writes its own documents, segment and classification
+        datasets, so a failing genre cannot corrupt the other's. A genre whose
+        chain raises is logged and recorded in ``failed_genres`` and the next
+        genre still runs; its partitions stay pending for the next run.
+        ``LeaseLostError`` is not caught: a run that lost its lease must stop
+        writing.
         """
         outcome = _PrepareOutcome()
-        prepare = {GENRE_8K: self._prepare_eightk, GENRE_6K: self._prepare_sixk}
         for genre in GENRES:
             if genre not in self.config.genres:
                 self.logger.info(
@@ -269,8 +332,8 @@ class PipelineOrchestrator:
                 )
                 continue
             try:
-                prepare[genre](
-                    outcome,
+                outcome.genre_results[genre] = self._prepare_genre(
+                    genre,
                     resolved_start,
                     resolved_end,
                     ciks,
@@ -284,112 +347,33 @@ class PipelineOrchestrator:
                 outcome.failed_genres.append(genre)
         return outcome
 
-    def _prepare_eightk(
+    def _prepare_genre(
         self: Self,
-        outcome: _PrepareOutcome,
+        genre: str,
         resolved_start: date,
         resolved_end: date,
-        ciks: set[str],
+        ciks: set[str] | None,
         resolved_artifact_root: str,
         renew: Callable[[], None] | None,
-    ) -> None:
-        """Run the 8-K chain into ``outcome``, then renew the writer lease."""
-        outcome.ingest, outcome.items, outcome.classified = (
-            self._ingest_itemize_classify(
-                resolved_start,
-                resolved_end,
-                ciks,
-                resolved_artifact_root,
-                renew,
-            )
+    ) -> GenreResult:
+        """Run one genre's ingest → segment → classify, renewing between stages."""
+        log_stage_start(
+            self.logger,
+            "ingest",
+            genre=genre,
+            flush_rows=self.config.ingest_flush_rows,
+            ciks=ALL_CIKS if ciks is None else len(ciks),
         )
-        self._renew(renew)
-
-    def _prepare_sixk(
-        self: Self,
-        outcome: _PrepareOutcome,
-        resolved_start: date,
-        resolved_end: date,
-        ciks: set[str],
-        resolved_artifact_root: str,
-        renew: Callable[[], None] | None,
-    ) -> None:
-        """Run the 6-K chain into ``outcome``."""
-        outcome.sixk_ingest, outcome.snippets = self._ingest_and_triage_sixk(
-            resolved_start,
-            resolved_end,
-            ciks,
-            resolved_artifact_root,
-            renew,
-        )
-
-    def _ingest_and_triage_sixk(
-        self: Self,
-        resolved_start: date,
-        resolved_end: date,
-        ciks: set[str],
-        resolved_artifact_root: str,
-        renew: Callable[[], None] | None = None,
-    ) -> tuple[IngestRunResult, pd.DataFrame]:
-        """Run the 6-K chain: acquire filings, then triage them into snippets."""
-        self._log_stage_start(
-            "ingest-sixk",
-            batch_size=self.config.ingest_batch_size,
-            forms=",".join(GENRES[GENRE_6K].form_types),
-            ciks=len(ciks),
-        )
-        _, sixk_ingest = ingest_genre(
-            GENRE_6K,
+        _, ingest_result = ingest_genre(
+            genre,
             self._ingest_config(resolved_start, resolved_end, resolved_artifact_root),
             ciks=ciks,
-        )
-        self._log_stage_complete(
-            "ingest-sixk",
-            rows=sixk_ingest.total_rows,
-            candidates=sixk_ingest.candidates_seen,
-            partitions=len(sixk_ingest.document_partitions),
-            failures=sixk_ingest.failures,
-        )
-        self._renew(renew)
-
-        self._log_stage_start(
-            "sixk",
-            batch_size=self.config.sixk_batch_size,
-            concurrency=self.config.sixk_concurrency,
-        )
-        snippets = triage_pending_documents(
-            artifact_root=resolved_artifact_root,
-            data_dir=self.config.data_dir,
-            batch_size=self.config.sixk_batch_size,
-            force=self.config.force,
-            concurrency=self.config.sixk_concurrency,
             renew=renew,
         )
-        self._log_stage_complete("sixk", rows=len(snippets))
-        return sixk_ingest, snippets
-
-    def _ingest_itemize_classify(
-        self: Self,
-        resolved_start: date,
-        resolved_end: date,
-        ciks: set[str],
-        resolved_artifact_root: str,
-        renew: Callable[[], None] | None = None,
-    ) -> tuple[IngestRunResult, pd.DataFrame, pd.DataFrame]:
-        """Run ingest → itemize → classify and return their results."""
-        self._log_stage_start(
+        log_stage_complete(
+            self.logger,
             "ingest",
-            batch_size=self.config.ingest_batch_size,
-            download=self.config.download,
-        )
-        ingest_table, ingest_result = ingest_genre(
-            GENRE_8K,
-            self._ingest_config(resolved_start, resolved_end, resolved_artifact_root),
-            ciks=ciks,
-        )
-        del ingest_table
-        self._log_stage_complete(
-            "ingest",
+            genre=genre,
             rows=ingest_result.total_rows,
             candidates=ingest_result.candidates_seen,
             partitions=len(ingest_result.document_partitions),
@@ -397,35 +381,36 @@ class PipelineOrchestrator:
         )
         self._renew(renew)
 
-        self._log_stage_start(
-            "itemize",
-            batch_size=self.config.itemize_batch_size,
-        )
-        items = itemize_pending_documents(
+        log_stage_start(self.logger, "segment", genre=genre)
+        segmented = segment_genre(
+            genre,
             artifact_root=resolved_artifact_root,
             data_dir=self.config.data_dir,
-            batch_size=self.config.itemize_batch_size,
             force=self.config.force,
             item_numbers=self.config.item_numbers,
             renew=renew,
         )
-        self._log_stage_complete("itemize", rows=len(items))
+        log_stage_complete(self.logger, "segment", genre=genre, rows=len(segmented))
         self._renew(renew)
 
-        self._log_stage_start(
-            "classify",
-            batch_size=self.config.classify_batch_size,
-        )
-        classified = classify_pending_items(
+        log_stage_start(self.logger, "classify", genre=genre)
+        classified = classify_genre(
+            genre,
             artifact_root=resolved_artifact_root,
             data_dir=self.config.data_dir,
-            model_dir=self.config.classifier_model_dir,
-            batch_size=self.config.classify_batch_size,
             force=self.config.force,
+            model_dir=self.config.classifier_model_dir,
+            sixk_model_dir=self.config.sixk_model_dir,
+            sixk_concurrency=self.config.sixk_concurrency,
             renew=renew,
         )
-        self._log_stage_complete("classify", rows=len(classified))
-        return ingest_result, items, classified
+        log_stage_complete(self.logger, "classify", genre=genre, rows=len(classified))
+        self._renew(renew)
+        return GenreResult(
+            ingest=ingest_result,
+            segmented_rows=len(segmented),
+            classified_rows=len(classified),
+        )
 
     def run_prepare(
         self: Self, renew: Callable[[], None] | None = None
@@ -446,38 +431,35 @@ class PipelineOrchestrator:
         )
         self._renew(renew)
 
-        self._log_stage_start(
+        log_stage_start(
+            self.logger,
             "extract",
-            batch_size=self.config.extract_batch_size,
             model=self.config.extractor_model,
         )
         extracted = extract_pending_items(
             artifact_root=resolved_artifact_root,
             data_dir=self.config.data_dir,
-            batch_size=self.config.extract_batch_size,
             force=self.config.force,
             model=self.config.extractor_model,
             reasoning_effort=self.config.extractor_reasoning_effort,
             max_attempts=self.config.extractor_max_attempts,
+            renew=renew,
         )
-        self._log_stage_complete("extract", rows=len(extracted))
+        log_stage_complete(self.logger, "extract", rows=len(extracted))
         self._renew(renew)
 
-        self._log_stage_start(
-            "match",
-            batch_size=self.config.match_batch_size,
-        )
+        log_stage_start(self.logger, "match")
         matched = match_pending_mentions(
             artifact_root=resolved_artifact_root,
             data_dir=self.config.data_dir,
-            batch_size=self.config.match_batch_size,
             force=self.config.force,
             strong_match_threshold=self.config.strong_match_threshold,
             loose_match_threshold=self.config.loose_match_threshold,
             ambiguity_margin=self.config.ambiguity_margin,
             renew=renew,
         )
-        self._log_stage_complete(
+        log_stage_complete(
+            self.logger,
             "match",
             edge_rows=len(matched["debt_instrument_mentions"]),
             debt_instruments=len(matched["debt_instrument"]),
@@ -493,22 +475,16 @@ class PipelineOrchestrator:
             mode=self.config.mode,
             start_date=resolved_start,
             end_date=resolved_end,
-            ingest=prepared.ingest,
-            itemized_rows=len(prepared.items),
-            classified_rows=len(prepared.classified),
             extracted_rows=len(extracted),
             matched_rows=matched_mentions,
             debt_instrument_rows=len(matched["debt_instrument"]),
-            classifier_model_dir=self.config.classifier_model_dir
-            or default_model_dir(self.config.data_dir),
             artifact_root=resolved_artifact_root,
             extractor_run_path=extracted_tables_path(
                 resolved_artifact_root,
                 data_dir=self.config.data_dir,
             ),
             genres=self.config.genres,
-            sixk_ingest=prepared.sixk_ingest,
-            sixk_snippet_rows=len(prepared.snippets),
+            genre_results=prepared.genre_results,
             failed_genres=tuple(prepared.failed_genres),
         )
         finalize_after_match(
@@ -516,13 +492,17 @@ class PipelineOrchestrator:
             artifact_root=resolved_artifact_root,
             final_database_root=self.config.final_database_root,
             data_dir=self.config.data_dir,
-            force=self.config.force,
+            force_publish=self.config.force_publish,
             renew=renew,
-            log_stage_start=self._log_stage_start,
-            log_stage_complete=self._log_stage_complete,
         )
         elapsed = datetime.now() - start_time
-        self._log_banner(f"Pipeline completed successfully in {elapsed}")
+        if prepared.failed_genres:
+            self._log_banner(
+                f"Pipeline finished in {elapsed} with failed genres: "
+                + ",".join(prepared.failed_genres)
+            )
+        else:
+            self._log_banner(f"Pipeline completed successfully in {elapsed}")
         return result
 
 
@@ -530,14 +510,14 @@ def run_pipeline(
     config: PipelineConfig, *, renew: Callable[[], None] | None = None
 ) -> PipelineRunResult:
     """Run the full CDT pipeline for the provided config."""
-    return PipelineOrchestrator(config).run(renew)
+    return Pipeline(config).run(renew)
 
 
 def run_prepare_stages(
     config: PipelineConfig, *, renew: Callable[[], None] | None = None
 ) -> PrepareResult:
     """Run only the prepare stages for a config."""
-    return PipelineOrchestrator(config).run_prepare(renew)
+    return Pipeline(config).run_prepare(renew)
 
 
 def run_match_and_finalize(
@@ -545,8 +525,8 @@ def run_match_and_finalize(
     artifact_root: ArtifactPath,
     final_database_root: ArtifactPath | None = None,
     data_dir: Path | None = None,
-    batch_size: int = DEFAULT_STAGE_BATCH_SIZE,
     force: bool = False,
+    force_publish: bool = False,
     strong_match_threshold: float = DEFAULT_MEMBERSHIP_THRESHOLD,
     loose_match_threshold: float = DEFAULT_RELATED_THRESHOLD,
     ambiguity_margin: float = DEFAULT_AMBIGUITY_MARGIN,
@@ -554,8 +534,10 @@ def run_match_and_finalize(
 ) -> dict[str, str]:
     """Run match on existing mentions, then finalize; idempotent.
 
-    ``renew`` extends the caller's writer lease per matched shard and before
-    the publish, so a stolen lease cannot keep publishing.
+    ``force`` rebuilds every shard from scratch; ``force_publish`` publishes past the
+    skip gate and the shrinkage guard. ``renew`` extends the caller's writer
+    lease per matched shard and before the publish, so a stolen lease cannot
+    keep publishing.
 
     Returns:
         Published table name -> snapshot path; empty when nothing was published.
@@ -564,7 +546,6 @@ def run_match_and_finalize(
     tables = match_pending_mentions(
         artifact_root=resolved_root,
         data_dir=data_dir,
-        batch_size=batch_size,
         force=force,
         strong_match_threshold=strong_match_threshold,
         loose_match_threshold=loose_match_threshold,
@@ -576,7 +557,7 @@ def run_match_and_finalize(
         artifact_root=resolved_root,
         final_database_root=final_database_root,
         data_dir=data_dir,
-        force=force,
+        force_publish=force_publish,
         renew=renew,
     )
 
@@ -607,8 +588,18 @@ def normalize_genres(values: str | Sequence[str]) -> tuple[str, ...]:
     return tuple(genre for genre in GENRES if genre.upper() in selected)
 
 
-def read_cik_file(path: ArtifactPath) -> set[str]:
-    """Read a one-CIK-per-line file from local storage or S3."""
+def read_cik_file(path: ArtifactPath) -> set[str] | None:
+    """Read a one-CIK-per-line file from local storage or S3.
+
+    The value :data:`ALL_CIKS` reads nothing and returns None: no CIK filter, so
+    a run covers every filer. It is an explicit choice, never a fallback: a run
+    given no CIK file at all is an error, not a run over the whole SEC universe.
+
+    >>> read_cik_file("all") is None
+    True
+    """
+    if str(path) == ALL_CIKS:
+        return None
     return {
         line.strip() for line in read_text_artifact(path).splitlines() if line.strip()
     }

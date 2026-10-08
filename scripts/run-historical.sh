@@ -19,7 +19,7 @@ Usage: scripts/run-historical.sh --start-date YYYY-MM-DD --end-date YYYY-MM-DD \
          [--extractor-backend batch|live]
 
 The task role can only read the shared bucket under sec/, processors/cdt/,
-database/cdt/, and the committed default CIK key -- s3:// CIK paths elsewhere
+database/cdt/, and the stack's idi:cik_scope file -- s3:// CIK paths elsewhere
 fail with AccessDenied. `batch` defers extraction to the hourly poll schedule;
 `live` extracts synchronously within the task via OpenRouter.
 EOF
@@ -49,7 +49,7 @@ done
 [[ "$start_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || usage
 [[ "$end_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || usage
 # The shape regex admits impossible dates (2024-13-01); reject them here rather
-# than paying a Fargate spin-up for the orchestrator to do it.
+# than paying a Fargate spin-up for `cdt run` to do it.
 date -d "$start_date" >/dev/null 2>&1 || usage
 date -d "$end_date" >/dev/null 2>&1 || usage
 [[ -n "$cik_file" ]] || usage
@@ -91,11 +91,11 @@ overrides_json="$(jq -n \
   '{
     containerOverrides: [
       {
-        name: "cdt-orchestrator",
+        name: "cdt",
         command: (
-          ["--extractor-backend", $backend]
+          ["run", "historical", "--extractor-backend", $backend]
           + (if $force == "true" then ["--force"] else [] end)
-          + ["historical", "--cik-file", $cik_file, "--start-date", $start_date, "--end-date", $end_date]
+          + ["--cik-file", $cik_file, "--start-date", $start_date, "--end-date", $end_date]
         )
       }
     ]

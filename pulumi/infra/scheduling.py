@@ -68,7 +68,7 @@ aws.iam.RolePolicy(
 schedule = aws.scheduler.Schedule(
     "cdt-daily-schedule",
     name=f"{config.name_prefix}-schedule",
-    description="Triggers the CDT orchestrator ECS task daily",
+    description="Runs `cdt run daily` as a CDT ECS task",
     schedule_expression=config.schedule_expression,
     flexible_time_window=aws.scheduler.ScheduleFlexibleTimeWindowArgs(mode="OFF"),
     state="ENABLED" if config.schedule_enabled else "DISABLED",
@@ -76,7 +76,11 @@ schedule = aws.scheduler.Schedule(
         arn=ecs.cluster.arn,
         role_arn=scheduler_role.arn,
         input=json.dumps(
-            {"containerOverrides": [{"name": ecs.CONTAINER_NAME, "command": ["daily"]}]}
+            {
+                "containerOverrides": [
+                    {"name": ecs.CONTAINER_NAME, "command": ["run", "daily"]}
+                ]
+            }
         ),
         ecs_parameters=aws.scheduler.ScheduleTargetEcsParametersArgs(
             task_definition_arn=ecs.task_definition.arn,
@@ -106,7 +110,7 @@ schedule = aws.scheduler.Schedule(
 poll_schedule = aws.scheduler.Schedule(
     "cdt-poll-schedule",
     name=f"{config.name_prefix}-poll-schedule",
-    description="Advances the CDT OpenAI batch extract job hourly",
+    description="Runs `cdt run poll` hourly to advance the batch extract job",
     schedule_expression=config.poll_schedule_expression,
     flexible_time_window=aws.scheduler.ScheduleFlexibleTimeWindowArgs(mode="OFF"),
     state="ENABLED" if config.poll_schedule_enabled else "DISABLED",
@@ -114,7 +118,11 @@ poll_schedule = aws.scheduler.Schedule(
         arn=ecs.cluster.arn,
         role_arn=scheduler_role.arn,
         input=json.dumps(
-            {"containerOverrides": [{"name": ecs.CONTAINER_NAME, "command": ["poll"]}]}
+            {
+                "containerOverrides": [
+                    {"name": ecs.CONTAINER_NAME, "command": ["run", "poll"]}
+                ]
+            }
         ),
         ecs_parameters=aws.scheduler.ScheduleTargetEcsParametersArgs(
             task_definition_arn=ecs.task_definition.arn,

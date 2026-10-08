@@ -1,8 +1,8 @@
 # Pipeline, ingest and publish: design decisions
 
-This page explains why stage orchestration, the orchestrator's lease and batch
-poll loop, ingest, 8-K itemizing, the item classifier and the final-snapshot
-publish work the way they do, and records the measurements behind them. Code
+This page explains why the pipeline's stage sequence, whole runs (`cdt run`)
+with their lease and batch poll loop, the CLI, ingest, 8-K segmenting, the item
+classifier and the final-snapshot publish work the way they do, and records the measurements behind them. Code
 docstrings give the current contract; this page gives the reasons. Sections are
 headed by the function or constant they explain (module in parentheses), so you
 can search for a name you saw in the code.
@@ -13,7 +13,7 @@ The `FINAL_OUTPUT_*` constants and `finalize_after_match` below live in `cdt.pub
 
 ### `FINAL_OUTPUT_TABLES`
 
-The published `items` table unions the itemizer's 8-K item sections with the
+The published `items` table unions the 8-K segmenter's 8-K item sections with the
 6-K snippets. Both are "the unit of text a mention was extracted from", and
 every consumer joins a mention to its unit by `item_id`. If only the 8-K units
 were published, every 6-K mention would have no row to join to. The website
@@ -23,15 +23,15 @@ so a 6-K instrument would show none of them (#172).
 ### `FINAL_OUTPUT_TABLE_COLUMNS`
 
 A 6-K snippet row has the classifier's three columns and the triage stage's six
-on top of the itemizer's sixteen. The published `items` table keeps the
-itemizer's shape, so the extra columns are dropped rather than widening the
+on top of the 8-K segmenter's sixteen. The published `items` table keeps the
+8-K segmenter's shape, so the extra columns are dropped rather than widening the
 table with columns that are null on every 8-K row. The snippet's span and
 verdict can still be queried in the `sixk-snippets` dataset.
 
 ### `FINAL_OUTPUT_TABLE_FORM_TYPES` / `FORM_TYPE_COLUMN`
 
 `items` is the one published table where a consumer otherwise cannot tell the
-genres apart: none of the itemizer's sixteen columns records which kind of
+genres apart: none of the 8-K segmenter's sixteen columns records which kind of
 filing a row came from. The column is called `form_type` because the documents
 dataset already uses that name for the same two values, so one vocabulary
 covers both ends.
@@ -39,28 +39,32 @@ covers both ends.
 ### `GENRE_8K` / `GENRE_6K` / `DEFAULT_GENRES`
 
 A genre is a form family plus the stages that turn it into rows the extractor
-can read. 8-K goes ingest → itemize → classify. 6-K goes ingest → triage: a 6-K
-has no items to itemize, so the item classifier has nothing to classify, and
-triage writes rows in the same classified-item columns. Both meet at extract.
+can read. Both go ingest → segment → classify and meet at extract. 8-K segments
+into item sections, which the item classifier scores. A 6-K has no items, so it
+segments into window spans (`sixk-windows`), and its classify stage is the
+two-stage triage, which writes rows in the same classified-item columns
+(`sixk-snippets`). `cdt.pipeline.segment_genre` and `classify_genre` dispatch a
+stage to its genre's module, for both the CLI's stage commands and a whole run.
 
 Each genre is one record in `cdt.datasets.GENRES`: its SEC forms, and the
-datasets its upstream stages write (documents, the rows it contributes to the
-published `items` table, the rows the extractor reads). The registry lives in
+datasets its upstream stages write (documents, segments, the rows it contributes
+to the published `items` table, the rows the extractor reads). The registry lives in
 the leaf `datasets.py` and holds data only, so every stage can read it without
 importing another stage. What depends on the set of genres is derived from it
 rather than listed by hand: the extractor's `CLASSIFICATION_SOURCES`, the
 `items` table's `form_type` stamps, the CLI default and the pipeline's prepare
-loop. Adding a genre is a record, a prepare method and its stage modules.
+loop. Adding a genre is a record, a branch in `segment_genre` and
+`classify_genre`, and its stage modules.
 
-The CLIs default to every genre. A run is asked for CIKs and a date range, and
+The CLI defaults to every genre. A run is asked for CIKs and a date range, and
 the caller should not have to know, or keep in sync with the scraper's
 coverage, which forms those filers happened to file. `--genres` narrows the
 run when it is deliberately about one genre.
 
 ### `PipelineConfig.genres`
 
-The dataclass default is 8-K only, narrower than `DEFAULT_GENRES`. Both entry
-points pass their `--genres` default through, so scheduled and hand-typed runs
+The dataclass default is 8-K only, narrower than `DEFAULT_GENRES`. `cdt run`
+passes its `--genres` default through, so scheduled and hand-typed runs
 still prepare both (`test_scheduled_runs_prepare_both_genres_by_default` pins
 this). Building a config in code is not a request for a full run, though, and
 the 6-K chain scrapes the network and calls a paid model before it does
@@ -74,9 +78,9 @@ issuers, not forms. A separate 6-K list (`--sixk-cik-file`) existed because a
 list chosen for 8-K coverage may contain no foreign private issuers; it was
 removed in favour of putting those issuers in the one list (2026-10).
 
-### `PipelineOrchestrator._setup` (genre validation)
+### `Pipeline._setup` (genre validation)
 
-A config built in code (a test, the orchestrator, a notebook) skips the CLI's
+A config built in code (a test, a notebook) skips the CLI's
 parsing. A genre list that matches nothing would then run extract and finalize
 over whatever the last run left behind and report success, so `_setup`
 validates the list itself.
@@ -88,7 +92,7 @@ asked, it would look like a corpus with no filings, so unknown genres raise.
 The order is normalized so 8-K prepares first however the caller spelled the
 list.
 
-### `PipelineOrchestrator._prepare_genres`
+### `Pipeline._prepare_genres`
 
 The two chains are independent until extract. They read different documents
 datasets and write different classification sources, and work selection is by
@@ -111,15 +115,25 @@ at the assembled submission in CDT's mirror. Inlining bodies into the
 documents partition would make every read of the partition pay for every
 body (#69).
 
-### `PipelineOrchestrator._renew`
+### `Pipeline._renew`
 
 Historical runs outlast the lease TTL by hours. Renewing between stages stops
 the run from being stolen mid-write, and the hook raises `LeaseLostError` if
-the lease has already been stolen (#89).
+the lease has already been stolen (#89). Every stage also renews inside
+itself, because one stage alone can outlast the TTL. Segment, classify and
+match renew per partition (or per shard). Ingest renews per scanned day, per
+manifest and per candidate: an 8-K backfill fetches every manifest in its
+window before it writes anything. Live extraction renews before each item's
+model calls and before each partition write. Ingest and live extraction call
+their hook per item, so they wrap it in `cdt.lease.throttled`, which renews at
+most every `RENEW_INTERVAL_SECONDS` (5 minutes). A lease renewed that recently
+cannot have expired, so it cannot have been stolen, and skipping the call in
+between loses no safety.
 
 ### `DAILY_LOOKBACK_DAYS` / `resolve_mode_dates`
 
-Daily mode scans a rolling window ending yesterday, not a single day. A
+Daily mode scans a rolling window, the `DAILY_LOOKBACK_DAYS` (5) filing dates
+ending yesterday, not a single day. A
 manifest that the scraper writes or repairs after CDT's morning pass would
 otherwise never be scanned again: a permanent gap that nothing reports (#90).
 Ingest deduplicates by accession, so the re-scan costs only LIST/GET requests,
@@ -127,8 +141,9 @@ and the fingerprint registries carry late merges downstream.
 
 ### `finalize_after_match`
 
-Every entry point that runs match and publishes finishes through this one
-function (`cdt match` runs the lineage pass itself and does not publish). When the
+Every whole run that matches and publishes finishes through this one
+function (`cdt match` runs the lineage pass itself and does not publish;
+`cdt publish` calls `publish_final_tables`, the publish half, alone). When the
 lineage pass was wired into only one of three entry points, production
 published 537 of 542 instruments as lineage heads (#170).
 
@@ -173,7 +188,7 @@ moments ago can still finish reading it.
 ### `FINAL_SNAPSHOT_GUARD_RATIO` / `_guard_against_shrinkage`
 
 A table that shrinks below half its published row count blocks the publish
-unless it is forced. The likeliest causes are a bug or a half-built artifact
+unless `--force-publish` is passed. The likeliest causes are a bug or a half-built artifact
 root, not a real mass deletion of filings. The prior counts come from the
 published `latest.parquet` footers, not from the pointer. The pointer lives
 with the artifact root, so a half-built or newly pointed artifact root has no
@@ -186,7 +201,7 @@ The publish is the most expensive step in the pipeline, and its cost is set by
 request count, not bytes. Measured in production, publishing a delta of 14
 documents took 25 minutes and 21,214 sequential GETs at about 70 ms each. The
 publish pays that whether or not the run produced anything, and it runs twice
-per batch cycle, because both `run_batch_backend` and `run_poll` finalize.
+per batch cycle, because both `run.run_prepare_then_publish` and `run.run_poll` finalize.
 
 The gate asks whether anything the publish reads has changed since the
 generation the pointer names. It compares a digest of the source dataset roots
@@ -195,23 +210,27 @@ produce instruments" answers a different question. `match_pending_mentions`
 returns every shard's full instrument table, not a delta, so that frame is
 empty only on a corpus that has never produced an instrument. Such a gate would
 never have fired on the 542-instrument root #110 was measured against. It also
-cannot see `items`, which itemize and 6-K triage write before match runs.
+cannot see `items`, which segment and 6-K classify write before match runs.
 
 Three things stop the gate from blocking every publish:
 
-- `force` overrides it.
+- `--force-publish` (`force_publish`) overrides it.
 - A pointer with no recorded digest publishes, which records one for next
   time.
 - A final database root missing any `latest.parquet` publishes regardless.
   Otherwise a newly pointed output root would stay empty until someone passed
-  `--force`. The check costs four HEAD requests on objects the publish would
+  `--force-publish`. The check costs four HEAD requests on objects the publish would
   write anyway.
 
 A run that crashed between writing a dataset and publishing it needs no
-`--force` to recover: the datasets changed, so the digest changed, so the next
-run publishes. This matters because `force` is the pipeline-wide flag, and it
-also turns off `_guard_against_shrinkage`, the protection a post-crash
-republish needs most. A crash during the publish works the same way (see the
+override to recover: the datasets changed, so the digest changed, so the next
+run publishes.
+
+The override is its own flag, not `--force`. `--force` means "reprocess
+partitions", and an operator reaches for it on exactly the runs most likely to
+leave a root half-built. If it also lowered `_guard_against_shrinkage`, such a
+run could publish that root over a good database. So `--force` reaches match but
+never the publish, and only `--force-publish` lowers either publish guard. A crash during the publish works the same way (see the
 next section).
 
 With no final database root the gate answers True without listing anything:
@@ -259,7 +278,7 @@ frames next to it to float. That would change a published table's types on any
 run where one genre produced nothing.
 
 `form_type` is stamped at publish time, not read from the source, because
-neither dataset carries it. The itemizer deliberately does not copy it from the
+neither dataset carries it. The 8-K segmenter deliberately does not copy it from the
 documents dataset (see `ITEM_DOCUMENT_COLUMNS`).
 
 ### `normalize_snapshot_text` / `normalize_snapshot_cell`
@@ -272,7 +291,7 @@ everything through the text helper would publish `True` as `"True"`. Nulling
 happens once, up front, so the immutable snapshot and the database root
 publish the same values.
 
-## Orchestrator and batch poll loop (`cdt.orchestrator`)
+## Whole runs and the batch poll loop (`cdt.run`)
 
 ### Module shape and the `pipeline-writer` lease
 
@@ -283,7 +302,7 @@ with a completing poll's. `historical` has the same shape as `daily`: with the
 batch backend it prepares its date range and the next poll tick claims the
 pending partitions.
 
-### `run_batch_backend`
+### `run_prepare_then_publish`
 
 The prepare stages rewrite the same completion registries that a poll tick's
 finalize does, so the whole run holds the lease, not just match/finalize (#88).
@@ -291,9 +310,6 @@ After prepare, the run publishes from whatever mentions already exist, and the
 in-flight batch job publishes again when it completes. Prepare can outlast the
 TTL, so the run renews before match. If the lease was stolen, the snapshots
 belong to another run.
-
-`--extract-batch-size` defaults to None so this path can tell an explicit
-value, which it warns about, from the unset default.
 
 ### `LEASE_WAIT_SECONDS`
 
@@ -319,8 +335,9 @@ the poll task out of memory. Deferred partitions form the next job (#92).
 ECS has no task-level timeout: a Fargate task runs, and bills, until its
 process exits. A run stuck past every client timeout must therefore end itself
 (#93). Deadlines are per mode. A poll tick takes minutes, and its 2h matches
-the lease TTL. Daily is bounded by its 24h cadence. Historical backfills can
-legitimately run long.
+the lease TTL. Daily gets 12h, well inside its 24h cadence. Historical
+backfills can legitimately run long, and get 72h. The CLI arms the watchdog in
+`cdt run` only; a stage command has no deadline.
 
 `os._exit` deliberately skips `finally` blocks. Every artifact write is already
 crash-safe, and an unreleased lease is exactly the crash case the TTL/steal
@@ -332,9 +349,9 @@ anyway.
 70 is EX_SOFTWARE. It separates a watchdog exit from an ordinary crash in the
 task's stoppedReason. Any nonzero exit trips the task-failure alarm (#85).
 
-### Heartbeat log lines
+### `RUN_COMPLETE_MESSAGE` / `POLL_TICK_COMPLETE_MESSAGE` (heartbeat log lines)
 
-The `Orchestrator run complete: mode=...` and `Poll tick complete: ...` lines
+The `Run complete: mode=...` and `Poll tick complete: ...` lines
 feed the daily-heartbeat and poll-liveness CloudWatch alarms (#85). A day with
 no `mode=daily` completion means the run crashed, got stuck or never launched.
 Keep the literals in sync with `pulumi/infra/alerts.py`.
@@ -342,41 +359,57 @@ Keep the literals in sync with `pulumi/infra/alerts.py`.
 ### `reject_placeholder_secrets`
 
 Without this check, a task launched before the one-time
-`aws ssm put-parameter` would run a full ingest/itemize/classify and then die
+`aws ssm put-parameter` would run a full ingest/segment/classify and then die
 on a provider 401 that looks like a revoked key.
-
-### `main` / `cdt.cli.main` (`configure_s3_profile`)
-
-The S3 profile is set once per process, before any other credentialed call, so
-artifact reads, writes and the lease all use `--aws-profile` and not the
-ambient credentials. Setting it where the flag enters the process also covers
-subcommands that have no way to pass it on (#71).
 
 ## CLI (`cdt.cli`)
 
-### `add_final_database_root_argument`
+### One command line, commands named after modules
 
-Only commands that publish accept `--final-database-root`. A stage subcommand
-that accepted the flag and ignored it would mislead anyone redirecting final
-output for a single stage run (#72).
+`cdt` is the only console script. Each stage command is named after the module
+it runs (`ingest`, `segment`, `classify`, `extract`, `match`, `publish`), and
+`cdt run daily|historical|poll` runs the whole pipeline the way ECS does. A
+separate deployment entry point and a separate `cdt pipeline` command both
+called the same pipeline code but had drifted apart in their defaults, lease
+handling, flags and watchdog; one parser removes the second place for those to
+live. `cdt run historical --extractor-backend live` is the synchronous
+end-to-end run.
 
-### `acquire_stage_lease`
+### `main` (`configure_s3_profile`, `configure_logging`)
 
-Stage subcommands rewrite the same completion registries and datasets as the
-scheduled orchestrator runs. Writers that are not serialized lose registry
-updates and strand partitions (#88).
+The S3 profile is set once per process, before any other credentialed call, so
+artifact reads, writes and the lease all use `--aws-profile` and not the
+ambient credentials (#71). Every command takes the flag. Logging is configured
+on the root logger, and `cdt.shared.get_logger` routes every module's logger
+through it, so `--quiet` and `--log-file` reach every module and a run has one
+log format.
 
-### `run_backfill_mentions` (renew)
+### `ENVIRONMENT_DEFAULTS`
 
-The backfill rewrites the whole dataset. Without renewal, once the 2h TTL
-passes, the next orchestrator tick can legitimately steal the lease and start
-extract or match while the backfill is still overwriting partitions one at a
-time. Both writers fully overwrite the same objects, so rows are lost silently,
-and `release_lease` does nothing after a steal (#89, #211). At reference-corpus
-scale 236 partitions take about 10 s, so the risk was never close; the point is
-the wiring.
+Every option that has an environment default reads it in one place, so a flag
+means the same thing on every command: the flag, then its variable, then the
+built-in default. This is what lets ECS pass only `run daily` and configure the
+rest through the task definition's environment.
 
-### `run_matcher` (lineage always)
+### `_common_options(suppress=True)`
+
+A nested command (`classify train`, `extract job show`) repeats its parent's
+shared options with suppressed defaults. Otherwise the nested parser's default
+would overwrite a value given before the nested command's name.
+
+### `_final_database_root_option`
+
+Only commands that publish accept `--final-database-root`. A stage command that
+accepted the flag and ignored it would mislead anyone redirecting final output
+for a single stage run (#72).
+
+### `_with_writer_lease`
+
+Stage commands rewrite the same completion registries and datasets as the
+scheduled runs. Writers that are not serialized lose registry updates and
+strand partitions (#88).
+
+### `run_match` (lineage always)
 
 An amend-and-restate chain spans filings, so its links exist only after every
 shard has matched (#170, #204). Every inferred pointer is re-derived, never
@@ -441,8 +474,8 @@ uniqueness guarantee. Uniqueness within a partition comes from
 The set is built with one parallel `read_partitions` scan, not a `read_table`
 per partition. Measured on `data/genwindow-eval-apr/documents`, 1,640
 partitions took 26.45 s one at a time and 1.75 s as one scan, for the same
-9,077 accessions. Daily mode's five-day window bounds the loop, but
-`--mode historical` defaults to 1994 through today, which is the whole corpus.
+9,077 accessions. The daily five-day window bounds the loop, but `cdt ingest`
+given only `--end-date` starts at 1994, which is the whole corpus.
 
 ### `_write_document_partitions`
 
@@ -462,16 +495,18 @@ Each genre gets its own documents dataset. Mixing forms in one dataset would
 merge new rows into partitions the 8-K path has already processed. Every
 downstream stage selects work by source-partition fingerprint (#62), so a 6-K
 backfill would make the whole 8-K corpus pending again. The name
-`documents-sixk` matches the old `cdt.sixk` package; the genre modules are now `*.sixk`. The partition contract
+`documents-sixk` matches the genre modules, `*.sixk`. The partition contract
 reads a path's date and shard, never its dataset segment, so the name has no
 effect on behaviour.
 
 ### `SIXK_FORM_TYPES` / `DEFAULT_FORM_TYPES`
 
-Ingest itself does not care about form type. `DEFAULT_FORM_TYPES` keeps every
-caller, CLI flag and deployed schedule on 8-K unless one asks for another
-form. Both form tuples are defined in `cdt.datasets` with the genre registry,
-so the CLI has them as a default before it knows which source will run.
+Ingest itself does not care about form type. `DEFAULT_FORM_TYPES` is the 8-K
+genre's forms and `SIXK_FORM_TYPES` the 6-K genre's; which genres a run covers
+is chosen by `--genres` (default every genre), and each genre's ingest narrows
+the config to its own forms (`ingest.genres.genre_config`). Both form tuples are
+defined in `cdt.datasets` with the genre registry, so an `IngestConfig` built in
+code without forms defaults to 8-K.
 
 ### `DOCUMENT_COLUMNS` (`form_type`, `source`)
 
@@ -520,7 +555,7 @@ The first occurrence of each key is kept.
 
 ### `ITEM_DOCUMENT_COLUMNS`
 
-These columns are fixed in the itemizer, not taken from
+These columns are fixed in the 8-K segmenter, not taken from
 `ingest.DOCUMENT_COLUMNS`. Items, classifications, mentions and the published
 items snapshot all take their schema from this list. If it were derived, a
 column added to the documents dataset would reshape four datasets and the
@@ -534,20 +569,28 @@ row carries either inline text (from `download=True` ingest) or a
 CDT's own mirror for 6-K. A local run with mirrored bodies must not need AWS
 credentials to resolve them.
 
-### `itemize_pending_documents` / `classify_pending_items` (fingerprint selection and checkpoints)
+### `run_partition_stage` (fingerprint selection and checkpoints)
 
-A documents partition that ingest merged new rows into becomes pending again
-and is recomputed whole. Itemizing and classifying are cheap and
-deterministic, so row-level diffing is not worth the complexity (#62).
+`cdt.partition_stage.run_partition_stage` is the one loop behind the four
+whole-partition stages: 8-K and 6-K segment, 8-K and 6-K classify. A source
+partition that changed (ingest merged new rows into a documents partition, or
+segment rewrote a windows partition) becomes pending again and is recomputed
+whole. Segmenting and the 8-K classifier are cheap and deterministic, so
+row-level diffing is not worth the complexity (#62). A stage can report a
+partition incomplete (`PartitionOutput.complete`), which writes nothing and
+records no completion, so the next run retries it.
 
-Completion is saved at every batch boundary. When the registry was written only
-at stage end, any interruption threw away the whole run's progress: up to 2.5 h
-of itemizing on the real corpus (#111). Repeated saves are cheap and safe under
-concurrency, because only dirty entries are merged, by compare-and-swap (#88).
-The lease is renewed at the same boundary, because a stage that outlasted the
-TTL used to be stolen mid-run (#111). One last save runs after the loop, because
-`pending_source_partitions` can refresh registry entries (backfill,
-fingerprint adoption) even when nothing was pending.
+Completion is checkpointed by time: saved at most every
+`CHECKPOINT_INTERVAL_SECONDS` (300 s) and once at the end. When the registry was
+written only at stage end, any interruption threw away the whole run's progress:
+up to 2.5 h of itemizing on the real corpus (#111). A count of partitions is the
+wrong unit for the interval, because what a partition costs varies by stage and
+will vary by partition layout. A time interval bounds the loss directly. A save
+is a few S3 requests, so at 300 s it costs nothing worth measuring. Repeated
+saves are safe under concurrency, because only dirty entries are merged, by
+compare-and-swap (#88). The lease is renewed after every partition, throttled
+to `RENEW_INTERVAL_SECONDS`, because a stage that outlasts the TTL would
+otherwise be stolen mid-run.
 
 ## The classifier (`cdt.classifier`)
 

@@ -12,10 +12,10 @@ The `dev` stack provisions:
 - an ECS Fargate cluster and task definition
 - IAM roles for ECS execution and runtime access
 - a CloudWatch log group
-- two EventBridge Scheduler schedules: a daily `cdt-orchestrator daily` and an hourly `cdt-orchestrator poll`
+- two EventBridge Scheduler schedules: a daily `cdt run daily` and an hourly `cdt run poll`
 - SSM SecureString parameters holding `OPENAI_API_KEY` and `OPENROUTER_API_KEY` under `/idi/dev/cdt/secrets/`
 
-The daily task runs `cdt-orchestrator daily`; the hourly task runs `cdt-orchestrator poll` to advance the OpenAI batch extract job. Historical runs are manual ECS task invocations with a container command override.
+The daily task runs `cdt run daily`; the hourly task runs `cdt run poll` to advance the OpenAI batch extract job. Historical runs are manual ECS task invocations with a container command override.
 
 ## Dev Values
 
@@ -25,12 +25,13 @@ These are the current recommended `dev` values:
 aws:region = us-east-2
 idi:artifact_prefix = processors/cdt
 idi:final_database_prefix = database/cdt
-idi:default_cik_key = processors/cdt/inputs/ciks/beta-1k.txt
+idi:cik_scope = processors/cdt/inputs/ciks/beta-1k.txt
 idi:cpu = 1024
 idi:memory = 4096
 idi:ecr_image_retention_count = 5
 idi:cron = cron(0 7 * * ? *)
 idi:schedule_enabled = false
+idi:poll_schedule_enabled = true
 ```
 
 These are already committed in `pulumi/Pulumi.dev.yaml`; the bucket and DLQ names
@@ -107,16 +108,21 @@ cd ..
 
 ## Upload the Beta CIK File
 
-For the first `dev` deploy, use the local `data/ciks/1000-ciks.txt` file as the default run scope. CIK
-universes live under `data/ciks/`, which is gitignored, so fetch or regenerate the file if it is absent:
+`idi:cik_scope` is the run scope a scheduled or historical run uses when it is
+given no `--cik-file`: the bucket-relative key of a one-CIK-per-line file, or
+`all` for every filer. The beta lists are already in S3 under
+`processors/cdt/inputs/ciks/` (`beta-1k.txt` is the beta default). To scope a
+new stack to a list of your own, upload it there first:
 
 ```bash
-aws s3 cp \
-  data/ciks/1000-ciks.txt \
-  s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/inputs/ciks/beta-1k.txt
+aws s3 cp my-ciks.txt \
+  s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/inputs/ciks/my-ciks.txt
 ```
 
-The deployed daily job and any manual historical run can override the CIK file, but this path is the default `dev` value.
+The task role reads the shared bucket under `sec/`, `processors/cdt/` (it also
+writes there) and `database/cdt/`, plus the one file `idi:cik_scope` names when
+that file lives elsewhere. A manual historical run can pass a different
+`--cik-file` anywhere under `processors/cdt/`, such as the beta lists.
 
 ## Create and Configure the Pulumi Stack
 
@@ -146,7 +152,7 @@ The OpenAI key powers the deployed batch extract poller and is required. The
 optional `idi:poll_cron` (default `cron(30 * * * ? *)`) controls the hourly poll
 schedule.
 
-This processor stack does not publish Cloudflare R2 JSON. It writes final parquet snapshots under `idi:final_database_prefix`; the dashboard publisher stack in `../commercial-debt-tracker-dashboard` reads those snapshots and updates R2.
+This processor stack does not publish Cloudflare R2 JSON. It writes final parquet snapshots under `idi:final_database_prefix`; the website publisher ([dsi-rse/commercial-debt-tracker-website](https://github.com/dsi-rse/commercial-debt-tracker-website)) reads those snapshots and updates R2.
 
 ## Preview and Deploy
 
@@ -173,12 +179,12 @@ pulumi stack output log_group_name
 The EventBridge schedule runs the container with:
 
 ```bash
-cdt-orchestrator daily
+cdt run daily
 ```
 
 It does not run `historical`.
 
-Because `idi:schedule_enabled` should be `false` for the first deploy, nothing runs automatically until you enable the schedule and deploy again.
+With the committed values, the daily schedule is off (`idi:schedule_enabled: false`) but the hourly poll is on (`idi:poll_schedule_enabled: true`). So after the first deploy, `cdt run poll` starts every hour. It is cheap while there is nothing to extract, and it drains the batch job a manual historical run leaves behind. Nothing else runs automatically until you enable the daily schedule and deploy again.
 
 ## Run a Historical Backfill Manually
 
@@ -211,9 +217,9 @@ aws ecs run-task \
   --overrides '{
     "containerOverrides": [
       {
-        "name": "cdt-orchestrator",
+        "name": "cdt",
         "command": [
-          "historical",
+          "run", "historical",
           "--cik-file", "s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/inputs/ciks/beta-1k.txt",
           "--start-date", "2024-01-01",
           "--end-date", "2024-01-31"
@@ -249,9 +255,9 @@ aws ecs run-task \
   --overrides "{
     \"containerOverrides\": [
       {
-        \"name\": \"cdt-orchestrator\",
+        \"name\": \"cdt\",
         \"command\": [
-          \"historical\",
+          \"run\", \"historical\",
           \"--cik-file\", \"s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/inputs/ciks/beta-50k.txt\",
           \"--start-date\", \"2016-01-01\",
           \"--end-date\", \"$(date +%F)\"
@@ -273,8 +279,11 @@ Expected `dev` artifacts:
 
 ```text
 s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/documents/...
+s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/documents-sixk/...
 s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/items/...
+s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/sixk-windows/...
 s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/classifications/...
+s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/sixk-snippets/...
 s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/mentions/...
 s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/mention-cluster-edges/...
 s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/debt-instruments/...
@@ -297,4 +306,4 @@ pulumi config set idi:schedule_enabled true
 uv run pulumi up
 ```
 
-At that point the scheduler will run `daily` mode automatically using the default CIK file configured in `idi:default_cik_key`.
+At that point the scheduler will run `daily` mode automatically over the scope configured in `idi:cik_scope`.

@@ -8,7 +8,7 @@ import pulumi
 
 from . import config, ecr, iam, logs, secrets
 
-CONTAINER_NAME = "cdt-orchestrator"
+CONTAINER_NAME = "cdt"
 artifact_root = f"s3://{config.output_bucket_name}/{config.artifact_prefix}"
 final_database_root = f"s3://{config.output_bucket_name}/{config.final_database_prefix}"
 
@@ -56,7 +56,7 @@ container_definitions = pulumi.Output.all(
                     "options": {
                         "awslogs-group": args["log_group_name"],
                         "awslogs-region": args["region"],
-                        "awslogs-stream-prefix": "orchestrator",
+                        "awslogs-stream-prefix": "cdt",
                     },
                 },
                 "stopTimeout": 30,

@@ -25,8 +25,10 @@ this is the runtime implementation.
    an instrument's amounts and dates while cutting away the noun that names it.
 6. **Stage 2: LLM over a whole filing's expanded windows at once.**
 
-Steps 1-3 are composed by `cdt.segmenter.sixk.prepare_filing`, so the order is code
-rather than prose. It matters in both directions: the gate applies to the whole
+Steps 1-3 are the segment stage and steps 4-6 the classify stage (see "Segment
+and classify" below). Steps 1-2 are `cdt.segmenter.sixk.gated_body` and step 3
+`split_into_windows`; `prepare_filing` composes all three for one text, so the
+order is code rather than prose. It matters in both directions: the gate applies to the whole
 document, so applying it per window would change the 13.4% pass rate above,
 and stripping has to come first because a prologue's tag names are themselves
 made of debt vocabulary.
@@ -187,15 +189,15 @@ Following the two patterns already in the repo rather than inventing a third:
 
 | | where | default | override |
 |---|---|---|---|
-| stage-1 artifact **path** | `cdt.classifier.triage.default_model_dir()` | `DATA_DIR/models/sixk/stage1-tfidf-linear-svc` | `DATA_DIR`, or pass `model_dir` |
+| stage-1 artifact **path** | `cdt.classifier.triage.default_model_dir()` | the committed `data/models/sixk/stage1-tfidf-linear-svc` | `cdt classify --sixk-model-dir`, or pass `model_dir` |
 | stage-1 **threshold** | the artifact's `metadata.json` | 0.332 | retrain and recalibrate |
 | stage-2 **model id** | `settings.SIXK_TRIAGE_MODEL` | `openai/gpt-5.6-luna` | `SIXK_TRIAGE_MODEL` env |
 | stage-2 **reasoning effort** | `settings.SIXK_TRIAGE_REASONING` | `none` | `SIXK_TRIAGE_REASONING` env |
 | **expansion** minimum / cap / merge budget | `cdt.segmenter.sixk` constants | 200 / 400 / 2,000 tokens | pass `min_tokens`, `max_tokens`, `max_merged_tokens` |
 
-Paths follow the 8-K classifier, which derives from `DATA_DIR` via
-`classifier.core.default_model_dir` rather than taking a settings entry, so one
-variable moves both classifiers. Model ids and reasoning effort follow the
+Paths follow the 8-K classifier: both default to the committed artifacts under
+`settings.MODELS_DIR` (the repo's `data/models`), not to `DATA_DIR`, because the
+models are part of the code and `DATA_DIR` is where a developer's data lives. Model ids and reasoning effort follow the
 extractor, which does keep
 them in `settings.py` with an env override. Both are read inside
 `triage_filing` rather than bound as default arguments, so an override applied
@@ -236,6 +238,48 @@ labelled windows (231 positive) with the 500 evaluation windows held out.
   the text rather than a judgement of relevance. It says the input now
   determines an answer; it does not say the answer improved. 6-K rerun
   stability, the other half of the check in issue #172, needs a pipeline run.
+
+## Segment and classify: where the windows are stored
+
+The 6-K chain is split at the window boundary, as the 8-K chain is at the item
+boundary. `cdt segment --genres 6-K` (`cdt.segmenter.sixk.segment_pending_sixk_documents`)
+runs the strip, the gate and the windowing and writes `sixk-windows`.
+`cdt classify --genres 6-K` (`cdt.classifier.sixk.triage_pending_windows`) runs
+stage 1, expansion and stage 2 into `sixk-snippets`. Retuning or retraining stage
+1 then reruns only classify; the windowing and its tokenizing, most of the 6-K
+CPU time, do not rerun.
+
+**Windows are stored as spans, not text.** Measured on 264 real 6-Ks (filed
+2026-09-15 to 09-17): 33 pass the gate and yield 3,567 windows, about 108 per
+passing filing, of which stage 1 admits about 6%. As parquet, a span row costs
+about 20 bytes and a row carrying its text about 730: roughly 0.23 MB against
+9.7 MB per 1,000 filings, or about 160 MB against 7 GB over a 20-year backfill
+of an estimated 700k filings.
+
+Storing the text would save classify almost nothing, because expansion reads up
+to 400 tokens *before* each admitted window, so classify needs the source text
+anyway for every filing that reaches stage 2, which is nearly every filing that
+has windows. Classify therefore reads each windows partition together with the
+`documents-sixk` partition of the same date and shard, re-derives the gated
+body of each document from the mirrored submission (`prose_documents`, then
+`gated_body`), and rebuilds every window as `body[start:end]`. That costs one
+extra read of the mirror per gate-passing filing.
+
+The coupling is guarded rather than assumed. Each span row carries
+`source_sha256`, the digest of the body it indexes. If the rebuilt body's digest
+differs — the flattening code changed between the two stages, or the document
+is missing — classify holds the whole partition. It makes no stage-2 call for
+any of its filings and writes nothing for it. It records an entry that matches
+no fingerprint, so the partition stays pending, even under `--force` with an
+earlier entry stored. After processing every other partition it raises
+`StaleSegmentationError`, naming the held partitions. The advice is to rerun
+`cdt segment --genres 6-K`, which re-windows every documents partition that
+changed, and to add `--force` only if the segmenter code itself changed.
+
+A re-segment that leaves a partition with no windows at all, because the gate
+now rejects its only filing, overwrites that windows partition with an empty
+table. Classify then sees the partition change, writes an empty snippets
+partition over the old one, and extract prunes the mentions that came from it.
 
 ## Where expansion runs
 
@@ -340,9 +384,11 @@ sharing an id there is correct.
 window: with the accession and document index in `item`, it names every window
 stage 1 admitted.
 
-The stage recomputes a whole documents partition when ingest merged new rows
-into it, as itemize and classify do. Unlike them this costs an LLM call per
-filing with admitted windows; at about $0.25 per 1,000 filings that is accepted.
+Both 6-K stages recompute a whole partition when their source partition
+changed: segment when ingest merged new rows into a documents partition, and
+classify when that rewrote the windows partition, as the 8-K segment and
+classify stages do. Unlike them, classify costs an LLM call per filing with
+admitted windows; at about $0.25 per 1,000 filings that is accepted.
 
 The OpenAI provider (`SIXK_TRIAGE_PROVIDER=openai`) exists because OpenRouter
 reserves an estimated maximum cost per in-flight request, so it is the first to

@@ -24,5 +24,5 @@ ENV TIKTOKEN_CACHE_DIR=/opt/tiktoken
 RUN mkdir -p "$TIKTOKEN_CACHE_DIR" \
     && python -c "from cdt.segmenter.sixk import count_tokens; count_tokens('warm')"
 
-ENTRYPOINT ["cdt-orchestrator"]
+ENTRYPOINT ["cdt"]
 CMD ["--help"]

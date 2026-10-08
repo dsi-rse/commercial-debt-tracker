@@ -1,15 +1,16 @@
-"""The 6-K triage stage: window a filing, score it, prune it, persist it.
+"""The 6-K classify stage: score a filing's windows, prune them, persist snippets.
 
-The 6-K counterpart of itemize → classify. Reads the 6-K documents dataset and
-writes ``sixk-snippets``, whose rows carry the classified-item columns plus
-:data:`SIXK_EXTRA_COLUMNS`, so the extractor reads both genres with one
-projection.
+The 6-K counterpart of the 8-K item classifier. Reads the ``sixk-windows`` spans
+the segment stage wrote and writes ``sixk-snippets``, whose rows carry the
+classified-item columns plus :data:`SIXK_EXTRA_COLUMNS`, so the extractor reads
+both genres with one projection.
 
-Per filing: window each prose document (:func:`cdt.segmenter.sixk.prepare_filing`),
-admit windows with stage 1, expand and merge the admitted ones
-(:func:`cdt.segmenter.sixk.expand_admitted_windows`), then judge them with stage 2. One
-row is written per snippet stage 2 judged, kept or dropped, with its verdict;
-windows stage 1 rejected are not persisted. Design notes are in
+Per filing: rebuild each window over the text it was cut from
+(:func:`cdt.segmenter.sixk.window_from_span`), admit windows with stage 1,
+expand and merge the admitted ones
+(:func:`cdt.segmenter.sixk.expand_admitted_windows`), then judge them with
+stage 2. One row is written per snippet stage 2 judged, kept or dropped, with
+its verdict; windows stage 1 rejected are not persisted. Design notes are in
 ``docs/sixk-two-stage-triage.md``.
 """
 
@@ -19,7 +20,6 @@ import asyncio
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from time import perf_counter
 from typing import Self
 
 import pandas as pd
@@ -34,36 +34,34 @@ from cdt.classifier.triage import (
     stage1_admit,
     triage_filing,
 )
-from cdt.completion import (
-    CompletedPartition,
-    completion_registry_root,
-    pending_source_partitions,
-    save_completion_registry,
-)
 from cdt.datasets import (
     SIXK_DOCUMENT_DATASET_NAME,
     SIXK_SNIPPET_DATASET_NAME,
+    SIXK_WINDOW_DATASET_NAME,
     dataset_root,
     date_shard_partition_path,
-    parse_date_shard_partition,
     resolve_artifact_root,
-    run_manifest_path,
 )
 from cdt.ingest.core import DOCUMENT_COLUMNS
+from cdt.partition_stage import PartitionOutput, run_partition_stage
 from cdt.segmenter.core import document_text_for_record, ensure_s3_client
 from cdt.segmenter.sixk import (
+    SIXK_WINDOW_COLUMNS,
     TextWindow,
+    body_digest,
     expand_admitted_windows,
-    prepare_filing,
+    gated_body,
     prose_documents,
+    window_from_span,
 )
 from cdt.shared import get_logger
-from cdt.storage.objects import write_json_artifact
-from cdt.storage.tables import read_table, write_partition_table
+from cdt.storage.objects import artifact_exists
+from cdt.storage.tables import read_table
 
 LOGGER = get_logger(__name__)
 
-STAGE_NAME = "sixk"
+#: Completion-registry and run-manifest name of the 6-K classify stage.
+STAGE_NAME = "sixk-classify"
 #: How many filings' stage-2 calls are in flight at once. One call per filing,
 #: so this bounds provider concurrency for the whole stage.
 DEFAULT_CONCURRENCY = 4
@@ -240,7 +238,31 @@ class _FilingPlan:
     candidates: list[_Candidate]
 
 
-def triage_documents(
+#: What to do when stored spans no longer match their text. A plain segment
+#: run re-windows every documents partition that changed; --force is needed
+#: only when the segmenter itself changed, and re-windows every partition.
+RESEGMENT_ADVICE = (
+    "Run `cdt segment --genres 6-K`, adding --force only if the segmenter "
+    "code changed."
+)
+
+
+class StaleSegmentationError(RuntimeError):
+    """Window spans no longer index the text their source submission yields."""
+
+
+@dataclass(frozen=True)
+class TriageOutput:
+    """Snippet rows for a set of filings, and the filings that could not be rebuilt."""
+
+    rows: pd.DataFrame
+    #: Accessions whose stored spans do not match the rebuilt text (see
+    #: :func:`_candidates_for_filing`); none of their rows are in ``rows``.
+    stale_accessions: tuple[str, ...] = ()
+
+
+def triage_windows(
+    windows: pd.DataFrame,
     documents: pd.DataFrame,
     *,
     data_dir: Path | None = None,
@@ -250,29 +272,56 @@ def triage_documents(
     s3_client: object | None = None,
     concurrency: int = DEFAULT_CONCURRENCY,
     max_attempts: int | None = None,
-) -> pd.DataFrame:
-    """Window, score and prune in-memory 6-K document rows.
+) -> TriageOutput:
+    """Score, expand and prune in-memory 6-K window spans.
 
-    ``artifacts`` is a pre-loaded ``(model, threshold)`` pair; when ``None`` the
-    model is loaded from ``model_dir``. ``client`` defaults to
+    ``windows`` are span rows (SIXK_WINDOW_COLUMNS); ``documents`` the 6-K
+    documents rows they were cut from, which supply each filing's text and
+    metadata. ``artifacts`` is a pre-loaded ``(model, threshold)`` pair; when
+    ``None`` the model is loaded from ``model_dir``. ``client`` defaults to
     :func:`default_triage_client`, built only if a stage-2 call is needed.
-    Returns one row per judged snippet; empty when nothing passes stage 1.
     """
-    if documents.empty:
-        return _empty_snippets()
+    if windows.empty:
+        return TriageOutput(rows=_empty_snippets())
 
     model, threshold = artifacts or load_stage1_model(model_dir)
-    records = documents.to_dict("records")
-    resolved_s3_client = ensure_s3_client(s3_client, records)
+    documents_by_accession = {
+        str(record["accession_number"]): record
+        for record in documents.to_dict("records")
+    }
+    resolved_s3_client = ensure_s3_client(
+        s3_client, list(documents_by_accession.values())
+    )
 
     plans: list[_FilingPlan] = []
-    windowed = 0
-    for record in records:
-        candidates = _candidates_for_filing(
-            record, data_dir=data_dir, s3_client=resolved_s3_client
+    stale: list[str] = []
+    for accession_number, filing_windows in windows.groupby(
+        "accession_number", sort=True
+    ):
+        document = documents_by_accession.get(str(accession_number))
+        candidates = (
+            None
+            if document is None
+            else _candidates_for_filing(
+                document,
+                filing_windows,
+                data_dir=data_dir,
+                s3_client=resolved_s3_client,
+            )
         )
-        windowed += len(candidates)
-        plans.append(_FilingPlan(document=record, candidates=candidates))
+        if candidates is None:
+            stale.append(str(accession_number))
+            continue
+        plans.append(_FilingPlan(document=document, candidates=candidates))
+    if stale:
+        LOGGER.error(
+            "6-K window spans do not match their source text: accessions=%s. %s",
+            ",".join(stale),
+            RESEGMENT_ADVICE,
+        )
+        # The partition is held whole, so stage 2 would be paid for nothing.
+        return TriageOutput(rows=_empty_snippets(), stale_accessions=tuple(stale))
+    windowed = sum(len(plan.candidates) for plan in plans)
 
     admitted_by_filing = [
         stage1_admit(
@@ -293,11 +342,11 @@ def triage_documents(
     sent_total = sum(len(sent) for sent in sent_by_filing)
     if admitted_total == 0:
         LOGGER.info(
-            "6-K triage: filings=%s gated_windows=%s stage1_admitted=0 (no stage-2 call)",
+            "6-K triage: filings=%s windows=%s stage1_admitted=0 (no stage-2 call)",
             len(plans),
             windowed,
         )
-        return _empty_snippets()
+        return TriageOutput(rows=_empty_snippets(), stale_accessions=tuple(stale))
 
     verdicts = _judge_filings(
         plans,
@@ -313,42 +362,60 @@ def triage_documents(
     ]
     table = _normalize_snippets(pd.DataFrame(rows, columns=SIXK_SNIPPET_COLUMNS))
     degraded = sum(1 for verdict in verdicts if verdict is not None and verdict.error)
+    kept = int(table["relevance"].fillna(False).sum())
     LOGGER.info(
-        "6-K triage: filings=%s gated_windows=%s stage1_admitted=%s "
+        "6-K triage: filings=%s windows=%s stage1_admitted=%s "
         "snippets_sent=%s kept=%s dropped=%s degraded_filings=%s",
         len(plans),
         windowed,
         admitted_total,
         sent_total,
-        int(table["relevance"].fillna(False).sum()),
-        sent_total - int(table["relevance"].fillna(False).sum()),
+        kept,
+        sent_total - kept,
         degraded,
     )
-    return table
+    return TriageOutput(rows=table, stale_accessions=tuple(stale))
 
 
 def _candidates_for_filing(
     document: dict[str, object],
+    windows: pd.DataFrame,
     *,
     data_dir: Path | None,
     s3_client: object | None,
-) -> list[_Candidate]:
-    """Split, flatten, gate and window one filing's submission."""
+) -> list[_Candidate] | None:
+    """Rebuild one filing's stored window spans over its submission's text.
+
+    Returns None when any span's document is missing from the submission, is
+    now gated out, or yields text whose digest differs from ``source_sha256``:
+    the spans were cut from different text, so none of them can be trusted.
+    """
     accession_number = str(document["accession_number"])
-    submission = document_text_for_record(
-        document, data_dir=data_dir, s3_client=s3_client
+    prose = prose_documents(
+        document_text_for_record(document, data_dir=data_dir, s3_client=s3_client)
     )
     candidates: list[_Candidate] = []
-    for document_index, prose in enumerate(prose_documents(submission)):
-        for window in prepare_filing(prose.text):
+    for document_index, document_windows in windows.groupby(
+        "document_index", sort=True
+    ):
+        index = int(document_index)
+        body = gated_body(prose[index].text) if index < len(prose) else None
+        expected = set(document_windows["source_sha256"])
+        if body is None or expected != {body_digest(body)}:
+            return None
+        for row in document_windows.sort_values("window").itertuples(index=False):
             candidates.append(
                 _Candidate(
-                    snippet_id=snippet_id_for(
-                        accession_number, document_index, window.index
+                    snippet_id=snippet_id_for(accession_number, index, int(row.window)),
+                    document_index=index,
+                    document_type=str(row.document_type),
+                    window=window_from_span(
+                        body,
+                        index=int(row.window),
+                        start=int(row.start),
+                        end=int(row.end),
+                        token_count=int(row.token_count),
                     ),
-                    document_index=document_index,
-                    document_type=prose.document_type,
-                    window=window,
                 )
             )
     return candidates
@@ -533,11 +600,10 @@ def _normalize_snippets(table: pd.DataFrame) -> pd.DataFrame:
     return normalized
 
 
-def triage_pending_documents(
+def triage_pending_windows(
     *,
     artifact_root: str | Path | None = None,
     data_dir: Path | None = None,
-    batch_size: int = 100,
     force: bool = False,
     model_dir: Path | None = None,
     client: SupportsChatCompletion | None = None,
@@ -546,150 +612,87 @@ def triage_pending_documents(
     max_attempts: int | None = None,
     renew: Callable[[], None] | None = None,
 ) -> pd.DataFrame:
-    """Triage pending 6-K document partitions into snippet partitions.
+    """Triage pending ``sixk-windows`` partitions into ``sixk-snippets`` partitions.
 
-    A documents partition is pending when its fingerprint changed since it was
-    last triaged, or always with ``force``. Writes a snippets partition for each
-    one that yields rows, the completion registry and a run manifest; ``renew``
-    is called at each batch boundary. Returns the concatenated snippets.
+    A windows partition is pending when its fingerprint changed since it was
+    last classified, or always with ``force``, and is recomputed whole, at one
+    LLM call per filing with admitted windows. Each partition's filings are read
+    from the 6-K documents partition of the same date and shard. A partition
+    holding a filing whose spans no longer match its text is left pending and
+    unwritten. Returns the snippet rows written this run.
 
     Raises:
-        ValueError: If ``batch_size`` or ``concurrency`` is not positive.
+        ValueError: If ``concurrency`` is not positive.
+        StaleSegmentationError: After every other partition is processed, if
+            any partition was left pending for stale spans.
     """
-    if batch_size <= 0:
-        msg = f"batch_size must be positive, got {batch_size}"
-        raise ValueError(msg)
     if concurrency <= 0:
         msg = f"concurrency must be positive, got {concurrency}"
         raise ValueError(msg)
-
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
-    processed_frames: list[pd.DataFrame] = []
-    partitions_written: list[str] = []
-    visited_document_paths: set[str] = set()
-    empty_partitions = 0
-    total_documents = 0
-    # A partition ingest merged rows into is recomputed whole, at one LLM call
-    # per filing with admitted windows.
-    pending_with_fingerprints, registry = pending_source_partitions(
-        STAGE_NAME,
-        SIXK_DOCUMENT_DATASET_NAME,
-        artifact_root=resolved_root,
-        data_dir=data_dir,
-        force=force,
-    )
-    pending_document_paths = [path for path, _ in pending_with_fingerprints]
-    source_fingerprints = dict(pending_with_fingerprints)
-
     artifacts: tuple[object, float] | None = None
-    if pending_document_paths:
-        model, threshold = load_stage1_model(model_dir)
-        artifacts = (model, threshold)
-        LOGGER.info("Stage-1 threshold %.3f", threshold)
+    shared_client = s3_client
 
-    total_partitions = len(pending_document_paths)
-    for chunk_start in range(0, total_partitions, batch_size):
-        chunk_paths = pending_document_paths[chunk_start : chunk_start + batch_size]
-        for partition_index, document_path in enumerate(
-            chunk_paths, start=chunk_start + 1
-        ):
-            partition = parse_date_shard_partition(document_path)
-            partition_label = f"date={partition['date']} shard={partition['shard']}"
-            partition_start = perf_counter()
-            visited_document_paths.add(document_path)
-            documents = read_table(document_path, DOCUMENT_COLUMNS).reindex(
-                columns=DOCUMENT_COLUMNS
-            )
-            total_documents += len(documents)
-            snippets = triage_documents(
-                documents,
-                data_dir=data_dir,
-                model_dir=model_dir,
-                artifacts=artifacts,
-                client=client,
-                s3_client=s3_client,
-                concurrency=concurrency,
-                max_attempts=max_attempts,
-            )
-            if snippets.empty:
-                empty_partitions += 1
-            else:
-                write_partition_table(
-                    sixk_snippets_root(resolved_root, data_dir=data_dir),
-                    partition={"date": partition["date"], "shard": partition["shard"]},
-                    table=snippets.reindex(columns=SIXK_SNIPPET_COLUMNS),
-                )
-                processed_frames.append(snippets)
-                partitions_written.append(
-                    date_shard_partition_path(
-                        SIXK_SNIPPET_DATASET_NAME,
-                        partition_date=partition["date"],
-                        shard=partition["shard"],
-                        artifact_root=resolved_root,
-                        data_dir=data_dir,
-                    )
-                )
-            LOGGER.info(
-                "6-K triage partition complete: %s progress=%s/%s filings=%s "
-                "snippets=%s relevant=%s wrote_output=%s elapsed=%.1fs",
-                partition_label,
-                partition_index,
-                total_partitions,
-                len(documents),
-                len(snippets),
-                int(snippets["relevance"].fillna(False).sum())
-                if not snippets.empty
-                else 0,
-                not snippets.empty,
-                perf_counter() - partition_start,
-            )
-
-        # Persist completion and renew the writer lease per batch, so an
-        # interruption keeps finished batches and a long run keeps its lease.
-        for document_path in chunk_paths:
-            registry[document_path] = CompletedPartition(
-                fingerprint=source_fingerprints.get(document_path)
-            )
-        save_completion_registry(
-            STAGE_NAME,
-            registry,
+    def process(source_path: str, partition: dict[str, str]) -> PartitionOutput:
+        nonlocal artifacts, shared_client
+        if artifacts is None:
+            artifacts = load_stage1_model(model_dir)
+            LOGGER.info("Stage-1 threshold %.3f", artifacts[1])
+        windows = read_table(source_path, SIXK_WINDOW_COLUMNS).reindex(
+            columns=SIXK_WINDOW_COLUMNS
+        )
+        documents_path = date_shard_partition_path(
+            SIXK_DOCUMENT_DATASET_NAME,
+            partition_date=partition["date"],
+            shard=partition["shard"],
             artifact_root=resolved_root,
             data_dir=data_dir,
         )
-        if renew is not None:
-            renew()
+        documents = (
+            read_table(documents_path, DOCUMENT_COLUMNS).reindex(
+                columns=DOCUMENT_COLUMNS
+            )
+            if artifact_exists(documents_path)
+            else pd.DataFrame(columns=DOCUMENT_COLUMNS)
+        )
+        shared_client = ensure_s3_client(shared_client, documents.to_dict("records"))
+        output = triage_windows(
+            windows,
+            documents,
+            data_dir=data_dir,
+            artifacts=artifacts,
+            client=client,
+            s3_client=shared_client,
+            concurrency=concurrency,
+            max_attempts=max_attempts,
+        )
+        return PartitionOutput(
+            rows=output.rows,
+            source_rows=windows["accession_number"].nunique(),
+            complete=not output.stale_accessions,
+        )
 
-    save_completion_registry(
-        STAGE_NAME, registry, artifact_root=resolved_root, data_dir=data_dir
-    )
-    write_json_artifact(
-        run_manifest_path(
-            STAGE_NAME, "latest", artifact_root=resolved_root, data_dir=data_dir
-        ),
-        {
-            "artifact_root": resolved_root,
-            "stage": STAGE_NAME,
-            "batch_size": batch_size,
+    result = run_partition_stage(
+        STAGE_NAME,
+        source_dataset=SIXK_WINDOW_DATASET_NAME,
+        output_dataset=SIXK_SNIPPET_DATASET_NAME,
+        output_columns=SIXK_SNIPPET_COLUMNS,
+        process=process,
+        artifact_root=resolved_root,
+        data_dir=data_dir,
+        force=force,
+        renew=renew,
+        manifest_extra={
             "concurrency": concurrency,
-            "force": force,
             "stage2_model": settings.SIXK_TRIAGE_MODEL,
             "stage2_provider": settings.SIXK_TRIAGE_PROVIDER,
-            "documents_processed": total_documents,
-            "partitions_visited": sorted(visited_document_paths),
-            "partitions_written": partitions_written,
-            "empty_partitions_skipped_from_write": empty_partitions,
-            "completion_registry": completion_registry_root(
-                STAGE_NAME, artifact_root=resolved_root, data_dir=data_dir
-            ),
         },
     )
-    LOGGER.info(
-        "6-K triage complete: documents=%s partitions_written=%s",
-        total_documents,
-        len(partitions_written),
-    )
-    if not processed_frames:
-        return _empty_snippets()
-    return pd.concat(processed_frames, ignore_index=True).reindex(
-        columns=SIXK_SNIPPET_COLUMNS
-    )
+    if result.held_partitions:
+        msg = (
+            f"{len(result.held_partitions)} 6-K windows partition(s) hold spans that "
+            f"no longer match their source text and were left pending. "
+            f"{RESEGMENT_ADVICE} Partitions: " + ", ".join(result.held_partitions)
+        )
+        raise StaleSegmentationError(msg)
+    return result.rows

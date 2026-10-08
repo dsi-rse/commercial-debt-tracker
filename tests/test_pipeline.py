@@ -24,6 +24,7 @@ from cdt.pipeline import (
     run_pipeline,
     run_prepare_stages,
 )
+from cdt.publish import PublishGuardError
 from cdt.storage.tables import read_dataset, read_table, write_partition_table
 
 EXPECTED_SIXK_SNIPPETS = 2
@@ -66,6 +67,7 @@ def test_run_pipeline_uses_stage_backed_functions(
         ciks: set[str] | None = None,
         s3_client: object | None = None,
         return_documents: bool = False,
+        renew: Callable[[], None] | None = None,
     ) -> tuple[pd.DataFrame, IngestRunResult]:
         del s3_client
         calls.append(("ingest", ciks))
@@ -88,12 +90,12 @@ def test_run_pipeline_uses_stage_backed_functions(
             run_manifest=str(tmp_path / "runs" / "ingest" / "run_id=1.json"),
         )
 
-    def fake_itemize_pending_documents(**kwargs: object) -> pd.DataFrame:
-        calls.append(("itemize", kwargs["batch_size"]))
+    def fake_segment_pending_eightk_documents(**kwargs: object) -> pd.DataFrame:
+        calls.append(("segment", None))
         return pd.DataFrame([{"item_id": "item-1"}])
 
     def fake_classify_pending_items(**kwargs: object) -> pd.DataFrame:
-        calls.append(("classify", kwargs["batch_size"]))
+        calls.append(("classify", None))
         return pd.DataFrame([{"item_id": "item-1", "relevance": True}])
 
     def fake_acquire_scraped_sixk_documents(
@@ -102,6 +104,7 @@ def test_run_pipeline_uses_stage_backed_functions(
         ciks: set[str] | None = None,
         s3_client: object | None = None,
         return_documents: bool = False,
+        renew: Callable[[], None] | None = None,
     ) -> tuple[pd.DataFrame, IngestRunResult]:
         del s3_client
         calls.append(("ingest-sixk", ciks))
@@ -123,16 +126,20 @@ def test_run_pipeline_uses_stage_backed_functions(
             dataset_name="documents-sixk",
         )
 
-    def fake_triage_pending_documents(**kwargs: object) -> pd.DataFrame:
-        calls.append(("sixk", kwargs["batch_size"]))
+    def fake_segment_pending_sixk_documents(**kwargs: object) -> pd.DataFrame:
+        calls.append(("segment-sixk", None))
+        return pd.DataFrame([{"accession_number": "2"}])
+
+    def fake_triage_pending_windows(**kwargs: object) -> pd.DataFrame:
+        calls.append(("classify-sixk", None))
         return pd.DataFrame([{"item_id": "snippet-1"}, {"item_id": "snippet-2"}])
 
     def fake_extract_pending_items(**kwargs: object) -> pd.DataFrame:
-        calls.append(("extract", kwargs["batch_size"]))
+        calls.append(("extract", None))
         return pd.DataFrame([{"debt_instrument_mention_id": "mention-1"}])
 
     def fake_match_pending_mentions(**kwargs: object) -> dict[str, pd.DataFrame]:
-        calls.append(("match", kwargs["batch_size"]))
+        calls.append(("match", None))
         return {
             "debt_instrument_mentions": pd.DataFrame(
                 [{"debt_instrument_mention_id": "mention-1"}]
@@ -144,7 +151,8 @@ def test_run_pipeline_uses_stage_backed_functions(
         "cdt.ingest.genres.acquire_eightk_documents", fake_run_ingest_pipeline
     )
     monkeypatch.setattr(
-        "cdt.pipeline.itemize_pending_documents", fake_itemize_pending_documents
+        "cdt.pipeline.segment_pending_eightk_documents",
+        fake_segment_pending_eightk_documents,
     )
     monkeypatch.setattr(
         "cdt.pipeline.classify_pending_items", fake_classify_pending_items
@@ -154,7 +162,11 @@ def test_run_pipeline_uses_stage_backed_functions(
         fake_acquire_scraped_sixk_documents,
     )
     monkeypatch.setattr(
-        "cdt.pipeline.triage_pending_documents", fake_triage_pending_documents
+        "cdt.pipeline.segment_pending_sixk_documents",
+        fake_segment_pending_sixk_documents,
+    )
+    monkeypatch.setattr(
+        "cdt.pipeline.triage_pending_windows", fake_triage_pending_windows
     )
     monkeypatch.setattr(
         "cdt.pipeline.extract_pending_items", fake_extract_pending_items
@@ -169,39 +181,36 @@ def test_run_pipeline_uses_stage_backed_functions(
             start_date=date(2024, 1, 1),
             end_date=date(2024, 1, 31),
             download=True,
-            ingest_batch_size=10,
-            itemize_batch_size=11,
-            classify_batch_size=12,
-            extract_batch_size=13,
-            match_batch_size=14,
-            sixk_batch_size=15,
+            ingest_flush_rows=10,
             genres=DEFAULT_GENRES,
         )
     )
 
-    assert result.ingest is not None
-    assert result.ingest.total_rows == 1
-    assert result.itemized_rows == 1
-    assert result.classified_rows == 1
-    assert result.sixk_ingest is not None
-    assert result.sixk_ingest.total_rows == 2
-    assert result.sixk_snippet_rows == EXPECTED_SIXK_SNIPPETS
+    eightk = result.genre_results[GENRE_8K]
+    assert eightk.ingest.total_rows == 1
+    assert eightk.segmented_rows == 1
+    assert eightk.classified_rows == 1
+    sixk = result.genre_results[GENRE_6K]
+    assert sixk.ingest.total_rows == 2
+    assert sixk.segmented_rows == 1
+    assert sixk.classified_rows == EXPECTED_SIXK_SNIPPETS
     assert result.extracted_rows == 1
     assert result.matched_rows == 1
     assert result.debt_instrument_rows == 1
     # Both genres when asked for both, and the same CIKs asked of each: the
     # caller says which issuers and which dates, not which forms those issuers
-    # filed. What a scheduled run defaults to is pinned on the orchestrator, in
+    # filed. What a scheduled run defaults to is pinned on `cdt run`, in
     # `test_scheduled_runs_prepare_both_genres_by_default`.
     assert result.genres == DEFAULT_GENRES
     assert calls == [
         ("ingest", {"320193"}),
-        ("itemize", 11),
-        ("classify", 12),
+        ("segment", None),
+        ("classify", None),
         ("ingest-sixk", {"320193"}),
-        ("sixk", 15),
-        ("extract", 13),
-        ("match", 14),
+        ("segment-sixk", None),
+        ("classify-sixk", None),
+        ("extract", None),
+        ("match", None),
     ]
 
 
@@ -229,7 +238,9 @@ def test_genres_narrow_the_run_to_one_chain(
     monkeypatch.setattr(
         "cdt.ingest.genres.acquire_eightk_documents", unexpected("ingest")
     )
-    monkeypatch.setattr("cdt.pipeline.itemize_pending_documents", unexpected("itemize"))
+    monkeypatch.setattr(
+        "cdt.pipeline.segment_pending_eightk_documents", unexpected("segment")
+    )
     monkeypatch.setattr("cdt.pipeline.classify_pending_items", unexpected("classify"))
     monkeypatch.setattr(
         "cdt.ingest.genres.acquire_scraped_sixk_documents",
@@ -239,7 +250,7 @@ def test_genres_narrow_the_run_to_one_chain(
         )[1],
     )
     monkeypatch.setattr(
-        "cdt.pipeline.triage_pending_documents",
+        "cdt.pipeline.triage_pending_windows",
         lambda **kwargs: (calls.append("sixk"), pd.DataFrame())[1],
     )
     monkeypatch.setattr(
@@ -272,8 +283,8 @@ def test_genres_narrow_the_run_to_one_chain(
     assert result.genres == (GENRE_6K,)
     # Absent, not empty: the 8-K chain did not run, which a zero-row result
     # would not distinguish from a run that found no filings.
-    assert result.ingest is None
-    assert result.sixk_ingest is not None
+    assert GENRE_8K not in result.genre_results
+    assert GENRE_6K in result.genre_results
 
 
 def test_a_config_that_names_no_genres_does_not_acquire_the_sixk_chain(
@@ -295,7 +306,7 @@ def test_a_config_that_names_no_genres_does_not_acquire_the_sixk_chain(
         raise AssertionError("the 6-K chain ran without being asked for")
 
     monkeypatch.setattr("cdt.ingest.genres.acquire_scraped_sixk_documents", explode)
-    monkeypatch.setattr("cdt.pipeline.triage_pending_documents", explode)
+    monkeypatch.setattr("cdt.pipeline.triage_pending_windows", explode)
 
     assert PipelineConfig(mode="historical", cik_file=str(cik_file)).genres == (
         GENRE_8K,
@@ -381,6 +392,7 @@ def test_run_pipeline_processes_small_seeded_batch(
         ciks: set[str] | None = None,
         s3_client: object | None = None,
         return_documents: bool = False,
+        renew: Callable[[], None] | None = None,
     ) -> tuple[pd.DataFrame, IngestRunResult]:
         del config, s3_client
         document_rows = pd.DataFrame(
@@ -479,11 +491,7 @@ This is the extracted event text.
             start_date=date(2024, 1, 1),
             end_date=date(2024, 1, 31),
             download=True,
-            ingest_batch_size=1,
-            itemize_batch_size=1,
-            classify_batch_size=1,
-            extract_batch_size=1,
-            match_batch_size=1,
+            ingest_flush_rows=1,
             artifact_root=str(tmp_path),
             final_database_root=str(tmp_path / "database" / "cdt"),
             genres=(GENRE_8K,),
@@ -502,8 +510,8 @@ This is the extracted event text.
     final_instruments = read_table(
         tmp_path / "database" / "cdt" / "debt-instruments" / "latest.parquet"
     )
-    assert result.itemized_rows == 1
-    assert result.classified_rows == 1
+    assert result.genre_results[GENRE_8K].segmented_rows == 1
+    assert result.genre_results[GENRE_8K].classified_rows == 1
     assert result.extracted_rows == 1
     assert result.matched_rows == 1
     assert written_matches["edge_type"].to_list() == ["member"]
@@ -724,7 +732,7 @@ def test_final_snapshot_guard_blocks_shrinkage_unless_forced(tmp_path: Path) -> 
         artifact_root=str(artifact_root), final_database_root=str(final_root)
     )
 
-    with pytest.raises(ValueError, match="row-count regressions"):
+    with pytest.raises(PublishGuardError, match="row-count regressions"):
         write_final_output_tables(
             artifact_root=str(empty_root), final_database_root=str(final_root)
         )
@@ -737,7 +745,7 @@ def test_final_snapshot_guard_blocks_shrinkage_unless_forced(tmp_path: Path) -> 
     forced = write_final_output_tables(
         artifact_root=str(empty_root),
         final_database_root=str(final_root),
-        force=True,
+        force_publish=True,
     )
     assert forced
 
@@ -795,7 +803,7 @@ def test_the_lease_is_renewed_between_the_eightk_and_sixk_chains(
         )[1],
     )
     monkeypatch.setattr(
-        "cdt.pipeline.triage_pending_documents", lambda **kwargs: pd.DataFrame()
+        "cdt.pipeline.triage_pending_windows", lambda **kwargs: pd.DataFrame()
     )
 
     run_pipeline(
@@ -828,6 +836,7 @@ def _stage_stubs(
         ciks: set[str] | None = None,
         s3_client: object | None = None,
         return_documents: bool = False,
+        renew: Callable[[], None] | None = None,
     ) -> tuple[pd.DataFrame, IngestRunResult]:
         del config, s3_client
         return pd.DataFrame([{"accession_number": "1"}]), IngestRunResult(
@@ -851,7 +860,7 @@ def _stage_stubs(
         "cdt.ingest.genres.acquire_eightk_documents", fake_run_ingest_pipeline
     )
     monkeypatch.setattr(
-        "cdt.pipeline.itemize_pending_documents",
+        "cdt.pipeline.segment_pending_eightk_documents",
         lambda **_: pd.DataFrame([{"item_id": "item-1"}]),
     )
     monkeypatch.setattr(
@@ -887,13 +896,10 @@ def test_run_pipeline_runs_the_lineage_pass_between_match_and_publish(
     instruments: pd.DataFrame,
     expected_calls: int,
 ) -> None:
-    """`cdt pipeline` and the live backend must infer lineage before publishing.
+    """A live run infers lineage before publishing, as the batch backend does.
 
-    The pass was wired into `run_match_and_finalize` and `cdt match` only, so
-    `cdt pipeline` and `cdt-orchestrator --extractor-backend live` still
-    published the un-inferred lineage #170 describes, on a root the batch
-    backend would have fixed. The guard matches `run_match_and_finalize`'s:
-    nothing matched means three empty datasets read to write none.
+    The guard matches `run_match_and_finalize`'s: nothing matched means three
+    empty datasets read to write none.
     """
     from cdt import publish as publish_module
 
@@ -979,7 +985,7 @@ def test_match_and_finalize_skips_the_publish_when_no_source_partition_changed(
     Measured in production: publishing a delta of 14 documents took 25 minutes
     and 21,214 sequential GETs at ~70 ms — the cost is request count, not bytes,
     and it was paid whether or not the run produced anything. Both
-    ``run_batch_backend`` and ``run_poll`` finalize, so one batch cycle paid it
+    ``run.run_prepare_then_publish`` and ``run.run_poll`` finalize, so one batch cycle paid it
     at least twice.
     """
     from cdt import pipeline as pipeline_module
@@ -1162,15 +1168,22 @@ def test_a_pointer_with_no_recorded_digest_publishes(tmp_path: Path) -> None:
     )
 
 
-def test_force_publishes_even_when_nothing_changed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("force", "force_publish", "expected_publishes"),
+    [(False, True, 1), (True, False, 0)],
+    ids=["force-publish", "plain-force"],
+)
+def test_only_force_publish_overrides_the_publish_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    force: bool,
+    force_publish: bool,
+    expected_publishes: int,
 ) -> None:
-    """--force still overrides the gate (#110).
+    """--force reprocesses; only --force-publish republishes unchanged sources.
 
-    It is no longer the documented way to recover a run that crashed between
-    writing a dataset and publishing it — the datasets moved, so the digest
-    moved, so the next run republishes on its own. That matters because
-    ``force`` is the pipeline-wide flag and also disables the shrinkage guard.
+    A crash between writing a dataset and publishing needs neither: the
+    datasets moved, so the digest moved, so the next run republishes on its own.
     """
     from cdt import pipeline as pipeline_module
     from cdt import publish as publish_module
@@ -1189,10 +1202,11 @@ def test_force_publishes_even_when_nothing_changed(
     pipeline_module.run_match_and_finalize(
         artifact_root=artifact_root,
         final_database_root=str(final_root),
-        force=True,
+        force=force,
+        force_publish=force_publish,
     )
 
-    assert len(published) == 1
+    assert len(published) == expected_publishes
 
 
 def test_an_unpublished_database_root_publishes_despite_unchanged_sources(
@@ -1267,7 +1281,7 @@ def test_no_final_database_root_skips_without_listing_anything(
     """The default configuration has nowhere to publish to (#110).
 
     ``final_database_root`` defaults to None on both ``PipelineConfig`` and
-    ``run_match_and_finalize``, which is what `cdt pipeline` gets without
+    ``run_match_and_finalize``, which is what a live run gets without
     ``--final-database-root``. ``write_final_output_tables`` returns before it
     reads anything in that case, so the gate answers the same and should not
     pay a listing to find out.
@@ -1334,24 +1348,21 @@ def test_normalize_snapshot_text_is_not_the_publish_cost(tmp_path: Path) -> None
 
 
 @pytest.mark.parametrize(
-    ("change_a_source", "force", "expected_publishes"),
+    ("change_a_source", "force_publish", "expected_publishes"),
     [(True, False, 1), (False, False, 0), (False, True, 1)],
-    ids=["source-changed", "sources-unchanged", "forced"],
+    ids=["source-changed", "sources-unchanged", "force-publish"],
 )
 def test_run_pipeline_skips_the_publish_when_nothing_changed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     change_a_source: bool,
-    force: bool,
+    force_publish: bool,
     expected_publishes: int,
 ) -> None:
-    """`cdt pipeline` and the live backend pay the same publish, so same gate (#110).
+    """A live run pays the same publish as the batch backend, so the same gate.
 
-    ``run_match_and_finalize`` is the batch backend's path; this is the other
-    two entry points. Gating only one of them would leave the identical
-    25-minute no-op publish in place for `cdt pipeline` and
-    `cdt-orchestrator --extractor-backend live`, which is the shape #170 took
-    when the lineage pass was wired into one path and not the others.
+    ``run_match_and_finalize`` is the batch backend's path; this is the live
+    one. Gating only one would leave a no-op publish in place for the other.
     """
     from cdt import publish as publish_module
 
@@ -1390,13 +1401,12 @@ def test_run_pipeline_skips_the_publish_when_nothing_changed(
             end_date=date(2024, 1, 31),
             artifact_root=str(tmp_path / "artifacts"),
             final_database_root=str(final_root),
-            force=force,
+            force_publish=force_publish,
         )
     )
 
-    # "forced" pins that --force reaches the shared tail from this entry point
-    # too: only run_match_and_finalize had a force test, so this path could
-    # stop passing it and nothing would fail.
+    # "force-publish" pins that the flag reaches the shared tail from this
+    # entry point too, not only from run_match_and_finalize.
     assert len(published) == expected_publishes
 
 
@@ -1428,7 +1438,7 @@ def _isolation_stubs(
         "cdt.ingest.genres.acquire_scraped_sixk_documents", ingest(GENRE_6K)
     )
     monkeypatch.setattr(
-        "cdt.pipeline.itemize_pending_documents",
+        "cdt.pipeline.segment_pending_eightk_documents",
         lambda **kwargs: (calls.append("itemize"), pd.DataFrame())[1],
     )
     monkeypatch.setattr(
@@ -1436,7 +1446,7 @@ def _isolation_stubs(
         lambda **kwargs: (calls.append("classify"), pd.DataFrame())[1],
     )
     monkeypatch.setattr(
-        "cdt.pipeline.triage_pending_documents",
+        "cdt.pipeline.triage_pending_windows",
         lambda **kwargs: (calls.append("sixk"), pd.DataFrame())[1],
     )
     monkeypatch.setattr(
@@ -1486,8 +1496,8 @@ def test_a_failing_sixk_chain_still_extracts_and_matches_the_eightk_chain(
         "match",
     ]
     assert result.failed_genres == (GENRE_6K,)
-    assert result.ingest is not None
-    assert result.sixk_ingest is None
+    assert GENRE_8K in result.genre_results
+    assert GENRE_6K not in result.genre_results
 
 
 def test_a_failing_eightk_chain_does_not_stop_the_sixk_chain(
@@ -1549,12 +1559,8 @@ def test_a_failed_genre_is_logged_with_its_traceback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-    propagate_logger: Callable[..., None],
 ) -> None:
     """Operators see which genre failed and why."""
-    from cdt.shared import get_logger
-
-    propagate_logger(get_logger("PipelineOrchestrator"))
     calls: list[str] = []
     _isolation_stubs(monkeypatch, tmp_path, calls, failing=(GENRE_6K,))
 
@@ -1564,3 +1570,143 @@ def test_a_failed_genre_is_logged_with_its_traceback(
     failures = [r for r in caplog.records if "Genre prepare failed" in r.getMessage()]
     assert {r.getMessage() for r in failures} == {"Genre prepare failed: genre=6-K"}
     assert all(r.exc_info is not None for r in failures)
+
+
+def test_a_run_with_a_failed_genre_does_not_report_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The closing banner names the failed genre instead of claiming success."""
+    calls: list[str] = []
+    _isolation_stubs(monkeypatch, tmp_path, calls, failing=(GENRE_6K,))
+
+    with caplog.at_level("INFO"):
+        run_pipeline(_both_genres_config(tmp_path))
+
+    assert "completed successfully" not in caplog.text
+    assert "with failed genres: 6-K" in caplog.text
+
+
+def test_match_and_finalize_logs_its_lineage_and_finalize_stages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The batch path (daily, poll) logs the same stage lines a live run does."""
+    from cdt.pipeline import run_match_and_finalize
+
+    monkeypatch.setattr(
+        "cdt.pipeline.match_pending_mentions",
+        lambda **kwargs: {
+            "debt_instrument": pd.DataFrame([{"debt_instrument_id": "i-1"}]),
+            "debt_instrument_mentions": pd.DataFrame(),
+        },
+    )
+    monkeypatch.setattr(
+        "cdt.publish.apply_lineage_inference_pass",
+        lambda *args, **kwargs: {"links": 0, "reopened": 0},
+    )
+
+    with caplog.at_level("INFO"):
+        run_match_and_finalize(artifact_root=str(tmp_path))
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert "Starting stage: infer-lineage" in messages
+    assert "Completed stage: infer-lineage | links=0 reopened=0" in messages
+    assert any(m.startswith("Starting stage: finalize") for m in messages)
+    assert any(m.startswith("Completed stage: finalize | tables=0") for m in messages)
+
+
+def test_plain_force_keeps_the_shrinkage_guard(tmp_path: Path) -> None:
+    """Reprocessing with --force must not publish a half-built root over a good one."""
+    from cdt.pipeline import run_match_and_finalize
+    from cdt.publish import write_final_output_tables
+
+    artifact_root = tmp_path / "artifacts"
+    final_root = tmp_path / "final"
+    _seed_final_tables(artifact_root)
+    write_final_output_tables(
+        artifact_root=str(artifact_root), final_database_root=str(final_root)
+    )
+
+    with pytest.raises(PublishGuardError, match="row-count regressions"):
+        run_match_and_finalize(
+            artifact_root=str(tmp_path / "half-built"),
+            final_database_root=str(final_root),
+            force=True,
+        )
+
+
+def test_read_cik_file_all_means_no_filter_and_reads_nothing(tmp_path: Path) -> None:
+    """`all` selects every filer; any other value is a file that must exist."""
+    from cdt.pipeline import ALL_CIKS, read_cik_file
+
+    assert read_cik_file(ALL_CIKS) is None
+    with pytest.raises(FileNotFoundError):
+        read_cik_file(tmp_path / "all")
+
+
+def test_a_run_hands_its_lease_renewal_to_ingest_and_extract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both stages that can outlast the TTL alone get the run's renewal hook."""
+    calls: list[str] = []
+    _isolation_stubs(monkeypatch, tmp_path, calls)
+    seen: dict[str, object] = {}
+    renewals: list[int] = []
+
+    def acquire(config: object, **kwargs: object) -> object:
+        seen["ingest"] = kwargs["renew"]
+        return pd.DataFrame(), _sixk_ingest_result(tmp_path, kwargs.get("ciks"))  # type: ignore[arg-type]
+
+    monkeypatch.setattr("cdt.ingest.genres.acquire_eightk_documents", acquire)
+    monkeypatch.setattr(
+        "cdt.pipeline.extract_pending_items",
+        lambda **kwargs: (seen.setdefault("extract", kwargs["renew"]), pd.DataFrame())[
+            1
+        ],
+    )
+    config = _both_genres_config(tmp_path)
+
+    run_pipeline(
+        PipelineConfig(**{**config.__dict__, "genres": (GENRE_8K,)}),
+        renew=lambda: renewals.append(1),
+    )
+
+    ingest_renew = seen["ingest"]
+    assert callable(ingest_renew)
+    before = len(renewals)
+    ingest_renew()  # type: ignore[operator]
+    assert len(renewals) == before + 1
+    assert callable(seen["extract"])
+
+
+@pytest.mark.parametrize(
+    ("force", "force_publish", "expected"),
+    [(True, False, False), (False, True, True)],
+)
+def test_a_live_run_publishes_with_force_publish_not_force(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    force: bool,
+    force_publish: bool,
+    expected: bool,
+) -> None:
+    """The live path keeps --force away from the publish guards too (#261)."""
+    calls: list[str] = []
+    _isolation_stubs(monkeypatch, tmp_path, calls)
+    published: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "cdt.pipeline.finalize_after_match",
+        lambda instruments, **kwargs: published.append(kwargs),
+    )
+    config = _both_genres_config(tmp_path)
+
+    run_pipeline(
+        PipelineConfig(
+            **{**config.__dict__, "force": force, "force_publish": force_publish}
+        )
+    )
+
+    assert published[0]["force_publish"] is expected

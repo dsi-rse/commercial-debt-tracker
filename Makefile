@@ -24,15 +24,17 @@ LOCAL_ARTIFACT_ROOT ?= $(DATA_DIR)/commercial-debt-tracker/local
 LOCAL_FINAL_DATABASE_ROOT ?= $(DATA_DIR)/commercial-debt-tracker/database/cdt
 LOCAL_BUCKET_NAME ?= idi-dev-ftm2j-shared-processor-storage
 LOCAL_AWS_PROFILE ?= idi-analysis
-LOCAL_CIK_FILE ?= $(current_abs_path)data/ciks/1000-ciks.txt
+LOCAL_CIK_FILE ?= $(current_abs_path)data/ciks/smoke-10.txt
 LOCAL_RUN_ARGS ?=
 
 # Pulumi / infra defaults. The AWS profile + SSO token cache are durable across
 # shells, so infra targets never juggle exported temporary credentials.
 PULUMI_AWS_PROFILE ?= $(or $(AWS_PROFILE),idi-analysis)
 PULUMI_AWS_REGION ?= us-east-2
-PULUMI_STATE_BUCKET ?= idi-ftm2j-dev-pulumi-state/commercial-debt-tracker
 PULUMI_STACK ?= dev
+# One state bucket per stack, matching each GitHub environment's
+# PULUMI_STATE_BUCKET variable and scripts/run-historical.sh.
+PULUMI_STATE_BUCKET ?= idi-ftm2j-$(PULUMI_STACK)-pulumi-state/commercial-debt-tracker
 PULUMI_AWS_ENV = AWS_PROFILE=$(PULUMI_AWS_PROFILE) AWS_REGION=$(PULUMI_AWS_REGION) AWS_DEFAULT_REGION=$(PULUMI_AWS_REGION) AWS_SDK_LOAD_CONFIG=1
 PULUMI_WITH_AWS = cd pulumi && $(PULUMI_AWS_ENV) pulumi
 # PULUMI_CONFIG_PASSPHRASE decrypts stack secrets; set it in .env (from Bitwarden).
@@ -56,7 +58,7 @@ local-run:
 	BUCKET_NAME="$(LOCAL_BUCKET_NAME)" \
 	AWS_PROFILE="$(LOCAL_AWS_PROFILE)" \
 	CDT_DEFAULT_CIK_FILE="$(LOCAL_CIK_FILE)" \
-	uv run cdt-orchestrator --aws-profile "$(LOCAL_AWS_PROFILE)" $(LOCAL_MODE) $(LOCAL_RUN_ARGS)
+	uv run cdt run $(LOCAL_MODE) --aws-profile "$(LOCAL_AWS_PROFILE)" $(LOCAL_RUN_ARGS)
 
 local-pipeline:
 	bash scripts/local-pipeline.sh

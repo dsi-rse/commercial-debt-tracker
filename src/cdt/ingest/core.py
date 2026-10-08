@@ -61,7 +61,7 @@ DEFAULT_AWS_PROFILE = ""
 DEFAULT_S3_PREFIX = "sec"
 
 
-DEFAULT_BATCH_SIZE = 100
+DEFAULT_FLUSH_ROWS = 100
 PROGRESS_DAY_INTERVAL = 30
 # {prefix...}/{date}/{form}/{cik}/{accession}/manifest.json — the CIK is
 # counted from the end so a multi-segment --s3-prefix cannot shift it.
@@ -219,7 +219,9 @@ class IngestConfig:
     data_dir: Path | None = None
     output_root: str | None = None
     force: bool = False
-    batch_size: int = DEFAULT_BATCH_SIZE
+    #: Document rows buffered before each write. Each write rewrites the
+    #: partitions its rows land in, so a larger buffer means fewer rewrites.
+    flush_rows: int = DEFAULT_FLUSH_ROWS
     download: bool = False
     failure_file: str | Path | None = None
     aws_profile: str = DEFAULT_AWS_PROFILE
@@ -275,6 +277,7 @@ def run_ingest_pipeline(
     s3_client: S3Client | None = None,
     candidate_source: Callable[[FailureRegistry], DocumentCandidateSource],
     return_documents: bool = False,
+    renew: Callable[[], None] | None = None,
 ) -> tuple[pd.DataFrame, IngestRunResult]:
     """Ingest one date window into the config's documents dataset.
 
@@ -291,15 +294,17 @@ def run_ingest_pipeline(
             the 6-K scraper each pass their own).
         return_documents: Read back and return the window's documents. When
             False the frame is empty and only ``total_rows`` counts them.
+        renew: Called per candidate and after each partition flush to extend
+            the caller's writer lease; pass a :func:`cdt.lease.throttled` hook.
 
     Returns:
         The documents frame (see ``return_documents``) and the run summary.
 
     Raises:
-        ValueError: If ``config.batch_size`` is not positive.
+        ValueError: If ``config.flush_rows`` is not positive.
     """
-    if config.batch_size <= 0:
-        msg = f"batch_size must be positive, got {config.batch_size}"
+    if config.flush_rows <= 0:
+        msg = f"flush_rows must be positive, got {config.flush_rows}"
         raise ValueError(msg)
 
     # Built on demand: a run that never touches S3 must not need a profile.
@@ -331,14 +336,14 @@ def run_ingest_pipeline(
 
     LOGGER.info(
         "Starting ingest: mode=%s bucket=%s forms=%s dataset=%s start_date=%s "
-        "end_date=%s batch_size=%s download=%s",
+        "end_date=%s flush_rows=%s download=%s",
         config.mode,
         config.bucket,
         ",".join(config.form_types),
         config.dataset_name,
         config.start_date,
         config.end_date,
-        config.batch_size,
+        config.flush_rows,
         config.download,
     )
 
@@ -384,6 +389,8 @@ def run_ingest_pipeline(
 
     source: DocumentCandidateSource = candidate_source(failure_registry)
     for candidate in source:
+        if renew is not None:
+            renew()
         candidates_seen += 1
         if candidate.accession_number in seen_accessions:
             continue
@@ -425,8 +432,10 @@ def run_ingest_pipeline(
                 failure_registry.discard(_failure_key_for_candidate(candidate))
 
         pending_rows.append(row)
-        if len(pending_rows) >= config.batch_size:
+        if len(pending_rows) >= config.flush_rows:
             flush_pending_rows()
+            if renew is not None:
+                renew()
 
     flush_pending_rows()
     failures += source.failures
@@ -511,10 +520,12 @@ def iter_manifest_keys_for_date_range(
     *,
     ciks: set[str] | None = None,
     s3_prefix: str = DEFAULT_S3_PREFIX,
+    renew: Callable[[], None] | None = None,
 ) -> Iterator[str]:
     """Yield manifest keys for the given forms over an inclusive date range.
 
     Only the scan: no document selection and no failure-registry lookup.
+    ``renew``, when given, is called once per scanned day.
     """
     return _iter_manifest_keys(
         s3_client,
@@ -524,6 +535,7 @@ def iter_manifest_keys_for_date_range(
         end_date,
         ciks=_normalize_ciks(ciks),
         s3_prefix=s3_prefix,
+        renew=renew,
     )
 
 
@@ -679,9 +691,12 @@ def _iter_manifest_keys(
     *,
     ciks: set[str] | None = None,
     s3_prefix: str = DEFAULT_S3_PREFIX,
+    renew: Callable[[], None] | None = None,
 ) -> Iterator[str]:
     paginator = s3_client.get_paginator("list_objects_v2")
     for day_index, day in enumerate(_days_in_range(start_date, end_date), start=1):
+        if renew is not None:
+            renew()
         if day_index == 1 or day_index % PROGRESS_DAY_INTERVAL == 0:
             LOGGER.info("Scanning S3 manifest prefixes through %s", day)
         for form_type in _normalize_form_types(form_types):
