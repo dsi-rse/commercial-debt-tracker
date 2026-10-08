@@ -253,12 +253,15 @@ class StaleSegmentationError(RuntimeError):
 
 @dataclass(frozen=True)
 class TriageOutput:
-    """Snippet rows for a set of filings, and the filings that could not be rebuilt."""
+    """Snippet rows for a set of filings, and the filings that could not be judged."""
 
     rows: pd.DataFrame
     #: Accessions whose stored spans do not match the rebuilt text (see
     #: :func:`_candidates_for_filing`); none of their rows are in ``rows``.
     stale_accessions: tuple[str, ...] = ()
+    #: Accessions whose stage-2 call failed on the provider or transport;
+    #: their rows are in ``rows`` as ``kept_degraded``.
+    infrastructure_failed_accessions: tuple[str, ...] = ()
 
 
 def triage_windows(
@@ -362,10 +365,16 @@ def triage_windows(
     ]
     table = _normalize_snippets(pd.DataFrame(rows, columns=SIXK_SNIPPET_COLUMNS))
     degraded = sum(1 for verdict in verdicts if verdict is not None and verdict.error)
+    infrastructure_failed = tuple(
+        verdict.accession_number
+        for verdict in verdicts
+        if verdict is not None and verdict.infrastructure_error
+    )
     kept = int(table["relevance"].fillna(False).sum())
     LOGGER.info(
         "6-K triage: filings=%s windows=%s stage1_admitted=%s "
-        "snippets_sent=%s kept=%s dropped=%s degraded_filings=%s",
+        "snippets_sent=%s kept=%s dropped=%s degraded_filings=%s "
+        "infrastructure_failed_filings=%s",
         len(plans),
         windowed,
         admitted_total,
@@ -373,8 +382,13 @@ def triage_windows(
         kept,
         sent_total - kept,
         degraded,
+        len(infrastructure_failed),
     )
-    return TriageOutput(rows=table, stale_accessions=tuple(stale))
+    return TriageOutput(
+        rows=table,
+        stale_accessions=tuple(stale),
+        infrastructure_failed_accessions=infrastructure_failed,
+    )
 
 
 def _candidates_for_filing(
@@ -619,7 +633,11 @@ def triage_pending_windows(
     LLM call per filing with admitted windows. Each partition's filings are read
     from the 6-K documents partition of the same date and shard. A partition
     holding a filing whose spans no longer match its text is left pending and
-    unwritten. Returns the snippet rows written this run.
+    unwritten, as is one where a stage-2 call failed on the provider or
+    transport, so the next run triages it again rather than sending its
+    snippets to extraction untriaged. A stage-2 call whose answers fail
+    validation every attempt still keeps its snippets. Returns the snippet
+    rows written this run.
 
     Raises:
         ValueError: If ``concurrency`` is not positive.
@@ -632,6 +650,8 @@ def triage_pending_windows(
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
     artifacts: tuple[object, float] | None = None
     shared_client = s3_client
+    stale_partitions: list[str] = []
+    infrastructure_held: list[str] = []
 
     def process(source_path: str, partition: dict[str, str]) -> PartitionOutput:
         nonlocal artifacts, shared_client
@@ -666,10 +686,16 @@ def triage_pending_windows(
             concurrency=concurrency,
             max_attempts=max_attempts,
         )
+        if output.stale_accessions:
+            stale_partitions.append(source_path)
+        elif output.infrastructure_failed_accessions:
+            infrastructure_held.append(source_path)
         return PartitionOutput(
             rows=output.rows,
             source_rows=windows["accession_number"].nunique(),
-            complete=not output.stale_accessions,
+            complete=not (
+                output.stale_accessions or output.infrastructure_failed_accessions
+            ),
         )
 
     result = run_partition_stage(
@@ -688,11 +714,18 @@ def triage_pending_windows(
             "stage2_provider": settings.SIXK_TRIAGE_PROVIDER,
         },
     )
-    if result.held_partitions:
+    if infrastructure_held:
+        LOGGER.warning(
+            "%s 6-K windows partition(s) left pending after stage-2 provider "
+            "failures; the next run triages them again: %s",
+            len(infrastructure_held),
+            ", ".join(infrastructure_held),
+        )
+    if stale_partitions:
         msg = (
-            f"{len(result.held_partitions)} 6-K windows partition(s) hold spans that "
+            f"{len(stale_partitions)} 6-K windows partition(s) hold spans that "
             f"no longer match their source text and were left pending. "
-            f"{RESEGMENT_ADVICE} Partitions: " + ", ".join(result.held_partitions)
+            f"{RESEGMENT_ADVICE} Partitions: " + ", ".join(stale_partitions)
         )
         raise StaleSegmentationError(msg)
     return result.rows

@@ -447,6 +447,16 @@ def _advance(tmp_path: Path, client: FakeBatchClient) -> object:
     )
 
 
+def _advance_until(status: str, tick: object, *, limit: int = 20) -> list[str]:
+    """Tick until ``status``; fail rather than hang if it never arrives."""
+    statuses: list[str] = []
+    for _ in range(limit):
+        statuses.append(tick().status)
+        if statuses[-1] == status:
+            return statuses
+    raise AssertionError(f"no {status!r} tick within {limit}: {statuses}")
+
+
 def test_job_lifecycle_completes_and_writes_mentions(tmp_path: Path) -> None:
     """A two-item job advances across ticks and finalizes mentions."""
     seed_classification(
@@ -481,6 +491,47 @@ def test_job_lifecycle_completes_and_writes_mentions(tmp_path: Path) -> None:
     # Active marker cleared; a subsequent tick is idle (nothing pending).
     idle = _advance(tmp_path, client)
     assert idle.status == "idle"
+
+
+def test_a_fold_that_raises_errors_its_row_and_the_job_still_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exception folding one row's response must not wedge the job.
+
+    The batch is still in ``job.batches`` while it folds, so an escaping
+    exception would re-fold the same response and crash on every tick.
+    """
+    seed_classification(
+        tmp_path,
+        [
+            {"item_id": "item-nodebt", "text": NODEBT_TEXT},
+            {"item_id": "item-multi", "text": MULTI_TEXT},
+        ],
+    )
+    client = FakeBatchClient(
+        {
+            "item-nodebt": {"ner": NODEBT_NER},
+            "item-multi": {"ner": MULTI_NER, "instrument_ie": MULTI_IE},
+        }
+    )
+    fold = batch_module._fold_one_response
+
+    def _raise_for_nodebt(entry: RowEntry, *args: object) -> None:
+        if entry.row_state.item_id == "item-nodebt":
+            raise TypeError("cannot use 'list' as a set element")
+        fold(entry, *args)
+
+    monkeypatch.setattr(batch_module, "_fold_one_response", _raise_for_nodebt)
+
+    statuses = [_advance(tmp_path, client).status for _ in range(3)]
+
+    assert statuses == ["submitted", "submitted", "completed"]
+    assert read_dataset(mentions_root(tmp_path))["name"].to_list() == ["Term Loan"]
+    audit = list((tmp_path / "extractor-runs").glob("run_id=*/full.jsonl"))
+    records = [json.loads(line) for line in audit[0].read_text().splitlines()]
+    errored = [record for record in records if record["state"] == "ERROR"]
+    assert [record["item_id"] for record in errored] == ["item-nodebt"]
+    assert "TypeError" in json.dumps(errored[0]["attempts"])
 
 
 def test_empty_job_finalizes_immediately(tmp_path: Path) -> None:
@@ -1123,42 +1174,71 @@ def test_unsupported_reasoning_effort_fails_before_job_creation(
     assert not Path(active_job_path(str(tmp_path))).exists()
 
 
-def test_force_warns_when_a_job_is_already_active(
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Force only applies at job creation, so a mid-job force must not go silent."""
+def test_force_during_an_active_job_is_queued_for_the_next_job(tmp_path: Path) -> None:
+    """A force request while a job runs re-extracts once that job finishes."""
     seed_classification(tmp_path, [{"item_id": "item-multi", "text": MULTI_TEXT}])
     client = FakeBatchClient(
         {"item-multi": {"ner": MULTI_NER, "instrument_ie": MULTI_IE}}
     )
 
-    # First tick creates the job; force is honored here and must stay quiet.
-    with caplog.at_level("WARNING"):
-        created = advance_extract_job(
+    def _tick(*, force: bool = False) -> object:
+        return advance_extract_job(
             batch_client=client,
             artifact_root=tmp_path,
             model="gpt-5.4",
             reasoning_effort="none",
             max_attempts=3,
-            force=True,
+            force=force,
         )
-    assert created.status == "submitted"
-    assert "Ignoring force=True" not in caplog.text
 
-    # Second tick has an active job, so force is inert and must warn.
-    caplog.clear()
-    with caplog.at_level("WARNING"):
-        advance_extract_job(
+    first = _tick()
+    assert first.status == "submitted"
+    assert _tick(force=True).status == "submitted"
+    assert _tick().status == "completed"
+
+    # The partition is complete, but the force request still names it.
+    second = _tick()
+    assert second.status == "submitted"
+    assert second.job_id != first.job_id
+    assert _tick().status == "submitted"
+    assert _tick().status == "completed"
+    assert _tick().status == "idle"
+
+
+def test_force_reaches_every_partition_across_capped_jobs(tmp_path: Path) -> None:
+    """``force`` outlives the first job when the row cap splits the work."""
+    for shard in ("0001", "0002", "0003"):
+        seed_classification(
+            tmp_path,
+            [{"item_id": f"item-{shard}", "text": NODEBT_TEXT}],
+            shard=shard,
+        )
+    client = FakeBatchClient(
+        {f"item-{shard}": {"ner": NODEBT_NER} for shard in ("0001", "0002", "0003")}
+    )
+
+    def _tick(*, force: bool = False) -> object:
+        return advance_extract_job(
             batch_client=client,
             artifact_root=tmp_path,
             model="gpt-5.4",
             reasoning_effort="none",
             max_attempts=3,
-            force=True,
+            max_rows_per_job=1,
+            force=force,
         )
-    assert "Ignoring force=True" in caplog.text
-    assert created.job_id in caplog.text
+
+    _advance_until("idle", _tick)
+    client.submitted.clear()
+
+    statuses = [_tick(force=True).status, *_advance_until("idle", _tick)]
+
+    assert sorted(ids[0] for _, ids in client.submitted) == [
+        "item-0001",
+        "item-0002",
+        "item-0003",
+    ]
+    assert statuses.count("completed") == 3
 
 
 # --------------------------------------------------------------------------- #
@@ -1216,6 +1296,35 @@ def test_truncated_manifest_self_heals(tmp_path: Path) -> None:
     manifest.write_text('{"job_id": "x"}', encoding="utf-8")
 
     assert _advance(tmp_path, client).status == "reset"
+
+
+def test_a_missing_manifest_on_s3_still_self_heals_and_resets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Abandoning a job survives the error S3 raises for a missing manifest.
+
+    S3 reports a missing key as botocore's NoSuchKey, not FileNotFoundError,
+    and the self-heal and `extract job reset` both re-read the manifest.
+    """
+    from botocore.exceptions import ClientError
+
+    client = FakeBatchClient({"item-multi": {"ner": MULTI_NER}})
+    job_id = _seed_active_job(tmp_path, client)
+    (tmp_path / "extract-batches" / f"job_id={job_id}" / "manifest.json").unlink()
+    read_json = batch_module.read_json_artifact
+
+    def read_like_s3(path: str) -> object:
+        if path.endswith("manifest.json"):
+            raise ClientError(
+                {"Error": {"Code": "NoSuchKey", "Message": "missing"}}, "GetObject"
+            )
+        return read_json(path)
+
+    monkeypatch.setattr(batch_module, "read_json_artifact", read_like_s3)
+
+    assert _advance(tmp_path, client).status == "reset"
+    assert _advance(tmp_path, client).status == "submitted"
+    assert reset_active_job(tmp_path) is not None
 
 
 def test_unparseable_state_jsonl_self_heals(tmp_path: Path) -> None:
@@ -1509,6 +1618,170 @@ def test_per_request_server_error_requeues_instead_of_terminating(
     assert result.status == "completed"
     assert not read_dataset(mentions_root(tmp_path)).empty
     assert load_row_failures("extract", artifact_root=tmp_path) == {}
+
+
+def test_a_persistent_server_error_defers_the_row_instead_of_failing_it(
+    tmp_path: Path,
+) -> None:
+    """Repeated 500s finish the job without the row; its partition stays pending.
+
+    A 500 says nothing about the filing, so it must never become an ERROR
+    verdict that marks the partition complete.
+    """
+    from cdt.extractor.batch import DEFAULT_MAX_INFRASTRUCTURE_ROUNDS
+
+    seed_classification(
+        tmp_path,
+        [
+            {"item_id": "item-nodebt", "text": NODEBT_TEXT},
+            {"item_id": "item-multi", "text": MULTI_TEXT},
+        ],
+    )
+    client = FakeBatchClient(
+        {
+            "item-nodebt": {"ner": NODEBT_NER},
+            "item-multi": {"ner": ("status", 500)},
+        }
+    )
+
+    _advance_until("completed", lambda: _advance(tmp_path, client))
+
+    multi_submissions = [ids for _, ids in client.submitted if "item-multi" in ids]
+    assert len(multi_submissions) == DEFAULT_MAX_INFRASTRUCTURE_ROUNDS
+    assert load_row_failures("extract", artifact_root=tmp_path) == {}
+    (entry,) = load_completion_registry("extract", artifact_root=tmp_path).values()
+    assert entry.complete is False
+    assert entry.item_ids == frozenset({"item-nodebt"})
+
+    # The next job claims only the deferred row and, once the provider
+    # recovers, extracts it.
+    client.scripts["item-multi"] = {"ner": MULTI_NER, "instrument_ie": MULTI_IE}
+    client.submitted.clear()
+    _advance_until("completed", lambda: _advance(tmp_path, client))
+    assert {cid for _, ids in client.submitted for cid in ids} == {"item-multi"}
+    assert read_dataset(mentions_root(tmp_path))["name"].to_list() == ["Term Loan"]
+
+
+def test_an_unreadable_output_file_is_retried_next_tick_not_resubmitted(
+    tmp_path: Path,
+) -> None:
+    """The results exist; resubmitting would pay for them a second time."""
+    seed_classification(tmp_path, [{"item_id": "item-multi", "text": MULTI_TEXT}])
+
+    class OutputDownloadFailsOnce(FakeBatchClient):
+        failed = False
+
+        def download_file(self, file_id: str) -> str:
+            if file_id.endswith("-out") and not self.failed:
+                self.failed = True
+                raise RuntimeError("503 fetching output file")
+            return super().download_file(file_id)
+
+    client = OutputDownloadFailsOnce(
+        {"item-multi": {"ner": MULTI_NER, "instrument_ie": MULTI_IE}}
+    )
+
+    assert _advance(tmp_path, client).status == "submitted"
+    waiting = _advance(tmp_path, client)
+    assert waiting.status == "waiting"
+    assert waiting.in_flight_batches == 1
+    assert _advance(tmp_path, client).status == "submitted"
+    assert _advance(tmp_path, client).status == "completed"
+
+    # One NER and one IE submission: the failed download resubmitted nothing.
+    assert len(client.submitted) == 2
+    assert read_dataset(mentions_root(tmp_path))["name"].to_list() == ["Term Loan"]
+
+
+def test_an_output_file_unreadable_past_the_cap_defers_its_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A batch whose output never downloads stops holding the job.
+
+    Each cap costs the row one infrastructure round; once those run out the
+    row is deferred, never failed.
+    """
+    from cdt.extractor.batch import DEFAULT_MAX_INFRASTRUCTURE_ROUNDS
+
+    monkeypatch.setattr(batch_module, "MAX_RESULT_DOWNLOAD_TICKS", 2)
+    seed_classification(tmp_path, [{"item_id": "item-multi", "text": MULTI_TEXT}])
+
+    class OutputNeverDownloads(FakeBatchClient):
+        def download_file(self, file_id: str) -> str:
+            if file_id.endswith("-out"):
+                raise RuntimeError("503 fetching output file")
+            return super().download_file(file_id)
+
+    client = OutputNeverDownloads(
+        {"item-multi": {"ner": MULTI_NER, "instrument_ie": MULTI_IE}}
+    )
+
+    assert _advance(tmp_path, client).status == "submitted"
+    # The first failure holds the batch; the second reaches the cap.
+    assert _advance(tmp_path, client).status == "waiting"
+    statuses = _advance_until("completed", lambda: _advance(tmp_path, client))
+
+    assert "submitted" in statuses
+    assert len(client.submitted) == DEFAULT_MAX_INFRASTRUCTURE_ROUNDS
+    assert load_row_failures("extract", artifact_root=tmp_path) == {}
+    (entry,) = load_completion_registry("extract", artifact_root=tmp_path).values()
+    assert entry.complete is False
+
+
+def test_an_unreadable_force_backlog_is_discarded_not_fatal(tmp_path: Path) -> None:
+    """A truncated backlog must not wedge every idle tick."""
+    from cdt.extractor.batch import _force_backlog_path
+
+    seed_classification(tmp_path, [{"item_id": "item-nodebt", "text": NODEBT_TEXT}])
+    path = Path(_force_backlog_path(str(tmp_path)))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"paths": ["clas')
+    client = FakeBatchClient({"item-nodebt": {"ner": NODEBT_NER}})
+
+    assert _advance(tmp_path, client).status == "submitted"
+    assert json.loads(path.read_text()) == {"paths": []}
+
+
+def test_a_backlog_naming_no_pending_partition_is_cleared(tmp_path: Path) -> None:
+    """Backlog paths that no longer exist are dropped on an idle tick."""
+    from cdt.extractor.batch import _force_backlog_path
+
+    path = Path(_force_backlog_path(str(tmp_path)))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"paths": ["classifications/date=2000-01-01"]}))
+
+    assert _advance(tmp_path, FakeBatchClient({})).status == "idle"
+    assert json.loads(path.read_text()) == {"paths": []}
+
+
+def test_resetting_a_forced_job_requeues_its_forced_partitions(
+    tmp_path: Path,
+) -> None:
+    """An abandoned forced job leaves its partitions in the force request."""
+    seed_classification(tmp_path, [{"item_id": "item-nodebt", "text": NODEBT_TEXT}])
+    client = FakeBatchClient({"item-nodebt": {"ner": NODEBT_NER}})
+    _advance_until("idle", lambda: _advance(tmp_path, client))
+    client.submitted.clear()
+
+    def _tick(*, force: bool = False) -> object:
+        return advance_extract_job(
+            batch_client=client,
+            artifact_root=tmp_path,
+            model="gpt-5.4",
+            reasoning_effort="none",
+            max_attempts=3,
+            force=force,
+        )
+
+    first = _tick(force=True)
+    assert first.status == "submitted"
+    assert reset_active_job(tmp_path) == first.job_id
+
+    second = _tick()
+    assert second.status == "submitted"
+    assert second.job_id != first.job_id
+    _advance_until("idle", _tick)
+    assert [ids for _, ids in client.submitted] == [["item-nodebt"], ["item-nodebt"]]
 
 
 def test_stall_warning_fires_only_past_the_tick_threshold(

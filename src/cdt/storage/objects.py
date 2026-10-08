@@ -31,10 +31,13 @@ _BOTO3_SESSIONS: dict[str, boto3.Session] = {}
 # The profile ``--aws-profile`` selected; empty means the ambient credential chain.
 _CONFIGURED_S3_PROFILE = ""
 
+# A constant of its own because botocore rewrites a Config's ``retries`` dict
+# in place when it builds a client, dropping the ``max_attempts`` key.
+S3_MAX_ATTEMPTS = 5
 # Bounds the API call itself, not the streaming read of a returned body;
 # ``_get_object_with_body`` retries that half.
 S3_CLIENT_CONFIG = Config(
-    retries={"mode": "standard", "max_attempts": 5},
+    retries={"mode": "standard", "max_attempts": S3_MAX_ATTEMPTS},
     connect_timeout=10,
     read_timeout=60,
 )
@@ -185,7 +188,7 @@ def list_artifacts(base: ArtifactPath, *, suffix: str = "") -> list[str]:
         bucket, prefix = parse_s3_uri(normalized)
         paginator = s3_client().get_paginator("list_objects_v2")
         results: list[str] = []
-        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for page in paginator.paginate(Bucket=bucket, Prefix=f"{prefix}/"):
             contents = cast(list[dict[str, str]], page.get("Contents", []))
             for obj in contents:
                 key = obj["Key"]
@@ -215,7 +218,7 @@ def list_artifacts_with_versions(
         bucket, prefix = parse_s3_uri(normalized)
         paginator = s3_client().get_paginator("list_objects_v2")
         results: dict[str, str] = {}
-        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for page in paginator.paginate(Bucket=bucket, Prefix=f"{prefix}/"):
             for obj in cast(list[dict[str, str]], page.get("Contents", [])):
                 key = obj["Key"]
                 if suffix and not key.endswith(suffix):

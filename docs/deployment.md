@@ -257,7 +257,9 @@ These flags are rarely needed; the defaults are what the schedules use.
 
 `--force` reprocesses partitions the completion registries already record. On a
 batch-backend `daily`/`historical` run it applies to the prepare and match stages
-only; to force a re-extract, run `cdt run poll --force` while no job is active.
+only; to force a re-extract, run `cdt run poll --force`. The request is queued,
+so every partition is re-extracted across as many jobs as `--max-rows-per-job`
+needs, starting after any job already active.
 `--force` never lowers the publish guards. To publish when no source changed, or
 past the shrinkage guard (a table falling below half its published rows), pass
 `--force-publish`, on `cdt publish` or any `cdt run` mode.
@@ -314,6 +316,29 @@ run-task` pattern the script wraps.
 - Reserve `--force-publish` for a deliberate overwrite of the published tables,
   after checking why the shrinkage guard refused; `run-historical.sh` never
   passes it.
+
+### When code changes reach stored rows
+
+The completion registries key on each partition's source fingerprint, not on
+the code that produced it, and no segmenter, classifier or extractor version
+is recorded. A segmenter, amount-parser or matcher change therefore applies to
+new filings only. Stored rows keep the old output until they are forced:
+
+- **Segmenter (8-K).** An 8-K `item_id` is accession plus item number, so it
+  survives a re-segment that changes the item's text, and extraction skips the
+  item as already done. The stored mentions' spans would then index text the
+  `items` table no longer has. Never force the 8-K segment stage alone: run
+  `cdt segment --genres 8-K --force` and `cdt run poll --force` together
+  (classification reruns by itself on the changed items).
+- **Segmenter (6-K).** Snippet ids carry the window index, so a re-segment
+  mints new ids and extraction picks up the changed snippets by itself. A
+  windows partition segmented by the old code but not yet classified fails
+  classification as stale (`Genre prepare failed: genre=6-K`, the daily
+  heartbeat alarm) until `cdt segment --genres 6-K --force`.
+- **Amount parser.** Amounts are parsed at extraction and stored in
+  `mentions`; only `cdt run poll --force` re-reads them.
+- **Matcher.** A change to clustering without a `MATCHER_SCHEMA_VERSION` bump
+  reaches existing instruments on `cdt match --force`.
 
 ## Prod Launch Checklist
 

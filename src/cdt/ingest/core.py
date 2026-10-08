@@ -148,35 +148,37 @@ class DocumentCandidate:
     source: str = DocumentSource.S3_MANIFEST
 
 
-class DocumentCandidateSource(Protocol):
-    """A source of document candidates for one ingest run.
+@dataclass
+class IngestFailures:
+    """One ingest run's use of the failure registry: skip, record, clear, count.
 
-    ``failures`` is read after iteration and added to the run's failure count:
-    the candidates the source could not acquire, which never reach ingest.
+    A registered failure is skipped unless ``retry_registered`` (``--force``),
+    and a retried one that now succeeds is cleared. ``count`` is every failure
+    this run recorded, whatever the genre or step, and is what the run reports.
     """
 
-    def __iter__(self: Self) -> Iterator[DocumentCandidate]:
-        """Yield the candidates this source acquired."""
+    registry: FailureRegistry | None = None
+    retry_registered: bool = False
+    count: int = 0
 
-    @property
-    def failures(self: Self) -> int:
-        """Return the number of candidates the source could not acquire."""
+    def is_skipped(self: Self, key: tuple[str, str]) -> bool:
+        """Return whether ``key`` is a registered failure this run does not retry."""
+        return (
+            not self.retry_registered
+            and self.registry is not None
+            and key in self.registry
+        )
 
+    def record(self: Self, key: tuple[str, str], failure: IngestFailureType) -> None:
+        """Count one failure and register it."""
+        self.count += 1
+        if self.registry is not None:
+            self.registry.add(key, failure)
 
-@dataclass(frozen=True)
-class ListCandidateSource:
-    """A source over an already-materialized candidate list."""
-
-    candidates: list[DocumentCandidate]
-
-    def __iter__(self: Self) -> Iterator[DocumentCandidate]:
-        """Yield the listed candidates."""
-        return iter(self.candidates)
-
-    @property
-    def failures(self: Self) -> int:
-        """Return zero; whoever built the list recorded its failures."""
-        return 0
+    def clear(self: Self, key: tuple[str, str]) -> None:
+        """Drop a registered failure a retry no longer reproduces."""
+        if self.retry_registered and self.registry is not None:
+            self.registry.discard(key)
 
 
 @dataclass(frozen=True)
@@ -275,7 +277,7 @@ def run_ingest_pipeline(
     *,
     ciks: set[str] | None = None,
     s3_client: S3Client | None = None,
-    candidate_source: Callable[[FailureRegistry], DocumentCandidateSource],
+    candidate_source: Callable[[IngestFailures], Iterable[DocumentCandidate]],
     return_documents: bool = False,
     renew: Callable[[], None] | None = None,
 ) -> tuple[pd.DataFrame, IngestRunResult]:
@@ -289,9 +291,10 @@ def run_ingest_pipeline(
         ciks: CIKs to keep; None keeps every filer.
         s3_client: Client to use; None builds one from ``config.aws_profile``
             when first needed.
-        candidate_source: Factory, given this run's failure registry, for the
-            source of this genre's candidates (``acquire_eightk_documents`` and
-            the 6-K scraper each pass their own).
+        candidate_source: Factory, given this run's :class:`IngestFailures`,
+            for the source of this genre's candidates (``acquire_eightk_documents``
+            and the 6-K scraper each pass their own). Every failure the source
+            records through it is counted in the run's ``failures``.
         return_documents: Read back and return the window's documents. When
             False the frame is empty and only ``total_rows`` counts them.
         renew: Called per candidate and after each partition flush to extend
@@ -333,6 +336,7 @@ def run_ingest_pipeline(
         str(failure_file),
         IngestFailureClassifier(),
     )
+    failures = IngestFailures(failure_registry, retry_registered=config.force)
 
     LOGGER.info(
         "Starting ingest: mode=%s bucket=%s forms=%s dataset=%s start_date=%s "
@@ -362,7 +366,6 @@ def run_ingest_pipeline(
     candidates_seen = 0
     skipped_existing = 0
     downloaded = 0
-    failures = 0
     document_partitions_written: set[str] = set()
     flush_count = 0
 
@@ -383,12 +386,11 @@ def run_ingest_pipeline(
             len(written),
             candidates_seen,
             downloaded,
-            failures,
+            failures.count,
         )
         pending_rows = []
 
-    source: DocumentCandidateSource = candidate_source(failure_registry)
-    for candidate in source:
+    for candidate in candidate_source(failures):
         if renew is not None:
             renew()
         candidates_seen += 1
@@ -420,16 +422,13 @@ def run_ingest_pipeline(
                     candidate.accession_number,
                     candidate.resource_uri,
                 )
-                failure_registry.add(
+                failures.record(
                     _failure_key_for_candidate(candidate),
                     IngestFailureType.DOCUMENT_DOWNLOAD_FAILED,
                 )
-                failures += 1
                 continue
             downloaded += 1
-            if config.force:
-                # The registered failure did not reproduce; drop it.
-                failure_registry.discard(_failure_key_for_candidate(candidate))
+            failures.clear(_failure_key_for_candidate(candidate))
 
         pending_rows.append(row)
         if len(pending_rows) >= config.flush_rows:
@@ -438,7 +437,6 @@ def run_ingest_pipeline(
                 renew()
 
     flush_pending_rows()
-    failures += source.failures
     failure_registry.flush()
 
     # Read back the window's partitions plus any this run wrote outside it. No
@@ -475,7 +473,7 @@ def run_ingest_pipeline(
             "candidates_seen": candidates_seen,
             "skipped_existing": skipped_existing,
             "downloaded": downloaded,
-            "failures": failures,
+            "failures": failures.count,
             "output_root": output_root,
             "documents_root": documents_dataset_root,
             "document_partitions": sorted(document_partitions_written),
@@ -487,7 +485,7 @@ def run_ingest_pipeline(
         candidates_seen,
         downloaded,
         skipped_existing,
-        failures,
+        failures.count,
         total_rows,
         documents_dataset_root,
     )
@@ -499,7 +497,7 @@ def run_ingest_pipeline(
         candidates_seen=candidates_seen,
         skipped_existing=skipped_existing,
         downloaded=downloaded,
-        failures=failures,
+        failures=failures.count,
         total_rows=total_rows,
         output_root=output_root,
         documents_root=documents_dataset_root,
@@ -587,34 +585,30 @@ def filing_from_manifest_key(
     bucket: str,
     manifest_key: str,
     *,
-    failure_registry: FailureRegistry | None = None,
+    failures: IngestFailures | None = None,
 ) -> ScrapedFiling | None:
     """Read one manifest into a filing.
 
-    Returns None for an invalid manifest (recorded in ``failure_registry`` as
-    permanent when given), and for an unreadable manifest or one the scraper
-    marked failed (neither recorded, so the next run retries them).
+    Returns None for an unreadable or invalid manifest, both recorded in
+    ``failures`` (only the invalid one is permanent), and for one the scraper
+    marked failed, which is not recorded.
     """
     try:
         manifest = _read_json_object(s3_client, bucket, manifest_key)
     except Exception:
         LOGGER.exception("Failed to read manifest: key=%s", manifest_key)
-        _record_failure(
-            failure_registry,
-            _failure_key(bucket, manifest_key),
-            IngestFailureType.MANIFEST_READ_FAILED,
-        )
+        if failures is not None:
+            failures.record(
+                (bucket, manifest_key), IngestFailureType.MANIFEST_READ_FAILED
+            )
         return None
 
     try:
         filing = _filing_from_manifest(manifest)
     except Exception:
         LOGGER.exception("Invalid manifest: key=%s", manifest_key)
-        _record_failure(
-            failure_registry,
-            _failure_key(bucket, manifest_key),
-            IngestFailureType.INVALID_MANIFEST,
-        )
+        if failures is not None:
+            failures.record((bucket, manifest_key), IngestFailureType.INVALID_MANIFEST)
         return None
 
     if filing.failure_reason:
@@ -627,17 +621,6 @@ def _download_candidate(s3_client: S3Client, candidate: DocumentCandidate) -> st
     bucket, key = parse_s3_uri(candidate.resource_uri)
     body = get_object_bytes(s3_client, bucket, key)
     return decode_document_bytes(body)
-
-
-def _record_failure(
-    failure_registry: FailureRegistry | None,
-    key: tuple[str, str],
-    failure_type: IngestFailureType,
-) -> None:
-    """Persist the failure when a registry is configured."""
-    if failure_registry is None:
-        return
-    failure_registry.add(key, failure_type)
 
 
 def decode_document_bytes(body: bytes) -> str:
@@ -729,10 +712,6 @@ def _key_matches_ciks(key: str, ciks: set[str] | None) -> bool:
     if len(parts) < MIN_MANIFEST_KEY_PARTS:
         return False
     return parts[MANIFEST_KEY_CIK_INDEX_FROM_END] in ciks
-
-
-def _failure_key(bucket: str, key: str) -> tuple[str, str]:
-    return (bucket, key)
 
 
 def _failure_key_for_candidate(candidate: DocumentCandidate) -> tuple[str, str]:

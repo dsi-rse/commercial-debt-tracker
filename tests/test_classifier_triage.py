@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Self
 
 import dotenv
+import httpx
+import openai
 import pytest
 
 from cdt import settings
@@ -173,6 +175,30 @@ def test_triage_retries_a_malformed_verdict() -> None:
     assert verdict.kept == ["s1", "s2"]
     assert verdict.attempts == 2
     assert "not usable" in client.calls[1][-1]["content"]
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {"keep": 1, "drop": []},
+        {"keep": "12", "drop": []},
+        {"keep": [1], "drop": {"id": 2}},
+        {"keep": [1], "drop": 5},
+        {"keep": [1], "drop": [{"id": 2, "reason": ["no_details"]}]},
+        {"keep": ["²"], "drop": [{"id": 2, "reason": "no_details"}]},
+    ],
+)
+def test_triage_retries_a_wrong_type_verdict(malformed: dict) -> None:
+    """A wrong-type field is a validation failure that retries, not an exception."""
+    client = FakeClient(
+        [
+            json.dumps(malformed),
+            json.dumps({"keep": [1, 2], "drop": []}),
+        ]
+    )
+    verdict = asyncio.run(triage_filing(client, "acc-1", _snippets(2)))
+    assert verdict.kept == ["s1", "s2"]
+    assert verdict.attempts == 2
 
 
 def test_triage_defaults_the_model_and_effort_to_the_built_in_values() -> None:
@@ -437,3 +463,51 @@ def test_the_eight_k_default_model_dir_is_the_committed_artifact() -> None:
         settings.PROJECT_ROOT / "data" / "models" / "classifier" / "tfidf-linear-svc"
     )
     assert (eightk_default_model_dir() / "model.pkl").exists()
+
+
+class _StatusError(Exception):
+    """A provider SDK error that exposes only its HTTP status."""
+
+    def __init__(self: Self, status_code: int) -> None:
+        super().__init__(f"HTTP {status_code}")
+        self.status_code = status_code
+
+
+@pytest.mark.parametrize(
+    ("error", "infrastructure"),
+    [
+        (
+            openai.APIConnectionError(
+                request=httpx.Request("POST", "https://api.openai.com")
+            ),
+            True,
+        ),
+        (
+            openai.APITimeoutError(
+                request=httpx.Request("POST", "https://api.openai.com")
+            ),
+            True,
+        ),
+        (httpx.ConnectError("connection refused"), True),
+        (httpx.ReadError("server closed the connection"), True),
+        (httpx.RemoteProtocolError("peer closed without a response"), True),
+        (_StatusError(529), True),
+        (_StatusError(400), False),
+        (ValueError("bad request body"), False),
+    ],
+)
+def test_a_client_error_records_whether_it_was_infrastructure(
+    error: Exception, infrastructure: bool
+) -> None:
+    """The stage holds a partition on a transport failure, not on a 400-like one."""
+
+    class RaisingClient:
+        async def complete(self: Self, **kwargs: object) -> str:
+            del kwargs
+            raise error
+
+    verdict = asyncio.run(triage_filing(RaisingClient(), "acc-1", _snippets(1)))
+
+    assert verdict.kept == ["s1"]
+    assert verdict.error is not None
+    assert verdict.infrastructure_error is infrastructure

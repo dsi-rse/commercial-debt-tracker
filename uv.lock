@@ -204,6 +204,7 @@ source = { editable = "." }
 dependencies = [
     { name = "boto3" },
     { name = "defusedxml" },
+    { name = "httpx" },
     { name = "idi-ftm2j-shared" },
     { name = "numpy" },
     { name = "openai" },
@@ -234,6 +235,7 @@ pulumi = [
 requires-dist = [
     { name = "boto3", specifier = "~=1.35" },
     { name = "defusedxml", specifier = "~=0.7" },
+    { name = "httpx", specifier = "~=0.28" },
     { name = "idi-ftm2j-shared", git = "https://github.com/dsi-rse/idi-ftm2j-shared.git?rev=v0.1.4" },
     { name = "numpy", specifier = "~=2.2" },
     { name = "openai", specifier = "~=1.0" },

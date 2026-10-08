@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import Any
 
 from cdt.extractor.normalize.amounts import (
@@ -33,6 +34,15 @@ from cdt.extractor.schema import (
     TERMINAL_DATE_KINDS,
 )
 from cdt.extractor.tags import normalize_span_whitespace, single_value_evidence_tag_ids
+
+
+def is_one_of(value: object, allowed: Collection[str]) -> bool:
+    """Return whether ``value`` is a string in ``allowed``.
+
+    Model JSON can put a list or object where a string belongs, and testing an
+    unhashable value against a set raises; this makes it a validation failure.
+    """
+    return isinstance(value, str) and value in allowed
 
 
 def validate_instrument_entry(
@@ -77,7 +87,9 @@ def validate_instrument_entry(
                 failures.append(
                     f"Entry {index}: '{property_name}' tag {tag_id} is type '{tag_info['type']}', expected {expected}."
                 )
-    if "instrument_type" in obj and obj["instrument_type"] not in INSTRUMENT_TYPES:
+    if "instrument_type" in obj and not is_one_of(
+        obj["instrument_type"], INSTRUMENT_TYPES
+    ):
         allowed = ", ".join(sorted(INSTRUMENT_TYPES))
         failures.append(
             f"Entry {index}: 'instrument_type' must be one of {allowed}, or omitted."
@@ -152,13 +164,13 @@ def validate_cross_field_semantics(*, index: int, obj: dict[str, Any]) -> list[s
     failures: list[str] = []
     dates = obj.get("dates") if isinstance(obj.get("dates"), list) else []
     amounts = obj.get("amounts") if isinstance(obj.get("amounts"), list) else []
-    date_kinds = {entry.get("kind") for entry in dates if isinstance(entry, dict)}
-    amount_kinds = {entry.get("kind") for entry in amounts if isinstance(entry, dict)}
+    date_kinds = _entry_kinds(dates)
+    amount_kinds = _entry_kinds(amounts)
     for entry in amounts:
         if (
             isinstance(entry, dict)
             and entry.get("prior") is True
-            and entry.get("kind") not in PRINCIPAL_AMOUNT_KINDS
+            and not is_one_of(entry.get("kind"), PRINCIPAL_AMOUNT_KINDS)
         ):
             failures.append(
                 f"Entry {index}: 'amounts' entry of kind '{entry.get('kind')}' cannot "
@@ -185,7 +197,9 @@ def validate_cross_field_semantics(*, index: int, obj: dict[str, Any]) -> list[s
             "unless a retirement, termination or exchange entry already dates the payment."
         )
     instrument_type = obj.get("instrument_type")
-    for kind in sorted(k for k in amount_kinds if isinstance(k, str)):
+    if not isinstance(instrument_type, str):
+        return failures
+    for kind in sorted(amount_kinds):
         if (kind, instrument_type) in AMOUNT_KIND_TYPE_CONFLICTS:
             failures.append(
                 f"Entry {index}: 'amounts' kind '{kind}' does not fit instrument_type "
@@ -193,6 +207,15 @@ def validate_cross_field_semantics(*, index: int, obj: dict[str, Any]) -> list[s
                 "face amount is a `principal`. Fix the kind or the type."
             )
     return failures
+
+
+def _entry_kinds(entries: list[Any]) -> set[str]:
+    """Return the string ``kind`` values of the object entries in a list."""
+    return {
+        entry["kind"]
+        for entry in entries
+        if isinstance(entry, dict) and isinstance(entry.get("kind"), str)
+    }
 
 
 def validate_parties_property(
@@ -217,9 +240,9 @@ def validate_parties_property(
         if not isinstance(cluster, dict):
             failures.append(f"{location} must be an object with 'tag_ids' and 'role'.")
             continue
-        if cluster.get("role") not in PARTY_ROLES:
+        if not is_one_of(cluster.get("role"), PARTY_ROLES):
             failures.append(f"{location} 'role' must be one of {roles}.")
-        if "kind" in cluster and cluster["kind"] not in PARTY_KINDS:
+        if "kind" in cluster and not is_one_of(cluster["kind"], PARTY_KINDS):
             failures.append(f"{location} 'kind' must be named or collective.")
         tag_ids = cluster.get("tag_ids")
         if not isinstance(tag_ids, list):
@@ -346,7 +369,7 @@ def validate_dates_property(
             failures.append(f"Entry {index}: '{label}' must be an object.")
             continue
         kind = entry.get("kind")
-        if kind not in DATE_KINDS:
+        if not is_one_of(kind, DATE_KINDS):
             allowed = ", ".join(sorted(DATE_KINDS))
             failures.append(f"Entry {index}: '{label}.kind' must be one of {allowed}.")
             kind = None
@@ -465,7 +488,7 @@ def validate_amounts_property(
             failures.append(f"Entry {index}: '{label}' must be an object.")
             continue
         kind = entry.get("kind")
-        if kind not in AMOUNT_KINDS:
+        if not is_one_of(kind, AMOUNT_KINDS):
             allowed = ", ".join(sorted(AMOUNT_KINDS))
             failures.append(f"Entry {index}: '{label}.kind' must be one of {allowed}.")
         evidence = entry.get("evidence")
@@ -546,7 +569,7 @@ def validate_interest_rate(
         return [f"Entry {index}: 'interest_rate' must be an object."]
     failures: list[str] = []
     kind = value.get("kind")
-    if kind not in INTEREST_RATE_KINDS:
+    if not is_one_of(kind, INTEREST_RATE_KINDS):
         allowed = ", ".join(sorted(INTEREST_RATE_KINDS))
         failures.append(
             f"Entry {index}: 'interest_rate.kind' must be one of {allowed}."

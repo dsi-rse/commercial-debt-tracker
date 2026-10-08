@@ -83,17 +83,17 @@ def name_fingerprint_tokens(fingerprint: str | None) -> frozenset[str]:
 def name_fingerprints_are_compatible(left: str | None, right: str | None) -> bool:
     """Return whether two name fingerprints can name one instrument.
 
-    Equal fingerprints are compatible. Otherwise one fingerprint's informative
-    tokens must be a subset of the other's, and:
+    Fingerprints that are equal, or have the same informative tokens (they
+    differ only in stopwords: `the senior notes due 2034` and `senior notes
+    due 2034`), are compatible. Otherwise one fingerprint's informative tokens
+    must be a subset of the other's, and:
 
     - the shorter has at least ``NAME_MIN_SHARED_TOKENS`` informative tokens
     - coupons present on both sides intersect
     - the differing tokens are not only class or tranche designators
       (`Tranche A Loan` is not a shortened `Tranche B Loan`)
 
-    Unequal fingerprints with identical informative tokens (they differ only in
-    stopwords, e.g. `the senior notes due 2034` and `senior notes due 2034`)
-    are not compatible. False when either side is missing.
+    False when either side is missing.
     """
     if not left or not right:
         return False
@@ -103,6 +103,8 @@ def name_fingerprints_are_compatible(left: str | None, right: str | None) -> boo
     right_tokens = name_fingerprint_tokens(right)
     if not left_tokens or not right_tokens:
         return False
+    if left_tokens == right_tokens:
+        return True
     if not (left_tokens <= right_tokens or right_tokens <= left_tokens):
         return False
     if min(len(left_tokens), len(right_tokens)) < NAME_MIN_SHARED_TOKENS:

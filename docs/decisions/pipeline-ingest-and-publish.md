@@ -330,6 +330,35 @@ lease was already stolen, which aborts the tick (#89).
 This caps the rows claimed into one job, so a job after a backfill cannot run
 the poll task out of memory. Deferred partitions form the next job (#92).
 
+### The force backlog (`extract-batches/force-backlog.json`)
+
+`--force` on a poll tick lists every classification partition into a backlog
+file. Each new job claims backlog partitions as forced (no rows counted done)
+and removes the ones it claimed, so a forced re-extract reaches every partition
+even when `--max-rows-per-job` splits it across jobs, and a force given while a
+job is active waits for that job instead of being dropped (#264). The backlog
+is updated after the new job's marker is written: a crash in between re-forces
+that job's partitions later rather than losing them from the request. The job
+manifest lists the partitions it claimed as forced, and abandoning the job
+(`cdt extract job reset`, or a tick's self-heal from a corrupt job directory)
+puts them back in the backlog: by then their registry entries say complete, so
+nothing else would re-extract them. An unreadable backlog is discarded with a
+warning rather than failing every idle tick; the operator re-runs `--force`.
+
+### Infrastructure failures in a batch job (deferred rows)
+
+A provider 429/5xx on one request, or an output file that cannot be read, says
+nothing about the filing, so it never becomes a verdict. Treating either as an
+`ERROR` row (as the resubmission cap once did) marked the partition complete
+and lost the row for good, while the live backend left the same row pending
+(#264). An unreadable output file keeps its batch in flight, retried each tick
+for `MAX_RESULT_DOWNLOAD_TICKS`: the results exist, and resubmitting pays for
+them again. A row's 429/5xx rounds count separately from expiries. At
+`DEFAULT_MAX_INFRASTRUCTURE_ROUNDS` the row is deferred: the job finishes
+without it, its partition's registry entry is written incomplete, and the next
+job claims just that row. This is the batch form of the live backend's abort,
+except that one bad request does not hold up the rest of the job.
+
 ### `MODE_DEADLINE_HOURS` / `start_runtime_watchdog`
 
 ECS has no task-level timeout: a Fargate task runs, and bills, until its
@@ -421,7 +450,11 @@ carried over.
 
 `candidate_source` is a factory, not a source, because the failure registry is
 created inside ingest: two registries over one `failures.json` would overwrite
-each other's entries. Everything after the candidates is shared: accession
+each other's entries. The factory receives the run's `IngestFailures`, which
+skips, records, clears and counts every failure in one place, so a run's
+`failures` is everything either genre recorded. Before it, the 8-K source
+registered a missing document without counting it, and each genre had its own
+copy of the skip-unless-forced and clear-on-success logic (#277). Everything after the candidates is shared: accession
 dedup, batched partition merges, the read-back window and the run manifest.
 That makes switching sources cheap. The S3 client is built only when needed,
 so a run that never touches S3 does not need a profile.
@@ -538,13 +571,34 @@ not in dissemination format never becomes one on retry.
 
 ## Segmenting 8-K text (`cdt.segmenter`)
 
-### `VALID_ITEM_NUMBERS` / `leading_item_numbers`
+### `VALID_ITEM_NUMBERS` / `ITEM_TITLE_PREFIXES` / `leading_item_numbers`
 
 Only real 8-K item numbers can be headings. Even those are rejected when they
 read as money or a rate: `$1.05 billion` in a heading line, or a coupon such as
 `5.25%`. HTML table cells become their own lines, so `5.25% Senior Notes due
 2029` used to be read as a heading and cut the enclosing item section off right
 at the debt text this pipeline targets (#63).
+
+A bare number, without the `Item` keyword, is a heading only when the filing's
+`ITEM INFORMATION` header declares that item, or when the item's title follows
+it on the line (`9.01 Financial Statements and Exhibits.`). A bare `5.06` coupon
+cell in an FHLB bond table otherwise ended its 2.03 section halfway, with
+`extraction_status` still `ok` (#262). Requiring a declared item alone was
+rejected: it also stopped an 8.01 section from ending at an undeclared `9.01
+Financial Statements` heading, which the title rule keeps. On the 1,008
+documents in `data/genwindow-eval`, one of 2,141 sections changes: the FHLB 2.03
+section, which now runs to its signature block (4,405 to about 8,500 chars).
+The title must start on the number's own line; on the same corpus no bare
+undeclared number has its title on the next line.
+
+### `normalize_body_lines` (tags stripped before entities are unescaped)
+
+Unescaping first turned `multiplier &lt; 1 = deleveraged` into a fake tag that
+the strip deleted along with the text up to the next `>` (#263). On
+`data/genwindow-eval`, 12 sections in 12 filings regain text (11 FHLB 2.03
+sections, one 8.01). The 6-K segmenter shares this function. The restored `<`
+reaches the NER stage, which `repair_unescaped_text` handles (see
+`extraction.md`).
 
 ### `extract_items_from_document` (one row per key)
 

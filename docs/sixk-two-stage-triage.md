@@ -336,6 +336,14 @@ reproduced.
   noun-less failure again, and the run of 21 is exactly that case, its table
   header sitting above a cut.
 
+  The estimate the ceiling is checked against counts the unadmitted gap text a
+  later member's expansion pulls in to reach the span (#240). Counting only
+  the members' own tokens let non-adjacent members merge to about 1.8 times the
+  ceiling. Replayed on the generalization window (27 filings, 392 windows
+  admitted, no LLM call): 219 snippets sent, one of them 2,380 tokens, became
+  220, the largest 1,996; stage-2 input grows by 200 tokens (0.1%), the
+  context the split-off window's own expansion adds.
+
 Header detection (`_is_section_header`) errs towards "not a header": a missed
 header lets the walk continue to its minimum and pass over it, while a false
 one stops the walk early and can leave the instrument noun outside the window.

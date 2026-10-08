@@ -501,8 +501,8 @@ def _add_extract(commands: argparse._SubParsersAction) -> None:
         parents=[
             _common_options(),
             _force_option(
-                "re-extract partitions already extracted (batch: when this "
-                "tick starts a new job)"
+                "re-extract partitions already extracted (batch: queued for "
+                "this and later jobs)"
             ),
             _extract_options(),
             _batch_tick_options(),
@@ -622,7 +622,8 @@ def _add_run(commands: argparse._SubParsersAction) -> None:
             _final_database_root_option(),
             _runtime_option(),
             _force_option(
-                "when this tick starts a new job, claim partitions already extracted"
+                "re-extract partitions already extracted (queued for this and "
+                "later jobs)"
             ),
             _force_publish_option(),
             _batch_tick_options(),

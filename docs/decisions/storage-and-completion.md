@@ -67,6 +67,15 @@ Types are keyed by column name, which keeps `write_table` generic. That works
 because a column name (`cik`, for example) means the same thing in every
 dataset.
 
+An undeclared column is text, and two inferred types are mapped to that
+default: `null`, and floating where every value is null (#268). The second is
+what a pandas `reindex` fills a missing column with. `synthesized_by` is null
+on every model-emitted mention, so a mentions partition with no synthesized
+row wrote it as `double` and the next as `string`, unification failed, and
+every match read fell back to per-file. Every real float column (the model
+scores) is declared, so the rule cannot retype one. Undeclared integer
+columns are pandas `Int64`, which keeps `int64` when all-null.
+
 Money and rates are stored as exact decimals (#185). Float is not an option:
 `float("372246148.11")` is not exactly that number, and printing it at fixed
 precision exposes the error. That error is what made every amount with cents
@@ -264,8 +273,8 @@ consecutive dates, and therefore one or two shards. Each cycle then touches
 about 0.2 to 0.5 MB.
 
 The legacy single object is neither read nor migrated: nothing in that format
-is kept during beta. On S3 the shard prefix also matches the legacy key, so
-the loader reads only `date=` files.
+is kept during beta. It sits beside the shard directory, not in it, so the
+listing never returns it.
 
 Naming: in this module, prefixes are `*_root` (`dataset_root`, `items_root`,
 `mentions_root`, `mirror_root`) and single objects are `*_path`

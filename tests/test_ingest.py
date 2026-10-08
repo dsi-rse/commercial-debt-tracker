@@ -366,7 +366,10 @@ def test_acquire_documents_decompresses_gzip_downloads(tmp_path: Path) -> None:
 
 
 def test_ingest_records_missing_document_failures(tmp_path: Path) -> None:
-    """Missing complete-submission documents are persisted in the failure registry."""
+    """A missing complete submission is registered and counted, as 6-K counts it.
+
+    The second run skips the registered filing, so it records nothing new.
+    """
     client = FakeS3Client(
         {
             (
@@ -405,13 +408,14 @@ def test_ingest_records_missing_document_failures(tmp_path: Path) -> None:
     first, result = acquire_eightk_documents(
         config, ciks={"320193"}, s3_client=client, return_documents=True
     )
-    second, _ = acquire_eightk_documents(
+    second, second_result = acquire_eightk_documents(
         config, ciks={"320193"}, s3_client=client, return_documents=True
     )
 
     assert first.empty
     assert second.empty
-    assert result.failures == 0
+    assert result.failures == 1
+    assert second_result.failures == 0
     assert client.manifest_reads == [
         ("sec-bucket", "sec/2024-01-02/8-K/320193/000114036126006577/manifest.json")
     ]
@@ -679,7 +683,7 @@ def test_document_shard_is_stable_across_processes() -> None:
 
 def test_force_retries_registered_permanent_failures(tmp_path: Path) -> None:
     """--force must be able to unpoison a filing the registry marked permanent (#67)."""
-    from cdt.ingest.core import IngestFailureClassifier
+    from cdt.ingest.core import IngestFailureClassifier, IngestFailures
     from cdt.ingest.eightk import iter_document_candidates_for_date_range
     from cdt.shared import FailureRegistry
 
@@ -707,15 +711,14 @@ def test_force_retries_registered_permanent_failures(tmp_path: Path) -> None:
         "sec-bucket",
         date(2024, 1, 2),
         date(2024, 1, 2),
-        failure_registry=registry,
+        failures=IngestFailures(registry),
     )
     retried = iter_document_candidates_for_date_range(
         client,
         "sec-bucket",
         date(2024, 1, 2),
         date(2024, 1, 2),
-        failure_registry=registry,
-        retry_registered_failures=True,
+        failures=IngestFailures(registry, retry_registered=True),
     )
 
     assert skipped == []

@@ -22,6 +22,7 @@ from cdt.ingest.core import (
     DocumentCandidate,
     DocumentSource,
     IngestConfig,
+    IngestFailures,
     IngestFailureType,
     IngestRunResult,
     S3Client,
@@ -33,7 +34,7 @@ from cdt.ingest.core import (
     run_ingest_pipeline,
 )
 from cdt.ingest.mirror import mirror_path
-from cdt.shared import FailureRegistry, get_logger
+from cdt.shared import get_logger
 from cdt.storage.objects import (
     artifact_exists,
     get_object_bytes,
@@ -113,21 +114,15 @@ class ScraperDocumentSource:
     Iterating mirrors each filing's assembled submission and yields its
     candidate. A filing whose mirror exists is yielded without re-reading its
     documents unless ``config.force``; a filing that fails is recorded in
-    ``failure_registry`` and skipped.
+    ``failures`` and skipped.
     """
 
     config: IngestConfig
     s3_client: S3Client
-    failure_registry: FailureRegistry | None = None
+    failures: IngestFailures = field(default_factory=IngestFailures)
     ciks: set[str] | None = None
     #: Called per scanned day and per manifest, to extend the writer lease.
     renew: Callable[[], None] | None = None
-    _failures: int = field(default=0, init=False)
-
-    @property
-    def failures(self: Self) -> int:
-        """Return the number of filings that could not be acquired."""
-        return self._failures
 
     def __iter__(self: Self) -> Iterator[DocumentCandidate]:
         """Assemble, mirror and yield every matching filing in the range."""
@@ -150,17 +145,16 @@ class ScraperDocumentSource:
             if self.renew is not None:
                 self.renew()
             key = (self.config.bucket, manifest_key)
-            if not self.config.force and self._is_registered_failure(key):
+            if self.failures.is_skipped(key):
                 LOGGER.info("Skipping known ingest failure: key=%s", manifest_key)
                 continue
             filing = filing_from_manifest_key(
                 self.s3_client,
                 self.config.bucket,
                 manifest_key,
-                failure_registry=self.failure_registry,
+                failures=self.failures,
             )
             if filing is None:
-                # Recorded by the shared reader; not a failure of this run.
                 continue
             indexed += 1
             target = mirror_path(
@@ -181,7 +175,7 @@ class ScraperDocumentSource:
             indexed,
             mirrored,
             reused,
-            self._failures,
+            self.failures.count,
         )
 
     def _mirror(
@@ -193,7 +187,7 @@ class ScraperDocumentSource:
             LOGGER.warning(
                 "Manifest lists no documents: accession=%s", filing.accession_number
             )
-            self._record(key, IngestFailureType.DOCUMENT_NOT_FOUND)
+            self.failures.record(key, IngestFailureType.DOCUMENT_NOT_FOUND)
             return False
         documents = []
         for uri in uris:
@@ -206,18 +200,16 @@ class ScraperDocumentSource:
                 )
             except Exception:
                 LOGGER.exception("Failed to read scraped 6-K document: %s", uri)
-                self._record(key, IngestFailureType.DOCUMENT_DOWNLOAD_FAILED)
+                self.failures.record(key, IngestFailureType.DOCUMENT_DOWNLOAD_FAILED)
                 return False
         try:
             submission = assemble_submission(filing, documents)
         except MalformedSubmissionError as error:
             LOGGER.error("%s", error)
-            self._record(key, IngestFailureType.MALFORMED_DOCUMENT)
+            self.failures.record(key, IngestFailureType.MALFORMED_DOCUMENT)
             return False
         write_bytes_artifact(target, gzip.compress(submission.encode("utf-8")))
-        if self.config.force and self.failure_registry is not None:
-            # The registered failure did not reproduce, so stop skipping it.
-            self.failure_registry.discard(key)
+        self.failures.clear(key)
         return True
 
     def _candidate(self: Self, filing: ScrapedFiling, target: str) -> DocumentCandidate:
@@ -233,14 +225,6 @@ class ScraperDocumentSource:
             form_type=filing.form_type,
             source=DocumentSource.S3_MANIFEST,
         )
-
-    def _is_registered_failure(self: Self, key: tuple[str, str]) -> bool:
-        return self.failure_registry is not None and key in self.failure_registry
-
-    def _record(self: Self, key: tuple[str, str], failure: IngestFailureType) -> None:
-        self._failures += 1
-        if self.failure_registry is not None:
-            self.failure_registry.add(key, failure)
 
 
 def acquire_scraped_sixk_documents(
@@ -279,10 +263,10 @@ def acquire_scraped_sixk_documents(
         ciks=ciks,
         s3_client=client,
         return_documents=return_documents,
-        candidate_source=lambda registry: ScraperDocumentSource(
+        candidate_source=lambda failures: ScraperDocumentSource(
             config=config,
             s3_client=client,
-            failure_registry=registry,
+            failures=failures,
             ciks=ciks,
             renew=renew,
         ),

@@ -568,6 +568,37 @@ def test_arrow_filesystem_builds_s3_on_the_configured_profile(
     )
 
 
+def test_arrow_filesystem_survives_a_real_client_built_from_the_shared_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Building a botocore client rewrites ``S3_CLIENT_CONFIG.retries`` in place.
+
+    The writer lease builds a client before any Arrow read, so the filesystem
+    must not read its attempt count back off that dict. The client here is real
+    (botocore, offline, no request issued); only pyarrow's filesystem is stubbed.
+    """
+    import botocore.session
+
+    botocore.session.get_session().create_client(
+        "s3",
+        config=storage_objects.S3_CLIENT_CONFIG,
+        region_name="us-east-1",
+        aws_access_key_id="AK",
+        aws_secret_access_key="SK",  # noqa: S106
+    )
+    built: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        storage_tables.pyarrow.fs,
+        "S3FileSystem",
+        lambda **kwargs: built.append(kwargs) or "FS",
+    )
+
+    filesystem, _ = storage_tables.arrow_filesystem("s3://bucket/a/b.parquet")
+
+    assert filesystem == "FS"
+    assert len(built) == 1
+
+
 def test_the_s3_branch_of_every_reader_actually_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

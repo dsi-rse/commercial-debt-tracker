@@ -91,9 +91,9 @@ The retry turn asks for a repair, not a redo. A version that listed only what th
 
 A zero-tag NER response that passed validation is the honest "this filing disclosed no debt" and finishes SUCCESS whether or not the row retried. Filing a retried zero as PARTIAL ("a model that failed once may be giving up") bought a registry entry and no re-extraction, because a PARTIAL row is terminal and the next run skips it, while asserting a loss nothing had evidence for. A give-up the row *does* hold evidence for is a validation failure instead (the high-water mark and the untagged-response check), so it retries to budget and terminates FAILED, which is counted and re-extractable (#176).
 
-### `repair_unescaped_ampersands`
+### `repair_unescaped_text`
 
-`NERStage.preprocess` wraps the item text in `<body>` unescaped, so an item containing `A&R Registration Rights Agreement` reaches the model as invalid XML, and the response must both reproduce the text exactly and be well-formed XML, which conflict unless the model escapes on its own. Bare ampersands appear in 44 of 342 relevant items in one held-out window across 37 issuers, and in 13% to 17% of relevant items in each of three windows: a standing tax, not one filer's quirk. Repairing the response rather than escaping the input keeps what the model sees unchanged, so its tagging behaviour does not move (#127). Only `&` is repaired: a stray `<` or `>` never occurs in source text, so one in a response is a real malformation.
+`NERStage.preprocess` wraps the item text in `<body>` unescaped, so an item containing `A&R Registration Rights Agreement` reaches the model as invalid XML, and the response must both reproduce the text exactly and be well-formed XML, which conflict unless the model escapes on its own. Bare ampersands appear in 44 of 342 relevant items in one held-out window across 37 issuers, and in 13% to 17% of relevant items in each of three windows: a standing tax, not one filer's quirk. Repairing the response rather than escaping the input keeps what the model sees unchanged, so its tagging behaviour does not move (#127). A `<` that cannot start markup (followed by anything but a letter, `_`, `/`, `!` or `?`) is repaired too. Item text carries one since the segmenter unescapes entities after stripping tags (#263): on `data/genwindow-eval`, 12 sections hold 13 of them (`multiplier < 1 = deleveraged` in 11 FHLB 2.03 sections, `(p<0.0001)` in an 8.01), all debt-relevant text that a verbatim reproduction would otherwise fail on, against none before. A `<` that could open markup is a real malformation and still fails parsing; `>` is legal in XML text.
 
 ### `realign_tag_details`
 
@@ -156,6 +156,30 @@ Every number in the span must carry a rate marker: `500,000,000 (100% of princip
 ### `AMOUNT_MULTIPLIERS`
 
 Magnitude words, spelled out and abbreviated (#182). The abbreviations matter because the name-derived principal (#129) reads the instrument's own name, and names use them: `Citibank $382.5 mil. Revolving Credit Facility`, `Syndicated $850.0 mil. Facility` (Costamare's 6-K facility schedules). On a cited span a missing magnitude only publishes null, because `amounts_agree` rejects the mismatch; on the name-derived path there is no model value to disagree with, so a value six orders of magnitude off would publish. `AMOUNT_SCALE_ALTERNATION` is built from this table so every magnitude the pattern recognizes is one the parser can apply.
+
+### `LETTER_AMOUNT_MAGNITUDE_PATTERN`
+
+`$250M` parsed as 250 and `$1.5B` as 1.5 (#266). An upper-case `K`, `M` or `B`
+counts when it follows the figure the parser reads; lower case only when that
+figure is currency-marked (`£250m`), since a bare `250m` is as likely metres or
+months. A letter that starts a longer word (`$250MMBtu`) is not a magnitude, and
+one on a later figure (`$500,000 (Tranche 1B)`) does not scale the first.
+`NAME_EMBEDDED_AMOUNT_PATTERN` builds its letter branch from the same table.
+On the 2,486 distinct amount spans in the local extractor audit logs, three
+change, each to the right figure (`$18.3M`, `$193M`, `$462M`); none of the 1,724
+instrument names changes its derived principal.
+
+### `_figure_with_unambiguous_separators`
+
+The parser assumed the US convention, so Grupo Supervielle's `20.877.777` read
+as 20.877 (#231). Two shapes read the same in every convention: `.` before
+exactly three digits more than once is a thousands separator, and with both `.`
+and `,` in one figure the last is the decimal point. Every other figure keeps
+the US reading, including the ambiguous single group `30.000` (30). Six of the
+2,486 stored spans change, each to the right figure (`U$S 1.000.000` reads
+1,000,000); no name-derived principal changes. `SEPARATED_FIGURE_PATTERN` is the
+one figure definition, used by the parser and by the `value` group of
+`NAME_EMBEDDED_AMOUNT_PATTERN`, whose match the parser reads again.
 
 ### `magnitude_in_amount_text`
 

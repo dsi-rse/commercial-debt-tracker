@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from cdt.segmenter.eightk import extract_items_from_document, primary_8k_body
-from cdt.segmenter.text import DocumentText
+from cdt.segmenter.text import DocumentText, normalize_body_lines
 
 
 def test_extract_items_from_complete_submission() -> None:
@@ -203,6 +203,69 @@ ITEM INFORMATION: Entry into a Material Definitive Agreement
     assert "per annum as described in the indenture" in sections[0].section_text
 
 
+def _eightk(item_informations: list[str], body: str) -> DocumentText:
+    header = "".join(f"ITEM INFORMATION: {value}\n" for value in item_informations)
+    return DocumentText(
+        accession_number="0006",
+        cik="320193",
+        company_name="Example Inc.",
+        url="https://sec.example/full.txt",
+        date="2024-01-02",
+        text=f"{header}<DOCUMENT>\n<TYPE>8-K\n<TEXT>\n<html><body>\n{body}\n"
+        "</body></html>\n</TEXT>\n</DOCUMENT>\n",
+    )
+
+
+def test_a_bare_coupon_cell_naming_an_undeclared_item_does_not_end_the_section() -> (
+    None
+):
+    """A ``5.06`` coupon cell in a bond table is content, not Item 5.06.
+
+    Shaped on an FHLB consolidated-obligation filing, whose 2.03 section lists
+    each bond's coupon in its own cell.
+    """
+    document = _eightk(
+        [
+            "Creation of a Direct Financial Obligation or an Obligation under an "
+            "Off-Balance Sheet Arrangement of a Registrant"
+        ],
+        """
+<p>Item 2.03 Creation of a Direct Financial Obligation.</p>
+<p>The Bank issued the following consolidated obligation bonds:</p>
+<table>
+<tr><td>3130BC2E2</td><td>9/18/2029</td><td>4.80</td><td>10,000,000</td></tr>
+<tr><td>3130BC2Q5</td><td>9/18/2031</td><td>5.06</td><td>10,000,000</td></tr>
+</table>
+<p>(1) Call Type Description: callable bonds may be redeemed by the Bank.</p>
+<p>Signatures</p>
+""",
+    )
+
+    (section,) = extract_items_from_document(document)
+
+    assert section.extraction_status == "ok"
+    assert "Call Type Description" in section.section_text
+
+
+def test_a_bare_heading_with_its_title_still_ends_the_section() -> None:
+    """An undeclared item still ends the section when its title follows the number."""
+    document = _eightk(
+        ["Other Events"],
+        """
+<p>8.01. Other Events.</p>
+<p>The Board declared a dividend.</p>
+<p>Item</p>
+<p>9.01 Financial Statements and Exhibits.</p>
+<p>(d) Exhibits</p>
+""",
+    )
+
+    (section,) = extract_items_from_document(document)
+
+    assert "declared a dividend" in section.section_text
+    assert "Exhibits" not in section.section_text
+
+
 def test_dollar_amounts_and_non_item_numbers_are_not_headings() -> None:
     """Money figures and numbers outside the 8-K item set never register as headings."""
     from cdt.segmenter.eightk import leading_item_numbers
@@ -215,3 +278,17 @@ def test_dollar_amounts_and_non_item_numbers_are_not_headings() -> None:
     assert leading_item_numbers("Item 1.05 Material Cybersecurity Incidents.") == (
         "1.05",
     )
+
+
+def test_escaped_angle_brackets_in_text_survive_the_tag_strip() -> None:
+    """``&lt;`` and ``&gt;`` are text; unescaping them first made them a tag."""
+    lines = normalize_body_lines(
+        "<p>multiplier &gt; 1 = leveraged; multiplier &lt; 1</p>"
+    )
+
+    assert [line.text for line in lines] == [
+        "multiplier > 1 = leveraged; multiplier < 1"
+    ]
+    assert [
+        line.text for line in normalize_body_lines("<td>x &lt; 5 and y &gt; 3</td>")
+    ] == ["x < 5 and y > 3"]
