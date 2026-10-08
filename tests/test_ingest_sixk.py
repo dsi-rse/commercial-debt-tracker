@@ -536,3 +536,40 @@ def test_malformed_documents_are_classified_permanent() -> None:
     assert (
         IngestFailureType.MALFORMED_DOCUMENT in IngestFailureClassifier().do_not_retry
     )
+
+
+def test_six_k_acquisition_renews_per_manifest_and_per_candidate(
+    tmp_path: Path,
+) -> None:
+    """The 6-K scan reads every manifest before its last write, so it renews as it goes."""
+    renewals: list[int] = []
+
+    _, result = acquire_scraped_sixk_documents(
+        _config(tmp_path),
+        s3_client=FakeS3Client(_objects()),
+        renew=lambda: renewals.append(1),
+    )
+
+    # At least once per scanned day, per manifest and per candidate.
+    assert result.total_rows == 2  # noqa: PLR2004
+    assert len(renewals) >= 2 + 2 + 2
+
+
+def test_ingest_genre_throttles_the_renewal_it_hands_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per-manifest calls cost one storage round trip per interval, not per call."""
+    from cdt.ingest.genres import ingest_genre
+
+    renewals: list[int] = []
+
+    def acquire(config: object, **kwargs: object) -> object:
+        for _ in range(5):
+            kwargs["renew"]()  # type: ignore[operator]
+        return None, None
+
+    monkeypatch.setattr("cdt.ingest.genres.acquire_scraped_sixk_documents", acquire)
+
+    ingest_genre("6-K", _config(tmp_path), renew=lambda: renewals.append(1))
+
+    assert renewals == [1]

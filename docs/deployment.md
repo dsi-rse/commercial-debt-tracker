@@ -253,7 +253,7 @@ These flags are rarely needed; the defaults are what the schedules use.
 | `--max-requests-per-batch` | `cdt run poll`, `cdt extract` (batch) | 40,000 | Requests per OpenAI batch input file. |
 | `--max-batch-bytes` | `cdt run poll`, `cdt extract` (batch) | 100 MiB | Bytes per OpenAI batch input file. |
 | `--flush-rows` (`ingest`), `--ingest-flush-rows` (`cdt run daily\|historical`) | ingest | 100 | Document rows buffered before each partition write; each write rewrites the partitions its rows land in. |
-| `--max-attempts` | `cdt run poll`, `cdt extract`, `cdt run daily\|historical` | 3 | Scored attempts per extractor stage per row. |
+| `--max-attempts` | `cdt run poll`, `cdt extract`, `cdt run daily\|historical` (live backend only) | 3 | Scored attempts per extractor stage per row. Under the batch backend, `cdt run daily\|historical` warns that it ignores this, `--model` and `--reasoning-effort`: extraction happens in `cdt run poll`. |
 
 `--force` reprocesses partitions the completion registries already record. On a
 batch-backend `daily`/`historical` run it applies to the prepare and match stages

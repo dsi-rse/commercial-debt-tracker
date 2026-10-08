@@ -827,3 +827,108 @@ def test_a_live_run_with_a_failed_genre_exits_non_zero(
 
     assert cli.main(_daily(tmp_path, "--extractor-backend", "live")) == 1
     assert "Failed genres: 8-K" in capsys.readouterr().out
+
+
+# --- review follow-ups: backend, ignored flags, publish override, bucket --------
+
+
+@pytest.mark.parametrize("value", ["Batch", "BATCH", " batch "])
+def test_extractor_backend_from_the_environment_is_normalised(
+    value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A differently-cased backend still means batch, never the paid live path."""
+    monkeypatch.setenv("EXTRACTOR_BACKEND", value)
+
+    args = cli.build_parser().parse_args(["run", "daily", "--cik-file", "c"])
+
+    assert args.extractor_backend == "batch"
+
+
+def test_an_unknown_extractor_backend_is_a_usage_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A typo in EXTRACTOR_BACKEND fails the parse instead of running live."""
+    monkeypatch.setenv("EXTRACTOR_BACKEND", "lvie")
+
+    for argv in (["run", "daily", "--cik-file", "c"], ["extract"]):
+        with pytest.raises(SystemExit) as raised:
+            cli.build_parser().parse_args(argv)
+        assert raised.value.code == 2  # noqa: PLR2004
+
+
+def test_a_batch_run_warns_about_flags_only_live_extraction_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    keep_caplog: None,
+) -> None:
+    """--model and friends do nothing under batch, so the run says so."""
+    _patch_prepare(monkeypatch, tmp_path)
+
+    with caplog.at_level("WARNING"):
+        assert cli.main(_daily(tmp_path, "--model", "m", "--max-attempts", "2")) == 0
+    assert "Ignoring --model, --max-attempts" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        assert cli.main(_daily(tmp_path)) == 0
+    assert "Ignoring" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [(("--force",), False), (("--force-publish",), True), ((), False)],
+)
+def test_only_force_publish_reaches_the_publisher_on_a_batch_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extra: tuple[str, ...],
+    expected: bool,
+) -> None:
+    """--force reprocesses; it never lowers the publish guards (#261)."""
+    _patch_prepare(monkeypatch, tmp_path)
+    published: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        run_module, "run_match_and_finalize", lambda **kwargs: published.append(kwargs)
+    )
+
+    assert cli.main(_daily(tmp_path, *extra)) == 0
+    assert published[0]["force_publish"] is expected
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [(("--force",), False), (("--force-publish",), True)],
+)
+def test_only_force_publish_reaches_the_publisher_on_a_poll_tick(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extra: tuple[str, ...],
+    expected: bool,
+) -> None:
+    """The poll tick that completes a job publishes with --force-publish only."""
+    _patch_tick(monkeypatch, "completed")
+    published: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        run_module, "run_match_and_finalize", lambda **kwargs: published.append(kwargs)
+    )
+
+    assert cli.main(_poll(tmp_path, *extra)) == 0
+    assert published[0]["force_publish"] is expected
+
+
+def test_the_scraper_bucket_defaults_to_the_shared_bucket_or_bucket_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no flag the run reads BUCKET_NAME, and failing that the shared bucket."""
+    from cdt.ingest.core import DEFAULT_BUCKET
+
+    configs: list[PipelineConfig] = []
+    _patch_prepare(monkeypatch, tmp_path, configs)
+
+    assert cli.main(_daily(tmp_path)) == 0
+    monkeypatch.setenv("BUCKET_NAME", "from-env-bucket")
+    assert cli.main(_daily(tmp_path)) == 0
+
+    assert DEFAULT_BUCKET == "idi-dev-ftm2j-shared-processor-storage"
+    assert [config.bucket for config in configs] == [DEFAULT_BUCKET, "from-env-bucket"]

@@ -22,7 +22,6 @@ from cdt.datasets import (
 )
 from cdt.extractor import (
     DEFAULT_MAX_ATTEMPTS,
-    DEFAULT_REASONING_EFFORT,
     extract_pending_items,
     extracted_tables_path,
 )
@@ -97,7 +96,8 @@ class PipelineConfig:
     sixk_concurrency: int = SIXK_DEFAULT_CONCURRENCY
     #: None resolves to the EXTRACTOR_MODEL setting when extraction runs.
     extractor_model: str | None = None
-    extractor_reasoning_effort: str = DEFAULT_REASONING_EFFORT
+    #: None resolves to the EXTRACTOR_REASONING setting when extraction runs.
+    extractor_reasoning_effort: str | None = None
     extractor_max_attempts: int = DEFAULT_MAX_ATTEMPTS
     strong_match_threshold: float = DEFAULT_MEMBERSHIP_THRESHOLD
     loose_match_threshold: float = DEFAULT_RELATED_THRESHOLD

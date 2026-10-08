@@ -1143,3 +1143,88 @@ def test_extract_backend_comes_from_the_environment(
 
     assert cli.main(["extract", "--quiet", "--artifact-root", str(tmp_path)]) == 0
     assert ran == ["live"]
+
+
+def test_an_error_inside_a_stage_exits_1_with_its_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A ValueError raised by the work is a failure, not an arguments error."""
+
+    def broken(**kwargs: object) -> object:
+        msg = "cannot reindex on an axis with duplicate labels"
+        raise ValueError(msg)
+
+    monkeypatch.setattr(cli, "match_pending_mentions", broken)
+    monkeypatch.setattr(cli, "configure_logging", lambda **kwargs: None)
+
+    with caplog.at_level("ERROR"):
+        status = cli.main(["match", "--artifact-root", str(tmp_path)])
+
+    assert status == 1
+    [record] = [r for r in caplog.records if r.getMessage() == "match failed"]
+    assert record.exc_info is not None
+    assert "Invalid" not in caplog.text
+
+
+def test_a_refused_publish_exits_1_with_the_guard_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The shrinkage guard's refusal reads as a refusal, without a traceback."""
+    from cdt.publish import PublishGuardError
+
+    def refuse(**kwargs: object) -> object:
+        raise PublishGuardError("Refusing to publish a final snapshot")
+
+    monkeypatch.setattr(cli, "publish_final_tables", refuse)
+    monkeypatch.setattr(cli, "configure_logging", lambda **kwargs: None)
+
+    with caplog.at_level("ERROR"):
+        status = cli.main(
+            [
+                "publish",
+                "--artifact-root",
+                str(tmp_path),
+                "--final-database-root",
+                str(tmp_path / "final"),
+            ]
+        )
+
+    assert status == 1
+    [record] = [r for r in caplog.records if "Refusing to publish" in r.getMessage()]
+    assert record.exc_info is None
+
+
+def test_ingest_passes_a_lease_renewer_that_reaches_the_acquirer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The acquirer gets a working renewer, throttled, wired to the CLI's lease."""
+    cik_file = tmp_path / "ciks.txt"
+    cik_file.write_text("320193\n", encoding="utf-8")
+    renewals: list[int] = []
+    real_renewer = cli.renewer
+
+    def counting_renewer(lease: object) -> Callable[[], None]:
+        renew = real_renewer(lease)  # type: ignore[arg-type]
+
+        def count() -> None:
+            renewals.append(1)
+            renew()
+
+        return count
+
+    def acquire(config: IngestConfig, **kwargs: object) -> object:
+        renew = kwargs["renew"]
+        assert callable(renew)
+        renew()
+        renew()  # Inside the throttle interval, so only the first renews.
+        return pd.DataFrame(), _ingest_result(config)
+
+    monkeypatch.setattr(cli, "renewer", counting_renewer)
+    monkeypatch.setattr("cdt.ingest.genres.acquire_eightk_documents", acquire)
+
+    assert cli.main(_ingest(tmp_path, cik_file, "--genres", "8-K")) == 0
+    assert renewals == [1]

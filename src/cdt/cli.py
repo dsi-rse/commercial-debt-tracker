@@ -82,7 +82,7 @@ from cdt.pipeline import (
     resolve_mode_dates,
     segment_genre,
 )
-from cdt.publish import publish_final_tables
+from cdt.publish import PublishGuardError, publish_final_tables
 from cdt.run import (
     EXTRACTOR_BACKENDS,
     MODE_DEADLINE_HOURS,
@@ -133,6 +133,14 @@ def _genres(value: str) -> tuple[str, ...]:
         return normalize_genres(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _backend(value: str) -> str:
+    backend = value.strip().lower()
+    if backend not in EXTRACTOR_BACKENDS:
+        msg = f"unknown extractor backend {value!r}; expected one of {', '.join(EXTRACTOR_BACKENDS)}"
+        raise argparse.ArgumentTypeError(msg)
+    return backend
 
 
 def _item_numbers(value: str) -> tuple[str, ...]:
@@ -296,19 +304,20 @@ def _extract_options() -> argparse.ArgumentParser:
         "--model",
         default=None,
         help="extractor model (default: env EXTRACTOR_MODEL live, "
-        "EXTRACTOR_BATCH_MODEL batch)",
+        "EXTRACTOR_BATCH_MODEL batch); on `cdt run`, live backend only",
     )
     parser.add_argument(
         "--reasoning-effort",
         default=None,
         help="reasoning effort (default: env EXTRACTOR_REASONING live, "
-        "EXTRACTOR_BATCH_REASONING batch)",
+        "EXTRACTOR_BATCH_REASONING batch); on `cdt run`, live backend only",
     )
     parser.add_argument(
         "--max-attempts",
         type=positive_int,
-        default=DEFAULT_EXTRACTOR_MAX_ATTEMPTS,
-        help=f"scored attempts per stage (default {DEFAULT_EXTRACTOR_MAX_ATTEMPTS})",
+        default=None,
+        help=f"scored attempts per stage (default {DEFAULT_EXTRACTOR_MAX_ATTEMPTS}); "
+        "on `cdt run daily|historical`, live backend only",
     )
     return parser
 
@@ -503,8 +512,11 @@ def _add_extract(commands: argparse._SubParsersAction) -> None:
     )
     extract.add_argument(
         "--backend",
-        choices=EXTRACTOR_BACKENDS,
-        default=_env_default("--backend", "batch"),
+        type=_backend,
+        metavar="{batch,live}",
+        # A string, so argparse parses it with ``type`` and reports a bad
+        # EXTRACTOR_BACKEND instead of quietly taking the live branch.
+        default=str(_env_default("--backend", "batch")),
         help="'batch' (env EXTRACTOR_BACKEND; default) advances the OpenAI batch "
         "job by one tick and prints its status; 'live' extracts every pending row "
         "synchronously",
@@ -585,8 +597,9 @@ def _add_run(commands: argparse._SubParsersAction) -> None:
         )
         prepare.add_argument(
             "--extractor-backend",
-            choices=EXTRACTOR_BACKENDS,
-            default=_env_default("--extractor-backend", "batch"),
+            type=_backend,
+            metavar="{batch,live}",
+            default=str(_env_default("--extractor-backend", "batch")),
             help="'batch' (env EXTRACTOR_BACKEND; default) leaves extraction to "
             "`cdt run poll`; 'live' extracts synchronously in this run",
         )
@@ -635,8 +648,9 @@ def _with_writer_lease(
 ) -> int:
     """Run ``body(artifact_root, lease)`` under the pipeline-writer lease.
 
-    Exit 1 without running when the lease is held, 1 when ``body`` raises
-    (logged), 2 when it raises ValueError (an invalid argument).
+    Exit 1 without running when the lease is held, and 1 when ``body`` raises:
+    a lost lease or a refused publish with its message, anything else with its
+    traceback. Arguments are validated before this is called.
     """
     artifact_root = _artifact_root(args)
     lease = acquire_lease(artifact_root, PIPELINE_WRITER_LEASE)
@@ -652,9 +666,9 @@ def _with_writer_lease(
     except LeaseLostError as exc:
         LOGGER.error("Aborting %s: %s", noun, exc)
         return 1
-    except ValueError as exc:
-        LOGGER.error("Invalid %s arguments: %s", noun, exc)
-        return USAGE_EXIT_CODE
+    except PublishGuardError as exc:
+        LOGGER.error("%s", exc)
+        return 1
     except Exception:
         LOGGER.exception("%s failed", noun)
         return 1
@@ -704,13 +718,16 @@ def run_ingest(args: argparse.Namespace) -> int:
         LOGGER.error("--cik-file (or CDT_DEFAULT_CIK_FILE) is required")
         return USAGE_EXIT_CODE
 
-    def body(artifact_root: str, lease: Lease) -> int:
-        mode = (
-            "daily"
-            if args.start_date is None and args.end_date is None
-            else "historical"
-        )
+    mode = (
+        "daily" if args.start_date is None and args.end_date is None else "historical"
+    )
+    try:
         start_date, end_date = resolve_mode_dates(mode, args.start_date, args.end_date)
+    except ValueError as exc:
+        LOGGER.error("Invalid ingest dates: %s", exc)
+        return USAGE_EXIT_CODE
+
+    def body(artifact_root: str, lease: Lease) -> int:
         config = IngestConfig(
             mode=mode,
             bucket=args.bucket,
@@ -844,7 +861,7 @@ def run_extract(args: argparse.Namespace) -> int:
             force=args.force,
             model=args.model,
             reasoning_effort=args.reasoning_effort,
-            max_attempts=args.max_attempts,
+            max_attempts=args.max_attempts or DEFAULT_EXTRACTOR_MAX_ATTEMPTS,
             max_requests_per_batch=args.max_requests_per_batch,
             max_batch_bytes=args.max_batch_bytes,
             max_rows_per_job=args.max_rows_per_job,
@@ -867,7 +884,7 @@ def run_extract(args: argparse.Namespace) -> int:
             force=args.force,
             model=args.model,
             reasoning_effort=args.reasoning_effort,
-            max_attempts=args.max_attempts,
+            max_attempts=args.max_attempts or DEFAULT_EXTRACTOR_MAX_ATTEMPTS,
             renew=renewer(lease),
         )
         print(
@@ -1027,6 +1044,23 @@ def run_run(args: argparse.Namespace) -> int:
         LOGGER.error("Invalid run arguments: %s", exc)
         return USAGE_EXIT_CODE
     if args.extractor_backend == "batch":
+        ignored = [
+            flag
+            for flag, value in (
+                ("--model", args.model),
+                ("--reasoning-effort", args.reasoning_effort),
+                ("--max-attempts", args.max_attempts),
+            )
+            if value is not None
+        ]
+        if ignored:
+            LOGGER.warning(
+                "Ignoring %s: the batch backend extracts in `cdt run poll`, which "
+                "takes its model and reasoning from EXTRACTOR_BATCH_MODEL and "
+                "EXTRACTOR_BATCH_REASONING and its own --max-attempts. Pass "
+                "--extractor-backend live to extract in this run.",
+                ", ".join(ignored),
+            )
         return run_prepare_then_publish(config)
     code, result = run_live(config)
     if result is not None:
@@ -1064,7 +1098,7 @@ def _pipeline_config(args: argparse.Namespace) -> PipelineConfig:
         sixk_concurrency=args.concurrency,
         extractor_model=args.model,
         extractor_reasoning_effort=args.reasoning_effort,
-        extractor_max_attempts=args.max_attempts,
+        extractor_max_attempts=args.max_attempts or DEFAULT_EXTRACTOR_MAX_ATTEMPTS,
         strong_match_threshold=args.strong_match_threshold,
         loose_match_threshold=args.loose_match_threshold,
         ambiguity_margin=args.ambiguity_margin,

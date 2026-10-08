@@ -24,6 +24,7 @@ from cdt.pipeline import (
     run_pipeline,
     run_prepare_stages,
 )
+from cdt.publish import PublishGuardError
 from cdt.storage.tables import read_dataset, read_table, write_partition_table
 
 EXPECTED_SIXK_SNIPPETS = 2
@@ -731,7 +732,7 @@ def test_final_snapshot_guard_blocks_shrinkage_unless_forced(tmp_path: Path) -> 
         artifact_root=str(artifact_root), final_database_root=str(final_root)
     )
 
-    with pytest.raises(ValueError, match="row-count regressions"):
+    with pytest.raises(PublishGuardError, match="row-count regressions"):
         write_final_output_tables(
             artifact_root=str(empty_root), final_database_root=str(final_root)
         )
@@ -1629,7 +1630,7 @@ def test_plain_force_keeps_the_shrinkage_guard(tmp_path: Path) -> None:
         artifact_root=str(artifact_root), final_database_root=str(final_root)
     )
 
-    with pytest.raises(ValueError, match="row-count regressions"):
+    with pytest.raises(PublishGuardError, match="row-count regressions"):
         run_match_and_finalize(
             artifact_root=str(tmp_path / "half-built"),
             final_database_root=str(final_root),
@@ -1644,3 +1645,68 @@ def test_read_cik_file_all_means_no_filter_and_reads_nothing(tmp_path: Path) -> 
     assert read_cik_file(ALL_CIKS) is None
     with pytest.raises(FileNotFoundError):
         read_cik_file(tmp_path / "all")
+
+
+def test_a_run_hands_its_lease_renewal_to_ingest_and_extract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both stages that can outlast the TTL alone get the run's renewal hook."""
+    calls: list[str] = []
+    _isolation_stubs(monkeypatch, tmp_path, calls)
+    seen: dict[str, object] = {}
+    renewals: list[int] = []
+
+    def acquire(config: object, **kwargs: object) -> object:
+        seen["ingest"] = kwargs["renew"]
+        return pd.DataFrame(), _sixk_ingest_result(tmp_path, kwargs.get("ciks"))  # type: ignore[arg-type]
+
+    monkeypatch.setattr("cdt.ingest.genres.acquire_eightk_documents", acquire)
+    monkeypatch.setattr(
+        "cdt.pipeline.extract_pending_items",
+        lambda **kwargs: (seen.setdefault("extract", kwargs["renew"]), pd.DataFrame())[
+            1
+        ],
+    )
+    config = _both_genres_config(tmp_path)
+
+    run_pipeline(
+        PipelineConfig(**{**config.__dict__, "genres": (GENRE_8K,)}),
+        renew=lambda: renewals.append(1),
+    )
+
+    ingest_renew = seen["ingest"]
+    assert callable(ingest_renew)
+    before = len(renewals)
+    ingest_renew()  # type: ignore[operator]
+    assert len(renewals) == before + 1
+    assert callable(seen["extract"])
+
+
+@pytest.mark.parametrize(
+    ("force", "force_publish", "expected"),
+    [(True, False, False), (False, True, True)],
+)
+def test_a_live_run_publishes_with_force_publish_not_force(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    force: bool,
+    force_publish: bool,
+    expected: bool,
+) -> None:
+    """The live path keeps --force away from the publish guards too (#261)."""
+    calls: list[str] = []
+    _isolation_stubs(monkeypatch, tmp_path, calls)
+    published: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "cdt.pipeline.finalize_after_match",
+        lambda instruments, **kwargs: published.append(kwargs),
+    )
+    config = _both_genres_config(tmp_path)
+
+    run_pipeline(
+        PipelineConfig(
+            **{**config.__dict__, "force": force, "force_publish": force_publish}
+        )
+    )
+
+    assert published[0]["force_publish"] is expected

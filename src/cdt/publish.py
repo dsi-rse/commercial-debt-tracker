@@ -294,7 +294,7 @@ def write_final_output_tables(
         Published table name -> snapshot path.
 
     Raises:
-        ValueError: Unless ``force_publish``, if a published table would shrink below
+        PublishGuardError: Unless ``force_publish``, if a published table would shrink below
             FINAL_SNAPSHOT_GUARD_RATIO of its current row count.
     """
     if final_database_root is None:
@@ -440,7 +440,7 @@ def _guard_against_shrinkage(
     """Refuse to publish a table shrinking below the guard ratio, unless ``force_publish``.
 
     Raises:
-        ValueError: If any table regressed and ``force_publish`` is False.
+        PublishGuardError: If any table regressed and ``force_publish`` is False.
     """
     regressions: list[str] = []
     for table_name, table in tables.items():
@@ -462,7 +462,11 @@ def _guard_against_shrinkage(
         f"({'; '.join(regressions)}). This usually means a bug or a half-built "
         "artifact root; re-run with --force-publish to publish anyway."
     )
-    raise ValueError(msg)
+    raise PublishGuardError(msg)
+
+
+class PublishGuardError(RuntimeError):
+    """The publish was refused because a table would shrink past the guard ratio."""
 
 
 def _prune_old_snapshots(snapshots_root: str, *, keep_run_ids: set[str]) -> None:
