@@ -188,7 +188,7 @@ moments ago can still finish reading it.
 ### `FINAL_SNAPSHOT_GUARD_RATIO` / `_guard_against_shrinkage`
 
 A table that shrinks below half its published row count blocks the publish
-unless it is forced. The likeliest causes are a bug or a half-built artifact
+unless `--force-publish` is passed. The likeliest causes are a bug or a half-built artifact
 root, not a real mass deletion of filings. The prior counts come from the
 published `latest.parquet` footers, not from the pointer. The pointer lives
 with the artifact root, so a half-built or newly pointed artifact root has no
@@ -214,19 +214,23 @@ cannot see `items`, which segment and 6-K classify write before match runs.
 
 Three things stop the gate from blocking every publish:
 
-- `force` overrides it.
+- `--force-publish` (`force_publish`) overrides it.
 - A pointer with no recorded digest publishes, which records one for next
   time.
 - A final database root missing any `latest.parquet` publishes regardless.
   Otherwise a newly pointed output root would stay empty until someone passed
-  `--force`. The check costs four HEAD requests on objects the publish would
+  `--force-publish`. The check costs four HEAD requests on objects the publish would
   write anyway.
 
 A run that crashed between writing a dataset and publishing it needs no
-`--force` to recover: the datasets changed, so the digest changed, so the next
-run publishes. This matters because `force` is the pipeline-wide flag, and it
-also turns off `_guard_against_shrinkage`, the protection a post-crash
-republish needs most. A crash during the publish works the same way (see the
+override to recover: the datasets changed, so the digest changed, so the next
+run publishes.
+
+The override is its own flag, not `--force`. `--force` means "reprocess
+partitions", and an operator reaches for it on exactly the runs most likely to
+leave a root half-built. If it also lowered `_guard_against_shrinkage`, such a
+run could publish that root over a good database. So `--force` reaches match but
+never the publish, and only `--force-publish` lowers either publish guard. A crash during the publish works the same way (see the
 next section).
 
 With no final database root the gate answers True without listing anything:

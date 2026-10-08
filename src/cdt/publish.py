@@ -61,7 +61,7 @@ FINAL_OUTPUT_TABLE_FORM_TYPES: dict[str, tuple[str, ...]] = {
 
 
 # A table shrinking below this fraction of its published row count blocks the
-# publish unless forced.
+# publish unless ``force_publish``.
 FINAL_SNAPSHOT_GUARD_RATIO = 0.5
 
 
@@ -121,19 +121,19 @@ def publish_would_republish_nothing(
     artifact_root: ArtifactPath,
     final_database_root: ArtifactPath | None,
     data_dir: Path | None = None,
-    force: bool = False,
+    force_publish: bool = False,
     source_digest: str | None = None,
 ) -> bool:
     """Return whether the publish can be skipped because its sources are unchanged.
 
     True when there is no final database root, or when the pointer's recorded
     source digest equals the current one and every published table's
-    ``latest.parquet`` exists. False when ``force`` is set, the pointer or its
+    ``latest.parquet`` exists. False when ``force_publish`` is set, the pointer or its
     digest is missing, the digest differs, or a published table is missing.
     ``source_digest`` is the caller's ``publish_source_digest`` if already
     computed; None computes it here.
     """
-    if force:
+    if force_publish:
         return False
     if final_database_root is None:
         return True
@@ -170,7 +170,7 @@ def publish_would_republish_nothing(
     LOGGER.info(
         "Skipping final publish: no partition under the published datasets has "
         "changed since generation %s, so the published snapshot is already "
-        "current. Use --force to publish anyway.",
+        "current. Use --force-publish to publish anyway.",
         pointer.get("run_id", "unknown"),
     )
     return True
@@ -182,7 +182,7 @@ def finalize_after_match(
     artifact_root: ArtifactPath,
     final_database_root: ArtifactPath | None,
     data_dir: Path | None = None,
-    force: bool = False,
+    force_publish: bool = False,
     renew: Callable[[], None] | None = None,
 ) -> dict[str, str]:
     """Run the lineage post-pass, then publish unless the gate says skip.
@@ -209,7 +209,7 @@ def finalize_after_match(
         artifact_root=artifact_root,
         final_database_root=final_database_root,
         data_dir=data_dir,
-        force=force,
+        force_publish=force_publish,
         renew=renew,
     )
 
@@ -219,7 +219,7 @@ def publish_final_tables(
     artifact_root: ArtifactPath,
     final_database_root: ArtifactPath | None,
     data_dir: Path | None = None,
-    force: bool = False,
+    force_publish: bool = False,
     renew: Callable[[], None] | None = None,
 ) -> dict[str, str]:
     """Publish the four final tables from the canonical datasets, unless the gate says skip.
@@ -242,7 +242,7 @@ def publish_final_tables(
         artifact_root=artifact_root,
         final_database_root=final_database_root,
         data_dir=data_dir,
-        force=force,
+        force_publish=force_publish,
         source_digest=source_digest,
     ):
         log_stage_complete(
@@ -255,7 +255,7 @@ def publish_final_tables(
         artifact_root=artifact_root,
         final_database_root=final_database_root,
         data_dir=data_dir,
-        force=force,
+        force_publish=force_publish,
         source_digest=source_digest,
     )
     log_stage_complete(
@@ -279,7 +279,7 @@ def write_final_output_tables(
     artifact_root: ArtifactPath,
     final_database_root: ArtifactPath | None,
     data_dir: Path | None = None,
-    force: bool = False,
+    force_publish: bool = False,
     source_digest: str | None = None,
 ) -> dict[str, str]:
     """Publish the final tables as one generation behind an atomic pointer.
@@ -294,7 +294,7 @@ def write_final_output_tables(
         Published table name -> snapshot path.
 
     Raises:
-        ValueError: Unless ``force``, if a published table would shrink below
+        ValueError: Unless ``force_publish``, if a published table would shrink below
             FINAL_SNAPSHOT_GUARD_RATIO of its current row count.
     """
     if final_database_root is None:
@@ -338,7 +338,7 @@ def write_final_output_tables(
         )
         is not None
     }
-    _guard_against_shrinkage(tables, previous_counts, force=force)
+    _guard_against_shrinkage(tables, previous_counts, force_publish=force_publish)
 
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     snapshots_root = final_snapshots_root(artifact_root)
@@ -435,12 +435,12 @@ def _guard_against_shrinkage(
     tables: dict[str, pd.DataFrame],
     previous_counts: dict[str, int],
     *,
-    force: bool,
+    force_publish: bool,
 ) -> None:
-    """Refuse to publish a table shrinking below the guard ratio, unless forced.
+    """Refuse to publish a table shrinking below the guard ratio, unless ``force_publish``.
 
     Raises:
-        ValueError: If any table regressed and ``force`` is False.
+        ValueError: If any table regressed and ``force_publish`` is False.
     """
     regressions: list[str] = []
     for table_name, table in tables.items():
@@ -451,7 +451,7 @@ def _guard_against_shrinkage(
             regressions.append(f"{table_name}: {prior_rows} -> {len(table)} rows")
     if not regressions:
         return
-    if force:
+    if force_publish:
         LOGGER.warning(
             "Publishing snapshot despite row-count regressions (forced): %s",
             "; ".join(regressions),
@@ -460,7 +460,7 @@ def _guard_against_shrinkage(
     msg = (
         "Refusing to publish a final snapshot with large row-count regressions "
         f"({'; '.join(regressions)}). This usually means a bug or a half-built "
-        "artifact root; re-run with force=True to publish anyway."
+        "artifact root; re-run with --force-publish to publish anyway."
     )
     raise ValueError(msg)
 

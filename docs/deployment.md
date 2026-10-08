@@ -246,9 +246,12 @@ These flags are rarely needed; the defaults are what the schedules use.
 | `--max-batch-bytes` | `cdt run poll` | 100 MiB | Bytes per OpenAI batch input file. |
 | `--max-attempts` | `cdt run poll`, `cdt extract`, `cdt run … --extractor-backend live` | 3 | Scored attempts per extractor stage per row. |
 
-`--force` on a batch-backend `daily`/`historical` run applies to the prepare and
-match/publish stages only, and also skips the publish gate and the shrinkage guard;
-to force a re-extract, run `cdt run poll --force` while no job is active.
+`--force` reprocesses partitions the completion registries already record. On a
+batch-backend `daily`/`historical` run it applies to the prepare and match stages
+only; to force a re-extract, run `cdt run poll --force` while no job is active.
+`--force` never lowers the publish guards. To publish when no source changed, or
+past the shrinkage guard (a table falling below half its published rows), pass
+`--force-publish`, on `cdt publish` or any `cdt run` mode.
 
 ## Monitoring and Response
 
@@ -299,6 +302,9 @@ run-task` pattern the script wraps.
 - Treat the configured default CIK file as the environment's normal run scope.
 - Use a smaller CIK file and narrow date range for first backfills.
 - Prefer `--force` only when intentionally recomputing existing partitions.
+- Reserve `--force-publish` for a deliberate overwrite of the published tables,
+  after checking why the shrinkage guard refused; `run-historical.sh` never
+  passes it.
 
 ## Prod Launch Checklist
 

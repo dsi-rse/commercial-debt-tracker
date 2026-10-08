@@ -76,7 +76,11 @@ class PipelineConfig:
     data_dir: Path | None = None
     artifact_root: ArtifactPath | None = None
     final_database_root: ArtifactPath | None = None
+    #: Reprocess partitions the completion registries already record.
     force: bool = False
+    #: Publish even when no source changed, and past the shrinkage guard.
+    #: Separate from ``force``: reprocessing must not lower the publish guards.
+    force_publish: bool = False
     download: bool = False
     failure_file: ArtifactPath | None = None
     aws_profile: str = DEFAULT_AWS_PROFILE
@@ -510,7 +514,7 @@ class Pipeline:
             artifact_root=resolved_artifact_root,
             final_database_root=self.config.final_database_root,
             data_dir=self.config.data_dir,
-            force=self.config.force,
+            force_publish=self.config.force_publish,
             renew=renew,
         )
         elapsed = datetime.now() - start_time
@@ -545,6 +549,7 @@ def run_match_and_finalize(
     data_dir: Path | None = None,
     batch_size: int = DEFAULT_STAGE_BATCH_SIZE,
     force: bool = False,
+    force_publish: bool = False,
     strong_match_threshold: float = DEFAULT_MEMBERSHIP_THRESHOLD,
     loose_match_threshold: float = DEFAULT_RELATED_THRESHOLD,
     ambiguity_margin: float = DEFAULT_AMBIGUITY_MARGIN,
@@ -552,7 +557,8 @@ def run_match_and_finalize(
 ) -> dict[str, str]:
     """Run match on existing mentions, then finalize; idempotent.
 
-    ``renew`` extends the caller's writer lease per matched shard and before
+    ``force`` re-matches every shard; ``force_publish`` publishes past the
+    skip gate and the shrinkage guard. ``renew`` extends the caller's writer lease per matched shard and before
     the publish, so a stolen lease cannot keep publishing.
 
     Returns:
@@ -574,7 +580,7 @@ def run_match_and_finalize(
         artifact_root=resolved_root,
         final_database_root=final_database_root,
         data_dir=data_dir,
-        force=force,
+        force_publish=force_publish,
         renew=renew,
     )
 

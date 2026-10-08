@@ -244,6 +244,17 @@ def _force_option(help_text: str) -> argparse.ArgumentParser:
     return parser
 
 
+def _force_publish_option() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--force-publish",
+        action="store_true",
+        help="publish even when no source changed since the last publish, and "
+        "even when a table would shrink below half its published rows",
+    )
+    return parser
+
+
 def _batch_size_option() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument(
@@ -517,9 +528,7 @@ def _add_publish(commands: argparse._SubParsersAction) -> None:
         parents=[
             _common_options(),
             _final_database_root_option(),
-            _force_option(
-                "publish even when no source changed, and skip the shrinkage guard"
-            ),
+            _force_publish_option(),
         ],
         help="write the four latest.parquet tables from the current datasets",
     )
@@ -539,10 +548,8 @@ def _add_run(commands: argparse._SubParsersAction) -> None:
                 _common_options(),
                 _genre_options(),
                 _filing_window_options(dates_required=mode == "historical"),
-                _force_option(
-                    "reprocess partitions already recorded complete, and skip "
-                    "the publish gate and shrinkage guard"
-                ),
+                _force_option("reprocess partitions already recorded complete"),
+                _force_publish_option(),
                 _final_database_root_option(),
                 _runtime_option(),
                 _segment_options(),
@@ -585,6 +592,7 @@ def _add_run(commands: argparse._SubParsersAction) -> None:
             _force_option(
                 "when this tick starts a new job, claim partitions already extracted"
             ),
+            _force_publish_option(),
         ],
         help="advance the batch extract job one tick; match and publish when it "
         "completes",
@@ -967,7 +975,7 @@ def run_publish(args: argparse.Namespace) -> int:
         published = publish_final_tables(
             artifact_root=artifact_root,
             final_database_root=args.final_database_root,
-            force=args.force,
+            force_publish=args.force_publish,
             renew=renewer(lease),
         )
         if not published:
@@ -991,6 +999,7 @@ def run_run(args: argparse.Namespace) -> int:
             artifact_root=args.artifact_root,
             final_database_root=args.final_database_root,
             force=args.force,
+            force_publish=args.force_publish,
             max_attempts=args.max_attempts,
             max_requests_per_batch=args.max_requests_per_batch,
             max_batch_bytes=args.max_batch_bytes,
@@ -1033,6 +1042,7 @@ def _pipeline_config(args: argparse.Namespace) -> PipelineConfig:
         artifact_root=args.artifact_root,
         final_database_root=args.final_database_root,
         force=args.force,
+        force_publish=args.force_publish,
         download=args.download,
         failure_file=args.failure_file,
         aws_profile=args.aws_profile,

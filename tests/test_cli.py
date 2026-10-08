@@ -973,7 +973,7 @@ def test_publish_writes_the_final_tables_under_the_lease(
         return {"items": f"{final_root}/items/latest.parquet"}
 
     monkeypatch.setattr(cli, "publish_final_tables", fake_publish)
-    argv = ["publish", "--quiet", "--artifact-root", str(tmp_path), "--force"]
+    argv = ["publish", "--quiet", "--artifact-root", str(tmp_path), "--force-publish"]
     if via_env:
         monkeypatch.setenv("FINAL_DATABASE_ROOT", final_root)
     else:
@@ -983,7 +983,7 @@ def test_publish_writes_the_final_tables_under_the_lease(
     [kwargs] = calls
     assert kwargs["artifact_root"] == str(tmp_path)
     assert kwargs["final_database_root"] == final_root
-    assert kwargs["force"] is True
+    assert kwargs["force_publish"] is True
     assert callable(kwargs["renew"])
     assert "Published items" in capsys.readouterr().out
 
@@ -1031,3 +1031,20 @@ def test_quiet_silences_stage_modules_info_logs(
 
     assert status == 0
     assert "partition_stage" not in capsys.readouterr().err
+
+
+def test_run_force_does_not_lower_the_publish_guards() -> None:
+    """--force reprocesses partitions; only --force-publish overrides the publish."""
+    plain = cli._pipeline_config(
+        cli.build_parser().parse_args(
+            ["run", "daily", "--cik-file", "c.txt", "--force"]
+        )
+    )
+    both = cli._pipeline_config(
+        cli.build_parser().parse_args(
+            ["run", "daily", "--cik-file", "c.txt", "--force", "--force-publish"]
+        )
+    )
+
+    assert (plain.force, plain.force_publish) == (True, False)
+    assert (both.force, both.force_publish) == (True, True)

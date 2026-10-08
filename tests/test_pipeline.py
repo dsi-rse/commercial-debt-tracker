@@ -752,7 +752,7 @@ def test_final_snapshot_guard_blocks_shrinkage_unless_forced(tmp_path: Path) -> 
     forced = write_final_output_tables(
         artifact_root=str(empty_root),
         final_database_root=str(final_root),
-        force=True,
+        force_publish=True,
     )
     assert forced
 
@@ -1175,15 +1175,22 @@ def test_a_pointer_with_no_recorded_digest_publishes(tmp_path: Path) -> None:
     )
 
 
-def test_force_publishes_even_when_nothing_changed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("force", "force_publish", "expected_publishes"),
+    [(False, True, 1), (True, False, 0)],
+    ids=["force-publish", "plain-force"],
+)
+def test_only_force_publish_overrides_the_publish_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    force: bool,
+    force_publish: bool,
+    expected_publishes: int,
 ) -> None:
-    """--force still overrides the gate (#110).
+    """--force reprocesses; only --force-publish republishes unchanged sources.
 
-    It is no longer the documented way to recover a run that crashed between
-    writing a dataset and publishing it — the datasets moved, so the digest
-    moved, so the next run republishes on its own. That matters because
-    ``force`` is the pipeline-wide flag and also disables the shrinkage guard.
+    A crash between writing a dataset and publishing needs neither: the
+    datasets moved, so the digest moved, so the next run republishes on its own.
     """
     from cdt import pipeline as pipeline_module
     from cdt import publish as publish_module
@@ -1202,10 +1209,11 @@ def test_force_publishes_even_when_nothing_changed(
     pipeline_module.run_match_and_finalize(
         artifact_root=artifact_root,
         final_database_root=str(final_root),
-        force=True,
+        force=force,
+        force_publish=force_publish,
     )
 
-    assert len(published) == 1
+    assert len(published) == expected_publishes
 
 
 def test_an_unpublished_database_root_publishes_despite_unchanged_sources(
@@ -1347,15 +1355,15 @@ def test_normalize_snapshot_text_is_not_the_publish_cost(tmp_path: Path) -> None
 
 
 @pytest.mark.parametrize(
-    ("change_a_source", "force", "expected_publishes"),
+    ("change_a_source", "force_publish", "expected_publishes"),
     [(True, False, 1), (False, False, 0), (False, True, 1)],
-    ids=["source-changed", "sources-unchanged", "forced"],
+    ids=["source-changed", "sources-unchanged", "force-publish"],
 )
 def test_run_pipeline_skips_the_publish_when_nothing_changed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     change_a_source: bool,
-    force: bool,
+    force_publish: bool,
     expected_publishes: int,
 ) -> None:
     """A live run pays the same publish as the batch backend, so the same gate.
@@ -1400,13 +1408,12 @@ def test_run_pipeline_skips_the_publish_when_nothing_changed(
             end_date=date(2024, 1, 31),
             artifact_root=str(tmp_path / "artifacts"),
             final_database_root=str(final_root),
-            force=force,
+            force_publish=force_publish,
         )
     )
 
-    # "forced" pins that --force reaches the shared tail from this entry point
-    # too: only run_match_and_finalize had a force test, so this path could
-    # stop passing it and nothing would fail.
+    # "force-publish" pins that the flag reaches the shared tail from this
+    # entry point too, not only from run_match_and_finalize.
     assert len(published) == expected_publishes
 
 
@@ -1616,3 +1623,23 @@ def test_match_and_finalize_logs_its_lineage_and_finalize_stages(
     assert "Completed stage: infer-lineage | links=0 reopened=0" in messages
     assert any(m.startswith("Starting stage: finalize") for m in messages)
     assert any(m.startswith("Completed stage: finalize | tables=0") for m in messages)
+
+
+def test_plain_force_keeps_the_shrinkage_guard(tmp_path: Path) -> None:
+    """Reprocessing with --force must not publish a half-built root over a good one."""
+    from cdt.pipeline import run_match_and_finalize
+    from cdt.publish import write_final_output_tables
+
+    artifact_root = tmp_path / "artifacts"
+    final_root = tmp_path / "final"
+    _seed_final_tables(artifact_root)
+    write_final_output_tables(
+        artifact_root=str(artifact_root), final_database_root=str(final_root)
+    )
+
+    with pytest.raises(ValueError, match="row-count regressions"):
+        run_match_and_finalize(
+            artifact_root=str(tmp_path / "half-built"),
+            final_database_root=str(final_root),
+            force=True,
+        )

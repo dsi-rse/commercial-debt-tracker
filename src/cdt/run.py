@@ -168,9 +168,9 @@ def run_prepare_then_publish(
         )
     if config.force:
         LOGGER.warning(
-            "--force applies to the prepare and match/publish stages only under "
-            "the batch backend: extraction is deferred to poll, which never "
-            "forces an already-completed partition. To re-extract, run "
+            "--force applies to the prepare and match stages only under the "
+            "batch backend: extraction is deferred to poll, which never forces "
+            "an already-completed partition. To re-extract, run "
             "`cdt run poll --force` while no job is active."
         )
     # Prepare writes registries a poll tick also writes, so the lease covers it.
@@ -194,6 +194,7 @@ def run_prepare_then_publish(
             final_database_root=config.final_database_root,
             batch_size=config.match_batch_size,
             force=config.force,
+            force_publish=config.force_publish,
             renew=renew,
         )
     except LeaseLostError as exc:
@@ -249,6 +250,7 @@ def run_poll(
     artifact_root: ArtifactPath | None,
     final_database_root: ArtifactPath | None = None,
     force: bool = False,
+    force_publish: bool = False,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     max_requests_per_batch: int | None = None,
     max_batch_bytes: int | None = None,
@@ -259,8 +261,9 @@ def run_poll(
 
     Runs under the pipeline-writer lease. Prints the job status, or ``locked``
     when the lease is held (exit 0). Returns 1 if the lease is lost mid-tick.
-    ``force`` applies only when the tick creates a new job. The ``max_*`` limits
-    default to the batch backend's own.
+    ``force`` applies only when the tick creates a new job; ``force_publish``
+    to the publish after a completed job. The ``max_*`` limits default to the
+    batch backend's own.
     """
     resolved_root = resolve_artifact_root(artifact_root)
     lease = acquire_lease(resolved_root, PIPELINE_WRITER_LEASE)
@@ -306,7 +309,7 @@ def run_poll(
                 artifact_root=resolved_root,
                 final_database_root=final_database_root,
                 batch_size=match_batch_size,
-                force=force,
+                force_publish=force_publish,
                 renew=renew,
             )
         print(result.status)
