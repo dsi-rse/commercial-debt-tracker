@@ -183,6 +183,7 @@ def test_triage_retries_a_malformed_verdict() -> None:
         {"keep": 1, "drop": []},
         {"keep": "12", "drop": []},
         {"keep": [1], "drop": {"id": 2}},
+        {"keep": [1], "drop": 5},
         {"keep": [1], "drop": [{"id": 2, "reason": ["no_details"]}]},
         {"keep": ["²"], "drop": [{"id": 2, "reason": "no_details"}]},
     ],

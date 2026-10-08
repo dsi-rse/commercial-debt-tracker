@@ -1297,6 +1297,8 @@ def test_names_differing_only_by_a_stopword_are_compatible() -> None:
     assert not name_fingerprints_are_compatible(
         fp("Tranche A Term Loan"), fp("Tranche B Term Loan")
     )
+    # A strict subset still has to pass the guards the equal-token case skips.
+    assert not name_fingerprints_are_compatible(fp("Notes"), fp("The Senior Notes"))
 
 
 def _cycle_links(dated_parents: dict[str, tuple[str, str]]) -> dict[str, dict]:

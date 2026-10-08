@@ -232,6 +232,8 @@ def validate_verdict(verdict: object, expected: int) -> list[str]:
     ['snippet 1 appears more than once in drop']
     >>> validate_verdict({"keep": 1, "drop": []}, 1)
     ["'keep' must be a list of snippet ids"]
+    >>> validate_verdict({"keep": [1], "drop": 5}, 1)
+    ["'drop' must be a list of objects"]
     """
     if not isinstance(verdict, dict):
         return ["response was not a JSON object"]
