@@ -445,7 +445,11 @@ carried over.
 
 `candidate_source` is a factory, not a source, because the failure registry is
 created inside ingest: two registries over one `failures.json` would overwrite
-each other's entries. Everything after the candidates is shared: accession
+each other's entries. The factory receives the run's `IngestFailures`, which
+skips, records, clears and counts every failure in one place, so a run's
+`failures` is everything either genre recorded. Before it, the 8-K source
+registered a missing document without counting it, and each genre had its own
+copy of the skip-unless-forced and clear-on-success logic (#277). Everything after the candidates is shared: accession
 dedup, batched partition merges, the read-back window and the run manifest.
 That makes switching sources cheap. The S3 client is built only when needed,
 so a run that never touches S3 does not need a profile.
