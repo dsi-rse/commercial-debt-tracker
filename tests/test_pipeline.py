@@ -1570,3 +1570,19 @@ def test_a_failed_genre_is_logged_with_its_traceback(
     failures = [r for r in caplog.records if "Genre prepare failed" in r.getMessage()]
     assert {r.getMessage() for r in failures} == {"Genre prepare failed: genre=6-K"}
     assert all(r.exc_info is not None for r in failures)
+
+
+def test_a_run_with_a_failed_genre_does_not_report_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The closing banner names the failed genre instead of claiming success."""
+    calls: list[str] = []
+    _isolation_stubs(monkeypatch, tmp_path, calls, failing=(GENRE_6K,))
+
+    with caplog.at_level("INFO"):
+        run_pipeline(_both_genres_config(tmp_path))
+
+    assert "completed successfully" not in caplog.text
+    assert "with failed genres: 6-K" in caplog.text

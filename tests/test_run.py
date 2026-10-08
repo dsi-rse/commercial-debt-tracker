@@ -633,6 +633,43 @@ def test_a_failed_genre_still_publishes_but_fails_the_run_without_a_heartbeat(
     assert "Run complete" not in caplog.text
 
 
+def test_a_clean_live_run_logs_the_heartbeat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    keep_caplog: None,
+) -> None:
+    """The live backend emits the same literal, so the alarm holds under either backend."""
+    monkeypatch.setattr(
+        run_module, "run_pipeline", lambda config, **kwargs: _result(tmp_path)
+    )
+
+    with caplog.at_level("INFO"):
+        assert cli.main(_daily(tmp_path, "--extractor-backend", "live")) == 0
+
+    assert "Run complete: mode=daily" in caplog.text
+
+
+def test_a_live_run_with_a_failed_genre_logs_no_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    keep_caplog: None,
+) -> None:
+    """A failed genre exits 1 with neither the heartbeat nor a success banner."""
+    monkeypatch.setattr(
+        run_module,
+        "run_pipeline",
+        lambda config, **kwargs: _result(tmp_path, failed_genres=(GENRE_6K,)),
+    )
+
+    with caplog.at_level("INFO"):
+        assert cli.main(_daily(tmp_path, "--extractor-backend", "live")) == 1
+
+    assert "Live run finished with failed genres: 6-K" in caplog.text
+    assert "Run complete" not in caplog.text
+
+
 # --- daily / historical, live backend ----------------------------------------
 
 
