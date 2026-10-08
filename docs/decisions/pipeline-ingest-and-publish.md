@@ -571,13 +571,34 @@ not in dissemination format never becomes one on retry.
 
 ## Segmenting 8-K text (`cdt.segmenter`)
 
-### `VALID_ITEM_NUMBERS` / `leading_item_numbers`
+### `VALID_ITEM_NUMBERS` / `ITEM_TITLE_PREFIXES` / `leading_item_numbers`
 
 Only real 8-K item numbers can be headings. Even those are rejected when they
 read as money or a rate: `$1.05 billion` in a heading line, or a coupon such as
 `5.25%`. HTML table cells become their own lines, so `5.25% Senior Notes due
 2029` used to be read as a heading and cut the enclosing item section off right
 at the debt text this pipeline targets (#63).
+
+A bare number, without the `Item` keyword, is a heading only when the filing's
+`ITEM INFORMATION` header declares that item, or when the item's title follows
+it on the line (`9.01 Financial Statements and Exhibits.`). A bare `5.06` coupon
+cell in an FHLB bond table otherwise ended its 2.03 section halfway, with
+`extraction_status` still `ok` (#262). Requiring a declared item alone was
+rejected: it also stopped an 8.01 section from ending at an undeclared `9.01
+Financial Statements` heading, which the title rule keeps. On the 1,008
+documents in `data/genwindow-eval`, one of 2,141 sections changes: the FHLB 2.03
+section, which now runs to its signature block (4,405 to about 8,500 chars).
+The title must start on the number's own line; on the same corpus no bare
+undeclared number has its title on the next line.
+
+### `normalize_body_lines` (tags stripped before entities are unescaped)
+
+Unescaping first turned `multiplier &lt; 1 = deleveraged` into a fake tag that
+the strip deleted along with the text up to the next `>` (#263). On
+`data/genwindow-eval`, 12 sections in 12 filings regain text (11 FHLB 2.03
+sections, one 8.01). The 6-K segmenter shares this function. The restored `<`
+reaches the NER stage, which `repair_unescaped_text` handles (see
+`extraction.md`).
 
 ### `extract_items_from_document` (one row per key)
 

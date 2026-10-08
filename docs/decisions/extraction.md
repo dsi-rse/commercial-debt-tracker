@@ -157,6 +157,30 @@ Every number in the span must carry a rate marker: `500,000,000 (100% of princip
 
 Magnitude words, spelled out and abbreviated (#182). The abbreviations matter because the name-derived principal (#129) reads the instrument's own name, and names use them: `Citibank $382.5 mil. Revolving Credit Facility`, `Syndicated $850.0 mil. Facility` (Costamare's 6-K facility schedules). On a cited span a missing magnitude only publishes null, because `amounts_agree` rejects the mismatch; on the name-derived path there is no model value to disagree with, so a value six orders of magnitude off would publish. `AMOUNT_SCALE_ALTERNATION` is built from this table so every magnitude the pattern recognizes is one the parser can apply.
 
+### `LETTER_AMOUNT_MAGNITUDE_PATTERN`
+
+`$250M` parsed as 250 and `$1.5B` as 1.5 (#266). An upper-case `K`, `M` or `B`
+counts when it follows the figure the parser reads; lower case only when that
+figure is currency-marked (`£250m`), since a bare `250m` is as likely metres or
+months. A letter that starts a longer word (`$250MMBtu`) is not a magnitude, and
+one on a later figure (`$500,000 (Tranche 1B)`) does not scale the first.
+`NAME_EMBEDDED_AMOUNT_PATTERN` builds its letter branch from the same table.
+On the 2,486 distinct amount spans in the local extractor audit logs, three
+change, each to the right figure (`$18.3M`, `$193M`, `$462M`); none of the 1,724
+instrument names changes its derived principal.
+
+### `_figure_with_unambiguous_separators`
+
+The parser assumed the US convention, so Grupo Supervielle's `20.877.777` read
+as 20.877 (#231). Two shapes read the same in every convention: `.` before
+exactly three digits more than once is a thousands separator, and with both `.`
+and `,` in one figure the last is the decimal point. Every other figure keeps
+the US reading, including the ambiguous single group `30.000` (30). Six of the
+2,486 stored spans change, each to the right figure (`U$S 1.000.000` reads
+1,000,000); no name-derived principal changes. `SEPARATED_FIGURE_PATTERN` is the
+one figure definition, used by the parser and by the `value` group of
+`NAME_EMBEDDED_AMOUNT_PATTERN`, whose match the parser reads again.
+
 ### `magnitude_in_amount_text`
 
 The single definition of a magnitude word, shared by the parser and `scaled_amount_from_sibling` (which asks whether a span carries its own magnitude and which one its neighbour carries), so the two cannot disagree.
