@@ -10,7 +10,28 @@ from idi_ftm2j_shared.failures import FailureRegistry as _SharedFailureRegistry
 from idi_ftm2j_shared.logs import TqdmLoggingHandler
 from idi_ftm2j_shared.logs import get_logger as _shared_get_logger
 
-__all__ = ["FailureClassifier", "FailureRegistry", "get_logger"]
+__all__ = [
+    "FailureClassifier",
+    "FailureRegistry",
+    "get_logger",
+    "log_stage_complete",
+    "log_stage_start",
+]
+
+
+def log_stage_start(logger: logging.Logger, stage: str, **details: object) -> None:
+    """Log ``Starting stage: <stage> | key=value ...``, the run's stage-start line."""
+    logger.info("Starting stage: %s%s", stage, _stage_details(details))
+
+
+def log_stage_complete(logger: logging.Logger, stage: str, **details: object) -> None:
+    """Log ``Completed stage: <stage> | key=value ...``, the run's stage-end line."""
+    logger.info("Completed stage: %s%s", stage, _stage_details(details))
+
+
+def _stage_details(details: dict[str, object]) -> str:
+    text = " ".join(f"{key}={value}" for key, value in details.items())
+    return f" | {text}" if text else ""
 
 
 def get_logger(name: str) -> logging.Logger:

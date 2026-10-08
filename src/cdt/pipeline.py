@@ -48,7 +48,7 @@ from cdt.segmenter.eightk import (
     segment_pending_eightk_documents,
 )
 from cdt.segmenter.sixk import segment_pending_sixk_documents
-from cdt.shared import get_logger
+from cdt.shared import get_logger, log_stage_complete, log_stage_start
 from cdt.storage.objects import ArtifactPath, read_text_artifact
 
 #: Genres the CLI entry points prepare unless `--genres` narrows them: all of them.
@@ -256,20 +256,10 @@ class Pipeline:
             self.logger.info("%s: %s", key, value)
 
     def _log_stage_start(self: Self, stage_name: str, **details: object) -> None:
-        detail_text = " ".join(f"{key}={value}" for key, value in details.items())
-        self.logger.info(
-            "Starting stage: %s%s",
-            stage_name,
-            f" | {detail_text}" if detail_text else "",
-        )
+        log_stage_start(self.logger, stage_name, **details)
 
     def _log_stage_complete(self: Self, stage_name: str, **details: object) -> None:
-        detail_text = " ".join(f"{key}={value}" for key, value in details.items())
-        self.logger.info(
-            "Completed stage: %s%s",
-            stage_name,
-            f" | {detail_text}" if detail_text else "",
-        )
+        log_stage_complete(self.logger, stage_name, **details)
 
     def _setup(self: Self) -> tuple[date, date, set[str], str]:
         """Resolve dates, CIKs, and the artifact root and emit the run banner."""
@@ -522,8 +512,6 @@ class Pipeline:
             data_dir=self.config.data_dir,
             force=self.config.force,
             renew=renew,
-            log_stage_start=self._log_stage_start,
-            log_stage_complete=self._log_stage_complete,
         )
         elapsed = datetime.now() - start_time
         if prepared.failed_genres:

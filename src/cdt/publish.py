@@ -20,7 +20,7 @@ from cdt.matcher import (
 from cdt.matcher.lineage_inference import apply_lineage_inference_pass
 from cdt.matcher.schema import MATCHER_SCHEMA_VERSION
 from cdt.segmenter.core import ITEM_COLUMNS, items_root
-from cdt.shared import get_logger
+from cdt.shared import get_logger, log_stage_complete, log_stage_start
 from cdt.storage.columns import coerce_dataset_text
 from cdt.storage.objects import (
     ArtifactPath,
@@ -176,10 +176,6 @@ def publish_would_republish_nothing(
     return True
 
 
-def _ignore_stage(*args: object, **kwargs: object) -> None:
-    """Swallow a stage log line: only a whole run reports stages."""
-
-
 def finalize_after_match(
     matched_instruments: pd.DataFrame,
     *,
@@ -188,8 +184,6 @@ def finalize_after_match(
     data_dir: Path | None = None,
     force: bool = False,
     renew: Callable[[], None] | None = None,
-    log_stage_start: Callable[..., None] = _ignore_stage,
-    log_stage_complete: Callable[..., None] = _ignore_stage,
 ) -> dict[str, str]:
     """Run the lineage post-pass, then publish unless the gate says skip.
 
@@ -197,7 +191,8 @@ def finalize_after_match(
     match`` runs the lineage pass itself and ``cdt publish`` only publishes. The lineage
     pass is skipped when ``matched_instruments`` is empty. ``renew`` extends
     the caller's writer lease before each long step, so a stolen lease cannot
-    keep publishing.
+    keep publishing. Each step logs its ``Starting stage``/``Completed stage``
+    lines, whichever entry point called it.
 
     Returns:
         Published table name -> snapshot path; empty when nothing was published.
@@ -205,19 +200,17 @@ def finalize_after_match(
     if not matched_instruments.empty:
         if renew is not None:
             renew()
-        log_stage_start("infer-lineage")
+        log_stage_start(LOGGER, "infer-lineage")
         lineage_stats = apply_lineage_inference_pass(
             artifact_root, data_dir=data_dir, renew=renew
         )
-        log_stage_complete("infer-lineage", **lineage_stats)
+        log_stage_complete(LOGGER, "infer-lineage", **lineage_stats)
     return publish_final_tables(
         artifact_root=artifact_root,
         final_database_root=final_database_root,
         data_dir=data_dir,
         force=force,
         renew=renew,
-        log_stage_start=log_stage_start,
-        log_stage_complete=log_stage_complete,
     )
 
 
@@ -228,8 +221,6 @@ def publish_final_tables(
     data_dir: Path | None = None,
     force: bool = False,
     renew: Callable[[], None] | None = None,
-    log_stage_start: Callable[..., None] = _ignore_stage,
-    log_stage_complete: Callable[..., None] = _ignore_stage,
 ) -> dict[str, str]:
     """Publish the four final tables from the canonical datasets, unless the gate says skip.
 
@@ -240,7 +231,7 @@ def publish_final_tables(
     Returns:
         Published table name -> snapshot path; empty when nothing was published.
     """
-    log_stage_start("finalize", output_root=final_database_root)
+    log_stage_start(LOGGER, "finalize", output_root=final_database_root)
     # After lineage (which writes debt-instruments), before the publish reads.
     source_digest = (
         None
@@ -254,7 +245,9 @@ def publish_final_tables(
         force=force,
         source_digest=source_digest,
     ):
-        log_stage_complete("finalize", tables=0, output_root=final_database_root)
+        log_stage_complete(
+            LOGGER, "finalize", tables=0, output_root=final_database_root
+        )
         return {}
     if renew is not None:
         renew()
@@ -266,7 +259,7 @@ def publish_final_tables(
         source_digest=source_digest,
     )
     log_stage_complete(
-        "finalize", tables=len(final_outputs), output_root=final_database_root
+        LOGGER, "finalize", tables=len(final_outputs), output_root=final_database_root
     )
     return final_outputs
 

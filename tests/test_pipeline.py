@@ -1586,3 +1586,33 @@ def test_a_run_with_a_failed_genre_does_not_report_success(
 
     assert "completed successfully" not in caplog.text
     assert "with failed genres: 6-K" in caplog.text
+
+
+def test_match_and_finalize_logs_its_lineage_and_finalize_stages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The batch path (daily, poll) logs the same stage lines a live run does."""
+    from cdt.pipeline import run_match_and_finalize
+
+    monkeypatch.setattr(
+        "cdt.pipeline.match_pending_mentions",
+        lambda **kwargs: {
+            "debt_instrument": pd.DataFrame([{"debt_instrument_id": "i-1"}]),
+            "debt_instrument_mentions": pd.DataFrame(),
+        },
+    )
+    monkeypatch.setattr(
+        "cdt.publish.apply_lineage_inference_pass",
+        lambda *args, **kwargs: {"links": 0, "reopened": 0},
+    )
+
+    with caplog.at_level("INFO"):
+        run_match_and_finalize(artifact_root=str(tmp_path))
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert "Starting stage: infer-lineage" in messages
+    assert "Completed stage: infer-lineage | links=0 reopened=0" in messages
+    assert any(m.startswith("Starting stage: finalize") for m in messages)
+    assert any(m.startswith("Completed stage: finalize | tables=0") for m in messages)
