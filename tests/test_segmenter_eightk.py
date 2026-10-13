@@ -280,6 +280,15 @@ def test_dollar_amounts_and_non_item_numbers_are_not_headings() -> None:
     )
 
 
+def test_a_bare_number_needs_its_title_unless_declared() -> None:
+    """With no declared items, a bare number is a heading only with its title."""
+    from cdt.segmenter.eightk import leading_item_numbers
+
+    assert leading_item_numbers("5.06") == ()
+    assert leading_item_numbers("5.06", bare_numbers=frozenset({"5.06"})) == ("5.06",)
+    assert leading_item_numbers("9.01 Financial Statements and Exhibits.") == ("9.01",)
+
+
 def test_escaped_angle_brackets_in_text_survive_the_tag_strip() -> None:
     """``&lt;`` and ``&gt;`` are text; unescaping them first made them a tag."""
     lines = normalize_body_lines(

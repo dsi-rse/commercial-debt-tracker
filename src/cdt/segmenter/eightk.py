@@ -302,16 +302,16 @@ def normalize_item_number(text: str) -> str:
 
 
 def leading_item_numbers(
-    line: str, *, bare_numbers: frozenset[str] = VALID_ITEM_NUMBERS
+    line: str, *, bare_numbers: frozenset[str] = frozenset()
 ) -> tuple[str, ...]:
     """Return item numbers if a line looks like an item heading.
 
     Args:
         line: Normalized body line to inspect.
         bare_numbers: Item numbers a line may name without the ``Item``
-            keyword. A bare ``5.06`` is as likely a table cell (a coupon, a
-            ratio) as a heading, so any other bare number is a heading only
-            when its item's title follows it.
+            keyword, none by default. A bare ``5.06`` is as likely a table
+            cell (a coupon, a ratio) as a heading, so any other bare number is
+            a heading only when its item's title follows it.
 
     Returns:
         Tuple of item numbers when the line starts like an item heading.
@@ -366,7 +366,7 @@ def is_subitem_heading(line: str, item_number: str) -> bool:
 
 
 def item_headings(
-    lines: list[BodyLine], *, bare_numbers: frozenset[str] = VALID_ITEM_NUMBERS
+    lines: list[BodyLine], *, bare_numbers: frozenset[str] = frozenset()
 ) -> list[Heading]:
     """Return item heading candidates, excluding table-of-contents entries.
 
