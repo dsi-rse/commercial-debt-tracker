@@ -111,7 +111,7 @@ Notes:
 - `make local-run` and `./scripts/local-pipeline.sh` run `cdt run` with deployment-like environment variables from `.env`.
 - `cdt extract job show` inspects the async batch extract job; `cdt extract job reset --yes`
   clears a wedged one. See [docs/architecture.md](docs/architecture.md).
-- The shared local convention is `DATA_DIR/commercial-debt-tracker/local` for canonical artifacts and `DATA_DIR/commercial-debt-tracker/database/cdt` for dashboard-consumable `latest.parquet` outputs.
+- `DATA_DIR` is the local artifact root, both for a bare `cdt` command (no `--artifact-root` or `ARTIFACT_ROOT`) and for `make local-run` / `./scripts/local-pipeline.sh`. It comes from the environment, then `.env`, else `<repo>/data`. Those two write dashboard-consumable `latest.parquet` outputs to `DATA_DIR/database/cdt`, the same `database/cdt` prefix the deployed stack uses in its bucket.
 
 ## Dashboard Handoff
 
@@ -119,8 +119,8 @@ This repo communicates with the website publisher, [`dsi-rse/commercial-debt-tra
 
 For local development with a shared `DATA_DIR`:
 
-- CDT writes canonical working artifacts to `DATA_DIR/commercial-debt-tracker/local`
-- CDT writes dashboard-facing final snapshots to `DATA_DIR/commercial-debt-tracker/database/cdt`
+- CDT writes canonical working artifacts to `DATA_DIR`
+- CDT writes dashboard-facing final snapshots to `DATA_DIR/database/cdt`
 - the website repo reads those four `latest.parquet` files and builds its local `generated/*.json` snapshot from them
 
 The dashboard-facing files are:
