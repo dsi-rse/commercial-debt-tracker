@@ -103,13 +103,9 @@ PROVIDER_OPENAI = "openai"
 
 def sixk_snippets_root(
     artifact_root: str | Path | None = None,
-    *,
-    data_dir: Path | None = None,
 ) -> str:
     """Return the canonical 6-K snippets dataset root."""
-    return dataset_root(
-        SIXK_SNIPPET_DATASET_NAME, artifact_root=artifact_root, data_dir=data_dir
-    )
+    return dataset_root(SIXK_SNIPPET_DATASET_NAME, artifact_root=artifact_root)
 
 
 def snippet_id_for(
@@ -274,7 +270,6 @@ def triage_windows(
     windows: pd.DataFrame,
     documents: pd.DataFrame,
     *,
-    data_dir: Path | None = None,
     model_dir: Path | None = None,
     artifacts: tuple[object, float] | None = None,
     client: SupportsChatCompletion | None = None,
@@ -314,7 +309,6 @@ def triage_windows(
             else _candidates_for_filing(
                 document,
                 filing_windows,
-                data_dir=data_dir,
                 s3_client=resolved_s3_client,
             )
         )
@@ -410,7 +404,6 @@ def _candidates_for_filing(
     document: dict[str, object],
     windows: pd.DataFrame,
     *,
-    data_dir: Path | None,
     s3_client: object | None,
 ) -> list[_Candidate] | None:
     """Rebuild one filing's stored window spans over its submission's text.
@@ -420,9 +413,7 @@ def _candidates_for_filing(
     the spans were cut from different text, so none of them can be trusted.
     """
     accession_number = str(document["accession_number"])
-    prose = prose_documents(
-        document_text_for_record(document, data_dir=data_dir, s3_client=s3_client)
-    )
+    prose = prose_documents(document_text_for_record(document, s3_client=s3_client))
     candidates: list[_Candidate] = []
     for document_index, document_windows in windows.groupby(
         "document_index", sort=True
@@ -651,7 +642,6 @@ class _WindowPartitionTriage:
         self: Self,
         *,
         artifact_root: str,
-        data_dir: Path | None,
         model_dir: Path | None,
         client: SupportsChatCompletion | None,
         s3_client: object | None,
@@ -667,7 +657,6 @@ class _WindowPartitionTriage:
             msg = f"concurrency must be positive, got {concurrency}"
             raise ValueError(msg)
         self.artifact_root = artifact_root
-        self.data_dir = data_dir
         self.model_dir = model_dir
         self.client = client
         self.s3_client = s3_client
@@ -699,7 +688,6 @@ class _WindowPartitionTriage:
             partition_date=partition["date"],
             shard=partition["shard"],
             artifact_root=self.artifact_root,
-            data_dir=self.data_dir,
         )
         documents = (
             read_table(documents_path, DOCUMENT_COLUMNS).reindex(
@@ -712,7 +700,6 @@ class _WindowPartitionTriage:
         output = triage_windows(
             windows,
             documents,
-            data_dir=self.data_dir,
             artifacts=self.artifacts,
             client=self.client,
             s3_client=self.s3_client,
@@ -757,7 +744,6 @@ class _WindowPartitionTriage:
 def triage_pending_windows(
     *,
     artifact_root: str | Path | None = None,
-    data_dir: Path | None = None,
     force: bool = False,
     model_dir: Path | None = None,
     client: SupportsChatCompletion | None = None,
@@ -784,10 +770,9 @@ def triage_pending_windows(
         StaleSegmentationError: After every other partition is processed, if
             any partition was left pending for stale spans.
     """
-    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    resolved_root = resolve_artifact_root(artifact_root)
     triage = _WindowPartitionTriage(
         artifact_root=resolved_root,
-        data_dir=data_dir,
         model_dir=model_dir,
         client=client,
         s3_client=s3_client,
@@ -801,7 +786,6 @@ def triage_pending_windows(
         output_columns=SIXK_SNIPPET_COLUMNS,
         process=lambda source_path, partition: triage(source_path, partition, None),
         artifact_root=resolved_root,
-        data_dir=data_dir,
         force=force,
         renew=renew,
         manifest_extra={
@@ -817,7 +801,6 @@ def triage_pending_windows(
 def retry_failed_triage(
     *,
     artifact_root: str | Path | None = None,
-    data_dir: Path | None = None,
     model_dir: Path | None = None,
     client: SupportsChatCompletion | None = None,
     s3_client: object | None = None,
@@ -834,10 +817,9 @@ def retry_failed_triage(
         StaleSegmentationError: After every other partition is retried, if any
             was held for stale spans.
     """
-    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    resolved_root = resolve_artifact_root(artifact_root)
     triage = _WindowPartitionTriage(
         artifact_root=resolved_root,
-        data_dir=data_dir,
         model_dir=model_dir,
         client=client,
         s3_client=s3_client,
@@ -851,7 +833,6 @@ def retry_failed_triage(
         output_columns=SIXK_SNIPPET_COLUMNS,
         classify_partition=triage,
         artifact_root=resolved_root,
-        data_dir=data_dir,
         renew=renew,
     )
     triage.report()

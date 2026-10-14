@@ -14,7 +14,6 @@ import pytest
 
 from cdt.datasets import (
     SIXK_DOCUMENT_DATASET_NAME,
-    default_artifact_root,
     failure_registry_path,
     parse_date_shard_partition,
 )
@@ -205,12 +204,10 @@ def test_acquire_documents_indexes_resources_without_downloading(
         "sec-bucket",
         "sec/2024-01-03/8-K/789019/000000000024000001/manifest.json",
     ) not in client.manifest_reads
-    documents = read_dataset(documents_root(data_dir=tmp_path), columns=first.columns)
+    documents = read_dataset(documents_root(tmp_path), columns=first.columns)
     assert documents["accession_number"].to_list() == ["000114036126006577"]
     assert documents["company_name"].to_list() == [""]
-    assert (
-        len(list_artifacts(documents_root(data_dir=tmp_path), suffix=".parquet")) == 1
-    )
+    assert len(list_artifacts(documents_root(tmp_path), suffix=".parquet")) == 1
 
 
 def test_acquire_documents_writes_downloads_in_batches_when_requested(
@@ -288,7 +285,7 @@ def test_acquire_documents_writes_downloads_in_batches_when_requested(
         ("sec-bucket", "sec/2024-01-04/8-K/320193/000000000024000003/full.txt"),
     ]
     assert (
-        len(list_artifacts(documents_root(data_dir=tmp_path), suffix=".parquet"))
+        len(list_artifacts(documents_root(tmp_path), suffix=".parquet"))
         == EXPECTED_PARTITION_FILES
     )
 
@@ -354,7 +351,7 @@ def test_acquire_documents_decompresses_gzip_downloads(tmp_path: Path) -> None:
     )
 
     partition_path = list_artifacts(
-        documents_root(data_dir=tmp_path),
+        documents_root(tmp_path),
         suffix=".parquet",
     )[0]
     downloaded = read_table(partition_path)
@@ -402,7 +399,7 @@ def test_ingest_records_missing_document_failures(tmp_path: Path) -> None:
         cik_file=tmp_path / "ciks.txt",
         start_date=date(2024, 1, 2),
         end_date=date(2024, 1, 2),
-        data_dir=tmp_path,
+        output_root=str(tmp_path),
         failure_file=tmp_path / "failures" / "ingest_failures.json",
     )
     first, result = acquire_eightk_documents(
@@ -450,7 +447,7 @@ def test_ingest_records_download_failures(tmp_path: Path) -> None:
             cik_file=tmp_path / "ciks.txt",
             start_date=date(2024, 1, 2),
             end_date=date(2024, 1, 2),
-            data_dir=tmp_path,
+            output_root=str(tmp_path),
             failure_file=failure_registry_path("ingest", artifact_root=tmp_path),
             download=True,
         ),
@@ -484,7 +481,7 @@ def test_ingest_without_an_injected_client_builds_one_from_the_profile(
             cik_file=tmp_path / "ciks.txt",
             start_date=date(2024, 1, 2),
             end_date=date(2024, 1, 2),
-            data_dir=tmp_path,
+            output_root=str(tmp_path),
             aws_profile="analysis",
         ),
         ciks={"320193"},
@@ -769,7 +766,7 @@ def test_acquire_eightk_documents_passes_force_and_prefix_to_the_manifest_walk(
             cik_file=tmp_path / "ciks.txt",
             start_date=date(2024, 1, 2),
             end_date=date(2024, 1, 2),
-            data_dir=tmp_path,
+            output_root=str(tmp_path),
             failure_file=failure_file,
             force=force,
             s3_prefix="custom",
@@ -875,7 +872,6 @@ def test_ingest_routes_configured_form_types_to_their_own_dataset(
             cik_file=Path(),
             start_date=date(2024, 1, 2),
             end_date=date(2024, 1, 4),
-            data_dir=tmp_path,
             output_root=str(tmp_path),
             form_types=("6-K", "6-K/A"),
             dataset_name=SIXK_DOCUMENT_DATASET_NAME,
@@ -948,7 +944,6 @@ def test_ingesting_six_k_leaves_the_eight_k_partitions_byte_identical(
         "cik_file": Path(),
         "start_date": date(2024, 1, 2),
         "end_date": date(2024, 1, 2),
-        "data_dir": tmp_path,
         "output_root": str(tmp_path),
     }
 
@@ -1039,7 +1034,6 @@ def test_partitions_written_before_the_provenance_columns_stay_readable(
             cik_file=Path(),
             start_date=date(2024, 1, 2),
             end_date=date(2024, 1, 2),
-            data_dir=tmp_path,
             output_root=str(tmp_path),
         ),
         ciks={"320193"},
@@ -1085,11 +1079,11 @@ def _document_row(accession: str, filing_date: str) -> dict[str, object]:
     }
 
 
-def _store_document(data_dir: Path, accession: str, filing_date: str) -> None:
+def _store_document(root: Path, accession: str, filing_date: str) -> None:
     from cdt.storage.tables import write_partition_table
 
     write_partition_table(
-        documents_root(data_dir=data_dir),
+        documents_root(str(root)),
         partition={"date": filing_date, "shard": _document_shard(accession)},
         table=pd.DataFrame(
             [_document_row(accession, filing_date)], columns=DOCUMENT_COLUMNS
@@ -1130,7 +1124,7 @@ def test_existing_accessions_reads_only_the_windowed_partitions(
 
     accessions = ingest._existing_accessions(
         "documents",
-        output_root=default_artifact_root(tmp_path),
+        output_root=str(tmp_path),
         start_date=date(2024, 1, 5),
         end_date=date(2024, 1, 6),
     )
@@ -1160,7 +1154,7 @@ def test_existing_accessions_projects_away_the_document_text(
 
     ingest._existing_accessions(
         "documents",
-        output_root=default_artifact_root(tmp_path),
+        output_root=str(tmp_path),
         start_date=date(2024, 1, 5),
         end_date=date(2024, 1, 5),
     )
@@ -1191,7 +1185,7 @@ def test_existing_accessions_scans_the_window_in_one_pass(
 
     accessions = ingest._existing_accessions(
         "documents",
-        output_root=default_artifact_root(tmp_path),
+        output_root=str(tmp_path),
         start_date=date(2024, 1, 5),
         end_date=date(2024, 1, 7),
     )
@@ -1235,7 +1229,7 @@ def test_reingest_inside_the_window_still_skips_the_download(tmp_path: Path) -> 
             cik_file=tmp_path / "ciks.txt",
             start_date=date(2024, 1, 2),
             end_date=date(2024, 1, 2),
-            data_dir=tmp_path,
+            output_root=str(tmp_path),
             download=True,
         ),
         ciks={"320193"},
@@ -1244,7 +1238,7 @@ def test_reingest_inside_the_window_still_skips_the_download(tmp_path: Path) -> 
 
     assert result.skipped_existing == 1
     assert client.downloads == []
-    documents = read_dataset(documents_root(data_dir=tmp_path))
+    documents = read_dataset(documents_root(tmp_path))
     assert documents["accession_number"].to_list() == [accession]
     assert documents["text"].to_list() == ["stored"]
 
@@ -1292,7 +1286,7 @@ def test_the_read_back_counts_the_window_without_reading_its_bodies(
         cik_file=tmp_path / "ciks.txt",
         start_date=date(2024, 1, 1),
         end_date=date(2024, 1, 31),
-        data_dir=tmp_path,
+        output_root=str(tmp_path),
     )
     table, result = acquire_eightk_documents(
         config, ciks={"320193"}, s3_client=FakeS3Client({})
@@ -1342,7 +1336,6 @@ def _two_day_config(tmp_path: Path) -> IngestConfig:
         cik_file=tmp_path / "ciks.txt",
         start_date=date(2024, 1, 2),
         end_date=date(2024, 1, 3),
-        data_dir=tmp_path,
         output_root=str(tmp_path),
         failure_file=tmp_path / "failures" / "ingest_failures.json",
     )

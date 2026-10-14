@@ -106,7 +106,6 @@ def run_partition_stage(
     output_columns: list[str],
     process: Callable[[str, dict[str, str]], PartitionOutput],
     artifact_root: str | Path | None = None,
-    data_dir: Path | None = None,
     force: bool = False,
     renew: Callable[[], None] | None = None,
     manifest_extra: dict[str, object] | None = None,
@@ -127,17 +126,14 @@ def run_partition_stage(
     before each partition's write, throttled (:func:`cdt.lease.throttled`). A
     run manifest is written at ``runs/<stage_name>/run_id=latest.json``.
     """
-    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    resolved_root = resolve_artifact_root(artifact_root)
     pending, registry = pending_source_partitions(
         stage_name,
         source_dataset,
         artifact_root=resolved_root,
-        data_dir=data_dir,
         force=force,
     )
-    output_root = dataset_root(
-        output_dataset, artifact_root=resolved_root, data_dir=data_dir
-    )
+    output_root = dataset_root(output_dataset, artifact_root=resolved_root)
 
     # Loaded on the first completed partition, so an idle run reads nothing.
     failures: dict[str, dict[str, object]] | None = None
@@ -145,13 +141,9 @@ def run_partition_stage(
 
     def save() -> None:
         nonlocal failures_changed
-        save_completion_registry(
-            stage_name, registry, artifact_root=resolved_root, data_dir=data_dir
-        )
+        save_completion_registry(stage_name, registry, artifact_root=resolved_root)
         if failures is not None and failures_changed:
-            save_row_failures(
-                stage_name, failures, artifact_root=resolved_root, data_dir=data_dir
-            )
+            save_row_failures(stage_name, failures, artifact_root=resolved_root)
             failures_changed = False
 
     checkpoint = throttled(save, interval_seconds=CHECKPOINT_INTERVAL_SECONDS)
@@ -172,7 +164,6 @@ def run_partition_stage(
             partition_date=partition["date"],
             shard=partition["shard"],
             artifact_root=resolved_root,
-            data_dir=data_dir,
         )
         if not output.complete:
             result.held_partitions.append(source_path)
@@ -193,9 +184,7 @@ def run_partition_stage(
             result.empty_partitions += 1
         if output.complete:
             if failures is None:
-                failures = load_row_failures(
-                    stage_name, artifact_root=resolved_root, data_dir=data_dir
-                )
+                failures = load_row_failures(stage_name, artifact_root=resolved_root)
             failures_changed |= replace_partition_failures(
                 failures, source_path, output.failures
             )
@@ -223,9 +212,7 @@ def run_partition_stage(
         save()
 
     write_json_artifact(
-        run_manifest_path(
-            stage_name, "latest", artifact_root=resolved_root, data_dir=data_dir
-        ),
+        run_manifest_path(stage_name, "latest", artifact_root=resolved_root),
         {
             "artifact_root": resolved_root,
             "stage": stage_name,
@@ -237,7 +224,7 @@ def run_partition_stage(
             "empty_partitions_skipped_from_write": result.empty_partitions,
             "partitions_held": result.held_partitions,
             "completion_registry": completion_registry_root(
-                stage_name, artifact_root=resolved_root, data_dir=data_dir
+                stage_name, artifact_root=resolved_root
             ),
         },
     )

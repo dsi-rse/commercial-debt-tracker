@@ -58,8 +58,6 @@ LOGGER = logging.getLogger(__name__)
 
 def _stale_schema_forces_rematch(
     resolved_root: str,
-    *,
-    data_dir: Path | None = None,
 ) -> bool:
     """Return True when the root's latest match manifest records an older schema.
 
@@ -72,7 +70,6 @@ def _stale_schema_forces_rematch(
         "match",
         "latest",
         artifact_root=resolved_root,
-        data_dir=data_dir,
     )
     if not artifact_exists(manifest_path):
         return False
@@ -92,7 +89,6 @@ def _stale_schema_forces_rematch(
 def match_pending_mentions(
     *,
     artifact_root: str | Path | None = None,
-    data_dir: Path | None = None,
     force: bool = False,
     strong_match_threshold: float = DEFAULT_MEMBERSHIP_THRESHOLD,
     loose_match_threshold: float = DEFAULT_RELATED_THRESHOLD,
@@ -108,13 +104,11 @@ def match_pending_mentions(
     ``{"debt_instrument_mentions": edges, "debt_instrument": instruments}``
     for every shard written (empty frames when there are no mentions).
     """
-    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    resolved_root = resolve_artifact_root(artifact_root)
     if not force:
-        force = _stale_schema_forces_rematch(resolved_root, data_dir=data_dir)
+        force = _stale_schema_forces_rematch(resolved_root)
     mention_rows = read_dataset(
-        dataset_root(
-            MENTIONS_DATASET_NAME, artifact_root=resolved_root, data_dir=data_dir
-        ),
+        dataset_root(MENTIONS_DATASET_NAME, artifact_root=resolved_root),
         columns=EXTRACTED_MENTION_COLUMNS,
     )
     if mention_rows.empty:
@@ -145,11 +139,11 @@ def match_pending_mentions(
             existing_instruments = pd.DataFrame(columns=DEBT_INSTRUMENT_COLUMNS)
         else:
             existing_edges = read_dataset(
-                mention_cluster_edges_root(resolved_root, data_dir=data_dir),
+                mention_cluster_edges_root(resolved_root),
                 partition_filter={"cik_shard": str(cik_shard)},
             )
             existing_instruments = read_dataset(
-                debt_instruments_root(resolved_root, data_dir=data_dir),
+                debt_instruments_root(resolved_root),
                 partition_filter={"cik_shard": str(cik_shard)},
             )
         tables = match_tables(
@@ -168,12 +162,12 @@ def match_pending_mentions(
             columns=DEBT_INSTRUMENT_COLUMNS
         )
         write_partition_table(
-            mention_cluster_edges_root(resolved_root, data_dir=data_dir),
+            mention_cluster_edges_root(resolved_root),
             partition={"cik_shard": str(cik_shard)},
             table=mention_cluster_edges,
         )
         write_partition_table(
-            debt_instruments_root(resolved_root, data_dir=data_dir),
+            debt_instruments_root(resolved_root),
             partition={"cik_shard": str(cik_shard)},
             table=debt_instruments,
         )
@@ -184,7 +178,6 @@ def match_pending_mentions(
                 DEBT_INSTRUMENT_DATASET_NAME,
                 cik_shard=str(cik_shard),
                 artifact_root=resolved_root,
-                data_dir=data_dir,
             )
         )
         LOGGER.info(
@@ -202,7 +195,6 @@ def match_pending_mentions(
             "match",
             "latest",
             artifact_root=resolved_root,
-            data_dir=data_dir,
         ),
         {
             "artifact_root": resolved_root,

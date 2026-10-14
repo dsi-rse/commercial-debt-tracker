@@ -321,7 +321,6 @@ def infer_amendment_parents(
 def apply_lineage_inference_pass(
     artifact_root: str | Path,
     *,
-    data_dir: Path | None = None,
     renew: Callable[[], None] | None = None,
 ) -> dict[str, int]:
     """Infer amendment lineage across the whole corpus, after all shards match.
@@ -338,13 +337,11 @@ def apply_lineage_inference_pass(
     all zero, with nothing written, when instruments, edges or mentions are
     empty.
     """
-    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
-    instruments = read_dataset(debt_instruments_root(resolved_root, data_dir=data_dir))
-    edges = read_dataset(mention_cluster_edges_root(resolved_root, data_dir=data_dir))
+    resolved_root = resolve_artifact_root(artifact_root)
+    instruments = read_dataset(debt_instruments_root(resolved_root))
+    edges = read_dataset(mention_cluster_edges_root(resolved_root))
     mentions = read_dataset(
-        dataset_root(
-            MENTIONS_DATASET_NAME, artifact_root=resolved_root, data_dir=data_dir
-        ),
+        dataset_root(MENTIONS_DATASET_NAME, artifact_root=resolved_root),
         columns=EXTRACTED_MENTION_COLUMNS,
     )
     if instruments.empty or edges.empty or mentions.empty:
@@ -403,7 +400,7 @@ def apply_lineage_inference_pass(
             renew()
         partitions_written.append(
             write_partition_table(
-                debt_instruments_root(resolved_root, data_dir=data_dir),
+                debt_instruments_root(resolved_root),
                 partition={"cik_shard": str(cik_shard)},
                 table=shard_rows.drop(columns=["_shard"]).reindex(
                     columns=DEBT_INSTRUMENT_COLUMNS
@@ -417,7 +414,6 @@ def apply_lineage_inference_pass(
             "infer-lineage",
             "latest",
             artifact_root=resolved_root,
-            data_dir=data_dir,
         ),
         {
             "artifact_root": resolved_root,

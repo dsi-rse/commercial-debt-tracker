@@ -5,7 +5,6 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from operator import itemgetter
-from pathlib import Path
 from typing import Self
 
 from cdt.datasets import (
@@ -36,14 +35,13 @@ def completion_registry_root(
     stage_name: str,
     *,
     artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
 ) -> str:
     """Return the prefix ``runs/<stage>/completed`` holding a registry's shards.
 
     The shard objects under it are ``completion_registry_shard_path``.
     """
     return join_artifact_path(
-        resolve_artifact_root(artifact_root, data_dir=data_dir),
+        resolve_artifact_root(artifact_root),
         "runs",
         stage_name,
         "completed",
@@ -71,13 +69,10 @@ def completion_registry_shard_path(
     shard_label: str,
     *,
     artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
 ) -> str:
     """Return the path of one date-prefix shard of a stage's registry."""
     return join_artifact_path(
-        completion_registry_root(
-            stage_name, artifact_root=artifact_root, data_dir=data_dir
-        ),
+        completion_registry_root(stage_name, artifact_root=artifact_root),
         f"date={shard_label}.json",
     )
 
@@ -132,7 +127,6 @@ def load_completion_registry(
     stage_name: str,
     *,
     artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
 ) -> CompletionRegistry:
     """Load one stage's registry from every ``date=`` shard, with no keys dirty.
 
@@ -140,14 +134,12 @@ def load_completion_registry(
     Keys come back as whole paths under the artifact root. No shards returns
     an empty registry.
     """
-    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    resolved_root = resolve_artifact_root(artifact_root)
     entries: dict[str, CompletedPartition] = {}
     shard_paths = [
         path
         for path in list_artifacts(
-            completion_registry_root(
-                stage_name, artifact_root=resolved_root, data_dir=data_dir
-            ),
+            completion_registry_root(stage_name, artifact_root=resolved_root),
             suffix=".json",
         )
         if path.rsplit("/", 1)[-1].startswith("date=")
@@ -296,7 +288,6 @@ def save_completion_registry(
     registry: dict[str, CompletedPartition],
     *,
     artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
 ) -> str:
     """Persist one stage's changed registry entries; return the registry root.
 
@@ -309,7 +300,7 @@ def save_completion_registry(
     written. Raises RuntimeError when a shard loses ``_REGISTRY_CAS_ATTEMPTS``
     races in a row.
     """
-    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    resolved_root = resolve_artifact_root(artifact_root)
     changed = sorted(
         registry.dirty if isinstance(registry, CompletionRegistry) else registry
     )
@@ -322,7 +313,6 @@ def save_completion_registry(
             shard_label,
             shard_entries,
             artifact_root=resolved_root,
-            data_dir=data_dir,
         )
         # Committed, so the next batch boundary must not re-send these keys;
         # otherwise every save rewrites every shard the run has touched and the
@@ -330,9 +320,7 @@ def save_completion_registry(
         # failed swap raises, leaving only that shard's keys dirty.
         if isinstance(registry, CompletionRegistry):
             registry.dirty -= shard_entries.keys()
-    return completion_registry_root(
-        stage_name, artifact_root=resolved_root, data_dir=data_dir
-    )
+    return completion_registry_root(stage_name, artifact_root=resolved_root)
 
 
 def _save_registry_shard(
@@ -341,7 +329,6 @@ def _save_registry_shard(
     entries: dict[str, CompletedPartition],
     *,
     artifact_root: str,
-    data_dir: Path | None,
 ) -> str:
     """Compare-and-swap ``entries`` into one date shard of a stage's registry.
 
@@ -350,7 +337,7 @@ def _save_registry_shard(
     path; raises RuntimeError after ``_REGISTRY_CAS_ATTEMPTS`` lost races.
     """
     path = completion_registry_shard_path(
-        stage_name, shard_label, artifact_root=artifact_root, data_dir=data_dir
+        stage_name, shard_label, artifact_root=artifact_root
     )
     for _ in range(_REGISTRY_CAS_ATTEMPTS):
         if not artifact_exists(path):
@@ -397,7 +384,6 @@ def pending_source_partitions(
     source_dataset: str,
     *,
     artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
     force: bool = False,
 ) -> tuple[list[tuple[str, str]], dict[str, CompletedPartition]]:
     """Select source partitions a whole-partition stage still has to process.
@@ -410,20 +396,18 @@ def pending_source_partitions(
     ValueError on a non-canonical parquet file other than an orphaned temp
     file.
     """
-    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    resolved_root = resolve_artifact_root(artifact_root)
     registry = (
         # Not a plain ``{}``: save_completion_registry treats every key of a
         # plain dict as changed and would re-send the whole run each save.
         CompletionRegistry()
         if force
-        else load_completion_registry(
-            stage_name, artifact_root=resolved_root, data_dir=data_dir
-        )
+        else load_completion_registry(stage_name, artifact_root=resolved_root)
     )
     # Same stray-file contract as iter_date_shard_partitions.
     fingerprints: dict[str, str] = {}
     for path, version in list_artifacts_with_versions(
-        dataset_root(source_dataset, artifact_root=resolved_root, data_dir=data_dir),
+        dataset_root(source_dataset, artifact_root=resolved_root),
         suffix=".parquet",
     ).items():
         if match_date_shard_partition(path) is not None:

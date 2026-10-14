@@ -37,7 +37,6 @@ STAGE_NAME = "classify"
 def classify_items(
     items: pd.DataFrame,
     *,
-    data_dir: Path | None = None,
     model_dir: Path | None = None,
     artifacts: tuple[object, float] | None = None,
 ) -> pd.DataFrame:
@@ -105,7 +104,6 @@ def item_partition_classifier(*, model_dir: Path | None = None) -> ClassifyParti
 def classify_pending_items(
     *,
     artifact_root: str | Path | None = None,
-    data_dir: Path | None = None,
     model_dir: Path | None = None,
     force: bool = False,
     renew: Callable[[], None] | None = None,
@@ -129,7 +127,6 @@ def classify_pending_items(
             source_path, partition, None
         ),
         artifact_root=artifact_root,
-        data_dir=data_dir,
         force=force,
         renew=renew,
     ).rows
@@ -138,7 +135,6 @@ def classify_pending_items(
 def retry_failed_items(
     *,
     artifact_root: str | Path | None = None,
-    data_dir: Path | None = None,
     model_dir: Path | None = None,
     renew: Callable[[], None] | None = None,
 ) -> RetryResult:
@@ -153,6 +149,5 @@ def retry_failed_items(
         output_columns=CLASSIFIED_ITEM_COLUMNS,
         classify_partition=item_partition_classifier(model_dir=model_dir),
         artifact_root=artifact_root,
-        data_dir=data_dir,
         renew=renew,
     )

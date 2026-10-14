@@ -74,7 +74,6 @@ class PipelineConfig:
     bucket: str = DEFAULT_BUCKET
     start_date: date | None = None
     end_date: date | None = None
-    data_dir: Path | None = None
     artifact_root: ArtifactPath | None = None
     final_database_root: ArtifactPath | None = None
     #: Reprocess partitions the completion registries already record.
@@ -159,7 +158,6 @@ def segment_genre(
     genre: str,
     *,
     artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
     force: bool = False,
     item_numbers: tuple[str, ...] = POTENTIALLY_RELEVANT_ITEM_NUMBERS,
     renew: Callable[[], None] | None = None,
@@ -174,7 +172,6 @@ def segment_genre(
     if genre == GENRE_8K:
         return segment_pending_eightk_documents(
             artifact_root=artifact_root,
-            data_dir=data_dir,
             force=force,
             item_numbers=item_numbers,
             renew=renew,
@@ -182,7 +179,6 @@ def segment_genre(
     if genre == GENRE_6K:
         return segment_pending_sixk_documents(
             artifact_root=artifact_root,
-            data_dir=data_dir,
             force=force,
             renew=renew,
         )
@@ -193,7 +189,6 @@ def classify_genre(
     genre: str,
     *,
     artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
     force: bool = False,
     model_dir: Path | None = None,
     sixk_model_dir: Path | None = None,
@@ -211,7 +206,6 @@ def classify_genre(
     if genre == GENRE_8K:
         return classify_pending_items(
             artifact_root=artifact_root,
-            data_dir=data_dir,
             model_dir=model_dir,
             force=force,
             renew=renew,
@@ -219,7 +213,6 @@ def classify_genre(
     if genre == GENRE_6K:
         return triage_pending_windows(
             artifact_root=artifact_root,
-            data_dir=data_dir,
             force=force,
             model_dir=sixk_model_dir,
             concurrency=sixk_concurrency,
@@ -232,7 +225,6 @@ def retry_classify_genre(
     genre: str,
     *,
     artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
     model_dir: Path | None = None,
     sixk_model_dir: Path | None = None,
     sixk_concurrency: int = SIXK_DEFAULT_CONCURRENCY,
@@ -248,14 +240,12 @@ def retry_classify_genre(
     if genre == GENRE_8K:
         return retry_failed_items(
             artifact_root=artifact_root,
-            data_dir=data_dir,
             model_dir=model_dir,
             renew=renew,
         )
     if genre == GENRE_6K:
         return retry_failed_triage(
             artifact_root=artifact_root,
-            data_dir=data_dir,
             model_dir=sixk_model_dir,
             concurrency=sixk_concurrency,
             renew=renew,
@@ -299,7 +289,6 @@ class Pipeline:
         ciks = read_cik_file(self.config.cik_file)
         resolved_artifact_root = resolve_artifact_root(
             self.config.artifact_root,
-            data_dir=self.config.data_dir,
         )
         self._log_banner(
             f"Starting pipeline | mode={self.config.mode} | cik_file={self.config.cik_file}"
@@ -320,7 +309,6 @@ class Pipeline:
             cik_file=Path(str(self.config.cik_file)),
             start_date=resolved_start,
             end_date=resolved_end,
-            data_dir=self.config.data_dir,
             output_root=resolved_artifact_root,
             force=self.config.force,
             flush_rows=self.config.ingest_flush_rows,
@@ -329,7 +317,6 @@ class Pipeline:
             or failure_registry_path(
                 "ingest",
                 artifact_root=resolved_artifact_root,
-                data_dir=self.config.data_dir,
             ),
             aws_profile=self.config.aws_profile,
             s3_prefix=self.config.s3_prefix,
@@ -421,7 +408,6 @@ class Pipeline:
         segmented = segment_genre(
             genre,
             artifact_root=resolved_artifact_root,
-            data_dir=self.config.data_dir,
             force=self.config.force,
             item_numbers=self.config.item_numbers,
             renew=renew,
@@ -433,7 +419,6 @@ class Pipeline:
         classified = classify_genre(
             genre,
             artifact_root=resolved_artifact_root,
-            data_dir=self.config.data_dir,
             force=self.config.force,
             model_dir=self.config.classifier_model_dir,
             sixk_model_dir=self.config.sixk_model_dir,
@@ -474,7 +459,6 @@ class Pipeline:
         )
         extracted = extract_pending_items(
             artifact_root=resolved_artifact_root,
-            data_dir=self.config.data_dir,
             force=self.config.force,
             model=self.config.extractor_model,
             reasoning_effort=self.config.extractor_reasoning_effort,
@@ -487,7 +471,6 @@ class Pipeline:
         log_stage_start(self.logger, "match")
         matched = match_pending_mentions(
             artifact_root=resolved_artifact_root,
-            data_dir=self.config.data_dir,
             force=self.config.force,
             strong_match_threshold=self.config.strong_match_threshold,
             loose_match_threshold=self.config.loose_match_threshold,
@@ -513,7 +496,6 @@ class Pipeline:
             artifact_root=resolved_artifact_root,
             extractor_run_path=extracted_tables_path(
                 resolved_artifact_root,
-                data_dir=self.config.data_dir,
             ),
             genres=self.config.genres,
             genre_results=prepared.genre_results,
@@ -523,7 +505,6 @@ class Pipeline:
             matched["debt_instrument"],
             artifact_root=resolved_artifact_root,
             final_database_root=self.config.final_database_root,
-            data_dir=self.config.data_dir,
             force_publish=self.config.force_publish,
             renew=renew,
         )
@@ -556,7 +537,6 @@ def run_match_and_finalize(
     *,
     artifact_root: ArtifactPath,
     final_database_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
     force: bool = False,
     force_publish: bool = False,
     strong_match_threshold: float = DEFAULT_MEMBERSHIP_THRESHOLD,
@@ -574,10 +554,9 @@ def run_match_and_finalize(
     Returns:
         Published table name -> snapshot path; empty when nothing was published.
     """
-    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    resolved_root = resolve_artifact_root(artifact_root)
     tables = match_pending_mentions(
         artifact_root=resolved_root,
-        data_dir=data_dir,
         force=force,
         strong_match_threshold=strong_match_threshold,
         loose_match_threshold=loose_match_threshold,
@@ -588,7 +567,6 @@ def run_match_and_finalize(
         tables["debt_instrument"],
         artifact_root=resolved_root,
         final_database_root=final_database_root,
-        data_dir=data_dir,
         force_publish=force_publish,
         renew=renew,
     )

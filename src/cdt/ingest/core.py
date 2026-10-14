@@ -217,7 +217,6 @@ class IngestConfig:
     cik_file: Path
     start_date: date
     end_date: date
-    data_dir: Path | None = None
     output_root: str | None = None
     force: bool = False
     #: Document rows buffered before each write. Each write rewrites the
@@ -259,11 +258,10 @@ class IngestRunResult:
 def documents_root(
     output_root: str | None = None,
     *,
-    data_dir: Path | None = None,
     dataset_name: str = DOCUMENT_DATASET_NAME,
 ) -> str:
     """Return the root URI for one canonical document dataset's partitions."""
-    return dataset_root(dataset_name, artifact_root=output_root, data_dir=data_dir)
+    return dataset_root(dataset_name, artifact_root=output_root)
 
 
 def normalize_accession_number(accession_number: str) -> str:
@@ -318,19 +316,17 @@ def run_ingest_pipeline(
         return resolved_client[0]
 
     normalized_ciks = _normalize_ciks(ciks)
-    output_root = config.output_root or default_artifact_root(config.data_dir)
+    output_root = config.output_root or default_artifact_root()
     documents_dataset_root = documents_root(
-        output_root, data_dir=config.data_dir, dataset_name=config.dataset_name
+        output_root, dataset_name=config.dataset_name
     )
     failure_file = config.failure_file or failure_registry_path(
-        "ingest", artifact_root=output_root, data_dir=config.data_dir
+        "ingest", artifact_root=output_root
     )
     if not str(failure_file).startswith("s3://"):
         Path(str(failure_file)).parent.mkdir(parents=True, exist_ok=True)
     run_id = _run_id()
-    run_manifest = run_manifest_path(
-        "ingest", run_id, artifact_root=output_root, data_dir=config.data_dir
-    )
+    run_manifest = run_manifest_path("ingest", run_id, artifact_root=output_root)
     failure_registry = FailureRegistry(
         str(failure_file),
         IngestFailureClassifier(),

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
-from pathlib import Path
 
 import pandas as pd
 
@@ -76,7 +75,7 @@ PUBLISH_FORMAT_VERSION = 1
 
 
 def publish_source_digest(
-    artifact_root: ArtifactPath, *, data_dir: Path | None = None
+    artifact_root: ArtifactPath,
 ) -> str:
     """Digest every partition a publish would read, and how it would read them.
 
@@ -92,7 +91,7 @@ def publish_source_digest(
         for table_name, entry in FINAL_OUTPUT_TABLES.items()
     }
     return artifact_tree_digest(
-        _publish_source_roots(artifact_root, data_dir=data_dir),
+        _publish_source_roots(artifact_root),
         suffix=".parquet",
         context={
             "publish_format_version": PUBLISH_FORMAT_VERSION,
@@ -103,14 +102,14 @@ def publish_source_digest(
 
 
 def _publish_source_roots(
-    artifact_root: ArtifactPath, *, data_dir: Path | None
+    artifact_root: ArtifactPath,
 ) -> list[str]:
     """Every dataset root a publish reads, deduplicated, in table order."""
     roots: list[str] = []
     for entry in FINAL_OUTPUT_TABLES.values():
         dataset_root_fns = entry if isinstance(entry, tuple) else (entry,)
         for dataset_root_fn in dataset_root_fns:
-            root = dataset_root_fn(artifact_root, data_dir=data_dir)
+            root = dataset_root_fn(artifact_root)
             if root not in roots:
                 roots.append(root)
     return roots
@@ -120,7 +119,6 @@ def publish_would_republish_nothing(
     *,
     artifact_root: ArtifactPath,
     final_database_root: ArtifactPath | None,
-    data_dir: Path | None = None,
     force_publish: bool = False,
     source_digest: str | None = None,
 ) -> bool:
@@ -152,7 +150,7 @@ def publish_would_republish_nothing(
         )
         return False
     if source_digest is None:
-        source_digest = publish_source_digest(artifact_root, data_dir=data_dir)
+        source_digest = publish_source_digest(artifact_root)
     if recorded != source_digest:
         return False
     if not all(
@@ -181,7 +179,6 @@ def finalize_after_match(
     *,
     artifact_root: ArtifactPath,
     final_database_root: ArtifactPath | None,
-    data_dir: Path | None = None,
     force_publish: bool = False,
     renew: Callable[[], None] | None = None,
 ) -> dict[str, str]:
@@ -201,14 +198,11 @@ def finalize_after_match(
         if renew is not None:
             renew()
         log_stage_start(LOGGER, "infer-lineage")
-        lineage_stats = apply_lineage_inference_pass(
-            artifact_root, data_dir=data_dir, renew=renew
-        )
+        lineage_stats = apply_lineage_inference_pass(artifact_root, renew=renew)
         log_stage_complete(LOGGER, "infer-lineage", **lineage_stats)
     return publish_final_tables(
         artifact_root=artifact_root,
         final_database_root=final_database_root,
-        data_dir=data_dir,
         force_publish=force_publish,
         renew=renew,
     )
@@ -218,7 +212,6 @@ def publish_final_tables(
     *,
     artifact_root: ArtifactPath,
     final_database_root: ArtifactPath | None,
-    data_dir: Path | None = None,
     force_publish: bool = False,
     renew: Callable[[], None] | None = None,
 ) -> dict[str, str]:
@@ -234,14 +227,11 @@ def publish_final_tables(
     log_stage_start(LOGGER, "finalize", output_root=final_database_root)
     # After lineage (which writes debt-instruments), before the publish reads.
     source_digest = (
-        None
-        if final_database_root is None
-        else publish_source_digest(artifact_root, data_dir=data_dir)
+        None if final_database_root is None else publish_source_digest(artifact_root)
     )
     if publish_would_republish_nothing(
         artifact_root=artifact_root,
         final_database_root=final_database_root,
-        data_dir=data_dir,
         force_publish=force_publish,
         source_digest=source_digest,
     ):
@@ -254,7 +244,6 @@ def publish_final_tables(
     final_outputs = write_final_output_tables(
         artifact_root=artifact_root,
         final_database_root=final_database_root,
-        data_dir=data_dir,
         force_publish=force_publish,
         source_digest=source_digest,
     )
@@ -278,7 +267,6 @@ def write_final_output_tables(
     *,
     artifact_root: ArtifactPath,
     final_database_root: ArtifactPath | None,
-    data_dir: Path | None = None,
     force_publish: bool = False,
     source_digest: str | None = None,
 ) -> dict[str, str]:
@@ -302,7 +290,7 @@ def write_final_output_tables(
     # Taken before the reads, so a source written while they run reads as moved
     # (one redundant publish next time) rather than as already published.
     if source_digest is None:
-        source_digest = publish_source_digest(artifact_root, data_dir=data_dir)
+        source_digest = publish_source_digest(artifact_root)
 
     pointer_path = final_pointer_path(artifact_root)
     previous: dict[str, object] = {}
@@ -319,7 +307,6 @@ def write_final_output_tables(
                 table_name,
                 dataset_root_fns,
                 artifact_root=artifact_root,
-                data_dir=data_dir,
             )
         )
         for table_name, dataset_root_fns in FINAL_OUTPUT_TABLES.items()
@@ -386,7 +373,6 @@ def _read_published_table(
     dataset_root_fns: Sequence[Callable[..., str]],
     *,
     artifact_root: ArtifactPath,
-    data_dir: Path | None,
 ) -> pd.DataFrame:
     """Read one published table, concatenating the datasets it unions.
 
@@ -398,9 +384,7 @@ def _read_published_table(
     form_types = FINAL_OUTPUT_TABLE_FORM_TYPES.get(table_name)
     frames: list[pd.DataFrame] = []
     for index, dataset_root_fn in enumerate(dataset_root_fns):
-        frame = read_dataset(
-            dataset_root_fn(artifact_root, data_dir=data_dir), columns=columns
-        )
+        frame = read_dataset(dataset_root_fn(artifact_root), columns=columns)
         if form_types is not None:
             frame[FORM_TYPE_COLUMN] = form_types[index]
         frames.append(frame)

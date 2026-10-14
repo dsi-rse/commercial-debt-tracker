@@ -79,27 +79,21 @@ DEBT_INSTRUMENT_DATASET_NAME = "debt-instruments"
 
 def mention_cluster_edges_root(
     artifact_root: str | Path | None = None,
-    *,
-    data_dir: Path | None = None,
 ) -> str:
     """Return the canonical mention-cluster-edges dataset root."""
     return dataset_root(
         MENTION_CLUSTER_EDGE_DATASET_NAME,
         artifact_root=artifact_root,
-        data_dir=data_dir,
     )
 
 
 def debt_instruments_root(
     artifact_root: str | Path | None = None,
-    *,
-    data_dir: Path | None = None,
 ) -> str:
     """Return the canonical debt-instruments dataset root."""
     return dataset_root(
         DEBT_INSTRUMENT_DATASET_NAME,
         artifact_root=artifact_root,
-        data_dir=data_dir,
     )
 
 

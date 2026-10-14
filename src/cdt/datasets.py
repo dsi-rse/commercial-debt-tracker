@@ -8,7 +8,6 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import date
-from pathlib import Path
 from typing import cast
 
 from cdt import settings
@@ -38,30 +37,25 @@ PARTITION_PATTERN = re.compile(
 )
 
 
-def default_artifact_root(data_dir: Path | None = None) -> str:
-    """Return the default artifact root for local development."""
-    return str(data_dir or settings.DATA_DIR)
+def default_artifact_root() -> str:
+    """Return the default artifact root for local development: ``settings.DATA_DIR``."""
+    return str(settings.DATA_DIR)
 
 
 def resolve_artifact_root(
     artifact_root: ArtifactPath | None = None,
-    *,
-    data_dir: Path | None = None,
 ) -> str:
     """Resolve the configured artifact root to a normalized string path."""
-    return normalize_artifact_path(artifact_root or default_artifact_root(data_dir))
+    return normalize_artifact_path(artifact_root or default_artifact_root())
 
 
 def dataset_root(
     dataset_name: str,
     *,
     artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
 ) -> str:
     """Return the root for one canonical dataset."""
-    return join_artifact_path(
-        resolve_artifact_root(artifact_root, data_dir=data_dir), dataset_name
-    )
+    return join_artifact_path(resolve_artifact_root(artifact_root), dataset_name)
 
 
 def run_manifest_path(
@@ -69,11 +63,10 @@ def run_manifest_path(
     run_id: str,
     *,
     artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
 ) -> str:
     """Return the path for one stage run manifest."""
     return join_artifact_path(
-        resolve_artifact_root(artifact_root, data_dir=data_dir),
+        resolve_artifact_root(artifact_root),
         "runs",
         stage_name,
         f"run_id={run_id}.json",
@@ -84,11 +77,10 @@ def failure_registry_path(
     stage_name: str,
     *,
     artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
 ) -> str:
     """Return the path for one stage failure registry."""
     return join_artifact_path(
-        resolve_artifact_root(artifact_root, data_dir=data_dir),
+        resolve_artifact_root(artifact_root),
         "failures",
         stage_name,
         "failures.json",
@@ -99,12 +91,9 @@ def load_row_failures(
     stage_name: str,
     *,
     artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
 ) -> dict[str, dict[str, object]]:
     """Load one stage's row-level failure registry, keyed by row id."""
-    path = failure_registry_path(
-        stage_name, artifact_root=artifact_root, data_dir=data_dir
-    )
+    path = failure_registry_path(stage_name, artifact_root=artifact_root)
     if not artifact_exists(path):
         return {}
     payload = read_json_artifact(path)
@@ -125,7 +114,6 @@ def save_row_failures(
     failures: dict[str, dict[str, object]],
     *,
     artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
 ) -> str:
     """Persist one stage's row-level failure registry.
 
@@ -135,9 +123,7 @@ def save_row_failures(
     (:func:`cdt.classifier.core.retry_failed_classifications`).
     """
     return write_json_artifact(
-        failure_registry_path(
-            stage_name, artifact_root=artifact_root, data_dir=data_dir
-        ),
+        failure_registry_path(stage_name, artifact_root=artifact_root),
         {
             "stage": stage_name,
             "failure_count": len(failures),
@@ -150,11 +136,10 @@ def extractor_run_path(
     run_id: str,
     *,
     artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
 ) -> str:
     """Return the path for one extractor full audit JSONL artifact."""
     return join_artifact_path(
-        resolve_artifact_root(artifact_root, data_dir=data_dir),
+        resolve_artifact_root(artifact_root),
         "extractor-runs",
         f"run_id={run_id}",
         "full.jsonl",
@@ -167,11 +152,10 @@ def date_shard_partition_path(
     partition_date: str,
     shard: str,
     artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
 ) -> str:
     """Return one canonical date/shard partition file path."""
     return join_artifact_path(
-        dataset_root(dataset_name, artifact_root=artifact_root, data_dir=data_dir),
+        dataset_root(dataset_name, artifact_root=artifact_root),
         f"date={partition_date}",
         f"shard={shard}",
         "part-0000.parquet",
@@ -183,11 +167,10 @@ def cik_shard_partition_path(
     *,
     cik_shard: str,
     artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
 ) -> str:
     """Return one canonical cik-shard partition file path."""
     return join_artifact_path(
-        dataset_root(dataset_name, artifact_root=artifact_root, data_dir=data_dir),
+        dataset_root(dataset_name, artifact_root=artifact_root),
         f"cik_shard={cik_shard}",
         "part-0000.parquet",
     )
@@ -216,7 +199,6 @@ def iter_date_shard_partitions(
     dataset_name: str,
     *,
     artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
 ) -> list[str]:
@@ -227,7 +209,7 @@ def iter_date_shard_partitions(
     other non-canonical parquet file.
     """
     paths = list_artifacts(
-        dataset_root(dataset_name, artifact_root=artifact_root, data_dir=data_dir),
+        dataset_root(dataset_name, artifact_root=artifact_root),
         suffix=".parquet",
     )
     filtered: list[str] = []

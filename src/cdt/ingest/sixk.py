@@ -126,9 +126,7 @@ class ScraperDocumentSource:
 
     def __iter__(self: Self) -> Iterator[DocumentCandidate]:
         """Assemble, mirror and yield every matching filing in the range."""
-        artifact_root = self.config.output_root or default_artifact_root(
-            self.config.data_dir
-        )
+        artifact_root = self.config.output_root or default_artifact_root()
         indexed = 0
         mirrored = 0
         reused = 0

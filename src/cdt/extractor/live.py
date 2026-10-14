@@ -47,7 +47,6 @@ EXTRACTOR_PROGRESS_LOG_INTERVAL = 10
 def extract_pending_items(
     *,
     artifact_root: str | Path | None = None,
-    data_dir: Path | None = None,
     force: bool = False,
     model: str | None = None,
     reasoning_effort: str | None = None,
@@ -75,7 +74,7 @@ def extract_pending_items(
         raise ValueError(f"max_attempts must be positive, got {max_attempts}")
     resolved_model = model or settings.EXTRACTOR_MODEL
     resolved_reasoning = normalize_reasoning_effort(reasoning_effort)
-    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    resolved_root = resolve_artifact_root(artifact_root)
     keep_lease = throttled(renew) if renew is not None else None
     last_commit = monotonic()
     checkpoint_paths: list[str] = []
@@ -90,9 +89,7 @@ def extract_pending_items(
     # live too would pay for every row twice and let the job's later finalize
     # overwrite the newer live mentions with stale results.
     claimed_by_batch_job = (
-        set()
-        if force
-        else active_job_claimed_partition_paths(resolved_root, data_dir=data_dir)
+        set() if force else active_job_claimed_partition_paths(resolved_root)
     )
     if claimed_by_batch_job:
         LOGGER.info(
@@ -103,7 +100,6 @@ def extract_pending_items(
 
     pending_partitions, registry = pending_extract_partitions(
         artifact_root=resolved_root,
-        data_dir=data_dir,
         force=force,
         exclude_paths=claimed_by_batch_job,
     )
@@ -116,14 +112,11 @@ def extract_pending_items(
             outcomes,
             registry,
             artifact_root=resolved_root,
-            data_dir=data_dir,
             index=index,
             audit_offset=audit_offset,
         )
         checkpoint_paths.append(
-            checkpoint_audit_path(
-                run_id, index, artifact_root=resolved_root, data_dir=data_dir
-            )
+            checkpoint_audit_path(run_id, index, artifact_root=resolved_root)
         )
         last_commit = monotonic()
 
@@ -197,7 +190,6 @@ def extract_pending_items(
                     keep_lease()
                 write_mentions_partition(
                     resolved_root,
-                    data_dir=data_dir,
                     partition=partition,
                     new_mentions=pd.DataFrame(
                         mention_rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS
@@ -230,7 +222,6 @@ def extract_pending_items(
             keep_lease()
         written = write_mentions_partition(
             resolved_root,
-            data_dir=data_dir,
             partition=partition,
             new_mentions=mentions,
             replaced_item_ids=replaced_item_ids,
@@ -264,7 +255,6 @@ def extract_pending_items(
         outcomes,
         registry,
         artifact_root=resolved_root,
-        data_dir=data_dir,
         manifest={
             "force": force,
             "model": resolved_model,

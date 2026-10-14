@@ -708,7 +708,6 @@ def item_id_for(accession_number: str, item_number: str) -> str:
 def itemize_documents(
     documents: pd.DataFrame,
     *,
-    data_dir: Path | None = None,
     s3_client: object | None = None,
     item_numbers: tuple[str, ...] | None = None,
 ) -> pd.DataFrame:
@@ -728,7 +727,6 @@ def itemize_documents(
     for document in documents.to_dict("records"):
         sections = itemize_document_record(
             document,
-            data_dir=data_dir,
             s3_client=resolved_s3_client,
         )
         relevant_sections = [
@@ -755,7 +753,6 @@ def itemize_documents(
 def segment_pending_eightk_documents(
     *,
     artifact_root: str | Path | None = None,
-    data_dir: Path | None = None,
     force: bool = False,
     s3_client: object | None = None,
     item_numbers: tuple[str, ...] | None = None,
@@ -782,7 +779,6 @@ def segment_pending_eightk_documents(
         shared_client = ensure_s3_client(shared_client, documents.to_dict("records"))
         items = itemize_documents(
             documents,
-            data_dir=data_dir,
             s3_client=shared_client,
             item_numbers=selected_item_numbers,
         )
@@ -795,7 +791,6 @@ def segment_pending_eightk_documents(
         output_columns=ITEM_COLUMNS,
         process=process,
         artifact_root=artifact_root,
-        data_dir=data_dir,
         force=force,
         renew=renew,
         manifest_extra={"item_numbers": list(selected_item_numbers)},
@@ -805,13 +800,11 @@ def segment_pending_eightk_documents(
 def itemize_document_record(
     document: dict[str, object],
     *,
-    data_dir: Path | None = None,
     s3_client: object | None = None,
 ) -> list[ItemSection]:
     """Extract every item section from one document record, mapped or not."""
     text = document_text_for_record(
         document,
-        data_dir=data_dir,
         s3_client=s3_client,
     )
     return extract_items_from_document(

@@ -619,7 +619,6 @@ def test_match_and_finalize_runs_the_lineage_pass_after_every_match(
     )
     assert len(calls) == 1
     assert calls[0]["artifact_root"] == str(root)
-    assert calls[0]["data_dir"] is None
     assert callable(calls[0]["renew"])
     assert renewals  # the lease was renewed around the pass
 

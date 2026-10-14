@@ -216,12 +216,10 @@ def _stub_stage1(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def triage_documents(
-    documents: pd.DataFrame, *, data_dir: Path | None = None, **kwargs: object
-) -> pd.DataFrame:
+def triage_documents(documents: pd.DataFrame, **kwargs: object) -> pd.DataFrame:
     """Segment then classify in-memory document rows, as the two stages do."""
-    windows = window_documents(documents, data_dir=data_dir)
-    return triage_windows(windows, documents, data_dir=data_dir, **kwargs).rows
+    windows = window_documents(documents)
+    return triage_windows(windows, documents, **kwargs).rows
 
 
 def segment_and_classify_pending(

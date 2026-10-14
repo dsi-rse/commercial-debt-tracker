@@ -45,13 +45,9 @@ ITEM_INTEGER_COLUMNS = [
 
 def items_root(
     artifact_root: str | Path | None = None,
-    *,
-    data_dir: Path | None = None,
 ) -> str:
     """Return the canonical items dataset root."""
-    return dataset_root(
-        ITEM_DATASET_NAME, artifact_root=artifact_root, data_dir=data_dir
-    )
+    return dataset_root(ITEM_DATASET_NAME, artifact_root=artifact_root)
 
 
 def normalize_item_table(table: pd.DataFrame) -> pd.DataFrame:
@@ -70,12 +66,9 @@ def normalize_item_table(table: pd.DataFrame) -> pd.DataFrame:
 def document_text_for_record(
     document: dict[str, object],
     *,
-    data_dir: Path | None = None,
     s3_client: object | None = None,
 ) -> str:
     """Return one documents row's text: its inline ``text``, else its resource.
-
-    A relative local ``resource_uri`` resolves against ``data_dir``.
 
     Raises:
         ValueError: If the row has neither text nor a resource URI, or the
@@ -89,15 +82,12 @@ def document_text_for_record(
     if not isinstance(resource_uri, str) or not resource_uri.strip():
         msg = f"no text or resource URI available for accession {document['accession_number']}"
         raise ValueError(msg)
-    return _load_resource_text(
-        str(resource_uri), data_dir=data_dir, s3_client=s3_client
-    )
+    return _load_resource_text(str(resource_uri), s3_client=s3_client)
 
 
 def _load_resource_text(
     resource_uri: str,
     *,
-    data_dir: Path | None,
     s3_client: object | None,
 ) -> str:
     if resource_uri.startswith("s3://"):
@@ -108,10 +98,7 @@ def _load_resource_text(
         body = get_object_bytes(s3_client, bucket, key)
         return decode_document_bytes(body)
 
-    path = Path(resource_uri)
-    if not path.is_absolute() and data_dir is not None:
-        path = (data_dir / path).resolve()
-    return decode_document_bytes(path.read_bytes())
+    return decode_document_bytes(Path(resource_uri).read_bytes())
 
 
 def ensure_s3_client(

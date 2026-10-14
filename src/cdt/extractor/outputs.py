@@ -63,24 +63,16 @@ MENTIONS_DATASET_NAME = "mentions"
 
 def mentions_root(
     artifact_root: str | Path | None = None,
-    *,
-    data_dir: Path | None = None,
 ) -> str:
     """Return the canonical mentions dataset root."""
-    return dataset_root(
-        MENTIONS_DATASET_NAME, artifact_root=artifact_root, data_dir=data_dir
-    )
+    return dataset_root(MENTIONS_DATASET_NAME, artifact_root=artifact_root)
 
 
 def extracted_tables_path(
     artifact_root: str | Path | None = None,
-    *,
-    data_dir: Path | None = None,
 ) -> str:
     """Return the root that stores extractor audit artifacts."""
-    return dataset_root(
-        "extractor-runs", artifact_root=artifact_root, data_dir=data_dir
-    )
+    return dataset_root("extractor-runs", artifact_root=artifact_root)
 
 
 @dataclass
@@ -101,7 +93,6 @@ class PendingExtractPartition:
 def pending_extract_partitions(
     *,
     artifact_root: str | Path | None = None,
-    data_dir: Path | None = None,
     force: bool = False,
     force_paths: frozenset[str] = frozenset(),
     exclude_paths: set[str] | None = None,
@@ -118,15 +109,13 @@ def pending_extract_partitions(
     Also returns the loaded registry (empty under ``force``) so the caller
     can update and persist it.
     """
-    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    resolved_root = resolve_artifact_root(artifact_root)
     registry = (
         # Not a plain ``{}``: save_completion_registry treats every key of one
         # as changed, which re-sends the whole run at every batch boundary.
         CompletionRegistry()
         if force
-        else load_completion_registry(
-            "extract", artifact_root=resolved_root, data_dir=data_dir
-        )
+        else load_completion_registry("extract", artifact_root=resolved_root)
     )
     fingerprints: dict[str, str | None] = {}
     for source in CLASSIFICATION_SOURCES:
@@ -137,7 +126,6 @@ def pending_extract_partitions(
                     dataset_root(
                         source,
                         artifact_root=resolved_root,
-                        data_dir=data_dir,
                     ),
                     suffix=".parquet",
                 ).items()
@@ -179,7 +167,6 @@ def pending_extract_partitions(
 def collect_pending_extract_items(
     *,
     artifact_root: str | Path | None = None,
-    data_dir: Path | None = None,
     force: bool = False,
     force_paths: frozenset[str] = frozenset(),
     max_rows: int | None = None,
@@ -202,10 +189,9 @@ def collect_pending_extract_items(
     ``force_paths`` names partitions to claim as forced (no row counted done),
     as ``pending_extract_partitions`` does.
     """
-    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    resolved_root = resolve_artifact_root(artifact_root)
     pending, _registry = pending_extract_partitions(
         artifact_root=resolved_root,
-        data_dir=data_dir,
         force=force,
         force_paths=force_paths,
     )
@@ -301,7 +287,6 @@ def merge_row_failures(
     succeeded_item_ids: set[str],
     *,
     artifact_root: str,
-    data_dir: Path | None,
 ) -> tuple[str, int]:
     """Merge this run's row outcomes into the extract failure registry.
 
@@ -309,15 +294,11 @@ def merge_row_failures(
     earlier entry, so a re-extract that fixes a row does not leave a stale
     failure behind. Returns the registry path and its total entry count.
     """
-    registry = load_row_failures(
-        "extract", artifact_root=artifact_root, data_dir=data_dir
-    )
+    registry = load_row_failures("extract", artifact_root=artifact_root)
     for item_id in succeeded_item_ids:
         registry.pop(item_id, None)
     registry.update(failures)
-    path = save_row_failures(
-        "extract", registry, artifact_root=artifact_root, data_dir=data_dir
-    )
+    path = save_row_failures("extract", registry, artifact_root=artifact_root)
     return path, len(registry)
 
 
@@ -357,7 +338,6 @@ class RowOutcomes:
 def write_mentions_partition(
     resolved_root: str,
     *,
-    data_dir: Path | None,
     partition: dict[str, str],
     new_mentions: pd.DataFrame,
     replaced_item_ids: set[str],
@@ -378,7 +358,6 @@ def write_mentions_partition(
         partition_date=partition["date"],
         shard=partition["shard"],
         artifact_root=resolved_root,
-        data_dir=data_dir,
     )
     dropped = replaced_item_ids | retired_item_ids
     if new_mentions.empty and not dropped:
@@ -392,7 +371,7 @@ def write_mentions_partition(
         kept = existing.loc[~existing["item_id"].astype(str).isin(dropped)]
         table = pd.concat([kept, new_mentions], ignore_index=True)
     write_partition_table(
-        mentions_root(resolved_root, data_dir=data_dir),
+        mentions_root(resolved_root),
         partition=partition,
         table=table.reindex(columns=DEBT_INSTRUMENT_MENTION_COLUMNS),
     )
@@ -420,7 +399,6 @@ def write_run_records(
     registry: CompletionRegistry,
     *,
     artifact_root: str,
-    data_dir: Path | None,
     manifest: dict[str, object],
 ) -> tuple[str, str, int]:
     """Save one extract run's registry, failures, audit log and run manifest.
@@ -435,22 +413,15 @@ def write_run_records(
         outcomes.failed_rows,
         outcomes.succeeded_item_ids,
         artifact_root=artifact_root,
-        data_dir=data_dir,
     )
-    save_completion_registry(
-        "extract", registry, artifact_root=artifact_root, data_dir=data_dir
-    )
-    audit_path = extractor_run_path(
-        outcomes.run_id, artifact_root=artifact_root, data_dir=data_dir
-    )
+    save_completion_registry("extract", registry, artifact_root=artifact_root)
+    audit_path = extractor_run_path(outcomes.run_id, artifact_root=artifact_root)
     write_text_artifact(
         audit_path,
         ("\n".join(outcomes.audit_records) + "\n") if outcomes.audit_records else "",
     )
     write_json_artifact(
-        run_manifest_path(
-            "extract", outcomes.run_id, artifact_root=artifact_root, data_dir=data_dir
-        ),
+        run_manifest_path("extract", outcomes.run_id, artifact_root=artifact_root),
         {
             "artifact_root": artifact_root,
             "stage": "extract",
@@ -458,7 +429,7 @@ def write_run_records(
             "failure_count": len(outcomes.failed_rows),
             "audit_path": audit_path,
             "completion_registry": completion_registry_root(
-                "extract", artifact_root=artifact_root, data_dir=data_dir
+                "extract", artifact_root=artifact_root
             ),
             "failure_registry": failure_registry,
         },
@@ -466,12 +437,10 @@ def write_run_records(
     return audit_path, failure_registry, total_known_failures
 
 
-def checkpoint_audit_path(
-    run_id: str, index: int, *, artifact_root: str, data_dir: Path | None
-) -> str:
+def checkpoint_audit_path(run_id: str, index: int, *, artifact_root: str) -> str:
     """Return the path of one checkpoint's audit records, beside ``full.jsonl``."""
     return join_artifact_path(
-        resolve_artifact_root(artifact_root, data_dir=data_dir),
+        resolve_artifact_root(artifact_root),
         "extractor-runs",
         f"run_id={run_id}",
         f"checkpoint-{index:04d}.jsonl",
@@ -483,7 +452,6 @@ def write_run_checkpoint(
     registry: CompletionRegistry,
     *,
     artifact_root: str,
-    data_dir: Path | None,
     index: int,
     audit_offset: int,
 ) -> int:
@@ -499,20 +467,15 @@ def write_run_checkpoint(
     records = outcomes.audit_records[audit_offset:]
     if records:
         write_text_artifact(
-            checkpoint_audit_path(
-                outcomes.run_id, index, artifact_root=artifact_root, data_dir=data_dir
-            ),
+            checkpoint_audit_path(outcomes.run_id, index, artifact_root=artifact_root),
             "\n".join(records) + "\n",
         )
     merge_row_failures(
         outcomes.failed_rows,
         outcomes.succeeded_item_ids,
         artifact_root=artifact_root,
-        data_dir=data_dir,
     )
-    save_completion_registry(
-        "extract", registry, artifact_root=artifact_root, data_dir=data_dir
-    )
+    save_completion_registry("extract", registry, artifact_root=artifact_root)
     return len(outcomes.audit_records)
 
 
@@ -525,7 +488,6 @@ def finalize_extract_outputs(
     reasoning_effort: str,
     max_attempts: int,
     artifact_root: str | Path | None = None,
-    data_dir: Path | None = None,
 ) -> pd.DataFrame:
     """Write mention partitions, audit log, and manifests for a completed job.
 
@@ -536,7 +498,7 @@ def finalize_extract_outputs(
     outcome rather than per visit. Mentions are regrouped by their originating
     ``(date, shard)`` partition and merged into existing targets per item.
     """
-    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    resolved_root = resolve_artifact_root(artifact_root)
     outcomes = RowOutcomes(run_id=run_id, backend="batch")
     # Keyed even when a partition publishes nothing, so every partition the
     # job covered is visited below.
@@ -587,7 +549,6 @@ def finalize_extract_outputs(
         mentions = pd.DataFrame(mention_rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
         written = write_mentions_partition(
             resolved_root,
-            data_dir=data_dir,
             partition={"date": partition_date, "shard": shard},
             new_mentions=mentions,
             replaced_item_ids=terminal_by_partition.get((partition_date, shard), set()),
@@ -602,9 +563,7 @@ def finalize_extract_outputs(
         else:
             processed_frames.append(mentions)
 
-    registry = load_completion_registry(
-        "extract", artifact_root=resolved_root, data_dir=data_dir
-    )
+    registry = load_completion_registry("extract", artifact_root=resolved_root)
     for classification_path, claim in claimed.items():
         partition = parse_date_shard_partition(classification_path)
         prior = {
@@ -625,7 +584,6 @@ def finalize_extract_outputs(
         outcomes,
         registry,
         artifact_root=resolved_root,
-        data_dir=data_dir,
         manifest={
             "backend": "batch",
             "model": model,
