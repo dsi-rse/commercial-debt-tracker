@@ -103,7 +103,7 @@ Evidence `char_start`/`char_end` must index the item's own `text` exactly; span 
 
 ### `DATE_KINDS`
 
-Dates are a kind-typed list of facts rather than single-value `start_date` / `maturity_date` / `commitment_termination_date` slots, so the model records each stated date once instead of arbitrating between competing dates; the post-processor chooses the published columns (`DATE_COLUMN_KINDS`). Events (amendment, repayment, retirement, ...) are dated facts too.
+Dates are a kind-typed list of facts rather than single-value `start_date` / `maturity_date` / `commitment_termination_date` slots, so the model records each stated date once instead of arbitrating between competing dates; the post-processor chooses the published columns. Events (amendment, repayment, retirement, ...) are dated facts too.
 
 ### `SINGLE_CURRENT_DATE_KINDS`
 
