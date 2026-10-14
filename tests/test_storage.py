@@ -437,19 +437,6 @@ def test_read_dataset_projection_reindexes_a_column_absent_everywhere(
     assert table["nowhere"].isna().all()
 
 
-def test_read_dataset_still_skips_orphaned_tempfiles(tmp_path: Path) -> None:
-    """The Arrow path reads the filtered path list, never the directory (#68).
-
-    A directory-backed dataset would pick up a crash-orphaned ``tmp*.parquet``
-    and die on it, which is the whole reason ``iter_partition_paths`` filters.
-    """
-    root = tmp_path / "items"
-    _write(root / "a.parquet", [{"k": "1"}])
-    (root / "tmpabc123.parquet").write_bytes(b"")
-
-    assert storage_tables.read_dataset(str(root))["k"].to_list() == ["1"]
-
-
 def test_read_dataset_honors_the_partition_filter(tmp_path: Path) -> None:
     """Partition selection happens before Arrow sees a path list."""
     root = tmp_path / "items"

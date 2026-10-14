@@ -245,13 +245,12 @@ path handles that case correctly.
 `read_partitions` it would loop over `read_table` and lose the parallel scan:
 26.45 s vs 1.75 s over 1,640 partitions.
 
-### `_ORPHANED_TEMP_RE`, `write_table` temp suffix
+### `write_table` temp suffix
 
-Before the current temp naming, `NamedTemporaryFile` gave temp files a
-`.parquet` suffix. A crash between creating the file and renaming it left an
-empty `tmp*.parquet` inside a partition directory, and every `**/*.parquet`
-reader failed on it (#68). `write_table` now uses `.parquet.tmp`. Readers
-still skip the old pattern, because existing roots may contain such files.
+A local write goes to a temp file in the partition directory, then is renamed
+into place. The temp suffix is `.parquet.tmp`, not `.parquet`: a crash between
+creating the file and renaming it must not leave a file that every
+`**/*.parquet` reader picks up and fails on (#68).
 
 ## `completion.py` (the registry) and `datasets.py` (paths and shards)
 

@@ -24,7 +24,7 @@ from cdt.storage.tables import (
 )
 
 
-def test_pending_source_partitions_skips_orphans_and_raises_on_flat_files(
+def test_pending_source_partitions_raises_on_flat_files(
     tmp_path: Path,
 ) -> None:
     """Fingerprint work selection follows the same stray contract as the scan.
@@ -41,10 +41,6 @@ def test_pending_source_partitions_skips_orphans_and_raises_on_flat_files(
         partition={"date": "2026-01-02", "shard": "0007"},
         table=table,
     )
-    (
-        root / "items" / "date=2026-01-02" / "shard=0007" / "tmpabc123.parquet"
-    ).write_bytes(b"")
-
     pending, _ = pending_source_partitions("classify", "items", artifact_root=str(root))
 
     assert len(pending) == 1

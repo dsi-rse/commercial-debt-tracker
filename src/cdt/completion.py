@@ -26,7 +26,6 @@ from cdt.storage.objects import (
     replace_json_artifact_if_match,
     write_json_artifact_if_absent,
 )
-from cdt.storage.tables import is_orphaned_temp_artifact
 
 LOGGER = get_logger(__name__)
 
@@ -393,8 +392,7 @@ def pending_source_partitions(
     its source fingerprint changed (ingest merges late rows into partition
     files in place). With ``force`` the registry starts empty. The caller
     persists the returned registry via ``save_completion_registry``. Raises
-    ValueError on a non-canonical parquet file other than an orphaned temp
-    file.
+    ValueError on a non-canonical parquet file.
     """
     resolved_root = resolve_artifact_root(artifact_root)
     registry = (
@@ -412,9 +410,6 @@ def pending_source_partitions(
     ).items():
         if match_date_shard_partition(path) is not None:
             fingerprints[path] = version
-            continue
-        if is_orphaned_temp_artifact(path):
-            LOGGER.warning("Skipping orphaned temp partition file: %s", path)
             continue
         msg = (
             f"Non-canonical parquet file in dataset {source_dataset!r}: {path}. "

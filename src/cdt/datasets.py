@@ -21,7 +21,6 @@ from cdt.storage.objects import (
     read_json_artifact,
     write_json_artifact,
 )
-from cdt.storage.tables import is_orphaned_temp_artifact
 
 LOGGER = get_logger(__name__)
 
@@ -205,8 +204,7 @@ def iter_date_shard_partitions(
     """List canonical date/shard partitions, optionally filtered by date window.
 
     ``start_date`` and ``end_date`` are inclusive; None leaves that side open.
-    Orphaned temp files are skipped with a warning. Raises ValueError on any
-    other non-canonical parquet file.
+    Raises ValueError on a non-canonical parquet file.
     """
     paths = list_artifacts(
         dataset_root(dataset_name, artifact_root=artifact_root),
@@ -216,12 +214,9 @@ def iter_date_shard_partitions(
     for path in paths:
         partition = match_date_shard_partition(path)
         if partition is None:
-            # An orphaned tempfile is junk to skip. Any other non-canonical
-            # parquet is real data laid out wrong; skipping it would run the
-            # pipeline on nothing while ingest counts its rows as ingested.
-            if is_orphaned_temp_artifact(path):
-                LOGGER.warning("Skipping orphaned temp partition file: %s", path)
-                continue
+            # A non-canonical parquet is real data laid out wrong; skipping it
+            # would run the pipeline on nothing while ingest counts its rows as
+            # ingested.
             msg = (
                 f"Non-canonical parquet file in dataset {dataset_name!r}: {path}. "
                 "Re-partition or remove it before running stages."
