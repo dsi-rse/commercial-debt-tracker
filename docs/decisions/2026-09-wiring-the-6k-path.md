@@ -187,11 +187,16 @@ Batch state machine would buy ~$0.12 per 1,000 filings and cost a second job
 type in `extractor/batch.py`. Run it synchronously in the stage, where
 `daily`/`historical` prepare already runs under the pipeline-writer lease.
 
-Failure is already designed for: `triage_filing` returns a `FilingVerdict` with
-`error` set and every admitted window kept. That degrades to stage-1 output —
-~2x extraction cost for that filing, no recall loss — which is the right
-direction to fail in. The stage logs and counts degraded filings in its run
-manifest rather than aborting.
+When stage 2 cannot judge a filing — its answers fail validation on every
+attempt, or the provider rejects the request (a 400) — `triage_filing` returns
+a `FilingVerdict` with `error` set and nothing kept. The stage writes every
+snippet of that filing with `label` and `verdict` `failed` and `relevance`
+false, so none of it reaches extraction, and lists the filing in
+`failures/sixk-classify/failures.json`. The partition completes rather than
+aborting the run. `cdt classify --retry-failures` triages the listed filings
+again (`cdt.classifier.core.retry_failed_classifications`). Keeping every
+admitted window instead would send about twice the text to extraction for that
+filing.
 
 A provider or transport failure (`is_infrastructure_error`: 402, 408, 429, 5xx
 including OpenRouter's 529, `httpx.TransportError` and the OpenAI SDK's
@@ -202,7 +207,7 @@ the partition complete, so an outage sent its filings to extraction untriaged
 and they were never triaged later. Such a filing now holds its partition:
 nothing is written, the registry entry carries no fingerprint, and the next run
 triages the partition again. Exhausted validation and other client errors (a
-400 will not succeed on retry) still fail open.
+400 will not succeed on a plain re-run) are written as failed, as above.
 
 The client: `extractor.core.OpenRouterChatClient` already matches
 `sixk.SupportsChatCompletion` (both `async def complete(*, messages, model,
@@ -441,7 +446,7 @@ the generalization eval's window, which is a scoring set.
 | filings passing the debt-vocabulary gate | 13.7% (20/146) | 13.4% |
 | windows stage 1 admitted | 129 of 876 gated | — |
 | snippets stage 2 pruned | 61% (79 of 129) | 47.5% |
-| filings degraded to stage-1 output | 0 | — |
+| filings stage 2 could not judge | 0 | — |
 
 The gate reproduces. Stage 2 pruned harder than measured, on 13 filings, so
 read that as a wide interval rather than a shift.

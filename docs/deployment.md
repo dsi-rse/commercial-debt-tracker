@@ -260,6 +260,10 @@ batch-backend `daily`/`historical` run it applies to the prepare and match stage
 only; to force a re-extract, run `cdt run poll --force`. The request is queued,
 so every partition is re-extracted across as many jobs as `--max-rows-per-job`
 needs, starting after any job already active.
+`cdt classify --retry-failures` classifies again only the filings a classify
+stage could not classify, as listed in `failures/<stage>/failures.json` (see
+[schema.md](schema.md#failure-registries)). Run it after a stage-2 problem is
+fixed; it cannot be combined with `--force`, and `--genres` narrows it.
 `--force` never lowers the publish guards. To publish when no source changed, or
 past the shrinkage guard (a table falling below half its published rows), pass
 `--force-publish`, on `cdt publish` or any `cdt run` mode.

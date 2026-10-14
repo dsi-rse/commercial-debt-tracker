@@ -132,9 +132,10 @@ def save_row_failures(
 ) -> str:
     """Persist one stage's row-level failure registry.
 
-    Unlike the completion registry this is diagnostic, not control flow: nothing
-    reads it to decide what to process. It exists so rows that a run dropped are
-    recoverable as a work-list instead of only appearing in an audit log.
+    Unlike the completion registry, no plain run reads it to decide what to
+    process. It is the work-list of rows a run could not finish: extract's for
+    review, and a classify stage's for ``cdt classify --retry-failures``
+    (:func:`cdt.classifier.core.retry_failed_classifications`).
     """
     return write_json_artifact(
         failure_registry_path(

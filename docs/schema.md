@@ -267,7 +267,7 @@ A `sixk-snippets` row (`form_type` `6-K` in the snapshot) fills the same columns
 - `item_information`, `extraction_status`, `duplicate_resolution`, `start_line`, `end_line`: null.
 - `resource_uri`: the parent document's.
 
-The snippet's own span and triage verdict (`sixk_window_start`, `sixk_window_end`, `sixk_token_count`, `sixk_verdict`, `sixk_duplicate_of`, `sixk_member_windows`) stay in `sixk-snippets` and are not published.
+The snippet's own span and triage detail (`sixk_window_start`, `sixk_window_end`, `sixk_token_count`, `sixk_duplicate_of`, `sixk_member_windows`) and its `verdict` stay in `sixk-snippets` and are not published.
 
 ### `sixk-windows`
 
@@ -290,13 +290,16 @@ Primary key: `accession_number`, `document_index`, `window`
 Columns:
 
 - all `items` columns: The full item row is carried forward unchanged.
-- `label`: Classifier output label, currently `relevant` or `irrelevant`.
-- `relevance`: Boolean convenience flag derived from `label`.
+- `label`: `relevant`, `irrelevant`, or `failed` when the filing could not be classified.
+- `relevance`: `label == "relevant"`; the extractor reads only these rows.
 - `classification_score`: Raw model decision score used to threshold relevance; higher means more likely relevant.
+- `verdict`: why the row has its label. 8-K: `kept` or `dropped_below_threshold`. 6-K: `kept`, `dropped_no_details`, `dropped_duplicate` (see `sixk_duplicate_of`), or `failed`.
 
 Primary key: `item_id`
 
-`sixk-snippets` carries the same columns, with the same `label` vocabulary, plus the `sixk_*` columns listed above.
+`sixk-snippets` carries the same columns, with the same `label` and `verdict` vocabulary, plus the `sixk_*` columns listed above.
+
+A `failed` filing has an entry in its classify stage's failure list (below) until a run classifies it.
 
 ### `mentions`
 
@@ -687,7 +690,33 @@ and `batch` backends:
 }
 ```
 
-This registry exists because a finished extract run marks all of its claimed
+Each classify stage keeps a failure list of the filings it could not classify,
+`failures/classify/failures.json` (8-K) and `failures/sixk-classify/failures.json`
+(6-K), keyed by accession number:
+
+```json
+{
+  "stage": "sixk-classify",
+  "failure_count": 1,
+  "failures": {
+    "<accession_number>": {
+      "source_partition": "<artifact-root>/sixk-windows/date=2026-10-01/shard=0007/part-0000.parquet",
+      "error": "validation failed: [...]"
+    }
+  }
+}
+```
+
+The filing's rows are written with `label` `failed`. When a run classifies that
+source partition again, its entries are replaced by that run's failures, so a
+filing that now succeeds leaves the list. `cdt classify --retry-failures`
+classifies only the listed filings again: it replaces their rows in the output
+partition, keeps every other row, and updates the list. It skips a source
+partition that is pending, since the next plain run classifies it whole, and
+writes no completion entry. Only 6-K triage can fail today; the 8-K list stays
+empty.
+
+The extract registry exists because a finished extract run marks all of its claimed
 classification partitions completed regardless of individual row outcomes, so rows that
 produced no mentions are never revisited. It is **diagnostic, not control flow**: nothing
 reads it to decide what to process, and writing it does not change which partitions are

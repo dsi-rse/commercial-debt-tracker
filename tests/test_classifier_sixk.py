@@ -13,15 +13,20 @@ import pandas as pd
 import pytest
 
 from cdt.classifier import sixk as sixk_stage
-from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS, score_model
-from cdt.classifier.sixk import (
-    SIXK_SNIPPET_COLUMNS,
+from cdt.classifier.core import (
+    CLASSIFIED_ITEM_COLUMNS,
+    LABEL_FAILED,
     VERDICT_DROPPED_DUPLICATE,
     VERDICT_DROPPED_NO_DETAILS,
+    VERDICT_FAILED,
     VERDICT_KEPT,
-    VERDICT_KEPT_DEGRADED,
+    score_model,
+)
+from cdt.classifier.sixk import (
+    SIXK_SNIPPET_COLUMNS,
     StaleSegmentationError,
     item_id_for,
+    retry_failed_triage,
     sixk_snippets_root,
     snippet_id_for,
     triage_pending_windows,
@@ -32,6 +37,7 @@ from cdt.datasets import (
     SIXK_DOCUMENT_DATASET_NAME,
     SIXK_WINDOW_DATASET_NAME,
     dataset_root,
+    load_row_failures,
     run_manifest_path,
 )
 from cdt.ingest.core import DOCUMENT_COLUMNS
@@ -317,10 +323,10 @@ def test_triage_keeps_stage_two_s_choice_and_records_the_rest(
     assert list(snippets.columns) == SIXK_SNIPPET_COLUMNS
     assert len(client.calls) == 1
     by_item = snippets.set_index("item")
-    assert by_item.loc[kept_id, "sixk_verdict"] == VERDICT_KEPT
+    assert by_item.loc[kept_id, "verdict"] == VERDICT_KEPT
     assert bool(by_item.loc[kept_id, "relevance"]) is True
     assert by_item.loc[kept_id, "label"] == "relevant"
-    assert by_item.loc[dropped_id, "sixk_verdict"] == VERDICT_DROPPED_DUPLICATE
+    assert by_item.loc[dropped_id, "verdict"] == VERDICT_DROPPED_DUPLICATE
     assert by_item.loc[dropped_id, "sixk_duplicate_of"] == kept_id
     assert bool(by_item.loc[dropped_id, "relevance"]) is False
 
@@ -490,14 +496,14 @@ def test_triage_needs_no_api_key_when_nothing_is_admitted(tmp_path: Path) -> Non
     assert snippets.empty
 
 
-def test_triage_degrades_to_stage_one_output_when_stage_two_fails(
+def test_a_rejected_stage_two_call_marks_the_filing_failed(
     tmp_path: Path,
 ) -> None:
-    """A stage-2 call the provider rejects keeps every admitted window.
+    """A stage-2 call the provider rejects sends nothing to extraction.
 
-    A 400 will not succeed on retry, so the filing fails open: roughly twice
-    as much extraction for it and no recall lost, the right direction to fail
-    in. A provider outage instead holds the partition (see below).
+    A 400 will not succeed on a plain re-run, so every snippet is written as
+    failed, not relevant. A provider outage instead holds the partition (see
+    below).
     """
     documents = pd.DataFrame(
         [
@@ -517,8 +523,9 @@ def test_triage_degrades_to_stage_one_output_when_stage_two_fails(
     )
 
     assert len(snippets) == 2
-    assert snippets["relevance"].all()
-    assert set(snippets["sixk_verdict"]) == {VERDICT_KEPT_DEGRADED}
+    assert not snippets["relevance"].any()
+    assert set(snippets["label"]) == {LABEL_FAILED}
+    assert set(snippets["verdict"]) == {VERDICT_FAILED}
 
 
 def test_triage_resolves_text_from_a_mirrored_submission(tmp_path: Path) -> None:
@@ -806,15 +813,15 @@ def test_a_stage_two_outage_leaves_the_partition_pending(
         artifact_root=str(tmp_path), client=FakeChatClient(keep_all=True)
     )
 
-    assert set(recovered["sixk_verdict"]) == {VERDICT_KEPT}
+    assert set(recovered["verdict"]) == {VERDICT_KEPT}
     registry = load_completion_registry("sixk-classify", artifact_root=str(tmp_path))
     assert [entry.fingerprint is not None for entry in registry.values()] == [True]
 
 
-def test_exhausted_stage_two_validation_still_completes_the_partition(
+def test_exhausted_stage_two_validation_completes_the_partition_as_failed(
     tmp_path: Path,
 ) -> None:
-    """A model that never returns a usable verdict fails open, as before."""
+    """A filing the model never judges usably is failed, listed and complete."""
     _write_documents(
         tmp_path,
         [
@@ -830,9 +837,164 @@ def test_exhausted_stage_two_validation_still_completes_the_partition(
         max_attempts=3,
     )
 
-    assert set(snippets["sixk_verdict"]) == {VERDICT_KEPT_DEGRADED}
+    assert set(snippets["verdict"]) == {VERDICT_FAILED}
+    assert not snippets["relevance"].any()
     registry = load_completion_registry("sixk-classify", artifact_root=str(tmp_path))
     assert [entry.fingerprint is not None for entry in registry.values()] == [True]
+    (source_partition,) = registry
+    failures = load_row_failures("sixk-classify", artifact_root=str(tmp_path))
+    assert list(failures) == ["000000000026000001"]
+    assert failures["000000000026000001"]["source_partition"] == source_partition
+    assert "validation failed" in str(failures["000000000026000001"]["error"])
+
+
+class _FailsFirstFiling(FakeChatClient):
+    """Keeps everything, except that the first call returns an unusable answer."""
+
+    async def complete(self: Self, **kwargs: object) -> str:
+        """Return garbage on the first call, then keep every snippet."""
+        if not self.calls:
+            self.calls.append([])
+            return "not json"
+        return await super().complete(**kwargs)  # type: ignore[arg-type]
+
+
+def _two_filings(tmp_path: Path) -> None:
+    _write_documents(
+        tmp_path,
+        [
+            _document_row(
+                tmp_path,
+                accession_number=accession_number,
+                submission=_submission(("6-K", f"<p>{DEBT_PROSE}</p>")),
+            )
+            for accession_number in ("000000000026000001", "000000000026000002")
+        ],
+    )
+
+
+def test_retry_triages_only_the_failed_filing_and_clears_its_entry(
+    tmp_path: Path,
+) -> None:
+    """The retry re-judges the listed filing, keeps the other's rows, leaves completion."""
+    _two_filings(tmp_path)
+    first = segment_and_classify_pending(
+        artifact_root=str(tmp_path),
+        client=_FailsFirstFiling(keep_all=True),
+        concurrency=1,
+        max_attempts=1,
+    )
+    verdicts = first.groupby("accession_number")["verdict"].agg(set).to_dict()
+    assert verdicts == {
+        "000000000026000001": {VERDICT_FAILED},
+        "000000000026000002": {VERDICT_KEPT},
+    }
+    registry_before = load_completion_registry(
+        "sixk-classify", artifact_root=str(tmp_path)
+    )
+    snippets_path = list_artifacts(sixk_snippets_root(str(tmp_path)), suffix=".parquet")
+    other_before = read_dataset(sixk_snippets_root(str(tmp_path)))
+    other_before = other_before.loc[
+        other_before["accession_number"] == "000000000026000002"
+    ].reset_index(drop=True)
+
+    client = FakeChatClient(keep_all=True)
+    result = retry_failed_triage(artifact_root=str(tmp_path), client=client)
+
+    assert (result.retried, result.recovered, result.still_failed) == (1, 1, 0)
+    assert len(client.calls) == 1
+    assert load_row_failures("sixk-classify", artifact_root=str(tmp_path)) == {}
+    assert list_artifacts(sixk_snippets_root(str(tmp_path)), suffix=".parquet") == (
+        snippets_path
+    )
+    after = read_dataset(sixk_snippets_root(str(tmp_path)))
+    assert set(after["verdict"]) == {VERDICT_KEPT}
+    assert after["relevance"].all()
+    other_after = after.loc[
+        after["accession_number"] == "000000000026000002"
+    ].reset_index(drop=True)
+    pd.testing.assert_frame_equal(other_after, other_before)
+    registry_after = load_completion_registry(
+        "sixk-classify", artifact_root=str(tmp_path)
+    )
+    assert {path: entry.fingerprint for path, entry in registry_after.items()} == {
+        path: entry.fingerprint for path, entry in registry_before.items()
+    }
+
+
+def test_a_retry_that_fails_again_keeps_the_entry_with_the_new_error(
+    tmp_path: Path,
+) -> None:
+    """A filing that fails on retry stays failed and listed."""
+    _two_filings(tmp_path)
+    segment_and_classify_pending(
+        artifact_root=str(tmp_path),
+        client=_FailsFirstFiling(keep_all=True),
+        concurrency=1,
+        max_attempts=1,
+    )
+
+    result = retry_failed_triage(
+        artifact_root=str(tmp_path),
+        client=FakeChatClient(error=_ProviderError(400)),
+    )
+
+    assert (result.retried, result.recovered, result.still_failed) == (1, 0, 1)
+    failures = load_row_failures("sixk-classify", artifact_root=str(tmp_path))
+    assert list(failures) == ["000000000026000001"]
+    assert "HTTP 400" in str(failures["000000000026000001"]["error"])
+    snippets = read_dataset(sixk_snippets_root(str(tmp_path)))
+    failed = snippets.loc[snippets["accession_number"] == "000000000026000001"]
+    assert set(failed["verdict"]) == {VERDICT_FAILED}
+
+
+def test_a_retry_during_an_outage_writes_nothing_and_keeps_the_entry(
+    tmp_path: Path,
+) -> None:
+    """A held retry leaves the partition and the failure list as they were."""
+    _two_filings(tmp_path)
+    segment_and_classify_pending(
+        artifact_root=str(tmp_path),
+        client=_FailsFirstFiling(keep_all=True),
+        concurrency=1,
+        max_attempts=1,
+    )
+    before = read_dataset(sixk_snippets_root(str(tmp_path)))
+
+    result = retry_failed_triage(
+        artifact_root=str(tmp_path),
+        client=FakeChatClient(error=_ProviderError(503)),
+    )
+
+    assert (result.retried, result.recovered, result.still_failed) == (1, 0, 1)
+    assert list(load_row_failures("sixk-classify", artifact_root=str(tmp_path))) == [
+        "000000000026000001"
+    ]
+    pd.testing.assert_frame_equal(
+        read_dataset(sixk_snippets_root(str(tmp_path))), before
+    )
+
+
+def test_a_plain_rerun_of_the_partition_clears_a_recovered_filing(
+    tmp_path: Path,
+) -> None:
+    """Re-triaging the whole partition replaces its failure entries."""
+    _two_filings(tmp_path)
+    segment_and_classify_pending(
+        artifact_root=str(tmp_path),
+        client=_FailsFirstFiling(keep_all=True),
+        concurrency=1,
+        max_attempts=1,
+    )
+    assert load_row_failures("sixk-classify", artifact_root=str(tmp_path))
+
+    segment_and_classify_pending(
+        artifact_root=str(tmp_path),
+        client=FakeChatClient(keep_all=True),
+        force=True,
+    )
+
+    assert load_row_failures("sixk-classify", artifact_root=str(tmp_path)) == {}
 
 
 def test_stage_retriages_a_partition_ingest_grew(tmp_path: Path) -> None:
@@ -904,13 +1066,13 @@ def test_a_dropped_window_records_why(tmp_path: Path) -> None:
         documents, artifacts=(FakeStage1(), 0.332), client=client
     )
 
-    verdicts = dict(zip(snippets["item"], snippets["sixk_verdict"], strict=True))
+    verdicts = dict(zip(snippets["item"], snippets["verdict"], strict=True))
     assert verdicts[snippet_id_for("000000000026000001", 1, 0)] == (
         VERDICT_DROPPED_NO_DETAILS
     )
     assert (
         snippets.loc[
-            snippets["sixk_verdict"] == VERDICT_DROPPED_NO_DETAILS, "sixk_duplicate_of"
+            snippets["verdict"] == VERDICT_DROPPED_NO_DETAILS, "sixk_duplicate_of"
         ]
         .isna()
         .all()
@@ -1102,3 +1264,41 @@ def test_a_partition_with_one_stale_filing_pays_for_no_stage_two_call(
 
     assert client.calls == []
     assert list_artifacts(sixk_snippets_root(str(tmp_path)), suffix=".parquet") == []
+
+
+def test_a_retry_skips_a_partition_that_changed_since_it_was_triaged(
+    tmp_path: Path,
+) -> None:
+    """A pending windows partition is left for the next plain run, which redoes it whole."""
+    _two_filings(tmp_path)
+    segment_and_classify_pending(
+        artifact_root=str(tmp_path),
+        client=_FailsFirstFiling(keep_all=True),
+        concurrency=1,
+        max_attempts=1,
+    )
+    _write_documents(
+        tmp_path,
+        [
+            _document_row(
+                tmp_path,
+                accession_number=accession_number,
+                submission=_submission(("6-K", f"<p>{DEBT_PROSE}</p>")),
+            )
+            for accession_number in (
+                "000000000026000001",
+                "000000000026000002",
+                "000000000026000003",
+            )
+        ],
+    )
+    segment_pending_sixk_documents(artifact_root=str(tmp_path))
+    client = FakeChatClient(keep_all=True)
+
+    result = retry_failed_triage(artifact_root=str(tmp_path), client=client)
+
+    assert (result.retried, result.skipped) == (0, 1)
+    assert client.calls == []
+    assert list(load_row_failures("sixk-classify", artifact_root=str(tmp_path))) == [
+        "000000000026000001"
+    ]

@@ -133,7 +133,7 @@ class FilingVerdict:
     """Stage-2 outcome for one filing.
 
     ``dropped_duplicate`` holds ``(dropped_id, covered_by_id)`` pairs. ``error``
-    is ``None`` on success; when set, ``kept`` holds every snippet.
+    is ``None`` on success; when set, the filing failed and nothing is kept.
     ``infrastructure_error`` marks an ``error`` from the provider or transport
     (see :func:`cdt.extractor.state.is_infrastructure_error`) rather than from
     the model's answers.
@@ -386,7 +386,7 @@ async def triage_filing(
     Returns:
         The verdict; ``attempts`` is 0 when ``snippets`` is empty and no call
         is made. On a client error or after ``max_attempts`` invalid verdicts,
-        every snippet is kept and ``error`` is set.
+        nothing is kept and ``error`` is set.
 
     Raises:
         ValueError: If ``reasoning_effort`` is not a recognised effort.
@@ -418,7 +418,6 @@ async def triage_filing(
             LOGGER.warning("stage 2 call failed for %s: %r", accession_number, error)
             return FilingVerdict(
                 accession_number=accession_number,
-                kept=[snippet.snippet_id for snippet in snippets],
                 attempts=attempt,
                 error=repr(error),
                 infrastructure_error=is_infrastructure_error(error),
@@ -444,7 +443,6 @@ async def triage_filing(
     )
     return FilingVerdict(
         accession_number=accession_number,
-        kept=[snippet.snippet_id for snippet in snippets],
         attempts=max_attempts,
         error=f"validation failed: {failures}",
     )

@@ -236,6 +236,7 @@ def test_classify_pending_items_writes_canonical_partitions(
     assert len(classified) == 1
     assert written["label"].to_list() == ["relevant"]
     assert written["relevance"].to_list() == [True]
+    assert written["verdict"].to_list() == ["kept"]
 
 
 def test_classify_pending_items_drains_all_partitions(

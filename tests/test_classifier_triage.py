@@ -284,18 +284,18 @@ def test_triage_retries_an_out_of_range_covered_by() -> None:
     assert verdict.error is None
 
 
-def test_triage_keeps_everything_when_attempts_run_out() -> None:
-    """Exhausting retries degrades to stage-1 behaviour rather than losing data."""
+def test_triage_keeps_nothing_when_attempts_run_out() -> None:
+    """Exhausting retries fails the filing; the stage records it for a retry."""
     client = FakeClient([json.dumps({"keep": [1], "drop": []})] * 3)
     verdict = asyncio.run(triage_filing(client, "acc-1", _snippets(2), max_attempts=3))
-    assert verdict.kept == ["s1", "s2"]
+    assert verdict.kept == []
     assert verdict.error is not None
 
 
-def test_triage_keeps_everything_when_the_provider_fails() -> None:
-    """A transport error must not silently drop a filing's snippets."""
+def test_triage_keeps_nothing_when_the_provider_fails() -> None:
+    """A transport error fails the filing and says why, rather than keeping all."""
     verdict = asyncio.run(triage_filing(ExplodingClient(), "acc-1", _snippets(2)))
-    assert verdict.kept == ["s1", "s2"]
+    assert verdict.kept == []
     assert "provider down" in (verdict.error or "")
 
 
@@ -508,6 +508,6 @@ def test_a_client_error_records_whether_it_was_infrastructure(
 
     verdict = asyncio.run(triage_filing(RaisingClient(), "acc-1", _snippets(1)))
 
-    assert verdict.kept == ["s1"]
+    assert verdict.kept == []
     assert verdict.error is not None
     assert verdict.infrastructure_error is infrastructure
