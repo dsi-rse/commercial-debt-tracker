@@ -13,7 +13,7 @@ import pickle
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, Self, runtime_checkable
+from typing import Protocol, Self
 
 import numpy as np
 import pandas as pd
@@ -87,7 +87,6 @@ class RetryResult:
     skipped: int = 0
 
 
-@runtime_checkable
 class SupportsDecisionFunction(Protocol):
     """Protocol for fitted classifiers used by this module."""
 

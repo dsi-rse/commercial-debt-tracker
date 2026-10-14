@@ -35,10 +35,6 @@ LOGGER = get_logger(__name__)
 #: the artifact.
 DEFAULT_STAGE1_THRESHOLD = 0.332
 
-#: Built-in stage-2 model; :func:`triage_filing` reads the configured
-#: ``settings.SIXK_TRIAGE_MODEL`` at call time.
-DEFAULT_STAGE2_MODEL = settings.DEFAULT_SIXK_TRIAGE_MODEL
-
 #: Built-in stage-2 reasoning effort; the configured value is
 #: ``settings.SIXK_TRIAGE_REASONING``, in the extractor's vocabulary.
 DEFAULT_STAGE2_REASONING = settings.DEFAULT_SIXK_TRIAGE_REASONING

@@ -14,7 +14,6 @@ DEFAULT_LENDER_SUPPORT_THRESHOLD = 0.5
 # Bump when published columns or hashed mention payloads change; a root matched
 # at an older version is fully rematched (`_stale_schema_forces_rematch`).
 MATCHER_SCHEMA_VERSION = 7
-EDGE_TYPES = ("member", "related", "ambiguous_candidate")
 
 
 MENTION_CLUSTER_EDGE_COLUMNS = [

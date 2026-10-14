@@ -36,9 +36,6 @@ MATCH_SHARDS = 64
 PARTITION_PATTERN = re.compile(
     r"(?P<dataset>[a-z\-]+)/date=(?P<date>\d{4}-\d{2}-\d{2})/shard=(?P<shard>\d{4})/part-0000\.parquet$"
 )
-CIK_PARTITION_PATTERN = re.compile(
-    r"(?P<dataset>[a-z\-]+)/cik_shard=(?P<cik_shard>\d{4})/part-0000\.parquet$"
-)
 
 
 def default_artifact_root(data_dir: Path | None = None) -> str:

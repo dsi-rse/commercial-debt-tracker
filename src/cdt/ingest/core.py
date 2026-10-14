@@ -67,7 +67,6 @@ PROGRESS_DAY_INTERVAL = 30
 # counted from the end so a multi-segment --s3-prefix cannot shift it.
 MANIFEST_KEY_CIK_INDEX_FROM_END = -3
 MIN_MANIFEST_KEY_PARTS = 5
-DEFAULT_OUTPUT_PREFIX = "processors/cdt"
 DOCUMENT_PARTITION_SHARDS = 64
 
 
