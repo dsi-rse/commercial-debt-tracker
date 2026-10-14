@@ -536,37 +536,6 @@ def iter_manifest_keys_for_date_range(
     )
 
 
-def iter_filings(
-    s3_client: S3Client,
-    bucket: str,
-    form_types: str | Sequence[str],
-    start_date: date,
-    end_date: date,
-    *,
-    include_failures: bool = False,
-    ciks: set[str] | None = None,
-) -> Iterator[ScrapedFiling]:
-    """Yield filing manifests for exact form type prefixes over an inclusive date range."""
-    for manifest_key in _iter_manifest_keys(
-        s3_client,
-        bucket,
-        form_types,
-        start_date,
-        end_date,
-        ciks=_normalize_ciks(ciks),
-    ):
-        try:
-            manifest = _read_json_object(s3_client, bucket, manifest_key)
-        except Exception:
-            LOGGER.exception("Failed to read manifest: key=%s", manifest_key)
-            raise
-        filing = _filing_from_manifest(manifest)
-        if filing.failure_reason and not include_failures:
-            LOGGER.info("Skipping failed manifest %s", manifest_key)
-            continue
-        yield filing
-
-
 def s3_uri(bucket: str, key: str) -> str:
     """Build a canonical S3 URI from bucket and key."""
     return f"s3://{bucket}/{key.lstrip('/')}"

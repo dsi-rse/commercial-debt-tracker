@@ -297,7 +297,7 @@ Runs at write time, through `published_mention_rows`. Every copied field is coer
 
 ### `published_mention_rows`
 
-The one seam between what the model returned for an item and what the pipeline writes. Every publish path (the live loop, the batch finalize, `extract_tables`, the `full.jsonl` audit record) goes through it, so the prior-state mint applies identically on every backend, including rows of an in-flight batch job whose IE postprocess ran under older code, while `state.jsonl` keeps only what the model returned. It takes no `counters`; a live-path mint counter should arrive with the manifest field that would carry it.
+The one seam between what the model returned for an item and what the pipeline writes. Every publish path (the live loop, the batch finalize, the `full.jsonl` audit record) goes through it, so the prior-state mint applies identically on every backend, including rows of an in-flight batch job whose IE postprocess ran under older code, while `state.jsonl` keeps only what the model returned. It takes no `counters`; a live-path mint counter should arrive with the manifest field that would carry it.
 
 ## Writing mentions (live and batch backends)
 

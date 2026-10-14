@@ -197,13 +197,6 @@ class CandidateScore:
     cluster_size: int = 0
     cluster_retired: bool = False
 
-    @property
-    def base_match_via(self: CandidateScore) -> str:
-        """Return the explanation family without the outcome prefix."""
-        if self.basis != "amount_start" or self.support_family is None:
-            return self.basis
-        return f"amount_start+{self.support_family}"
-
 
 # Extracted terminal events. A cluster with a member carrying one is retired,
 # which breaks a name-only tie toward the live obligation; the matcher derives

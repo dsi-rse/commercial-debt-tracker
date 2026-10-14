@@ -128,22 +128,6 @@ class CompletionRegistry(dict[str, CompletedPartition]):
         return self[key]
 
 
-def load_completed_partitions(
-    stage_name: str,
-    *,
-    artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
-) -> set[str]:
-    """Load completed source partition paths for one stage, ignoring fingerprints."""
-    return {
-        path
-        for path, entry in load_completion_registry(
-            stage_name, artifact_root=artifact_root, data_dir=data_dir
-        ).items()
-        if entry.complete
-    }
-
-
 def load_completion_registry(
     stage_name: str,
     *,
@@ -235,27 +219,6 @@ def _prepend_registry_root(stored: str, join_prefix: str) -> str:
     if not PARTITION_PATTERN.fullmatch(stored):
         return stored
     return join_prefix + stored
-
-
-def _relative_registry_key(key: str, artifact_root: str) -> str:
-    """Return one registry key with the artifact root stripped off.
-
-    Stripped only when the remainder is a bare canonical partition path, so
-    this is the exact inverse of ``_absolute_registry_key``; any other key is
-    returned whole. The one-key form of ``_strip_registry_root``.
-    """
-    return _strip_registry_root(key, _registry_strip_prefix(artifact_root))
-
-
-def _absolute_registry_key(stored: str, artifact_root: str) -> str:
-    """Return one persisted key with the artifact root reattached.
-
-    A stored key is root-relative exactly when it is a bare canonical
-    date/shard partition path -- ``fullmatch``, not the suffix ``search`` the
-    parsers use, so a whole path or an S3 URI is not mistaken for one. Anything
-    else is returned as stored.
-    """
-    return _prepend_registry_root(stored, _registry_join_prefix(artifact_root))
 
 
 def _registry_entries(

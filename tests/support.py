@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 from cdt.classifier.core import classifications_root
+from cdt.completion import load_completion_registry
 from cdt.extractor.normalize.amounts import normalized_amount_from_text
 from cdt.extractor.schema import DEBT_INSTRUMENT_MENTION_COLUMNS
 from cdt.extractor.state import ExtractionRowState
@@ -352,3 +353,14 @@ class FakeModel:
         """Return a single strong-positive score."""
         del texts
         return [2.0]
+
+
+def completed_partitions(stage_name: str, artifact_root: Path | str) -> set[str]:
+    """Return the source partitions one stage's registry records as complete."""
+    return {
+        path
+        for path, entry in load_completion_registry(
+            stage_name, artifact_root=artifact_root
+        ).items()
+        if entry.complete
+    }

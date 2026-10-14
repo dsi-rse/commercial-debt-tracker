@@ -254,28 +254,6 @@ def iter_date_shard_partitions(
     return filtered
 
 
-def existing_date_shard_partition_ids(
-    dataset_name: str,
-    *,
-    artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
-) -> set[tuple[str, str]]:
-    """Return the ``(date, shard)`` ids of every written partition in a dataset.
-
-    One LIST answers "does the output partition exist?" for any number of
-    candidates, instead of one HEAD per target.
-    """
-    return {
-        (partition["date"], partition["shard"])
-        for partition in (
-            parse_date_shard_partition(path)
-            for path in iter_date_shard_partitions(
-                dataset_name, artifact_root=artifact_root, data_dir=data_dir
-            )
-        )
-    }
-
-
 def shard_label(value: str, shard_count: int) -> str:
     """Return the canonical shard label for one key.
 

@@ -20,6 +20,7 @@ from cdt.extractor.normalize.amounts import (
 )
 from cdt.extractor.normalize.dates import (
     derived_status_payload,
+    expected_retirement_in_payloads,
     mark_post_filing_events_expected,
     select_date_payload,
     standardized_dates_payloads,
@@ -31,7 +32,6 @@ from cdt.extractor.normalize.parties import (
 from cdt.extractor.schema import (
     INSTRUMENT_RELATION_TYPES,
     INSTRUMENT_TYPES,
-    TERMINAL_DATE_KINDS,
     debt_instrument_mention_id_for,
     raw_id_for,
 )
@@ -690,11 +690,8 @@ def relation_instrument_manifest(row_state: ExtractionRowState) -> str:
             facts = json.loads(str(mention.get("dates_json") or "[]"))
         except json.JSONDecodeError:
             facts = []
-        if any(
-            isinstance(fact, dict)
-            and fact.get("kind") in TERMINAL_DATE_KINDS
-            and fact.get("expected") is True
-            for fact in facts
+        if expected_retirement_in_payloads(
+            [fact for fact in facts if isinstance(fact, dict)]
         ):
             attributes.append('expected_retirement="true"')
         lines.append(f"  <instrument {' '.join(attributes)}/>")

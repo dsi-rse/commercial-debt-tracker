@@ -568,7 +568,6 @@ def test_keyless_mention_matches_on_identifying_fingerprint() -> None:
     assert len(candidates) == 1
     assert candidates[0].match_score == 0.90
     assert candidates[0].basis == "name_fingerprint"
-    assert candidates[0].base_match_via == "name_fingerprint"
 
 
 def test_keyless_mention_with_generic_name_stays_unmatched() -> None:

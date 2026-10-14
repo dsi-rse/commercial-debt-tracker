@@ -10,7 +10,7 @@ from cdt.extractor.batch import (
     describe_active_job,
     reset_active_job,
 )
-from cdt.extractor.live import extract_pending_items, extract_tables
+from cdt.extractor.live import extract_pending_items
 from cdt.extractor.llm import DEFAULT_REASONING_EFFORT
 from cdt.extractor.outputs import extracted_tables_path, mentions_root
 from cdt.extractor.schema import DEBT_INSTRUMENT_MENTION_COLUMNS
@@ -28,7 +28,6 @@ __all__ = [
     "advance_extract_job",
     "describe_active_job",
     "extract_pending_items",
-    "extract_tables",
     "extracted_tables_path",
     "mentions_root",
     "reset_active_job",

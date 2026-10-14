@@ -17,7 +17,6 @@ from support import build_mention_row
 
 from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
 from cdt.datasets import (
-    existing_date_shard_partition_ids,
     normalize_cik,
     shard_for_cik,
 )
@@ -147,31 +146,6 @@ def test_get_object_bytes_does_not_retry_client_errors(
         get_object_bytes(_MissingKeyClient(), "bucket", "key")
 
     assert calls == 1
-
-
-def test_existing_date_shard_partition_ids_lists_written_partitions(
-    tmp_path: Path,
-) -> None:
-    """The one-LIST partition-id set matches exactly what was written (#83)."""
-    root = tmp_path / "artifacts"
-    table = pd.DataFrame({"item_id": ["a"], "text": ["x"]})
-    write_partition_table(
-        str(root / "items"),
-        partition={"date": "2026-01-02", "shard": "0007"},
-        table=table,
-    )
-    write_partition_table(
-        str(root / "items"),
-        partition={"date": "2026-03-04", "shard": "0001"},
-        table=table,
-    )
-
-    ids = existing_date_shard_partition_ids("items", artifact_root=str(root))
-
-    assert ids == {("2026-01-02", "0007"), ("2026-03-04", "0001")}
-    assert (
-        existing_date_shard_partition_ids("mentions", artifact_root=str(root)) == set()
-    )
 
 
 class _PrefixMatchingS3Client:

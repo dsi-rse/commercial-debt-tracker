@@ -654,19 +654,21 @@ def test_registry_follows_a_copied_artifact_root(tmp_path: Path) -> None:
     """
     import shutil
 
-    from cdt.completion import load_completed_partitions, pending_source_partitions
+    from support import completed_partitions
+
+    from cdt.completion import pending_source_partitions
 
     source = tmp_path / "source"
     seed_document_partitions_across_months(
         source, [("2024-01-02", "0000"), ("2024-02-05", "0001")]
     )
     segment_pending_eightk_documents(artifact_root=source)
-    assert len(load_completed_partitions("itemize", artifact_root=source)) == 2
+    assert len(completed_partitions("itemize", source)) == 2
 
     copy = tmp_path / "copy"
     shutil.copytree(source, copy)
 
-    completed = load_completed_partitions("itemize", artifact_root=copy)
+    completed = completed_partitions("itemize", copy)
     assert completed == {
         cdt_datasets.date_shard_partition_path(
             "documents", partition_date=day, shard=shard, artifact_root=copy
@@ -813,6 +815,14 @@ def test_completion_registry_shards_sit_under_the_registry_root(
     assert shard == str(Path(root, "date=2024-01.json"))
 
 
+def _absolute(stored: str, root: str) -> str:
+    """Reattach the artifact root to one persisted key, as a registry load does."""
+    return cdt_completion._prepend_registry_root(  # noqa: SLF001
+        stored,
+        cdt_completion._registry_join_prefix(root),  # noqa: SLF001
+    )
+
+
 def test_registry_key_relativizing_is_invertible(tmp_path: Path) -> None:
     """Every in-memory key shape round-trips through the persisted form unchanged.
 
@@ -841,16 +851,17 @@ def test_registry_key_relativizing_is_invertible(tmp_path: Path) -> None:
         "bookkeeping-key",
         "P",
     ):
-        stored = cdt_completion._relative_registry_key(key, root)  # noqa: SLF001
-        assert cdt_completion._absolute_registry_key(stored, root) == key  # noqa: SLF001
+        stored = cdt_completion._strip_registry_root(  # noqa: SLF001
+            key,
+            cdt_completion._registry_strip_prefix(root),  # noqa: SLF001
+        )
+        assert _absolute(stored, root) == key
 
     # A bare relative canonical key is the *persisted* spelling, so it reads
     # back as that partition under the current root -- which is exactly the
     # portability the v3 keys buy.
     bare = "documents/date=2024-01-02/shard=0001/part-0000.parquet"
-    assert cdt_completion._absolute_registry_key(bare, root) == str(  # noqa: SLF001
-        tmp_path / bare
-    )
+    assert _absolute(bare, root) == str(tmp_path / bare)
 
 
 def test_infrastructure_error_aborts_and_preserves_progress(

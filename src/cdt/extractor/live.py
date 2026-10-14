@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,7 +13,7 @@ import pandas as pd
 from cdt import settings
 from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
 from cdt.completion import CHECKPOINT_INTERVAL_SECONDS
-from cdt.datasets import extractor_run_path, resolve_artifact_root
+from cdt.datasets import resolve_artifact_root
 from cdt.extractor.batch import active_job_claimed_partition_paths
 from cdt.extractor.llm import normalize_reasoning_effort
 from cdt.extractor.outputs import (
@@ -22,16 +21,13 @@ from cdt.extractor.outputs import (
     checkpoint_audit_path,
     completion_entry,
     pending_extract_partitions,
-    summarize_failure,
     write_mentions_partition,
     write_run_checkpoint,
     write_run_records,
 )
-from cdt.extractor.prior_state import published_mention_rows
 from cdt.extractor.schema import DEBT_INSTRUMENT_MENTION_COLUMNS
 from cdt.extractor.state import (
     DEFAULT_MAX_ATTEMPTS,
-    PUBLISHABLE_ROW_STATES,
     InfrastructureError,
     SupportsChatCompletion,
 )
@@ -40,7 +36,7 @@ from cdt.extractor.workflow import (
 )
 from cdt.lease import throttled
 from cdt.shared import get_logger
-from cdt.storage.objects import delete_artifact, write_text_artifact
+from cdt.storage.objects import delete_artifact
 from cdt.storage.tables import read_table
 
 LOGGER = get_logger(__name__)
@@ -313,72 +309,3 @@ def extract_pending_items(
     return pd.concat(processed_frames, ignore_index=True).reindex(
         columns=DEBT_INSTRUMENT_MENTION_COLUMNS
     )
-
-
-def extract_tables(
-    classified_items: pd.DataFrame,
-    *,
-    artifact_root: str | Path | None = None,
-    data_dir: Path | None = None,
-    force: bool = False,
-    model: str | None = None,
-    reasoning_effort: str | None = None,
-    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
-    client: SupportsChatCompletion | None = None,
-) -> dict[str, pd.DataFrame]:
-    """Run in-memory extraction and return instrument mention tables."""
-    del force
-    if classified_items.empty:
-        return {
-            "debt_instrument_mentions": pd.DataFrame(
-                columns=DEBT_INSTRUMENT_MENTION_COLUMNS
-            )
-        }
-    relevant_items = (
-        classified_items.loc[classified_items["relevance"].fillna(False)]
-        if "relevance" in classified_items
-        else classified_items
-    )
-    if relevant_items.empty:
-        return {
-            "debt_instrument_mentions": pd.DataFrame(
-                columns=DEBT_INSTRUMENT_MENTION_COLUMNS
-            )
-        }
-    resolved_model = model or settings.EXTRACTOR_MODEL
-    resolved_reasoning = normalize_reasoning_effort(reasoning_effort)
-    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
-    run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-    full_jsonl_path = extractor_run_path(
-        run_id, artifact_root=resolved_root, data_dir=data_dir
-    )
-    rows: list[dict[str, object]] = []
-    audit_records: list[str] = []
-    for item_row in relevant_items.to_dict("records"):
-        row_state = asyncio.run(
-            run_extraction_workflow(
-                item_row=item_row,
-                model=resolved_model,
-                reasoning_effort=resolved_reasoning,
-                max_attempts=max_attempts,
-                client=client,
-            )
-        )
-        audit_records.append(json.dumps(row_state.to_audit_dict(), sort_keys=True))
-        if row_state.state in PUBLISHABLE_ROW_STATES:
-            rows.extend(published_mention_rows(row_state))
-        else:
-            LOGGER.warning(
-                "In-memory extractor failed for item %s: %s",
-                row_state.item_id,
-                summarize_failure(row_state),
-            )
-    write_text_artifact(
-        full_jsonl_path,
-        ("\n".join(audit_records) + "\n") if audit_records else "",
-    )
-    return {
-        "debt_instrument_mentions": pd.DataFrame(
-            rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS
-        )
-    }

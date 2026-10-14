@@ -320,8 +320,8 @@ def mint_prior_state_rows(
 def published_mention_rows(row_state: ExtractionRowState) -> list[dict[str, object]]:
     """Return the mention rows one row state publishes, prior states included.
 
-    Every publish path (live loop, batch finalize, `extract_tables`, the
-    `full.jsonl` audit record) goes through here, so the prior-state mint is
+    Every publish path (live loop, batch finalize, the `full.jsonl`
+    audit record) goes through here, so the prior-state mint is
     applied identically on every backend. The row state itself is not mutated.
     """
     return mint_prior_state_rows(row_state.debt_instrument_mentions)

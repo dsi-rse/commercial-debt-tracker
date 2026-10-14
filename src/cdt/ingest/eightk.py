@@ -4,17 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from datetime import date
-from pathlib import Path
 
 import pandas as pd
 
 from cdt.datasets import (
     DEFAULT_FORM_TYPES,
-    DOCUMENT_DATASET_NAME,
-    default_artifact_root,
 )
 from cdt.ingest.core import (
-    DEFAULT_FLUSH_ROWS,
     DEFAULT_S3_PREFIX,
     DocumentCandidate,
     DocumentSource,
@@ -39,79 +35,6 @@ LOGGER = get_logger(__name__)
 
 CDT_DOCUMENT_TYPE = "COMPLETE SUBMISSION TEXT FILE"
 CDT_DOCUMENT_DESCRIPTION = "COMPLETE SUBMISSION TEXT FILE"
-
-
-def acquire_documents(
-    bucket: str,
-    year: int,
-    ciks: set[str] | None = None,
-    *,
-    data_dir: Path | None = None,
-    s3_client: S3Client | None = None,
-    force: bool = False,
-    flush_rows: int = DEFAULT_FLUSH_ROWS,
-    download: bool = False,
-    form_types: tuple[str, ...] = DEFAULT_FORM_TYPES,
-    dataset_name: str = DOCUMENT_DATASET_NAME,
-) -> pd.DataFrame:
-    """Acquire matching documents for a year and update document partitions."""
-    documents, _ = acquire_eightk_documents(
-        IngestConfig(
-            mode="historical",
-            bucket=bucket,
-            cik_file=Path(),
-            start_date=date(year, 1, 1),
-            end_date=date(year, 12, 31),
-            data_dir=data_dir,
-            output_root=default_artifact_root(data_dir),
-            force=force,
-            flush_rows=flush_rows,
-            download=download,
-            form_types=form_types,
-            dataset_name=dataset_name,
-        ),
-        ciks=ciks,
-        s3_client=s3_client,
-        return_documents=True,
-    )
-    return documents
-
-
-def acquire_documents_for_date_range(
-    bucket: str,
-    start_date: date,
-    end_date: date,
-    ciks: set[str] | None = None,
-    *,
-    data_dir: Path | None = None,
-    s3_client: S3Client | None = None,
-    force: bool = False,
-    flush_rows: int = DEFAULT_FLUSH_ROWS,
-    download: bool = False,
-    form_types: tuple[str, ...] = DEFAULT_FORM_TYPES,
-    dataset_name: str = DOCUMENT_DATASET_NAME,
-) -> pd.DataFrame:
-    """Acquire matching documents for a date range and update partitions."""
-    documents, _ = acquire_eightk_documents(
-        IngestConfig(
-            mode="historical",
-            bucket=bucket,
-            cik_file=Path(),
-            start_date=start_date,
-            end_date=end_date,
-            data_dir=data_dir,
-            output_root=default_artifact_root(data_dir),
-            force=force,
-            flush_rows=flush_rows,
-            download=download,
-            form_types=form_types,
-            dataset_name=dataset_name,
-        ),
-        ciks=ciks,
-        s3_client=s3_client,
-        return_documents=True,
-    )
-    return documents
 
 
 def acquire_eightk_documents(

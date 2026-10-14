@@ -24,18 +24,41 @@ from cdt.ingest.core import (
     _document_shard,
     _partition_path,
     documents_root,
-    iter_filings,
+    filing_from_manifest_key,
+    iter_manifest_keys_for_date_range,
     normalize_accession_number,
 )
-from cdt.ingest.eightk import (
-    acquire_documents,
-    acquire_documents_for_date_range,
-    acquire_eightk_documents,
-)
+from cdt.ingest.eightk import acquire_eightk_documents
 from cdt.storage.objects import list_artifacts
 from cdt.storage.tables import read_dataset, read_table, write_table
 
 EXPECTED_PARTITION_FILES = 3
+
+
+def _acquire(
+    client: object,
+    root: Path,
+    start_date: date,
+    end_date: date,
+    ciks: set[str],
+    **overrides: object,
+) -> pd.DataFrame:
+    """Run 8-K acquisition into ``root`` and return the documents it saw."""
+    documents, _ = acquire_eightk_documents(
+        IngestConfig(
+            mode="historical",
+            bucket="sec-bucket",
+            cik_file=Path(),
+            start_date=start_date,
+            end_date=end_date,
+            output_root=str(root),
+            **overrides,  # type: ignore[arg-type]
+        ),
+        ciks=ciks,
+        s3_client=client,  # type: ignore[arg-type]
+        return_documents=True,
+    )
+    return documents
 
 
 class FakePaginator:
@@ -165,19 +188,9 @@ def test_acquire_documents_indexes_resources_without_downloading(
         }
     )
 
-    first = acquire_documents(
-        "sec-bucket",
-        2024,
-        {"320193"},
-        data_dir=tmp_path,
-        s3_client=client,
-    )
-    second = acquire_documents(
-        "sec-bucket",
-        2024,
-        {"320193"},
-        data_dir=tmp_path,
-        s3_client=client,
+    first = _acquire(client, tmp_path, date(2024, 1, 1), date(2024, 12, 31), {"320193"})
+    second = _acquire(
+        client, tmp_path, date(2024, 1, 1), date(2024, 12, 31), {"320193"}
     )
 
     assert first["accession_number"].to_list() == ["000114036126006577"]
@@ -253,13 +266,12 @@ def test_acquire_documents_writes_downloads_in_batches_when_requested(
             ): b"third",
         }
     )
-    table = acquire_documents_for_date_range(
-        "sec-bucket",
+    table = _acquire(
+        client,
+        tmp_path,
         date(2024, 1, 2),
         date(2024, 1, 4),
         {"320193"},
-        data_dir=tmp_path,
-        s3_client=client,
         flush_rows=2,
         download=True,
     )
@@ -303,14 +315,8 @@ def test_acquire_documents_normalizes_bare_s3_keys(tmp_path: Path) -> None:
         }
     )
 
-    table = acquire_documents_for_date_range(
-        "sec-bucket",
-        date(2024, 1, 2),
-        date(2024, 1, 2),
-        {"320193"},
-        data_dir=tmp_path,
-        s3_client=client,
-        download=True,
+    table = _acquire(
+        client, tmp_path, date(2024, 1, 2), date(2024, 1, 2), {"320193"}, download=True
     )
 
     assert table["resource_uri"].to_list() == [
@@ -343,14 +349,8 @@ def test_acquire_documents_decompresses_gzip_downloads(tmp_path: Path) -> None:
         }
     )
 
-    table = acquire_documents_for_date_range(
-        "sec-bucket",
-        date(2024, 1, 2),
-        date(2024, 1, 2),
-        {"320193"},
-        data_dir=tmp_path,
-        s3_client=client,
-        download=True,
+    table = _acquire(
+        client, tmp_path, date(2024, 1, 2), date(2024, 1, 2), {"320193"}, download=True
     )
 
     partition_path = list_artifacts(
@@ -494,7 +494,28 @@ def test_ingest_without_an_injected_client_builds_one_from_the_profile(
     assert result.failures == 0
 
 
-def test_iter_filings_yields_manifest_objects_for_form_type_list() -> None:
+def _scan_filings(
+    client: object,
+    form_types: str | list[str],
+    start_date: date,
+    end_date: date,
+) -> list[object]:
+    """Read every filing the manifest scan finds, as ingest's candidate source does."""
+    keys = iter_manifest_keys_for_date_range(
+        client,  # type: ignore[arg-type]
+        "sec-bucket",
+        form_types,
+        start_date,
+        end_date,
+    )
+    filings = (
+        filing_from_manifest_key(client, "sec-bucket", key)  # type: ignore[arg-type]
+        for key in keys
+    )
+    return [filing for filing in filings if filing is not None]
+
+
+def test_manifest_scan_unions_form_type_prefixes() -> None:
     """Manifest iteration unions exact form type prefixes over the date range."""
     client = FakeS3Client(
         {
@@ -531,14 +552,8 @@ def test_iter_filings_yields_manifest_objects_for_form_type_list() -> None:
         }
     )
 
-    filings = list(
-        iter_filings(
-            client,
-            "sec-bucket",
-            ["8-K", "13F-HR"],
-            date(2024, 1, 2),
-            date(2024, 1, 3),
-        )
+    filings = _scan_filings(
+        client, ["8-K", "13F-HR"], date(2024, 1, 2), date(2024, 1, 3)
     )
 
     assert [filing.form_type for filing in filings] == ["8-K", "13F-HR"]
@@ -546,8 +561,8 @@ def test_iter_filings_yields_manifest_objects_for_form_type_list() -> None:
     assert filings[0].documents[0].type == "COMPLETE SUBMISSION TEXT FILE"
 
 
-def test_iter_filings_skips_failures_unless_requested() -> None:
-    """Failure manifests are available only when explicitly requested."""
+def test_manifest_scan_skips_upstream_failures() -> None:
+    """A manifest the scraper marked failed yields no filing."""
     client = FakeS3Client(
         {
             (
@@ -564,31 +579,10 @@ def test_iter_filings_skips_failures_unless_requested() -> None:
         }
     )
 
-    skipped = list(
-        iter_filings(
-            client,
-            "sec-bucket",
-            "8-K",
-            date(2024, 1, 2),
-            date(2024, 1, 2),
-        )
-    )
-    included = list(
-        iter_filings(
-            client,
-            "sec-bucket",
-            "8-K",
-            date(2024, 1, 2),
-            date(2024, 1, 2),
-            include_failures=True,
-        )
-    )
-
-    assert skipped == []
-    assert included[0].failure_reason == "api_error"
+    assert _scan_filings(client, "8-K", date(2024, 1, 2), date(2024, 1, 2)) == []
 
 
-def test_iter_filings_normalizes_amended_form_prefix() -> None:
+def test_manifest_scan_normalizes_amended_form_prefix() -> None:
     """SEC form slashes are normalized to scraper S3 prefixes."""
     client = FakeS3Client(
         {
@@ -605,15 +599,7 @@ def test_iter_filings_normalizes_amended_form_prefix() -> None:
         }
     )
 
-    filings = list(
-        iter_filings(
-            client,
-            "sec-bucket",
-            "10-K/A",
-            date(2024, 1, 2),
-            date(2024, 1, 2),
-        )
-    )
+    filings = _scan_filings(client, "10-K/A", date(2024, 1, 2), date(2024, 1, 2))
 
     assert filings[0].form_type == "10-K/A"
 

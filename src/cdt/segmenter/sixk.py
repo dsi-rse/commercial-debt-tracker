@@ -253,34 +253,6 @@ def count_tokens(text: str) -> int:
     return len(_get_encoding().encode(text))
 
 
-def matched_debt_keywords(
-    text: str,
-    *,
-    keywords: tuple[str, ...] = DEBT_KEYWORDS,
-) -> tuple[str, ...]:
-    """Return the debt keywords present in a text.
-
-    Args:
-        text: Text to search.
-        keywords: Vocabulary to match, in reporting order.
-
-    Returns:
-        Matching keywords in ``keywords`` order.
-
-    >>> matched_debt_keywords("entered into a new Term Loan and an indenture")
-    ('indenture', 'term loan')
-    >>> matched_debt_keywords("amended its credit agreements and two term loans")
-    ('credit agreement', 'term loan')
-    >>> matched_debt_keywords("the debenture was issued")
-    ('debenture',)
-    """
-    return tuple(
-        keyword
-        for keyword, pattern in _compiled_keywords(keywords)
-        if pattern.search(text)
-    )
-
-
 def has_debt_keyword(
     text: str,
     *,
