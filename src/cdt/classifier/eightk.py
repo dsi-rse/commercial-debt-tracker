@@ -39,16 +39,14 @@ def classify_items(
     *,
     data_dir: Path | None = None,
     model_dir: Path | None = None,
-    force: bool = False,
     artifacts: tuple[object, float] | None = None,
 ) -> pd.DataFrame:
     """Classify in-memory item rows using a saved binary model.
 
     Adds ``label``, ``relevance``, ``classification_score`` and ``verdict``.
     ``artifacts`` is a pre-loaded ``(model, threshold)`` pair; None loads them
-    from ``model_dir`` (default ``default_model_dir()``). ``force`` is ignored.
+    from ``model_dir`` (default ``default_model_dir()``).
     """
-    del force
     if items.empty:
         return pd.DataFrame(columns=CLASSIFIED_ITEM_COLUMNS)
 

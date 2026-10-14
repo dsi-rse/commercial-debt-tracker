@@ -709,16 +709,14 @@ def itemize_documents(
     documents: pd.DataFrame,
     *,
     data_dir: Path | None = None,
-    force: bool = False,
     s3_client: object | None = None,
     item_numbers: tuple[str, ...] | None = None,
 ) -> pd.DataFrame:
     """Extract the selected item sections from complete 8-K documents.
 
-    ``item_numbers`` of None selects POTENTIALLY_RELEVANT_ITEM_NUMBERS;
-    ``force`` is ignored. Returns an ITEM_COLUMNS frame, empty if no rows.
+    ``item_numbers`` of None selects POTENTIALLY_RELEVANT_ITEM_NUMBERS.
+    Returns an ITEM_COLUMNS frame, empty if no rows.
     """
-    del force
     if documents.empty:
         return pd.DataFrame(columns=ITEM_COLUMNS)
 
@@ -732,7 +730,6 @@ def itemize_documents(
             document,
             data_dir=data_dir,
             s3_client=resolved_s3_client,
-            item_numbers=None,
         )
         relevant_sections = [
             section
@@ -810,18 +807,14 @@ def itemize_document_record(
     *,
     data_dir: Path | None = None,
     s3_client: object | None = None,
-    item_numbers: tuple[str, ...] | None = None,
 ) -> list[ItemSection]:
-    """Extract item sections from one document record.
-
-    ``item_numbers`` of None returns every section, mapped or not.
-    """
+    """Extract every item section from one document record, mapped or not."""
     text = document_text_for_record(
         document,
         data_dir=data_dir,
         s3_client=s3_client,
     )
-    sections = extract_items_from_document(
+    return extract_items_from_document(
         DocumentText(
             accession_number=str(document["accession_number"]),
             cik=str(document["cik"]),
@@ -831,13 +824,6 @@ def itemize_document_record(
             date=str(document["date"]),
         )
     )
-    if item_numbers is None:
-        return sections
-
-    selected_item_numbers = normalize_item_numbers(item_numbers)
-    return [
-        section for section in sections if section.item_number in selected_item_numbers
-    ]
 
 
 def item_row(section: ItemSection) -> dict[str, object]:

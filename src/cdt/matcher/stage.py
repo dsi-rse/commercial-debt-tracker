@@ -311,7 +311,6 @@ def match_tables(
             mention,
             profiles,
             strong_match_threshold=strong_match_threshold,
-            loose_match_threshold=loose_match_threshold,
             name_class_size=class_sizes.get(mention_id, 1),
             lender_signature=borrowed_lender_signature(mention, mention_index),
         )

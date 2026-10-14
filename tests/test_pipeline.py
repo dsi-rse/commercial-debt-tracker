@@ -15,6 +15,7 @@ from cdt.datasets import GENRE_6K, GENRE_8K
 from cdt.extractor.state import ExtractionRowState
 from cdt.ingest.core import IngestRunResult
 from cdt.matcher import debt_instruments_root, mention_cluster_edges_root
+from cdt.matcher.schema import MENTION_CLUSTER_EDGE_COLUMNS
 from cdt.pipeline import (
     ALL_TIME_START_DATE,
     DEFAULT_GENRES,
@@ -142,7 +143,7 @@ def test_run_pipeline_uses_stage_backed_functions(
         calls.append(("match", None))
         return {
             "debt_instrument_mentions": pd.DataFrame(
-                [{"debt_instrument_mention_id": "mention-1"}]
+                [{"debt_instrument_mention_id": "mention-1", "edge_type": "member"}]
             ),
             "debt_instrument": pd.DataFrame([{"debt_instrument_id": "instrument-1"}]),
         }
@@ -262,7 +263,9 @@ def test_genres_narrow_the_run_to_one_chain(
         lambda **kwargs: (
             calls.append("match"),
             {
-                "debt_instrument_mentions": pd.DataFrame(),
+                "debt_instrument_mentions": pd.DataFrame(
+                    columns=MENTION_CLUSTER_EDGE_COLUMNS
+                ),
                 "debt_instrument": pd.DataFrame(),
             },
         )[1],
@@ -1458,7 +1461,9 @@ def _isolation_stubs(
         lambda **kwargs: (
             calls.append("match"),
             {
-                "debt_instrument_mentions": pd.DataFrame(),
+                "debt_instrument_mentions": pd.DataFrame(
+                    columns=MENTION_CLUSTER_EDGE_COLUMNS
+                ),
                 "debt_instrument": pd.DataFrame(),
             },
         )[1],
@@ -1600,7 +1605,9 @@ def test_match_and_finalize_logs_its_lineage_and_finalize_stages(
         "cdt.pipeline.match_pending_mentions",
         lambda **kwargs: {
             "debt_instrument": pd.DataFrame([{"debt_instrument_id": "i-1"}]),
-            "debt_instrument_mentions": pd.DataFrame(),
+            "debt_instrument_mentions": pd.DataFrame(
+                columns=MENTION_CLUSTER_EDGE_COLUMNS
+            ),
         },
     )
     monkeypatch.setattr(

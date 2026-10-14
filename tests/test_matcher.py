@@ -80,7 +80,6 @@ def score(
         mention,
         profiles,
         strong_match_threshold=0.90,
-        loose_match_threshold=0.75,
         name_class_size=name_class_size,
     )
 
@@ -173,7 +172,6 @@ def test_a_borrower_only_mint_reaches_membership_only_with_borrowed_lenders() ->
         minted,
         profiles,
         strong_match_threshold=0.90,
-        loose_match_threshold=0.75,
         lender_signature=borrowed,
     )
     assert [candidate.match_score for candidate in with_lenders] == [1.0]

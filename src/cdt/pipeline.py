@@ -500,12 +500,8 @@ class Pipeline:
             edge_rows=len(matched["debt_instrument_mentions"]),
             debt_instruments=len(matched["debt_instrument"]),
         )
-        member_edge_rows = matched["debt_instrument_mentions"]
-        matched_mentions = (
-            int((member_edge_rows["edge_type"] == "member").sum())
-            if "edge_type" in member_edge_rows
-            else len(member_edge_rows)
-        )
+        edge_rows = matched["debt_instrument_mentions"]
+        matched_mentions = int((edge_rows["edge_type"] == "member").sum())
 
         result = PipelineRunResult(
             mode=self.config.mode,

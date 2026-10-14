@@ -180,13 +180,11 @@ def _read_registry_shards(shard_paths: list[str]) -> list[object]:
         return list(pool.map(read_json_artifact, shard_paths))
 
 
-# Payload version. Keys are stored root-relative when the remainder is a bare
-# canonical partition path, and whole otherwise. Shape tells them apart safely:
-# a whole path (``/srv/cdt/documents/...``, ``s3://bucket/documents/...``) has a
-# slash in its dataset segment, which ``[a-z\-]+`` cannot ``fullmatch``.
-_REGISTRY_VERSION = 3
-
-
+# Keys are stored root-relative when the remainder is a bare canonical
+# partition path, and whole otherwise. Shape tells them apart safely: a whole
+# path (``/srv/cdt/documents/...``, ``s3://bucket/documents/...``) has a slash
+# in its dataset segment, which ``[a-z\-]+`` cannot ``fullmatch``.
+#
 # Key prefixes are derived once per object, not per key (the per-key cost is in
 # docs/decisions/storage-and-completion.md). The probe is a bare canonical
 # partition path, the only shape a prefix is applied to, so slicing it off a
@@ -262,7 +260,7 @@ def _registry_payload(
     *,
     artifact_root: str,
 ) -> dict[str, object]:
-    """Build the persisted v3 payload for one date shard of a registry.
+    """Build the persisted payload for one date shard of a registry.
 
     Sorted on the relativized key alone: ``CompletedPartition`` is unordered,
     so a tuple sort would raise TypeError if two keys relativized alike.
@@ -270,7 +268,6 @@ def _registry_payload(
     strip_prefix = _registry_strip_prefix(artifact_root)
     return {
         "stage": stage_name,
-        "version": _REGISTRY_VERSION,
         "date_prefix": shard_label,
         "partitions": {
             path: {

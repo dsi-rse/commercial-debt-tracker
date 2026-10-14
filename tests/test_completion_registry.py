@@ -368,7 +368,6 @@ def test_completion_registry_load_reads_only_date_shards() -> None:
         fingerprint = "shard" if path == shard else "sibling"
         return {
             "stage": "itemize",
-            "version": 3,
             "partitions": {
                 key: {"fingerprint": fingerprint},
                 f"{key}.only-in-{fingerprint}": {"fingerprint": fingerprint},
@@ -414,7 +413,6 @@ def test_completion_registry_load_merges_shards_in_sorted_order(
             json.dumps(
                 {
                     "stage": "itemize",
-                    "version": 3,
                     "date_prefix": label,
                     "partitions": {key: {"fingerprint": fingerprint}},
                 }
@@ -597,7 +595,6 @@ def test_registry_keys_persist_without_the_artifact_root(tmp_path: Path) -> None
             completion_registry_shard_path("itemize", "2024-01", artifact_root=tmp_path)
         ).read_text()
     )
-    assert payload["version"] == 3
     assert list(payload["partitions"]) == [
         "documents/date=2024-01-02/shard=0001/part-0000.parquet"
     ]
@@ -701,7 +698,6 @@ def test_a_v2_shard_is_normalized_on_its_next_write(tmp_path: Path) -> None:
         json.dumps(
             {
                 "stage": "itemize",
-                "version": 2,
                 "date_prefix": "2024-01",
                 "partitions": {key: {"fingerprint": "old"} for key in keys},
             }
@@ -715,7 +711,6 @@ def test_a_v2_shard_is_normalized_on_its_next_write(tmp_path: Path) -> None:
     )
 
     payload = json.loads(shard.read_text())
-    assert payload["version"] == 3
     assert sorted(payload["partitions"]) == [
         "documents/date=2024-01-02/shard=0001/part-0000.parquet",
         "documents/date=2024-01-03/shard=0001/part-0000.parquet",

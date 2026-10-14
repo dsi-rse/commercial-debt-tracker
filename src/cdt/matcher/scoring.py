@@ -191,7 +191,6 @@ def score_candidates_for_mention(
     profiles: dict[str, ClusterProfile],
     *,
     strong_match_threshold: float,
-    loose_match_threshold: float,
     name_class_size: int = 1,
     lender_signature: str | None = None,
 ) -> list[CandidateScore]:
@@ -202,7 +201,6 @@ def score_candidates_for_mention(
     exceeds ``NAME_CLASS_GATE``. ``lender_signature`` overrides the mention's
     own for scoring only (see ``borrowed_lender_signature``).
     """
-    del loose_match_threshold
     scoring_lender_signature = (
         lender_signature if lender_signature is not None else mention.lender_signature
     )
