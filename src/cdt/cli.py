@@ -23,6 +23,7 @@ import logging
 import os
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import TypeVar
 
 import pandas as pd
 
@@ -30,6 +31,7 @@ from cdt.classifier.core import (
     DEFAULT_CV_SPLITS,
     DEFAULT_RANDOM_SEED,
     DEFAULT_TARGET_RECALL,
+    RetryResult,
     default_model_dir,
     train_classifier_model,
 )
@@ -80,6 +82,7 @@ from cdt.pipeline import (
     normalize_genres,
     read_cik_file,
     resolve_mode_dates,
+    retry_classify_genre,
     segment_genre,
 )
 from cdt.publish import PublishGuardError, publish_final_tables
@@ -460,6 +463,12 @@ def _add_classify(commands: argparse._SubParsersAction) -> None:
         ],
         help="decide which 8-K items and 6-K windows reach the extractor",
     )
+    classify.add_argument(
+        "--retry-failures",
+        action="store_true",
+        help="classify again only the filings in each genre's classify failure "
+        "list (failures/<stage>/failures.json)",
+    )
     classify.set_defaults(func=run_classify)
     nested = classify.add_subparsers(dest="classify_command")
     train = nested.add_parser(
@@ -501,8 +510,8 @@ def _add_extract(commands: argparse._SubParsersAction) -> None:
         parents=[
             _common_options(),
             _force_option(
-                "re-extract partitions already extracted (batch: when this "
-                "tick starts a new job)"
+                "re-extract partitions already extracted (batch: queued for "
+                "this and later jobs)"
             ),
             _extract_options(),
             _batch_tick_options(),
@@ -622,7 +631,8 @@ def _add_run(commands: argparse._SubParsersAction) -> None:
             _final_database_root_option(),
             _runtime_option(),
             _force_option(
-                "when this tick starts a new job, claim partitions already extracted"
+                "re-extract partitions already extracted (queued for this and "
+                "later jobs)"
             ),
             _force_publish_option(),
             _batch_tick_options(),
@@ -679,14 +689,17 @@ def _with_writer_lease(
         release_lease(lease)
 
 
+GenreResult = TypeVar("GenreResult")
+
+
 def _per_genre(
-    genres: Sequence[str], noun: str, stage: Callable[[str], pd.DataFrame]
-) -> tuple[dict[str, pd.DataFrame], list[str]]:
+    genres: Sequence[str], noun: str, stage: Callable[[str], GenreResult]
+) -> tuple[dict[str, GenreResult], list[str]]:
     """Run ``stage`` per genre; a genre that raises is logged and the rest still run.
 
     ``LeaseLostError`` is not caught: a command that lost its lease stops.
     """
-    results: dict[str, pd.DataFrame] = {}
+    results: dict[str, GenreResult] = {}
     failed: list[str] = []
     for genre in genres:
         try:
@@ -700,9 +713,9 @@ def _per_genre(
 
 
 def _report_genres(
-    results: dict[str, pd.DataFrame],
+    results: dict[str, GenreResult],
     failed: list[str],
-    describe: Callable[[str, pd.DataFrame], str],
+    describe: Callable[[str, GenreResult], str],
 ) -> int:
     for genre, rows in results.items():
         print(describe(genre, rows))
@@ -804,7 +817,12 @@ def run_segment(args: argparse.Namespace) -> int:
 
 
 def run_classify(args: argparse.Namespace) -> int:
-    """Run ``cdt classify``."""
+    """Run ``cdt classify``, or with ``--retry-failures`` its retry."""
+    if args.retry_failures:
+        if args.force:
+            LOGGER.error("--retry-failures and --force cannot be combined")
+            return USAGE_EXIT_CODE
+        return _run_classify_retry(args)
 
     def body(artifact_root: str, lease: Lease) -> int:
         results, failed = _per_genre(
@@ -829,6 +847,33 @@ def run_classify(args: argparse.Namespace) -> int:
             return (
                 f"{genre}: classified {len(rows)} rows, {relevant} relevant, "
                 f"into {target}."
+            )
+
+        return _report_genres(results, failed, describe)
+
+    return _with_writer_lease(args, "classify", body)
+
+
+def _run_classify_retry(args: argparse.Namespace) -> int:
+    def body(artifact_root: str, lease: Lease) -> int:
+        results, failed = _per_genre(
+            args.genres,
+            "classify retry",
+            lambda genre: retry_classify_genre(
+                genre,
+                artifact_root=artifact_root,
+                model_dir=args.model_dir,
+                sixk_model_dir=args.sixk_model_dir,
+                sixk_concurrency=args.concurrency,
+                renew=renewer(lease),
+            ),
+        )
+
+        def describe(genre: str, result: RetryResult) -> str:
+            return (
+                f"{genre}: retried {result.retried} failed filing(s), "
+                f"{result.recovered} recovered, {result.still_failed} still failed, "
+                f"{result.skipped} skipped (their partitions are pending)."
             )
 
         return _report_genres(results, failed, describe)

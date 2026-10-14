@@ -20,6 +20,7 @@ from cdt.shared import get_logger
 from cdt.storage.columns import apply_declared_column_types
 from cdt.storage.objects import (
     S3_CLIENT_CONFIG,
+    S3_MAX_ATTEMPTS,
     ArtifactPath,
     boto3_session,
     configured_s3_profile,
@@ -145,7 +146,7 @@ def arrow_filesystem(path: ArtifactPath) -> tuple[object | None, str]:
         "connect_timeout": S3_CLIENT_CONFIG.connect_timeout,
         "request_timeout": S3_CLIENT_CONFIG.read_timeout,
         "retry_strategy": pyarrow.fs.AwsStandardS3RetryStrategy(
-            max_attempts=S3_CLIENT_CONFIG.retries["max_attempts"]
+            max_attempts=S3_MAX_ATTEMPTS
         ),
     }
     # Usually unset in production: botocore reads only AWS_DEFAULT_REGION, ECS

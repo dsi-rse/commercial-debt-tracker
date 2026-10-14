@@ -18,6 +18,8 @@ from cdt.extractor.schema import (
     DERIVED_FROM_STATED,
     INTEREST_RATE_KINDS,
     ISO_DATE_PATTERN,
+    LETTER_AMOUNT_MAGNITUDE_PATTERN,
+    LETTER_AMOUNT_MULTIPLIERS,
     MINIMUM_COMPUTED_SUM_SPANS,
     NAME_EMBEDDED_AMOUNT_PATTERN,
     NUMERIC_STRING_PATTERN,
@@ -26,6 +28,7 @@ from cdt.extractor.schema import (
     QUALIFIED_DOLLAR_PATTERN,
     RATE_PCT_PATTERN,
     RATE_SUFFIX_PATTERN,
+    SEPARATED_FIGURE_PATTERN,
 )
 from cdt.extractor.tags import (
     cluster_payload,
@@ -316,7 +319,9 @@ def magnitude_in_amount_text(text: str | None) -> int | None:
     """Return the magnitude `normalized_amount_from_text` would apply, or None.
 
     The one definition of a magnitude word, shared with
-    `scaled_amount_from_sibling` so the two cannot disagree.
+    `scaled_amount_from_sibling` so the two cannot disagree. A spelled or
+    abbreviated word (`million`, `mm`, `bn`) wins over a single letter
+    (`$250M`, see `LETTER_AMOUNT_MAGNITUDE_PATTERN`).
     """
     if not text:
         return None
@@ -326,18 +331,65 @@ def magnitude_in_amount_text(text: str | None) -> int | None:
         # `$500 mm`, while `million` still cannot match inside a longer word.
         if re.search(rf"(?<![a-z]){word}\b", lowered):
             return AMOUNT_MULTIPLIERS[word]
+    # A letter counts only on the figure the parser reads, so `$500,000 (Tranche
+    # 1B)` is not read as billions.
+    figure = SEPARATED_FIGURE_PATTERN.search(text)
+    if figure is None:
+        return None
+    letter = LETTER_AMOUNT_MAGNITUDE_PATTERN.match(text, figure.end())
+    if letter is None:
+        return None
+    if letter.group(0).islower() and not _CURRENCY_BEFORE_FIGURE.search(
+        text, 0, figure.start()
+    ):
+        return None
+    return LETTER_AMOUNT_MULTIPLIERS[letter.group(0).lower()]
+
+
+_CURRENCY_BEFORE_FIGURE = re.compile(r"[$€£¥]\s?$")
+_DOT_THOUSANDS_FIGURE = re.compile(r"\d{1,3}(?:\.\d{3}){2,}")
+
+
+def _figure_with_unambiguous_separators(text: str) -> str | None:
+    """Return the first figure as plain digits when its separators decide it.
+
+    Two shapes read the same in every convention: `.` before exactly three
+    digits more than once is a thousands separator (`20.877.777`), and when
+    both `.` and `,` appear the last is the decimal point (`1.234.567,89`,
+    `1,234,567.89`). None for every other figure, including the ambiguous
+    `30.000`, which the caller reads in the US convention.
+    """
+    match = SEPARATED_FIGURE_PATTERN.search(text)
+    if match is None:
+        return None
+    figure = match.group(0)
+    if _DOT_THOUSANDS_FIGURE.fullmatch(figure):
+        return figure.replace(".", "")
+    if "." in figure and "," in figure:
+        decimal = "." if figure.rfind(".") > figure.rfind(",") else ","
+        thousands = "," if decimal == "." else "."
+        whole, _, fraction = figure.replace(thousands, "").rpartition(decimal)
+        if decimal in whole:
+            return None
+        return f"{whole}.{fraction}"
     return None
 
 
 def normalized_amount_from_text(text: str | None) -> str | None:
-    """Parse one amount mention into a normalized numeric string."""
+    """Parse one amount mention into a normalized numeric string.
+
+    Separators are read in the US convention unless the figure's own shape
+    decides them (see `_figure_with_unambiguous_separators`).
+    """
     if not text:
         return None
-    lowered = text.lower().replace(",", "")
-    match = re.search(r"\d+(?:\.\d+)?", lowered)
-    if not match:
-        return None
-    amount = decimal_from_amount_string(match.group(0))
+    figure = _figure_with_unambiguous_separators(text)
+    if figure is None:
+        match = re.search(r"\d+(?:\.\d+)?", text.lower().replace(",", ""))
+        if not match:
+            return None
+        figure = match.group(0)
+    amount = decimal_from_amount_string(figure)
     if amount is None:
         return None
     magnitude = magnitude_in_amount_text(text)

@@ -224,6 +224,7 @@ AMOUNT_MULTIPLIERS = {
     "mil": 1_000_000,
     "mils": 1_000_000,
     "mm": 1_000_000,
+    "mn": 1_000_000,
     "billion": 1_000_000_000,
     "billions": 1_000_000_000,
     "bil": 1_000_000_000,
@@ -232,13 +233,27 @@ AMOUNT_MULTIPLIERS = {
     "trillion": 1_000_000_000_000,
     "trillions": 1_000_000_000_000,
 }
+# A figure with its separators, ending on a digit: the figure the amount parser
+# reads, and the extent of the value in a name-embedded amount.
+SEPARATED_FIGURE_PATTERN = re.compile(r"\d(?:[\d.,]*\d)?")
+# Single-letter magnitudes attached to the figure: `$250M`, `$1.5B`, `$500K`,
+# `£250m`. Upper case after any figure; lower case only after a currency-marked
+# one, since a bare `250m` is as likely metres or months. `MM` is the
+# abbreviation in `AMOUNT_MULTIPLIERS`, and a letter that starts a longer word
+# (`$250MMBtu`) is not a magnitude.
+LETTER_AMOUNT_MULTIPLIERS = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000}
+_LETTER_AMOUNT_CLASS = "".join(LETTER_AMOUNT_MULTIPLIERS)
+LETTER_AMOUNT_MAGNITUDE_PATTERN = re.compile(
+    rf"(?-i:[{_LETTER_AMOUNT_CLASS.upper()}{_LETTER_AMOUNT_CLASS}])(?![A-Za-z])"
+)
 # Built from the table above so a magnitude this pattern recognizes is always one
 # the parser can apply.
 AMOUNT_SCALE_ALTERNATION = "|".join(sorted(AMOUNT_MULTIPLIERS, key=len, reverse=True))
 NAME_EMBEDDED_AMOUNT_PATTERN = re.compile(
     r"(?P<currency>[A-Z]{0,2}\$|€|£|¥)\s?"
-    r"(?P<value>\d[\d,]*(?:\.\d+)?)"
-    rf"(?:\s*(?P<scale>{AMOUNT_SCALE_ALTERNATION})\b\.?)?",
+    rf"(?P<value>{SEPARATED_FIGURE_PATTERN.pattern})"
+    rf"(?:\s*(?P<scale>{AMOUNT_SCALE_ALTERNATION})\b\.?"
+    rf"|{LETTER_AMOUNT_MAGNITUDE_PATTERN.pattern})?",
     re.IGNORECASE,
 )
 ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")

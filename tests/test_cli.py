@@ -581,6 +581,51 @@ def test_classify_genres_8k_is_the_8k_only_classifier(
     assert callable(kwargs["renew"])
 
 
+def test_classify_retry_failures_retries_each_genre(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """``--retry-failures`` runs each genre's retry, not its classify stage."""
+    from cdt.classifier.core import RetryResult
+
+    calls: list[str] = []
+
+    def recorder(genre: str) -> object:
+        def retry(**kwargs: object) -> RetryResult:
+            del kwargs
+            calls.append(genre)
+            return RetryResult(retried=2, recovered=1, still_failed=1)
+
+        return retry
+
+    monkeypatch.setattr("cdt.pipeline.retry_failed_items", recorder(GENRE_8K))
+    monkeypatch.setattr("cdt.pipeline.retry_failed_triage", recorder(GENRE_6K))
+    monkeypatch.delenv("GENRES", raising=False)
+
+    status = cli.main(
+        ["classify", "--quiet", "--artifact-root", str(tmp_path), "--retry-failures"]
+    )
+
+    assert status == 0
+    assert calls == [GENRE_8K, GENRE_6K]
+    assert "6-K: retried 2 failed filing(s), 1 recovered" in capsys.readouterr().out
+
+
+def test_classify_retry_failures_rejects_force(tmp_path: Path) -> None:
+    """A retry re-classifies listed filings; forcing every partition contradicts it."""
+    status = cli.main(
+        [
+            "classify",
+            "--quiet",
+            "--artifact-root",
+            str(tmp_path),
+            "--retry-failures",
+            "--force",
+        ]
+    )
+
+    assert status == cli.USAGE_EXIT_CODE
+
+
 @pytest.fixture
 def train_calls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -604,10 +604,10 @@ MIN_EXPANSION_TOKENS = 200
 MAX_EXPANSION_TOKENS = 400
 
 #: Ceiling on the merged-window estimate, matching the largest snippet the 8-K
-#: path sends the extractor. The estimate counts the first member's context and
-#: each member's own tokens, not the text a later member's expansion pulls in to
-#: reach the span, so each merge can add up to :data:`MAX_EXPANSION_TOKENS`
-#: uncounted and a merged window can exceed this ceiling.
+#: path sends the extractor. The estimate counts the first member's context,
+#: each member's own tokens and the gap text a later member's expansion pulls
+#: in to reach the span, so it is the merged text's size up to tokenization at
+#: the joins.
 MAX_MERGED_TOKENS = 2_000
 
 #: Longest a line can be and still read as a heading rather than a sentence.
@@ -643,8 +643,8 @@ class ExpandedWindow:
     ``window`` is the text stage 2 and extraction see; its ``index`` is the
     first member's. ``member_indices`` holds the indices of every admitted
     window it covers, in document order. A merged window may exceed
-    :data:`WINDOW_TOKENS`, and can exceed :data:`MAX_MERGED_TOKENS` (see
-    there).
+    :data:`WINDOW_TOKENS` but not, up to tokenization at the joins,
+    :data:`MAX_MERGED_TOKENS`.
     """
 
     window: TextWindow
@@ -877,9 +877,9 @@ def _line_at(text: str, offset: int) -> str:
 class _MergedSpan:
     """A span under construction, with a running token estimate.
 
-    The estimate sums the first member's prepended context and each member's
-    own count rather than re-measuring the join, which would make a long run
-    quadratic; context a later member brings is not counted.
+    The estimate sums the first member's prepended context, each member's own
+    count and the gap text between the span and each later member, rather than
+    re-measuring the whole join, which would make a long run quadratic.
     """
 
     start: int
@@ -903,13 +903,13 @@ class _MergedSpan:
             tokens=context + window.token_count,
         )
 
-    def merged(self: _MergedSpan, window: TextWindow) -> _MergedSpan:
-        """Return this span extended over an adjacent or overlapping window."""
+    def merged(self: _MergedSpan, window: TextWindow, *, gap: int) -> _MergedSpan:
+        """Return this span extended over a window ``gap`` tokens beyond its end."""
         return _MergedSpan(
             start=self.start,
             end=max(self.end, window.end),
             members=(*self.members, window.index),
-            tokens=self.tokens + window.token_count,
+            tokens=self.tokens + gap + window.token_count,
         )
 
 
@@ -977,8 +977,18 @@ def expand_admitted_windows(
         # Overlap slices to "", so overlapping and whitespace-separated
         # expansions both count as adjacent.
         adjacent = bool(spans) and not source[spans[-1].end : start].strip()
-        if adjacent and spans[-1].tokens + window.token_count <= max_merged_tokens:
-            spans[-1] = spans[-1].merged(window)
+        # The unadmitted text between the span and this window joins the span
+        # with it, so it counts toward the ceiling.
+        gap = (
+            count_tokens(source[spans[-1].end : window.start])
+            if adjacent and window.start > spans[-1].end
+            else 0
+        )
+        if (
+            adjacent
+            and spans[-1].tokens + gap + window.token_count <= max_merged_tokens
+        ):
+            spans[-1] = spans[-1].merged(window, gap=gap)
         else:
             # A window opening a run cut by the budget still expands, so up to
             # ``max_tokens`` of text is sent twice rather than starting cold.

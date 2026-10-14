@@ -1,11 +1,17 @@
-"""The relevance classifier: train, score and threshold a TF-IDF linear SVC, and load or save its artifacts."""
+"""What every genre's classify stage shares, and the relevance classifier.
+
+Shared: the classified-row columns and their ``label`` and ``verdict`` values,
+and the retry of filings a classify stage could not classify. The classifier:
+train, score and threshold a TF-IDF linear SVC, and load or save its artifacts.
+"""
 
 from __future__ import annotations
 
 import json
 import logging
 import pickle
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, Self, runtime_checkable
 
@@ -13,8 +19,20 @@ import numpy as np
 import pandas as pd
 
 from cdt import settings
-from cdt.datasets import CLASSIFICATION_DATASET_NAME, dataset_root
+from cdt.completion import pending_source_partitions
+from cdt.datasets import (
+    CLASSIFICATION_DATASET_NAME,
+    dataset_root,
+    date_shard_partition_path,
+    load_row_failures,
+    parse_date_shard_partition,
+    resolve_artifact_root,
+    save_row_failures,
+)
+from cdt.lease import throttled
+from cdt.partition_stage import PartitionOutput, replace_partition_failures
 from cdt.segmenter.core import ITEM_COLUMNS
+from cdt.storage.tables import read_table, write_partition_table
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_TARGET_RECALL = 0.99
@@ -25,7 +43,48 @@ MIN_CV_SPLITS = 2
 MODEL_NAME = "tfidf_linear_svc"
 MODEL_FILENAME = "model.pkl"
 METADATA_FILENAME = "metadata.json"
-CLASSIFIED_ITEM_COLUMNS = [*ITEM_COLUMNS, "label", "relevance", "classification_score"]
+#: ``label`` values. A failed row was not classified, so it is neither
+#: relevant nor irrelevant; ``relevance`` is ``label == LABEL_RELEVANT``.
+LABEL_RELEVANT = "relevant"
+LABEL_IRRELEVANT = "irrelevant"
+LABEL_FAILED = "failed"
+#: ``verdict`` values: why a row has its label.
+VERDICT_KEPT = "kept"
+#: The relevance score fell below the classifier's threshold.
+VERDICT_DROPPED_BELOW_THRESHOLD = "dropped_below_threshold"
+#: 6-K stage 2: the snippet names debt but gives no details.
+VERDICT_DROPPED_NO_DETAILS = "dropped_no_details"
+#: 6-K stage 2: another snippet of the filing covers the same debt.
+VERDICT_DROPPED_DUPLICATE = "dropped_duplicate"
+#: The filing could not be classified; it has an entry in the stage's failure
+#: list, and ``cdt classify --retry-failures`` classifies it again.
+VERDICT_FAILED = "failed"
+CLASSIFIED_ITEM_COLUMNS = [
+    *ITEM_COLUMNS,
+    "label",
+    "relevance",
+    "classification_score",
+    "verdict",
+]
+
+#: Classify one source partition: ``(source_path, {date, shard}, accessions)``.
+#: ``accessions`` None classifies every filing in it; a set classifies only
+#: those filings.
+ClassifyPartition = Callable[
+    [str, dict[str, str], frozenset[str] | None], PartitionOutput
+]
+
+
+@dataclass(frozen=True)
+class RetryResult:
+    """What one ``retry_failed_classifications`` run did, counted in filings."""
+
+    retried: int = 0
+    recovered: int = 0
+    still_failed: int = 0
+    #: In a source partition that changed since it was classified; the next
+    #: plain run classifies the whole partition.
+    skipped: int = 0
 
 
 @runtime_checkable
@@ -355,3 +414,117 @@ def parse_label(value: str) -> int:
 def normalize_text(text: str) -> str:
     """Collapse repeated whitespace in free text."""
     return " ".join(text.split())
+
+
+def retry_failed_classifications(
+    stage_name: str,
+    *,
+    source_dataset: str,
+    output_dataset: str,
+    output_columns: list[str],
+    classify_partition: ClassifyPartition,
+    artifact_root: str | Path | None = None,
+    data_dir: Path | None = None,
+    renew: Callable[[], None] | None = None,
+) -> RetryResult:
+    """Classify again the filings in a classify stage's failure list.
+
+    The failure list is ``failures/<stage_name>/failures.json``
+    (:func:`cdt.datasets.failure_registry_path`), one entry per filing the
+    stage could not classify, keyed by accession number and naming the source
+    partition it was read from. For each source partition, ``classify_partition``
+    classifies only the source rows of those filings. Their rows in the output
+    partition (same date and shard of ``output_dataset``) are replaced by the
+    new ones, and every other row is written back unchanged. Filings that now
+    succeed leave the list; filings that fail again keep an entry with the new
+    error. A partition ``classify_partition`` holds (``complete`` False) writes
+    nothing and keeps its entries.
+
+    A source partition that is pending (changed since it was classified, or
+    held) is skipped: the next plain run classifies it whole. The completion
+    registry is not written, since no source partition changed. ``renew`` is
+    called before each write, throttled (:func:`cdt.lease.throttled`).
+    """
+    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    failures = load_row_failures(
+        stage_name, artifact_root=resolved_root, data_dir=data_dir
+    )
+    if not failures:
+        return RetryResult()
+    by_partition: dict[str, set[str]] = {}
+    for accession, entry in failures.items():
+        by_partition.setdefault(str(entry.get("source_partition")), set()).add(
+            accession
+        )
+    pending, _ = pending_source_partitions(
+        stage_name, source_dataset, artifact_root=resolved_root, data_dir=data_dir
+    )
+    pending_paths = {path for path, _ in pending}
+    output_root = dataset_root(
+        output_dataset, artifact_root=resolved_root, data_dir=data_dir
+    )
+    keep_lease = throttled(renew) if renew is not None else None
+    retried = recovered = still_failed = skipped = 0
+    for source_path, accession_set in sorted(by_partition.items()):
+        accessions = frozenset(accession_set)
+        if source_path in pending_paths:
+            LOGGER.info(
+                "%s: not retrying %s filing(s) of %s, which is pending; the next "
+                "plain run classifies it whole.",
+                stage_name,
+                len(accessions),
+                source_path,
+            )
+            skipped += len(accessions)
+            continue
+        partition = parse_date_shard_partition(source_path)
+        output = classify_partition(source_path, partition, accessions)
+        retried += len(accessions)
+        if not output.complete:
+            still_failed += len(accessions)
+            continue
+        if keep_lease is not None:
+            keep_lease()
+        output_path = date_shard_partition_path(
+            output_dataset,
+            partition_date=partition["date"],
+            shard=partition["shard"],
+            artifact_root=resolved_root,
+            data_dir=data_dir,
+        )
+        existing = read_table(output_path, output_columns).reindex(
+            columns=output_columns
+        )
+        unchanged = existing.loc[
+            ~existing["accession_number"].astype(str).isin(accessions)
+        ]
+        write_partition_table(
+            output_root,
+            partition={"date": partition["date"], "shard": partition["shard"]},
+            table=pd.concat(
+                [unchanged, output.rows.reindex(columns=output_columns)],
+                ignore_index=True,
+            ),
+        )
+        replace_partition_failures(failures, source_path, output.failures)
+        save_row_failures(
+            stage_name, failures, artifact_root=resolved_root, data_dir=data_dir
+        )
+        failed_again = len(accessions & output.failures.keys())
+        still_failed += failed_again
+        recovered += len(accessions) - failed_again
+    result = RetryResult(
+        retried=retried,
+        recovered=recovered,
+        still_failed=still_failed,
+        skipped=skipped,
+    )
+    LOGGER.info(
+        "%s retry: retried=%s recovered=%s still_failed=%s skipped=%s",
+        stage_name,
+        result.retried,
+        result.recovered,
+        result.still_failed,
+        result.skipped,
+    )
+    return result

@@ -18,6 +18,9 @@ from cdt.matcher.normalize import (
     parse_cluster_list,
 )
 from cdt.matcher.schema import PreparedMention
+from cdt.shared import get_logger
+
+LOGGER = get_logger(__name__)
 
 
 def apply_lifecycle_rollup(
@@ -139,6 +142,7 @@ def derive_parent_links(
     None for that kind; retirers are a JSON list. The existing row's amendment
     pointer is used only when the mentions state none and are not ambiguous,
     and `amendment_inferred_by` is kept only while the pointer is unchanged.
+    Amendment cycles are broken (see :func:`break_amendment_cycles`).
     """
     existing_rows = (
         {
@@ -215,7 +219,57 @@ def derive_parent_links(
             ),
             "split_of_debt_instrument_id": next(iter(split_parents), None),
         }
+    first_seen = {
+        debt_instrument_id: min(
+            (
+                mention_sort_key(mention_index[member_id])
+                for member_id in member_ids
+                if member_id in mention_index
+            ),
+            default=(),
+        )
+        for debt_instrument_id, member_ids in member_groups.items()
+    }
+    break_amendment_cycles(parent_links, first_seen)
     return parent_links
+
+
+def break_amendment_cycles(
+    parent_links: dict[str, dict[str, str | None]],
+    first_seen: dict[str, tuple[object, ...]],
+) -> None:
+    """Drop one amendment pointer per cycle, in place, so every family has a head.
+
+    In each cycle the pointer to the instrument first seen latest
+    (``first_seen``, ties broken by id) is dropped, since nothing amends an
+    instrument that appeared after it; that instrument becomes the head.
+    """
+    state: dict[str, str] = {}
+    for start in sorted(parent_links):
+        path: list[str] = []
+        node: str | None = start
+        while node is not None and node in parent_links and node not in state:
+            state[node] = "on_path"
+            path.append(node)
+            node = parent_links[node]["amendment_of_debt_instrument_id"]
+        if node is not None and state.get(node) == "on_path":
+            cycle = path[path.index(node) :]
+            newest = max(cycle, key=lambda member: (first_seen.get(member, ()), member))
+            child = next(
+                member
+                for member in cycle
+                if parent_links[member]["amendment_of_debt_instrument_id"] == newest
+            )
+            parent_links[child]["amendment_of_debt_instrument_id"] = None
+            parent_links[child]["amendment_inferred_by"] = None
+            LOGGER.warning(
+                "Amendment cycle %s: dropped %s -> %s, the instrument first seen last",
+                " -> ".join([*cycle, node]),
+                child,
+                newest,
+            )
+        for member in path:
+            state[member] = "done"
 
 
 def build_debt_instrument_rows(

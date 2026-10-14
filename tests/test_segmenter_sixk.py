@@ -284,3 +284,29 @@ def test_expansion_rejects_a_minimum_above_the_cap() -> None:
 def test_expansion_of_nothing_is_nothing() -> None:
     """Most filings have no admitted window at all."""
     assert expand_admitted_windows([]) == []
+
+
+def test_merged_windows_stay_within_the_ceiling_when_members_are_not_adjacent() -> None:
+    """The unadmitted text a merge pulls in counts toward ``MAX_MERGED_TOKENS``.
+
+    With every other window admitted, each later member's backward expansion
+    reaches the span through an unadmitted window. Counting only the members'
+    own tokens let a merge reach about 1.8 times the ceiling.
+    """
+    from cdt.segmenter.sixk import MAX_MERGED_TOKENS
+
+    # Lines of about 140 tokens: the backward walk stops at the first line
+    # boundary past its 200-token minimum, which is then a whole unadmitted
+    # window back, so it reaches the span before it.
+    sentence = (
+        "Under the agreement the revolving credit facility bears interest at a "
+        "floating rate plus an applicable margin. "
+    )
+    text = "\n".join(f"{index}. " + sentence * 7 for index in range(200))
+    windows = split_into_windows(text, target_tokens=281)
+    assert len(windows) >= 60
+
+    expanded = expand_admitted_windows(windows[::2])
+
+    assert any(len(window.member_indices) > 1 for window in expanded)
+    assert max(window.window.token_count for window in expanded) <= MAX_MERGED_TOKENS

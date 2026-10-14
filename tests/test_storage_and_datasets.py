@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset
+import pyarrow.parquet
 import pytest
 from botocore.exceptions import ClientError, ReadTimeoutError
 from support import build_mention_row
@@ -171,6 +172,60 @@ def test_existing_date_shard_partition_ids_lists_written_partitions(
     assert (
         existing_date_shard_partition_ids("mentions", artifact_root=str(root)) == set()
     )
+
+
+class _PrefixMatchingS3Client:
+    """Lists keys the way S3 does: ``Prefix`` is a plain string match."""
+
+    def __init__(self: _PrefixMatchingS3Client, keys: list[str]) -> None:
+        self.keys = keys
+
+    def get_paginator(self: _PrefixMatchingS3Client, name: str) -> object:
+        assert name == "list_objects_v2"
+        keys = self.keys
+
+        class _Paginator:
+            def paginate(self: _Paginator, Bucket: str, Prefix: str) -> list[dict]:  # noqa: N803
+                del Bucket
+                return [
+                    {
+                        "Contents": [
+                            {"Key": key, "ETag": f'"{key}"'}
+                            for key in keys
+                            if key.startswith(Prefix)
+                        ]
+                    }
+                ]
+
+        return _Paginator()
+
+
+def test_s3_listing_excludes_a_sibling_dataset_sharing_the_name_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Listing ``documents`` must not return ``documents-sixk`` partitions."""
+    from cdt.datasets import (
+        DOCUMENT_DATASET_NAME,
+        SIXK_DOCUMENT_DATASET_NAME,
+        iter_date_shard_partitions,
+    )
+
+    partition = "date=2026-01-02/shard=0007/part-0000.parquet"
+    keys = [
+        f"root/{DOCUMENT_DATASET_NAME}/{partition}",
+        f"root/{SIXK_DOCUMENT_DATASET_NAME}/{partition}",
+    ]
+    monkeypatch.setattr(
+        storage_objects, "s3_client", lambda: _PrefixMatchingS3Client(keys)
+    )
+
+    eightk = f"s3://bucket/root/{DOCUMENT_DATASET_NAME}/{partition}"
+    assert iter_date_shard_partitions(
+        DOCUMENT_DATASET_NAME, artifact_root="s3://bucket/root"
+    ) == [eightk]
+    assert storage_objects.list_artifacts_with_versions(
+        f"s3://bucket/root/{DOCUMENT_DATASET_NAME}/"
+    ) == {eightk: f'"root/{DOCUMENT_DATASET_NAME}/{partition}"'}
 
 
 def test_iter_date_shard_partitions_skips_orphaned_tempfiles(tmp_path: Path) -> None:
@@ -363,6 +418,36 @@ def test_a_multi_partition_dataset_reads_with_a_standard_reader(
     assert table.num_rows == 2
     assert len(pd.read_parquet(root)) == 2
     assert len(read_dataset(root)) == 2
+
+
+def test_a_reindexed_all_null_text_column_keeps_the_text_type(tmp_path: Path) -> None:
+    """A column a reindex adds is all-NaN float, and must still publish as text.
+
+    `synthesized_by` is null on every model-emitted mention, so a partition with
+    no synthesized row held it as `double` and the next as `string`; schema
+    unification failed and every read fell back to one file at a time.
+    """
+    root = tmp_path / "mentions"
+    model_only = pd.DataFrame(
+        [{"debt_instrument_mention_id": "m-1", "item_id": "i-1"}]
+    ).reindex(columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
+    assert model_only["synthesized_by"].dtype == "float64"
+    synthesized = model_only.assign(
+        debt_instrument_mention_id="m-2",
+        synthesized_by="prior_state",
+        synthesized_from_mention_id="m-1",
+    )
+    for shard, frame in (("0001", model_only), ("0002", synthesized)):
+        write_partition_table(
+            root, partition={"date": "2026-01-02", "shard": shard}, table=frame
+        )
+
+    schemas = [
+        pyarrow.parquet.read_schema(path) for path in sorted(root.rglob("*.parquet"))
+    ]
+    assert schemas[0] == schemas[1]
+    assert schemas[0].field("synthesized_by").type == pa.string()
+    assert pyarrow.dataset.dataset(root, format="parquet").to_table().num_rows == 2
 
 
 def test_a_rewrite_may_mix_read_back_decimals_with_fresh_text(tmp_path: Path) -> None:

@@ -57,10 +57,11 @@ def normalize_body_lines(body: str) -> list[BodyLine]:
         Non-empty plain-text lines with collapsed whitespace and approximate
         source line numbers.
     """
-    body = html.unescape(body)
     body = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", body)
     body = re.sub(r"(?i)</\s*(p|div|tr|td|th|li|h[1-6])\s*>", "\n", body)
     body = re.sub(r"<[^>]+>", " ", body)
+    # After the tag strip, so an escaped `&lt;` in the text is not read as a tag.
+    body = html.unescape(body)
 
     lines = []
     for line_number, line in enumerate(body.splitlines(), start=1):

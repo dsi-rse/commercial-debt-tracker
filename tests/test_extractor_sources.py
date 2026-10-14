@@ -59,6 +59,7 @@ def _classified_row(item_id: str, accession_number: str) -> dict[str, object]:
         "label": "relevant",
         "relevance": True,
         "classification_score": 0.9,
+        "verdict": "kept",
     }
 
 
@@ -77,7 +78,6 @@ def _snippet_row(item_id: str, accession_number: str) -> dict[str, object]:
         "sixk_window_start": 0,
         "sixk_window_end": 44,
         "sixk_token_count": 12,
-        "sixk_verdict": "kept",
         "sixk_duplicate_of": None,
     }
 
@@ -340,7 +340,7 @@ def test_a_snippet_that_stops_being_relevant_loses_its_mentions(
     dropped = _snippet_row(SIXK_ITEM_ID, SIXK_ACCESSION)
     dropped["relevance"] = False
     dropped["label"] = "irrelevant"
-    dropped["sixk_verdict"] = "dropped_no_details"
+    dropped["verdict"] = "dropped_no_details"
     write_partition_table(
         str(tmp_path / SIXK_SNIPPET_DATASET_NAME),
         partition=PARTITION,
@@ -351,6 +351,33 @@ def test_a_snippet_that_stops_being_relevant_loses_its_mentions(
 
     written = read_dataset(mentions_root(tmp_path))
     assert sorted(written["item_id"].astype(str)) == [EIGHTK_ITEM_ID]
+
+
+def test_a_failed_snippet_is_not_extracted_until_a_retry_recovers_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``failed`` row is not relevant; once a retry makes it relevant it is extracted.
+
+    The failed row never reached extraction, so it is not in the partition's
+    done set, and the rewritten partition is pending again.
+    """
+    _write_classifications(tmp_path)
+    failed = _snippet_row(SIXK_ITEM_ID, SIXK_ACCESSION)
+    failed.update({"label": "failed", "relevance": False, "verdict": "failed"})
+    write_partition_table(
+        str(tmp_path / SIXK_SNIPPET_DATASET_NAME),
+        partition=PARTITION,
+        table=pd.DataFrame([failed], columns=SIXK_SNIPPET_COLUMNS),
+    )
+    _stub_workflow(monkeypatch)
+
+    extract_pending_items(artifact_root=tmp_path, client=None)
+    assert SIXK_ITEM_ID not in set(read_dataset(mentions_root(tmp_path))["item_id"])
+
+    _write_snippets(tmp_path)
+    extract_pending_items(artifact_root=tmp_path, client=None)
+
+    assert SIXK_ITEM_ID in set(read_dataset(mentions_root(tmp_path))["item_id"])
 
 
 def test_new_snippets_merge_without_dropping_the_other_genres_mentions(

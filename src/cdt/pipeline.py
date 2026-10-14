@@ -10,9 +10,10 @@ from typing import Self
 
 import pandas as pd
 
-from cdt.classifier.eightk import classify_pending_items
+from cdt.classifier.core import RetryResult
+from cdt.classifier.eightk import classify_pending_items, retry_failed_items
 from cdt.classifier.sixk import DEFAULT_CONCURRENCY as SIXK_DEFAULT_CONCURRENCY
-from cdt.classifier.sixk import triage_pending_windows
+from cdt.classifier.sixk import retry_failed_triage, triage_pending_windows
 from cdt.datasets import (
     GENRE_6K,
     GENRE_8K,
@@ -220,6 +221,41 @@ def classify_genre(
             artifact_root=artifact_root,
             data_dir=data_dir,
             force=force,
+            model_dir=sixk_model_dir,
+            concurrency=sixk_concurrency,
+            renew=renew,
+        )
+    raise ValueError(_unknown_genre(genre))
+
+
+def retry_classify_genre(
+    genre: str,
+    *,
+    artifact_root: ArtifactPath | None = None,
+    data_dir: Path | None = None,
+    model_dir: Path | None = None,
+    sixk_model_dir: Path | None = None,
+    sixk_concurrency: int = SIXK_DEFAULT_CONCURRENCY,
+    renew: Callable[[], None] | None = None,
+) -> RetryResult:
+    """Classify again the filings in one genre's classify failure list.
+
+    See :func:`cdt.classifier.core.retry_failed_classifications`.
+
+    Raises:
+        ValueError: If ``genre`` is not one of GENRES.
+    """
+    if genre == GENRE_8K:
+        return retry_failed_items(
+            artifact_root=artifact_root,
+            data_dir=data_dir,
+            model_dir=model_dir,
+            renew=renew,
+        )
+    if genre == GENRE_6K:
+        return retry_failed_triage(
+            artifact_root=artifact_root,
+            data_dir=data_dir,
             model_dir=sixk_model_dir,
             concurrency=sixk_concurrency,
             renew=renew,

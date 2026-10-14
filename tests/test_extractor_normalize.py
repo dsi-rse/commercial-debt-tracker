@@ -1351,6 +1351,55 @@ def test_abbreviated_magnitudes_parse_to_full_amounts() -> None:
     assert normalized_amount_from_text("$5 millions") == "5000000"
 
 
+def test_separators_a_figure_s_shape_decides_are_read_in_any_convention() -> None:
+    """`20.877.777` is twenty million in every convention, not 20.877.
+
+    Grupo Supervielle, a 6-K filer, cites it. Repeated three-digit `.` groups
+    are thousands separators, and with both `.` and `,` the last is the
+    decimal point. A single group (`30.000`) is ambiguous and keeps the US
+    reading.
+    """
+    assert normalized_amount_from_text("20.877.777") == "20877777"
+    assert normalized_amount_from_text("$20.877.777") == "20877777"
+    assert normalized_amount_from_text("U$S 1.000.000") == "1000000"
+    assert normalized_amount_from_text("1.234.567,89") == "1234567.89"
+    assert normalized_amount_from_text("1.234,5") == "1234.5"
+    assert normalized_amount_from_text("€2.500.000.000") == "2500000000"
+    assert normalized_amount_from_name("R$1.500.000.000 debentures") == "1500000000"
+    # Unchanged: the US convention and the ambiguous single group.
+    assert normalized_amount_from_text("20,877,777") == "20877777"
+    assert normalized_amount_from_text("1,234,567.89") == "1234567.89"
+    assert normalized_amount_from_text("$500.5 million") == "500500000"
+    assert normalized_amount_from_text("30.000") == "30"
+    assert normalized_amount_from_text("12.03.2024") == "12.03"
+
+
+def test_single_letter_magnitudes_parse_to_full_amounts() -> None:
+    """`$250M` is 250 million, on a cited span and inside a name.
+
+    The name-derived principal has no model value to disagree with, so a
+    missed letter there would publish 250.
+    """
+    assert normalized_amount_from_text("$250M") == "250000000"
+    assert normalized_amount_from_text("$1.5B") == "1500000000"
+    assert normalized_amount_from_text("$500K") == "500000"
+    assert normalized_amount_from_text("$1,250M") == "1250000000"
+    assert normalized_amount_from_text("250MM") == "250000000"
+    assert normalized_amount_from_text("£250m") == "250000000"
+    assert normalized_amount_from_text("£250mn") == "250000000"
+    assert normalized_amount_from_text("€1.2b") == "1200000000"
+    assert normalized_amount_from_name("$250M Term Loan") == "250000000"
+    assert normalized_amount_from_name("$1.5B Senior Notes due 2030") == "1500000000"
+    assert normalized_amount_from_name("£250m notes due 2031") == "250000000"
+    # Lower case only on a currency-marked figure: a bare `250m` may be metres
+    # or months. A letter starting a longer word is not a magnitude.
+    assert normalized_amount_from_text("250m") == "250"
+    assert normalized_amount_from_text("$250MMBtu") == "250"
+    assert normalized_amount_from_text("$250 Mortgage") == "250"
+    # The letter must sit on the figure the parser reads.
+    assert normalized_amount_from_text("$500,000 (Tranche 1B)") == "500000"
+
+
 def test_magnitude_in_amount_text_is_the_magnitude_the_parser_applies() -> None:
     """The helper and the parser must not drift about what a magnitude is (#213).
 

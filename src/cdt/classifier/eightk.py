@@ -11,9 +11,16 @@ import pandas as pd
 
 from cdt.classifier.core import (
     CLASSIFIED_ITEM_COLUMNS,
+    LABEL_IRRELEVANT,
+    LABEL_RELEVANT,
+    VERDICT_DROPPED_BELOW_THRESHOLD,
+    VERDICT_KEPT,
+    ClassifyPartition,
+    RetryResult,
     default_model_dir,
     load_training_artifacts,
     normalize_text,
+    retry_failed_classifications,
     score_model,
 )
 from cdt.datasets import CLASSIFICATION_DATASET_NAME, ITEM_DATASET_NAME
@@ -37,9 +44,9 @@ def classify_items(
 ) -> pd.DataFrame:
     """Classify in-memory item rows using a saved binary model.
 
-    Adds ``label``, ``relevance`` and ``classification_score``. ``artifacts`` is
-    a pre-loaded ``(model, threshold)`` pair; None loads them from
-    ``model_dir`` (default ``default_model_dir()``). ``force`` is ignored.
+    Adds ``label``, ``relevance``, ``classification_score`` and ``verdict``.
+    ``artifacts`` is a pre-loaded ``(model, threshold)`` pair; None loads them
+    from ``model_dir`` (default ``default_model_dir()``). ``force`` is ignored.
     """
     del force
     if items.empty:
@@ -53,16 +60,48 @@ def classify_items(
     classified = items.copy()
     texts = [normalize_text(str(value)) for value in classified["text"].fillna("")]
     scores = score_model(model, texts)
+    above = scores >= threshold
     classified["classification_score"] = scores
-    classified["label"] = np.where(scores >= threshold, "relevant", "irrelevant")
-    classified["relevance"] = classified["label"].eq("relevant")
+    classified["label"] = np.where(above, LABEL_RELEVANT, LABEL_IRRELEVANT)
+    classified["relevance"] = classified["label"].eq(LABEL_RELEVANT)
+    classified["verdict"] = np.where(
+        above, VERDICT_KEPT, VERDICT_DROPPED_BELOW_THRESHOLD
+    )
 
     output_columns = list(
-        dict.fromkeys(
-            [*classified.columns, "label", "relevance", "classification_score"]
-        )
+        dict.fromkeys([*classified.columns, *CLASSIFIED_ITEM_COLUMNS])
     )
     return classified.reindex(columns=output_columns)
+
+
+def item_partition_classifier(*, model_dir: Path | None = None) -> ClassifyPartition:
+    """Return the function that classifies one ``items`` partition.
+
+    Given accessions, it classifies only those filings' items. The model is
+    unpickled on the first call, once per returned function.
+    """
+    artifacts: tuple[object, float] | None = None
+
+    def classify_partition(
+        source_path: str,
+        partition: dict[str, str],
+        accessions: frozenset[str] | None = None,
+    ) -> PartitionOutput:
+        nonlocal artifacts
+        del partition
+        if artifacts is None:
+            model, threshold, _ = load_training_artifacts(
+                model_dir or default_model_dir()
+            )
+            artifacts = (model, threshold)
+        items = read_table(source_path, ITEM_COLUMNS).reindex(columns=ITEM_COLUMNS)
+        if accessions is not None:
+            items = items.loc[items["accession_number"].astype(str).isin(accessions)]
+        return PartitionOutput(
+            rows=classify_items(items, artifacts=artifacts), source_rows=len(items)
+        )
+
+    return classify_partition
 
 
 def classify_pending_items(
@@ -82,30 +121,40 @@ def classify_pending_items(
     Returns:
         The classified rows written this run, in CLASSIFIED_ITEM_COLUMNS order.
     """
-    # Unpickled on the first pending partition, once per run.
-    artifacts: tuple[object, float] | None = None
-
-    def process(source_path: str, partition: dict[str, str]) -> PartitionOutput:
-        nonlocal artifacts
-        del partition
-        if artifacts is None:
-            model, threshold, _ = load_training_artifacts(
-                model_dir or default_model_dir()
-            )
-            artifacts = (model, threshold)
-        items = read_table(source_path, ITEM_COLUMNS).reindex(columns=ITEM_COLUMNS)
-        return PartitionOutput(
-            rows=classify_items(items, artifacts=artifacts), source_rows=len(items)
-        )
-
+    classify_partition = item_partition_classifier(model_dir=model_dir)
     return run_partition_stage(
         STAGE_NAME,
         source_dataset=ITEM_DATASET_NAME,
         output_dataset=CLASSIFICATION_DATASET_NAME,
         output_columns=CLASSIFIED_ITEM_COLUMNS,
-        process=process,
+        process=lambda source_path, partition: classify_partition(
+            source_path, partition, None
+        ),
         artifact_root=artifact_root,
         data_dir=data_dir,
         force=force,
         renew=renew,
     ).rows
+
+
+def retry_failed_items(
+    *,
+    artifact_root: str | Path | None = None,
+    data_dir: Path | None = None,
+    model_dir: Path | None = None,
+    renew: Callable[[], None] | None = None,
+) -> RetryResult:
+    """Classify again the 8-K filings in this stage's failure list.
+
+    See :func:`cdt.classifier.core.retry_failed_classifications`.
+    """
+    return retry_failed_classifications(
+        STAGE_NAME,
+        source_dataset=ITEM_DATASET_NAME,
+        output_dataset=CLASSIFICATION_DATASET_NAME,
+        output_columns=CLASSIFIED_ITEM_COLUMNS,
+        classify_partition=item_partition_classifier(model_dir=model_dir),
+        artifact_root=artifact_root,
+        data_dir=data_dir,
+        renew=renew,
+    )

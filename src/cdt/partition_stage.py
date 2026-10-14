@@ -4,6 +4,9 @@ A stage reads one date/shard source partition at a time, turns it into output
 rows, and writes them to the same date/shard of its output dataset. Which
 source partitions are pending comes from the stage's completion registry,
 keyed by source fingerprint (``cdt.completion.pending_source_partitions``).
+Filings a stage could not process are recorded in its failure list
+(:func:`cdt.datasets.failure_registry_path`), keyed by accession number, so they
+can be listed and retried.
 """
 
 from __future__ import annotations
@@ -25,9 +28,11 @@ from cdt.completion import (
 from cdt.datasets import (
     dataset_root,
     date_shard_partition_path,
+    load_row_failures,
     parse_date_shard_partition,
     resolve_artifact_root,
     run_manifest_path,
+    save_row_failures,
 )
 from cdt.lease import throttled
 from cdt.shared import get_logger
@@ -43,11 +48,41 @@ class PartitionOutput:
 
     ``complete`` False leaves the partition pending: nothing is written and no
     completion entry is recorded, so the next run processes it again.
+    ``failures`` maps the accession number of each filing the stage could not
+    process to why; the stage still writes rows for it, marked failed.
     """
 
     rows: pd.DataFrame
     source_rows: int
     complete: bool = True
+    failures: dict[str, str] = field(default_factory=dict)
+
+
+def replace_partition_failures(
+    registry: dict[str, dict[str, object]],
+    source_path: str,
+    failures: dict[str, str],
+) -> bool:
+    """Replace one source partition's entries in a failure list; return if it changed.
+
+    Every earlier entry for ``source_path`` goes, so a filing that now
+    succeeded leaves the list.
+    """
+    entries = {
+        accession: {"source_partition": source_path, "error": error}
+        for accession, error in failures.items()
+    }
+    previous = {
+        accession: entry
+        for accession, entry in registry.items()
+        if entry.get("source_partition") == source_path
+    }
+    if previous == entries:
+        return False
+    for accession in previous:
+        del registry[accession]
+    registry.update(entries)
+    return True
 
 
 @dataclass
@@ -83,7 +118,8 @@ def run_partition_stage(
     date/shard of ``output_dataset``. Empty output completes the partition and
     writes nothing, unless an earlier run's output is there, which is then
     overwritten empty so later stages see the rows go. A held partition (output
-    ``complete`` False) writes nothing and stays pending.
+    ``complete`` False) writes nothing and stays pending. A completed
+    partition's ``failures`` replace its entries in the stage's failure list.
 
     Completion is saved at most every
     :data:`cdt.completion.CHECKPOINT_INTERVAL_SECONDS` and once at the end, so
@@ -103,10 +139,20 @@ def run_partition_stage(
         output_dataset, artifact_root=resolved_root, data_dir=data_dir
     )
 
+    # Loaded on the first completed partition, so an idle run reads nothing.
+    failures: dict[str, dict[str, object]] | None = None
+    failures_changed = False
+
     def save() -> None:
+        nonlocal failures_changed
         save_completion_registry(
             stage_name, registry, artifact_root=resolved_root, data_dir=data_dir
         )
+        if failures is not None and failures_changed:
+            save_row_failures(
+                stage_name, failures, artifact_root=resolved_root, data_dir=data_dir
+            )
+            failures_changed = False
 
     checkpoint = throttled(save, interval_seconds=CHECKPOINT_INTERVAL_SECONDS)
     keep_lease = throttled(renew) if renew is not None else None
@@ -145,6 +191,14 @@ def run_partition_stage(
             result.partitions_written.append(output_path)
         else:
             result.empty_partitions += 1
+        if output.complete:
+            if failures is None:
+                failures = load_row_failures(
+                    stage_name, artifact_root=resolved_root, data_dir=data_dir
+                )
+            failures_changed |= replace_partition_failures(
+                failures, source_path, output.failures
+            )
         # A held partition gets an entry that matches no fingerprint, so it stays
         # pending even when an earlier run's entry for it is still stored.
         registry[source_path] = CompletedPartition(

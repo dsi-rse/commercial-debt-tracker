@@ -9,23 +9,34 @@ Per filing: rebuild each window over the text it was cut from
 (:func:`cdt.segmenter.sixk.window_from_span`), admit windows with stage 1,
 expand and merge the admitted ones
 (:func:`cdt.segmenter.sixk.expand_admitted_windows`), then judge them with
-stage 2. One row is written per snippet stage 2 judged, kept or dropped, with
-its verdict; windows stage 1 rejected are not persisted. Design notes are in
-``docs/sixk-two-stage-triage.md``.
+stage 2. One row is written per snippet sent to stage 2, kept, dropped or
+failed, with its verdict; windows stage 1 rejected are not persisted. Design
+notes are in ``docs/sixk-two-stage-triage.md``.
 """
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Self
 
 import pandas as pd
 
 from cdt import settings
-from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
+from cdt.classifier.core import (
+    CLASSIFIED_ITEM_COLUMNS,
+    LABEL_FAILED,
+    LABEL_IRRELEVANT,
+    LABEL_RELEVANT,
+    VERDICT_DROPPED_DUPLICATE,
+    VERDICT_DROPPED_NO_DETAILS,
+    VERDICT_FAILED,
+    VERDICT_KEPT,
+    RetryResult,
+    retry_failed_classifications,
+)
 from cdt.classifier.triage import (
     FilingVerdict,
     Snippet,
@@ -65,13 +76,6 @@ STAGE_NAME = "sixk-classify"
 #: How many filings' stage-2 calls are in flight at once. One call per filing,
 #: so this bounds provider concurrency for the whole stage.
 DEFAULT_CONCURRENCY = 4
-#: Verdict vocabulary recorded per row, in ``sixk_verdict``.
-VERDICT_KEPT = "kept"
-#: Stage 2 failed for the filing, so the stage-1 admission stands.
-VERDICT_KEPT_DEGRADED = "kept_degraded"
-VERDICT_DROPPED_NO_DETAILS = "dropped_no_details"
-VERDICT_DROPPED_DUPLICATE = "dropped_duplicate"
-KEPT_VERDICTS = frozenset({VERDICT_KEPT, VERDICT_KEPT_DEGRADED})
 #: Columns beyond the classified-item contract, for auditing stage-2 decisions
 #: and tracing a snippet to its span of the flattened document. The extractor
 #: does not read them.
@@ -79,7 +83,6 @@ SIXK_EXTRA_COLUMNS = [
     "sixk_window_start",
     "sixk_window_end",
     "sixk_token_count",
-    "sixk_verdict",
     "sixk_duplicate_of",
     # Comma-separated indices of the admitted windows this row's text covers
     # (several when adjacent windows merged).
@@ -253,12 +256,18 @@ class StaleSegmentationError(RuntimeError):
 
 @dataclass(frozen=True)
 class TriageOutput:
-    """Snippet rows for a set of filings, and the filings that could not be rebuilt."""
+    """Snippet rows for a set of filings, and the filings that could not be judged."""
 
     rows: pd.DataFrame
     #: Accessions whose stored spans do not match the rebuilt text (see
     #: :func:`_candidates_for_filing`); none of their rows are in ``rows``.
     stale_accessions: tuple[str, ...] = ()
+    #: Accessions whose stage-2 call failed on the provider or transport;
+    #: their rows are in ``rows`` as failed, but the caller holds the partition.
+    infrastructure_failed_accessions: tuple[str, ...] = ()
+    #: Accession -> error for every other filing stage 2 could not judge
+    #: (validation exhausted, a rejected request); its rows are failed.
+    failures: dict[str, str] = field(default_factory=dict)
 
 
 def triage_windows(
@@ -361,20 +370,40 @@ def triage_windows(
         for row in _snippet_rows(plan, sent, verdict)
     ]
     table = _normalize_snippets(pd.DataFrame(rows, columns=SIXK_SNIPPET_COLUMNS))
-    degraded = sum(1 for verdict in verdicts if verdict is not None and verdict.error)
+    infrastructure_failed = tuple(
+        verdict.accession_number
+        for verdict in verdicts
+        if verdict is not None and verdict.infrastructure_error
+    )
+    failures = {
+        verdict.accession_number: verdict.error
+        for verdict in verdicts
+        if verdict is not None
+        and verdict.error is not None
+        and not verdict.infrastructure_error
+    }
     kept = int(table["relevance"].fillna(False).sum())
+    failed = int(table["label"].eq(LABEL_FAILED).sum())
     LOGGER.info(
         "6-K triage: filings=%s windows=%s stage1_admitted=%s "
-        "snippets_sent=%s kept=%s dropped=%s degraded_filings=%s",
+        "snippets_sent=%s kept=%s dropped=%s failed=%s failed_filings=%s "
+        "infrastructure_failed_filings=%s",
         len(plans),
         windowed,
         admitted_total,
         sent_total,
         kept,
-        sent_total - kept,
-        degraded,
+        sent_total - kept - failed,
+        failed,
+        len(failures),
+        len(infrastructure_failed),
     )
-    return TriageOutput(rows=table, stale_accessions=tuple(stale))
+    return TriageOutput(
+        rows=table,
+        stale_accessions=tuple(stale),
+        infrastructure_failed_accessions=infrastructure_failed,
+        failures=failures,
+    )
 
 
 def _candidates_for_filing(
@@ -510,7 +539,7 @@ def _snippet_rows(
     sent: list[_SentSnippet],
     verdict: FilingVerdict | None,
 ) -> list[dict[str, object]]:
-    """Build one persisted row per snippet stage 2 judged."""
+    """Build one persisted row per snippet sent to stage 2; all failed if it failed."""
     if not sent or verdict is None:
         return []
     kept = set(verdict.kept)
@@ -519,8 +548,10 @@ def _snippet_rows(
     rows: list[dict[str, object]] = []
     for item in sent:
         snippet = item.snippet
-        if snippet.snippet_id in kept:
-            resolved = VERDICT_KEPT_DEGRADED if verdict.error else VERDICT_KEPT
+        if verdict.error is not None:
+            resolved = VERDICT_FAILED
+        elif snippet.snippet_id in kept:
+            resolved = VERDICT_KEPT
         elif snippet.snippet_id in duplicates:
             resolved = VERDICT_DROPPED_DUPLICATE
         elif snippet.snippet_id in no_details:
@@ -541,7 +572,12 @@ def _snippet_row(
 ) -> dict[str, object]:
     candidate = item.candidate
     snippet = item.snippet
-    relevant = resolved_verdict in KEPT_VERDICTS
+    if resolved_verdict == VERDICT_KEPT:
+        label = LABEL_RELEVANT
+    elif resolved_verdict == VERDICT_FAILED:
+        label = LABEL_FAILED
+    else:
+        label = LABEL_IRRELEVANT
     accession_number = str(document["accession_number"])
     return {
         "item_id": item_id_for(
@@ -559,7 +595,7 @@ def _snippet_row(
         "date": document.get("date"),
         "resource_uri": document.get("resource_uri"),
         # 8-K itemizer fields with no 6-K analogue; duplicates are recorded in
-        # sixk_verdict instead.
+        # verdict and sixk_duplicate_of instead.
         "item_information": None,
         "extraction_status": None,
         "duplicate_resolution": None,
@@ -570,14 +606,14 @@ def _snippet_row(
         "end_line": None,
         "section_char_count": len(item.window.text),
         # Same vocabulary as the 8-K classifier.
-        "label": "relevant" if relevant else "irrelevant",
-        "relevance": relevant,
+        "label": label,
+        "relevance": label == LABEL_RELEVANT,
         "classification_score": snippet.score,
+        "verdict": resolved_verdict,
         # The expanded span, matching `text`.
         "sixk_window_start": item.window.start,
         "sixk_window_end": item.window.end,
         "sixk_token_count": item.window.token_count,
-        "sixk_verdict": resolved_verdict,
         "sixk_duplicate_of": duplicates.get(snippet.snippet_id),
         "sixk_member_windows": ",".join(str(index) for index in item.member_indices),
     }
@@ -600,6 +636,124 @@ def _normalize_snippets(table: pd.DataFrame) -> pd.DataFrame:
     return normalized
 
 
+class _WindowPartitionTriage:
+    """Triage one ``sixk-windows`` partition, optionally only some filings.
+
+    Each partition's filings are read from the 6-K documents partition of the
+    same date and shard. The stage-1 model is loaded on the first call. A
+    partition holding a filing whose spans no longer match its text is held,
+    as is one where a stage-2 call failed on the provider or transport, so the
+    next run triages it again. :meth:`report` logs and raises for what was
+    held.
+    """
+
+    def __init__(
+        self: Self,
+        *,
+        artifact_root: str,
+        data_dir: Path | None,
+        model_dir: Path | None,
+        client: SupportsChatCompletion | None,
+        s3_client: object | None,
+        concurrency: int,
+        max_attempts: int | None,
+    ) -> None:
+        """Hold the stage settings; nothing is loaded until the first call.
+
+        Raises:
+            ValueError: If ``concurrency`` is not positive.
+        """
+        if concurrency <= 0:
+            msg = f"concurrency must be positive, got {concurrency}"
+            raise ValueError(msg)
+        self.artifact_root = artifact_root
+        self.data_dir = data_dir
+        self.model_dir = model_dir
+        self.client = client
+        self.s3_client = s3_client
+        self.concurrency = concurrency
+        self.max_attempts = max_attempts
+        self.artifacts: tuple[object, float] | None = None
+        self.stale_partitions: list[str] = []
+        self.infrastructure_held: list[str] = []
+
+    def __call__(
+        self: Self,
+        source_path: str,
+        partition: dict[str, str],
+        accessions: frozenset[str] | None = None,
+    ) -> PartitionOutput:
+        """Triage the partition's filings, or only ``accessions``."""
+        if self.artifacts is None:
+            self.artifacts = load_stage1_model(self.model_dir)
+            LOGGER.info("Stage-1 threshold %.3f", self.artifacts[1])
+        windows = read_table(source_path, SIXK_WINDOW_COLUMNS).reindex(
+            columns=SIXK_WINDOW_COLUMNS
+        )
+        if accessions is not None:
+            windows = windows.loc[
+                windows["accession_number"].astype(str).isin(accessions)
+            ]
+        documents_path = date_shard_partition_path(
+            SIXK_DOCUMENT_DATASET_NAME,
+            partition_date=partition["date"],
+            shard=partition["shard"],
+            artifact_root=self.artifact_root,
+            data_dir=self.data_dir,
+        )
+        documents = (
+            read_table(documents_path, DOCUMENT_COLUMNS).reindex(
+                columns=DOCUMENT_COLUMNS
+            )
+            if artifact_exists(documents_path)
+            else pd.DataFrame(columns=DOCUMENT_COLUMNS)
+        )
+        self.s3_client = ensure_s3_client(self.s3_client, documents.to_dict("records"))
+        output = triage_windows(
+            windows,
+            documents,
+            data_dir=self.data_dir,
+            artifacts=self.artifacts,
+            client=self.client,
+            s3_client=self.s3_client,
+            concurrency=self.concurrency,
+            max_attempts=self.max_attempts,
+        )
+        if output.stale_accessions:
+            self.stale_partitions.append(source_path)
+        elif output.infrastructure_failed_accessions:
+            self.infrastructure_held.append(source_path)
+        return PartitionOutput(
+            rows=output.rows,
+            source_rows=windows["accession_number"].nunique(),
+            complete=not (
+                output.stale_accessions or output.infrastructure_failed_accessions
+            ),
+            failures=output.failures,
+        )
+
+    def report(self: Self) -> None:
+        """Log the partitions held after provider failures; raise for stale ones.
+
+        Raises:
+            StaleSegmentationError: If any partition was held for stale spans.
+        """
+        if self.infrastructure_held:
+            LOGGER.warning(
+                "%s 6-K windows partition(s) left pending after stage-2 provider "
+                "failures; the next run triages them again: %s",
+                len(self.infrastructure_held),
+                ", ".join(self.infrastructure_held),
+            )
+        if self.stale_partitions:
+            msg = (
+                f"{len(self.stale_partitions)} 6-K windows partition(s) hold spans "
+                f"that no longer match their source text and were left pending. "
+                f"{RESEGMENT_ADVICE} Partitions: " + ", ".join(self.stale_partitions)
+            )
+            raise StaleSegmentationError(msg)
+
+
 def triage_pending_windows(
     *,
     artifact_root: str | Path | None = None,
@@ -616,68 +770,36 @@ def triage_pending_windows(
 
     A windows partition is pending when its fingerprint changed since it was
     last classified, or always with ``force``, and is recomputed whole, at one
-    LLM call per filing with admitted windows. Each partition's filings are read
-    from the 6-K documents partition of the same date and shard. A partition
-    holding a filing whose spans no longer match its text is left pending and
-    unwritten. Returns the snippet rows written this run.
+    LLM call per filing with admitted windows. A partition holding a filing
+    whose spans no longer match its text is left pending and unwritten, as is
+    one where a stage-2 call failed on the provider or transport, so the next
+    run triages it again rather than sending its snippets to extraction
+    untriaged. A filing stage 2 could not judge for any other reason (its
+    answers failed validation every attempt, or the request was rejected) is
+    written as failed and listed in ``failures/sixk-classify/failures.json``
+    for :func:`retry_failed_triage`. Returns the snippet rows written this run.
 
     Raises:
         ValueError: If ``concurrency`` is not positive.
         StaleSegmentationError: After every other partition is processed, if
             any partition was left pending for stale spans.
     """
-    if concurrency <= 0:
-        msg = f"concurrency must be positive, got {concurrency}"
-        raise ValueError(msg)
     resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
-    artifacts: tuple[object, float] | None = None
-    shared_client = s3_client
-
-    def process(source_path: str, partition: dict[str, str]) -> PartitionOutput:
-        nonlocal artifacts, shared_client
-        if artifacts is None:
-            artifacts = load_stage1_model(model_dir)
-            LOGGER.info("Stage-1 threshold %.3f", artifacts[1])
-        windows = read_table(source_path, SIXK_WINDOW_COLUMNS).reindex(
-            columns=SIXK_WINDOW_COLUMNS
-        )
-        documents_path = date_shard_partition_path(
-            SIXK_DOCUMENT_DATASET_NAME,
-            partition_date=partition["date"],
-            shard=partition["shard"],
-            artifact_root=resolved_root,
-            data_dir=data_dir,
-        )
-        documents = (
-            read_table(documents_path, DOCUMENT_COLUMNS).reindex(
-                columns=DOCUMENT_COLUMNS
-            )
-            if artifact_exists(documents_path)
-            else pd.DataFrame(columns=DOCUMENT_COLUMNS)
-        )
-        shared_client = ensure_s3_client(shared_client, documents.to_dict("records"))
-        output = triage_windows(
-            windows,
-            documents,
-            data_dir=data_dir,
-            artifacts=artifacts,
-            client=client,
-            s3_client=shared_client,
-            concurrency=concurrency,
-            max_attempts=max_attempts,
-        )
-        return PartitionOutput(
-            rows=output.rows,
-            source_rows=windows["accession_number"].nunique(),
-            complete=not output.stale_accessions,
-        )
-
+    triage = _WindowPartitionTriage(
+        artifact_root=resolved_root,
+        data_dir=data_dir,
+        model_dir=model_dir,
+        client=client,
+        s3_client=s3_client,
+        concurrency=concurrency,
+        max_attempts=max_attempts,
+    )
     result = run_partition_stage(
         STAGE_NAME,
         source_dataset=SIXK_WINDOW_DATASET_NAME,
         output_dataset=SIXK_SNIPPET_DATASET_NAME,
         output_columns=SIXK_SNIPPET_COLUMNS,
-        process=process,
+        process=lambda source_path, partition: triage(source_path, partition, None),
         artifact_root=resolved_root,
         data_dir=data_dir,
         force=force,
@@ -688,11 +810,49 @@ def triage_pending_windows(
             "stage2_provider": settings.SIXK_TRIAGE_PROVIDER,
         },
     )
-    if result.held_partitions:
-        msg = (
-            f"{len(result.held_partitions)} 6-K windows partition(s) hold spans that "
-            f"no longer match their source text and were left pending. "
-            f"{RESEGMENT_ADVICE} Partitions: " + ", ".join(result.held_partitions)
-        )
-        raise StaleSegmentationError(msg)
+    triage.report()
     return result.rows
+
+
+def retry_failed_triage(
+    *,
+    artifact_root: str | Path | None = None,
+    data_dir: Path | None = None,
+    model_dir: Path | None = None,
+    client: SupportsChatCompletion | None = None,
+    s3_client: object | None = None,
+    concurrency: int = DEFAULT_CONCURRENCY,
+    max_attempts: int | None = None,
+    renew: Callable[[], None] | None = None,
+) -> RetryResult:
+    """Triage again the 6-K filings in this stage's failure list.
+
+    See :func:`cdt.classifier.core.retry_failed_classifications`.
+
+    Raises:
+        ValueError: If ``concurrency`` is not positive.
+        StaleSegmentationError: After every other partition is retried, if any
+            was held for stale spans.
+    """
+    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    triage = _WindowPartitionTriage(
+        artifact_root=resolved_root,
+        data_dir=data_dir,
+        model_dir=model_dir,
+        client=client,
+        s3_client=s3_client,
+        concurrency=concurrency,
+        max_attempts=max_attempts,
+    )
+    result = retry_failed_classifications(
+        STAGE_NAME,
+        source_dataset=SIXK_WINDOW_DATASET_NAME,
+        output_dataset=SIXK_SNIPPET_DATASET_NAME,
+        output_columns=SIXK_SNIPPET_COLUMNS,
+        classify_partition=triage,
+        artifact_root=resolved_root,
+        data_dir=data_dir,
+        renew=renew,
+    )
+    triage.report()
+    return result

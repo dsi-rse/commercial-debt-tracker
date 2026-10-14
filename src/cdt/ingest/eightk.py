@@ -17,25 +17,22 @@ from cdt.ingest.core import (
     DEFAULT_FLUSH_ROWS,
     DEFAULT_S3_PREFIX,
     DocumentCandidate,
-    DocumentCandidateSource,
     DocumentSource,
     IngestConfig,
+    IngestFailures,
     IngestFailureType,
     IngestRunResult,
-    ListCandidateSource,
     S3Client,
     ScrapedDocument,
     ScrapedFiling,
-    _failure_key,
     _iter_manifest_keys,
     _normalize_ciks,
-    _record_failure,
     filing_from_manifest_key,
     normalize_accession_number,
     normalize_s3_uri,
     run_ingest_pipeline,
 )
-from cdt.shared import FailureRegistry, get_logger
+from cdt.shared import get_logger
 from cdt.storage.objects import s3_client as storage_s3_client
 
 LOGGER = get_logger(__name__)
@@ -134,22 +131,17 @@ def acquire_eightk_documents(
     Returns what ``run_ingest_pipeline`` returns.
     """
 
-    def manifest_source(failure_registry: FailureRegistry) -> DocumentCandidateSource:
-        return ListCandidateSource(
-            iter_document_candidates_for_date_range(
-                s3_client or storage_s3_client(config.aws_profile),
-                config.bucket,
-                config.start_date,
-                config.end_date,
-                _normalize_ciks(ciks),
-                failure_registry=failure_registry,
-                s3_prefix=config.s3_prefix,
-                form_types=config.form_types,
-                # --force retries even permanently registered failures; new
-                # failures are still recorded.
-                retry_registered_failures=config.force,
-                renew=renew,
-            )
+    def manifest_source(failures: IngestFailures) -> list[DocumentCandidate]:
+        return iter_document_candidates_for_date_range(
+            s3_client or storage_s3_client(config.aws_profile),
+            config.bucket,
+            config.start_date,
+            config.end_date,
+            _normalize_ciks(ciks),
+            failures=failures,
+            s3_prefix=config.s3_prefix,
+            form_types=config.form_types,
+            renew=renew,
         )
 
     return run_ingest_pipeline(
@@ -169,9 +161,8 @@ def iter_document_candidates_for_date_range(
     end_date: date,
     ciks: set[str] | None = None,
     *,
-    failure_registry: FailureRegistry | None = None,
+    failures: IngestFailures | None = None,
     s3_prefix: str = DEFAULT_S3_PREFIX,
-    retry_registered_failures: bool = False,
     form_types: str | Sequence[str] = DEFAULT_FORM_TYPES,
     renew: Callable[[], None] | None = None,
 ) -> list[DocumentCandidate]:
@@ -183,11 +174,10 @@ def iter_document_candidates_for_date_range(
         start_date: First filing date scanned.
         end_date: Last filing date scanned.
         ciks: CIKs to keep; None keeps every filer.
-        failure_registry: Where new failures are recorded and known ones looked
-            up; None records nothing.
+        failures: Where failures are recorded and counted, and known ones
+            skipped or, when it retries them, cleared on success; None records
+            nothing.
         s3_prefix: The scraper's key prefix.
-        retry_registered_failures: Re-attempt manifests the registry marks
-            failed, discarding the entry when one now succeeds.
         form_types: SEC form names ("8-K", "6-K/A").
         renew: Called per scanned day and per manifest read, to extend the
             caller's writer lease across a scan that writes nothing.
@@ -205,12 +195,8 @@ def iter_document_candidates_for_date_range(
     ):
         if renew is not None:
             renew()
-        key = _failure_key(bucket, manifest_key)
-        if (
-            not retry_registered_failures
-            and failure_registry is not None
-            and key in failure_registry
-        ):
+        key = (bucket, manifest_key)
+        if failures is not None and failures.is_skipped(key):
             LOGGER.info(
                 "Skipping known ingest failure: bucket=%s key=%s", bucket, manifest_key
             )
@@ -219,16 +205,11 @@ def iter_document_candidates_for_date_range(
             s3_client,
             bucket,
             manifest_key,
-            failure_registry=failure_registry,
+            failures=failures,
         )
         if candidate is not None:
-            if (
-                retry_registered_failures
-                and failure_registry is not None
-                and key in failure_registry
-            ):
-                # The registered failure did not reproduce; drop it.
-                failure_registry.discard(key)
+            if failures is not None:
+                failures.clear(key)
             candidates.append(candidate)
     return candidates
 
@@ -262,10 +243,10 @@ def _candidate_from_manifest_key(
     bucket: str,
     manifest_key: str,
     *,
-    failure_registry: FailureRegistry | None = None,
+    failures: IngestFailures | None = None,
 ) -> DocumentCandidate | None:
     filing = filing_from_manifest_key(
-        s3_client, bucket, manifest_key, failure_registry=failure_registry
+        s3_client, bucket, manifest_key, failures=failures
     )
     if filing is None:
         return None
@@ -273,11 +254,10 @@ def _candidate_from_manifest_key(
     candidate = _candidate_from_filing(filing, bucket=bucket)
     if candidate is None:
         LOGGER.warning("Manifest missing target CDT document: key=%s", manifest_key)
-        _record_failure(
-            failure_registry,
-            _failure_key(bucket, manifest_key),
-            IngestFailureType.DOCUMENT_NOT_FOUND,
-        )
+        if failures is not None:
+            failures.record(
+                (bucket, manifest_key), IngestFailureType.DOCUMENT_NOT_FOUND
+            )
         return None
     return candidate
 

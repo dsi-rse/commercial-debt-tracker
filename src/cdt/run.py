@@ -163,7 +163,7 @@ def run_prepare_then_publish(config: PipelineConfig) -> int:
             "--force applies to the prepare and match stages only under the "
             "batch backend: extraction is deferred to poll, which never forces "
             "an already-completed partition. To re-extract, run "
-            "`cdt run poll --force` while no job is active."
+            "`cdt run poll --force`."
         )
     # Prepare writes registries a poll tick also writes, so the lease covers it.
     lease = _acquire_or_report(resolve_artifact_root(config.artifact_root), "the run")
@@ -251,7 +251,8 @@ def advance_batch_extract(
     """Advance the OpenAI batch extract job by one tick, against the real API.
 
     The caller holds the writer lease; ``renew`` extends it at the tick's
-    phase boundaries and raises ``LeaseLostError`` if it was stolen. ``force``,
+    phase boundaries and raises ``LeaseLostError`` if it was stolen. ``force``
+    queues every partition for re-extraction by this and later jobs.
     ``model`` and ``reasoning_effort`` apply when the tick starts a new job
     (None: the ``EXTRACTOR_BATCH_*`` settings). A ``max_*`` limit left None is
     the batch backend's own.
@@ -292,8 +293,8 @@ def run_poll(
 
     Runs under the pipeline-writer lease. Prints the job status, or ``locked``
     when the lease is held (exit 0). Returns 1 if the lease is lost mid-tick.
-    ``force`` applies only when the tick creates a new job; ``force_publish``
-    to the publish after a completed job. The ``max_*`` limits default to the
+    ``force`` queues every partition for re-extraction; ``force_publish``
+    applies to the publish after a completed job. The ``max_*`` limits default to the
     batch backend's own.
     """
     resolved_root = resolve_artifact_root(artifact_root)

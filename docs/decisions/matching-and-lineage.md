@@ -67,7 +67,9 @@ gate and split a mention out of the cluster it had always joined (#203).
 
 Requiring equal names is too strict for the filing sequence. An announcement
 names `senior notes due 2034`, and the closing names the same debt `7.500%
-senior notes due 2034`. The rule is a token subset, with three guards:
+senior notes due 2034`. Equal informative tokens (names that differ only by a
+stopword, `the senior notes due 2034`) are compatible outright. Otherwise the
+rule is a token subset, with three guards:
 
 - `NAME_MIN_SHARED_TOKENS`: without it, a bare `note` would subsume every note
   the issuer has.
@@ -75,6 +77,13 @@ senior notes due 2034`. The rule is a token subset, with three guards:
 - The differing tokens must not be only a class or tranche designator.
   Without this guard, Kestra Medical's four tranches (`Tranche A Loan`,
   `Tranche B Loan`, and so on) collapse into one instrument.
+
+The equal-token case used to fall through to the class guard, which found no
+differing token and refused the pair (#239). A forced rematch of
+`data/genwindow-run-dev` merges one split instrument (572 to 571 instruments);
+`data/genwindow-run-branch` is unchanged. `MATCHER_SCHEMA_VERSION` was not
+bumped, since no published column or hashed payload changes, so a root that
+already split such a pair keeps it until `cdt match --force`.
 
 ## `name_fingerprint_is_identifying`
 
@@ -160,6 +169,15 @@ recomputed both before and after inference (#211).
 - **`amendment_inferred_by` travels with its pointer.** It is cleared when the
   pointer changes. Otherwise a rematch would publish a guess that cannot be
   told apart from an extracted relation (#184).
+- **`break_amendment_cycles`.** Extracted and carried amendment pointers can
+  form a cycle (A amends B, B amends A); every member then has a child, so the
+  family has no head and drops out of head-only views (#267). One pointer per
+  cycle is dropped: the one into the member first seen latest (earliest member
+  mention by `mention_sort_key`, ties by id), since nothing amends an
+  instrument that appeared after it. That member becomes the head of a pure
+  cycle; in a chain that joins the cycle, the family still has exactly one
+  head. Each break is logged. Inferred links refuse to close a cycle, so the
+  final rows stay acyclic. No stored root under `data/` had a cycle (14 roots).
 
 ## `build_debt_instrument_rows`: canonical members
 

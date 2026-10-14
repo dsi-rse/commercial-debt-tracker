@@ -152,9 +152,7 @@ def load_completion_registry(
 ) -> CompletionRegistry:
     """Load one stage's registry from every ``date=`` shard, with no keys dirty.
 
-    Only ``date=*.json`` objects are read; on S3 the shard prefix also matches
-    the unsupported legacy ``runs/<stage>/completed-partitions.json``, which is
-    ignored. Shards are read concurrently and merged in sorted path order.
+    Only ``date=*.json`` objects are read. Shards are read concurrently and merged in sorted path order.
     Keys come back as whole paths under the artifact root. No shards returns
     an empty registry.
     """
