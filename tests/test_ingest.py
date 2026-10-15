@@ -103,7 +103,7 @@ def test_normalize_accession_number_strips_dashes() -> None:
     assert normalize_accession_number("0001140361-26-006577") == "000114036126006577"
 
 
-def test_acquire_documents_indexes_resources_without_downloading(
+def test_acquire_eightk_documents_indexes_resources_without_downloading(
     tmp_path: Path,
 ) -> None:
     """Acquisition records resource URIs without fetching document bodies."""
@@ -210,7 +210,7 @@ def test_acquire_documents_indexes_resources_without_downloading(
     assert len(list_artifacts(documents_root(tmp_path), suffix=".parquet")) == 1
 
 
-def test_acquire_documents_writes_downloads_in_batches_when_requested(
+def test_acquire_eightk_documents_writes_downloads_in_batches_when_requested(
     tmp_path: Path,
 ) -> None:
     """Downloaded document bodies are flushed according to the batch size."""
@@ -290,7 +290,7 @@ def test_acquire_documents_writes_downloads_in_batches_when_requested(
     )
 
 
-def test_acquire_documents_normalizes_bare_s3_keys(tmp_path: Path) -> None:
+def test_acquire_eightk_documents_normalizes_bare_s3_keys(tmp_path: Path) -> None:
     """Manifest document keys without an s3:// prefix are canonicalized."""
     client = FakeS3Client(
         {
@@ -324,7 +324,7 @@ def test_acquire_documents_normalizes_bare_s3_keys(tmp_path: Path) -> None:
     ]
 
 
-def test_acquire_documents_decompresses_gzip_downloads(tmp_path: Path) -> None:
+def test_acquire_eightk_documents_decompresses_gzip_downloads(tmp_path: Path) -> None:
     """Downloaded SEC document bodies should be decompressed before storage."""
     client = FakeS3Client(
         {

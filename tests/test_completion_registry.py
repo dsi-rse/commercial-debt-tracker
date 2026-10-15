@@ -568,7 +568,7 @@ def document_keys(tmp_path: Path, days: list[str]) -> list[str]:
 
 
 def test_registry_keys_persist_without_the_artifact_root(tmp_path: Path) -> None:
-    """v3 stores the dataset-relative key, not the whole path (#191).
+    """The registry stores the dataset-relative key, not the whole path (#191).
 
     The root was repeated in all 440,000 entries: 129 B per entry with it,
     105 B without, measured over a full-corpus-shaped registry. The in-memory
@@ -672,8 +672,10 @@ def test_registry_follows_a_copied_artifact_root(tmp_path: Path) -> None:
     assert pending == []
 
 
-def test_a_v2_shard_is_normalized_on_its_next_write(tmp_path: Path) -> None:
-    """A shard at the old key convention gains no duplicate spelling of a key.
+def test_a_shard_of_whole_path_keys_is_rewritten_relative_on_its_next_write(
+    tmp_path: Path,
+) -> None:
+    """A shard of whole-path keys gains no duplicate spelling of a key.
 
     Both spellings surviving in one object would double-count the entry and,
     worse, let the stale copy win a later merge.
@@ -850,7 +852,7 @@ def test_registry_key_relativizing_is_invertible(tmp_path: Path) -> None:
 
     # A bare relative canonical key is the *persisted* spelling, so it reads
     # back as that partition under the current root -- which is exactly the
-    # portability the v3 keys buy.
+    # portability the relative keys buy.
     bare = "documents/date=2024-01-02/shard=0001/part-0000.parquet"
     assert _absolute(bare, root) == str(tmp_path / bare)
 
