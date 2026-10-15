@@ -80,7 +80,6 @@ def score(
         mention,
         profiles,
         strong_match_threshold=0.90,
-        loose_match_threshold=0.75,
         name_class_size=name_class_size,
     )
 
@@ -173,7 +172,6 @@ def test_a_borrower_only_mint_reaches_membership_only_with_borrowed_lenders() ->
         minted,
         profiles,
         strong_match_threshold=0.90,
-        loose_match_threshold=0.75,
         lender_signature=borrowed,
     )
     assert [candidate.match_score for candidate in with_lenders] == [1.0]
@@ -568,7 +566,6 @@ def test_keyless_mention_matches_on_identifying_fingerprint() -> None:
     assert len(candidates) == 1
     assert candidates[0].match_score == 0.90
     assert candidates[0].basis == "name_fingerprint"
-    assert candidates[0].base_match_via == "name_fingerprint"
 
 
 def test_keyless_mention_with_generic_name_stays_unmatched() -> None:

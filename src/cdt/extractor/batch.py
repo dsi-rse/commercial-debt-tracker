@@ -32,7 +32,6 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Protocol, cast
 
 from cdt import settings
@@ -427,16 +426,14 @@ def _write_force_backlog(root: str, paths: frozenset[str]) -> None:
     write_json_artifact(_force_backlog_path(root), {"paths": sorted(paths)})
 
 
-def _record_force_request(root: str, *, data_dir: Path | None) -> None:
+def _record_force_request(root: str) -> None:
     """Queue every classification partition for a forced re-extract.
 
     One job claims at most ``max_rows`` rows, so the request outlives the job
     that starts it: each later job claims backlog partitions as forced until
     none remain.
     """
-    pending, _ = pending_extract_partitions(
-        artifact_root=root, data_dir=data_dir, force=True
-    )
+    pending, _ = pending_extract_partitions(artifact_root=root, force=True)
     paths = frozenset(partition.classification_path for partition in pending)
     _write_force_backlog(root, _read_force_backlog(root) | paths)
     LOGGER.info("Queued %s partition(s) for a forced re-extract.", len(paths))
@@ -479,7 +476,7 @@ def _read_active_job(root: str) -> str | None:
 
 
 def active_job_claimed_partition_paths(
-    artifact_root: ArtifactPath | None = None, *, data_dir: Path | None = None
+    artifact_root: ArtifactPath | None = None,
 ) -> set[str]:
     """Classification partitions claimed by the active batch job, if any.
 
@@ -489,7 +486,7 @@ def active_job_claimed_partition_paths(
     poll tick self-heals those), at worst letting the live path re-extract a
     claimed partition.
     """
-    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    resolved_root = resolve_artifact_root(artifact_root)
     try:
         job_id = _read_active_job(resolved_root)
         if job_id is None:
@@ -715,7 +712,6 @@ def _parse_jsonl_by_custom_id(text: str) -> dict[str, dict[str, object]]:
 def _create_job(
     root: str,
     *,
-    data_dir: Path | None,
     model: str,
     reasoning_effort: str,
     max_attempts: int,
@@ -728,7 +724,7 @@ def _create_job(
     """
     backlog = _read_force_backlog(root)
     entries, claimed = collect_pending_extract_items(
-        artifact_root=root, data_dir=data_dir, force_paths=backlog, max_rows=max_rows
+        artifact_root=root, force_paths=backlog, max_rows=max_rows
     )
     if not claimed:
         if backlog:
@@ -1139,14 +1135,14 @@ def _submit_awaiting(
 
 
 def describe_active_job(
-    artifact_root: ArtifactPath | None = None, *, data_dir: Path | None = None
+    artifact_root: ArtifactPath | None = None,
 ) -> ActiveJobSummary:
     """Summarize the active extract job without mutating anything.
 
     Reports ``corrupt`` rather than raising when the job directory is unusable,
     so an operator can diagnose a stuck poller before deciding to reset it.
     """
-    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    resolved_root = resolve_artifact_root(artifact_root)
     try:
         job_id = _read_active_job(resolved_root)
     except CorruptJobStateError as exc:
@@ -1174,7 +1170,6 @@ def describe_active_job(
 def reset_active_job(
     artifact_root: ArtifactPath | None = None,
     *,
-    data_dir: Path | None = None,
     expected_job_id: str | None = None,
 ) -> str | None:
     """Clear the active-job marker; returns the abandoned job id, or None if idle.
@@ -1187,7 +1182,7 @@ def reset_active_job(
     The job's own directory is left on disk for inspection. Callers must hold the
     pipeline-writer lease, or a concurrent poll tick could rewrite the marker.
     """
-    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    resolved_root = resolve_artifact_root(artifact_root)
     try:
         job_id = _read_active_job(resolved_root)
     except CorruptJobStateError as exc:
@@ -1217,7 +1212,6 @@ def advance_extract_job(
     *,
     batch_client: SupportsBatchClient,
     artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
     model: str | None = None,
     reasoning_effort: str | None = None,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
@@ -1244,7 +1238,7 @@ def advance_extract_job(
     batches are re-folded idempotently next tick) and after submits are
     persisted, so an abort never loses durable state.
     """
-    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    resolved_root = resolve_artifact_root(artifact_root)
     resolved_model = model or settings.EXTRACTOR_BATCH_MODEL
     resolved_reasoning = (
         reasoning_effort
@@ -1262,7 +1256,7 @@ def advance_extract_job(
         )
 
     if force:
-        _record_force_request(resolved_root, data_dir=data_dir)
+        _record_force_request(resolved_root)
     try:
         active_job_id = _read_active_job(resolved_root)
     except CorruptJobStateError as exc:
@@ -1274,7 +1268,6 @@ def advance_extract_job(
     if active_job_id is None:
         job = _create_job(
             resolved_root,
-            data_dir=data_dir,
             model=resolved_model,
             reasoning_effort=resolved_reasoning,
             max_attempts=max_attempts,
@@ -1383,7 +1376,7 @@ def advance_extract_job(
                 awaiting_rows=len(stranded),
                 terminal_rows=terminal_rows,
             )
-        _finalize_job(resolved_root, job, data_dir=data_dir)
+        _finalize_job(resolved_root, job)
         return ExtractTickResult(
             status="completed",
             job_id=job.job_id,
@@ -1437,7 +1430,7 @@ def _warn_if_stalled(job: JobState, terminal_rows: int) -> None:
     )
 
 
-def _finalize_job(root: str, job: JobState, *, data_dir: Path | None) -> None:
+def _finalize_job(root: str, job: JobState) -> None:
     """Write mentions/audit/completion for a finished job and clear the marker.
 
     Deferred rows are left out, so their partitions are recorded incomplete
@@ -1467,7 +1460,6 @@ def _finalize_job(root: str, job: JobState, *, data_dir: Path | None) -> None:
         reasoning_effort=job.reasoning_effort,
         max_attempts=job.max_attempts,
         artifact_root=root,
-        data_dir=data_dir,
     )
     _clear_active_job(root)
     LOGGER.info(

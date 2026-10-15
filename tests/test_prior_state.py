@@ -13,7 +13,7 @@ from cdt.extractor.state import ExtractionRowState
 def test_published_mention_rows_is_the_single_publish_seam() -> None:
     """Every publish path reads through one helper, which hands out a copy.
 
-    The live loop, batch finalize, `extract_tables` and the audit record all
+    The live loop, batch finalize and the audit record all
     call `published_mention_rows`; a derivation attached there (#203) reaches
     every backend at once. The helper returns a fresh list so a caller that
     extends its result cannot mutate the state persisted to `state.jsonl`.

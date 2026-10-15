@@ -14,7 +14,6 @@ DEFAULT_LENDER_SUPPORT_THRESHOLD = 0.5
 # Bump when published columns or hashed mention payloads change; a root matched
 # at an older version is fully rematched (`_stale_schema_forces_rematch`).
 MATCHER_SCHEMA_VERSION = 7
-EDGE_TYPES = ("member", "related", "ambiguous_candidate")
 
 
 MENTION_CLUSTER_EDGE_COLUMNS = [
@@ -80,27 +79,21 @@ DEBT_INSTRUMENT_DATASET_NAME = "debt-instruments"
 
 def mention_cluster_edges_root(
     artifact_root: str | Path | None = None,
-    *,
-    data_dir: Path | None = None,
 ) -> str:
     """Return the canonical mention-cluster-edges dataset root."""
     return dataset_root(
         MENTION_CLUSTER_EDGE_DATASET_NAME,
         artifact_root=artifact_root,
-        data_dir=data_dir,
     )
 
 
 def debt_instruments_root(
     artifact_root: str | Path | None = None,
-    *,
-    data_dir: Path | None = None,
 ) -> str:
     """Return the canonical debt-instruments dataset root."""
     return dataset_root(
         DEBT_INSTRUMENT_DATASET_NAME,
         artifact_root=artifact_root,
-        data_dir=data_dir,
     )
 
 
@@ -197,13 +190,6 @@ class CandidateScore:
     exact_name: bool = False
     cluster_size: int = 0
     cluster_retired: bool = False
-
-    @property
-    def base_match_via(self: CandidateScore) -> str:
-        """Return the explanation family without the outcome prefix."""
-        if self.basis != "amount_start" or self.support_family is None:
-            return self.basis
-        return f"amount_start+{self.support_family}"
 
 
 # Extracted terminal events. A cluster with a member carrying one is retired,

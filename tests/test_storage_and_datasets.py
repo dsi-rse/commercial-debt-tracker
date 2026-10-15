@@ -17,7 +17,6 @@ from support import build_mention_row
 
 from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
 from cdt.datasets import (
-    existing_date_shard_partition_ids,
     normalize_cik,
     shard_for_cik,
 )
@@ -149,31 +148,6 @@ def test_get_object_bytes_does_not_retry_client_errors(
     assert calls == 1
 
 
-def test_existing_date_shard_partition_ids_lists_written_partitions(
-    tmp_path: Path,
-) -> None:
-    """The one-LIST partition-id set matches exactly what was written (#83)."""
-    root = tmp_path / "artifacts"
-    table = pd.DataFrame({"item_id": ["a"], "text": ["x"]})
-    write_partition_table(
-        str(root / "items"),
-        partition={"date": "2026-01-02", "shard": "0007"},
-        table=table,
-    )
-    write_partition_table(
-        str(root / "items"),
-        partition={"date": "2026-03-04", "shard": "0001"},
-        table=table,
-    )
-
-    ids = existing_date_shard_partition_ids("items", artifact_root=str(root))
-
-    assert ids == {("2026-01-02", "0007"), ("2026-03-04", "0001")}
-    assert (
-        existing_date_shard_partition_ids("mentions", artifact_root=str(root)) == set()
-    )
-
-
 class _PrefixMatchingS3Client:
     """Lists keys the way S3 does: ``Prefix`` is a plain string match."""
 
@@ -228,27 +202,6 @@ def test_s3_listing_excludes_a_sibling_dataset_sharing_the_name_prefix(
     ) == {eightk: f'"root/{DOCUMENT_DATASET_NAME}/{partition}"'}
 
 
-def test_iter_date_shard_partitions_skips_orphaned_tempfiles(tmp_path: Path) -> None:
-    """A tempfile left by a crash between create and rename must not brick the scan (#68)."""
-    from cdt.datasets import iter_date_shard_partitions
-
-    root = tmp_path / "artifacts"
-    table = pd.DataFrame({"item_id": ["a"], "text": ["x"]})
-    write_partition_table(
-        str(root / "items"),
-        partition={"date": "2026-01-02", "shard": "0007"},
-        table=table,
-    )
-    (
-        root / "items" / "date=2026-01-02" / "shard=0007" / "tmpabc123.parquet"
-    ).write_bytes(b"")
-
-    paths = iter_date_shard_partitions("items", artifact_root=str(root))
-
-    assert len(paths) == 1
-    assert paths[0].endswith("date=2026-01-02/shard=0007/part-0000.parquet")
-
-
 def test_iter_date_shard_partitions_raises_on_non_canonical_data(
     tmp_path: Path,
 ) -> None:
@@ -271,27 +224,6 @@ def test_iter_date_shard_partitions_raises_on_non_canonical_data(
 
     with pytest.raises(ValueError, match="Non-canonical parquet file"):
         iter_date_shard_partitions("items", artifact_root=str(root))
-
-
-def test_read_dataset_skips_orphaned_tempfiles(tmp_path: Path) -> None:
-    """Every read path, not just the partition scan, must survive an orphan.
-
-    ingest's existing-accession scan, its per-partition merge, the matcher, and
-    pipeline finalize all read through read_dataset; a zero-byte tmp*.parquet
-    orphan previously made each of them raise ArrowInvalid.
-    """
-    root = tmp_path / "artifacts" / "items"
-    table = pd.DataFrame({"item_id": ["a"], "text": ["x"]})
-    write_partition_table(
-        str(root),
-        partition={"date": "2026-01-02", "shard": "0007"},
-        table=table,
-    )
-    (root / "date=2026-01-02" / "shard=0007" / "tmpabc123.parquet").write_bytes(b"")
-
-    read = read_dataset(str(root))
-
-    assert read["item_id"].to_list() == ["a"]
 
 
 def test_read_table_projects_columns_and_tolerates_missing_ones(

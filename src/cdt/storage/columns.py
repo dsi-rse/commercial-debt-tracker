@@ -8,9 +8,6 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 import pandas as pd
 import pyarrow as pa
-import pyarrow.dataset
-import pyarrow.fs
-import pyarrow.parquet
 
 MISSING_TEXT_VALUES = frozenset({"nan", "none", "null", "<na>", "n/a"})
 

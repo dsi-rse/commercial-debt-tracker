@@ -6,7 +6,6 @@ import hashlib
 import json
 import re
 
-INSTRUMENT_ENTITY_TAG_TYPES = {"debt_instrument"}
 LENDER_TAG_TYPES = {"person", "organization"}
 DEFAULT_LENDER_CLUSTER_KIND = "named"
 BORROWER_PARTY_ROLE = "borrower"
@@ -26,7 +25,7 @@ AMOUNT_KINDS = {
 }
 PRINCIPAL_AMOUNT_KINDS = ("commitment", "principal")
 # Kind-typed date facts: each stated date is recorded once and the
-# post-processor chooses the published columns (`DATE_COLUMN_KINDS`).
+# post-processor chooses the published date columns.
 DATE_KINDS = {
     "agreement",  # the instrument's own `dated as of` date
     "announcement",  # pricing, launch, or commitment-letter date
@@ -124,13 +123,6 @@ LENDER_DISCLOSURE_PRECEDENCE = {
     LENDER_DISCLOSURE_COMPLETE: 1,
     LENDER_DISCLOSURE_COLLECTIVE_PRESENT: 2,
 }
-# Published flat columns and the fact kind each one reads.
-DATE_COLUMN_KINDS = {
-    "start_date": "closing",
-    "maturity_date": "maturity",
-    "commitment_termination_date": "commitment_termination",
-}
-DATE_PRECISIONS = ("day", "month", "year")
 AMOUNT_EVIDENCE_TAG_TYPES = {"amount", "debt_instrument"}
 INTEREST_RATE_KINDS = {"fixed", "floating"}
 INTEREST_RATE_EVIDENCE_TAG_TYPES = {"interest_rate", "debt_instrument"}
@@ -145,7 +137,6 @@ INSTRUMENT_TYPES = {
     "note_bond",
 }
 MATURITY_EVIDENCE_TAG_TYPES = {"debt_instrument"}
-NAME_EMBEDDED_AMOUNT_TAG_TYPES = {"debt_instrument"}
 INSTRUMENT_RELATION_TYPES = {"amendment_of", "retired_by", "split_of"}
 NUMERIC_STRING_PATTERN = re.compile(r"^\d+(?:\.\d+)?$")
 # One `due` can carry a list of maturities: `due 2028 and 2030`,

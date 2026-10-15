@@ -1668,8 +1668,8 @@ def test_the_scale_rescue_refuses_a_magnitude_on_any_own_span_not_just_canonical
     sibling's `million` is the six-orders-out figure the guard exists to
     refuse.
 
-    Reachable from model output rather than hypothetical: unlike the single
-    `amount` property, `validate_amounts_property` never calls
+    Reachable from model output rather than hypothetical:
+    `validate_amounts_property` never calls
     `validate_standardized_single_value_cardinality`, so one `amounts[*]` entry
     may cite several spans with distinct parsed values and still validate. Of
     762 amount facts in the stored corpus, 4 cite two or more spans and 1

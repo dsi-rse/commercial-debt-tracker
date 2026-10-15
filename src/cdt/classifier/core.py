@@ -13,7 +13,7 @@ import pickle
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, Self, runtime_checkable
+from typing import Protocol, Self
 
 import numpy as np
 import pandas as pd
@@ -87,7 +87,6 @@ class RetryResult:
     skipped: int = 0
 
 
-@runtime_checkable
 class SupportsDecisionFunction(Protocol):
     """Protocol for fitted classifiers used by this module."""
 
@@ -116,14 +115,11 @@ def default_model_dir() -> Path:
 
 def classifications_root(
     artifact_root: str | Path | None = None,
-    *,
-    data_dir: Path | None = None,
 ) -> str:
     """Return the canonical classifications dataset root."""
     return dataset_root(
         CLASSIFICATION_DATASET_NAME,
         artifact_root=artifact_root,
-        data_dir=data_dir,
     )
 
 
@@ -424,7 +420,6 @@ def retry_failed_classifications(
     output_columns: list[str],
     classify_partition: ClassifyPartition,
     artifact_root: str | Path | None = None,
-    data_dir: Path | None = None,
     renew: Callable[[], None] | None = None,
 ) -> RetryResult:
     """Classify again the filings in a classify stage's failure list.
@@ -445,10 +440,8 @@ def retry_failed_classifications(
     registry is not written, since no source partition changed. ``renew`` is
     called before each write, throttled (:func:`cdt.lease.throttled`).
     """
-    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
-    failures = load_row_failures(
-        stage_name, artifact_root=resolved_root, data_dir=data_dir
-    )
+    resolved_root = resolve_artifact_root(artifact_root)
+    failures = load_row_failures(stage_name, artifact_root=resolved_root)
     if not failures:
         return RetryResult()
     by_partition: dict[str, set[str]] = {}
@@ -457,12 +450,10 @@ def retry_failed_classifications(
             accession
         )
     pending, _ = pending_source_partitions(
-        stage_name, source_dataset, artifact_root=resolved_root, data_dir=data_dir
+        stage_name, source_dataset, artifact_root=resolved_root
     )
     pending_paths = {path for path, _ in pending}
-    output_root = dataset_root(
-        output_dataset, artifact_root=resolved_root, data_dir=data_dir
-    )
+    output_root = dataset_root(output_dataset, artifact_root=resolved_root)
     keep_lease = throttled(renew) if renew is not None else None
     retried = recovered = still_failed = skipped = 0
     for source_path, accession_set in sorted(by_partition.items()):
@@ -490,7 +481,6 @@ def retry_failed_classifications(
             partition_date=partition["date"],
             shard=partition["shard"],
             artifact_root=resolved_root,
-            data_dir=data_dir,
         )
         existing = read_table(output_path, output_columns).reindex(
             columns=output_columns
@@ -507,9 +497,7 @@ def retry_failed_classifications(
             ),
         )
         replace_partition_failures(failures, source_path, output.failures)
-        save_row_failures(
-            stage_name, failures, artifact_root=resolved_root, data_dir=data_dir
-        )
+        save_row_failures(stage_name, failures, artifact_root=resolved_root)
         failed_again = len(accessions & output.failures.keys())
         still_failed += failed_again
         recovered += len(accessions) - failed_again

@@ -5,9 +5,9 @@ from __future__ import annotations
 import re
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Self
+from typing import Any
 
 import pandas as pd
 
@@ -156,10 +156,8 @@ class ItemSection:
         url: Source SEC URL for the document.
         item_information: Normalized ``ITEM INFORMATION`` caption.
         item_number: Form 8-K item number, or an empty string if unmapped.
-        heading_count: Number of matching item headings found in the body.
         extraction_status: Extraction status label.
         duplicate_resolution: Duplicate-heading resolution label, if any.
-        selected_heading_index: One-based selected heading index, if any.
         section_heading: Heading text selected for the section.
         section_text: Extracted item section text.
         start_line: One-based section start line, if available.
@@ -174,23 +172,13 @@ class ItemSection:
     url: str
     item_information: str
     item_number: str
-    heading_count: int
     extraction_status: str
     duplicate_resolution: str
-    selected_heading_index: int | str
     section_heading: str
     section_text: str
     start_line: int | str
     end_line: int | str
     section_char_count: int
-
-    def to_dict(self: Self) -> dict[str, Any]:
-        """Return this item section as a plain dictionary.
-
-        Returns:
-            Dictionary representation suitable for dataframe construction.
-        """
-        return asdict(self)
 
 
 def extract_items_from_document(document: DocumentText) -> list[ItemSection]:
@@ -652,13 +640,10 @@ def extract_section(
     if selected_candidate is None:
         selected_candidate = candidates[0]
     status = "ok" if is_resolved else "duplicate_heading"
-    selected_heading_index = candidates.index(selected_candidate) + 1
 
     return {
-        "heading_count": len(matches),
         "extraction_status": status,
         "duplicate_resolution": resolution,
-        "selected_heading_index": selected_heading_index,
         "section_heading": selected_candidate.heading.text,
         "section_text": selected_candidate.text,
         "start_line": selected_candidate.start_line,
@@ -695,10 +680,8 @@ def empty_section(status: str) -> dict[str, Any]:
         Empty section fields using ``status``.
     """
     return {
-        "heading_count": 0,
         "extraction_status": status,
         "duplicate_resolution": "",
-        "selected_heading_index": "",
         "section_heading": "",
         "section_text": "",
         "start_line": "",
@@ -725,17 +708,14 @@ def item_id_for(accession_number: str, item_number: str) -> str:
 def itemize_documents(
     documents: pd.DataFrame,
     *,
-    data_dir: Path | None = None,
-    force: bool = False,
     s3_client: object | None = None,
     item_numbers: tuple[str, ...] | None = None,
 ) -> pd.DataFrame:
     """Extract the selected item sections from complete 8-K documents.
 
-    ``item_numbers`` of None selects POTENTIALLY_RELEVANT_ITEM_NUMBERS;
-    ``force`` is ignored. Returns an ITEM_COLUMNS frame, empty if no rows.
+    ``item_numbers`` of None selects POTENTIALLY_RELEVANT_ITEM_NUMBERS.
+    Returns an ITEM_COLUMNS frame, empty if no rows.
     """
-    del force
     if documents.empty:
         return pd.DataFrame(columns=ITEM_COLUMNS)
 
@@ -747,9 +727,7 @@ def itemize_documents(
     for document in documents.to_dict("records"):
         sections = itemize_document_record(
             document,
-            data_dir=data_dir,
             s3_client=resolved_s3_client,
-            item_numbers=None,
         )
         relevant_sections = [
             section
@@ -775,7 +753,6 @@ def itemize_documents(
 def segment_pending_eightk_documents(
     *,
     artifact_root: str | Path | None = None,
-    data_dir: Path | None = None,
     force: bool = False,
     s3_client: object | None = None,
     item_numbers: tuple[str, ...] | None = None,
@@ -802,7 +779,6 @@ def segment_pending_eightk_documents(
         shared_client = ensure_s3_client(shared_client, documents.to_dict("records"))
         items = itemize_documents(
             documents,
-            data_dir=data_dir,
             s3_client=shared_client,
             item_numbers=selected_item_numbers,
         )
@@ -815,7 +791,6 @@ def segment_pending_eightk_documents(
         output_columns=ITEM_COLUMNS,
         process=process,
         artifact_root=artifact_root,
-        data_dir=data_dir,
         force=force,
         renew=renew,
         manifest_extra={"item_numbers": list(selected_item_numbers)},
@@ -825,20 +800,14 @@ def segment_pending_eightk_documents(
 def itemize_document_record(
     document: dict[str, object],
     *,
-    data_dir: Path | None = None,
     s3_client: object | None = None,
-    item_numbers: tuple[str, ...] | None = None,
 ) -> list[ItemSection]:
-    """Extract item sections from one document record.
-
-    ``item_numbers`` of None returns every section, mapped or not.
-    """
+    """Extract every item section from one document record, mapped or not."""
     text = document_text_for_record(
         document,
-        data_dir=data_dir,
         s3_client=s3_client,
     )
-    sections = extract_items_from_document(
+    return extract_items_from_document(
         DocumentText(
             accession_number=str(document["accession_number"]),
             cik=str(document["cik"]),
@@ -848,13 +817,6 @@ def itemize_document_record(
             date=str(document["date"]),
         )
     )
-    if item_numbers is None:
-        return sections
-
-    selected_item_numbers = normalize_item_numbers(item_numbers)
-    return [
-        section for section in sections if section.item_number in selected_item_numbers
-    ]
 
 
 def item_row(section: ItemSection) -> dict[str, object]:

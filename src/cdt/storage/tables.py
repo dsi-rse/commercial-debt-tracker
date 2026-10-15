@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import io
-import re
 from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -34,16 +33,6 @@ from cdt.storage.objects import (
 
 LOGGER = get_logger(__name__)
 
-# Empty ``tmp*.parquet`` files left in a partition directory by a crash under
-# write_table's former temp naming; ``**/*.parquet`` readers must skip them.
-# Current writes use ``.parquet.tmp``, which this does not match.
-_ORPHANED_TEMP_RE = re.compile(r"(?:^|/)tmp[^/]*\.parquet$")
-
-
-def is_orphaned_temp_artifact(path: ArtifactPath) -> bool:
-    """Return whether a path is a ``tmp*.parquet`` file of write_table's old naming."""
-    return _ORPHANED_TEMP_RE.search(normalize_artifact_path(path)) is not None
-
 
 def iter_partition_paths(
     base: ArtifactPath,
@@ -52,8 +41,6 @@ def iter_partition_paths(
 ) -> Iterator[str]:
     """Yield partition file paths under a dataset, optionally filtered by key/value."""
     for path in list_artifacts(base, suffix=".parquet"):
-        if is_orphaned_temp_artifact(path):
-            continue
         if partition_filter is None:
             yield path
             continue

@@ -5,7 +5,6 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from operator import itemgetter
-from pathlib import Path
 from typing import Self
 
 from cdt.datasets import (
@@ -27,7 +26,6 @@ from cdt.storage.objects import (
     replace_json_artifact_if_match,
     write_json_artifact_if_absent,
 )
-from cdt.storage.tables import is_orphaned_temp_artifact
 
 LOGGER = get_logger(__name__)
 
@@ -36,14 +34,13 @@ def completion_registry_root(
     stage_name: str,
     *,
     artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
 ) -> str:
     """Return the prefix ``runs/<stage>/completed`` holding a registry's shards.
 
     The shard objects under it are ``completion_registry_shard_path``.
     """
     return join_artifact_path(
-        resolve_artifact_root(artifact_root, data_dir=data_dir),
+        resolve_artifact_root(artifact_root),
         "runs",
         stage_name,
         "completed",
@@ -71,13 +68,10 @@ def completion_registry_shard_path(
     shard_label: str,
     *,
     artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
 ) -> str:
     """Return the path of one date-prefix shard of a stage's registry."""
     return join_artifact_path(
-        completion_registry_root(
-            stage_name, artifact_root=artifact_root, data_dir=data_dir
-        ),
+        completion_registry_root(stage_name, artifact_root=artifact_root),
         f"date={shard_label}.json",
     )
 
@@ -128,27 +122,10 @@ class CompletionRegistry(dict[str, CompletedPartition]):
         return self[key]
 
 
-def load_completed_partitions(
-    stage_name: str,
-    *,
-    artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
-) -> set[str]:
-    """Load completed source partition paths for one stage, ignoring fingerprints."""
-    return {
-        path
-        for path, entry in load_completion_registry(
-            stage_name, artifact_root=artifact_root, data_dir=data_dir
-        ).items()
-        if entry.complete
-    }
-
-
 def load_completion_registry(
     stage_name: str,
     *,
     artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
 ) -> CompletionRegistry:
     """Load one stage's registry from every ``date=`` shard, with no keys dirty.
 
@@ -156,14 +133,12 @@ def load_completion_registry(
     Keys come back as whole paths under the artifact root. No shards returns
     an empty registry.
     """
-    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    resolved_root = resolve_artifact_root(artifact_root)
     entries: dict[str, CompletedPartition] = {}
     shard_paths = [
         path
         for path in list_artifacts(
-            completion_registry_root(
-                stage_name, artifact_root=resolved_root, data_dir=data_dir
-            ),
+            completion_registry_root(stage_name, artifact_root=resolved_root),
             suffix=".json",
         )
         if path.rsplit("/", 1)[-1].startswith("date=")
@@ -196,13 +171,11 @@ def _read_registry_shards(shard_paths: list[str]) -> list[object]:
         return list(pool.map(read_json_artifact, shard_paths))
 
 
-# Payload version. Keys are stored root-relative when the remainder is a bare
-# canonical partition path, and whole otherwise. Shape tells them apart safely:
-# a whole path (``/srv/cdt/documents/...``, ``s3://bucket/documents/...``) has a
-# slash in its dataset segment, which ``[a-z\-]+`` cannot ``fullmatch``.
-_REGISTRY_VERSION = 3
-
-
+# Keys are stored root-relative when the remainder is a bare canonical
+# partition path, and whole otherwise. Shape tells them apart safely: a whole
+# path (``/srv/cdt/documents/...``, ``s3://bucket/documents/...``) has a slash
+# in its dataset segment, which ``[a-z\-]+`` cannot ``fullmatch``.
+#
 # Key prefixes are derived once per object, not per key (the per-key cost is in
 # docs/decisions/storage-and-completion.md). The probe is a bare canonical
 # partition path, the only shape a prefix is applied to, so slicing it off a
@@ -235,27 +208,6 @@ def _prepend_registry_root(stored: str, join_prefix: str) -> str:
     if not PARTITION_PATTERN.fullmatch(stored):
         return stored
     return join_prefix + stored
-
-
-def _relative_registry_key(key: str, artifact_root: str) -> str:
-    """Return one registry key with the artifact root stripped off.
-
-    Stripped only when the remainder is a bare canonical partition path, so
-    this is the exact inverse of ``_absolute_registry_key``; any other key is
-    returned whole. The one-key form of ``_strip_registry_root``.
-    """
-    return _strip_registry_root(key, _registry_strip_prefix(artifact_root))
-
-
-def _absolute_registry_key(stored: str, artifact_root: str) -> str:
-    """Return one persisted key with the artifact root reattached.
-
-    A stored key is root-relative exactly when it is a bare canonical
-    date/shard partition path -- ``fullmatch``, not the suffix ``search`` the
-    parsers use, so a whole path or an S3 URI is not mistaken for one. Anything
-    else is returned as stored.
-    """
-    return _prepend_registry_root(stored, _registry_join_prefix(artifact_root))
 
 
 def _registry_entries(
@@ -299,7 +251,7 @@ def _registry_payload(
     *,
     artifact_root: str,
 ) -> dict[str, object]:
-    """Build the persisted v3 payload for one date shard of a registry.
+    """Build the persisted payload for one date shard of a registry.
 
     Sorted on the relativized key alone: ``CompletedPartition`` is unordered,
     so a tuple sort would raise TypeError if two keys relativized alike.
@@ -307,7 +259,6 @@ def _registry_payload(
     strip_prefix = _registry_strip_prefix(artifact_root)
     return {
         "stage": stage_name,
-        "version": _REGISTRY_VERSION,
         "date_prefix": shard_label,
         "partitions": {
             path: {
@@ -336,7 +287,6 @@ def save_completion_registry(
     registry: dict[str, CompletedPartition],
     *,
     artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
 ) -> str:
     """Persist one stage's changed registry entries; return the registry root.
 
@@ -349,7 +299,7 @@ def save_completion_registry(
     written. Raises RuntimeError when a shard loses ``_REGISTRY_CAS_ATTEMPTS``
     races in a row.
     """
-    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    resolved_root = resolve_artifact_root(artifact_root)
     changed = sorted(
         registry.dirty if isinstance(registry, CompletionRegistry) else registry
     )
@@ -362,7 +312,6 @@ def save_completion_registry(
             shard_label,
             shard_entries,
             artifact_root=resolved_root,
-            data_dir=data_dir,
         )
         # Committed, so the next batch boundary must not re-send these keys;
         # otherwise every save rewrites every shard the run has touched and the
@@ -370,9 +319,7 @@ def save_completion_registry(
         # failed swap raises, leaving only that shard's keys dirty.
         if isinstance(registry, CompletionRegistry):
             registry.dirty -= shard_entries.keys()
-    return completion_registry_root(
-        stage_name, artifact_root=resolved_root, data_dir=data_dir
-    )
+    return completion_registry_root(stage_name, artifact_root=resolved_root)
 
 
 def _save_registry_shard(
@@ -381,7 +328,6 @@ def _save_registry_shard(
     entries: dict[str, CompletedPartition],
     *,
     artifact_root: str,
-    data_dir: Path | None,
 ) -> str:
     """Compare-and-swap ``entries`` into one date shard of a stage's registry.
 
@@ -390,7 +336,7 @@ def _save_registry_shard(
     path; raises RuntimeError after ``_REGISTRY_CAS_ATTEMPTS`` lost races.
     """
     path = completion_registry_shard_path(
-        stage_name, shard_label, artifact_root=artifact_root, data_dir=data_dir
+        stage_name, shard_label, artifact_root=artifact_root
     )
     for _ in range(_REGISTRY_CAS_ATTEMPTS):
         if not artifact_exists(path):
@@ -437,7 +383,6 @@ def pending_source_partitions(
     source_dataset: str,
     *,
     artifact_root: ArtifactPath | None = None,
-    data_dir: Path | None = None,
     force: bool = False,
 ) -> tuple[list[tuple[str, str]], dict[str, CompletedPartition]]:
     """Select source partitions a whole-partition stage still has to process.
@@ -447,30 +392,24 @@ def pending_source_partitions(
     its source fingerprint changed (ingest merges late rows into partition
     files in place). With ``force`` the registry starts empty. The caller
     persists the returned registry via ``save_completion_registry``. Raises
-    ValueError on a non-canonical parquet file other than an orphaned temp
-    file.
+    ValueError on a non-canonical parquet file.
     """
-    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    resolved_root = resolve_artifact_root(artifact_root)
     registry = (
         # Not a plain ``{}``: save_completion_registry treats every key of a
         # plain dict as changed and would re-send the whole run each save.
         CompletionRegistry()
         if force
-        else load_completion_registry(
-            stage_name, artifact_root=resolved_root, data_dir=data_dir
-        )
+        else load_completion_registry(stage_name, artifact_root=resolved_root)
     )
     # Same stray-file contract as iter_date_shard_partitions.
     fingerprints: dict[str, str] = {}
     for path, version in list_artifacts_with_versions(
-        dataset_root(source_dataset, artifact_root=resolved_root, data_dir=data_dir),
+        dataset_root(source_dataset, artifact_root=resolved_root),
         suffix=".parquet",
     ).items():
         if match_date_shard_partition(path) is not None:
             fingerprints[path] = version
-            continue
-        if is_orphaned_temp_artifact(path):
-            LOGGER.warning("Skipping orphaned temp partition file: %s", path)
             continue
         msg = (
             f"Non-canonical parquet file in dataset {source_dataset!r}: {path}. "

@@ -253,42 +253,6 @@ def test_the_batch_finalize_purges_an_item_that_stopped_being_relevant(
     assert written.empty, f"stale mentions survived: {written['item_id'].to_list()}"
 
 
-def test_extract_tables_publishes_through_the_mint_seam(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The in-memory path mints too, so a notebook sees what the pipeline writes."""
-    from cdt.extractor.live import extract_tables
-
-    async def fake_run_extraction_workflow(**kwargs: object) -> ExtractionRowState:
-        item_row = kwargs["item_row"]
-        return _row_state_with_a_prior_term(str(item_row["item_id"]))
-
-    monkeypatch.setattr(
-        "cdt.extractor.live.run_extraction_workflow", fake_run_extraction_workflow
-    )
-
-    tables = extract_tables(
-        pd.DataFrame(
-            [
-                {
-                    "item_id": "item-1",
-                    "accession_number": "0001",
-                    "cik": "0000320193",
-                    "company_name": "Example Inc.",
-                    "date": "2024-06-01",
-                    "text": "amended",
-                    "relevance": True,
-                }
-            ]
-        ),
-        artifact_root=tmp_path,
-        client=None,
-    )
-
-    rows = tables["debt_instrument_mentions"]
-    assert (rows["synthesized_by"] == "prior_state").sum() == 1
-
-
 def test_a_registry_entry_keeps_only_ids_the_source_still_holds() -> None:
     """A terminal id whose row is gone stays out of the entry.
 

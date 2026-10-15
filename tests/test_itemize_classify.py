@@ -13,6 +13,7 @@ from support import (
     FakeModel,
     _fact,
     build_mention_row,
+    completed_partitions,
     seed_document_partitions_across_months,
 )
 
@@ -20,7 +21,7 @@ from cdt.classifier import core as classifier_core
 from cdt.classifier import eightk as classifier_eightk
 from cdt.classifier.core import classifications_root
 from cdt.classifier.eightk import classify_pending_items
-from cdt.completion import completion_registry_root, load_completed_partitions
+from cdt.completion import completion_registry_root
 from cdt.datasets import (
     load_row_failures,
     run_manifest_path,
@@ -372,13 +373,13 @@ def test_segment_pending_eightk_documents_persists_progress_per_checkpoint(
     with pytest.raises(TimeoutError):
         segment_pending_eightk_documents(artifact_root=tmp_path)
 
-    assert len(load_completed_partitions("itemize", artifact_root=tmp_path)) == 1
+    assert len(completed_partitions("itemize", tmp_path)) == 1
 
     monkeypatch.setattr(segmenter_eightk, "itemize_documents", real_itemize_documents)
     resumed = segment_pending_eightk_documents(artifact_root=tmp_path)
 
     assert len(resumed) == 1
-    assert len(load_completed_partitions("itemize", artifact_root=tmp_path)) == 2
+    assert len(completed_partitions("itemize", tmp_path)) == 2
 
 
 def test_classify_pending_items_persists_progress_per_checkpoint(
@@ -410,7 +411,7 @@ def test_classify_pending_items_persists_progress_per_checkpoint(
     with pytest.raises(TimeoutError):
         classify_pending_items(artifact_root=tmp_path)
 
-    assert len(load_completed_partitions("classify", artifact_root=tmp_path)) == 1
+    assert len(completed_partitions("classify", tmp_path)) == 1
 
 
 def test_stages_renew_the_writer_lease_per_partition(
@@ -704,7 +705,7 @@ def test_extract_failures_are_recorded_and_cleared(
     # which is exactly why the failure has to be recorded somewhere durable.
     # Read through the loader, not a fixed path: the registry is a prefix of
     # date shards since #191 and no test should re-encode its layout.
-    assert load_completed_partitions("extract", artifact_root=tmp_path)
+    assert completed_partitions("extract", tmp_path)
     failures = load_row_failures("extract", artifact_root=tmp_path)
     assert len(failures) == 1
     entry = next(iter(failures.values()))
@@ -774,8 +775,6 @@ def test_itemize_progress_survives_a_mid_run_interruption(
 
     Includes a month boundary, where the progress spans two registry shards.
     """
-    from cdt.completion import load_completed_partitions
-
     days = ["2024-01-02", "2024-01-03", "2024-02-01", "2024-02-02", "2024-03-01"]
     paths = seed_document_partitions_across_months(
         tmp_path, [(day, f"{index:04d}") for index, day in enumerate(days)]
@@ -797,7 +796,7 @@ def test_itemize_progress_survives_a_mid_run_interruption(
         segment_pending_eightk_documents(artifact_root=tmp_path)
 
     # Three partitions finished; their completion is durable, in two shards.
-    completed = load_completed_partitions("itemize", artifact_root=tmp_path)
+    completed = completed_partitions("itemize", tmp_path)
     assert completed == set(paths[:3])
     written = sorted(
         path.name for path in (tmp_path / "runs" / "itemize" / "completed").iterdir()
@@ -809,7 +808,7 @@ def test_itemize_progress_survives_a_mid_run_interruption(
     calls.clear()
     segment_pending_eightk_documents(artifact_root=tmp_path)
     assert len(calls) == 2
-    assert load_completed_partitions("itemize", artifact_root=tmp_path) == set(paths)
+    assert completed_partitions("itemize", tmp_path) == set(paths)
 
 
 def test_grown_document_partition_reitemizes_and_reclassifies(

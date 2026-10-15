@@ -210,7 +210,6 @@ def _config(tmp_path: Path, **overrides: object) -> IngestConfig:
         "cik_file": Path(),
         "start_date": date(2026, 9, 8),
         "end_date": date(2026, 9, 9),
-        "data_dir": tmp_path,
         "output_root": str(tmp_path),
         "form_types": SIXK_FORM_TYPES,
         "dataset_name": SIXK_DOCUMENT_DATASET_NAME,

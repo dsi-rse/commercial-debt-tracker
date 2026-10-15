@@ -536,7 +536,7 @@ def derived_status_payload(
 def expected_retirement_in_payloads(date_payloads: list[dict[str, object]]) -> bool:
     """Return whether the mention states a planned retirement of the obligation."""
     return any(
-        payload.get("kind") in TERMINAL_DATE_KINDS and payload.get("expected")
+        payload.get("kind") in TERMINAL_DATE_KINDS and payload.get("expected") is True
         for payload in date_payloads
     )
 

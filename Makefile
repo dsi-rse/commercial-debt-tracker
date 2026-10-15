@@ -9,19 +9,30 @@ current_abs_path := $(subst Makefile,,$(mkfile_path))
 project_name := "commercial-debt-tracker"
 project_dir := "$(current_abs_path)"
 
-# environment variables
-include .env
-
-# Check required environment variables
-ifeq ($(DATA_DIR),)
-	$(error DATA_DIR must be set in .env file)
+# environment variables, from .env when it exists
+ifeq ($(origin DATA_DIR),environment)
+data_dir_from_environment := 1
+environment_data_dir := $(DATA_DIR)
 endif
+-include .env
+
+# DATA_DIR resolves as cdt's settings.DATA_DIR does: the environment, then
+# .env, else <repo>/data, with a leading ~ expanded. An empty value also means
+# <repo>/data. A bare `cdt` command with no --artifact-root or ARTIFACT_ROOT
+# uses it as its artifact root too.
+ifdef data_dir_from_environment
+DATA_DIR := $(environment_data_dir)
+endif
+ifeq ($(strip $(DATA_DIR)),)
+DATA_DIR := $(current_abs_path)data
+endif
+DATA_DIR := $(patsubst ~%,$(HOME)%,$(DATA_DIR))
 
 
 # local runtime defaults
 LOCAL_MODE ?= daily
-LOCAL_ARTIFACT_ROOT ?= $(DATA_DIR)/commercial-debt-tracker/local
-LOCAL_FINAL_DATABASE_ROOT ?= $(DATA_DIR)/commercial-debt-tracker/database/cdt
+LOCAL_ARTIFACT_ROOT ?= $(DATA_DIR)
+LOCAL_FINAL_DATABASE_ROOT ?= $(DATA_DIR)/database/cdt
 LOCAL_BUCKET_NAME ?= idi-dev-ftm2j-shared-processor-storage
 LOCAL_AWS_PROFILE ?= idi-analysis
 LOCAL_CIK_FILE ?= $(current_abs_path)data/ciks/smoke-10.txt

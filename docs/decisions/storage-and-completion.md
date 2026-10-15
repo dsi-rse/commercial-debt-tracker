@@ -245,13 +245,12 @@ path handles that case correctly.
 `read_partitions` it would loop over `read_table` and lose the parallel scan:
 26.45 s vs 1.75 s over 1,640 partitions.
 
-### `_ORPHANED_TEMP_RE`, `write_table` temp suffix
+### `write_table` temp suffix
 
-Before the current temp naming, `NamedTemporaryFile` gave temp files a
-`.parquet` suffix. A crash between creating the file and renaming it left an
-empty `tmp*.parquet` inside a partition directory, and every `**/*.parquet`
-reader failed on it (#68). `write_table` now uses `.parquet.tmp`. Readers
-still skip the old pattern, because existing roots may contain such files.
+A local write goes to a temp file in the partition directory, then is renamed
+into place. The temp suffix is `.parquet.tmp`, not `.parquet`: a crash between
+creating the file and renaming it must not leave a file that every
+`**/*.parquet` reader picks up and fails on (#68).
 
 ## `completion.py` (the registry) and `datasets.py` (paths and shards)
 
@@ -308,7 +307,7 @@ Concurrency is capped at 10, botocore's default `max_pool_connections`. All
 the GETs share one cached client, and threads beyond the pool size only queue
 and log "connection pool is full".
 
-### `_relative_registry_key` (root-relative keys)
+### `_strip_registry_root` (root-relative keys)
 
 Keys used to store the whole path, root included. That made each entry larger
 (129 B vs 105 B, measured over 440,000 full-corpus-shaped entries). Less
@@ -316,17 +315,17 @@ obviously, it also made an artifact root non-portable. Copy a root, and every
 key still carries a prefix that no longer exists, so the copy's registry
 matches nothing and the whole corpus reads as unprocessed: #107's failure,
 arriving through `cp -r`. Keys are relativized only when they will read back
-through `_absolute_registry_key`. That keeps the two functions exact inverses,
-and the tests assert that property on this one-key pair.
+through `_prepend_registry_root`. That keeps the two functions exact inverses,
+and the tests assert that property key by key.
 
 ### `_REGISTRY_PREFIX_PROBE` (hoisted key prefixes)
 
 Both key prefixes are computed once per object read or written, not once per
 key (#227). Computed per key, `join_artifact_path` built a `pathlib.Path` and
-`_relative_registry_key` rebuilt a normalized prefix and an f-string, inside
+the key relativizer rebuilt a normalized prefix and an f-string, inside
 loops over every entry. On a 440,000-entry registry (local disk, best of
 three), that made the load 2.32 s, against 1.06 s for the old single object,
-and `_absolute_registry_key` took 56% of the save time under cProfile. With
+and the per-key root reattachment took 56% of the save time under cProfile. With
 the prefixes hoisted, the load takes 1.08 s. That matches the old object on a
 short root and beats it under a long absolute root (1.18 s vs 1.27 s), because
 the per-key cost no longer grows with the root's length.
@@ -378,12 +377,6 @@ exists, because ingest merges late rows into existing partition files in
 place. A check on the target path alone would strand those rows forever (#62).
 `item_ids` makes reprocessing row-level, so rows that already have a real
 outcome are never paid for twice (#49).
-
-### `existing_date_shard_partition_ids`
-
-The alternative, one HeadObject per candidate target, costs one sequential
-round trip for every partition ever written. Once the dataset is large, that
-dominates stage runtime (#83).
 
 ### `shard_label`, `normalize_cik`, `shard_for_cik`
 

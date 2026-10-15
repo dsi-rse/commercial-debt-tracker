@@ -67,7 +67,6 @@ PROGRESS_DAY_INTERVAL = 30
 # counted from the end so a multi-segment --s3-prefix cannot shift it.
 MANIFEST_KEY_CIK_INDEX_FROM_END = -3
 MIN_MANIFEST_KEY_PARTS = 5
-DEFAULT_OUTPUT_PREFIX = "processors/cdt"
 DOCUMENT_PARTITION_SHARDS = 64
 
 
@@ -218,7 +217,6 @@ class IngestConfig:
     cik_file: Path
     start_date: date
     end_date: date
-    data_dir: Path | None = None
     output_root: str | None = None
     force: bool = False
     #: Document rows buffered before each write. Each write rewrites the
@@ -260,11 +258,10 @@ class IngestRunResult:
 def documents_root(
     output_root: str | None = None,
     *,
-    data_dir: Path | None = None,
     dataset_name: str = DOCUMENT_DATASET_NAME,
 ) -> str:
     """Return the root URI for one canonical document dataset's partitions."""
-    return dataset_root(dataset_name, artifact_root=output_root, data_dir=data_dir)
+    return dataset_root(dataset_name, artifact_root=output_root)
 
 
 def normalize_accession_number(accession_number: str) -> str:
@@ -319,19 +316,17 @@ def run_ingest_pipeline(
         return resolved_client[0]
 
     normalized_ciks = _normalize_ciks(ciks)
-    output_root = config.output_root or default_artifact_root(config.data_dir)
+    output_root = config.output_root or default_artifact_root()
     documents_dataset_root = documents_root(
-        output_root, data_dir=config.data_dir, dataset_name=config.dataset_name
+        output_root, dataset_name=config.dataset_name
     )
     failure_file = config.failure_file or failure_registry_path(
-        "ingest", artifact_root=output_root, data_dir=config.data_dir
+        "ingest", artifact_root=output_root
     )
     if not str(failure_file).startswith("s3://"):
         Path(str(failure_file)).parent.mkdir(parents=True, exist_ok=True)
     run_id = _run_id()
-    run_manifest = run_manifest_path(
-        "ingest", run_id, artifact_root=output_root, data_dir=config.data_dir
-    )
+    run_manifest = run_manifest_path("ingest", run_id, artifact_root=output_root)
     failure_registry = FailureRegistry(
         str(failure_file),
         IngestFailureClassifier(),
@@ -535,37 +530,6 @@ def iter_manifest_keys_for_date_range(
         s3_prefix=s3_prefix,
         renew=renew,
     )
-
-
-def iter_filings(
-    s3_client: S3Client,
-    bucket: str,
-    form_types: str | Sequence[str],
-    start_date: date,
-    end_date: date,
-    *,
-    include_failures: bool = False,
-    ciks: set[str] | None = None,
-) -> Iterator[ScrapedFiling]:
-    """Yield filing manifests for exact form type prefixes over an inclusive date range."""
-    for manifest_key in _iter_manifest_keys(
-        s3_client,
-        bucket,
-        form_types,
-        start_date,
-        end_date,
-        ciks=_normalize_ciks(ciks),
-    ):
-        try:
-            manifest = _read_json_object(s3_client, bucket, manifest_key)
-        except Exception:
-            LOGGER.exception("Failed to read manifest: key=%s", manifest_key)
-            raise
-        filing = _filing_from_manifest(manifest)
-        if filing.failure_reason and not include_failures:
-            LOGGER.info("Skipping failed manifest %s", manifest_key)
-            continue
-        yield filing
 
 
 def s3_uri(bucket: str, key: str) -> str:

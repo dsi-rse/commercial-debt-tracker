@@ -7,7 +7,6 @@ from typing import Any
 
 from cdt.extractor.normalize.amounts import (
     is_rate_like_amount_text,
-    normalized_amount_from_text,
 )
 from cdt.extractor.normalize.dates import is_valid_iso_date, normalized_date_from_text
 from cdt.extractor.schema import (
@@ -125,7 +124,6 @@ def validate_instrument_entry(
 
 # Which amount kinds fit which instrument types: a facility has a commitment, a
 # security has a principal. Balances, draws, repayments and proceeds fit any.
-FACILITY_INSTRUMENT_TYPES = {"revolving_credit", "credit_line"}
 AMOUNT_KIND_TYPE_CONFLICTS = {
     ("commitment", "note_bond"),
     ("principal", "revolving_credit"),
@@ -285,18 +283,11 @@ def validate_standardized_single_value_cardinality(
         # Name spans carrying an embedded maturity are not comparable date mentions.
         and tag_details[tag_id]["type"] not in MATURITY_EVIDENCE_TAG_TYPES
     ]
-    if property_name == "amount":
-        normalized_values = {
-            parsed
-            for parsed in (normalized_amount_from_text(text) for text in evidence_texts)
-            if parsed is not None
-        }
-    else:
-        normalized_values = {
-            parsed
-            for parsed in (normalized_date_from_text(text) for text in evidence_texts)
-            if parsed is not None
-        }
+    normalized_values = {
+        parsed
+        for parsed in (normalized_date_from_text(text) for text in evidence_texts)
+        if parsed is not None
+    }
     if len(normalized_values) <= 1:
         return []
     return [

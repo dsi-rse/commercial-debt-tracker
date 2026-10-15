@@ -460,26 +460,23 @@ def canonical_scalar_fields(
     *,
     field_name: str,
     source_column: str,
-    existing_keys: tuple[str, ...] | None = None,
 ) -> dict[str, str | None]:
     """Return one canonical field and the mention it came from.
 
     The first non-null value across ``ordered_member_ids`` wins. Otherwise the
-    first non-null of ``existing_keys`` (default: the field) on the existing
-    row is carried with that row's recorded source; both None when neither has
-    one.
+    existing row's value is carried with that row's recorded source; both None
+    when neither has one.
     """
     for mention_id in ordered_member_ids:
         value = getattr(mention_index[mention_id], field_name)
         if value is not None:
             return {field_name: value, source_column: mention_id}
-    for key in existing_keys or (field_name,):
-        value = coerce_optional_text(existing_row.get(key))
-        if value is not None:
-            return {
-                field_name: value,
-                source_column: coerce_optional_text(existing_row.get(source_column)),
-            }
+    value = coerce_optional_text(existing_row.get(field_name))
+    if value is not None:
+        return {
+            field_name: value,
+            source_column: coerce_optional_text(existing_row.get(source_column)),
+        }
     return {field_name: None, source_column: None}
 
 

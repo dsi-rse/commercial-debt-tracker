@@ -9,7 +9,7 @@ from cdt.segmenter.sixk import (
     _to_windows,
     count_tokens,
     expand_admitted_windows,
-    matched_debt_keywords,
+    has_debt_keyword,
     prepare_filing,
     split_into_windows,
     strip_inline_xbrl_prologue,
@@ -34,13 +34,21 @@ def test_windows_cover_the_text_without_loss() -> None:
 
 def test_keyword_gate_matches_plurals() -> None:
     """The gate lemmatises trailing plurals so it does not miss filings."""
-    assert matched_debt_keywords(
-        "amended its credit agreements and two term loans"
-    ) == (
-        "credit agreement",
-        "term loan",
-    )
-    assert matched_debt_keywords("the debentures were issued") == ("debenture",)
+    for text, keyword in (
+        ("amended its credit agreements", "credit agreement"),
+        ("entered into two term loans", "term loan"),
+        ("the debentures were issued", "debenture"),
+    ):
+        assert has_debt_keyword(text, keywords=(keyword,)), text
+
+
+def test_keyword_gate_ignores_case() -> None:
+    """Filings capitalise defined terms, so the gate matches in any case."""
+    for text, keyword in (
+        ("entered into a new Term Loan", "term loan"),
+        ("the CREDIT AGREEMENT dated May 1", "credit agreement"),
+    ):
+        assert has_debt_keyword(text, keywords=(keyword,)), text
 
 
 def test_xbrl_prologue_stripped_but_prose_untouched() -> None:

@@ -22,6 +22,18 @@ def test_settings_uses_default_data_dir_when_env_missing(monkeypatch) -> None:  
     importlib.reload(cdt.settings)
 
 
+def test_settings_treats_an_empty_data_dir_as_unset(monkeypatch) -> None:  # noqa: ANN001
+    """An empty DATA_DIR means the default, not the project root."""
+    monkeypatch.setenv("DATA_DIR", "")
+    monkeypatch.setattr(dotenv, "load_dotenv", lambda *args, **kwargs: None)
+    reloaded = importlib.reload(cdt.settings)
+
+    assert reloaded.DATA_DIR == (reloaded.PROJECT_ROOT / "data").resolve()
+
+    monkeypatch.undo()
+    importlib.reload(cdt.settings)
+
+
 def test_settings_resolves_configured_data_dir(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
     """Configured DATA_DIR should still be resolved relative to the project root."""
     monkeypatch.setenv("DATA_DIR", str(tmp_path / "processor"))

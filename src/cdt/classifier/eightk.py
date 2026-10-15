@@ -37,18 +37,15 @@ STAGE_NAME = "classify"
 def classify_items(
     items: pd.DataFrame,
     *,
-    data_dir: Path | None = None,
     model_dir: Path | None = None,
-    force: bool = False,
     artifacts: tuple[object, float] | None = None,
 ) -> pd.DataFrame:
     """Classify in-memory item rows using a saved binary model.
 
     Adds ``label``, ``relevance``, ``classification_score`` and ``verdict``.
     ``artifacts`` is a pre-loaded ``(model, threshold)`` pair; None loads them
-    from ``model_dir`` (default ``default_model_dir()``). ``force`` is ignored.
+    from ``model_dir`` (default ``default_model_dir()``).
     """
-    del force
     if items.empty:
         return pd.DataFrame(columns=CLASSIFIED_ITEM_COLUMNS)
 
@@ -107,7 +104,6 @@ def item_partition_classifier(*, model_dir: Path | None = None) -> ClassifyParti
 def classify_pending_items(
     *,
     artifact_root: str | Path | None = None,
-    data_dir: Path | None = None,
     model_dir: Path | None = None,
     force: bool = False,
     renew: Callable[[], None] | None = None,
@@ -131,7 +127,6 @@ def classify_pending_items(
             source_path, partition, None
         ),
         artifact_root=artifact_root,
-        data_dir=data_dir,
         force=force,
         renew=renew,
     ).rows
@@ -140,7 +135,6 @@ def classify_pending_items(
 def retry_failed_items(
     *,
     artifact_root: str | Path | None = None,
-    data_dir: Path | None = None,
     model_dir: Path | None = None,
     renew: Callable[[], None] | None = None,
 ) -> RetryResult:
@@ -155,6 +149,5 @@ def retry_failed_items(
         output_columns=CLASSIFIED_ITEM_COLUMNS,
         classify_partition=item_partition_classifier(model_dir=model_dir),
         artifact_root=artifact_root,
-        data_dir=data_dir,
         renew=renew,
     )

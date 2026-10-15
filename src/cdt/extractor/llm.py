@@ -33,10 +33,7 @@ class OpenRouterChatClient:
     def __init__(self, *, api_key: str | None = None) -> None:
         self.api_key = api_key or settings.OPENROUTER_API_KEY
         if not self.api_key:
-            raise RuntimeError(
-                "OPENROUTER_API_KEY is required for cdt extractor. "
-                "OPENROUTER_API_TOKEN is also accepted as a compatibility alias."
-            )
+            raise RuntimeError("OPENROUTER_API_KEY is required for cdt extractor.")
 
     async def complete(
         self,

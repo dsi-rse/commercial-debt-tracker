@@ -14,7 +14,6 @@ import pytest
 
 from cdt.datasets import (
     SIXK_DOCUMENT_DATASET_NAME,
-    default_artifact_root,
     failure_registry_path,
     parse_date_shard_partition,
 )
@@ -24,18 +23,41 @@ from cdt.ingest.core import (
     _document_shard,
     _partition_path,
     documents_root,
-    iter_filings,
+    filing_from_manifest_key,
+    iter_manifest_keys_for_date_range,
     normalize_accession_number,
 )
-from cdt.ingest.eightk import (
-    acquire_documents,
-    acquire_documents_for_date_range,
-    acquire_eightk_documents,
-)
+from cdt.ingest.eightk import acquire_eightk_documents
 from cdt.storage.objects import list_artifacts
 from cdt.storage.tables import read_dataset, read_table, write_table
 
 EXPECTED_PARTITION_FILES = 3
+
+
+def _acquire(
+    client: object,
+    root: Path,
+    start_date: date,
+    end_date: date,
+    ciks: set[str],
+    **overrides: object,
+) -> pd.DataFrame:
+    """Run 8-K acquisition into ``root`` and return the documents it saw."""
+    documents, _ = acquire_eightk_documents(
+        IngestConfig(
+            mode="historical",
+            bucket="sec-bucket",
+            cik_file=Path(),
+            start_date=start_date,
+            end_date=end_date,
+            output_root=str(root),
+            **overrides,  # type: ignore[arg-type]
+        ),
+        ciks=ciks,
+        s3_client=client,  # type: ignore[arg-type]
+        return_documents=True,
+    )
+    return documents
 
 
 class FakePaginator:
@@ -81,7 +103,7 @@ def test_normalize_accession_number_strips_dashes() -> None:
     assert normalize_accession_number("0001140361-26-006577") == "000114036126006577"
 
 
-def test_acquire_documents_indexes_resources_without_downloading(
+def test_acquire_eightk_documents_indexes_resources_without_downloading(
     tmp_path: Path,
 ) -> None:
     """Acquisition records resource URIs without fetching document bodies."""
@@ -165,19 +187,9 @@ def test_acquire_documents_indexes_resources_without_downloading(
         }
     )
 
-    first = acquire_documents(
-        "sec-bucket",
-        2024,
-        {"320193"},
-        data_dir=tmp_path,
-        s3_client=client,
-    )
-    second = acquire_documents(
-        "sec-bucket",
-        2024,
-        {"320193"},
-        data_dir=tmp_path,
-        s3_client=client,
+    first = _acquire(client, tmp_path, date(2024, 1, 1), date(2024, 12, 31), {"320193"})
+    second = _acquire(
+        client, tmp_path, date(2024, 1, 1), date(2024, 12, 31), {"320193"}
     )
 
     assert first["accession_number"].to_list() == ["000114036126006577"]
@@ -192,15 +204,13 @@ def test_acquire_documents_indexes_resources_without_downloading(
         "sec-bucket",
         "sec/2024-01-03/8-K/789019/000000000024000001/manifest.json",
     ) not in client.manifest_reads
-    documents = read_dataset(documents_root(data_dir=tmp_path), columns=first.columns)
+    documents = read_dataset(documents_root(tmp_path), columns=first.columns)
     assert documents["accession_number"].to_list() == ["000114036126006577"]
     assert documents["company_name"].to_list() == [""]
-    assert (
-        len(list_artifacts(documents_root(data_dir=tmp_path), suffix=".parquet")) == 1
-    )
+    assert len(list_artifacts(documents_root(tmp_path), suffix=".parquet")) == 1
 
 
-def test_acquire_documents_writes_downloads_in_batches_when_requested(
+def test_acquire_eightk_documents_writes_downloads_in_batches_when_requested(
     tmp_path: Path,
 ) -> None:
     """Downloaded document bodies are flushed according to the batch size."""
@@ -253,13 +263,12 @@ def test_acquire_documents_writes_downloads_in_batches_when_requested(
             ): b"third",
         }
     )
-    table = acquire_documents_for_date_range(
-        "sec-bucket",
+    table = _acquire(
+        client,
+        tmp_path,
         date(2024, 1, 2),
         date(2024, 1, 4),
         {"320193"},
-        data_dir=tmp_path,
-        s3_client=client,
         flush_rows=2,
         download=True,
     )
@@ -276,12 +285,12 @@ def test_acquire_documents_writes_downloads_in_batches_when_requested(
         ("sec-bucket", "sec/2024-01-04/8-K/320193/000000000024000003/full.txt"),
     ]
     assert (
-        len(list_artifacts(documents_root(data_dir=tmp_path), suffix=".parquet"))
+        len(list_artifacts(documents_root(tmp_path), suffix=".parquet"))
         == EXPECTED_PARTITION_FILES
     )
 
 
-def test_acquire_documents_normalizes_bare_s3_keys(tmp_path: Path) -> None:
+def test_acquire_eightk_documents_normalizes_bare_s3_keys(tmp_path: Path) -> None:
     """Manifest document keys without an s3:// prefix are canonicalized."""
     client = FakeS3Client(
         {
@@ -303,14 +312,8 @@ def test_acquire_documents_normalizes_bare_s3_keys(tmp_path: Path) -> None:
         }
     )
 
-    table = acquire_documents_for_date_range(
-        "sec-bucket",
-        date(2024, 1, 2),
-        date(2024, 1, 2),
-        {"320193"},
-        data_dir=tmp_path,
-        s3_client=client,
-        download=True,
+    table = _acquire(
+        client, tmp_path, date(2024, 1, 2), date(2024, 1, 2), {"320193"}, download=True
     )
 
     assert table["resource_uri"].to_list() == [
@@ -321,7 +324,7 @@ def test_acquire_documents_normalizes_bare_s3_keys(tmp_path: Path) -> None:
     ]
 
 
-def test_acquire_documents_decompresses_gzip_downloads(tmp_path: Path) -> None:
+def test_acquire_eightk_documents_decompresses_gzip_downloads(tmp_path: Path) -> None:
     """Downloaded SEC document bodies should be decompressed before storage."""
     client = FakeS3Client(
         {
@@ -343,18 +346,12 @@ def test_acquire_documents_decompresses_gzip_downloads(tmp_path: Path) -> None:
         }
     )
 
-    table = acquire_documents_for_date_range(
-        "sec-bucket",
-        date(2024, 1, 2),
-        date(2024, 1, 2),
-        {"320193"},
-        data_dir=tmp_path,
-        s3_client=client,
-        download=True,
+    table = _acquire(
+        client, tmp_path, date(2024, 1, 2), date(2024, 1, 2), {"320193"}, download=True
     )
 
     partition_path = list_artifacts(
-        documents_root(data_dir=tmp_path),
+        documents_root(tmp_path),
         suffix=".parquet",
     )[0]
     downloaded = read_table(partition_path)
@@ -402,7 +399,7 @@ def test_ingest_records_missing_document_failures(tmp_path: Path) -> None:
         cik_file=tmp_path / "ciks.txt",
         start_date=date(2024, 1, 2),
         end_date=date(2024, 1, 2),
-        data_dir=tmp_path,
+        output_root=str(tmp_path),
         failure_file=tmp_path / "failures" / "ingest_failures.json",
     )
     first, result = acquire_eightk_documents(
@@ -450,7 +447,7 @@ def test_ingest_records_download_failures(tmp_path: Path) -> None:
             cik_file=tmp_path / "ciks.txt",
             start_date=date(2024, 1, 2),
             end_date=date(2024, 1, 2),
-            data_dir=tmp_path,
+            output_root=str(tmp_path),
             failure_file=failure_registry_path("ingest", artifact_root=tmp_path),
             download=True,
         ),
@@ -484,7 +481,7 @@ def test_ingest_without_an_injected_client_builds_one_from_the_profile(
             cik_file=tmp_path / "ciks.txt",
             start_date=date(2024, 1, 2),
             end_date=date(2024, 1, 2),
-            data_dir=tmp_path,
+            output_root=str(tmp_path),
             aws_profile="analysis",
         ),
         ciks={"320193"},
@@ -494,7 +491,28 @@ def test_ingest_without_an_injected_client_builds_one_from_the_profile(
     assert result.failures == 0
 
 
-def test_iter_filings_yields_manifest_objects_for_form_type_list() -> None:
+def _scan_filings(
+    client: object,
+    form_types: str | list[str],
+    start_date: date,
+    end_date: date,
+) -> list[object]:
+    """Read every filing the manifest scan finds, as ingest's candidate source does."""
+    keys = iter_manifest_keys_for_date_range(
+        client,  # type: ignore[arg-type]
+        "sec-bucket",
+        form_types,
+        start_date,
+        end_date,
+    )
+    filings = (
+        filing_from_manifest_key(client, "sec-bucket", key)  # type: ignore[arg-type]
+        for key in keys
+    )
+    return [filing for filing in filings if filing is not None]
+
+
+def test_manifest_scan_unions_form_type_prefixes() -> None:
     """Manifest iteration unions exact form type prefixes over the date range."""
     client = FakeS3Client(
         {
@@ -531,14 +549,8 @@ def test_iter_filings_yields_manifest_objects_for_form_type_list() -> None:
         }
     )
 
-    filings = list(
-        iter_filings(
-            client,
-            "sec-bucket",
-            ["8-K", "13F-HR"],
-            date(2024, 1, 2),
-            date(2024, 1, 3),
-        )
+    filings = _scan_filings(
+        client, ["8-K", "13F-HR"], date(2024, 1, 2), date(2024, 1, 3)
     )
 
     assert [filing.form_type for filing in filings] == ["8-K", "13F-HR"]
@@ -546,8 +558,8 @@ def test_iter_filings_yields_manifest_objects_for_form_type_list() -> None:
     assert filings[0].documents[0].type == "COMPLETE SUBMISSION TEXT FILE"
 
 
-def test_iter_filings_skips_failures_unless_requested() -> None:
-    """Failure manifests are available only when explicitly requested."""
+def test_manifest_scan_skips_upstream_failures() -> None:
+    """A manifest the scraper marked failed yields no filing."""
     client = FakeS3Client(
         {
             (
@@ -564,31 +576,10 @@ def test_iter_filings_skips_failures_unless_requested() -> None:
         }
     )
 
-    skipped = list(
-        iter_filings(
-            client,
-            "sec-bucket",
-            "8-K",
-            date(2024, 1, 2),
-            date(2024, 1, 2),
-        )
-    )
-    included = list(
-        iter_filings(
-            client,
-            "sec-bucket",
-            "8-K",
-            date(2024, 1, 2),
-            date(2024, 1, 2),
-            include_failures=True,
-        )
-    )
-
-    assert skipped == []
-    assert included[0].failure_reason == "api_error"
+    assert _scan_filings(client, "8-K", date(2024, 1, 2), date(2024, 1, 2)) == []
 
 
-def test_iter_filings_normalizes_amended_form_prefix() -> None:
+def test_manifest_scan_normalizes_amended_form_prefix() -> None:
     """SEC form slashes are normalized to scraper S3 prefixes."""
     client = FakeS3Client(
         {
@@ -605,15 +596,7 @@ def test_iter_filings_normalizes_amended_form_prefix() -> None:
         }
     )
 
-    filings = list(
-        iter_filings(
-            client,
-            "sec-bucket",
-            "10-K/A",
-            date(2024, 1, 2),
-            date(2024, 1, 2),
-        )
-    )
+    filings = _scan_filings(client, "10-K/A", date(2024, 1, 2), date(2024, 1, 2))
 
     assert filings[0].form_type == "10-K/A"
 
@@ -783,7 +766,7 @@ def test_acquire_eightk_documents_passes_force_and_prefix_to_the_manifest_walk(
             cik_file=tmp_path / "ciks.txt",
             start_date=date(2024, 1, 2),
             end_date=date(2024, 1, 2),
-            data_dir=tmp_path,
+            output_root=str(tmp_path),
             failure_file=failure_file,
             force=force,
             s3_prefix="custom",
@@ -889,7 +872,6 @@ def test_ingest_routes_configured_form_types_to_their_own_dataset(
             cik_file=Path(),
             start_date=date(2024, 1, 2),
             end_date=date(2024, 1, 4),
-            data_dir=tmp_path,
             output_root=str(tmp_path),
             form_types=("6-K", "6-K/A"),
             dataset_name=SIXK_DOCUMENT_DATASET_NAME,
@@ -962,7 +944,6 @@ def test_ingesting_six_k_leaves_the_eight_k_partitions_byte_identical(
         "cik_file": Path(),
         "start_date": date(2024, 1, 2),
         "end_date": date(2024, 1, 2),
-        "data_dir": tmp_path,
         "output_root": str(tmp_path),
     }
 
@@ -1053,7 +1034,6 @@ def test_partitions_written_before_the_provenance_columns_stay_readable(
             cik_file=Path(),
             start_date=date(2024, 1, 2),
             end_date=date(2024, 1, 2),
-            data_dir=tmp_path,
             output_root=str(tmp_path),
         ),
         ciks={"320193"},
@@ -1099,11 +1079,11 @@ def _document_row(accession: str, filing_date: str) -> dict[str, object]:
     }
 
 
-def _store_document(data_dir: Path, accession: str, filing_date: str) -> None:
+def _store_document(root: Path, accession: str, filing_date: str) -> None:
     from cdt.storage.tables import write_partition_table
 
     write_partition_table(
-        documents_root(data_dir=data_dir),
+        documents_root(str(root)),
         partition={"date": filing_date, "shard": _document_shard(accession)},
         table=pd.DataFrame(
             [_document_row(accession, filing_date)], columns=DOCUMENT_COLUMNS
@@ -1144,7 +1124,7 @@ def test_existing_accessions_reads_only_the_windowed_partitions(
 
     accessions = ingest._existing_accessions(
         "documents",
-        output_root=default_artifact_root(tmp_path),
+        output_root=str(tmp_path),
         start_date=date(2024, 1, 5),
         end_date=date(2024, 1, 6),
     )
@@ -1174,7 +1154,7 @@ def test_existing_accessions_projects_away_the_document_text(
 
     ingest._existing_accessions(
         "documents",
-        output_root=default_artifact_root(tmp_path),
+        output_root=str(tmp_path),
         start_date=date(2024, 1, 5),
         end_date=date(2024, 1, 5),
     )
@@ -1205,7 +1185,7 @@ def test_existing_accessions_scans_the_window_in_one_pass(
 
     accessions = ingest._existing_accessions(
         "documents",
-        output_root=default_artifact_root(tmp_path),
+        output_root=str(tmp_path),
         start_date=date(2024, 1, 5),
         end_date=date(2024, 1, 7),
     )
@@ -1249,7 +1229,7 @@ def test_reingest_inside_the_window_still_skips_the_download(tmp_path: Path) -> 
             cik_file=tmp_path / "ciks.txt",
             start_date=date(2024, 1, 2),
             end_date=date(2024, 1, 2),
-            data_dir=tmp_path,
+            output_root=str(tmp_path),
             download=True,
         ),
         ciks={"320193"},
@@ -1258,7 +1238,7 @@ def test_reingest_inside_the_window_still_skips_the_download(tmp_path: Path) -> 
 
     assert result.skipped_existing == 1
     assert client.downloads == []
-    documents = read_dataset(documents_root(data_dir=tmp_path))
+    documents = read_dataset(documents_root(tmp_path))
     assert documents["accession_number"].to_list() == [accession]
     assert documents["text"].to_list() == ["stored"]
 
@@ -1306,7 +1286,7 @@ def test_the_read_back_counts_the_window_without_reading_its_bodies(
         cik_file=tmp_path / "ciks.txt",
         start_date=date(2024, 1, 1),
         end_date=date(2024, 1, 31),
-        data_dir=tmp_path,
+        output_root=str(tmp_path),
     )
     table, result = acquire_eightk_documents(
         config, ciks={"320193"}, s3_client=FakeS3Client({})
@@ -1356,7 +1336,6 @@ def _two_day_config(tmp_path: Path) -> IngestConfig:
         cik_file=tmp_path / "ciks.txt",
         start_date=date(2024, 1, 2),
         end_date=date(2024, 1, 3),
-        data_dir=tmp_path,
         output_root=str(tmp_path),
         failure_file=tmp_path / "failures" / "ingest_failures.json",
     )

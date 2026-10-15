@@ -253,34 +253,6 @@ def count_tokens(text: str) -> int:
     return len(_get_encoding().encode(text))
 
 
-def matched_debt_keywords(
-    text: str,
-    *,
-    keywords: tuple[str, ...] = DEBT_KEYWORDS,
-) -> tuple[str, ...]:
-    """Return the debt keywords present in a text.
-
-    Args:
-        text: Text to search.
-        keywords: Vocabulary to match, in reporting order.
-
-    Returns:
-        Matching keywords in ``keywords`` order.
-
-    >>> matched_debt_keywords("entered into a new Term Loan and an indenture")
-    ('indenture', 'term loan')
-    >>> matched_debt_keywords("amended its credit agreements and two term loans")
-    ('credit agreement', 'term loan')
-    >>> matched_debt_keywords("the debenture was issued")
-    ('debenture',)
-    """
-    return tuple(
-        keyword
-        for keyword, pattern in _compiled_keywords(keywords)
-        if pattern.search(text)
-    )
-
-
 def has_debt_keyword(
     text: str,
     *,
@@ -1141,15 +1113,12 @@ def window_rows_for_submission(
 def window_documents(
     documents: pd.DataFrame,
     *,
-    data_dir: Path | None = None,
     s3_client: object | None = None,
 ) -> pd.DataFrame:
     """Window in-memory 6-K document rows into span rows (SIXK_WINDOW_COLUMNS)."""
     rows: list[dict[str, object]] = []
     for record in documents.to_dict("records"):
-        submission = document_text_for_record(
-            record, data_dir=data_dir, s3_client=s3_client
-        )
+        submission = document_text_for_record(record, s3_client=s3_client)
         rows.extend(window_rows_for_submission(record, submission))
     table = pd.DataFrame(rows, columns=SIXK_WINDOW_COLUMNS)
     for column in SIXK_WINDOW_INTEGER_COLUMNS:
@@ -1160,7 +1129,6 @@ def window_documents(
 def segment_pending_sixk_documents(
     *,
     artifact_root: str | Path | None = None,
-    data_dir: Path | None = None,
     force: bool = False,
     s3_client: object | None = None,
     renew: Callable[[], None] | None = None,
@@ -1171,7 +1139,7 @@ def segment_pending_sixk_documents(
     last segmented, or always with ``force``, and is recomputed whole. Returns
     the span rows written this run.
     """
-    resolved_root = resolve_artifact_root(artifact_root, data_dir=data_dir)
+    resolved_root = resolve_artifact_root(artifact_root)
     shared_client = s3_client
 
     def process(source_path: str, partition: dict[str, str]) -> PartitionOutput:
@@ -1182,9 +1150,7 @@ def segment_pending_sixk_documents(
         )
         shared_client = ensure_s3_client(shared_client, documents.to_dict("records"))
         return PartitionOutput(
-            rows=window_documents(
-                documents, data_dir=data_dir, s3_client=shared_client
-            ),
+            rows=window_documents(documents, s3_client=shared_client),
             source_rows=len(documents),
         )
 
@@ -1195,7 +1161,6 @@ def segment_pending_sixk_documents(
         output_columns=SIXK_WINDOW_COLUMNS,
         process=process,
         artifact_root=resolved_root,
-        data_dir=data_dir,
         force=force,
         renew=renew,
         manifest_extra={"window_tokens": WINDOW_TOKENS},
