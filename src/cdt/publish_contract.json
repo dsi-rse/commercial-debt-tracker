@@ -1,0 +1,579 @@
+{
+  "contract_version": 1,
+  "tables": {
+    "items": {
+      "primary_key": [
+        "item_id"
+      ],
+      "columns": [
+        {
+          "name": "item_id",
+          "type": "string"
+        },
+        {
+          "name": "item",
+          "type": "string"
+        },
+        {
+          "name": "accession_number",
+          "type": "string"
+        },
+        {
+          "name": "cik",
+          "type": "string"
+        },
+        {
+          "name": "company_name",
+          "type": "string"
+        },
+        {
+          "name": "url",
+          "type": "string"
+        },
+        {
+          "name": "text",
+          "type": "string"
+        },
+        {
+          "name": "date",
+          "type": "string"
+        },
+        {
+          "name": "resource_uri",
+          "type": "string"
+        },
+        {
+          "name": "item_information",
+          "type": "string"
+        },
+        {
+          "name": "extraction_status",
+          "type": "string"
+        },
+        {
+          "name": "duplicate_resolution",
+          "type": "string"
+        },
+        {
+          "name": "section_heading",
+          "type": "string"
+        },
+        {
+          "name": "start_line",
+          "type": "int64"
+        },
+        {
+          "name": "end_line",
+          "type": "int64"
+        },
+        {
+          "name": "section_char_count",
+          "type": "int64"
+        },
+        {
+          "name": "form_type",
+          "type": "string"
+        }
+      ]
+    },
+    "debt-instruments": {
+      "primary_key": [
+        "debt_instrument_id"
+      ],
+      "columns": [
+        {
+          "name": "debt_instrument_id",
+          "type": "string"
+        },
+        {
+          "name": "cik",
+          "type": "string"
+        },
+        {
+          "name": "company_name",
+          "type": "string"
+        },
+        {
+          "name": "seed_debt_instrument_mention_id",
+          "type": "string"
+        },
+        {
+          "name": "amendment_of_debt_instrument_id",
+          "type": "string"
+        },
+        {
+          "name": "retired_by_debt_instrument_ids",
+          "type": "string"
+        },
+        {
+          "name": "split_of_debt_instrument_id",
+          "type": "string"
+        },
+        {
+          "name": "superseded_by_debt_instrument_id",
+          "type": "string"
+        },
+        {
+          "name": "lineage_family_id",
+          "type": "string"
+        },
+        {
+          "name": "is_lineage_head",
+          "type": "bool"
+        },
+        {
+          "name": "first_seen_filing_date",
+          "type": "string"
+        },
+        {
+          "name": "last_seen_filing_date",
+          "type": "string"
+        },
+        {
+          "name": "mention_count",
+          "type": "int64"
+        },
+        {
+          "name": "document_count",
+          "type": "int64"
+        },
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "name_source_mention_id",
+          "type": "string"
+        },
+        {
+          "name": "instrument_type",
+          "type": "string"
+        },
+        {
+          "name": "instrument_type_source_mention_id",
+          "type": "string"
+        },
+        {
+          "name": "start_date",
+          "type": "string"
+        },
+        {
+          "name": "start_date_source_mention_id",
+          "type": "string"
+        },
+        {
+          "name": "maturity_date",
+          "type": "string"
+        },
+        {
+          "name": "maturity_source_mention_id",
+          "type": "string"
+        },
+        {
+          "name": "commitment_termination_date",
+          "type": "string"
+        },
+        {
+          "name": "commitment_termination_source_mention_id",
+          "type": "string"
+        },
+        {
+          "name": "principal_amount",
+          "type": "decimal128(38, 2)"
+        },
+        {
+          "name": "principal_currency",
+          "type": "string"
+        },
+        {
+          "name": "principal_amount_kind",
+          "type": "string"
+        },
+        {
+          "name": "principal_source_mention_id",
+          "type": "string"
+        },
+        {
+          "name": "outstanding_balance",
+          "type": "decimal128(38, 2)"
+        },
+        {
+          "name": "outstanding_balance_currency",
+          "type": "string"
+        },
+        {
+          "name": "outstanding_balance_as_of",
+          "type": "string"
+        },
+        {
+          "name": "outstanding_balance_as_of_is_filing_date",
+          "type": "bool"
+        },
+        {
+          "name": "outstanding_balance_source_mention_id",
+          "type": "string"
+        },
+        {
+          "name": "interest_rate_kind",
+          "type": "string"
+        },
+        {
+          "name": "interest_rate_pct",
+          "type": "decimal128(9, 4)"
+        },
+        {
+          "name": "interest_rate_source_mention_id",
+          "type": "string"
+        },
+        {
+          "name": "parties_json",
+          "type": "string"
+        },
+        {
+          "name": "lender_disclosure",
+          "type": "string"
+        },
+        {
+          "name": "amendment_inferred_by",
+          "type": "string"
+        },
+        {
+          "name": "synthesized_only",
+          "type": "bool"
+        }
+      ]
+    },
+    "debt-instrument-mentions": {
+      "primary_key": [
+        "debt_instrument_mention_id"
+      ],
+      "columns": [
+        {
+          "name": "debt_instrument_mention_id",
+          "type": "string"
+        },
+        {
+          "name": "item_id",
+          "type": "string"
+        },
+        {
+          "name": "accession_number",
+          "type": "string"
+        },
+        {
+          "name": "cik",
+          "type": "string"
+        },
+        {
+          "name": "company_name",
+          "type": "string"
+        },
+        {
+          "name": "date",
+          "type": "string"
+        },
+        {
+          "name": "raw_id",
+          "type": "string"
+        },
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "instrument_type",
+          "type": "string"
+        },
+        {
+          "name": "start_date",
+          "type": "string"
+        },
+        {
+          "name": "maturity_date",
+          "type": "string"
+        },
+        {
+          "name": "commitment_termination_date",
+          "type": "string"
+        },
+        {
+          "name": "principal_amount",
+          "type": "decimal128(38, 2)"
+        },
+        {
+          "name": "principal_currency",
+          "type": "string"
+        },
+        {
+          "name": "principal_amount_kind",
+          "type": "string"
+        },
+        {
+          "name": "status",
+          "type": "string"
+        },
+        {
+          "name": "status_date",
+          "type": "string"
+        },
+        {
+          "name": "interest_rate_kind",
+          "type": "string"
+        },
+        {
+          "name": "interest_rate_pct",
+          "type": "decimal128(9, 4)"
+        },
+        {
+          "name": "amendment_of",
+          "type": "string"
+        },
+        {
+          "name": "retired_by_json",
+          "type": "string"
+        },
+        {
+          "name": "split_of",
+          "type": "string"
+        },
+        {
+          "name": "parties_json",
+          "type": "string"
+        },
+        {
+          "name": "name_json",
+          "type": "string"
+        },
+        {
+          "name": "start_date_json",
+          "type": "string"
+        },
+        {
+          "name": "maturity_date_json",
+          "type": "string"
+        },
+        {
+          "name": "commitment_termination_date_json",
+          "type": "string"
+        },
+        {
+          "name": "amounts_json",
+          "type": "string"
+        },
+        {
+          "name": "status_json",
+          "type": "string"
+        },
+        {
+          "name": "interest_rate_json",
+          "type": "string"
+        },
+        {
+          "name": "dates_json",
+          "type": "string"
+        },
+        {
+          "name": "lender_disclosure",
+          "type": "string"
+        },
+        {
+          "name": "synthesized_by",
+          "type": "string"
+        },
+        {
+          "name": "synthesized_from_mention_id",
+          "type": "string"
+        }
+      ]
+    },
+    "mention-cluster-edges": {
+      "primary_key": [
+        "debt_instrument_mention_id",
+        "debt_instrument_id",
+        "edge_type"
+      ],
+      "columns": [
+        {
+          "name": "debt_instrument_mention_id",
+          "type": "string"
+        },
+        {
+          "name": "debt_instrument_id",
+          "type": "string"
+        },
+        {
+          "name": "cik",
+          "type": "string"
+        },
+        {
+          "name": "item_id",
+          "type": "string"
+        },
+        {
+          "name": "edge_type",
+          "type": "string"
+        },
+        {
+          "name": "match_score",
+          "type": "double"
+        },
+        {
+          "name": "candidate_rank",
+          "type": "int64"
+        },
+        {
+          "name": "match_via",
+          "type": "string"
+        },
+        {
+          "name": "evaluated_run_id",
+          "type": "string"
+        }
+      ]
+    },
+    "debt-instrument-redirects": {
+      "primary_key": [
+        "old_debt_instrument_id"
+      ],
+      "columns": [
+        {
+          "name": "old_debt_instrument_id",
+          "type": "string"
+        },
+        {
+          "name": "debt_instrument_id",
+          "type": "string"
+        },
+        {
+          "name": "cik",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "payloads": {
+    "spans": {
+      "version": 1,
+      "keys": [
+        "tag_id",
+        "char_start",
+        "char_end",
+        "text"
+      ]
+    },
+    "columns": {
+      "debt-instrument-mentions": {
+        "parties_json": {
+          "container": "array",
+          "version": 1,
+          "keys": [
+            "role",
+            "canonical_name",
+            "kind",
+            "spans"
+          ]
+        },
+        "name_json": {
+          "container": "object",
+          "version": 1,
+          "keys": [
+            "spans"
+          ]
+        },
+        "start_date_json": {
+          "container": "object",
+          "version": 1,
+          "keys": [
+            "normalized_date",
+            "derived_from",
+            "spans"
+          ]
+        },
+        "maturity_date_json": {
+          "container": "object",
+          "version": 1,
+          "keys": [
+            "normalized_date",
+            "derived_from",
+            "spans"
+          ]
+        },
+        "commitment_termination_date_json": {
+          "container": "object",
+          "version": 1,
+          "keys": [
+            "normalized_date",
+            "derived_from",
+            "spans"
+          ]
+        },
+        "amounts_json": {
+          "container": "array",
+          "version": 1,
+          "keys": [
+            "kind",
+            "normalized_amount",
+            "currency",
+            "as_of_date",
+            "prior",
+            "derived_from",
+            "spans"
+          ]
+        },
+        "dates_json": {
+          "container": "array",
+          "version": 1,
+          "keys": [
+            "kind",
+            "normalized_date",
+            "precision",
+            "prior",
+            "expected",
+            "derived_from",
+            "spans"
+          ]
+        },
+        "status_json": {
+          "container": "object",
+          "version": 1,
+          "keys": [
+            "status",
+            "status_date"
+          ]
+        },
+        "interest_rate_json": {
+          "container": "object",
+          "version": 1,
+          "keys": [
+            "kind",
+            "rate_pct",
+            "derived_from",
+            "spans"
+          ]
+        },
+        "retired_by_json": {
+          "container": "array",
+          "version": 1,
+          "items": "string"
+        }
+      },
+      "debt-instruments": {
+        "parties_json": {
+          "container": "array",
+          "version": 1,
+          "keys": [
+            "role",
+            "canonical_name",
+            "kind",
+            "spans"
+          ]
+        },
+        "retired_by_debt_instrument_ids": {
+          "container": "array",
+          "version": 1,
+          "items": "string"
+        }
+      }
+    }
+  }
+}

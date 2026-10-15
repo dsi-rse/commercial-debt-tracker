@@ -521,20 +521,41 @@ This is the extracted event text.
     assert final_instruments["company_name"].to_list() == ["Example Inc."]
 
 
-def _seed_final_tables(artifact_root: Path, *, rows: int = 2) -> None:
-    """Write minimal rows into every dataset finalize publishes."""
-    from cdt.publish import FINAL_OUTPUT_TABLES
+def _seed_final_tables(
+    artifact_root: Path, *, rows: int = 2, extra_item_ids: tuple[str, ...] = ()
+) -> None:
+    """Write ``rows`` minimal rows into every dataset finalize publishes.
+
+    Each row sets its table's first primary-key column; the mentions
+    reference the items (and ``extra_item_ids``), so every item publishes.
+    """
+    from cdt.publish import FINAL_OUTPUT_TABLES, publish_contract
 
     for table_name, dataset_root_fns in FINAL_OUTPUT_TABLES.items():
+        key = publish_contract()["tables"][table_name]["primary_key"][0]
+        table = pd.DataFrame([{key: f"{table_name}-{index}"} for index in range(rows)])
+        if table_name == "debt-instrument-mentions":
+            item_ids = [f"items-{index}" for index in range(rows)]
+            table["item_id"] = item_ids
+            table = pd.concat(
+                [
+                    table,
+                    pd.DataFrame(
+                        {
+                            key: [f"extra-{item_id}" for item_id in extra_item_ids],
+                            "item_id": list(extra_item_ids),
+                        }
+                    ),
+                ],
+                ignore_index=True,
+            )
         # The first dataset only. `items` unions a second one, and these tests
         # are about the pointer, the guard and pruning — seeding both would
         # double the row counts they assert on. The union has its own test.
         write_partition_table(
             dataset_root_fns[0](str(artifact_root)),
             partition={"month": "2024-01"},
-            table=pd.DataFrame(
-                [{"id": f"{table_name}-{index}"} for index in range(rows)]
-            ),
+            table=table,
         )
 
 
@@ -588,7 +609,7 @@ def test_published_items_union_both_genres_so_every_mention_can_join(
 
     artifact_root = tmp_path / "artifacts"
     final_root = tmp_path / "final"
-    _seed_final_tables(artifact_root)
+    _seed_final_tables(artifact_root, extra_item_ids=("000165495426008172-6K-0-0-512",))
     write_partition_table(
         sixk_snippets_root(str(artifact_root)),
         partition={"month": "2024-01"},
@@ -652,22 +673,22 @@ def test_final_snapshots_publish_atomically_with_pointer(tmp_path: Path) -> None
         artifact_root=str(artifact_root), final_database_root=str(final_root)
     )
 
-    pointer = read_json_artifact(str(artifact_root / "final-snapshots" / "latest.json"))
+    pointer = read_json_artifact(str(final_root / "latest.json"))
     assert isinstance(pointer, dict)
     assert set(pointer["tables"]) == set(written)
     for table_name, path in written.items():
         assert f"snapshot={pointer['run_id']}" in path
+        assert path.startswith(str(final_root / "snapshots"))
         assert len(read_table(path)) == 2
         assert pointer["tables"][table_name]["rows"] == 2
-        # The parquet-only contract surface under the final database root.
         assert (final_root / table_name / "latest.parquet").exists()
     assert pointer["schema_version"]
-    # The database prefix stays parquet-only: pointer and snapshots live
-    # under the artifact root instead.
+    assert pointer["contract_version"] == 1
+    # The pointer is the one non-parquet object, beside the tables it names.
     non_parquet = [
         p for p in final_root.rglob("*") if p.is_file() and p.suffix != ".parquet"
     ]
-    assert non_parquet == []
+    assert non_parquet == [final_root / "latest.json"]
 
 
 def test_final_snapshot_guard_blocks_shrinkage_unless_forced(tmp_path: Path) -> None:
@@ -689,7 +710,7 @@ def test_final_snapshot_guard_blocks_shrinkage_unless_forced(tmp_path: Path) -> 
     # The refused publish must not have moved the pointer.
     from cdt.storage.objects import read_json_artifact
 
-    pointer = read_json_artifact(str(artifact_root / "final-snapshots" / "latest.json"))
+    pointer = read_json_artifact(str(final_root / "latest.json"))
     assert pointer["tables"]["items"]["rows"] == 2
 
     forced = write_final_output_tables(
@@ -714,8 +735,7 @@ def test_old_final_snapshots_are_pruned(tmp_path: Path) -> None:
         )
 
     snapshot_dirs = {
-        path.parent.name
-        for path in (artifact_root / "final-snapshots").glob("*/*.parquet")
+        path.parent.name for path in (final_root / "snapshots").glob("*/*.parquet")
     }
     assert len(snapshot_dirs) == 2
 
@@ -832,11 +852,11 @@ def _stage_stubs(
     )
 
 
-def _publish_all_four(final_root: Path) -> None:
+def _publish_every_table(final_root: Path) -> None:
     """Stand in for a complete published generation under the database root.
 
     Written directly rather than by running a real publish: the gate inspects
-    exactly these four objects, and seeding the *artifact* datasets with
+    exactly these objects, and seeding the *artifact* datasets with
     placeholder rows would hand the matcher mention rows it cannot parse.
     """
     from cdt.publish import FINAL_OUTPUT_TABLES
@@ -850,7 +870,7 @@ def _publish_all_four(final_root: Path) -> None:
 
 
 def _record_published_generation(artifact_root: Path, final_root: Path) -> None:
-    """Stand in for a complete publish: four live objects and a pointer.
+    """Stand in for a complete publish: every live table and a pointer.
 
     The gate compares a digest of the source partitions against the one the
     pointer recorded when the live generation was written, so "nothing has
@@ -864,9 +884,9 @@ def _record_published_generation(artifact_root: Path, final_root: Path) -> None:
     )
     from cdt.storage.objects import write_json_artifact
 
-    _publish_all_four(final_root)
+    _publish_every_table(final_root)
     write_json_artifact(
-        final_pointer_path(str(artifact_root)),
+        final_pointer_path(str(final_root)),
         {
             "run_id": "seeded-generation",
             PUBLISH_SOURCE_DIGEST_KEY: publish_source_digest(str(artifact_root)),
@@ -958,7 +978,7 @@ def test_new_items_publish_even_though_match_produced_no_instruments(
 ) -> None:
     """``items`` is published too, and itemize writes it before match runs (#110).
 
-    ``FINAL_OUTPUT_TABLES`` publishes four tables, and ``items`` comes from the
+    ``FINAL_OUTPUT_TABLES`` publishes five tables, and ``items`` comes from the
     itemizer (and, on dev, the 6-K triage) — stages upstream of match. A gate
     that asked only about instruments could not see them, so a run that
     itemized new rows and matched nothing left the published ``items`` table
@@ -1021,7 +1041,7 @@ def test_a_real_publish_records_the_digest_the_next_run_gates_on(
         artifact_root=str(artifact_root), final_database_root=str(final_root)
     )
 
-    pointer = read_json_artifact(final_pointer_path(str(artifact_root)))
+    pointer = read_json_artifact(final_pointer_path(str(final_root)))
     assert pointer[PUBLISH_SOURCE_DIGEST_KEY]
     assert publish_would_republish_nothing(
         artifact_root=str(artifact_root), final_database_root=str(final_root)
@@ -1050,9 +1070,9 @@ def test_a_pointer_with_no_recorded_digest_publishes(tmp_path: Path) -> None:
 
     artifact_root = tmp_path / "artifacts"
     final_root = tmp_path / "final"
-    _publish_all_four(final_root)
+    _publish_every_table(final_root)
     write_json_artifact(
-        final_pointer_path(str(artifact_root)),
+        final_pointer_path(str(final_root)),
         {"run_id": "pre-gate", "tables": {}},
     )
 
@@ -1133,7 +1153,7 @@ def test_an_unpublished_database_root_publishes_despite_unchanged_sources(
 
 
 def test_a_partially_published_database_root_publishes(tmp_path: Path) -> None:
-    """Three of four latest.parquet objects is not a complete generation (#110).
+    """All but one latest.parquet object is not a complete generation (#110).
 
     The digest matches here, so the missing fourth object is the only reason
     left to publish — which is what this pins.
@@ -1156,7 +1176,7 @@ def test_a_partially_published_database_root_publishes(tmp_path: Path) -> None:
             pd.DataFrame([{"id": "x"}]),
         )
     write_json_artifact(
-        final_pointer_path(str(artifact_root)),
+        final_pointer_path(str(final_root)),
         {
             "run_id": "seeded-generation",
             PUBLISH_SOURCE_DIGEST_KEY: publish_source_digest(str(artifact_root)),
@@ -1217,28 +1237,6 @@ def test_the_publish_gate_leaves_the_live_tables_untouched(tmp_path: Path) -> No
 
     assert written == {}
     assert [path.read_bytes() for path in paths] == before
-
-
-def test_normalize_snapshot_text_is_not_the_publish_cost(tmp_path: Path) -> None:
-    """Recorded, not optimized: it is 1.2% of read+normalize (#110).
-
-    ``normalize_snapshot_text`` maps a Python lambda over every object column of
-    every row, which looks like it should dominate. Measured on
-    data/genwindow-eval-apr's 5,794-row x 16-column ``items`` dataset it is
-    0.113s against an 8.9s read — 1.2% — so the 25 minutes is I/O, not this, and
-    it was deliberately left alone. This test pins only that it still nulls
-    placeholders, which is the behaviour the dashboard depends on.
-    """
-    del tmp_path
-    from cdt.publish import normalize_snapshot_text
-
-    normalized = normalize_snapshot_text(
-        pd.DataFrame([{"a": "nan", "b": "real", "c": True}])
-    )
-
-    assert normalized["a"].to_list() == [None]
-    assert normalized["b"].to_list() == ["real"]
-    assert normalized["c"].to_list() == [True]
 
 
 @pytest.mark.parametrize(

@@ -152,7 +152,7 @@ instruments as lineage heads (#170).
 
 ### `write_final_output_tables` (atomic generation)
 
-Writing four separate `<table>/latest.parquet` objects in a loop can never be
+Writing separate `<table>/latest.parquet` objects in a loop can never be
 consistent as a set (#91):
 
 - a consumer polling mid-loop reads mixed generations, such as mentions that
@@ -161,19 +161,51 @@ consistent as a set (#91):
 - an accidentally empty dataset overwrites a good snapshot with zero rows.
 
 So each publish first writes the whole generation under an immutable
-`final-snapshots/snapshot=<run_id>/` prefix under the artifact root. Then it
-replaces a single `latest.json` pointer, as the last atomic step. Consumers
-that need a consistent four-table generation should resolve that pointer. Only
-after that are the per-table `latest.parquet` objects under the final database
-root refreshed. Each of those objects is atomic on its own, but the set is not
-consistent mid-publish.
+`snapshots/snapshot=<run_id>/` prefix. Then it replaces a single `latest.json`
+pointer, as the last atomic step. Consumers that need a consistent generation
+resolve that pointer. Only after that are the per-table `latest.parquet`
+objects refreshed, as copies of the snapshot files. Each of those objects is
+atomic on its own, but the set is not consistent mid-publish.
 
-### `final_snapshots_root`
+### `final_pointer_path`, `final_snapshots_root`
 
-The snapshots live under the artifact root, not the final database root. The
-final database prefix is a parquet-only contract for downstream consumers, so
-the control metadata (`latest.json`) and the immutable generation copies stay
-with the pipeline's other artifacts.
+The pointer and the generations live under the final database root, beside
+the tables. When they lived under the artifact root, the website could not
+resolve a generation without reading the pipeline's working prefix, so it read
+the four `latest.parquet` files directly and could read a mix of two
+generations.
+
+### The publish contract and `conform_to_contract`
+
+The website could not read CDT's output (#257): columns had been renamed
+(`amount` to `principal_amount`, `end_date` to `maturity_date`,
+`lenders_json` to `parties_json`), and payload shapes had changed (evidence
+`mentions` became `spans`; parties gained a `role`). Renaming columns alone
+would have left the evidence highlights and lender lists silently empty. Only
+`items` was cut to a column list; the other tables published whatever was on
+disk. `publish_contract.json` is now the one statement of what the website
+reads, every table is conformed to it, and a test checks it against the code
+and against the payloads a publish writes. On `genwindow-run-branch`, all 7,280
+payloads of the published instruments and mentions match it.
+
+### `REFERENCED_ITEMS_TABLE`: only items some mention cites
+
+About 17% of items are referenced by a mention (measured), so publishing
+every item would carry an estimated 2 GB of text at full scope to serve
+0.4–0.5 GB of it. The
+website then fetches item text by `item_id` rather than embedding it.
+
+### `_stream_published_table` (memory)
+
+The publish used to read every row of every table, item text included, into
+pandas and then copy it to null placeholders: an estimated 10 GB, 20 GB at
+peak, at full scope, on a 4 GB task. It now streams one source partition at a
+time through Arrow, never pandas, and hands each partition's memory back to
+the system before the next (`release_unused`; without it the allocator kept
+growing by 15–30 MB per partition even with nothing live). Measured publishing
+`genwindow-eval-apr`'s items replicated 1×, 4× and 16× (5,794 to 92,704 items,
+14 to 224 MB of text): peak RSS 292, 322 and 353 MB, against 392, 627 and
+948 MB before.
 
 ### `_prune_old_snapshots`
 
@@ -185,9 +217,9 @@ moments ago can still finish reading it.
 A table that shrinks below half its published row count blocks the publish
 unless `--force-publish` is passed. The likeliest causes are a bug or a half-built artifact
 root, not a real mass deletion of filings. The prior counts come from the
-published `latest.parquet` footers, not from the pointer. The pointer lives
-with the artifact root, so a half-built or newly pointed artifact root has no
-pointer, and that is exactly the case that must not overwrite a good database.
+published `latest.parquet` footers, not from the pointer: a database whose
+pointer is missing must still not be overwritten by a half-built artifact
+root.
 Footer metadata gives the counts without decoding any columns.
 
 ### `publish_would_republish_nothing` (the skip gate)
@@ -214,8 +246,8 @@ Three things stop the gate from blocking every publish:
   time.
 - A final database root missing any `latest.parquet` publishes regardless.
   Otherwise a newly pointed output root would stay empty until someone passed
-  `--force-publish`. The check costs four HEAD requests on objects the publish would
-  write anyway.
+  `--force-publish`. The check costs one HEAD request per table, on objects the
+  publish would write anyway.
 
 A run that crashed between writing a dataset and publishing it needs no
 override to recover: the datasets changed, so the digest changed, so the next
@@ -233,8 +265,8 @@ With no final database root the gate answers True without listing anything:
 
 ### `PUBLISH_SOURCE_DIGEST_KEY` (recorded last)
 
-The digest is written into the pointer only after all four `latest.parquet`
-objects are written (#222). When it was recorded with the first pointer write,
+The digest is written into the pointer only after every `latest.parquet`
+copy is written (#222). When it was recorded with the first pointer write,
 a crash in the table loop left a pointer whose digest matched while the
 database root still held the previous tables, and every later run skipped the
 publish. Now a crash leaves no digest, which the gate treats as "unknown" and

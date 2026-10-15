@@ -215,16 +215,16 @@ Normal daily processing is:
 4. when an extract job completes, that poll tick writes new `mentions` partitions and
    re-runs match + finalize
 5. outputs land under the configured artifact root in S3, and if `FINAL_DATABASE_ROOT` is
-   set, finalize publishes in two layers. Consistent generations live under the
-   **artifact root**: the four tables are written to an immutable
-   `<artifact root>/final-snapshots/snapshot=<run_id>/<table>.parquet` prefix, then a
-   single `latest.json` pointer there (run id, schema version, per-table row counts and
-   paths) is replaced as the last, atomic step — resolve the pointer to read a
-   consistent generation across all four tables. The **final database root stays
-   parquet-only**: `<table>/latest.parquet` per table, refreshed after the pointer; each
-   object is individually atomic but the set is not consistent mid-publish. A publish
-   that would shrink a table below half its prior row count (or empty it) is refused
-   unless forced. Only the current and prior generations are retained.
+   set, finalize publishes the five contract tables (`src/cdt/publish_contract.json`)
+   under it. Each is streamed to an immutable
+   `<final database root>/snapshots/snapshot=<run_id>/<table>.parquet`, then a single
+   `<final database root>/latest.json` pointer (run id, schema and contract versions,
+   per-table row counts and paths) is replaced as the atomic step — resolve the pointer
+   to read a consistent generation across all tables. Each table is then copied to
+   `<table>/latest.parquet`; each copy is atomic but the set is not consistent
+   mid-publish. A publish that would shrink a table below half its prior row count (or
+   empty it) is refused unless forced. Only the current and prior generations are
+   retained.
 6. the website publisher ([dsi-rse/commercial-debt-tracker-website](https://github.com/dsi-rse/commercial-debt-tracker-website)) reads the final
    database root's parquet and publishes `generated/*` JSON to R2; if it needs
    cross-table consistency, it should resolve the `latest.json` pointer instead.
@@ -378,8 +378,8 @@ launch day — but do it in order then.
    narrow date range (admin credentials; see Historical Backfills). Verify document/
    item/classification partitions appear under `processors/cdt/`, a manual
    (or scheduled) poll tick drains the extract job, `database/cdt/` holds
-   exactly the four `latest.parquet` tables, and
-   `processors/cdt/final-snapshots/latest.json` points at a consistent
+   the five `latest.parquet` tables, and `database/cdt/latest.json` points at a
+   consistent
    generation with sane row counts.
 7. **Remint instrument ids** once the backfill has extracted and matched, and
    before the first public publish: `cdt match --remint` gives every

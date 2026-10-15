@@ -25,9 +25,9 @@ Two schema-wide contracts:
   mentions/
   mention-cluster-edges/
   debt-instruments/
+  debt-instrument-redirects/
   extractor-runs/
   extract-batches/
-  final-snapshots/
   runs/
   failures/
   locks/
@@ -39,13 +39,27 @@ Optional final snapshot layout:
 
 ```text
 <final-database-root>/
+  latest.json                                   # the generation pointer
+  snapshots/snapshot=<run_id>/<table>.parquet   # the current and prior generation
   items/latest.parquet
   debt-instruments/latest.parquet
   debt-instrument-mentions/latest.parquet
   mention-cluster-edges/latest.parquet
+  debt-instrument-redirects/latest.parquet
 ```
 
-`debt-instrument-mentions` is the `mentions` dataset. `items` is the union of `items` (8-K) and `sixk-snippets` (6-K), projected to the `items` columns plus a `form_type` column stamped `8-K` or `6-K` by the dataset each row came from. The `final-snapshots/latest.json` pointer under the artifact root names the current consistent four-table generation.
+Every published table has exactly the columns and Arrow types `src/cdt/publish_contract.json` lists, and every `*_json` column there has its documented shape (see [Publish contract](#publish-contract)). `debt-instrument-mentions` is the `mentions` dataset. `items` is the union of `items` (8-K) and `sixk-snippets` (6-K), cut to the rows some mention references, projected to the `items` columns plus a `form_type` column stamped `8-K` or `6-K` by the dataset each row came from. `latest.json` names the current consistent generation: run id, `schema_version`, `contract_version`, `publish_format_version`, and each table's snapshot path and row count. A reader resolves every table from it; each `<table>/latest.parquet` is a copy refreshed after the pointer, atomic on its own but not consistent as a set mid-publish.
+
+### Publish contract
+
+`src/cdt/publish_contract.json` is owned by CDT and vendored by the website. It holds:
+
+- `contract_version`, stamped into `latest.json`; changing the contract bumps it and `publish.PUBLISH_FORMAT_VERSION`.
+- `tables`: each published table's `primary_key` and `columns` (name and Arrow type, in order). The publish writes exactly these, so a column on disk that the contract does not name is never published.
+- `payloads.spans`: the keys every evidence span carries.
+- `payloads.columns`: for each `*_json` column, its `container` (`object`, or `array` of objects or of strings), the `keys` every object always carries, and a `version`.
+
+`tests/test_publish_contract.py` checks that the contract names exactly the code's column lists with the declared types, and that a published fixture's tables and payloads have the contract's shapes.
 
 ## Partitioning Rules
 
@@ -541,7 +555,7 @@ The match manifest records `rebuild_all`, `remint`, `ciks_matched`,
 `ciks_removed`, `inferred_lineage_links` and the thresholds alongside the
 shards it rewrote.
 
-The match manifest and the `final-snapshots/latest.json` pointer carry
+The match manifest and the `<final-database-root>/latest.json` pointer carry
 `schema_version` (`MATCHER_SCHEMA_VERSION`, currently 8). It is bumped whenever a
 `debt-instruments` or `mention-cluster-edges` column is added or removed.
 `match_pending_mentions` reads the recorded value back and **re-clusters every

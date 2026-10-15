@@ -377,7 +377,7 @@ def _final_database_root_option() -> argparse.ArgumentParser:
     parser.add_argument(
         "--final-database-root",
         default=_env_default("--final-database-root"),
-        help="where the four latest.parquet tables are published, a local path "
+        help="where the published tables and their latest.json pointer go, a local path "
         "or s3:// URI (env FINAL_DATABASE_ROOT; unset publishes nothing)",
     )
     return parser
@@ -582,7 +582,7 @@ def _add_publish(commands: argparse._SubParsersAction) -> None:
             _final_database_root_option(),
             _force_publish_option(),
         ],
-        help="write the four latest.parquet tables from the current datasets",
+        help="write the published tables from the current datasets",
     )
     publish.set_defaults(func=run_publish)
 

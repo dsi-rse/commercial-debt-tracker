@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 from collections.abc import Collection, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -207,6 +208,21 @@ def read_table(
     return table.reindex(columns=requested)
 
 
+def read_arrow_table(path: ArtifactPath, columns: Sequence[str]) -> pa.Table:
+    """Read the ``columns`` a Parquet file has as an Arrow table; empty if absent.
+
+    Requested columns the file lacks are left out, not filled: the caller
+    knows their types and adds them.
+    """
+    normalized = normalize_artifact_path(path)
+    try:
+        parquet_file = _open_parquet_file(normalized)
+    except FileNotFoundError:
+        return pa.table({})
+    available = set(parquet_file.schema_arrow.names)
+    return parquet_file.read(columns=[name for name in columns if name in available])
+
+
 def count_table_rows(path: ArtifactPath) -> int | None:
     """Return a parquet table's row count from its footer alone; None if absent."""
     normalized = normalize_artifact_path(path)
@@ -384,6 +400,40 @@ def write_table(path: ArtifactPath, table: pd.DataFrame) -> str:
         if temp_path.exists():
             temp_path.unlink()
     return str(local_path)
+
+
+@contextmanager
+def parquet_table_writer(
+    path: ArtifactPath, schema: pa.Schema
+) -> Iterator[pyarrow.parquet.ParquetWriter]:
+    """Write one Parquet file a batch at a time; it appears only when complete.
+
+    Yields a ``ParquetWriter`` for ``schema``. The file is written to a local
+    temporary file, then renamed into place, or uploaded to S3 (multipart for
+    a large file). An exception leaves nothing at ``path``. Memory is bounded
+    by one batch; the file itself is on local disk until it is moved.
+    """
+    normalized = normalize_artifact_path(path)
+    on_s3 = is_s3_uri(normalized)
+    directory = None if on_s3 else Path(normalized).parent
+    if directory is not None:
+        directory.mkdir(parents=True, exist_ok=True)
+    # Not ending in .parquet, so a reader never picks up a partial file.
+    with NamedTemporaryFile(
+        dir=directory, suffix=".parquet.tmp", delete=False
+    ) as temp_file:
+        temp_path = Path(temp_file.name)
+    try:
+        with pyarrow.parquet.ParquetWriter(temp_path, schema) as writer:
+            yield writer
+        if on_s3:
+            bucket, key = parse_s3_uri(normalized)
+            s3_client().upload_file(str(temp_path), bucket, key)
+        else:
+            temp_path.replace(normalized)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
 
 def write_partition_table(

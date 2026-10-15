@@ -75,7 +75,7 @@ cdt segment    8-K item sections and 6-K window spans                 (cdt.segme
 cdt classify   8-K item relevance and 6-K triage; `classify train`    (cdt.classifier)
 cdt extract    a batch tick (default) or `--backend live`; `extract job`  (cdt.extractor)
 cdt match      instruments and lineage                                (cdt.matcher)
-cdt publish    the four latest.parquet tables                         (cdt.publish)
+cdt publish    the published tables, cut to publish_contract.json     (cdt.publish)
 cdt run daily | historical | poll                                     (cdt.run)
 ```
 
@@ -120,7 +120,7 @@ For local development with a shared `DATA_DIR`:
 
 - CDT writes canonical working artifacts to `DATA_DIR`
 - CDT writes dashboard-facing final snapshots to `DATA_DIR/database/cdt`
-- the website repo reads those four `latest.parquet` files and builds its local `generated/*.json` snapshot from them
+- the website repo reads the `latest.json` pointer there (or the `latest.parquet` files) and builds its local `generated/*.json` snapshot from them; `src/cdt/publish_contract.json` lists every column and payload shape it can rely on
 
 The dashboard-facing files are:
 
@@ -128,6 +128,8 @@ The dashboard-facing files are:
 - `debt-instruments/latest.parquet`
 - `debt-instrument-mentions/latest.parquet`
 - `mention-cluster-edges/latest.parquet`
+- `debt-instrument-redirects/latest.parquet`
+- `latest.json`, the pointer to the current consistent generation under `snapshots/`
 
 This mirrors the cloud contract: in deployment, CDT writes the same final snapshots to S3, and the dashboard publisher turns them into `generated/*` JSON for R2.
 

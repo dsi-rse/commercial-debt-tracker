@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import shutil
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -493,6 +494,31 @@ def read_gzip_text_artifact(path: ArtifactPath) -> str:
     else:
         body = Path(normalized).read_bytes()
     return gzip.decompress(body).decode("utf-8")
+
+
+def copy_artifact(source: ArtifactPath, target: ArtifactPath) -> str:
+    """Copy one object to another path; return the target path.
+
+    Both paths must be on S3 or both local. On S3 this is a server-side copy
+    (multipart past 5 GB), so the bytes never pass through this process; a
+    local copy is written beside the target and renamed into place.
+    """
+    source_path = normalize_artifact_path(source)
+    target_path = normalize_artifact_path(target)
+    if is_s3_uri(source_path) != is_s3_uri(target_path):
+        msg = f"Cannot copy between S3 and local paths: {source_path} -> {target_path}"
+        raise ValueError(msg)
+    if is_s3_uri(target_path):
+        source_bucket, source_key = parse_s3_uri(source_path)
+        bucket, key = parse_s3_uri(target_path)
+        s3_client().copy({"Bucket": source_bucket, "Key": source_key}, bucket, key)
+        return target_path
+    destination = Path(target_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial = destination.with_name(f"{destination.name}.partial")
+    shutil.copyfile(source_path, partial)
+    partial.replace(destination)
+    return str(destination)
 
 
 def delete_artifact(path: ArtifactPath) -> None:
