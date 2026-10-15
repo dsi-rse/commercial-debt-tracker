@@ -101,7 +101,7 @@ def test_match_pending_mentions_carries_lender_disclosure(tmp_path: Path) -> Non
     )
     write_partition_table(
         tmp_path / "mentions",
-        partition={"date": "2024-01-02", "shard": "0001"},
+        partition={"month": "2024-01"},
         table=mention_rows,
     )
 
@@ -147,7 +147,7 @@ def test_match_reads_a_partition_written_before_a_json_column_existed(
     legacy = pd.DataFrame([{k: v for k, v in row.items() if k not in absent}])
     write_partition_table(
         tmp_path / "mentions",
-        partition={"date": "2024-01-02", "shard": "0001"},
+        partition={"month": "2024-01"},
         table=legacy,
     )
     # Pin the premise: if a future writer starts backfilling these columns this
@@ -218,7 +218,7 @@ def test_match_pending_mentions_writes_match_datasets(tmp_path: Path) -> None:
     )
     write_partition_table(
         tmp_path / "mentions",
-        partition={"date": "2024-01-02", "shard": "0001"},
+        partition={"month": "2024-01"},
         table=mention_rows,
     )
 
@@ -354,7 +354,7 @@ def _ordinal_chain_root(tmp_path: Path, **mention_overrides: object) -> Path:
     )
     write_partition_table(
         tmp_path / "mentions",
-        partition={"date": "2024-01-02", "shard": "0001"},
+        partition={"month": "2024-01"},
         table=rows,
     )
     match_pending_mentions(artifact_root=tmp_path)
@@ -444,7 +444,7 @@ def test_lineage_pass_never_reopens_an_extracted_pointer(tmp_path: Path) -> None
     )
     write_partition_table(
         tmp_path / "mentions",
-        partition={"date": "2024-01-02", "shard": "0001"},
+        partition={"month": "2024-01"},
         table=rows,
     )
     match_pending_mentions(artifact_root=tmp_path)
@@ -539,7 +539,7 @@ def test_lineage_inference_pass_writes_pointers_and_rederives_the_rollup(
     )
     write_partition_table(
         tmp_path / "mentions",
-        partition={"date": "2024-01-02", "shard": "0001"},
+        partition={"month": "2024-01"},
         table=rows,
     )
     match_pending_mentions(artifact_root=tmp_path)
@@ -611,12 +611,12 @@ def test_match_pending_mentions_drains_all_shards(tmp_path: Path) -> None:
     )
     write_partition_table(
         tmp_path / "mentions",
-        partition={"date": "2024-01-02", "shard": "0001"},
+        partition={"month": "2024-01"},
         table=mention_rows.iloc[[0]],
     )
     write_partition_table(
         tmp_path / "mentions",
-        partition={"date": "2024-01-03", "shard": "0002"},
+        partition={"month": "2024-02"},
         table=mention_rows.iloc[[1]],
     )
 
@@ -665,12 +665,12 @@ def test_match_pending_mentions_force_rebuilds_existing_memberships(
     )
     write_partition_table(
         tmp_path / "mentions",
-        partition={"date": "2024-01-01", "shard": "0001"},
+        partition={"month": "2024-01"},
         table=mention_rows.iloc[[0]],
     )
     write_partition_table(
         tmp_path / "mentions",
-        partition={"date": "2024-01-02", "shard": "0001"},
+        partition={"month": "2024-02"},
         table=mention_rows.iloc[[1]],
     )
 
@@ -1261,12 +1261,12 @@ def test_match_tables_still_attaches_an_add_on_to_its_series() -> None:
 
 def test_match_pending_mentions_renews_lease_per_shard(tmp_path: Path) -> None:
     """The matcher extends the writer lease before rewriting each shard (#89)."""
-    for index, (cik, date_value, shard) in enumerate(
-        [("320193", "2024-01-02", "0001"), ("789019", "2024-01-03", "0002")], start=1
+    for index, (cik, date_value) in enumerate(
+        [("320193", "2024-01-02"), ("789019", "2024-02-03")], start=1
     ):
         write_partition_table(
             tmp_path / "mentions",
-            partition={"date": date_value, "shard": shard},
+            partition={"month": date_value[:7]},
             table=pd.DataFrame(
                 [
                     build_mention_row(
@@ -1876,7 +1876,7 @@ def test_a_root_matched_under_an_older_schema_forces_a_full_rematch(
     )
     write_partition_table(
         tmp_path / "mentions",
-        partition={"date": "2024-01-02", "shard": "0001"},
+        partition={"month": "2024-01"},
         table=rows,
     )
     match_pending_mentions(artifact_root=tmp_path)

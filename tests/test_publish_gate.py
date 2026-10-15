@@ -119,7 +119,7 @@ def test_a_source_written_while_the_publish_reads_is_not_recorded_as_published(
             writes.append("late")
             write_partition_table(
                 artifact_root / "items",
-                partition={"date": "2022-01-03", "shard": "0001"},
+                partition={"month": "2022-01"},
                 table=pd.DataFrame([{"item_id": "item-late"}]),
             )
         return real_read_dataset(*args, **kwargs)
@@ -189,7 +189,7 @@ def test_every_source_root_moves_the_digest(tmp_path: Path) -> None:
         before = publish_source_digest(str(artifact_root))
         write_partition_table(
             root,
-            partition={"date": "2022-01-02", "shard": f"{index:04d}"},
+            partition={"month": f"2022-{index + 1:02d}"},
             table=pd.DataFrame([{"id": f"row-{index}"}]),
         )
         assert publish_source_digest(str(artifact_root)) != before, root

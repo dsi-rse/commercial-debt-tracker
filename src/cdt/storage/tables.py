@@ -39,15 +39,19 @@ def iter_partition_paths(
     *,
     partition_filter: dict[str, str] | None = None,
 ) -> Iterator[str]:
-    """Yield partition file paths under a dataset, optionally filtered by key/value."""
+    """Yield partition file paths under a dataset, optionally filtered by key/value.
+
+    A filter entry matches one whole ``key=value`` path segment, so
+    ``shard=0001`` does not match ``cik_shard=0001`` and ``month=2026-0`` does
+    not match ``month=2026-01``.
+    """
+    wanted = {f"{key}={value}" for key, value in (partition_filter or {}).items()}
     for path in list_artifacts(base, suffix=".parquet"):
-        if partition_filter is None:
+        if not wanted:
             yield path
             continue
-        normalized = normalize_artifact_path(path)
-        if all(
-            f"{key}={value}" in normalized for key, value in partition_filter.items()
-        ):
+        segments = set(normalize_artifact_path(path).split("/"))
+        if wanted <= segments:
             yield path
 
 

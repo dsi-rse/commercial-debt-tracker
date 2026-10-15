@@ -282,7 +282,7 @@ def _seed_classifications(
         rows.append(row)
     write_partition_table(
         str(classifications_root(tmp_path)),
-        partition={"date": date, "shard": "0001"},
+        partition={"month": date[:7]},
         table=pd.DataFrame(rows, columns=CLASSIFIED_ITEM_COLUMNS),
     )
 

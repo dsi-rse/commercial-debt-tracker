@@ -538,7 +538,7 @@ def _seed_final_tables(artifact_root: Path, *, rows: int = 2) -> None:
         # double the row counts they assert on. The union has its own test.
         write_partition_table(
             dataset_root_fns[0](str(artifact_root)),
-            partition={"date": "2024-01-02", "shard": "0001"},
+            partition={"month": "2024-01"},
             table=pd.DataFrame(
                 [{"id": f"{table_name}-{index}"} for index in range(rows)]
             ),
@@ -609,7 +609,7 @@ def test_match_and_finalize_runs_the_lineage_pass_after_every_match(
     root = tmp_path / "artifacts"
     write_partition_table(
         root / "mentions",
-        partition={"date": "2022-01-02", "shard": "0001"},
+        partition={"month": "2022-01"},
         table=_mention_frame(
             "Credit Agreement", "Second Amended and Restated Credit Agreement"
         ),
@@ -643,7 +643,7 @@ def test_published_items_union_both_genres_so_every_mention_can_join(
     _seed_final_tables(artifact_root)
     write_partition_table(
         sixk_snippets_root(str(artifact_root)),
-        partition={"date": "2024-01-02", "shard": "0001"},
+        partition={"month": "2024-01"},
         table=pd.DataFrame(
             [
                 {
@@ -1034,7 +1034,7 @@ def test_the_gate_fires_on_a_corpus_that_already_has_instruments(
     final_root = tmp_path / "final"
     write_partition_table(
         artifact_root / "mentions",
-        partition={"date": "2022-01-02", "shard": "0001"},
+        partition={"month": "2022-01"},
         table=_mention_frame("Credit Agreement"),
     )
     # Match once so the corpus genuinely holds instruments, then record the
@@ -1080,7 +1080,7 @@ def test_new_items_publish_even_though_match_produced_no_instruments(
     _record_published_generation(artifact_root, final_root)
     write_partition_table(
         artifact_root / "items",
-        partition={"date": "2022-01-02", "shard": "0001"},
+        partition={"month": "2022-01"},
         table=pd.DataFrame([{"item_id": "item-1"}]),
     )
 
@@ -1121,7 +1121,7 @@ def test_a_real_publish_records_the_digest_the_next_run_gates_on(
     final_root = tmp_path / "final"
     write_partition_table(
         artifact_root / "items",
-        partition={"date": "2022-01-02", "shard": "0001"},
+        partition={"month": "2022-01"},
         table=pd.DataFrame([{"item_id": "item-1"}]),
     )
 
@@ -1137,7 +1137,7 @@ def test_a_real_publish_records_the_digest_the_next_run_gates_on(
 
     write_partition_table(
         artifact_root / "items",
-        partition={"date": "2022-01-03", "shard": "0001"},
+        partition={"month": "2022-01"},
         table=pd.DataFrame([{"item_id": "item-2"}]),
     )
 
@@ -1384,7 +1384,7 @@ def test_run_pipeline_skips_the_publish_when_nothing_changed(
     if change_a_source:
         write_partition_table(
             artifact_root / "items",
-            partition={"date": "2022-01-02", "shard": "0001"},
+            partition={"month": "2022-01"},
             table=pd.DataFrame([{"item_id": "item-1"}]),
         )
 

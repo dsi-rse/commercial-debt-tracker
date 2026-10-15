@@ -72,7 +72,7 @@ def classify_items(
 
 
 def item_partition_classifier(*, model_dir: Path | None = None) -> ClassifyPartition:
-    """Return the function that classifies one ``items`` partition.
+    """Return the function that classifies one ``items`` month file.
 
     Given accessions, it classifies only those filings' items. The model is
     unpickled on the first call, once per returned function.
@@ -108,9 +108,9 @@ def classify_pending_items(
     force: bool = False,
     renew: Callable[[], None] | None = None,
 ) -> pd.DataFrame:
-    """Classify pending item partitions into classification partitions.
+    """Classify pending ``items`` month files into ``classifications`` month files.
 
-    A partition is pending when its fingerprint differs from the completion
+    A month is pending when its fingerprint differs from the completion
     registry's (or always, with ``force``) and is recomputed whole. Completion
     is checkpointed and ``renew`` called as :func:`run_partition_stage` does.
 
@@ -123,7 +123,7 @@ def classify_pending_items(
         source_dataset=ITEM_DATASET_NAME,
         output_dataset=CLASSIFICATION_DATASET_NAME,
         output_columns=CLASSIFIED_ITEM_COLUMNS,
-        process=lambda source_path, partition: classify_partition(
+        process=lambda source_path, partition, _done: classify_partition(
             source_path, partition, None
         ),
         artifact_root=artifact_root,

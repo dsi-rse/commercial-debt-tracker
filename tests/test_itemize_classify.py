@@ -23,6 +23,7 @@ from cdt.classifier.core import classifications_root
 from cdt.classifier.eightk import classify_pending_items
 from cdt.completion import completion_registry_root
 from cdt.datasets import (
+    document_shard,
     load_row_failures,
     run_manifest_path,
 )
@@ -70,7 +71,7 @@ This is the extracted event text.
     )
     return write_partition_table(
         tmp_path / "documents",
-        partition={"date": "2024-01-02", "shard": "0001"},
+        partition={"date": "2024-01-02", "shard": document_shard("000114036126006577")},
         table=table,
     )
 
@@ -89,22 +90,12 @@ def checkpoint_every_partition(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def seed_document_partitions(tmp_path: Path) -> list[str]:
     """Write multiple canonical document partitions."""
-    partitions: list[tuple[str, str, str, str]] = [
-        (
-            "000114036126006577",
-            "320193",
-            "2024-01-02",
-            "0001",
-        ),
-        (
-            "000078901925000010",
-            "789019",
-            "2024-01-03",
-            "0002",
-        ),
+    partitions: list[tuple[str, str, str]] = [
+        ("000114036126006577", "320193", "2024-01-02"),
+        ("000078901925000010", "789019", "2024-02-03"),
     ]
     paths: list[str] = []
-    for accession_number, cik, filing_date, shard in partitions:
+    for accession_number, cik, filing_date in partitions:
         table = pd.DataFrame(
             [
                 {
@@ -131,7 +122,10 @@ This is the extracted event text.
         paths.append(
             write_partition_table(
                 tmp_path / "documents",
-                partition={"date": filing_date, "shard": shard},
+                partition={
+                    "date": filing_date,
+                    "shard": document_shard(accession_number),
+                },
                 table=table,
             )
         )
@@ -712,7 +706,7 @@ def test_extract_failures_are_recorded_and_cleared(
     assert entry["backend"] == "live"
     assert entry["state"] == "ERROR"
     assert entry["error"] == "instrument_ie did not return valid JSON"
-    assert entry["date"] and entry["shard"]
+    assert entry["date"] and entry["month"]
 
     async def succeeding_workflow(**kwargs: object) -> ExtractionRowState:
         item_row = kwargs["item_row"]
@@ -832,11 +826,12 @@ def test_grown_document_partition_reitemizes_and_reclassifies(
         }
 
     def _write_documents(accessions: list[str]) -> None:
-        write_partition_table(
-            str(tmp_path / "documents"),
-            partition={"date": "2024-01-02", "shard": "0001"},
-            table=pd.DataFrame([_doc(a) for a in accessions], columns=DOCUMENT_COLUMNS),
-        )
+        for accession in accessions:
+            write_partition_table(
+                str(tmp_path / "documents"),
+                partition={"date": "2024-01-02", "shard": document_shard(accession)},
+                table=pd.DataFrame([_doc(accession)], columns=DOCUMENT_COLUMNS),
+            )
 
     class SizedFakeModel:
         def decision_function(self: SizedFakeModel, texts: list[str]) -> list[float]:

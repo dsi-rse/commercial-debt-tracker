@@ -19,15 +19,16 @@ from cdt.completion import (
 )
 from cdt.datasets import (
     GENRES,
-    PARTITION_PATTERN,
+    MONTH_PARTITION_PATTERN,
     dataset_root,
-    date_shard_partition_path,
     extractor_run_path,
     load_row_failures,
-    parse_date_shard_partition,
+    month_partition_path,
+    parse_source_partition,
     resolve_artifact_root,
     run_manifest_path,
     save_row_failures,
+    source_partition_month,
 )
 from cdt.extractor.prior_state import published_mention_rows
 from cdt.extractor.schema import DEBT_INSTRUMENT_MENTION_COLUMNS
@@ -38,6 +39,7 @@ from cdt.extractor.state import (
     ExtractionRowState,
     coerce_native,
 )
+from cdt.partition_stage import sort_partition_rows
 from cdt.shared import get_logger
 from cdt.storage.objects import (
     artifact_exists,
@@ -77,15 +79,15 @@ def extracted_tables_path(
 
 @dataclass
 class PendingExtractPartition:
-    """One source partition with extraction work outstanding.
+    """One classification month file with extraction work outstanding.
 
     ``classification_path`` points into any of CLASSIFICATION_SOURCES; the rows
-    it holds are classification rows either way.
+    it holds are classification rows either way. ``month`` is its month, and
+    the month of the mentions file its rows' mentions go to.
     """
 
     classification_path: str
-    date: str
-    shard: str
+    month: str
     fingerprint: str | None
     done_item_ids: frozenset[str]
 
@@ -129,22 +131,21 @@ def pending_extract_partitions(
                     ),
                     suffix=".parquet",
                 ).items()
-                if PARTITION_PATTERN.search(path)
+                if MONTH_PARTITION_PATTERN.search(path)
             }
         )
     pending: list[PendingExtractPartition] = []
     for classification_path in sorted(fingerprints):
         if exclude_paths and classification_path in exclude_paths:
             continue
-        partition = parse_date_shard_partition(classification_path)
+        month = source_partition_month(parse_source_partition(classification_path))
         fingerprint = fingerprints[classification_path]
         entry = registry.get(classification_path)
         if force or entry is None or classification_path in force_paths:
             pending.append(
                 PendingExtractPartition(
                     classification_path=classification_path,
-                    date=partition["date"],
-                    shard=partition["shard"],
+                    month=month,
                     fingerprint=fingerprint,
                     done_item_ids=frozenset(),
                 )
@@ -155,8 +156,7 @@ def pending_extract_partitions(
         pending.append(
             PendingExtractPartition(
                 classification_path=classification_path,
-                date=partition["date"],
-                shard=partition["shard"],
+                month=month,
                 fingerprint=fingerprint,
                 done_item_ids=entry.item_ids,
             )
@@ -170,11 +170,11 @@ def collect_pending_extract_items(
     force: bool = False,
     force_paths: frozenset[str] = frozenset(),
     max_rows: int | None = None,
-) -> tuple[list[tuple[dict[str, str | None], str, str]], dict[str, dict[str, object]]]:
+) -> tuple[list[tuple[dict[str, str | None], str]], dict[str, dict[str, object]]]:
     """Collect relevant items awaiting extraction across pending partitions.
 
     Returns ``(entries, claimed)`` where each entry is a native-typed item row
-    plus its originating ``(date, shard)``, and ``claimed`` maps each claimed
+    plus the month of the file it came from, and ``claimed`` maps each claimed
     classification partition to its source fingerprint and the item_ids that
     were already terminal before this job — the state finalize needs to record
     row-outcome-keyed completion and to detect source growth. Uses the same
@@ -195,7 +195,7 @@ def collect_pending_extract_items(
         force=force,
         force_paths=force_paths,
     )
-    entries: list[tuple[dict[str, str | None], str, str]] = []
+    entries: list[tuple[dict[str, str | None], str]] = []
     claimed: dict[str, dict[str, object]] = {}
     deferred_partitions = 0
     for pending_partition in pending:
@@ -216,7 +216,7 @@ def collect_pending_extract_items(
             coerced = {
                 key: coerce_native(item_row.get(key)) for key in STATE_ITEM_ROW_FIELDS
             }
-            entries.append((coerced, pending_partition.date, pending_partition.shard))
+            entries.append((coerced, pending_partition.month))
     if deferred_partitions:
         LOGGER.info(
             "Deferred %s pending partition(s) beyond the %s-row job cap; the "
@@ -262,8 +262,7 @@ def failed_stage_name(row_state: ExtractionRowState) -> str:
 def failure_record(
     row_state: ExtractionRowState,
     *,
-    partition_date: str,
-    shard: str,
+    month: str,
     run_id: str,
     backend: str,
 ) -> dict[str, object]:
@@ -272,8 +271,8 @@ def failure_record(
         "item_id": row_state.item_id,
         "accession_number": row_state.item_row.get("accession_number"),
         "cik": row_state.item_row.get("cik"),
-        "date": partition_date,
-        "shard": shard,
+        "date": row_state.item_row.get("date"),
+        "month": month,
         "state": row_state.state,
         "stage": failed_stage_name(row_state),
         "run_id": run_id,
@@ -313,7 +312,7 @@ class RowOutcomes:
     succeeded_item_ids: set[str] = field(default_factory=set)
 
     def add(
-        self: Self, row_state: ExtractionRowState, *, partition_date: str, shard: str
+        self: Self, row_state: ExtractionRowState, *, month: str
     ) -> list[dict[str, object]]:
         """Record one terminal row; return the mention rows it publishes."""
         self.audit_records.append(json.dumps(row_state.to_audit_dict(), sort_keys=True))
@@ -327,8 +326,7 @@ class RowOutcomes:
         else:
             self.failed_rows[row_state.item_id] = failure_record(
                 row_state,
-                partition_date=partition_date,
-                shard=shard,
+                month=month,
                 run_id=self.run_id,
                 backend=self.backend,
             )
@@ -338,26 +336,24 @@ class RowOutcomes:
 def write_mentions_partition(
     resolved_root: str,
     *,
-    partition: dict[str, str],
+    month: str,
     new_mentions: pd.DataFrame,
     replaced_item_ids: set[str],
     retired_item_ids: set[str],
 ) -> str | None:
-    """Merge one partition's new mentions into its target, replacing per item.
+    """Merge new mentions into one mentions month file, replacing per item.
 
-    The target can already hold mentions from earlier passes, both genres and
-    several accessions, so only rows of ``replaced_item_ids`` (re-extracted
+    The file can already hold mentions from earlier passes, both genres and
+    many accessions, so only rows of ``replaced_item_ids`` (re-extracted
     this run) and ``retired_item_ids`` (gone from a claimed source) are
     dropped. Replaced ids purge too, so an item re-extracted to zero mentions
-    withdraws what it published before. Returns the partition path written,
-    or None when there is nothing to add or take away; a partition that does
-    not exist is never written empty. See docs/decisions/extraction.md.
+    withdraws what it published before. Rows are written sorted
+    (:func:`cdt.partition_stage.sort_partition_rows`). Returns the path
+    written, or None when there is nothing to add or take away; a month file
+    that does not exist is never written empty. See docs/decisions/extraction.md.
     """
-    target_path = date_shard_partition_path(
-        MENTIONS_DATASET_NAME,
-        partition_date=partition["date"],
-        shard=partition["shard"],
-        artifact_root=resolved_root,
+    target_path = month_partition_path(
+        MENTIONS_DATASET_NAME, month=month, artifact_root=resolved_root
     )
     dropped = replaced_item_ids | retired_item_ids
     if new_mentions.empty and not dropped:
@@ -372,8 +368,10 @@ def write_mentions_partition(
         table = pd.concat([kept, new_mentions], ignore_index=True)
     write_partition_table(
         mentions_root(resolved_root),
-        partition=partition,
-        table=table.reindex(columns=DEBT_INSTRUMENT_MENTION_COLUMNS),
+        partition={"month": month},
+        table=sort_partition_rows(table).reindex(
+            columns=DEBT_INSTRUMENT_MENTION_COLUMNS
+        ),
     )
     return target_path
 
@@ -480,7 +478,7 @@ def write_run_checkpoint(
 
 
 def finalize_extract_outputs(
-    row_entries: list[tuple[ExtractionRowState, str, str]],
+    row_entries: list[tuple[ExtractionRowState, str]],
     *,
     claimed: dict[str, dict[str, object]],
     run_id: str,
@@ -489,41 +487,37 @@ def finalize_extract_outputs(
     max_attempts: int,
     artifact_root: str | Path | None = None,
 ) -> pd.DataFrame:
-    """Write mention partitions, audit log, and manifests for a completed job.
+    """Write mention month files, audit log, and manifests for a completed job.
 
     This is the batch backend's analogue of the tail of ``extract_pending_items``.
-    Every row in ``row_entries`` must already be terminal. ``claimed`` carries each
-    claimed classification partition's fingerprint and prior terminal item_ids
-    (from ``collect_pending_extract_items``), so completion is recorded per row
-    outcome rather than per visit. Mentions are regrouped by their originating
-    ``(date, shard)`` partition and merged into existing targets per item.
+    Every row in ``row_entries`` (a row and its month) must already be
+    terminal. ``claimed`` carries each claimed classification file's
+    fingerprint and prior terminal item_ids (from
+    ``collect_pending_extract_items``), so completion is recorded per row
+    outcome rather than per visit. Mentions are grouped by month and each
+    month file is written once, merged per item.
     """
     resolved_root = resolve_artifact_root(artifact_root)
     outcomes = RowOutcomes(run_id=run_id, backend="batch")
-    # Keyed even when a partition publishes nothing, so every partition the
-    # job covered is visited below.
-    mentions_by_partition: dict[tuple[str, str], list[dict[str, object]]] = {}
-    for row_state, partition_date, shard in row_entries:
-        mentions_by_partition.setdefault((partition_date, shard), []).extend(
-            outcomes.add(row_state, partition_date=partition_date, shard=shard)
+    # Keyed even when a month publishes nothing, so every month the job
+    # covered is visited below.
+    mentions_by_month: dict[str, list[dict[str, object]]] = {}
+    terminal_by_month: dict[str, set[str]] = {}
+    for row_state, month in row_entries:
+        mentions_by_month.setdefault(month, []).extend(
+            outcomes.add(row_state, month=month)
         )
-
-    terminal_by_partition: dict[tuple[str, str], set[str]] = {}
-    for row_state, partition_date, shard in row_entries:
         if row_state.state is not None:
-            terminal_by_partition.setdefault((partition_date, shard), set()).add(
-                row_state.item_id
-            )
+            terminal_by_month.setdefault(month, set()).add(row_state.item_id)
 
     # Read each claimed source once, before the merge loop needs it and before
-    # the registry loop below records it. A mentions partition is keyed by
-    # (date, shard) while a claim is keyed by path, and both genres can claim
-    # the same (date, shard) — so retired ids are accumulated per partition
-    # across every claim that lands there, never inferred from one source.
+    # the registry loop below records it. Both genres' classification files
+    # for one month write the same mentions file, so retired ids are
+    # accumulated per month across every claim that lands there.
     relevant_by_path: dict[str, set[str]] = {}
-    retired_by_partition: dict[tuple[str, str], set[str]] = {}
+    retired_by_month: dict[str, set[str]] = {}
     for classification_path, claim in claimed.items():
-        claim_partition = parse_date_shard_partition(classification_path)
+        month = source_partition_month(parse_source_partition(classification_path))
         claim_relevant = read_table(
             classification_path, CLASSIFIED_ITEM_COLUMNS
         ).reindex(columns=CLASSIFIED_ITEM_COLUMNS)
@@ -533,26 +527,24 @@ def finalize_extract_outputs(
         prior_ids = {
             str(item) for item in cast(list[object], claim.get("prior_item_ids") or [])
         }
-        retired_by_partition.setdefault(
-            (claim_partition["date"], claim_partition["shard"]), set()
-        ).update(prior_ids - relevant_ids)
-    # A partition whose rows were all done already contributes no mention rows,
+        retired_by_month.setdefault(month, set()).update(prior_ids - relevant_ids)
+    # A month whose rows were all done already contributes no mention rows,
     # but may still have ids to prune.
-    for partition_key, retired_ids in retired_by_partition.items():
+    for month, retired_ids in retired_by_month.items():
         if retired_ids:
-            mentions_by_partition.setdefault(partition_key, [])
+            mentions_by_month.setdefault(month, [])
 
     processed_frames: list[pd.DataFrame] = []
     partitions_written: list[str] = []
     empty_partitions = 0
-    for (partition_date, shard), mention_rows in sorted(mentions_by_partition.items()):
+    for month, mention_rows in sorted(mentions_by_month.items()):
         mentions = pd.DataFrame(mention_rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
         written = write_mentions_partition(
             resolved_root,
-            partition={"date": partition_date, "shard": shard},
+            month=month,
             new_mentions=mentions,
-            replaced_item_ids=terminal_by_partition.get((partition_date, shard), set()),
-            retired_item_ids=retired_by_partition.get((partition_date, shard), set()),
+            replaced_item_ids=terminal_by_month.get(month, set()),
+            retired_item_ids=retired_by_month.get(month, set()),
         )
         if written is None:
             empty_partitions += 1
@@ -565,16 +557,14 @@ def finalize_extract_outputs(
 
     registry = load_completion_registry("extract", artifact_root=resolved_root)
     for classification_path, claim in claimed.items():
-        partition = parse_date_shard_partition(classification_path)
+        month = source_partition_month(parse_source_partition(classification_path))
         prior = {
             str(item) for item in cast(list[object], claim.get("prior_item_ids") or [])
         }
-        terminal = prior | terminal_by_partition.get(
-            (partition["date"], partition["shard"]), set()
-        )
+        terminal = prior | terminal_by_month.get(month, set())
         fingerprint = claim.get("fingerprint")
-        # Only this source's relevant ids: one (date, shard) can be claimed by
-        # both genres, so `terminal_by_partition` mixes them.
+        # Only this source's relevant ids: one month is claimed by both
+        # genres, so `terminal_by_month` mixes them.
         registry[classification_path] = completion_entry(
             str(fingerprint) if fingerprint else None,
             terminal,

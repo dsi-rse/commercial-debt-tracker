@@ -1,8 +1,8 @@
 """Tests for the extractor claiming work from both genres' sources.
 
 The 8-K classifier and the 6-K triage stage write different datasets in the same
-shape, and the extractor unions them. Both write mentions into one dataset keyed
-by ``(date, shard)``, which is where the sharp edges are.
+shape, and the extractor unions them. Both write mentions into one month file,
+which is where the sharp edges are.
 """
 
 from __future__ import annotations
@@ -30,7 +30,8 @@ from cdt.extractor.schema import DEBT_INSTRUMENT_MENTION_COLUMNS
 from cdt.extractor.state import ExtractionRowState
 from cdt.storage.tables import read_dataset, write_partition_table
 
-PARTITION = {"date": "2026-09-08", "shard": "0001"}
+FILING_DATE = "2026-09-08"
+PARTITION = {"month": "2026-09"}
 EIGHTK_ACCESSION = "000114036126006577"
 SIXK_ACCESSION = "000165495426008172"
 EIGHTK_ITEM_ID = f"{EIGHTK_ACCESSION}-1-01"
@@ -47,7 +48,7 @@ def _classified_row(item_id: str, accession_number: str) -> dict[str, object]:
         "company_name": "Example Inc.",
         "url": "https://sec.example/full.txt",
         "text": "The Company entered into a credit agreement.",
-        "date": PARTITION["date"],
+        "date": FILING_DATE,
         "resource_uri": None,
         "item_information": "Entry into a Material Definitive Agreement",
         "extraction_status": "extracted",
@@ -117,7 +118,7 @@ def _write_mentions(tmp_path: Path, item_id: str) -> str:
                     "item_id": item_id,
                     "accession_number": EIGHTK_ACCESSION,
                     "cik": "320193",
-                    "date": PARTITION["date"],
+                    "date": FILING_DATE,
                     "name": "Term Loan",
                 }
             ],
@@ -149,7 +150,7 @@ def test_pending_partitions_span_both_sources(tmp_path: Path) -> None:
 def test_a_sixk_partition_is_pending_even_where_eightk_mentions_exist(
     tmp_path: Path,
 ) -> None:
-    """Mentions at a 6-K partition's (date, shard) do not make it complete."""
+    """Mentions in a 6-K month's mentions file do not make it complete."""
     _write_classifications(tmp_path)
     sixk_path = _write_snippets(tmp_path)
     _write_mentions(tmp_path, EIGHTK_ITEM_ID)
@@ -195,18 +196,16 @@ def test_collect_claims_relevant_rows_from_both_sources(tmp_path: Path) -> None:
 
     entries, claimed = collect_pending_extract_items(artifact_root=tmp_path)
 
-    assert sorted(str(row["item_id"]) for row, _date, _shard in entries) == sorted(
+    assert sorted(str(row["item_id"]) for row, _month in entries) == sorted(
         [EIGHTK_ITEM_ID, SIXK_ITEM_ID]
     )
-    # Registry keys are full paths, so two sources sharing one (date, shard)
-    # cannot collide.
-    assert {Path(path).parts[-4] for path in claimed} == {
+    # Registry keys are full paths, so two sources sharing one month cannot
+    # collide.
+    assert {Path(path).parts[-3] for path in claimed} == {
         CLASSIFICATION_DATASET_NAME,
         SIXK_SNIPPET_DATASET_NAME,
     }
-    assert {
-        Path(path).parts[-3:-1] == ("date=2026-09-08", "shard=0001") for path in claimed
-    } == {True}
+    assert {Path(path).parts[-2] for path in claimed} == {"month=2026-09"}
 
 
 def _stub_workflow(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -242,8 +241,8 @@ def test_extract_writes_both_genres_mentions_into_one_partition(
 ) -> None:
     """Two sources, one mentions partition, and neither genre's rows lost.
 
-    The genres share the (date, shard) space by construction — both shard on
-    crc32 of the accession — so this is the common case, not an edge one.
+    Both genres' filings of one month share its mentions file, so this is the
+    common case, not an edge one.
     """
     _write_classifications(tmp_path)
     _write_snippets(tmp_path)
@@ -387,8 +386,7 @@ def test_new_snippets_merge_without_dropping_the_other_genres_mentions(
 
     Mentions are merged by replacing only the item ids just extracted, so rows
     from the genre that did not change have to survive. The two genres share the
-    partition by construction — both shard on crc32 of the accession — so this
-    is how a normal day behaves once ingest merges a late filing.
+    month file, so this is how a normal day behaves once a late filing lands.
     """
     _write_classifications(tmp_path)
     _write_snippets(tmp_path)

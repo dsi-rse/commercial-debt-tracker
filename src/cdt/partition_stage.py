@@ -1,10 +1,12 @@
-"""The loop every whole-partition stage shares: pending source → output partition.
+"""The loop every whole-partition stage shares: pending source → month output.
 
-A stage reads one date/shard source partition at a time, turns it into output
-rows, and writes them to the same date/shard of its output dataset. Which
-source partitions are pending comes from the stage's completion registry,
-keyed by source fingerprint (``cdt.completion.pending_source_partitions``).
-Filings a stage could not process are recorded in its failure list
+A stage reads one source partition at a time (a ``documents`` date/shard file,
+or a month file of a derived dataset) and turns it into output rows, which
+belong in the output dataset's month file for the source's month
+(:func:`cdt.datasets.source_partition_month`). Which source partitions are
+pending comes from the stage's completion registry, keyed by source
+fingerprint (``cdt.completion.pending_source_partitions``). Filings a stage
+could not process are recorded in its failure list
 (:func:`cdt.datasets.failure_registry_path`), keyed by accession number, so they
 can be listed and retried.
 """
@@ -15,6 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
+from typing import Self
 
 import pandas as pd
 
@@ -27,17 +30,19 @@ from cdt.completion import (
 )
 from cdt.datasets import (
     dataset_root,
-    date_shard_partition_path,
+    document_shard,
     load_row_failures,
-    parse_date_shard_partition,
+    month_partition_path,
+    parse_source_partition,
     resolve_artifact_root,
     run_manifest_path,
     save_row_failures,
+    source_partition_month,
 )
 from cdt.lease import throttled
 from cdt.shared import get_logger
 from cdt.storage.objects import artifact_exists, write_json_artifact
-from cdt.storage.tables import write_partition_table
+from cdt.storage.tables import read_table, write_partition_table
 
 LOGGER = get_logger(__name__)
 
@@ -46,16 +51,69 @@ LOGGER = get_logger(__name__)
 class PartitionOutput:
     """What one source partition produced.
 
-    ``complete`` False leaves the partition pending: nothing is written and no
-    completion entry is recorded, so the next run processes it again.
-    ``failures`` maps the accession number of each filing the stage could not
-    process to why; the stage still writes rows for it, marked failed.
+    ``rows`` are every output row the source yields; they replace the rows the
+    source produced before. ``complete`` False leaves the partition pending.
+    ``done_keys`` is the stage's done set for the source
+    (:attr:`cdt.completion.CompletedPartition.item_ids`): rows the next
+    processing of this source may carry over instead of recomputing. A held
+    output (``complete`` False) with no ``done_keys`` writes nothing; one with
+    ``done_keys`` writes its rows and records the keys, so the retry redoes
+    only the rest. ``failures`` maps the accession number of each filing the
+    stage could not process to why; the stage still writes rows for it,
+    marked failed.
     """
 
     rows: pd.DataFrame
     source_rows: int
     complete: bool = True
     failures: dict[str, str] = field(default_factory=dict)
+    done_keys: frozenset[str] | None = None
+
+    @property
+    def writes(self: Self) -> bool:
+        """Whether this output's rows replace the source's rows in the target."""
+        return self.complete or self.done_keys is not None
+
+
+#: Process one source partition: ``(source_path, partition, done_keys)``.
+#: ``partition`` is the parsed source path (``{date, shard}`` or ``{month}``);
+#: ``done_keys`` the done set its completion entry recorded (empty when forced
+#: or never processed).
+ProcessPartition = Callable[[str, dict[str, str], frozenset[str]], PartitionOutput]
+
+
+def sort_partition_rows(table: pd.DataFrame) -> pd.DataFrame:
+    """Sort rows by ``(cik, date, accession_number)``, stably, for a month file.
+
+    Sorted files let a reader filtering on ``cik`` skip row groups.
+    """
+    keys = [column for column in ("cik", "date", "accession_number") if column in table]
+    table = table.reset_index(drop=True)
+    if table.empty or not keys:
+        return table
+    order = pd.DataFrame({key: table[key].astype(str) for key in keys})
+    return table.iloc[
+        order.sort_values(by=keys, kind="stable").index.to_numpy()
+    ].reset_index(drop=True)
+
+
+def rows_from_sources(rows: pd.DataFrame, sources: list[dict[str, str]]) -> pd.Series:
+    """Return a mask of the rows of a month file that came from ``sources``.
+
+    A month source owns the whole file. A date/shard source owns the rows whose
+    ``date`` and ``documents`` shard of ``accession_number`` are its own.
+    """
+    if any("month" in source for source in sources):
+        return pd.Series(True, index=rows.index)
+    if rows.empty:
+        return pd.Series(False, index=rows.index)
+    owned = {(source["date"], source["shard"]) for source in sources}
+    keys = zip(
+        rows["date"].astype(str),
+        rows["accession_number"].astype(str).map(document_shard),
+        strict=True,
+    )
+    return pd.Series([key in owned for key in keys], index=rows.index)
 
 
 def replace_partition_failures(
@@ -91,8 +149,9 @@ class PartitionStageResult:
 
     rows: pd.DataFrame
     source_rows: int = 0
+    #: Month files written, once per flush.
     partitions_written: list[str] = field(default_factory=list)
-    #: Completed source partitions that produced no rows, so wrote nothing.
+    #: Completed source partitions that produced no rows.
     empty_partitions: int = 0
     #: Source partitions whose output reported ``complete=False``.
     held_partitions: list[str] = field(default_factory=list)
@@ -104,7 +163,7 @@ def run_partition_stage(
     source_dataset: str,
     output_dataset: str,
     output_columns: list[str],
-    process: Callable[[str, dict[str, str]], PartitionOutput],
+    process: ProcessPartition,
     artifact_root: str | Path | None = None,
     force: bool = False,
     renew: Callable[[], None] | None = None,
@@ -112,19 +171,22 @@ def run_partition_stage(
 ) -> PartitionStageResult:
     """Run ``process`` over every pending source partition of ``source_dataset``.
 
-    ``process`` receives the source partition path and its ``{date, shard}``
-    and returns that partition's output, which is written to the same
-    date/shard of ``output_dataset``. Empty output completes the partition and
-    writes nothing, unless an earlier run's output is there, which is then
-    overwritten empty so later stages see the rows go. A held partition (output
-    ``complete`` False) writes nothing and stays pending. A completed
-    partition's ``failures`` replace its entries in the stage's failure list.
+    Outputs are buffered per target month. A month is written once, when the
+    run moves on to a source of another month and at each checkpoint: its file
+    is read, the rows of the buffered sources are replaced by their new
+    output (:func:`rows_from_sources`), and the result is written back sorted
+    (:func:`sort_partition_rows`). A source whose output is empty deletes its
+    rows; a month file left empty is still written, so the next stage sees its
+    rows go, and no file is created for a month that never had rows. A held
+    output with no ``done_keys`` writes nothing and stays pending. A completed
+    output's ``failures`` replace its entries in the stage's failure list.
 
-    Completion is saved at most every
-    :data:`cdt.completion.CHECKPOINT_INTERVAL_SECONDS` and once at the end, so
-    an interruption loses at most that much finished work. ``renew`` is called
-    before each partition's write, throttled (:func:`cdt.lease.throttled`). A
-    run manifest is written at ``runs/<stage_name>/run_id=latest.json``.
+    Completion entries are recorded only after their month is written, and
+    saved at most every :data:`cdt.completion.CHECKPOINT_INTERVAL_SECONDS` and
+    once at the end, so an interruption loses at most that much finished work
+    and never records work that was not written. ``renew`` is called before
+    each month write, throttled (:func:`cdt.lease.throttled`). A run manifest
+    is written at ``runs/<stage_name>/run_id=latest.json``.
     """
     resolved_root = resolve_artifact_root(artifact_root)
     pending, registry = pending_source_partitions(
@@ -138,72 +200,113 @@ def run_partition_stage(
     # Loaded on the first completed partition, so an idle run reads nothing.
     failures: dict[str, dict[str, object]] | None = None
     failures_changed = False
+    keep_lease = throttled(renew) if renew is not None else None
+    result = PartitionStageResult(rows=pd.DataFrame(columns=output_columns))
+    frames: list[pd.DataFrame] = []
+
+    buffered_month: str | None = None
+    buffered_sources: list[tuple[dict[str, str], pd.DataFrame]] = []
+    buffered_entries: dict[str, CompletedPartition] = {}
+
+    def flush() -> None:
+        nonlocal buffered_month
+        if buffered_month is None:
+            return
+        if buffered_sources:
+            if keep_lease is not None:
+                keep_lease()
+            output_path = month_partition_path(
+                output_dataset, month=buffered_month, artifact_root=resolved_root
+            )
+            exists = artifact_exists(output_path)
+            existing = (
+                read_table(output_path, output_columns).reindex(columns=output_columns)
+                if exists
+                else pd.DataFrame(columns=output_columns)
+            )
+            kept = existing.loc[
+                ~rows_from_sources(existing, [source for source, _ in buffered_sources])
+            ]
+            new_frames = [
+                rows.reindex(columns=output_columns)
+                for _, rows in buffered_sources
+                if not rows.empty
+            ]
+            parts = [frame for frame in [kept, *new_frames] if not frame.empty]
+            table = (
+                pd.concat(parts, ignore_index=True)
+                if parts
+                else pd.DataFrame(columns=output_columns)
+            )
+            if exists or not table.empty:
+                write_partition_table(
+                    output_root,
+                    partition={"month": buffered_month},
+                    table=sort_partition_rows(table).reindex(columns=output_columns),
+                )
+                result.partitions_written.append(output_path)
+        for key, entry in buffered_entries.items():
+            registry[key] = entry
+        buffered_month = None
+        buffered_sources.clear()
+        buffered_entries.clear()
 
     def save() -> None:
         nonlocal failures_changed
+        flush()
         save_completion_registry(stage_name, registry, artifact_root=resolved_root)
         if failures is not None and failures_changed:
             save_row_failures(stage_name, failures, artifact_root=resolved_root)
             failures_changed = False
 
     checkpoint = throttled(save, interval_seconds=CHECKPOINT_INTERVAL_SECONDS)
-    keep_lease = throttled(renew) if renew is not None else None
-    result = PartitionStageResult(rows=pd.DataFrame(columns=output_columns))
-    frames: list[pd.DataFrame] = []
     total = len(pending)
     for index, (source_path, fingerprint) in enumerate(pending, start=1):
-        partition = parse_date_shard_partition(source_path)
+        partition = parse_source_partition(source_path)
+        month = source_partition_month(partition)
+        if buffered_month is not None and month != buffered_month:
+            flush()
+        buffered_month = month
+        previous = registry.get(source_path)
+        done = previous.item_ids if previous is not None and not force else frozenset()
         started = perf_counter()
-        output = process(source_path, partition)
-        # Before writing: a writer that lost its lease must not write again.
-        if keep_lease is not None:
-            keep_lease()
+        output = process(source_path, partition, done)
         result.source_rows += output.source_rows
-        output_path = date_shard_partition_path(
-            output_dataset,
-            partition_date=partition["date"],
-            shard=partition["shard"],
-            artifact_root=resolved_root,
-        )
-        if not output.complete:
-            result.held_partitions.append(source_path)
-        elif not output.rows.empty or artifact_exists(output_path):
-            # An emptied partition is overwritten, not left or deleted: its
-            # new fingerprint is what tells the next stage to drop the rows it
-            # derived from the old ones. With no earlier output, an empty
-            # partition writes no file at all.
-            write_partition_table(
-                output_root,
-                partition={"date": partition["date"], "shard": partition["shard"]},
-                table=output.rows.reindex(columns=output_columns),
-            )
+        if output.writes:
+            buffered_sources.append((partition, output.rows))
             if not output.rows.empty:
                 frames.append(output.rows)
-            result.partitions_written.append(output_path)
+            elif output.complete:
+                result.empty_partitions += 1
+        if not output.complete:
+            result.held_partitions.append(source_path)
         else:
-            result.empty_partitions += 1
-        if output.complete:
             if failures is None:
                 failures = load_row_failures(stage_name, artifact_root=resolved_root)
             failures_changed |= replace_partition_failures(
                 failures, source_path, output.failures
             )
-        # A held partition gets an entry that matches no fingerprint, so it stays
-        # pending even when an earlier run's entry for it is still stored.
-        registry[source_path] = CompletedPartition(
-            fingerprint=fingerprint if output.complete else None
+        # A held partition's entry is incomplete or matches no fingerprint, so
+        # it stays pending even when an earlier run's entry is still stored.
+        buffered_entries[source_path] = (
+            CompletedPartition(
+                fingerprint=fingerprint,
+                item_ids=output.done_keys or frozenset(),
+                complete=output.complete,
+            )
+            if output.writes
+            else CompletedPartition(fingerprint=None)
         )
         LOGGER.info(
-            "%s partition complete: date=%s shard=%s progress=%s/%s "
-            "source_rows=%s rows=%s wrote_output=%s held=%s elapsed=%.1fs",
+            "%s partition complete: source=%s month=%s progress=%s/%s "
+            "source_rows=%s rows=%s held=%s elapsed=%.1fs",
             stage_name,
-            partition["date"],
-            partition["shard"],
+            source_path,
+            month,
             index,
             total,
             output.source_rows,
             len(output.rows),
-            output_path in result.partitions_written,
             not output.complete,
             perf_counter() - started,
         )
@@ -229,7 +332,7 @@ def run_partition_stage(
         },
     )
     LOGGER.info(
-        "%s complete: partitions=%s written=%s held=%s source_rows=%s",
+        "%s complete: partitions=%s months_written=%s held=%s source_rows=%s",
         stage_name,
         total,
         len(result.partitions_written),

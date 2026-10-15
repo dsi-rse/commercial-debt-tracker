@@ -18,11 +18,11 @@ from cdt.datasets import (
     DOCUMENT_DATASET_NAME,
     dataset_root,
     default_artifact_root,
+    document_shard,
     failure_registry_path,
     iter_date_shard_partitions,
     normalize_cik,
     run_manifest_path,
-    shard_label,
 )
 from cdt.shared import FailureClassifier, FailureRegistry, get_logger
 from cdt.storage.objects import (
@@ -67,7 +67,6 @@ PROGRESS_DAY_INTERVAL = 30
 # counted from the end so a multi-segment --s3-prefix cannot shift it.
 MANIFEST_KEY_CIK_INDEX_FROM_END = -3
 MIN_MANIFEST_KEY_PARTS = 5
-DOCUMENT_PARTITION_SHARDS = 64
 
 
 class IngestFailureType(StrEnum):
@@ -696,14 +695,6 @@ def _run_id() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
 
 
-def _document_shard(accession_number: str) -> str:
-    """Return the document shard for one accession, stable across processes.
-
-    Per-partition dedup relies on an accession always landing in the same shard.
-    """
-    return shard_label(accession_number, DOCUMENT_PARTITION_SHARDS)
-
-
 def _partition_path(dataset_root: str, partition: dict[str, str]) -> str:
     partition_root = normalize_artifact_path(dataset_root).rstrip("/")
     for key, value in partition.items():
@@ -751,7 +742,7 @@ def _write_document_partitions(
     for date_value, date_group in grouped:
         for shard, shard_group in date_group.assign(
             shard=date_group["accession_number"].map(
-                lambda value: _document_shard(str(value))
+                lambda value: document_shard(str(value))
             )
         ).groupby("shard", sort=True):
             partition = {"date": str(date_value), "shard": str(shard)}

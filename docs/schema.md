@@ -49,93 +49,23 @@ Optional final snapshot layout:
 
 ## Partitioning Rules
 
-Date-partitioned datasets:
+| Datasets | Path | Rows in a file |
+|---|---|---|
+| `documents`, `documents-sixk` | `<dataset>/date=YYYY-MM-DD/shard=NNNN/part-0000.parquet` | one filing date's filings whose `crc32(accession_number) % 64` is `NNNN` |
+| `items`, `sixk-windows`, `classifications`, `sixk-snippets`, `mentions` | `<dataset>/month=YYYY-MM/part-0000.parquet` | every row whose filing `date` falls in the month, sorted by `(cik, date, accession_number)` |
+| `mention-cluster-edges`, `debt-instruments` | `<dataset>/cik_shard=NNNN/part-0000.parquet` | the matcher's output for every CIK whose unpadded form hashes (`crc32 % 64`) to `NNNN` |
 
-- `documents`, `documents-sixk`
-- `items`, `sixk-windows`
-- `classifications`, `sixk-snippets`
-- `mentions`
+- `datasets.shard_label` is the single source of the shard contract (crc32, modulo, four-digit label); it never uses Python's per-process salted `hash`. `datasets.document_shard` is the `documents` shard of an accession; `datasets.shard_for_cik` hashes the unpadded CIK, so both spellings of one CIK land in one shard.
+- `datasets.target_month` names a row's month file. A stage writes a source's rows into the month of the source (`datasets.source_partition_month`).
+- A `documents` file holds 148 MB–1 GB of text per date, so splitting each date 64 ways keeps files near 8 MB and a late filing cheap to merge. The derived datasets hold a few rows per filing, so one file per month keeps them at a few MB rather than thousands of files of one row each. Measurements: `docs/decisions/storage-and-completion.md`.
 
-Canonical path shape:
+How a month file is written (`cdt.partition_stage.run_partition_stage`):
 
-```text
-<artifact-root>/<dataset>/date=YYYY-MM-DD/shard=NNNN/part-0000.parquet
-```
-
-CIK-sharded datasets:
-
-- `mention-cluster-edges`
-- `debt-instruments`
-
-Canonical path shape:
-
-```text
-<artifact-root>/<dataset>/cik_shard=NNNN/part-0000.parquet
-```
-
-Notes:
-
-- `documents` shards by `crc32(accession_number) % 64`, computed by `datasets.shard_label` — the single source of the shard contract (crc32, modulo, four-digit label). Changing it strands every existing partition, so it is defined nowhere else.
-- `items`, `classifications`, and `mentions` preserve their source document `date` and `shard`
-- CIK shards are `crc32 % 64` of the **unpadded** CIK, so the padded and unpadded spellings of one CIK always land in the same shard
-- `documents` currently use 64 date shards
-- downstream date-partitioned datasets currently preserve whichever document shards they read
-- CIK-sharded datasets currently use 64 shards
-- Shard assignment is stable across runs and processes: `datasets.shard_label` hashes with crc32, never Python's per-process salted `hash`.
-
-### What "Partition", "Shard", and "Batch" Mean
-
-- A `partition` is one physical parquet file at a canonical path such as `documents/date=2026-05-31/shard=0017/part-0000.parquet`.
-- A `shard` is the hash bucket inside a dataset's partitioning scheme. `documents` currently use 64 shards, rendered as `0000` through `0063`. Downstream date-partitioned datasets preserve source document shard values. CIK-sharded datasets also use 64 shards, rendered as `0000` through `0063`.
-- For `documents`, all rows for the same filing date are split across 64 shard files by `crc32(accession_number) % 64`.
-- For `items`, `classifications`, and `mentions`, rows keep the `date` and `shard` partition of their upstream source partition.
-- For CIK-sharded datasets, rows are split across 64 shard files by `crc32` of the unpadded CIK, regardless of filing date.
-- A `batch` is not a second storage layer. It is just the internal chunk size one pipeline invocation uses while draining all work in scope.
-
-### Date-Partitioned Stages
-
-`documents`, `items`, `classifications`, and `mentions` all use the same path shape:
-
-```text
-<artifact-root>/<dataset>/date=YYYY-MM-DD/shard=NNNN/part-0000.parquet
-```
-
-How rows land there:
-
-- `documents`: rows are grouped by filing `date`, then by `crc32(accession_number) % 64`.
-- `items`: each item row is written to the same `date` and `shard` partition as its parent document partition.
-- `classifications`: each classified row is written to the same `date` and `shard` partition as its source item partition.
-- `sixk-windows`: each window row is written to the same `date` and `shard` partition as its source `documents-sixk` partition.
-- `sixk-snippets`: each snippet row is written to the same `date` and `shard` partition as its source `sixk-windows` partition (and so its `documents-sixk` partition).
-- `mentions`: each extracted mention row is written to the same `date` and `shard` partition as its source classification or snippet partition.
-
-Practical implication:
-
-- one parquet file usually represents "one filing date, one shard bucket"
-- the number of rows in that file is variable and depends on how many filings hashed into that bucket
-- downstream stages preserve the partition shape rather than reshuffling by a new key
-- a source partition that produces zero downstream rows is marked completed without writing an output parquet. If an earlier run did write one, it is overwritten with an empty table instead, so the next stage sees that partition change and drops what it derived from the old rows
-
-### CIK-Sharded Stages
-
-`mention-cluster-edges` and `debt-instruments` use this path shape:
-
-```text
-<artifact-root>/<dataset>/cik_shard=NNNN/part-0000.parquet
-```
-
-How rows land there:
-
-- the matcher reads all `mentions`
-- each mention is assigned to `shard_for_cik(cik)`, which is `crc32` of the unpadded CIK modulo 64
-- all mentions for companies whose CIK hashes to the same shard are processed together
-- the matcher writes one `mention-cluster-edges` parquet and one `debt-instruments` parquet for that `cik_shard`
-
-Practical implication:
-
-- matching is company-scoped, not filing-date-scoped
-- rows from many filing dates can coexist in the same `cik_shard` parquet
-- this lets the matcher compare debt mentions across time for the same issuer
+- Completion stays keyed on **source** files. A stage buffers its outputs per target month and writes each month once: it reads the month file, replaces the rows that came from the reprocessed sources, and writes the month back.
+- The rows of a `documents` source are the month rows whose `date` and `document_shard(accession_number)` are the source's own; a month source owns the whole month file it maps to.
+- A source whose output is empty deletes its rows. A month file left with no rows is still written, so the next stage sees it change; a month that never had rows gets no file.
+- A source's completion entry is recorded only after its month is written. Buffered months are written whenever the run moves to another month and at every checkpoint.
+- Extract writes the mentions of a classification month file into the mentions file of the same month, replacing rows per item; both genres share it.
 
 ### Checkpoints and buffers
 
@@ -143,9 +73,13 @@ No stage has a batch size. Each one drains every pending partition in one
 invocation, and what an interruption can lose is bounded by time, not by a count
 of partitions:
 
-- `segment` and `classify` (both genres): completion is saved at most every
-  `cdt.completion.CHECKPOINT_INTERVAL_SECONDS` (300 s) and once at the end. The
-  writer lease is renewed per partition, throttled to the same interval.
+- `segment` and `classify` (both genres): buffered months are written and
+  completion saved at most every `cdt.completion.CHECKPOINT_INTERVAL_SECONDS`
+  (300 s) and once at the end. The writer lease is renewed before each month
+  write, throttled to the same interval. 6-K classify records a done set per
+  month, one key per filing judged (`classifier.sixk.filing_done_key`: the
+  accession and a digest of its window spans), so a month reprocessed after a
+  late filing judges only the filings whose windows are new or changed.
 - `extract` (live backend): commits what it has paid for at every partition end,
   and within a partition once `CHECKPOINT_INTERVAL_SECONDS` has passed since the
   last commit. A commit writes, in order:
@@ -162,8 +96,8 @@ of partitions:
   shard. It keeps no completion registry: each run re-matches every shard.
 - `ingest`: `--flush-rows` (`cdt run`: `--ingest-flush-rows`, default 100) is a
   write buffer, not a checkpoint. Ingest flushes accumulated document rows after
-  that many, and each flush rewrites the `date/shard` partitions its rows land
-  in. A larger buffer means fewer rewrites and more memory.
+  that many, and each flush rewrites the `documents` `date/shard` partitions its
+  rows land in. A larger buffer means fewer rewrites and more memory.
 
 None of these settings controls parquet file size.
 
@@ -644,7 +578,7 @@ Every writing command also takes an advisory lock directly under the artifact ro
 locks/pipeline-writer.json           # single-writer lease: {holder, acquired_at, expires_at}
 ```
 
-When a job finishes, its mentions are written to the canonical `mentions` partitions and its
+When a job finishes, its mentions are written to the canonical `mentions` month files and its
 audit log to `extractor-runs/run_id=<run_id>/full.jsonl`, exactly like the synchronous
 backend. `state.jsonl.gz` and `batches.json` are working state, not canonical outputs.
 
@@ -679,7 +613,7 @@ and `batch` backends:
       "accession_number": "...",
       "cik": "...",
       "date": "2024-01-02",
-      "shard": "0001",
+      "month": "2024-01",
       "state": "ERROR",
       "stage": "ner",
       "run_id": "20260814T134326943342Z",
@@ -700,7 +634,7 @@ Each classify stage keeps a failure list of the filings it could not classify,
   "failure_count": 1,
   "failures": {
     "<accession_number>": {
-      "source_partition": "<artifact-root>/sixk-windows/date=2026-10-01/shard=0007/part-0000.parquet",
+      "source_partition": "<artifact-root>/sixk-windows/month=2026-10/part-0000.parquet",
       "error": "validation failed: [...]"
     }
   }
@@ -711,7 +645,7 @@ The filing's rows are written with `label` `failed`. When a run classifies that
 source partition again, its entries are replaced by that run's failures, so a
 filing that now succeeds leaves the list. `cdt classify --retry-failures`
 classifies only the listed filings again: it replaces their rows in the output
-partition, keeps every other row, and updates the list. It skips a source
+month file, keeps every other row, and updates the list. It skips a source
 partition that is pending, since the next plain run classifies it whole, and
 writes no completion entry. Only 6-K triage can fail today; the 8-K list stays
 empty.

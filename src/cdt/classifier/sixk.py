@@ -17,6 +17,8 @@ notes are in ``docs/sixk-two-stage-triage.md``.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,7 +53,10 @@ from cdt.datasets import (
     SIXK_WINDOW_DATASET_NAME,
     dataset_root,
     date_shard_partition_path,
+    document_shard,
+    month_partition_path,
     resolve_artifact_root,
+    source_partition_month,
 )
 from cdt.ingest.core import DOCUMENT_COLUMNS
 from cdt.partition_stage import PartitionOutput, run_partition_stage
@@ -627,15 +632,52 @@ def _normalize_snippets(table: pd.DataFrame) -> pd.DataFrame:
     return normalized
 
 
-class _WindowPartitionTriage:
-    """Triage one ``sixk-windows`` partition, optionally only some filings.
+#: The window columns a filing's done key covers: a filing whose spans or
+#: source text change is judged again.
+_DONE_KEY_COLUMNS = [
+    "document_index",
+    "window",
+    "start",
+    "end",
+    "token_count",
+    "source_sha256",
+]
 
-    Each partition's filings are read from the 6-K documents partition of the
-    same date and shard. The stage-1 model is loaded on the first call. A
-    partition holding a filing whose spans no longer match its text is held,
-    as is one where a stage-2 call failed on the provider or transport, so the
-    next run triages it again. :meth:`report` logs and raises for what was
-    held.
+
+def filing_done_key(accession_number: str, filing_windows: pd.DataFrame) -> str:
+    """Return the done-set key of one filing's windows: its accession and their digest."""
+    spans = sorted(
+        tuple(str(value) for value in row)
+        for row in filing_windows[_DONE_KEY_COLUMNS].itertuples(index=False)
+    )
+    digest = hashlib.sha256(json.dumps(spans).encode("utf-8")).hexdigest()[:16]
+    return f"{accession_number}@{digest}"
+
+
+def filing_done_keys(windows: pd.DataFrame) -> dict[str, str]:
+    """Return each filing's done-set key (:func:`filing_done_key`), by accession."""
+    return {
+        str(accession_number): filing_done_key(str(accession_number), filing_windows)
+        for accession_number, filing_windows in windows.groupby(
+            "accession_number", sort=True
+        )
+    }
+
+
+class _WindowPartitionTriage:
+    """Triage one ``sixk-windows`` month file, optionally only some filings.
+
+    A filing whose done key (:func:`filing_done_key`) is in the month's done
+    set keeps its snippet rows from the ``sixk-snippets`` month file and makes
+    no stage-2 call. The others are read from the 6-K documents partitions
+    their date and accession place them in, and judged. The stage-1 model is
+    loaded on the first call. A month holding a filing whose spans no longer
+    match its text is held whole. When a stage-2 call fails on the provider or
+    transport, the month is written with that filing's earlier rows kept and
+    left pending, and its done set names only the filings judged, so the next
+    run judges only that filing again. Filings that failed for any other
+    reason are not in the done set either. :meth:`report` logs and raises for
+    what was held.
     """
 
     def __init__(
@@ -666,13 +708,63 @@ class _WindowPartitionTriage:
         self.stale_partitions: list[str] = []
         self.infrastructure_held: list[str] = []
 
+    def _documents_for(self: Self, windows: pd.DataFrame) -> pd.DataFrame:
+        """Read the 6-K documents rows of the filings ``windows`` covers."""
+        if windows.empty:
+            return pd.DataFrame(columns=DOCUMENT_COLUMNS)
+        filings = windows[["date", "accession_number"]].drop_duplicates()
+        frames: list[pd.DataFrame] = []
+        for (filing_date, shard), group in filings.groupby(
+            [
+                filings["date"].astype(str),
+                filings["accession_number"].astype(str).map(document_shard),
+            ],
+            sort=True,
+        ):
+            documents_path = date_shard_partition_path(
+                SIXK_DOCUMENT_DATASET_NAME,
+                partition_date=str(filing_date),
+                shard=str(shard),
+                artifact_root=self.artifact_root,
+            )
+            if not artifact_exists(documents_path):
+                continue
+            documents = read_table(documents_path, DOCUMENT_COLUMNS).reindex(
+                columns=DOCUMENT_COLUMNS
+            )
+            wanted = set(group["accession_number"].astype(str))
+            frames.append(
+                documents.loc[documents["accession_number"].astype(str).isin(wanted)]
+            )
+        populated = [frame for frame in frames if not frame.empty]
+        if not populated:
+            return pd.DataFrame(columns=DOCUMENT_COLUMNS)
+        return pd.concat(populated, ignore_index=True)
+
+    def _earlier_rows(
+        self: Self, partition: dict[str, str], accessions: set[str]
+    ) -> pd.DataFrame:
+        """Return the stored snippet rows of ``accessions`` in the source's month."""
+        if not accessions:
+            return _empty_snippets()
+        snippets_path = month_partition_path(
+            SIXK_SNIPPET_DATASET_NAME,
+            month=source_partition_month(partition),
+            artifact_root=self.artifact_root,
+        )
+        stored = read_table(snippets_path, SIXK_SNIPPET_COLUMNS).reindex(
+            columns=SIXK_SNIPPET_COLUMNS
+        )
+        return stored.loc[stored["accession_number"].astype(str).isin(accessions)]
+
     def __call__(
         self: Self,
         source_path: str,
         partition: dict[str, str],
         accessions: frozenset[str] | None = None,
+        done_keys: frozenset[str] = frozenset(),
     ) -> PartitionOutput:
-        """Triage the partition's filings, or only ``accessions``."""
+        """Triage the month's filings, or only ``accessions``, skipping done ones."""
         if self.artifacts is None:
             self.artifacts = load_stage1_model(self.model_dir)
             LOGGER.info("Stage-1 threshold %.3f", self.artifacts[1])
@@ -683,22 +775,13 @@ class _WindowPartitionTriage:
             windows = windows.loc[
                 windows["accession_number"].astype(str).isin(accessions)
             ]
-        documents_path = date_shard_partition_path(
-            SIXK_DOCUMENT_DATASET_NAME,
-            partition_date=partition["date"],
-            shard=partition["shard"],
-            artifact_root=self.artifact_root,
-        )
-        documents = (
-            read_table(documents_path, DOCUMENT_COLUMNS).reindex(
-                columns=DOCUMENT_COLUMNS
-            )
-            if artifact_exists(documents_path)
-            else pd.DataFrame(columns=DOCUMENT_COLUMNS)
-        )
+        keys = filing_done_keys(windows)
+        carried = {accession for accession, key in keys.items() if key in done_keys}
+        to_judge = windows.loc[~windows["accession_number"].astype(str).isin(carried)]
+        documents = self._documents_for(to_judge)
         self.s3_client = ensure_s3_client(self.s3_client, documents.to_dict("records"))
         output = triage_windows(
-            windows,
+            to_judge,
             documents,
             artifacts=self.artifacts,
             client=self.client,
@@ -706,17 +789,42 @@ class _WindowPartitionTriage:
             concurrency=self.concurrency,
             max_attempts=self.max_attempts,
         )
+        source_rows = windows["accession_number"].nunique()
         if output.stale_accessions:
             self.stale_partitions.append(source_path)
-        elif output.infrastructure_failed_accessions:
+            return PartitionOutput(
+                rows=_empty_snippets(), source_rows=source_rows, complete=False
+            )
+        held = set(output.infrastructure_failed_accessions)
+        if held:
             self.infrastructure_held.append(source_path)
+        judged = output.rows.loc[
+            ~output.rows["accession_number"].astype(str).isin(held)
+        ]
+        earlier = self._earlier_rows(partition, carried | held)
+        frames = [frame for frame in (earlier, judged) if not frame.empty]
+        rows = (
+            _normalize_snippets(pd.concat(frames, ignore_index=True))
+            if frames
+            else _empty_snippets()
+        )
+        done = frozenset(
+            key
+            for accession, key in keys.items()
+            if accession not in held and accession not in output.failures
+        )
+        if carried:
+            LOGGER.info(
+                "6-K triage: %s filing(s) of %s already judged; kept their rows",
+                len(carried),
+                source_path,
+            )
         return PartitionOutput(
-            rows=output.rows,
-            source_rows=windows["accession_number"].nunique(),
-            complete=not (
-                output.stale_accessions or output.infrastructure_failed_accessions
-            ),
+            rows=rows,
+            source_rows=source_rows,
+            complete=not held,
             failures=output.failures,
+            done_keys=done,
         )
 
     def report(self: Self) -> None:
@@ -752,18 +860,20 @@ def triage_pending_windows(
     max_attempts: int | None = None,
     renew: Callable[[], None] | None = None,
 ) -> pd.DataFrame:
-    """Triage pending ``sixk-windows`` partitions into ``sixk-snippets`` partitions.
+    """Triage pending ``sixk-windows`` month files into ``sixk-snippets`` month files.
 
-    A windows partition is pending when its fingerprint changed since it was
-    last classified, or always with ``force``, and is recomputed whole, at one
-    LLM call per filing with admitted windows. A partition holding a filing
-    whose spans no longer match its text is left pending and unwritten, as is
-    one where a stage-2 call failed on the provider or transport, so the next
-    run triages it again rather than sending its snippets to extraction
-    untriaged. A filing stage 2 could not judge for any other reason (its
-    answers failed validation every attempt, or the request was rejected) is
-    written as failed and listed in ``failures/sixk-classify/failures.json``
-    for :func:`retry_failed_triage`. Returns the snippet rows written this run.
+    A windows month is pending when its fingerprint changed since it was last
+    classified, or always with ``force``. Its filings already judged with the
+    same windows keep their rows; the rest cost one LLM call per filing with
+    admitted windows (``force`` judges every filing). A month holding a filing
+    whose spans no longer match its text is left pending and unwritten. A
+    filing whose stage-2 call failed on the provider or transport keeps its
+    earlier rows and leaves the month pending, so the next run judges it again
+    rather than sending its snippets to extraction untriaged. A filing stage 2
+    could not judge for any other reason (its answers failed validation every
+    attempt, or the request was rejected) is written as failed and listed in
+    ``failures/sixk-classify/failures.json`` for :func:`retry_failed_triage`.
+    Returns the snippet rows written this run.
 
     Raises:
         ValueError: If ``concurrency`` is not positive.
@@ -784,7 +894,9 @@ def triage_pending_windows(
         source_dataset=SIXK_WINDOW_DATASET_NAME,
         output_dataset=SIXK_SNIPPET_DATASET_NAME,
         output_columns=SIXK_SNIPPET_COLUMNS,
-        process=lambda source_path, partition: triage(source_path, partition, None),
+        process=lambda source_path, partition, done: triage(
+            source_path, partition, None, done
+        ),
         artifact_root=resolved_root,
         force=force,
         renew=renew,

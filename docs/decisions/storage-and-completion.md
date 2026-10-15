@@ -386,6 +386,43 @@ anything keyed on SEC's canonical CIKs (#153). Partitions written before
 padding hashed the bare string (for example `707605`), so `shard_for_cik`
 hashes the unpadded form.
 
+### `target_month`, `run_partition_stage` (month files for derived datasets)
+
+`items`, `classifications`, `sixk-windows`, `sixk-snippets` and `mentions`
+used to copy the `date=/shard=` layout of `documents`, 64 shards per filing
+date, although nothing about them needs it. Measured on dev S3 before the
+change: `items` 20,054 files for 26,512 rows (1.3 rows per file),
+`classifications` the same, `mentions` 1,044 files for 1,913 rows. Measured
+locally on `genwindow-eval-apr`: `items` took 1,554 files and 30 MB, and the
+same rows in month files take 2 files and 6.5 MB; `read_dataset` took 1.55 s
+over the date/shard layout and 0.13 s over month files, about 12× faster.
+On S3 the gap is wider, because every file is a round trip.
+
+Month was chosen over one file per date. At beta scope (about 1k CIKs over
+20 years) date files would hold about 30 items and 10 mentions each, so the
+per-file overhead (about 19 KB measured) would dominate again; month files
+hold about 640 items and 200 mentions. A date file's only advantage is write
+locality: the daily run rewrites the current month instead of up to five
+date files, about 4 MB of items at full scope. Both need the same "replace
+rows by source" writer, so the choice is the one function `target_month`.
+`documents` keeps `date=/shard=`: each date holds 148 MB–1 GB of text, and 64
+shards keep files near 8 MB and a late filing cheap to merge.
+
+Completion stays keyed on source files, so a late filing still makes only
+its own `documents` file pending. The rows a `documents` source produced are
+found by `(date, document_shard(accession_number))`, both already in every
+row, so no provenance column is needed. Rejected: keeping the 64-way shard
+and compacting afterwards (a second process and a second source of truth),
+and keying completion on rows (a larger change than the problem needs).
+
+A stage whose source is itself a month file sees the whole month as one
+source, since any change to it changes its version. For the local 8-K
+classifier that is cheap (about 4k rows a month at full scope, under a
+second). 6-K stage-2 triage is an LLM call per filing, so it records a done
+set like extract's: one key per filing judged, the accession plus a digest
+of its window spans, so a re-windowed filing is judged again. Filings whose
+stage-2 call failed are left out of it.
+
 ## lease.py
 
 ### `release_lease`, `_EXPIRED`, `_log_takeover`

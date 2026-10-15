@@ -23,7 +23,7 @@ STAGE = "test-classify"
 SOURCE = "test-segments"
 OUTPUT = "test-classified"
 COLUMNS = ["item_id", "accession_number", "label", "relevance", "verdict"]
-PARTITION = {"date": "2026-01-02", "shard": "0001"}
+PARTITION = {"month": "2026-01"}
 FAILING = "acc-fails"
 FINE = "acc-fine"
 
@@ -68,7 +68,7 @@ class FakeClassifier:
         """Return one row per filing of the source partition, or of ``accessions``."""
         del partition
         self.calls.append(accessions)
-        source = read_dataset(str(Path(source_path).parent.parent.parent))
+        source = read_dataset(str(Path(source_path).parent.parent))
         wanted = [
             accession
             for accession in source["accession_number"]
@@ -89,7 +89,7 @@ def _run(tmp_path: Path, classifier: FakeClassifier) -> None:
         source_dataset=SOURCE,
         output_dataset=OUTPUT,
         output_columns=COLUMNS,
-        process=lambda path, partition: classifier(path, partition, None),
+        process=lambda path, partition, _done: classifier(path, partition, None),
         artifact_root=str(tmp_path),
         force=True,
     )

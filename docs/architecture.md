@@ -45,6 +45,7 @@ CDT stores canonical state as Parquet, JSON, and JSONL artifacts under one root 
 That choice is visible throughout the code:
 
 - stage completion is recorded per source partition in a completion registry, keyed by the source file's fingerprint, so a partition that grows is processed again
+- `documents` are split by filing date and accession shard; every dataset derived from them is one file per month, in which a reprocessed source replaces only the rows it produced (see [schema.md](schema.md#partitioning-rules))
 - partitions are rewritten deterministically
 - stage manifests are sidecar metadata, not the source of truth
 - the same pipeline can target either local paths or `s3://` URIs

@@ -23,14 +23,19 @@ from cdt.completion import pending_source_partitions
 from cdt.datasets import (
     CLASSIFICATION_DATASET_NAME,
     dataset_root,
-    date_shard_partition_path,
     load_row_failures,
-    parse_date_shard_partition,
+    month_partition_path,
+    parse_source_partition,
     resolve_artifact_root,
     save_row_failures,
+    source_partition_month,
 )
 from cdt.lease import throttled
-from cdt.partition_stage import PartitionOutput, replace_partition_failures
+from cdt.partition_stage import (
+    PartitionOutput,
+    replace_partition_failures,
+    sort_partition_rows,
+)
 from cdt.segmenter.core import ITEM_COLUMNS
 from cdt.storage.tables import read_table, write_partition_table
 
@@ -67,7 +72,7 @@ CLASSIFIED_ITEM_COLUMNS = [
     "verdict",
 ]
 
-#: Classify one source partition: ``(source_path, {date, shard}, accessions)``.
+#: Classify one source month file: ``(source_path, {month}, accessions)``.
 #: ``accessions`` None classifies every filing in it; a set classifies only
 #: those filings.
 ClassifyPartition = Callable[
@@ -429,7 +434,7 @@ def retry_failed_classifications(
     stage could not classify, keyed by accession number and naming the source
     partition it was read from. For each source partition, ``classify_partition``
     classifies only the source rows of those filings. Their rows in the output
-    partition (same date and shard of ``output_dataset``) are replaced by the
+    month file (the source's month of ``output_dataset``) are replaced by the
     new ones, and every other row is written back unchanged. Filings that now
     succeed leave the list; filings that fail again keep an entry with the new
     error. A partition ``classify_partition`` holds (``complete`` False) writes
@@ -468,7 +473,7 @@ def retry_failed_classifications(
             )
             skipped += len(accessions)
             continue
-        partition = parse_date_shard_partition(source_path)
+        partition = parse_source_partition(source_path)
         output = classify_partition(source_path, partition, accessions)
         retried += len(accessions)
         if not output.complete:
@@ -476,11 +481,9 @@ def retry_failed_classifications(
             continue
         if keep_lease is not None:
             keep_lease()
-        output_path = date_shard_partition_path(
-            output_dataset,
-            partition_date=partition["date"],
-            shard=partition["shard"],
-            artifact_root=resolved_root,
+        month = source_partition_month(partition)
+        output_path = month_partition_path(
+            output_dataset, month=month, artifact_root=resolved_root
         )
         existing = read_table(output_path, output_columns).reindex(
             columns=output_columns
@@ -490,10 +493,12 @@ def retry_failed_classifications(
         ]
         write_partition_table(
             output_root,
-            partition={"date": partition["date"], "shard": partition["shard"]},
-            table=pd.concat(
-                [unchanged, output.rows.reindex(columns=output_columns)],
-                ignore_index=True,
+            partition={"month": month},
+            table=sort_partition_rows(
+                pd.concat(
+                    [unchanged, output.rows.reindex(columns=output_columns)],
+                    ignore_index=True,
+                )
             ),
         )
         replace_partition_failures(failures, source_path, output.failures)

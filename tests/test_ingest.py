@@ -14,13 +14,13 @@ import pytest
 
 from cdt.datasets import (
     SIXK_DOCUMENT_DATASET_NAME,
+    document_shard,
     failure_registry_path,
-    parse_date_shard_partition,
+    parse_source_partition,
 )
 from cdt.ingest.core import (
     DOCUMENT_COLUMNS,
     IngestConfig,
-    _document_shard,
     _partition_path,
     documents_root,
     filing_from_manifest_key,
@@ -638,14 +638,14 @@ def _manifest_bytes(
 
 def test_document_shard_is_stable_across_processes() -> None:
     """Shard assignment must not depend on the per-process hash salt (#61)."""
-    from cdt.ingest.core import DOCUMENT_PARTITION_SHARDS, _document_shard
+    from cdt.datasets import DOCUMENT_PARTITION_SHARDS
 
     # crc32 is deterministic: pin exact values so any change to the scheme
     # (which would strand existing partitions) fails loudly.
-    assert _document_shard("0001437749-26-027029") == _document_shard(
+    assert document_shard("0001437749-26-027029") == document_shard(
         "0001437749-26-027029"
     )
-    shard = int(_document_shard("0001437749-26-027029"))
+    shard = int(document_shard("0001437749-26-027029"))
     assert 0 <= shard < DOCUMENT_PARTITION_SHARDS
     import subprocess
     import sys
@@ -654,14 +654,14 @@ def test_document_shard_is_stable_across_processes() -> None:
         [
             sys.executable,
             "-c",
-            "from cdt.ingest.core import _document_shard;"
-            "print(_document_shard('0001437749-26-027029'))",
+            "from cdt.datasets import document_shard;"
+            "print(document_shard('0001437749-26-027029'))",
         ],
         capture_output=True,
         text=True,
         check=True,
     ).stdout.strip()
-    assert out == _document_shard("0001437749-26-027029")
+    assert out == document_shard("0001437749-26-027029")
 
 
 def test_force_retries_registered_permanent_failures(tmp_path: Path) -> None:
@@ -992,7 +992,7 @@ def test_partitions_written_before_the_provenance_columns_stay_readable(
     ]
     legacy_path = _partition_path(
         documents_root(str(tmp_path)),
-        {"date": "2023-01-02", "shard": _document_shard("000000000023000001")},
+        {"date": "2023-01-02", "shard": document_shard("000000000023000001")},
     )
     write_table(
         legacy_path,
@@ -1058,7 +1058,7 @@ def test_sixk_document_partitions_are_canonical_date_shard_partitions() -> None:
     consumed. So this pins what the new dataset actually needs — that its
     partitions parse — rather than anything about its name.
     """
-    partition = parse_date_shard_partition(
+    partition = parse_source_partition(
         f"/artifacts/{SIXK_DOCUMENT_DATASET_NAME}/date=2024-01-02/shard=0001/part-0000.parquet"
     )
     assert partition["date"] == "2024-01-02"
@@ -1084,7 +1084,7 @@ def _store_document(root: Path, accession: str, filing_date: str) -> None:
 
     write_partition_table(
         documents_root(str(root)),
-        partition={"date": filing_date, "shard": _document_shard(accession)},
+        partition={"date": filing_date, "shard": document_shard(accession)},
         table=pd.DataFrame(
             [_document_row(accession, filing_date)], columns=DOCUMENT_COLUMNS
         ),

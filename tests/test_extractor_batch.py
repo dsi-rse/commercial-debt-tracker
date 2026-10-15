@@ -125,9 +125,8 @@ def seed_classification(
     items: list[dict[str, object]],
     *,
     date: str = "2024-01-02",
-    shard: str = "0001",
 ) -> str:
-    """Write one canonical classification partition for the given items."""
+    """Write the classification month file of ``date`` with the given items."""
     rows: list[dict[str, object]] = []
     for item in items:
         row: dict[str, object] = {column: None for column in CLASSIFIED_ITEM_COLUMNS}
@@ -149,7 +148,7 @@ def seed_classification(
     table = pd.DataFrame(rows).reindex(columns=CLASSIFIED_ITEM_COLUMNS)
     return write_partition_table(
         classifications_root(tmp_path),
-        partition={"date": date, "shard": shard},
+        partition={"month": date[:7]},
         table=table,
     )
 
@@ -810,7 +809,7 @@ def test_stale_batch_result_is_ignored() -> None:
     # The row already folded this batch and advanced to instrument_ie.
     handle_response(row_state, MULTI_NER, max_attempts=3)
     assert row_state.current_attempt.stage_name == "instrument_ie"
-    entry = RowEntry(row_state=row_state, date="2024-01-02", shard="0001")
+    entry = RowEntry(row_state=row_state, month="2024-01")
     job = JobState(
         job_id="J",
         model="gpt-5.4",
@@ -838,9 +837,7 @@ def test_state_jsonl_round_trip_preserves_pending() -> None:
     )
     initial_messages(row_state)
     pending = {"batch_id": "batch-0", "stage": "ner", "attempt_index": 0}
-    entry = RowEntry(
-        row_state=row_state, date="2024-01-02", shard="0001", pending=pending
-    )
+    entry = RowEntry(row_state=row_state, month="2024-01", pending=pending)
 
     loaded = _load_state_jsonl(_serialize_state_jsonl({"item-1": entry}))
     assert loaded["item-1"].pending == pending
@@ -982,7 +979,7 @@ def test_reconcile_adopts_orphan_batch(tmp_path: Path) -> None:
         reasoning_effort="none",
         max_attempts=3,
         claimed_partitions=[],
-        rows={"item-1": RowEntry(row_state=row_state, date="2024-01-02", shard="0001")},
+        rows={"item-1": RowEntry(row_state=row_state, month="2024-01")},
     )
 
     _reconcile_orphans(str(tmp_path), job, client)
@@ -1207,14 +1204,14 @@ def test_force_during_an_active_job_is_queued_for_the_next_job(tmp_path: Path) -
 
 def test_force_reaches_every_partition_across_capped_jobs(tmp_path: Path) -> None:
     """``force`` outlives the first job when the row cap splits the work."""
-    for shard in ("0001", "0002", "0003"):
+    for month in ("01", "02", "03"):
         seed_classification(
             tmp_path,
-            [{"item_id": f"item-{shard}", "text": NODEBT_TEXT}],
-            shard=shard,
+            [{"item_id": f"item-{month}", "text": NODEBT_TEXT}],
+            date=f"2024-{month}-02",
         )
     client = FakeBatchClient(
-        {f"item-{shard}": {"ner": NODEBT_NER} for shard in ("0001", "0002", "0003")}
+        {f"item-{month}": {"ner": NODEBT_NER} for month in ("01", "02", "03")}
     )
 
     def _tick(*, force: bool = False) -> object:
@@ -1234,9 +1231,9 @@ def test_force_reaches_every_partition_across_capped_jobs(tmp_path: Path) -> Non
     statuses = [_tick(force=True).status, *_advance_until("idle", _tick)]
 
     assert sorted(ids[0] for _, ids in client.submitted) == [
-        "item-0001",
-        "item-0002",
-        "item-0003",
+        "item-01",
+        "item-02",
+        "item-03",
     ]
     assert statuses.count("completed") == 3
 
@@ -1400,22 +1397,20 @@ def test_batch_failures_are_recorded_in_the_failure_registry(tmp_path: Path) -> 
     assert entry["state"] == "ERROR"
     assert "content filtered" in str(entry["error"])
     assert entry["date"] == "2024-01-02"
-    assert entry["shard"] == "0001"
+    assert entry["month"] == "2024-01"
     # The successful row is absent, and its mentions still landed.
     assert read_dataset(mentions_root(tmp_path))["name"].to_list() == ["Term Loan"]
 
 
 def test_failure_registry_survives_across_jobs(tmp_path: Path) -> None:
     """A second job's failures accumulate rather than replacing the first's."""
-    seed_classification(
-        tmp_path, [{"item_id": "item-a", "text": MULTI_TEXT}], shard="0001"
-    )
+    seed_classification(tmp_path, [{"item_id": "item-a", "text": MULTI_TEXT}])
     client = FakeBatchClient({"item-a": {"ner": ("error", "first failure")}})
     while _advance(tmp_path, client).status != "completed":
         pass
 
     seed_classification(
-        tmp_path, [{"item_id": "item-b", "text": MULTI_TEXT}], shard="0002"
+        tmp_path, [{"item_id": "item-b", "text": MULTI_TEXT}], date="2024-02-02"
     )
     client = FakeBatchClient({"item-b": {"ner": ("error", "second failure")}})
     while _advance(tmp_path, client).status != "completed":
@@ -1423,8 +1418,8 @@ def test_failure_registry_survives_across_jobs(tmp_path: Path) -> None:
 
     failures = load_row_failures("extract", artifact_root=tmp_path)
     assert sorted(failures) == ["item-a", "item-b"]
-    assert failures["item-a"]["shard"] == "0001"
-    assert failures["item-b"]["shard"] == "0002"
+    assert failures["item-a"]["month"] == "2024-01"
+    assert failures["item-b"]["month"] == "2024-02"
     assert failures["item-a"]["run_id"] != failures["item-b"]["run_id"]
 
 
@@ -1818,15 +1813,13 @@ def test_collect_pending_extract_items_caps_claimed_rows(tmp_path: Path) -> None
     """Claiming stops at max_rows; unclaimed partitions stay pending (#92)."""
     from cdt.extractor.outputs import collect_pending_extract_items
 
-    for index, (date_value, shard) in enumerate(
-        [("2024-01-02", "0001"), ("2024-01-03", "0002"), ("2024-01-04", "0003")],
-        start=1,
+    for index, date_value in enumerate(
+        ["2024-01-02", "2024-02-03", "2024-03-04"], start=1
     ):
         seed_classification(
             tmp_path,
             [{"item_id": f"item-{index}", "text": f"text {index}"}],
             date=date_value,
-            shard=shard,
         )
 
     entries, claimed = collect_pending_extract_items(artifact_root=tmp_path, max_rows=1)
@@ -1883,7 +1876,7 @@ def _awaiting_entry(text: str) -> RowEntry:
     row_state = ExtractionRowState(item_row=_item_row("item-1", text), stage_name="ner")
     row_state.current_attempt.messages = initial_messages(row_state) or []
     # `_fold_completed_batches` clears `pending` before it folds.
-    return RowEntry(row_state=row_state, date="2024-01-02", shard="0001", pending=None)
+    return RowEntry(row_state=row_state, month="2024-01", pending=None)
 
 
 def test_batch_fold_resends_a_provider_abort_without_scoring_it() -> None:

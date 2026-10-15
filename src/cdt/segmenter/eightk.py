@@ -758,11 +758,12 @@ def segment_pending_eightk_documents(
     item_numbers: tuple[str, ...] | None = None,
     renew: Callable[[], None] | None = None,
 ) -> pd.DataFrame:
-    """Itemize pending documents partitions into item partitions.
+    """Itemize pending documents partitions into the ``items`` month files.
 
     A partition is pending when its fingerprint differs from the completion
-    registry's (or always, with ``force``) and is recomputed whole. Completion
-    is checkpointed and ``renew`` called as :func:`run_partition_stage` does.
+    registry's (or always, with ``force``) and is recomputed whole; its items
+    replace the ones it produced before. Writes, completion and ``renew`` work
+    as :func:`run_partition_stage` describes.
 
     Returns:
         The item rows written this run, in ITEM_COLUMNS order.
@@ -770,9 +771,11 @@ def segment_pending_eightk_documents(
     selected_item_numbers = normalize_item_numbers(item_numbers)
     shared_client = s3_client
 
-    def process(source_path: str, partition: dict[str, str]) -> PartitionOutput:
+    def process(
+        source_path: str, partition: dict[str, str], done: frozenset[str]
+    ) -> PartitionOutput:
         nonlocal shared_client
-        del partition
+        del partition, done
         documents = read_table(source_path, DOCUMENT_COLUMNS).reindex(
             columns=DOCUMENT_COLUMNS
         )

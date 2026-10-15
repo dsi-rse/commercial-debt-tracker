@@ -25,6 +25,7 @@ from cdt.classifier.core import (
 from cdt.classifier.sixk import (
     SIXK_SNIPPET_COLUMNS,
     StaleSegmentationError,
+    filing_done_key,
     item_id_for,
     retry_failed_triage,
     sixk_snippets_root,
@@ -37,6 +38,7 @@ from cdt.datasets import (
     SIXK_DOCUMENT_DATASET_NAME,
     SIXK_WINDOW_DATASET_NAME,
     dataset_root,
+    document_shard,
     load_row_failures,
     run_manifest_path,
 )
@@ -714,11 +716,18 @@ def test_windows_of_two_documents_are_never_merged_together(tmp_path: Path) -> N
 
 
 def _write_documents(tmp_path: Path, rows: list[dict[str, object]]) -> None:
-    write_partition_table(
-        ingest_documents_root(str(tmp_path), dataset_name=SIXK_DOCUMENT_DATASET_NAME),
-        partition={"date": "2026-03-03", "shard": "0001"},
-        table=pd.DataFrame(rows, columns=DOCUMENT_COLUMNS),
-    )
+    """Write 6-K documents rows dated 2026-03-03 at the shard ingest would use."""
+    table = pd.DataFrame(rows, columns=DOCUMENT_COLUMNS)
+    for shard, shard_rows in table.groupby(
+        table["accession_number"].astype(str).map(document_shard)
+    ):
+        write_partition_table(
+            ingest_documents_root(
+                str(tmp_path), dataset_name=SIXK_DOCUMENT_DATASET_NAME
+            ),
+            partition={"date": "2026-03-03", "shard": str(shard)},
+            table=shard_rows,
+        )
 
 
 def test_stage_writes_snippet_partitions_and_records_completion(
@@ -780,10 +789,10 @@ def test_stage_skips_a_partition_it_has_already_triaged(tmp_path: Path) -> None:
 def test_a_stage_two_outage_leaves_the_partition_pending(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A 503 writes nothing and records no completion, so the next run re-triages.
+    """A 503 writes no snippets and leaves the month pending, so the next run re-triages.
 
     Failing open here would send the filing to extraction untriaged and mark
-    the partition complete, so it would never be triaged.
+    the month complete, so it would never be triaged.
     """
     _write_documents(
         tmp_path,
@@ -802,9 +811,11 @@ def test_a_stage_two_outage_leaves_the_partition_pending(
 
     assert held.empty
     assert list_artifacts(sixk_snippets_root(str(tmp_path)), suffix=".parquet") == []
-    # Recorded with no fingerprint, so it matches nothing and stays pending.
+    # Recorded incomplete with an empty done set, so the filing is judged again.
     registry = load_completion_registry("sixk-classify", artifact_root=str(tmp_path))
-    assert [entry.fingerprint for entry in registry.values()] == [None]
+    assert [(entry.complete, entry.item_ids) for entry in registry.values()] == [
+        (False, frozenset())
+    ]
     assert "left pending after stage-2 provider failures" in caplog.text
 
     recovered = segment_and_classify_pending(
@@ -813,7 +824,7 @@ def test_a_stage_two_outage_leaves_the_partition_pending(
 
     assert set(recovered["verdict"]) == {VERDICT_KEPT}
     registry = load_completion_registry("sixk-classify", artifact_root=str(tmp_path))
-    assert [entry.fingerprint is not None for entry in registry.values()] == [True]
+    assert [entry.complete for entry in registry.values()] == [True]
 
 
 def test_exhausted_stage_two_validation_completes_the_partition_as_failed(
@@ -995,8 +1006,12 @@ def test_a_plain_rerun_of_the_partition_clears_a_recovered_filing(
     assert load_row_failures("sixk-classify", artifact_root=str(tmp_path)) == {}
 
 
-def test_stage_retriages_a_partition_ingest_grew(tmp_path: Path) -> None:
-    """A documents partition with new rows is pending again."""
+def test_a_grown_month_judges_only_its_new_filing(tmp_path: Path) -> None:
+    """A late filing makes the month pending; the filing already judged keeps its rows.
+
+    The first filing's windows are unchanged, so its done key is in the
+    month's done set and it costs no second stage-2 call.
+    """
     first_row = _document_row(
         tmp_path, submission=_submission(("6-K", f"<p>{DEBT_PROSE}</p>"))
     )
@@ -1014,21 +1029,15 @@ def test_stage_retriages_a_partition_ingest_grew(tmp_path: Path) -> None:
     client = FakeChatClient(keep_all=True)
     snippets = segment_and_classify_pending(artifact_root=str(tmp_path), client=client)
 
-    assert len(client.calls) == 2
+    assert len(client.calls) == 1
     assert set(snippets["accession_number"]) == {
         "000000000026000001",
         "000000000026000002",
     }
 
 
-def test_snippets_land_in_their_source_documents_partition(tmp_path: Path) -> None:
-    """Snippets inherit the source partition, which is what groups a filing.
-
-    Stage 2 must see a whole filing at once. Documents shard by accession
-    (`ingest._document_shard`), so every window of one filing is co-partitioned
-    and reaches one call; snippets are then written at the same coordinates, so
-    a re-run maps output back to input without a lookup.
-    """
+def test_snippets_land_in_their_filing_month(tmp_path: Path) -> None:
+    """Snippets are written to the month file of their filing date."""
     _write_documents(
         tmp_path,
         [
@@ -1043,9 +1052,7 @@ def test_snippets_land_in_their_source_documents_partition(tmp_path: Path) -> No
     )
 
     written = list_artifacts(sixk_snippets_root(str(tmp_path)), suffix=".parquet")
-    assert [Path(path).parent.parts[-2:] for path in written] == [
-        ("date=2026-03-03", "shard=0001")
-    ]
+    assert [Path(path).parent.name for path in written] == ["month=2026-03"]
 
 
 def test_a_dropped_window_records_why(tmp_path: Path) -> None:
@@ -1300,3 +1307,23 @@ def test_a_retry_skips_a_partition_that_changed_since_it_was_triaged(
     assert list(load_row_failures("sixk-classify", artifact_root=str(tmp_path))) == [
         "000000000026000001"
     ]
+
+
+def test_a_filing_done_key_changes_with_its_windows() -> None:
+    """A re-windowed filing gets a new done key, so the done set never skips it."""
+    windows = pd.DataFrame(
+        {
+            "document_index": [0, 0],
+            "window": [0, 1],
+            "start": [0, 400],
+            "end": [512, 912],
+            "token_count": [100, 100],
+            "source_sha256": ["abc", "abc"],
+        }
+    )
+    key = filing_done_key("0001", windows)
+
+    assert key.startswith("0001@")
+    assert filing_done_key("0001", windows.iloc[::-1]) == key
+    assert filing_done_key("0001", windows.assign(end=[512, 900])) != key
+    assert filing_done_key("0001", windows.assign(source_sha256="def")) != key
