@@ -9,7 +9,7 @@ can search for a name you saw in the code.
 
 ## Stage orchestration (`cdt.pipeline`)
 
-The `FINAL_OUTPUT_*` constants and `finalize_after_match` below live in `cdt.publish`, and `GENRE_8K` / `GENRE_6K` in `cdt.datasets`; they are described here because they shape the run.
+The `FINAL_OUTPUT_*` constants below live in `cdt.publish`, and `GENRE_8K` / `GENRE_6K` in `cdt.datasets`; they are described here because they shape the run.
 
 ### `FINAL_OUTPUT_TABLES`
 
@@ -139,19 +139,14 @@ otherwise never be scanned again: a permanent gap that nothing reports (#90).
 Ingest deduplicates by accession, so the re-scan costs only LIST/GET requests,
 and the fingerprint registries carry late merges downstream.
 
-### `finalize_after_match`
+### Lineage is part of match
 
-Every whole run that matches and publishes finishes through this one
-function (`cdt match` runs the lineage pass itself and does not publish;
-`cdt publish` calls `publish_final_tables`, the publish half, alone). When the
-lineage pass was wired into only one of three entry points, production
-published 537 of 542 instruments as lineage heads (#170).
-
-Amendment lineage spans filings, so it can only be derived after every shard
-has matched. That makes it a post-pass over the whole corpus. It re-derives
-every pointer it has ever inferred (#204). It is skipped only when match
-produced nothing, because it would then read three empty datasets to write
-none.
+Every whole run that matches and publishes calls `match_pending_mentions` and
+then `publish_final_tables`; `cdt match` matches and does not publish, and
+`cdt publish` only publishes. Lineage is inferred inside match, for each CIK
+it re-clusters, so no entry point can skip it. When it was a separate pass
+wired into only one of three entry points, production published 537 of 542
+instruments as lineage heads (#170).
 
 ## The publish (`cdt.publish`)
 

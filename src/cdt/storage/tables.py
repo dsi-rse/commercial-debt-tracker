@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import io
-from collections.abc import Iterator, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
@@ -11,6 +11,7 @@ from tempfile import NamedTemporaryFile
 
 import pandas as pd
 import pyarrow as pa
+import pyarrow.compute
 import pyarrow.dataset
 import pyarrow.fs
 import pyarrow.parquet
@@ -227,17 +228,53 @@ def count_partition_rows(paths: Sequence[ArtifactPath]) -> int:
     return sum(count or 0 for count in counts)
 
 
+#: Keep only rows whose column value is in the given collection.
+RowFilter = Mapping[str, Collection[object]]
+
+
+def _filter_frame(table: pd.DataFrame, where: RowFilter | None) -> pd.DataFrame:
+    """Apply ``where`` to an in-memory frame; a filtered column it lacks keeps no row."""
+    if not where:
+        return table
+    mask = pd.Series(True, index=table.index)
+    for column, values in where.items():
+        if column not in table:
+            return table.iloc[0:0]
+        mask &= table[column].isin(list(values))
+    return table.loc[mask].reset_index(drop=True)
+
+
+def _arrow_filter(
+    where: RowFilter | None, schema: pa.Schema
+) -> pyarrow.compute.Expression | None | bool:
+    """Return ``where`` as an Arrow expression; False when a column is absent."""
+    if not where:
+        return None
+    expression: pyarrow.compute.Expression | None = None
+    for column, values in where.items():
+        if column not in schema.names:
+            return False
+        term = pyarrow.compute.field(column).isin(
+            pa.array(list(values), type=schema.field(column).type)
+        )
+        expression = term if expression is None else expression & term
+    return expression
+
+
 def _read_dataset_with_arrow(
-    paths: list[str], columns: Sequence[str] | None
+    paths: list[str],
+    columns: Sequence[str] | None,
+    where: RowFilter | None = None,
 ) -> tuple[pd.DataFrame | None, Exception | None]:
     """Read many partitions as one parallel Arrow dataset scan.
 
-    The schema is merged across every file by ``_unified_schema``. Returns
-    ``(table, None)`` on success, or ``(None, error)`` when the files cannot be
-    read as one table (an error in ``_ARROW_READ_ERRORS``: incompatible
-    per-partition types, or a partition deleted since the listing), so the
-    caller can report which. Requested ``columns`` absent from every file come
-    back all-null.
+    The schema is merged across every file by ``_unified_schema``. ``where``
+    is pushed into the scan, so row groups whose statistics rule it out are
+    skipped. Returns ``(table, None)`` on success, or ``(None, error)`` when
+    the files cannot be read as one table (an error in ``_ARROW_READ_ERRORS``:
+    incompatible per-partition types, or a partition deleted since the
+    listing), so the caller can report which. Requested ``columns`` absent
+    from every file come back all-null.
     """
     filesystem, _ = arrow_filesystem(paths[0])
     # One filesystem (and connection pool) for the whole scan; the other paths
@@ -251,12 +288,15 @@ def _read_dataset_with_arrow(
         unified = pyarrow.dataset.dataset(
             resolved, format="parquet", filesystem=filesystem, schema=schema
         )
+        row_filter = _arrow_filter(where, schema)
+        if row_filter is False:
+            return pd.DataFrame(columns=columns), None
         if columns is None:
-            return unified.to_table().to_pandas(), None
+            return unified.to_table(filter=row_filter).to_pandas(), None
         # Project only the columns this root actually has; a name absent
         # everywhere is reindexed in below, matching the pandas path.
         present = [name for name in columns if name in schema.names]
-        table = unified.to_table(columns=present).to_pandas()
+        table = unified.to_table(columns=present, filter=row_filter).to_pandas()
         return table.reindex(columns=list(columns)), None
     except _ARROW_READ_ERRORS as error:
         return None, error
@@ -267,15 +307,20 @@ def read_dataset(
     *,
     columns: Sequence[str] | None = None,
     partition_filter: dict[str, str] | None = None,
+    where: RowFilter | None = None,
 ) -> pd.DataFrame:
     """Read and concatenate all Parquet files under a dataset prefix.
 
-    ``partition_filter`` keeps only paths containing every ``key=value``. Reads
-    through ``read_partitions``: one parallel Arrow scan, falling back to
-    per-file reads when the partitions cannot be read as one table.
+    ``partition_filter`` keeps only paths containing every ``key=value``
+    segment; ``where`` keeps only rows whose column values are in the given
+    collections. Reads through ``read_partitions``: one parallel Arrow scan,
+    falling back to per-file reads when the partitions cannot be read as one
+    table.
     """
     paths = list(iter_partition_paths(base, partition_filter=partition_filter))
-    return read_partitions(paths, columns=columns, label=normalize_artifact_path(base))
+    return read_partitions(
+        paths, columns=columns, label=normalize_artifact_path(base), where=where
+    )
 
 
 def read_partitions(
@@ -283,18 +328,20 @@ def read_partitions(
     *,
     columns: Sequence[str] | None = None,
     label: str | None = None,
+    where: RowFilter | None = None,
 ) -> pd.DataFrame:
     """Read an explicit list of partitions as one table, Arrow scan first.
 
     Tries ``_read_dataset_with_arrow``; when the partitions cannot be read as
-    one table, logs the reason and concatenates per-file ``read_table`` reads.
-    ``label`` names the group in that log (default: the first path). No paths
-    returns an empty frame with ``columns``.
+    one table, logs the reason and concatenates per-file ``read_table`` reads,
+    filtered by ``where`` in memory. ``label`` names the group in that log
+    (default: the first path). No paths returns an empty frame with
+    ``columns``.
     """
     if not paths:
         return pd.DataFrame(columns=columns)
     resolved_paths = [normalize_artifact_path(path) for path in paths]
-    table, error = _read_dataset_with_arrow(resolved_paths, columns)
+    table, error = _read_dataset_with_arrow(resolved_paths, columns, where)
     if table is not None:
         return table
     LOGGER.info(
@@ -305,7 +352,9 @@ def read_partitions(
         type(error).__name__,
         error,
     )
-    frames = [read_table(path, columns) for path in resolved_paths]
+    frames = [
+        _filter_frame(read_table(path, columns), where) for path in resolved_paths
+    ]
     return pd.concat(frames, ignore_index=True)
 
 

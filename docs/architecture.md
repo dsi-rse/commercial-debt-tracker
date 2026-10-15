@@ -23,7 +23,7 @@ those issuers happened to file is not something the caller should have to know.
 4. `extract`
    Extracts structured debt-instrument mentions from relevant rows of **both** classification sources and writes a full per-run audit log. Two backends exist: a synchronous `live` backend (OpenRouter chat completions) and the deployed `batch` backend (OpenAI Batch API). See "Extractor Design" below.
 5. `match`
-   Consolidates mention rows into debt instruments and writes instrument-level outputs partitioned by CIK shard, then runs the lineage pass. A 6-K mention consolidates against an 8-K mention for the same issuer for free: the matcher shards by CIK and never reads the genre.
+   Re-clusters, from scratch, every CIK whose set of mentions changed since the last run, assigns instrument ids (carried forward by member overlap, minted from content when new), infers amendment lineage within each CIK, and writes instrument-level outputs partitioned by CIK shard. A 6-K mention consolidates against an 8-K mention for the same issuer for free: the matcher works per CIK and never reads the genre.
 6. `publish`
    Writes the four final snapshot tables below, when a final database root is configured.
 
@@ -257,7 +257,7 @@ Practical consequences when extending the matcher:
 
 - Reading the `classifications` dataset, or any other raw document text, from matcher code is out of bounds. Consume the extractor's facts instead.
 - If a needed fact is not in the extractor's output, the fix belongs in the extractor — add the property there, bound to an object and cited with spans — not in a matcher heuristic that reconstructs it from text.
-- A new published column that records a matcher inference, rather than an extractor fact, needs a provenance column that survives an incremental rematch, and it needs saying so in `docs/schema.md`.
+- A new published column that records a matcher inference, rather than an extractor fact, needs a provenance column alongside it, and it needs saying so in `docs/schema.md`.
 
 `ordinal_chain` in `cdt.matcher.lineage_inference` illustrates the right side of the line: it reasons over the `name` column, the filing dates, and the borrower the extractor bound to each row in `parties_json` — all extractor facts, all cited. The other side is an instrument's prior state, the terms it had before an amendment: that is a new object with its own terms, so the extractor mints it from the filing's `prior` marks rather than the matcher inferring it. The rule of thumb: **IE owns facts; the matcher decides identity and may build views over extractor facts, but it neither creates objects nor asserts facts.**
 

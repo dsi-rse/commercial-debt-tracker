@@ -16,6 +16,61 @@ from cdt.extractor.state import ExtractionRowState
 from cdt.ingest.core import DOCUMENT_COLUMNS
 from cdt.storage.tables import write_partition_table
 
+_INSTRUMENT_ID_COLUMNS = (
+    "debt_instrument_id",
+    "amendment_of_debt_instrument_id",
+    "split_of_debt_instrument_id",
+    "superseded_by_debt_instrument_id",
+    "lineage_family_id",
+)
+
+
+def name_by_seed(
+    frame: pd.DataFrame, instruments: pd.DataFrame | None = None
+) -> pd.DataFrame:
+    """Return ``frame`` with every instrument id replaced by its seed mention id.
+
+    Instrument ids are minted hashes; tests read better naming an instrument
+    after the mention that seeded it. ``instruments`` supplies the id -> seed
+    map (default: ``frame`` itself, when it is the instruments table). A
+    ``lineage_family_id`` becomes the smallest seed in the family, so it still
+    compares equal across members.
+    """
+    source = frame if instruments is None else instruments
+    seeds = dict(
+        zip(
+            source["debt_instrument_id"].astype(str),
+            source["seed_debt_instrument_mention_id"].astype(str),
+            strict=True,
+        )
+    )
+    renamed = frame.copy()
+    for column in _INSTRUMENT_ID_COLUMNS:
+        if column in renamed:
+            renamed[column] = renamed[column].map(
+                lambda value: seeds.get(str(value), value)
+                if isinstance(value, str)
+                else value
+            )
+    if "lineage_family_id" in renamed and "debt_instrument_id" in renamed:
+        smallest: dict[object, str] = {}
+        for family, seed in zip(
+            renamed["lineage_family_id"], renamed["debt_instrument_id"], strict=True
+        ):
+            smallest[family] = min(smallest.get(family, str(seed)), str(seed))
+        renamed["lineage_family_id"] = renamed["lineage_family_id"].map(smallest)
+    if "retired_by_debt_instrument_ids" in renamed:
+        renamed["retired_by_debt_instrument_ids"] = renamed[
+            "retired_by_debt_instrument_ids"
+        ].map(
+            lambda value: json.dumps(
+                sorted(seeds.get(item, item) for item in json.loads(value))
+            )
+            if isinstance(value, str)
+            else value
+        )
+    return renamed
+
 
 def build_mention_row(
     *,

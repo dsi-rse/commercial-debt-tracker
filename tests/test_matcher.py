@@ -252,11 +252,6 @@ def test_synthesized_mentions_do_not_widen_the_name_class() -> None:
     assert sizes["m-original"] == 2
     assert sizes["m-amendment"] == 2
 
-    published_mint = pd.DataFrame(
-        [{"cik": "0000320193", "name": "Credit Agreement", "synthesized_only": True}]
-    )
-    assert name_class_sizes(index, published_mint)["m-original"] == 2
-
 
 def test_a_prior_state_is_placed_before_the_object_it_was_minted_from() -> None:
     """Two amendments of one restatement chain through their minted prior states.
@@ -381,7 +376,6 @@ def test_a_synthesized_member_never_supplies_canonical_fields() -> None:
         {"inst": ["m-original", "m-prior"]},
         index,
         {},
-        existing_instruments=pd.DataFrame(),
         company_names={},
     )[0]
     assert merged["name"] == "Credit Agreement"
@@ -394,7 +388,6 @@ def test_a_synthesized_member_never_supplies_canonical_fields() -> None:
         {"inst": ["m-prior"]},
         index,
         {},
-        existing_instruments=pd.DataFrame(),
         company_names={},
     )[0]
     assert alone["name"] == "Fifth Amended and Restated Credit Agreement"
@@ -1092,14 +1085,20 @@ def test_name_only_tie_prefers_a_live_cluster_over_a_retired_one() -> None:
     assert chosen == "inst-live"
 
 
-def test_name_only_tie_prefers_the_largest_cluster_then_the_lowest_id() -> None:
-    """The third and fourth sort components; the fourth is what makes it stable."""
+def test_name_only_tie_prefers_the_largest_cluster_then_the_earliest_seed() -> None:
+    """The third and fourth sort components; the fourth is what makes it stable.
+
+    The fourth is the cluster's seed sort key, never its id, so the choice of
+    ids can never change a clustering decision.
+    """
     from cdt.matcher.schema import CandidateScore
     from cdt.matcher.scoring import resolve_candidates
 
     mention = prepare_mention(mention_row(debt_instrument_mention_id="mention-new"))
 
-    def candidate(instrument_id: str, *, size: int) -> CandidateScore:
+    def candidate(
+        instrument_id: str, *, size: int, seeded: str = "2024-01-01"
+    ) -> CandidateScore:
         return CandidateScore(
             debt_instrument_id=instrument_id,
             match_score=0.90,
@@ -1108,6 +1107,7 @@ def test_name_only_tie_prefers_the_largest_cluster_then_the_lowest_id() -> None:
             exact_name=True,
             cluster_size=size,
             cluster_retired=False,
+            seed_sort_key=(seeded, "0001", "item-1", 1, instrument_id),
         )
 
     kwargs = {
@@ -1122,12 +1122,17 @@ def test_name_only_tie_prefers_the_largest_cluster_then_the_lowest_id() -> None:
         **kwargs,
     )
     assert bigger == "inst-big"
-    # Equal on every earlier component, the id breaks the tie deterministically,
-    # which is what keeps resolution reproducible across runs (#171).
+    # Equal on every earlier component, the earlier seed breaks the tie
+    # deterministically, whatever the ids sort as (#171).
     stable, _ = resolve_candidates(
-        mention, [candidate("zzz", size=3), candidate("aaa", size=3)], **kwargs
+        mention,
+        [
+            candidate("aaa", size=3, seeded="2024-06-01"),
+            candidate("zzz", size=3, seeded="2024-01-01"),
+        ],
+        **kwargs,
     )
-    assert stable == "aaa"
+    assert stable == "zzz"
 
 
 def test_relaxed_key_rule_is_gated_at_exactly_the_name_class_gate() -> None:
@@ -1175,91 +1180,14 @@ def test_lender_keys_reads_only_lender_clusters() -> None:
     assert lender_keys(payload) == ["acme bank"]
 
 
-def test_an_extracted_amendment_pointer_beats_a_carried_inferred_one() -> None:
-    """A guess and a fact must not cancel each other out (#203, #204).
-
-    `derive_parent_links` used to seed `amendment_parents` with the existing
-    row's pointer whatever its provenance, so a row carrying an inferred
-    pointer to one instrument, whose mention now states an extracted pointer to
-    another, held two candidates and the ambiguity guard threw both away. The
-    pass then re-inferred its guess on the next run and the extracted link
-    never came back. What the mentions state wins; the carried pointer is only
-    a fallback, and it is what keeps an inferred link alive across an ordinary
-    rematch since no mention names it.
-    """
-    child = prepare_mention(
-        mention_row(debt_instrument_mention_id="m-child", amendment_of="m-real-parent")
-    )
-    existing = pd.DataFrame(
-        [
-            {
-                "debt_instrument_id": "m-child",
-                "amendment_of_debt_instrument_id": "m-guessed-parent",
-                "amendment_inferred_by": "ordinal_chain",
-                "retired_by_debt_instrument_ids": None,
-                "split_of_debt_instrument_id": None,
-            }
-        ]
-    )
-
-    links = derive_parent_links(
-        {"m-child": ["m-child"]},
-        {"m-child": child},
-        {"m-child": "m-child", "m-real-parent": "m-real-parent"},
-        existing_instruments=existing,
-    )
-
-    assert links["m-child"]["amendment_of_debt_instrument_id"] == "m-real-parent"
-    # provenance travels with the pointer: this one is extracted, not inferred
-    assert links["m-child"]["amendment_inferred_by"] is None
-
-
-def test_a_carried_pointer_survives_when_no_mention_names_a_parent() -> None:
-    """The fallback is the whole reason an inferred pointer outlives a rematch (#184)."""
-    child = prepare_mention(mention_row(debt_instrument_mention_id="m-child"))
-    existing = pd.DataFrame(
-        [
-            {
-                "debt_instrument_id": "m-child",
-                "amendment_of_debt_instrument_id": "m-guessed-parent",
-                "amendment_inferred_by": "ordinal_chain",
-                "retired_by_debt_instrument_ids": None,
-                "split_of_debt_instrument_id": None,
-            }
-        ]
-    )
-
-    links = derive_parent_links(
-        {"m-child": ["m-child"]},
-        {"m-child": child},
-        {"m-child": "m-child"},
-        existing_instruments=existing,
-    )
-
-    assert links["m-child"]["amendment_of_debt_instrument_id"] == "m-guessed-parent"
-    assert links["m-child"]["amendment_inferred_by"] == "ordinal_chain"
-
-
-def test_two_extracted_parents_refuse_rather_than_fall_back_to_a_guess() -> None:
-    """An ambiguous extracted set is a refusal; falling back would publish a guess."""
+def test_two_extracted_parents_publish_no_amendment_pointer() -> None:
+    """An ambiguous extracted set is a refusal, not a choice between them."""
     first = prepare_mention(
         mention_row(debt_instrument_mention_id="m-a", amendment_of="m-parent-1")
     )
     second = prepare_mention(
         mention_row(debt_instrument_mention_id="m-b", amendment_of="m-parent-2")
     )
-    existing = pd.DataFrame(
-        [
-            {
-                "debt_instrument_id": "m-a",
-                "amendment_of_debt_instrument_id": "m-guessed-parent",
-                "amendment_inferred_by": "ordinal_chain",
-                "retired_by_debt_instrument_ids": None,
-                "split_of_debt_instrument_id": None,
-            }
-        ]
-    )
-
     links = derive_parent_links(
         {"m-a": ["m-a", "m-b"]},
         {"m-a": first, "m-b": second},
@@ -1269,7 +1197,6 @@ def test_two_extracted_parents_refuse_rather_than_fall_back_to_a_guess() -> None
             "m-parent-1": "m-parent-1",
             "m-parent-2": "m-parent-2",
         },
-        existing_instruments=existing,
     )
 
     assert links["m-a"]["amendment_of_debt_instrument_id"] is None

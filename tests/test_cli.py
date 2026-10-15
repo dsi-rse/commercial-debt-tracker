@@ -927,34 +927,19 @@ def test_extract_job_reset_aborts_when_the_job_changed(
 # --- match --------------------------------------------------------------------
 
 
-def test_match_matches_then_infers_lineage_both_renewing(
+def test_match_forwards_its_options_and_a_renewer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``cdt match`` forwards its options, then runs the lineage pass over every shard.
+    """``cdt match`` forwards its options, ``--remint`` included, and a lease renewer."""
+    from cdt.matcher.stage import MatchResult
 
-    Both rewrite whole datasets, so each is handed a renewer for the lease.
-    """
     calls: list[dict[str, object]] = []
 
-    def fake_match_pending_mentions(**kwargs: object) -> dict[str, pd.DataFrame]:
+    def fake_match_pending_mentions(**kwargs: object) -> MatchResult:
         calls.append(kwargs)
-        return {
-            "debt_instrument_mentions": pd.DataFrame(
-                [{"debt_instrument_mention_id": "m-1"}]
-            ),
-            "debt_instrument": pd.DataFrame([{"debt_instrument_id": "di-1"}]),
-        }
+        return MatchResult(ciks_matched=1)
 
-    lineage_calls: list[dict[str, object]] = []
     monkeypatch.setattr(cli, "match_pending_mentions", fake_match_pending_mentions)
-    monkeypatch.setattr(
-        cli,
-        "apply_lineage_inference_pass",
-        lambda artifact_root, **kwargs: (
-            lineage_calls.append({"root": str(artifact_root), **kwargs}),
-            {"links": 1, "reopened": 0, "heads_before": 2, "heads_after": 1},
-        )[1],
-    )
 
     status = cli.main(
         [
@@ -963,6 +948,7 @@ def test_match_matches_then_infers_lineage_both_renewing(
             "--artifact-root",
             str(tmp_path),
             "--force",
+            "--remint",
         ]
     )
 
@@ -970,14 +956,12 @@ def test_match_matches_then_infers_lineage_both_renewing(
     [kwargs] = calls
     assert (
         kwargs["force"],
+        kwargs["remint"],
         kwargs["strong_match_threshold"],
         kwargs["loose_match_threshold"],
         kwargs["ambiguity_margin"],
-    ) == (True, 0.9, 0.75, 0.05)
+    ) == (True, True, 0.9, 0.75, 0.05)
     assert callable(kwargs["renew"])
-    [lineage] = lineage_calls
-    assert lineage["root"] == str(tmp_path)
-    assert callable(lineage["renew"])
 
 
 # --- publish ------------------------------------------------------------------

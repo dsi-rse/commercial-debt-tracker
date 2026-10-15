@@ -73,7 +73,6 @@ from cdt.matcher import (
     match_pending_mentions,
     mention_cluster_edges_root,
 )
-from cdt.matcher.lineage_inference import apply_lineage_inference_pass
 from cdt.pipeline import (
     DEFAULT_GENRES,
     PipelineConfig,
@@ -560,12 +559,17 @@ def _add_match(commands: argparse._SubParsersAction) -> None:
         parents=[
             _common_options(),
             _force_option(
-                "rebuild every shard from scratch instead of extending its "
-                "existing instruments"
+                "re-cluster every CIK, not only those whose mentions changed"
             ),
             _match_options(),
         ],
-        help="group mentions into debt instruments, then infer lineage",
+        help="group mentions into debt instruments and infer their lineage",
+    )
+    match.add_argument(
+        "--remint",
+        action="store_true",
+        help="re-cluster every CIK and give every instrument its content id, "
+        "redirecting the old ids (run once before the first public publish)",
     )
     match.set_defaults(func=run_match)
 
@@ -1013,29 +1017,22 @@ def run_extract_job_reset(args: argparse.Namespace) -> int:
 
 
 def run_match(args: argparse.Namespace) -> int:
-    """Run ``cdt match``: match, then the lineage pass over every shard."""
+    """Run ``cdt match``: re-cluster the CIKs whose mentions changed."""
 
     def body(artifact_root: str, lease: Lease) -> int:
-        tables = match_pending_mentions(
+        result = match_pending_mentions(
             artifact_root=artifact_root,
             force=args.force,
+            remint=args.remint,
             renew=renewer(lease),
             strong_match_threshold=args.strong_match_threshold,
             loose_match_threshold=args.loose_match_threshold,
             ambiguity_margin=args.ambiguity_margin,
         )
-        # Lineage spans filings, so it is a post-pass over every shard.
-        stats = apply_lineage_inference_pass(artifact_root, renew=renewer(lease))
-        LOGGER.info(
-            "Lineage inference: %s links (%s re-opened), lineage heads %s -> %s",
-            stats["links"],
-            stats["reopened"],
-            stats["heads_before"],
-            stats["heads_after"],
-        )
         print(
-            f"Matched {len(tables['debt_instrument_mentions'])} mention-cluster "
-            f"edge rows into {mention_cluster_edges_root(artifact_root)} and "
+            f"Matched {result.ciks_matched} CIK(s) into "
+            f"{len(result.instruments)} debt instruments under "
+            f"{mention_cluster_edges_root(artifact_root)} and "
             f"{debt_instruments_root(artifact_root)}."
         )
         return 0

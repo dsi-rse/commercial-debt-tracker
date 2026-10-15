@@ -342,7 +342,8 @@ new filings only. Stored rows keep the old output until they are forced:
 - **Amount parser.** Amounts are parsed at extraction and stored in
   `mentions`; only `cdt run poll --force` re-reads them.
 - **Matcher.** A change to clustering without a `MATCHER_SCHEMA_VERSION` bump
-  reaches existing instruments on `cdt match --force`.
+  reaches existing instruments on `cdt match --force`, which re-clusters every
+  CIK and keeps instrument ids that still share members.
 
 ## Prod Launch Checklist
 
@@ -380,11 +381,15 @@ launch day — but do it in order then.
    exactly the four `latest.parquet` tables, and
    `processors/cdt/final-snapshots/latest.json` points at a consistent
    generation with sane row counts.
-7. **Enable schedules**: set `idi:poll_schedule_enabled: "true"` first and
+7. **Remint instrument ids** once the backfill has extracted and matched, and
+   before the first public publish: `cdt match --remint` gives every
+   instrument its content id, so the ids no longer depend on the order the
+   backfill ran in, and records a redirect for every id it replaces.
+8. **Enable schedules**: set `idi:poll_schedule_enabled: "true"` first and
    watch a few ticks (the poller alone drains extraction), then
    `idi:schedule_enabled: "true"` for the daily run. Confirm the poll-liveness
    and daily-heartbeat alarms settle into OK.
-8. **Leave the beta scope**: when prod should cover every filer, set
+9. **Leave the beta scope**: when prod should cover every filer, set
    `idi:cik_scope: all` in `Pulumi.prod.yaml` and deploy. The task then reads
    no CIK file and loses its read grant on the beta list. Size the first run
    on all filers deliberately: run a bounded `run-historical.sh` backfill

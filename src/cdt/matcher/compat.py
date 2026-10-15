@@ -4,18 +4,19 @@ from __future__ import annotations
 
 import re
 from decimal import Decimal, InvalidOperation
-
-import pandas as pd
+from functools import lru_cache
 
 from cdt.extractor.normalize.amounts import normalize_numeric_string
 from cdt.matcher.normalize import (
     MONTH_TEXT_LENGTH,
     YEAR_TEXT_LENGTH,
-    coerce_optional_bool,
-    coerce_optional_text,
-    normalize_name_fingerprint,
 )
 from cdt.matcher.schema import PreparedMention
+
+# The name rules below are pure functions of fingerprint strings, and matching
+# one CIK calls them for the same few hundred fingerprints millions of times.
+_FINGERPRINT_CACHE = 1 << 14
+_FINGERPRINT_PAIR_CACHE = 1 << 18
 
 
 def end_dates_are_compatible(left: str | None, right: str | None) -> bool:
@@ -43,6 +44,7 @@ def end_dates_are_compatible(left: str | None, right: str | None) -> bool:
 NAME_RATE_PATTERN = re.compile(r"(?<!\d)(\d{1,3})(?:[ .](\d{1,4}))?%")
 
 
+@lru_cache(maxsize=_FINGERPRINT_CACHE)
 def name_rate_tokens(fingerprint: str | None) -> frozenset[str]:
     """Return the coupon rates in one name fingerprint, as canonical numbers.
 
@@ -71,6 +73,7 @@ NAME_CLASS_GATE = 2
 NAME_MIN_SHARED_TOKENS = 2
 
 
+@lru_cache(maxsize=_FINGERPRINT_CACHE)
 def name_fingerprint_tokens(fingerprint: str | None) -> frozenset[str]:
     """Return the informative tokens of one name fingerprint."""
     if not fingerprint:
@@ -80,6 +83,7 @@ def name_fingerprint_tokens(fingerprint: str | None) -> frozenset[str]:
     )
 
 
+@lru_cache(maxsize=_FINGERPRINT_PAIR_CACHE)
 def name_fingerprints_are_compatible(left: str | None, right: str | None) -> bool:
     """Return whether two name fingerprints can name one instrument.
 
@@ -118,6 +122,7 @@ def name_fingerprints_are_compatible(left: str | None, right: str | None) -> boo
     )
 
 
+@lru_cache(maxsize=_FINGERPRINT_CACHE)
 def name_fingerprint_is_identifying(fingerprint: str | None) -> bool:
     """Return whether a name fingerprint alone can identify one instrument.
 
@@ -130,49 +135,45 @@ def name_fingerprint_is_identifying(fingerprint: str | None) -> bool:
     return bool(NAME_MATURITY_YEAR_PATTERN.search(fingerprint))
 
 
-def name_class_sizes(
-    mention_index: dict[str, PreparedMention],
-    existing_instruments: pd.DataFrame | None = None,
-) -> dict[str, int]:
+def name_class_sizes(mention_index: dict[str, PreparedMention]) -> dict[str, int]:
     """Count, per mention, how many mentions of its CIK share a compatible name.
 
     A name shared by many of one issuer's mentions is a template rather than an
     identifier, so the relaxed key rule stands down for it.
 
-    Counted over the CIK's mentions and existing instrument rows whose name is
-    equal or compatible, excluding synthesized mentions and `synthesized_only`
-    rows, which carry another instrument's name. A mention with no CIK gets 1.
+    Counted over the CIK's mentions whose name is equal or compatible,
+    excluding synthesized mentions, which carry another instrument's name. A
+    mention with no CIK gets 1. Compatibility is decided once per pair of
+    distinct fingerprints, not per pair of mentions.
     """
-    by_cik: dict[str, list[str | None]] = {}
+    counts_by_cik: dict[str, dict[str | None, int]] = {}
     for mention in mention_index.values():
         if mention.cik is None or mention.synthesized_by is not None:
             continue
-        by_cik.setdefault(mention.cik, []).append(mention.normalized_name_fingerprint)
-    if existing_instruments is not None and not existing_instruments.empty:
-        for row in existing_instruments.to_dict("records"):
-            cik = coerce_optional_text(row.get("cik"))
-            if cik is None or cik not in by_cik:
-                continue
-            if coerce_optional_bool(row.get("synthesized_only")):
-                continue
-            by_cik[cik].append(
-                normalize_name_fingerprint(coerce_optional_text(row.get("name")))
-            )
+        counts = counts_by_cik.setdefault(mention.cik, {})
+        fingerprint = mention.normalized_name_fingerprint
+        counts[fingerprint] = counts.get(fingerprint, 0) + 1
+    class_size_by_cik: dict[str, dict[str | None, int]] = {}
     sizes: dict[str, int] = {}
     for mention_id, mention in mention_index.items():
         if mention.cik is None:
             sizes[mention_id] = 1
             continue
+        counts = counts_by_cik.get(mention.cik, {})
+        class_sizes = class_size_by_cik.setdefault(mention.cik, {})
         fingerprint = mention.normalized_name_fingerprint
-        sizes[mention_id] = sum(
-            1
-            for other in by_cik.get(mention.cik, [])
-            if other == fingerprint
-            or name_fingerprints_are_compatible(fingerprint, other)
-        )
+        if fingerprint not in class_sizes:
+            class_sizes[fingerprint] = sum(
+                count
+                for other, count in counts.items()
+                if other == fingerprint
+                or name_fingerprints_are_compatible(fingerprint, other)
+            )
+        sizes[mention_id] = class_sizes[fingerprint]
     return sizes
 
 
+@lru_cache(maxsize=_FINGERPRINT_PAIR_CACHE)
 def name_rates_are_compatible(left: str | None, right: str | None) -> bool:
     """Return whether two name fingerprints can still describe one instrument."""
     left_rates = name_rate_tokens(left)

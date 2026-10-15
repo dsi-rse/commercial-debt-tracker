@@ -53,7 +53,7 @@ Optional final snapshot layout:
 |---|---|---|
 | `documents`, `documents-sixk` | `<dataset>/date=YYYY-MM-DD/shard=NNNN/part-0000.parquet` | one filing date's filings whose `crc32(accession_number) % 64` is `NNNN` |
 | `items`, `sixk-windows`, `classifications`, `sixk-snippets`, `mentions` | `<dataset>/month=YYYY-MM/part-0000.parquet` | every row whose filing `date` falls in the month, sorted by `(cik, date, accession_number)` |
-| `mention-cluster-edges`, `debt-instruments` | `<dataset>/cik_shard=NNNN/part-0000.parquet` | the matcher's output for every CIK whose unpadded form hashes (`crc32 % 64`) to `NNNN` |
+| `mention-cluster-edges`, `debt-instruments`, `debt-instrument-redirects` | `<dataset>/cik_shard=NNNN/part-0000.parquet` | the matcher's output for every CIK whose unpadded form hashes (`crc32 % 64`) to `NNNN` |
 
 - `datasets.shard_label` is the single source of the shard contract (crc32, modulo, four-digit label); it never uses Python's per-process salted `hash`. `datasets.document_shard` is the `documents` shard of an accession; `datasets.shard_for_cik` hashes the unpadded CIK, so both spellings of one CIK land in one shard.
 - `datasets.target_month` names a row's month file. A stage writes a source's rows into the month of the source (`datasets.source_partition_month`).
@@ -92,8 +92,13 @@ of partitions:
   A resumed run pays only for rows with no verdict. The batch backend persists every row's state at each tick and sizes
   its work with `cdt run poll`'s `--max-rows-per-job`,
   `--max-requests-per-batch` and `--max-batch-bytes`.
-- `match`: processes every `cik_shard` group in turn, renewing the lease per
-  shard. It keeps no completion registry: each run re-matches every shard.
+- `match`: re-clusters only the CIKs whose set of mention ids changed since the
+  last run (`runs/match/cik-digests/cik_shard=NNNN.json`, one digest per
+  normalized CIK), and rewrites only the shards they live in, renewing the
+  lease per shard. A shard's digests are written after its tables, so a run
+  that stops part-way leaves those CIKs for the next one. The affected CIKs'
+  mentions are read with one filtered scan per batch of shards
+  (`MENTION_READ_BATCH_ROWS`).
 - `ingest`: `--flush-rows` (`cdt run`: `--ingest-flush-rows`, default 100) is a
   write buffer, not a checkpoint. Ingest flushes accumulated document rows after
   that many, and each flush rewrites the `documents` `date/shard` partitions its
@@ -446,6 +451,8 @@ Columns:
 
 - `debt_instrument_mention_id`: Mention-level identifier from the `mentions` dataset.
 - `debt_instrument_id`: Canonical debt instrument entity the matcher assigned the mention to.
+- `cik`: The mention's normalized CIK, by which the matcher replaces one CIK's rows.
+- `item_id`: The mention's item, by which a re-extracted item finds the cluster it belonged to.
 - `edge_type`: Relationship type, currently `member`, `related`, or `ambiguous_candidate`.
 - `match_score`: Numeric matcher confidence score for the candidate relationship.
 - `candidate_rank`: Rank of this candidate among evaluated instrument candidates for the mention.
@@ -456,20 +463,20 @@ Columns:
 
 Columns:
 
-- `debt_instrument_id`: Canonical entity identifier for one consolidated debt instrument history.
+- `debt_instrument_id`: Canonical entity identifier for one consolidated debt instrument history: `di::` and a digest. A cluster that shares members with one of its CIK's previous clusters keeps that cluster's id (largest overlap of mention ids, then of item ids); a cluster with no previous overlap gets the digest of its CIK and its smallest member `mention_sort_key` (`cdt.matcher.identity`). `cdt match --remint` gives every cluster that content id.
 - `cik`: Issuer CIK shared by the instrument's directly matched mentions, zero-padded.
 - `company_name`: Issuer display name resolved from the instrument's directly matched mentions, falling back to the newest name any mention for the same CIK carries.
-- `seed_debt_instrument_mention_id`: First direct mention used as the representative seed for the instrument record.
-- `amendment_of_debt_instrument_id`: Parent instrument ID when this instrument is an amendment lineage child. Every lineage pointer on this table carries a relation the **extractor** asserted and cited, except where `amendment_inferred_by` says otherwise; the matcher resolves the `raw_id` to an instrument ID but never invents the relation. A pointer that records a matcher inference rather than an extracted fact needs a provenance column alongside it, documented here, and that column has to survive an incremental rematch — see the stage boundary in `docs/architecture.md`.
+- `seed_debt_instrument_mention_id`: The member mention that sorts first (`mention_sort_key`).
+- `amendment_of_debt_instrument_id`: Parent instrument ID when this instrument is an amendment lineage child. Every lineage pointer on this table carries a relation the **extractor** asserted and cited, except where `amendment_inferred_by` says otherwise; the matcher resolves the `raw_id` to an instrument ID but never invents the relation. A pointer that records a matcher inference rather than an extracted fact needs a provenance column alongside it, documented here — see the stage boundary in `docs/architecture.md`.
 - `retired_by_debt_instrument_ids`: JSON array of IDs of the instruments that retired this one, set on the retired instrument's own row (null when none).
 - `split_of_debt_instrument_id`: Parent instrument ID when this instrument is a split lineage child.
-- `amendment_inferred_by`: Which rule inferred `amendment_of_debt_instrument_id`, when the matcher filled it rather than the extractor: `ordinal_chain` (the amend-and-restate ordinal in the name) is the only value. Null means the pointer came from an extracted, cited relation — including the pointer from an amended instrument to the prior state the extractor minted for it — so an inferred pointer is never mistaken for an extracted one. Set by the lineage pass, which runs after every match — in `cdt match`, in the pipeline's match-and-finalize step, and in `Pipeline.run` (`cdt run daily|historical --extractor-backend live`) alike — and which clears and re-derives every inferred pointer on each run.
+- `amendment_inferred_by`: Which rule inferred `amendment_of_debt_instrument_id`, when the matcher filled it rather than the extractor: `ordinal_chain` (the amend-and-restate ordinal in the name) is the only value. Null means the pointer came from an extracted, cited relation — including the pointer from an amended instrument to the prior state the extractor minted for it — so an inferred pointer is never mistaken for an extracted one. Inferred within each CIK every time the matcher re-clusters it, from its current rows only.
 - `superseded_by_debt_instrument_id`: The amendment child that replaced this state, when exactly one exists. A row with this set is a superseded state, not a live obligation.
 - `lineage_family_id`: One ID per connected lineage component over amendment, split, and retirement pointers — every state of one obligation history shares it. Singleton instruments use their own ID.
 - `is_lineage_head`: True when no amendment child supersedes this row; the browse index should show heads and collapse the rest of the family beneath them.
 - `first_seen_filing_date` / `last_seen_filing_date`: Filing-date range of the instrument's direct mentions.
 - `mention_count` / `document_count`: Direct mentions, and distinct filings containing them.
-- `name`, `instrument_type`, `start_date`, `commitment_termination_date`: Matcher-selected canonical values — the newest non-null across direct mentions, falling back to the value already on the row when no mention carries one.
+- `name`, `instrument_type`, `start_date`, `commitment_termination_date`: Matcher-selected canonical values — the newest non-null across direct mentions.
 - `maturity_date`: Selected on a different rule from the fields above. The newest **stated** maturity wins; a derived one — read out of the instrument's own name, or computed from a tenor — publishes only when no mention in the cluster states any. The other canonical fields do not yet apply this preference.
 - `principal_amount`, `principal_currency`, `principal_amount_kind`: Canonical headline amount, taken together from the newest mention that carries one so the currency can never detach from its figure.
 - `outstanding_balance`, `outstanding_balance_currency`, `outstanding_balance_as_of`, `outstanding_balance_as_of_is_filing_date`: The newest balance observation, kept apart from principal so it never double-counts. When the filing dates the balance no other way, `as_of` falls back to the observing mention's filing date and `outstanding_balance_as_of_is_filing_date` is true, so a substituted date is never mistaken for a stated one.
@@ -480,6 +487,17 @@ Columns:
 - `lender_disclosure`: The instrument's worst-case answer across its direct mentions. `collective_present` wins outright — one filing showing a collective lender phrase means holders are hidden however many others name some — and `complete` beats `none_named`, so a filing that named every lender is not erased by one that named none.
 
 Primary key: `debt_instrument_id`
+
+### `debt-instrument-redirects`
+
+One row per instrument id no longer in use whose members another instrument
+took over, so a link to the old id can be sent to the right page.
+
+- `old_debt_instrument_id`: The id no longer published in `debt-instruments`.
+- `debt_instrument_id`: The live instrument that took most of its members. A redirect whose target later stops being used follows that target's redirect, so every target is live.
+- `cik`: The issuer's normalized CIK.
+
+Primary key: `old_debt_instrument_id`
 
 **No lifecycle `status` is published here, by design.** The publisher derives
 it at publish time against an explicit `asOf` recorded alongside `generatedAt`
@@ -508,7 +526,7 @@ These stages overwrite a `latest` manifest, named by their completion-registry s
 <artifact-root>/runs/classify/run_id=latest.json       # 8-K classify
 <artifact-root>/runs/sixk-classify/run_id=latest.json  # 6-K classify (triage)
 <artifact-root>/runs/match/run_id=latest.json
-<artifact-root>/runs/infer-lineage/run_id=latest.json
+<artifact-root>/runs/match/cik-digests/cik_shard=NNNN.json   # {schema_version, ciks: {cik: digest}}
 ```
 
 The four segment and classify manifests share one shape (`cdt.partition_stage`):
@@ -519,20 +537,16 @@ spans no longer match their text) and `completion_registry`, plus stage-specific
 settings (`item_numbers`; `window_tokens`; `concurrency`, `stage2_model`,
 `stage2_provider`).
 
-`infer-lineage` is the amendment-lineage post-pass. It runs after every match
-and rewrites every `debt-instruments` partition the match manifest just listed,
-so it records its own manifest: the last manifest of that dataset then
-describes its final state. It carries the pass's counters (`links`,
-`reopened`, `heads_before`, `heads_after`) alongside the partitions it
-rewrote.
+The match manifest records `rebuild_all`, `remint`, `ciks_matched`,
+`ciks_removed`, `inferred_lineage_links` and the thresholds alongside the
+shards it rewrote.
 
 The match manifest and the `final-snapshots/latest.json` pointer carry
-`schema_version` (`MATCHER_SCHEMA_VERSION`, currently 7). It is bumped whenever a
+`schema_version` (`MATCHER_SCHEMA_VERSION`, currently 8). It is bumped whenever a
 `debt-instruments` or `mention-cluster-edges` column is added or removed.
-`match_pending_mentions` reads the recorded value back and **promotes a plain
-run to a full rematch when it is lower than the running version**; the manifest
-that rematch writes records the current version, so the next run is an
-ordinary incremental match again.
+`match_pending_mentions` reads the recorded value back and **re-clusters every
+CIK when it is lower than the running version**; the manifest that run writes
+records the current version, so the next run matches only changed CIKs again.
 
 ### Extractor manifests and audit logs
 
@@ -706,14 +720,10 @@ published status a function of the run's **scope** rather than of the filings.
 Re-deriving one 542-instrument corpus against a reference date two years
 earlier moved 218 statuses and changed nothing else.
 
-**Why an older `schema_version` forces a rematch.** Mention ids are content
-hashes, so a schema change that alters the hashed payload changes every id,
-and clusters carried over from the older root are then keyed on ids the
-mentions dataset no longer contains. Minting prior-state rows adds mentions
-too, so carried-over clusters can hold slots the mints would take on a clean
-build, and a cluster can end up with two members naming two different
-amendment parents, which `derive_parent_links` refuses. Promoting rather than
-refusing keeps the scheduled run self-healing; a rematch is deterministic local
+**Why an older `schema_version` forces a rematch.** A schema change can change
+what the matcher writes for a CIK whose mentions did not change, so the
+digests alone would leave those CIKs stale. Promoting rather than refusing
+keeps the scheduled run self-healing; a rematch is deterministic local
 compute.
 
 **Observed evidence multiplicity.** Measured over a 669-mention window:

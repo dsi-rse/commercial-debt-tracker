@@ -8,14 +8,14 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
-from support import FakeModel
+from support import FakeModel, name_by_seed
 
 from cdt.classifier import eightk as classifier_eightk
 from cdt.datasets import GENRE_6K, GENRE_8K
 from cdt.extractor.state import ExtractionRowState
 from cdt.ingest.core import IngestRunResult
 from cdt.matcher import debt_instruments_root, mention_cluster_edges_root
-from cdt.matcher.schema import MENTION_CLUSTER_EDGE_COLUMNS
+from cdt.matcher.stage import MatchResult
 from cdt.pipeline import (
     ALL_TIME_START_DATE,
     DEFAULT_GENRES,
@@ -139,14 +139,15 @@ def test_run_pipeline_uses_stage_backed_functions(
         calls.append(("extract", None))
         return pd.DataFrame([{"debt_instrument_mention_id": "mention-1"}])
 
-    def fake_match_pending_mentions(**kwargs: object) -> dict[str, pd.DataFrame]:
+    def fake_match_pending_mentions(**kwargs: object) -> MatchResult:
         calls.append(("match", None))
-        return {
-            "debt_instrument_mentions": pd.DataFrame(
+        return MatchResult(
+            edges=pd.DataFrame(
                 [{"debt_instrument_mention_id": "mention-1", "edge_type": "member"}]
             ),
-            "debt_instrument": pd.DataFrame([{"debt_instrument_id": "instrument-1"}]),
-        }
+            instruments=pd.DataFrame([{"debt_instrument_id": "instrument-1"}]),
+            ciks_matched=1,
+        )
 
     monkeypatch.setattr(
         "cdt.ingest.genres.acquire_eightk_documents", fake_run_ingest_pipeline
@@ -260,15 +261,7 @@ def test_genres_narrow_the_run_to_one_chain(
     )
     monkeypatch.setattr(
         "cdt.pipeline.match_pending_mentions",
-        lambda **kwargs: (
-            calls.append("match"),
-            {
-                "debt_instrument_mentions": pd.DataFrame(
-                    columns=MENTION_CLUSTER_EDGE_COLUMNS
-                ),
-                "debt_instrument": pd.DataFrame(),
-            },
-        )[1],
+        lambda **kwargs: (calls.append("match"), MatchResult())[1],
     )
 
     result = run_pipeline(
@@ -518,13 +511,13 @@ This is the extracted event text.
     assert result.extracted_rows == 1
     assert result.matched_rows == 1
     assert written_matches["edge_type"].to_list() == ["member"]
-    assert written_instruments["debt_instrument_id"].to_list() == ["m-1"]
+    assert name_by_seed(written_instruments)["debt_instrument_id"].to_list() == ["m-1"]
     assert final_items["item_id"].to_list() == ["000114036126006577-8-01"]
     assert final_items["company_name"].to_list() == ["Example Inc."]
     assert final_mentions["debt_instrument_mention_id"].to_list() == ["m-1"]
     assert final_mentions["company_name"].to_list() == ["Example Inc."]
     assert final_edges["debt_instrument_mention_id"].to_list() == ["m-1"]
-    assert final_instruments["debt_instrument_id"].to_list() == ["m-1"]
+    assert name_by_seed(final_instruments)["debt_instrument_id"].to_list() == ["m-1"]
     assert final_instruments["company_name"].to_list() == ["Example Inc."]
 
 
@@ -576,51 +569,6 @@ def _mention_frame(*names: str) -> pd.DataFrame:
         )
         rows.append(row)
     return pd.DataFrame(rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
-
-
-def test_match_and_finalize_runs_the_lineage_pass_after_every_match(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The pass is part of the pipeline, renews the lease, and skips an empty corpus.
-
-    Behind `cdt match --infer-lineage` it never ran in production, which is why
-    537 of 542 instruments published as lineage heads (#170). It reads three
-    whole datasets and rewrites every shard, so it must renew the writer lease
-    like the phases around it (#89).
-    """
-    from cdt import pipeline as pipeline_module
-    from cdt import publish as publish_module
-
-    calls: list[dict[str, object]] = []
-    renewals: list[int] = []
-
-    def fake_pass(artifact_root: object, **kwargs: object) -> dict[str, int]:
-        calls.append({"artifact_root": str(artifact_root), **kwargs})
-        return {"links": 0, "reopened": 0, "heads_before": 0, "heads_after": 0}
-
-    monkeypatch.setattr(publish_module, "apply_lineage_inference_pass", fake_pass)
-
-    empty_root = tmp_path / "empty"
-    pipeline_module.run_match_and_finalize(
-        artifact_root=empty_root, renew=lambda: renewals.append(1)
-    )
-    assert calls == []
-
-    root = tmp_path / "artifacts"
-    write_partition_table(
-        root / "mentions",
-        partition={"month": "2022-01"},
-        table=_mention_frame(
-            "Credit Agreement", "Second Amended and Restated Credit Agreement"
-        ),
-    )
-    pipeline_module.run_match_and_finalize(
-        artifact_root=root, renew=lambda: renewals.append(1)
-    )
-    assert len(calls) == 1
-    assert calls[0]["artifact_root"] == str(root)
-    assert callable(calls[0]["renew"])
-    assert renewals  # the lease was renewed around the pass
 
 
 def test_published_items_union_both_genres_so_every_mention_can_join(
@@ -875,66 +823,13 @@ def _stage_stubs(
     )
     monkeypatch.setattr(
         "cdt.pipeline.match_pending_mentions",
-        lambda **_: {
-            "debt_instrument_mentions": pd.DataFrame(
+        lambda **_: MatchResult(
+            edges=pd.DataFrame(
                 [{"debt_instrument_mention_id": "mention-1", "edge_type": "member"}]
             ),
-            "debt_instrument": instruments,
-        },
-    )
-
-
-@pytest.mark.parametrize(
-    ("instruments", "expected_calls"),
-    [
-        (pd.DataFrame([{"debt_instrument_id": "instrument-1"}]), 1),
-        (pd.DataFrame(columns=["debt_instrument_id"]), 0),
-    ],
-    ids=["matched-something", "matched-nothing"],
-)
-def test_run_pipeline_runs_the_lineage_pass_between_match_and_publish(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    instruments: pd.DataFrame,
-    expected_calls: int,
-) -> None:
-    """A live run infers lineage before publishing, as the batch backend does.
-
-    The guard matches `run_match_and_finalize`'s: nothing matched means three
-    empty datasets read to write none.
-    """
-    from cdt import publish as publish_module
-
-    cik_file = tmp_path / "ciks.txt"
-    cik_file.write_text("320193\n", encoding="utf-8")
-    calls: list[dict[str, object]] = []
-    _stage_stubs(monkeypatch, tmp_path, instruments=instruments)
-    monkeypatch.setattr(
-        publish_module,
-        "apply_lineage_inference_pass",
-        lambda artifact_root, **kwargs: (
-            calls.append({"artifact_root": str(artifact_root), **kwargs}),
-            {"links": 0, "reopened": 0, "heads_before": 0, "heads_after": 0},
-        )[1],
-    )
-
-    renewals: list[int] = []
-    run_pipeline(
-        PipelineConfig(
-            mode="historical",
-            cik_file=str(cik_file),
-            start_date=date(2024, 1, 1),
-            end_date=date(2024, 1, 31),
-            artifact_root=str(tmp_path / "artifacts"),
+            instruments=instruments,
         ),
-        renew=lambda: renewals.append(1),
     )
-
-    assert len(calls) == expected_calls
-    if expected_calls:
-        assert calls[0]["artifact_root"] == str(tmp_path / "artifacts")
-        assert callable(calls[0]["renew"])
-        assert renewals
 
 
 def _publish_all_four(final_root: Path) -> None:
@@ -1027,9 +922,6 @@ def test_the_gate_fires_on_a_corpus_that_already_has_instruments(
     from cdt import pipeline as pipeline_module
     from cdt import publish as publish_module
 
-    monkeypatch.setattr(
-        publish_module, "apply_lineage_inference_pass", lambda *a, **k: {}
-    )
     artifact_root = tmp_path / "artifacts"
     final_root = tmp_path / "final"
     write_partition_table(
@@ -1375,9 +1267,6 @@ def test_run_pipeline_skips_the_publish_when_nothing_changed(
         tmp_path,
         instruments=pd.DataFrame([{"debt_instrument_id": "instrument-1"}]),
     )
-    monkeypatch.setattr(
-        publish_module, "apply_lineage_inference_pass", lambda *a, **k: {}
-    )
     artifact_root = tmp_path / "artifacts"
     final_root = tmp_path / "final"
     _record_published_generation(artifact_root, final_root)
@@ -1457,15 +1346,7 @@ def _isolation_stubs(
     )
     monkeypatch.setattr(
         "cdt.pipeline.match_pending_mentions",
-        lambda **kwargs: (
-            calls.append("match"),
-            {
-                "debt_instrument_mentions": pd.DataFrame(
-                    columns=MENTION_CLUSTER_EDGE_COLUMNS
-                ),
-                "debt_instrument": pd.DataFrame(),
-            },
-        )[1],
+        lambda **kwargs: (calls.append("match"), MatchResult())[1],
     )
 
 
@@ -1592,34 +1473,22 @@ def test_a_run_with_a_failed_genre_does_not_report_success(
     assert "with failed genres: 6-K" in caplog.text
 
 
-def test_match_and_finalize_logs_its_lineage_and_finalize_stages(
+def test_match_and_finalize_logs_its_match_and_finalize_stages(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The batch path (daily, poll) logs the same stage lines a live run does."""
+    """The batch path (daily, poll) logs the same finalize lines a live run does."""
     from cdt.pipeline import run_match_and_finalize
 
     monkeypatch.setattr(
-        "cdt.pipeline.match_pending_mentions",
-        lambda **kwargs: {
-            "debt_instrument": pd.DataFrame([{"debt_instrument_id": "i-1"}]),
-            "debt_instrument_mentions": pd.DataFrame(
-                columns=MENTION_CLUSTER_EDGE_COLUMNS
-            ),
-        },
-    )
-    monkeypatch.setattr(
-        "cdt.publish.apply_lineage_inference_pass",
-        lambda *args, **kwargs: {"links": 0, "reopened": 0},
+        "cdt.pipeline.match_pending_mentions", lambda **kwargs: MatchResult()
     )
 
     with caplog.at_level("INFO"):
         run_match_and_finalize(artifact_root=str(tmp_path))
 
     messages = [record.getMessage() for record in caplog.records]
-    assert "Starting stage: infer-lineage" in messages
-    assert "Completed stage: infer-lineage | links=0 reopened=0" in messages
     assert any(m.startswith("Starting stage: finalize") for m in messages)
     assert any(m.startswith("Completed stage: finalize | tables=0") for m in messages)
 
@@ -1704,8 +1573,8 @@ def test_a_live_run_publishes_with_force_publish_not_force(
     _isolation_stubs(monkeypatch, tmp_path, calls)
     published: list[dict[str, object]] = []
     monkeypatch.setattr(
-        "cdt.pipeline.finalize_after_match",
-        lambda instruments, **kwargs: published.append(kwargs),
+        "cdt.pipeline.publish_final_tables",
+        lambda **kwargs: published.append(kwargs),
     )
     config = _both_genres_config(tmp_path)
 

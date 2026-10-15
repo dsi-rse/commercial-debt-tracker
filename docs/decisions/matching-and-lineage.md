@@ -1,10 +1,11 @@
 # Matching and lineage: design decisions and measurements
 
 The matcher (`src/cdt/matcher/`) groups extracted debt-instrument
-mentions into stable clusters within one CIK. It writes membership, related and
-ambiguous edges, rolls each cluster up into one published row, and then runs a
-corpus-wide pass (`src/cdt/matcher/lineage_inference.py`) that infers amendment
-links the item-scoped extractor cannot express. This page records why the
+mentions into clusters within one CIK, as a pure function of that CIK's current
+mentions. It writes membership, related and ambiguous edges, gives each cluster
+an id (`src/cdt/matcher/identity.py`), rolls each cluster up into one published
+row, and infers the amendment links the item-scoped extractor cannot express
+(`src/cdt/matcher/lineage_inference.py`). This page records why the
 thresholds and rules are what they are, and the measurements behind them. The
 docstrings give the current contract. Each section below is headed by the code
 name it explains, so you can search for it from the code.
@@ -147,7 +148,10 @@ yields one link and nulls the column, and pass 2 adds a link that pass 1
 refused. Rows like that arise naturally. Re-extracting an item mints a new
 content-hash mention id, the old member edge is never deleted, and the old
 instrument survives with `mention_count` 0. So the observation columns are
-recomputed both before and after inference (#211).
+recomputed both before and after inference (#211). Since the matcher builds
+rows only from current mentions, no row has members that are gone, but the
+order still matters: inference must read dates of the rows it is about to
+publish.
 
 ## `derive_parent_links`
 
@@ -158,18 +162,15 @@ recomputed both before and after inference (#211).
   lineage that was unambiguous on its own (#130). Retirers form a list,
   because several instruments jointly retiring one obligation is a legitimate
   state of the world.
-- **The carried amendment pointer is a fallback, not a candidate.** Seeding it
-  alongside the extracted pointers put a guess and a fact in one set, and the
-  ambiguity guard then threw both away. On `data/lineage-verify`, a backfill
-  plus one plain match published 19 pointers and 539 heads, against a clean
-  rebuild's 22 and 536, and three further matches did not recover them. The
-  carried pointer is what keeps an inferred link alive across an ordinary
-  rematch, because no mention names it. An ambiguous extracted set is a
-  refusal and does not fall back.
-- **`amendment_inferred_by` travels with its pointer.** It is cleared when the
-  pointer changes. Otherwise a rematch would publish a guess that cannot be
-  told apart from an extracted relation (#184).
-- **`break_amendment_cycles`.** Extracted and carried amendment pointers can
+- **Only extracted pointers.** Inferred links are added afterwards
+  (`apply_inferred_lineage`), so `amendment_inferred_by` is null on every
+  pointer this function returns and names the rule on every pointer inference
+  adds; a guess can never be told apart from an extracted relation (#184).
+  Nothing is carried from a previous match: carrying the previous row's
+  pointer as a fallback was what let a guess and a fact cancel out (19
+  pointers and 539 heads after a backfill on `data/lineage-verify`, against a
+  clean rebuild's 22 and 536).
+- **`break_amendment_cycles`.** Extracted amendment pointers can
   form a cycle (A amends B, B amends A); every member then has a child, so the
   family has no head and drops out of head-only views (#267). One pointer per
   cycle is dropped: the one into the member first seen latest (earliest member
@@ -224,37 +225,91 @@ junk, a JSON object, and a list of scalars), the guarded and unguarded
 readings agree. Those sites are guarded so that `PreparedMention` never
 carries the text `nan` forward.
 
+## `match_pending_mentions`: one CIK's mentions in, one CIK's rows out
+
+Every matching rule works within one CIK: candidates must share the CIK, name
+classes are counted per CIK, and the lender signatures, extracted pointers and
+lineage rules are all per CIK. So the CIK is the unit, and the 64 `cik_shard`
+files are only an I/O grouping. A run re-clusters, from all of their current
+mentions, exactly the CIKs whose set of mention ids changed (a digest per
+normalized CIK in `runs/match/cik-digests/`), then runs lineage for those same
+CIKs. It never extends clusters an earlier run built.
+
+The matcher used to extend existing clusters, scoring only mentions with no
+member edge yet and then running a separate lineage pass over the whole
+corpus. Nobody recorded why; it dates from the SQLite matcher's
+`pending_only`/`batch_size` mode (`c752f63`), and there are no human edits for
+history to protect. Its costs, measured by replaying stored roots in
+different orders:
+
+- `name_class_sizes` counted an existing cluster once through its mentions and
+  again through its instrument row, so two halves matched forward gave 550
+  clusters where a full match gave 542 on `genwindow-run-branch` (#258).
+- Backfilling the newer half first gave 213 of 901 mentions a different
+  instrument id on the pre-beta root, because an id was its seed mention's id
+  (#259).
+- Re-extraction mints new mention ids; the old member edge was never deleted,
+  so the old instrument stayed published with zero members (#225).
+- The lineage pass held every instrument, edge and mention of the corpus in
+  one task: about 3.7 KB per mention on top of the frames, estimated at 4.5 GB
+  or more at full scope, on a 4 GB task.
+
+With the per-CIK design, on `genwindow-run-branch` (669 mentions, 193 CIKs) a
+full match, two halves forward and the newer half first all give the same 542
+clusters; the backfill order gives 16 of 669 mentions a different carried id,
+and after `--remint` every order gives identical ids. A full rematch takes
+3.4 s. A daily run whose mentions did not change reads two columns of the
+mentions dataset and writes nothing.
+
+**Ties never depend on ids.** Scoring ties are broken by the cluster's seed
+sort key (its smallest member `mention_sort_key`), not by its id, so how ids
+are assigned can never change a clustering decision.
+
+**The unit key is the normalized CIK.** Local roots mix zero-padded and
+unpadded CIKs; keyed on the raw string, one issuer would be two units. Reads
+filter on every stored spelling of the CIK.
+
+## `cdt.matcher.identity`: ids carried by overlap, minted from content
+
+Options considered: the seed mention's id (not deterministic, changes with
+arrival order and re-extraction); a pure content id such as a hash of the
+earliest member (deterministic, but a backfilled older filing becomes the
+earliest member and changes every URL); a separate persisted id map (another
+store to keep consistent); and the chosen one, a content id when a cluster is
+first seen, carried forward by member overlap.
+
+- Overlap is counted on mention ids first and on item ids second; 8-K item ids
+  survive re-extraction, so a re-extracted item keeps its cluster's id. 6-K
+  item ids name the snippet span, so a re-windowed 6-K filing loses both and
+  gets a new id, which the redirect records.
+- Pairs are taken greedily, largest overlap first, each previous id used at
+  most once, so when two clusters merge the larger keeps its id.
+- An id no longer used gets a redirect to the cluster that took most of its
+  members; redirects follow a retired target, so every target is live.
+- Carried ids depend on history: two roots built in different orders get the
+  same clusters but can label them differently. `cdt match --remint` replaces
+  every id with its content id, once, before the first public publish.
+- The `di::` prefix keeps instrument ids distinct from mention ids (`dim::`).
+
+## `name_class_sizes`: one comparison per pair of distinct names
+
+Counting compatible names pairwise over an issuer's mentions was O(n²), and
+one 4,048-mention CIK took 31 s to match (#269). The count now compares each
+distinct fingerprint once against the issuer's distinct fingerprints. That
+alone did not make a large CIK fast: replicating the largest
+`genwindow-run-branch` CIK to 4,048 mentions still took 36.6 s, almost all of
+it the candidate loop calling the name rules for the same few hundred
+fingerprints millions of times. Those rules are pure, so `compat` memoizes
+them: 253 mentions 0.07 s, 1,012 mentions 0.30 s, 4,048 mentions 3.0 s.
+
 ## `MATCHER_SCHEMA_VERSION`, `_stale_schema_forces_rematch`
 
-Mention ids are content hashes. A schema change that alters the hashed payload
-changes every id, so an incremental match over an older root keys surviving
-clusters on ids the mentions dataset no longer contains. The rollup then
-recomputes lifecycle columns from member lists that are empty after filtering.
-The older clusters also hold the slots that freshly minted prior states would
-take, so a cluster can end up with two members that name two different
-amendment parents. On `lineage-verify` (recorded at version 4, code at
-version 7), a backfill plus one plain match published 19 amendment pointers
-and 539 heads, against a forced match's 22 and 536, and further plain matches
-never recovered them. A rematch is deterministic local compute. Forcing one is
-cheaper than refusing (which would wedge the scheduled daily run behind an
-operator) and safer than proceeding (which publishes wrong rows with a
-successful-looking log) (#208).
-
-## `apply_lineage_inference_pass`
-
-- **Why it is a post-pass.** `match_tables` sees 1 to 7 rows per call on a
-  364-item window, so no rule there could see both states of one facility.
-- **Why inferred pointers are re-opened.** `infer_amendment_parents` considers
-  only null pointers, and a rematch carries pointers forward. Without
-  re-opening them, a link that a tightened rule now refuses survives on every
-  already-matched root. The EQT/EQM cross-borrower link was one such case: 14
-  of 542 pointers differed from a clean rebuild (#204).
-- **Shard assignment.** It must match `match_pending_mentions` exactly, null
-  CIKs included. Otherwise a rewritten row lands in a second shard and the
-  original copy remains.
-- **Its own manifest.** The pass rewrites every partition the match manifest
-  lists, so without a manifest of its own, the latest record of
-  `debt-instruments` would describe a state that has since changed.
+A schema change can change what the matcher writes for a CIK whose mentions
+did not change, so the digests alone would leave that CIK stale; a plain match
+over a root recorded at an older version re-clusters every CIK. A rematch is
+deterministic local compute. Forcing one is cheaper than refusing (which would
+wedge the scheduled daily run behind an operator) and safer than proceeding
+(which publishes wrong rows with a successful-looking log) (#208).
 
 ## `lineage_inference` module: scope
 

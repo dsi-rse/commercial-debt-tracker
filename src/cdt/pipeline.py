@@ -42,7 +42,7 @@ from cdt.matcher import (
     DEFAULT_RELATED_THRESHOLD,
     match_pending_mentions,
 )
-from cdt.publish import finalize_after_match
+from cdt.publish import publish_final_tables
 from cdt.segmenter.eightk import (
     POTENTIALLY_RELEVANT_ITEM_NUMBERS,
     segment_pending_eightk_documents,
@@ -480,11 +480,10 @@ class Pipeline:
         log_stage_complete(
             self.logger,
             "match",
-            edge_rows=len(matched["debt_instrument_mentions"]),
-            debt_instruments=len(matched["debt_instrument"]),
+            ciks=matched.ciks_matched,
+            debt_instruments=len(matched.instruments),
         )
-        edge_rows = matched["debt_instrument_mentions"]
-        matched_mentions = int((edge_rows["edge_type"] == "member").sum())
+        matched_mentions = int((matched.edges["edge_type"] == "member").sum())
 
         result = PipelineRunResult(
             mode=self.config.mode,
@@ -492,7 +491,7 @@ class Pipeline:
             end_date=resolved_end,
             extracted_rows=len(extracted),
             matched_rows=matched_mentions,
-            debt_instrument_rows=len(matched["debt_instrument"]),
+            debt_instrument_rows=len(matched.instruments),
             artifact_root=resolved_artifact_root,
             extractor_run_path=extracted_tables_path(
                 resolved_artifact_root,
@@ -501,8 +500,7 @@ class Pipeline:
             genre_results=prepared.genre_results,
             failed_genres=tuple(prepared.failed_genres),
         )
-        finalize_after_match(
-            matched["debt_instrument"],
+        publish_final_tables(
             artifact_root=resolved_artifact_root,
             final_database_root=self.config.final_database_root,
             force_publish=self.config.force_publish,
@@ -544,18 +542,18 @@ def run_match_and_finalize(
     ambiguity_margin: float = DEFAULT_AMBIGUITY_MARGIN,
     renew: Callable[[], None] | None = None,
 ) -> dict[str, str]:
-    """Run match on existing mentions, then finalize; idempotent.
+    """Match the CIKs whose mentions changed, then publish; idempotent.
 
-    ``force`` rebuilds every shard from scratch; ``force_publish`` publishes past the
-    skip gate and the shrinkage guard. ``renew`` extends the caller's writer
-    lease per matched shard and before the publish, so a stolen lease cannot
-    keep publishing.
+    ``force`` re-clusters every CIK; ``force_publish`` publishes past the skip
+    gate and the shrinkage guard. ``renew`` extends the caller's writer lease
+    per matched shard and before the publish, so a stolen lease cannot keep
+    publishing.
 
     Returns:
         Published table name -> snapshot path; empty when nothing was published.
     """
     resolved_root = resolve_artifact_root(artifact_root)
-    tables = match_pending_mentions(
+    match_pending_mentions(
         artifact_root=resolved_root,
         force=force,
         strong_match_threshold=strong_match_threshold,
@@ -563,8 +561,7 @@ def run_match_and_finalize(
         ambiguity_margin=ambiguity_margin,
         renew=renew,
     )
-    return finalize_after_match(
-        tables["debt_instrument"],
+    return publish_final_tables(
         artifact_root=resolved_root,
         final_database_root=final_database_root,
         force_publish=force_publish,

@@ -7,9 +7,7 @@ import json
 import pandas as pd
 
 from cdt.matcher.normalize import (
-    _json_text,
     aggregate_lender_disclosure,
-    coerce_optional_bool,
     coerce_optional_text,
     dedupe_party_clusters,
     first_non_null,
@@ -132,45 +130,20 @@ def derive_parent_links(
     member_groups: dict[str, list[str]],
     mention_index: dict[str, PreparedMention],
     mention_to_instrument: dict[str, str],
-    *,
-    existing_instruments: pd.DataFrame | None = None,
 ) -> dict[str, dict[str, str | None]]:
-    """Return each instrument's amendment, retirement and split pointers.
+    """Return each instrument's extracted amendment, retirement and split pointers.
 
     Pointers come from member mentions, mapped through
     ``mention_to_instrument``. Two or more amendment (or split) parents publish
-    None for that kind; retirers are a JSON list. The existing row's amendment
-    pointer is used only when the mentions state none and are not ambiguous,
-    and `amendment_inferred_by` is kept only while the pointer is unchanged.
-    Amendment cycles are broken (see :func:`break_amendment_cycles`).
+    None for that kind; retirers are a JSON list. Amendment cycles are broken
+    (see :func:`break_amendment_cycles`). Inferred links are added later, by
+    :func:`apply_inferred_lineage`.
     """
-    existing_rows = (
-        {
-            str(row["debt_instrument_id"]): row
-            for row in existing_instruments.to_dict("records")
-        }
-        if existing_instruments is not None and not existing_instruments.empty
-        else {}
-    )
     parent_links: dict[str, dict[str, str | None]] = {}
     for debt_instrument_id, member_ids in member_groups.items():
-        existing_row = existing_rows.get(debt_instrument_id, {})
-        amendment_parents = set()
-        retired_parents = set()
-        split_parents = set()
-        existing_amendment = coerce_optional_text(
-            existing_row.get("amendment_of_debt_instrument_id")
-        )
-        existing_retired = coerce_optional_text(
-            existing_row.get("retired_by_debt_instrument_ids")
-        )
-        if existing_retired:
-            retired_parents.update(json.loads(existing_retired))
-        existing_split = coerce_optional_text(
-            existing_row.get("split_of_debt_instrument_id")
-        )
-        if existing_split:
-            split_parents.add(existing_split)
+        amendment_parents: set[str] = set()
+        retired_parents: set[str] = set()
+        split_parents: set[str] = set()
         for member_id in member_ids:
             mention = mention_index.get(member_id)
             if mention is None:
@@ -193,27 +166,13 @@ def derive_parent_links(
                 split_parents.add(mention_to_instrument[mention.split_of])
         # Each pointer kind is judged on its own; ambiguity within a kind
         # publishes nothing for it. Retirers are a list, so they keep them all.
-        amendment_is_ambiguous = len(amendment_parents) > 1
-        if amendment_is_ambiguous:
+        if len(amendment_parents) > 1:
             amendment_parents.clear()
         if len(split_parents) > 1:
             split_parents.clear()
-        # The carried pointer is a fallback, not a candidate: what the mentions
-        # state wins, and an ambiguous extracted set does not fall back. It is
-        # what keeps an inferred link alive across a rematch.
-        if not amendment_parents and not amendment_is_ambiguous and existing_amendment:
-            amendment_parents.add(existing_amendment)
-        amendment_parent = next(iter(amendment_parents), None)
-        # Provenance travels with the carried pointer and is cleared when the
-        # pointer changes.
-        inferred_by = coerce_optional_text(existing_row.get("amendment_inferred_by"))
-        if amendment_parent != coerce_optional_text(
-            existing_row.get("amendment_of_debt_instrument_id")
-        ):
-            inferred_by = None
         parent_links[debt_instrument_id] = {
-            "amendment_of_debt_instrument_id": amendment_parent,
-            "amendment_inferred_by": inferred_by,
+            "amendment_of_debt_instrument_id": next(iter(amendment_parents), None),
+            "amendment_inferred_by": None,
             "retired_by_debt_instrument_ids": (
                 json.dumps(sorted(retired_parents)) if retired_parents else None
             ),
@@ -277,24 +236,21 @@ def build_debt_instrument_rows(
     mention_index: dict[str, PreparedMention],
     parent_links: dict[str, dict[str, str | None]],
     *,
-    existing_instruments: pd.DataFrame | None = None,
     company_names: dict[str, str] | None = None,
 ) -> list[dict[str, object]]:
-    """Build persisted debt instrument rows from member groups and lineage."""
-    existing_rows = (
-        {
-            str(row["debt_instrument_id"]): row
-            for row in existing_instruments.to_dict("records")
-        }
-        if existing_instruments is not None and not existing_instruments.empty
-        else {}
-    )
+    """Build debt instrument rows from member groups and their extracted lineage.
+
+    Every value comes from the group's members in ``mention_index``; a group
+    with none is skipped. The lineage rollup and observation columns are
+    filled later (:func:`apply_lifecycle_rollup`).
+    """
     rows: list[dict[str, object]] = []
     for debt_instrument_id, member_ids in sorted(member_groups.items()):
-        existing_row = existing_rows.get(debt_instrument_id, {})
         present_member_ids = [
             member_id for member_id in member_ids if member_id in mention_index
         ]
+        if not present_member_ids:
+            continue
         ordered_member_ids = sorted(
             present_member_ids,
             key=lambda mention_id: mention_recency_key(mention_index[mention_id]),
@@ -308,49 +264,16 @@ def build_debt_instrument_rows(
             for mention_id in ordered_member_ids
             if mention_index[mention_id].synthesized_by is None
         ] or ordered_member_ids
-        if present_member_ids:
-            seed_mention = mention_index[
-                min(
-                    present_member_ids,
-                    key=lambda mention_id: mention_sort_key(mention_index[mention_id]),
-                )
-            ]
-            seed_mention_id = (
-                coerce_optional_text(
-                    existing_row.get("seed_debt_instrument_mention_id")
-                )
-                or seed_mention.debt_instrument_mention_id
+        seed_mention = mention_index[
+            min(
+                present_member_ids,
+                key=lambda mention_id: mention_sort_key(mention_index[mention_id]),
             )
-            cik = coerce_optional_text(existing_row.get("cik")) or seed_mention.cik
-        else:
-            seed_mention = None
-            seed_mention_id = coerce_optional_text(
-                existing_row.get("seed_debt_instrument_mention_id")
-            )
-            cik = coerce_optional_text(existing_row.get("cik"))
-        if seed_mention_id is None or cik is None:
+        ]
+        cik = seed_mention.cik
+        if cik is None:
             continue
-        parties_json = json.dumps(
-            dedupe_party_clusters(
-                [
-                    _json_text(existing_row, "parties_json") or "[]",
-                    *[
-                        mention_index[mention_id].parties_json
-                        for mention_id in present_member_ids
-                    ],
-                ]
-            ),
-            sort_keys=True,
-        )
-        lender_disclosure = aggregate_lender_disclosure(
-            [
-                coerce_optional_text(existing_row.get("lender_disclosure")),
-                *[
-                    mention_index[mention_id].lender_disclosure
-                    for mention_id in present_member_ids
-                ],
-            ]
-        )
+        links = parent_links.get(debt_instrument_id, {})
         rows.append(
             {
                 "debt_instrument_id": debt_instrument_id,
@@ -360,73 +283,66 @@ def build_debt_instrument_rows(
                 "company_name": first_non_null(
                     canonical_member_ids, mention_index, "company_name"
                 )
-                or coerce_optional_text(existing_row.get("company_name"))
                 or (company_names or {}).get(cik),
-                "seed_debt_instrument_mention_id": seed_mention_id,
-                "amendment_of_debt_instrument_id": parent_links.get(
-                    debt_instrument_id, {}
-                ).get("amendment_of_debt_instrument_id"),
-                "amendment_inferred_by": parent_links.get(debt_instrument_id, {}).get(
-                    "amendment_inferred_by"
+                "seed_debt_instrument_mention_id": (
+                    seed_mention.debt_instrument_mention_id
                 ),
-                "retired_by_debt_instrument_ids": parent_links.get(
-                    debt_instrument_id, {}
-                ).get("retired_by_debt_instrument_ids"),
-                "split_of_debt_instrument_id": parent_links.get(
-                    debt_instrument_id, {}
-                ).get("split_of_debt_instrument_id"),
+                "amendment_of_debt_instrument_id": links.get(
+                    "amendment_of_debt_instrument_id"
+                ),
+                "amendment_inferred_by": links.get("amendment_inferred_by"),
+                "retired_by_debt_instrument_ids": links.get(
+                    "retired_by_debt_instrument_ids"
+                ),
+                "split_of_debt_instrument_id": links.get("split_of_debt_instrument_id"),
                 **canonical_scalar_fields(
                     canonical_member_ids,
                     mention_index,
-                    existing_row,
                     field_name="name",
                     source_column="name_source_mention_id",
                 ),
                 **canonical_scalar_fields(
                     canonical_member_ids,
                     mention_index,
-                    existing_row,
                     field_name="instrument_type",
                     source_column="instrument_type_source_mention_id",
                 ),
                 **canonical_scalar_fields(
                     canonical_member_ids,
                     mention_index,
-                    existing_row,
                     field_name="start_date",
                     source_column="start_date_source_mention_id",
                 ),
-                **canonical_maturity_fields(
-                    canonical_member_ids, mention_index, existing_row
-                ),
+                **canonical_maturity_fields(canonical_member_ids, mention_index),
                 **canonical_scalar_fields(
                     canonical_member_ids,
                     mention_index,
-                    existing_row,
                     field_name="commitment_termination_date",
                     source_column="commitment_termination_source_mention_id",
                 ),
-                **principal_amount_fields(
-                    canonical_member_ids, mention_index, existing_row
+                **principal_amount_fields(canonical_member_ids, mention_index),
+                **outstanding_balance_fields(canonical_member_ids, mention_index),
+                **interest_rate_fields(canonical_member_ids, mention_index),
+                "parties_json": json.dumps(
+                    dedupe_party_clusters(
+                        [
+                            mention_index[mention_id].parties_json
+                            for mention_id in present_member_ids
+                        ]
+                    ),
+                    sort_keys=True,
                 ),
-                **outstanding_balance_fields(
-                    canonical_member_ids, mention_index, existing_row
-                ),
-                **interest_rate_fields(
-                    canonical_member_ids, mention_index, existing_row
-                ),
-                "parties_json": parties_json,
-                "lender_disclosure": lender_disclosure,
-                # Every member synthesized: a minted prior state no filing
-                # describes on its own. Carried forward when this run loaded no
-                # member for the row, like every other canonical field.
-                "synthesized_only": (
-                    all(
-                        mention_index[mention_id].synthesized_by is not None
+                "lender_disclosure": aggregate_lender_disclosure(
+                    [
+                        mention_index[mention_id].lender_disclosure
                         for mention_id in present_member_ids
-                    )
-                    if present_member_ids
-                    else coerce_optional_bool(existing_row.get("synthesized_only"))
+                    ]
+                ),
+                # Every member synthesized: a minted prior state no filing
+                # describes on its own.
+                "synthesized_only": all(
+                    mention_index[mention_id].synthesized_by is not None
+                    for mention_id in present_member_ids
                 ),
             }
         )
@@ -456,40 +372,30 @@ def company_names_by_cik(mention_rows: pd.DataFrame) -> dict[str, str]:
 def canonical_scalar_fields(
     ordered_member_ids: list[str],
     mention_index: dict[str, PreparedMention],
-    existing_row: dict[str, object],
     *,
     field_name: str,
     source_column: str,
 ) -> dict[str, str | None]:
     """Return one canonical field and the mention it came from.
 
-    The first non-null value across ``ordered_member_ids`` wins. Otherwise the
-    existing row's value is carried with that row's recorded source; both None
-    when neither has one.
+    The first non-null value across ``ordered_member_ids`` wins; both None
+    when no member has one.
     """
     for mention_id in ordered_member_ids:
         value = getattr(mention_index[mention_id], field_name)
         if value is not None:
             return {field_name: value, source_column: mention_id}
-    value = coerce_optional_text(existing_row.get(field_name))
-    if value is not None:
-        return {
-            field_name: value,
-            source_column: coerce_optional_text(existing_row.get(source_column)),
-        }
     return {field_name: None, source_column: None}
 
 
 def canonical_maturity_fields(
     ordered_member_ids: list[str],
     mention_index: dict[str, PreparedMention],
-    existing_row: dict[str, object],
 ) -> dict[str, str | None]:
     """Return the canonical maturity and its source mention.
 
     The newest stated maturity wins. A derived one (`DERIVED_MATURITY_KINDS`)
-    is used only when no member states one, and the existing row's value only
-    when no member carries any.
+    is used only when no member states one.
     """
     fallback: dict[str, str | None] | None = None
     for mention_id in ordered_member_ids:
@@ -504,23 +410,12 @@ def canonical_maturity_fields(
             return fields
         if fallback is None:
             fallback = fields
-    if fallback is not None:
-        return fallback
-    value = coerce_optional_text(existing_row.get("maturity_date"))
-    return {
-        "maturity_date": value,
-        "maturity_source_mention_id": (
-            coerce_optional_text(existing_row.get("maturity_source_mention_id"))
-            if value is not None
-            else None
-        ),
-    }
+    return fallback or {"maturity_date": None, "maturity_source_mention_id": None}
 
 
 def principal_amount_fields(
     ordered_member_ids: list[str],
     mention_index: dict[str, PreparedMention],
-    existing_row: dict[str, object],
 ) -> dict[str, str | None]:
     """Return the canonical principal columns from the newest carrying mention.
 
@@ -536,24 +431,19 @@ def principal_amount_fields(
                 "principal_amount_kind": mention.principal_amount_kind,
                 "principal_source_mention_id": mention_id,
             }
-    return {
-        "principal_amount": coerce_optional_text(existing_row.get("principal_amount")),
-        "principal_currency": coerce_optional_text(
-            existing_row.get("principal_currency")
-        ),
-        "principal_amount_kind": coerce_optional_text(
-            existing_row.get("principal_amount_kind")
-        ),
-        "principal_source_mention_id": coerce_optional_text(
-            existing_row.get("principal_source_mention_id")
-        ),
-    }
+    return dict.fromkeys(
+        (
+            "principal_amount",
+            "principal_currency",
+            "principal_amount_kind",
+            "principal_source_mention_id",
+        )
+    )
 
 
 def outstanding_balance_fields(
     ordered_member_ids: list[str],
     mention_index: dict[str, PreparedMention],
-    existing_row: dict[str, object],
 ) -> dict[str, str | bool | None]:
     """Return the newest outstanding-balance observation.
 
@@ -584,29 +474,20 @@ def outstanding_balance_fields(
                     "outstanding_balance_as_of_is_filing_date": as_of is None,
                     "outstanding_balance_source_mention_id": mention_id,
                 }
-    return {
-        "outstanding_balance": coerce_optional_text(
-            existing_row.get("outstanding_balance")
-        ),
-        "outstanding_balance_currency": coerce_optional_text(
-            existing_row.get("outstanding_balance_currency")
-        ),
-        "outstanding_balance_as_of": coerce_optional_text(
-            existing_row.get("outstanding_balance_as_of")
-        ),
-        "outstanding_balance_as_of_is_filing_date": coerce_optional_bool(
-            existing_row.get("outstanding_balance_as_of_is_filing_date")
-        ),
-        "outstanding_balance_source_mention_id": coerce_optional_text(
-            existing_row.get("outstanding_balance_source_mention_id")
-        ),
-    }
+    return dict.fromkeys(
+        (
+            "outstanding_balance",
+            "outstanding_balance_currency",
+            "outstanding_balance_as_of",
+            "outstanding_balance_as_of_is_filing_date",
+            "outstanding_balance_source_mention_id",
+        )
+    )
 
 
 def interest_rate_fields(
     ordered_member_ids: list[str],
     mention_index: dict[str, PreparedMention],
-    existing_row: dict[str, object],
 ) -> dict[str, str | None]:
     """Return the canonical interest rate from the newest carrying mention."""
     for mention_id in ordered_member_ids:
@@ -619,14 +500,6 @@ def interest_rate_fields(
                 "interest_rate_pct": mention.interest_rate_pct,
                 "interest_rate_source_mention_id": mention_id,
             }
-    return {
-        "interest_rate_kind": coerce_optional_text(
-            existing_row.get("interest_rate_kind")
-        ),
-        "interest_rate_pct": coerce_optional_text(
-            existing_row.get("interest_rate_pct")
-        ),
-        "interest_rate_source_mention_id": coerce_optional_text(
-            existing_row.get("interest_rate_source_mention_id")
-        ),
-    }
+    return dict.fromkeys(
+        ("interest_rate_kind", "interest_rate_pct", "interest_rate_source_mention_id")
+    )
