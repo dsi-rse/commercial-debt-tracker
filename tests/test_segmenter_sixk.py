@@ -42,6 +42,15 @@ def test_keyword_gate_matches_plurals() -> None:
         assert has_debt_keyword(text, keywords=(keyword,)), text
 
 
+def test_keyword_gate_ignores_case() -> None:
+    """Filings capitalise defined terms, so the gate matches in any case."""
+    for text, keyword in (
+        ("entered into a new Term Loan", "term loan"),
+        ("the CREDIT AGREEMENT dated May 1", "credit agreement"),
+    ):
+        assert has_debt_keyword(text, keywords=(keyword,)), text
+
+
 def test_xbrl_prologue_stripped_but_prose_untouched() -> None:
     """A tag-dominated prologue goes; ordinary prose is returned unchanged."""
     prose = "The Company entered into a term loan with the bank on that date."
