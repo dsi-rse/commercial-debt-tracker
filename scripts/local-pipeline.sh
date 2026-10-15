@@ -4,16 +4,22 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-environment_data_dir="${DATA_DIR:-}"
+if [[ -n "${DATA_DIR+set}" ]]; then
+  environment_data_dir="${DATA_DIR}"
+fi
 if [[ -f "${repo_root}/.env" ]]; then
   # shellcheck disable=SC1091
   source "${repo_root}/.env"
 fi
 
 # DATA_DIR resolves as cdt's settings.DATA_DIR does: the environment, then
-# .env, else <repo>/data, with a leading ~ expanded. A bare `cdt` command with
-# no --artifact-root or ARTIFACT_ROOT uses it as its artifact root too.
-DATA_DIR="${environment_data_dir:-${DATA_DIR:-${repo_root}/data}}"
+# .env, else <repo>/data, with a leading ~ expanded. An empty value also means
+# <repo>/data. A bare `cdt` command with no --artifact-root or ARTIFACT_ROOT
+# uses it as its artifact root too.
+if [[ -n "${environment_data_dir+set}" ]]; then
+  DATA_DIR="${environment_data_dir}"
+fi
+DATA_DIR="${DATA_DIR:-${repo_root}/data}"
 DATA_DIR="${DATA_DIR/#\~/${HOME}}"
 
 local_mode="${LOCAL_MODE:-daily}"

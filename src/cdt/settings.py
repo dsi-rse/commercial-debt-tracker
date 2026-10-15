@@ -25,7 +25,8 @@ def resolve_path(path: Path) -> Path:
 
 load_dotenv()
 
-DATA_DIR = resolve_path(Path(os.environ.get("DATA_DIR", str(DEFAULT_DATA_DIR))))
+# An empty DATA_DIR means the default, as in the Makefile and local-pipeline.sh.
+DATA_DIR = resolve_path(Path(os.environ.get("DATA_DIR") or str(DEFAULT_DATA_DIR)))
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 # The extractor model id, as an OpenRouter slug; the batch backend strips the

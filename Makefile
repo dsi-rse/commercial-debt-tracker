@@ -11,17 +11,21 @@ project_dir := "$(current_abs_path)"
 
 # environment variables, from .env when it exists
 ifeq ($(origin DATA_DIR),environment)
+data_dir_from_environment := 1
 environment_data_dir := $(DATA_DIR)
 endif
 -include .env
 
 # DATA_DIR resolves as cdt's settings.DATA_DIR does: the environment, then
-# .env, else <repo>/data, with a leading ~ expanded. A bare `cdt` command with
-# no --artifact-root or ARTIFACT_ROOT uses it as its artifact root too.
-ifdef environment_data_dir
+# .env, else <repo>/data, with a leading ~ expanded. An empty value also means
+# <repo>/data. A bare `cdt` command with no --artifact-root or ARTIFACT_ROOT
+# uses it as its artifact root too.
+ifdef data_dir_from_environment
 DATA_DIR := $(environment_data_dir)
 endif
-DATA_DIR ?= $(current_abs_path)data
+ifeq ($(strip $(DATA_DIR)),)
+DATA_DIR := $(current_abs_path)data
+endif
 DATA_DIR := $(patsubst ~%,$(HOME)%,$(DATA_DIR))
 
 
