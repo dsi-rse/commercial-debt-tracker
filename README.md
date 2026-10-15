@@ -87,10 +87,9 @@ lists live in S3 under `s3://idi-dev-ftm2j-shared-processor-storage/processors/c
 (`beta-1k.txt`, `beta-10k.txt`, `beta-50k.txt`, `beta-100k.txt`).
 
 ```bash
-uv run cdt run historical --extractor-backend live --artifact-root ./data/local \
-  --final-database-root ./data/database --cik-file data/ciks/smoke-10.txt \
+uv run cdt run historical --extractor-backend live --cik-file data/ciks/smoke-10.txt \
   --start-date 2024-01-01 --end-date 2024-01-31
-uv run cdt segment --genres 8-K --artifact-root ./data/local
+uv run cdt segment --genres 8-K
 make local-run
 ./scripts/local-pipeline.sh historical --start-date 2024-01-01 --end-date 2024-01-31
 ```
