@@ -156,7 +156,9 @@ Required:
 - `cik_scope`: what a run covers when no `--cik-file` is given. Either the
   bucket-relative key of a one-CIK-per-line file, or `all` for every filer.
   It is required, so a stack can never default to `all` by omission. During
-  the beta both stacks use `processors/cdt/inputs/ciks/beta-1k.txt`. At the
+  the beta both stacks use `processors/cdt/inputs/ciks/important-8K-filers.txt`: the
+  54 filers in `data/important-8K-filers.csv` (16,052 8-Ks all-time), committed
+  as `data/ciks/important-8K-filers.txt`. At the
   production launch prod moves to `all` and dev keeps a beta list; after
   that the beta lists can be deleted from S3, because nothing in the code
   names them.
@@ -302,7 +304,7 @@ Use the launcher script with admin credentials:
 export PULUMI_CONFIG_PASSPHRASE='<from the Core Facility Bitwarden>'
 ./scripts/run-historical.sh --stack dev \
   --start-date 2024-01-01 --end-date 2024-01-31 \
-  --cik-file s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/inputs/ciks/beta-1k.txt
+  --cik-file s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/inputs/ciks/important-8K-filers.txt
 ```
 
 It resolves the cluster, task definition, subnet, and security group from
