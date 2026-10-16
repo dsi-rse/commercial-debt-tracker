@@ -24,7 +24,7 @@ These are the current recommended `dev` values:
 ```text
 aws:region = us-east-2
 idi:artifact_prefix = processors/cdt
-idi:final_database_prefix = database/cdt
+idi:final_database_prefix = database/cdt-beta
 idi:cik_scope = processors/cdt/inputs/ciks/important-8K-filers.txt
 idi:cpu = 1024
 idi:memory = 4096
@@ -124,7 +124,8 @@ aws s3 cp my-ciks.txt \
 ```
 
 The task role reads the shared bucket under `sec/`, `processors/cdt/` (it also
-writes there) and `database/cdt/`, plus the one file `idi:cik_scope` names when
+writes there) and its `idi:final_database_prefix` (`database/cdt-beta/`), plus
+the one file `idi:cik_scope` names when
 that file lives elsewhere. A manual historical run can pass a different
 `--cik-file` anywhere under `processors/cdt/`, such as the beta lists.
 
@@ -294,15 +295,17 @@ s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/debt-instruments/...
 s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/debt-instrument-redirects/...
 s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/runs/...
 
-The publish writes, under the final database root:
+The publish writes, under the final database root (`database/cdt/` beside it is
+the previous build's publish, kept in place; the website's dev publisher still
+reads it):
 
-s3://idi-dev-ftm2j-shared-processor-storage/database/cdt/latest.json
-s3://idi-dev-ftm2j-shared-processor-storage/database/cdt/snapshots/snapshot=<run_id>/<table>.parquet
-s3://idi-dev-ftm2j-shared-processor-storage/database/cdt/items/latest.parquet
-s3://idi-dev-ftm2j-shared-processor-storage/database/cdt/debt-instruments/latest.parquet
-s3://idi-dev-ftm2j-shared-processor-storage/database/cdt/debt-instrument-mentions/latest.parquet
-s3://idi-dev-ftm2j-shared-processor-storage/database/cdt/mention-cluster-edges/latest.parquet
-s3://idi-dev-ftm2j-shared-processor-storage/database/cdt/debt-instrument-redirects/latest.parquet
+s3://idi-dev-ftm2j-shared-processor-storage/database/cdt-beta/latest.json
+s3://idi-dev-ftm2j-shared-processor-storage/database/cdt-beta/snapshots/snapshot=<run_id>/<table>.parquet
+s3://idi-dev-ftm2j-shared-processor-storage/database/cdt-beta/items/latest.parquet
+s3://idi-dev-ftm2j-shared-processor-storage/database/cdt-beta/debt-instruments/latest.parquet
+s3://idi-dev-ftm2j-shared-processor-storage/database/cdt-beta/debt-instrument-mentions/latest.parquet
+s3://idi-dev-ftm2j-shared-processor-storage/database/cdt-beta/mention-cluster-edges/latest.parquet
+s3://idi-dev-ftm2j-shared-processor-storage/database/cdt-beta/debt-instrument-redirects/latest.parquet
 ```
 
 ## Enable the Daily Schedule

@@ -112,7 +112,7 @@ Notes:
 - `make local-run` and `./scripts/local-pipeline.sh` run `cdt run` with deployment-like environment variables from `.env`.
 - `cdt extract job show` inspects the async batch extract job; `cdt extract job reset --yes`
   clears a wedged one. See [docs/architecture.md](docs/architecture.md).
-- `DATA_DIR` is the local artifact root, both for a bare `cdt` command (no `--artifact-root` or `ARTIFACT_ROOT`) and for `make local-run` / `./scripts/local-pipeline.sh`. It comes from the environment, then `.env`, else `<repo>/data`; an empty value also means `<repo>/data`. Those two write dashboard-consumable `latest.parquet` outputs to `DATA_DIR/database/cdt`, the same `database/cdt` prefix the deployed stack uses in its bucket.
+- `DATA_DIR` is the local artifact root, both for a bare `cdt` command (no `--artifact-root` or `ARTIFACT_ROOT`) and for `make local-run` / `./scripts/local-pipeline.sh`. It comes from the environment, then `.env`, else `<repo>/data`; an empty value also means `<repo>/data`. Those two write dashboard-consumable `latest.parquet` outputs to `DATA_DIR/database/cdt`, the default `database/cdt` prefix; the dev stack publishes the beta to `database/cdt-beta` for now (`idi:final_database_prefix`).
 
 ## Dashboard Handoff
 
