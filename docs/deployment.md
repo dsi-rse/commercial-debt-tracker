@@ -156,7 +156,9 @@ Required:
 - `cik_scope`: what a run covers when no `--cik-file` is given. Either the
   bucket-relative key of a one-CIK-per-line file, or `all` for every filer.
   It is required, so a stack can never default to `all` by omission. During
-  the beta both stacks use `processors/cdt/inputs/ciks/beta-1k.txt`. At the
+  the beta both stacks use `processors/cdt/inputs/ciks/important-8K-filers.txt`: the
+  54 filers in `data/important-8K-filers.csv` (16,052 8-Ks all-time), committed
+  as `data/ciks/important-8K-filers.txt`. At the
   production launch prod moves to `all` and dev keeps a beta list; after
   that the beta lists can be deleted from S3, because nothing in the code
   names them.
@@ -165,7 +167,8 @@ Optional:
 
 - `output_bucket_name` (defaults to the shared processor bucket)
 - `artifact_prefix` (default `processors/cdt`)
-- `final_database_prefix` (default `database/cdt`)
+- `final_database_prefix` (default `database/cdt`; dev publishes the beta to
+  `database/cdt-beta` so the previous build's tables stay in place)
 - `source_prefix` (default `sec`)
 - `app_name` (set by the pipeline from the caller input)
 - `cpu`, `memory`
@@ -302,7 +305,7 @@ Use the launcher script with admin credentials:
 export PULUMI_CONFIG_PASSPHRASE='<from the Core Facility Bitwarden>'
 ./scripts/run-historical.sh --stack dev \
   --start-date 2024-01-01 --end-date 2024-01-31 \
-  --cik-file s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/inputs/ciks/beta-1k.txt
+  --cik-file s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/inputs/ciks/important-8K-filers.txt
 ```
 
 It resolves the cluster, task definition, subnet, and security group from
@@ -370,8 +373,11 @@ rebuilding. Merging to `dev` is the deploy, so the pause has to land first:
 2. **After the deploy**, with no task running, delete everything under the
    artifact root (`processors/cdt/`) except `documents/`, `documents-sixk/`,
    `raw-documents/sixk/` and `inputs/` (the CIK lists `idi:cik_scope` and the
-   backfill read), and delete the final database root (`database/cdt/`). The
-   final database root matters too: the publish compares each table with its
+   backfill read), and either delete the final database root or point
+   `idi:final_database_prefix` at a fresh one (dev publishes the beta to
+   `database/cdt-beta/` and leaves the old `database/cdt/` untouched; an empty
+   root has no previous `latest.json`, so its first publish passes the guard).
+   The final database root matters: the publish compares each table with its
    old `latest.parquet`, and a rebuild from empty (or an `items` table now
    cut to referenced rows) shrinks past the guard, so every tick would refuse
    to publish and exit non-zero. Instead of deleting it, the first publish

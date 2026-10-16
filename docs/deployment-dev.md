@@ -24,8 +24,8 @@ These are the current recommended `dev` values:
 ```text
 aws:region = us-east-2
 idi:artifact_prefix = processors/cdt
-idi:final_database_prefix = database/cdt
-idi:cik_scope = processors/cdt/inputs/ciks/beta-1k.txt
+idi:final_database_prefix = database/cdt-beta
+idi:cik_scope = processors/cdt/inputs/ciks/important-8K-filers.txt
 idi:cpu = 1024
 idi:memory = 4096
 idi:ecr_image_retention_count = 5
@@ -111,8 +111,12 @@ cd ..
 `idi:cik_scope` is the run scope a scheduled or historical run uses when it is
 given no `--cik-file`: the bucket-relative key of a one-CIK-per-line file, or
 `all` for every filer. The beta lists are already in S3 under
-`processors/cdt/inputs/ciks/` (`beta-1k.txt` is the beta default). To scope a
-new stack to a list of your own, upload it there first:
+`processors/cdt/inputs/ciks/`: `important-8K-filers.txt` (the 54 filers in
+`data/important-8K-filers.csv`) is the beta default, and `beta-1k.txt`,
+`beta-10k.txt`, `beta-50k.txt` and `beta-100k.txt` are random samples for
+scale tests. The task role can read only the file `idi:cik_scope` names, so
+change that setting and deploy before a backfill that uses another list. To
+scope a new stack to a list of your own, upload it there first:
 
 ```bash
 aws s3 cp my-ciks.txt \
@@ -120,7 +124,8 @@ aws s3 cp my-ciks.txt \
 ```
 
 The task role reads the shared bucket under `sec/`, `processors/cdt/` (it also
-writes there) and `database/cdt/`, plus the one file `idi:cik_scope` names when
+writes there) and its `idi:final_database_prefix` (`database/cdt-beta/`), plus
+the one file `idi:cik_scope` names when
 that file lives elsewhere. A manual historical run can pass a different
 `--cik-file` anywhere under `processors/cdt/`, such as the beta lists.
 
@@ -220,7 +225,7 @@ aws ecs run-task \
         "name": "cdt",
         "command": [
           "run", "historical",
-          "--cik-file", "s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/inputs/ciks/beta-1k.txt",
+          "--cik-file", "s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/inputs/ciks/important-8K-filers.txt",
           "--start-date", "2024-01-01",
           "--end-date", "2024-01-31"
         ]
@@ -231,7 +236,7 @@ aws ecs run-task \
 
 Recommended first manual run:
 
-- use `beta-1k.txt`
+- use the stack's `idi:cik_scope` file (`important-8K-filers.txt`)
 - use a one-month window
 - inspect the output before widening the date range or CIK set
 
@@ -290,15 +295,17 @@ s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/debt-instruments/...
 s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/debt-instrument-redirects/...
 s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/runs/...
 
-The publish writes, under the final database root:
+The publish writes, under the final database root (`database/cdt/` beside it is
+the previous build's publish, kept in place; the website's dev publisher still
+reads it):
 
-s3://idi-dev-ftm2j-shared-processor-storage/database/cdt/latest.json
-s3://idi-dev-ftm2j-shared-processor-storage/database/cdt/snapshots/snapshot=<run_id>/<table>.parquet
-s3://idi-dev-ftm2j-shared-processor-storage/database/cdt/items/latest.parquet
-s3://idi-dev-ftm2j-shared-processor-storage/database/cdt/debt-instruments/latest.parquet
-s3://idi-dev-ftm2j-shared-processor-storage/database/cdt/debt-instrument-mentions/latest.parquet
-s3://idi-dev-ftm2j-shared-processor-storage/database/cdt/mention-cluster-edges/latest.parquet
-s3://idi-dev-ftm2j-shared-processor-storage/database/cdt/debt-instrument-redirects/latest.parquet
+s3://idi-dev-ftm2j-shared-processor-storage/database/cdt-beta/latest.json
+s3://idi-dev-ftm2j-shared-processor-storage/database/cdt-beta/snapshots/snapshot=<run_id>/<table>.parquet
+s3://idi-dev-ftm2j-shared-processor-storage/database/cdt-beta/items/latest.parquet
+s3://idi-dev-ftm2j-shared-processor-storage/database/cdt-beta/debt-instruments/latest.parquet
+s3://idi-dev-ftm2j-shared-processor-storage/database/cdt-beta/debt-instrument-mentions/latest.parquet
+s3://idi-dev-ftm2j-shared-processor-storage/database/cdt-beta/mention-cluster-edges/latest.parquet
+s3://idi-dev-ftm2j-shared-processor-storage/database/cdt-beta/debt-instrument-redirects/latest.parquet
 ```
 
 ## Enable the Daily Schedule

@@ -82,9 +82,11 @@ cdt run daily | historical | poll                                     (cdt.run)
 Every run is scoped by a CIK file: a one-CIK-per-line file (local or `s3://`),
 or `all` for every filer. There is no implicit default: without `--cik-file` or
 `CDT_DEFAULT_CIK_FILE` a run is an error, never a run over every filer. The repo
-commits one small list, `data/ciks/smoke-10.txt` (ten large filers); the beta
-lists live in S3 under `s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/inputs/ciks/`
-(`beta-1k.txt`, `beta-10k.txt`, `beta-50k.txt`, `beta-100k.txt`).
+commits two small lists, `data/ciks/smoke-10.txt` (ten large filers) and
+`data/ciks/important-8K-filers.txt` (the 54 beta filers; `data/important-8K-filers.csv`
+has their names and 8-K counts); the beta lists also live in S3 under `s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/inputs/ciks/`
+(`important-8K-filers.txt`, the beta scope both stacks are configured with, and the
+random samples `beta-1k.txt`, `beta-10k.txt`, `beta-50k.txt`, `beta-100k.txt`).
 
 ```bash
 uv run cdt run historical --extractor-backend live --cik-file data/ciks/smoke-10.txt \
@@ -110,7 +112,7 @@ Notes:
 - `make local-run` and `./scripts/local-pipeline.sh` run `cdt run` with deployment-like environment variables from `.env`.
 - `cdt extract job show` inspects the async batch extract job; `cdt extract job reset --yes`
   clears a wedged one. See [docs/architecture.md](docs/architecture.md).
-- `DATA_DIR` is the local artifact root, both for a bare `cdt` command (no `--artifact-root` or `ARTIFACT_ROOT`) and for `make local-run` / `./scripts/local-pipeline.sh`. It comes from the environment, then `.env`, else `<repo>/data`; an empty value also means `<repo>/data`. Those two write dashboard-consumable `latest.parquet` outputs to `DATA_DIR/database/cdt`, the same `database/cdt` prefix the deployed stack uses in its bucket.
+- `DATA_DIR` is the local artifact root, both for a bare `cdt` command (no `--artifact-root` or `ARTIFACT_ROOT`) and for `make local-run` / `./scripts/local-pipeline.sh`. It comes from the environment, then `.env`, else `<repo>/data`; an empty value also means `<repo>/data`. Those two write dashboard-consumable `latest.parquet` outputs to `DATA_DIR/database/cdt`, the default `database/cdt` prefix; the dev stack publishes the beta to `database/cdt-beta` for now (`idi:final_database_prefix`).
 
 ## Dashboard Handoff
 
