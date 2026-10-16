@@ -9,7 +9,7 @@ can search for a name you saw in the code.
 
 ## Stage orchestration (`cdt.pipeline`)
 
-The `FINAL_OUTPUT_*` constants and `finalize_after_match` below live in `cdt.publish`, and `GENRE_8K` / `GENRE_6K` in `cdt.datasets`; they are described here because they shape the run.
+The `FINAL_OUTPUT_*` constants below live in `cdt.publish`, and `GENRE_8K` / `GENRE_6K` in `cdt.datasets`; they are described here because they shape the run.
 
 ### `FINAL_OUTPUT_TABLES`
 
@@ -19,14 +19,6 @@ every consumer joins a mention to its unit by `item_id`. If only the 8-K units
 were published, every 6-K mention would have no row to join to. The website
 reads item text, the filing's SEC URL and its accession number from that row,
 so a 6-K instrument would show none of them (#172).
-
-### `FINAL_OUTPUT_TABLE_COLUMNS`
-
-A 6-K snippet row has the classifier's three columns and the triage stage's six
-on top of the 8-K segmenter's sixteen. The published `items` table keeps the
-8-K segmenter's shape, so the extra columns are dropped rather than widening the
-table with columns that are null on every 8-K row. The snippet's span and
-verdict can still be queried in the `sixk-snippets` dataset.
 
 ### `FINAL_OUTPUT_TABLE_FORM_TYPES` / `FORM_TYPE_COLUMN`
 
@@ -139,25 +131,20 @@ otherwise never be scanned again: a permanent gap that nothing reports (#90).
 Ingest deduplicates by accession, so the re-scan costs only LIST/GET requests,
 and the fingerprint registries carry late merges downstream.
 
-### `finalize_after_match`
+### Lineage is part of match
 
-Every whole run that matches and publishes finishes through this one
-function (`cdt match` runs the lineage pass itself and does not publish;
-`cdt publish` calls `publish_final_tables`, the publish half, alone). When the
-lineage pass was wired into only one of three entry points, production
-published 537 of 542 instruments as lineage heads (#170).
-
-Amendment lineage spans filings, so it can only be derived after every shard
-has matched. That makes it a post-pass over the whole corpus. It re-derives
-every pointer it has ever inferred (#204). It is skipped only when match
-produced nothing, because it would then read three empty datasets to write
-none.
+Every whole run that matches and publishes calls `match_pending_mentions` and
+then `publish_final_tables`; `cdt match` matches and does not publish, and
+`cdt publish` only publishes. Lineage is inferred inside match, for each CIK
+it re-clusters, so no entry point can skip it. When it was a separate pass
+wired into only one of three entry points, production published 537 of 542
+instruments as lineage heads (#170).
 
 ## The publish (`cdt.publish`)
 
 ### `write_final_output_tables` (atomic generation)
 
-Writing four separate `<table>/latest.parquet` objects in a loop can never be
+Writing separate `<table>/latest.parquet` objects in a loop can never be
 consistent as a set (#91):
 
 - a consumer polling mid-loop reads mixed generations, such as mentions that
@@ -166,19 +153,64 @@ consistent as a set (#91):
 - an accidentally empty dataset overwrites a good snapshot with zero rows.
 
 So each publish first writes the whole generation under an immutable
-`final-snapshots/snapshot=<run_id>/` prefix under the artifact root. Then it
-replaces a single `latest.json` pointer, as the last atomic step. Consumers
-that need a consistent four-table generation should resolve that pointer. Only
-after that are the per-table `latest.parquet` objects under the final database
-root refreshed. Each of those objects is atomic on its own, but the set is not
-consistent mid-publish.
+`snapshots/snapshot=<run_id>/` prefix. Then it replaces a single `latest.json`
+pointer, as the last atomic step. Consumers that need a consistent generation
+resolve that pointer. Only after that are the per-table `latest.parquet`
+objects refreshed, as copies of the snapshot files. Each of those objects is
+atomic on its own, but the set is not consistent mid-publish.
 
-### `final_snapshots_root`
+### `final_pointer_path`, `final_snapshots_root`
 
-The snapshots live under the artifact root, not the final database root. The
-final database prefix is a parquet-only contract for downstream consumers, so
-the control metadata (`latest.json`) and the immutable generation copies stay
-with the pipeline's other artifacts.
+The pointer and the generations live under the final database root, beside
+the tables. When they lived under the artifact root, the website could not
+resolve a generation without reading the pipeline's working prefix, so it read
+the four `latest.parquet` files directly and could read a mix of two
+generations.
+
+### The publish contract and `conform_to_contract`
+
+The website could not read CDT's output (#257): columns had been renamed
+(`amount` to `principal_amount`, `end_date` to `maturity_date`,
+`lenders_json` to `parties_json`), and payload shapes had changed (evidence
+`mentions` became `spans`; parties gained a `role`). Renaming columns alone
+would have left the evidence highlights and lender lists silently empty. Only
+`items` was cut to a column list; the other tables published whatever was on
+disk. `publish_contract.json` is now the one statement of what the website
+reads, every table is conformed to it, and a test checks it against the code
+and against the payloads a publish writes. On `genwindow-run-branch`, all 7,280
+payloads of the published instruments and mentions match it.
+
+Conforming fills a missing column with nulls, which on `heldout-eval-dev`
+published 22 of 34 mention columns as null with nothing said (#295). So the
+publish warns when a table has rows but some contract column was in no source
+partition, and when sampled payloads (`PAYLOAD_CHECK_SAMPLE`, 200 per column
+and partition) break their shape (`payload_problem`). It warns rather than
+refuses: a refusal would hold every other table back for one column. It
+samples because a change in a writer's shapes affects every row it writes, and
+parsing every payload at full scope costs millions of `json.loads` per
+publish.
+
+The pointer's table paths are relative to the final database root, so a
+copied or mirrored root still resolves its generation.
+
+### `REFERENCED_ITEMS_TABLE`: only items some mention cites
+
+About 17% of items are referenced by a mention (measured), so publishing
+every item would carry an estimated 2 GB of text at full scope to serve
+0.4–0.5 GB of it. The
+website then fetches item text by `item_id` rather than embedding it.
+
+### `_stream_published_table` (memory)
+
+The publish used to read every row of every table, item text included, into
+pandas and then copy it to null placeholders: an estimated 10 GB, 20 GB at
+peak, at full scope, on a 4 GB task. It now streams one source partition at a
+time through Arrow, never pandas, and hands each partition's memory back to
+the system before the next (`release_unused`; without it the allocator kept
+growing by 15–30 MB per partition even with nothing live). Measured publishing
+`genwindow-eval-apr`'s items replicated 1×, 4× and 16× (5,794 to 92,704 items,
+14 to 224 MB of text): peak RSS 292, 322 and 353 MB, against 392, 627 and
+948 MB before.
 
 ### `_prune_old_snapshots`
 
@@ -189,10 +221,12 @@ moments ago can still finish reading it.
 
 A table that shrinks below half its published row count blocks the publish
 unless `--force-publish` is passed. The likeliest causes are a bug or a half-built artifact
-root, not a real mass deletion of filings. The prior counts come from the
-published `latest.parquet` footers, not from the pointer. The pointer lives
-with the artifact root, so a half-built or newly pointed artifact root has no
-pointer, and that is exactly the case that must not overwrite a good database.
+root, not a real mass deletion of filings. `debt-instrument-redirects` is not
+checked (`SHRINK_GUARD_EXEMPT_TABLES`, #296): it shrinks legitimately when a
+retired id comes back into use, and a table of a few rows can halve at once. The prior counts come from the
+published `latest.parquet` footers, not from the pointer: a database whose
+pointer is missing must still not be overwritten by a half-built artifact
+root.
 Footer metadata gives the counts without decoding any columns.
 
 ### `publish_would_republish_nothing` (the skip gate)
@@ -206,11 +240,10 @@ per batch cycle, because both `run.run_prepare_then_publish` and `run.run_poll` 
 The gate asks whether anything the publish reads has changed since the
 generation the pointer names. It compares a digest of the source dataset roots
 with the one recorded when that generation was written. Gating on "did match
-produce instruments" answers a different question. `match_pending_mentions`
-returns every shard's full instrument table, not a delta, so that frame is
-empty only on a corpus that has never produced an instrument. Such a gate would
-never have fired on the 542-instrument root #110 was measured against. It also
-cannot see `items`, which segment and 6-K classify write before match runs.
+produce instruments" answers a different question: a match can change no
+instruments while segment or 6-K classify, which run before it, changed
+`items`, and a match run's result does not say whether any published table
+moved.
 
 Three things stop the gate from blocking every publish:
 
@@ -219,8 +252,8 @@ Three things stop the gate from blocking every publish:
   time.
 - A final database root missing any `latest.parquet` publishes regardless.
   Otherwise a newly pointed output root would stay empty until someone passed
-  `--force-publish`. The check costs four HEAD requests on objects the publish would
-  write anyway.
+  `--force-publish`. The check costs one HEAD request per table, on objects the
+  publish would write anyway.
 
 A run that crashed between writing a dataset and publishing it needs no
 override to recover: the datasets changed, so the digest changed, so the next
@@ -238,8 +271,8 @@ With no final database root the gate answers True without listing anything:
 
 ### `PUBLISH_SOURCE_DIGEST_KEY` (recorded last)
 
-The digest is written into the pointer only after all four `latest.parquet`
-objects are written (#222). When it was recorded with the first pointer write,
+The digest is written into the pointer only after every `latest.parquet`
+copy is written (#222). When it was recorded with the first pointer write,
 a crash in the table loop left a pointer whose digest matched while the
 database root still held the previous tables, and every later run skipped the
 publish. Now a crash leaves no digest, which the gate treats as "unknown" and
@@ -253,43 +286,34 @@ redundant publish next time, instead of being treated as already published.
 
 This works like `pending_source_partitions` (#62): compare a stored source
 version. But it uses `artifact_content_versions`, which is byte-based on both
-backends. The registries' mtime-based version would be wrong here. The matcher
-rewrites every shard on every run, almost always with identical content, so an
-mtime digest would change on every run and the gate would never fire.
+backends. The registries' mtime-based version would be wrong here: a forced
+match, or a stage that rewrites a month file with the same rows, changes the
+mtime but not the bytes, and the publish would run for nothing.
 
 The bytes are not the whole input. The same partitions published by a
 different publisher are a different snapshot, so the digest also covers which
-roots feed which table, `MATCHER_SCHEMA_VERSION`, and `PUBLISH_FORMAT_VERSION`
-(#223). On S3 the digest costs one LIST per root, and the ETag comes with it.
+roots feed which table, `MATCHER_SCHEMA_VERSION`, `PUBLISH_FORMAT_VERSION`
+(#223), and the sha256 of `publish_contract.json`'s bytes, so an edit to the
+contract republishes even without a `contract_version` bump. On S3 the digest costs one LIST per root, and the ETag comes with it.
 
 ### `PUBLISH_FORMAT_VERSION`
 
 The source digest cannot see code. If the publish changes what it writes for
-the same source bytes (a column projection, the `form_type` stamp,
-`normalize_snapshot_text`, any reshaping in `write_final_output_tables`)
+the same source bytes (the `form_type` stamp, `null_placeholder_text`, any
+reshaping in `write_final_output_tables`)
 without a version bump, the gate keeps skipping, and the published tables keep
 the old shape until some partition happens to change (#223).
 
-### `_read_published_table`
-
-Empty frames are left out of the concat. A dataset with no partitions reads
-back with all-object columns, and pandas would widen the integer columns of the
-frames next to it to float. That would change a published table's types on any
-run where one genre produced nothing.
+### `form_type` and placeholder text
 
 `form_type` is stamped at publish time, not read from the source, because
 neither dataset carries it. The 8-K segmenter deliberately does not copy it from the
 documents dataset (see `ITEM_DOCUMENT_COLUMNS`).
 
-### `normalize_snapshot_text` / `normalize_snapshot_cell`
-
 Partitions written before a text column existed, or by a stage that turned a
-missing value into a string, contain literal text such as `nan`. Dashboard
-consumers read the snapshots directly, so these are nulled on the way out.
-Only string cells are coerced: an object column can hold booleans, and passing
-everything through the text helper would publish `True` as `"True"`. Nulling
-happens once, up front, so the immutable snapshot and the database root
-publish the same values.
+missing value into a string, contain literal text such as `nan`, so
+`null_placeholder_text` nulls them on the way out. It works on Arrow string
+columns only, so a boolean column is never published as text.
 
 ## Whole runs and the batch poll loop (`cdt.run`)
 
@@ -438,12 +462,6 @@ Stage commands rewrite the same completion registries and datasets as the
 scheduled runs. Writers that are not serialized lose registry updates and
 strand partitions (#88).
 
-### `run_match` (lineage always)
-
-An amend-and-restate chain spans filings, so its links exist only after every
-shard has matched (#170, #204). Every inferred pointer is re-derived, never
-carried over.
-
 ## Ingest (`cdt.ingest`)
 
 ### `run_ingest_pipeline` (`candidate_source`)
@@ -515,12 +533,14 @@ given only `--end-date` starts at 1994, which is the whole corpus.
 Each partition holds exactly one file at a known path, so it is read directly.
 Listing the dataset to find it would cost a full LIST per group per flush.
 
-### `_document_shard`
+### `document_shard`
 
 Python's built-in `hash` is salted per process, so the same accession used to
 land in different shards across runs. A forced re-ingest then wrote a second
 copy into a new partition that per-partition dedup could never see (#61). The
-crc32 scheme in `datasets.shard_label` pins the assignment.
+crc32 scheme in `datasets.shard_label` pins the assignment. Month-file stages
+use the same function to tell which rows of a month came from which
+`documents` partition (`partition_stage.rows_from_sources`).
 
 ### `IngestConfig.dataset_name` / `SIXK_DOCUMENT_DATASET_NAME`
 
@@ -623,28 +643,37 @@ row carries either inline text (from `download=True` ingest) or a
 CDT's own mirror for 6-K. A local run with mirrored bodies must not need AWS
 credentials to resolve them.
 
-### `run_partition_stage` (fingerprint selection and checkpoints)
+### `run_partition_stage` (fingerprint selection, month writes, checkpoints)
 
 `cdt.partition_stage.run_partition_stage` is the one loop behind the four
 whole-partition stages: 8-K and 6-K segment, 8-K and 6-K classify. A source
 partition that changed (ingest merged new rows into a documents partition, or
-segment rewrote a windows partition) becomes pending again and is recomputed
-whole. Segmenting and the 8-K classifier are cheap and deterministic, so
-row-level diffing is not worth the complexity (#62). A stage can report a
-partition incomplete (`PartitionOutput.complete`), which writes nothing and
-records no completion, so the next run retries it.
+segment rewrote a month file) becomes pending again. Segmenting and the 8-K
+classifier recompute it whole: they are cheap and deterministic, so row-level
+diffing is not worth the complexity (#62). 6-K triage pays an LLM call per
+filing, so it records a done set per source (`PartitionOutput.done_keys`) and
+re-judges only filings whose windows changed. A stage can report a partition
+incomplete (`PartitionOutput.complete`). With done keys, its rows are written
+and the partition stays pending; without, nothing is written and the done set
+recorded before is kept (#292), so the retry redoes only what is not done.
 
-Completion is checkpointed by time: saved at most every
+Outputs go to one file per month, written once per run as the loop moves to
+the next month or checkpoints, and completion is recorded only after its month
+is written. Completion is checkpointed by time: saved at most every
 `CHECKPOINT_INTERVAL_SECONDS` (300 s) and once at the end. When the registry was
 written only at stage end, any interruption threw away the whole run's progress:
 up to 2.5 h of itemizing on the real corpus (#111). A count of partitions is the
 wrong unit for the interval, because what a partition costs varies by stage and
-will vary by partition layout. A time interval bounds the loss directly. A save
+by partition layout. A time interval bounds the loss directly. A save
 is a few S3 requests, so at 300 s it costs nothing worth measuring. Repeated
 saves are safe under concurrency, because only dirty entries are merged, by
-compare-and-swap (#88). The lease is renewed after every partition, throttled
-to `RENEW_INTERVAL_SECONDS`, because a stage that outlasts the TTL would
-otherwise be stolen mid-run.
+compare-and-swap (#88).
+
+The lease is renewed, throttled to `RENEW_INTERVAL_SECONDS`, before each month
+write and whenever a processor calls the hook the loop hands it. 6-K triage
+calls it as each stage-2 call returns (#293): one month of 6-K filings is
+thousands of calls, which can outlast the 2-hour TTL, and a stolen lease
+throws the month's paid work away at the write.
 
 ## The classifier (`cdt.classifier`)
 

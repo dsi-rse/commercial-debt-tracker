@@ -10,11 +10,75 @@ import pytest
 
 from cdt.classifier.core import classifications_root
 from cdt.completion import load_completion_registry
+from cdt.datasets import normalize_cik
 from cdt.extractor.normalize.amounts import normalized_amount_from_text
 from cdt.extractor.schema import DEBT_INSTRUMENT_MENTION_COLUMNS
 from cdt.extractor.state import ExtractionRowState
 from cdt.ingest.core import DOCUMENT_COLUMNS
+from cdt.matcher.schema import (
+    DEBT_INSTRUMENT_COLUMNS,
+    DEFAULT_AMBIGUITY_MARGIN,
+    DEFAULT_MEMBERSHIP_THRESHOLD,
+    DEFAULT_RELATED_THRESHOLD,
+    MENTION_CLUSTER_EDGE_COLUMNS,
+)
+from cdt.matcher.stage import MatchThresholds, match_cik
 from cdt.storage.tables import write_partition_table
+
+_INSTRUMENT_ID_COLUMNS = (
+    "debt_instrument_id",
+    "amendment_of_debt_instrument_id",
+    "split_of_debt_instrument_id",
+    "superseded_by_debt_instrument_id",
+    "lineage_family_id",
+)
+
+
+def name_by_seed(
+    frame: pd.DataFrame, instruments: pd.DataFrame | None = None
+) -> pd.DataFrame:
+    """Return ``frame`` with every instrument id replaced by its seed mention id.
+
+    Instrument ids are minted hashes; tests read better naming an instrument
+    after the mention that seeded it. ``instruments`` supplies the id -> seed
+    map (default: ``frame`` itself, when it is the instruments table). A
+    ``lineage_family_id`` becomes the smallest seed in the family, so it still
+    compares equal across members.
+    """
+    source = frame if instruments is None else instruments
+    seeds = dict(
+        zip(
+            source["debt_instrument_id"].astype(str),
+            source["seed_debt_instrument_mention_id"].astype(str),
+            strict=True,
+        )
+    )
+    renamed = frame.copy()
+    for column in _INSTRUMENT_ID_COLUMNS:
+        if column in renamed:
+            renamed[column] = renamed[column].map(
+                lambda value: seeds.get(str(value), value)
+                if isinstance(value, str)
+                else value
+            )
+    if "lineage_family_id" in renamed and "debt_instrument_id" in renamed:
+        smallest: dict[object, str] = {}
+        for family, seed in zip(
+            renamed["lineage_family_id"], renamed["debt_instrument_id"], strict=True
+        ):
+            smallest[family] = min(smallest.get(family, str(seed)), str(seed))
+        renamed["lineage_family_id"] = renamed["lineage_family_id"].map(smallest)
+    if "retired_by_debt_instrument_ids" in renamed:
+        renamed["retired_by_debt_instrument_ids"] = renamed[
+            "retired_by_debt_instrument_ids"
+        ].map(
+            lambda value: json.dumps(
+                sorted(seeds.get(item, item) for item in json.loads(value))
+            )
+            if isinstance(value, str)
+            else value
+        )
+    return renamed
 
 
 def build_mention_row(
@@ -282,7 +346,7 @@ def _seed_classifications(
         rows.append(row)
     write_partition_table(
         str(classifications_root(tmp_path)),
-        partition={"date": date, "shard": "0001"},
+        partition={"month": date[:7]},
         table=pd.DataFrame(rows, columns=CLASSIFIED_ITEM_COLUMNS),
     )
 
@@ -363,4 +427,54 @@ def completed_partitions(stage_name: str, artifact_root: Path | str) -> set[str]
             stage_name, artifact_root=artifact_root
         ).items()
         if entry.complete
+    }
+
+
+def match_tables(
+    debt_instrument_mentions: pd.DataFrame,
+    *,
+    strong_match_threshold: float = DEFAULT_MEMBERSHIP_THRESHOLD,
+    loose_match_threshold: float = DEFAULT_RELATED_THRESHOLD,
+    ambiguity_margin: float = DEFAULT_AMBIGUITY_MARGIN,
+) -> dict[str, pd.DataFrame]:
+    """Match in-memory mentions of any CIKs from scratch, with nothing carried over.
+
+    Each CIK goes through :func:`cdt.matcher.stage.match_cik`, as a match
+    run would, without the storage around it.
+
+    Returns ``{"debt_instrument_mentions": edges, "debt_instrument":
+    instruments}``. Mentions with no CIK are skipped.
+
+    Raises:
+        ValueError: ``strong_match_threshold < loose_match_threshold`` or
+            ``ambiguity_margin`` is negative.
+    """
+    thresholds = MatchThresholds(
+        strong=strong_match_threshold,
+        loose=loose_match_threshold,
+        ambiguity_margin=ambiguity_margin,
+    )
+    with_cik = debt_instrument_mentions.loc[
+        debt_instrument_mentions["cik"].notna()
+        & debt_instrument_mentions["cik"].astype(str).str.strip().ne("")
+    ]
+    normalized = with_cik.assign(cik=with_cik["cik"].map(normalize_cik))
+    matches = [
+        match_cik(cik_mentions, cik=str(cik), thresholds=thresholds)
+        for cik, cik_mentions in normalized.groupby("cik", sort=True)
+    ]
+
+    def combine(frames: list[pd.DataFrame], columns: list[str]) -> pd.DataFrame:
+        populated = [frame for frame in frames if not frame.empty]
+        if not populated:
+            return pd.DataFrame(columns=columns)
+        return pd.concat(populated, ignore_index=True).reindex(columns=columns)
+
+    return {
+        "debt_instrument_mentions": combine(
+            [match.edges for match in matches], MENTION_CLUSTER_EDGE_COLUMNS
+        ),
+        "debt_instrument": combine(
+            [match.instruments for match in matches], DEBT_INSTRUMENT_COLUMNS
+        ),
     }

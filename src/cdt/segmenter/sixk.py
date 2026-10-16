@@ -1133,18 +1133,24 @@ def segment_pending_sixk_documents(
     s3_client: object | None = None,
     renew: Callable[[], None] | None = None,
 ) -> pd.DataFrame:
-    """Window pending 6-K documents partitions into ``sixk-windows`` partitions.
+    """Window pending 6-K documents partitions into the ``sixk-windows`` month files.
 
     A documents partition is pending when its fingerprint changed since it was
-    last segmented, or always with ``force``, and is recomputed whole. Returns
-    the span rows written this run.
+    last segmented, or always with ``force``, and is recomputed whole; its
+    spans replace the ones it produced before. Returns the span rows written
+    this run.
     """
     resolved_root = resolve_artifact_root(artifact_root)
     shared_client = s3_client
 
-    def process(source_path: str, partition: dict[str, str]) -> PartitionOutput:
+    def process(
+        source_path: str,
+        partition: dict[str, str],
+        done: frozenset[str],
+        renew: Callable[[], None],
+    ) -> PartitionOutput:
         nonlocal shared_client
-        del partition
+        del partition, done, renew
         documents = read_table(source_path, DOCUMENT_COLUMNS).reindex(
             columns=DOCUMENT_COLUMNS
         )

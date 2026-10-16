@@ -259,8 +259,9 @@ of an estimated 700k filings.
 Storing the text would save classify almost nothing, because expansion reads up
 to 400 tokens *before* each admitted window, so classify needs the source text
 anyway for every filing that reaches stage 2, which is nearly every filing that
-has windows. Classify therefore reads each windows partition together with the
-`documents-sixk` partition of the same date and shard, re-derives the gated
+has windows. Classify therefore reads each windows month file together with
+the `documents-sixk` partitions (by date and shard) of the filings it covers,
+re-derives the gated
 body of each document from the mirrored submission (`prose_documents`, then
 `gated_body`), and rebuilds every window as `body[start:end]`. That costs one
 extra read of the mirror per gate-passing filing.
@@ -268,11 +269,13 @@ extra read of the mirror per gate-passing filing.
 The coupling is guarded rather than assumed. Each span row carries
 `source_sha256`, the digest of the body it indexes. If the rebuilt body's digest
 differs — the flattening code changed between the two stages, or the document
-is missing — classify holds the whole partition. It makes no stage-2 call for
-any of its filings and writes nothing for it. It records an entry that matches
-no fingerprint, so the partition stays pending, even under `--force` with an
-earlier entry stored. After processing every other partition it raises
-`StaleSegmentationError`, naming the held partitions. The advice is to rerun
+is missing — classify holds that filing. It makes no stage-2 call for it,
+keeps its earlier rows, and leaves it out of the month's done set; the month's
+other filings are judged, written and recorded as done, and the month is
+recorded incomplete, so it stays pending. Holding the whole month instead
+re-billed every filing in it after the re-segment (#292). After processing
+every other partition it raises `StaleSegmentationError`, naming the held
+partitions. The advice is to rerun
 `cdt segment --genres 6-K`, which re-windows every documents partition that
 changed, and to add `--force` only if the segmenter code itself changed.
 
@@ -369,7 +372,7 @@ admission rate, and an empty user message is a 400 from several providers.
 ### `cdt.classifier.sixk`: dataset and row shape
 
 `sixk-snippets` is its own dataset rather than rows in `classifications`.
-Classify owns `classifications/date=D/shard=S/part-0000.parquet` and rewrites it
+Classify owns `classifications/month=M/part-0000.parquet` and rewrites it
 whole, so a second writer would need genre-scoped merge-on-write and would race
 a second completion registry. One writer per dataset is the invariant the
 file-native design relies on.
@@ -392,11 +395,19 @@ sharing an id there is correct.
 window: with the accession and document index in `item`, it names every window
 stage 1 admitted.
 
-Both 6-K stages recompute a whole partition when their source partition
-changed: segment when ingest merged new rows into a documents partition, and
-classify when that rewrote the windows partition, as the 8-K segment and
-classify stages do. Unlike them, classify costs an LLM call per filing with
-admitted windows; at about $0.25 per 1,000 filings that is accepted.
+Both 6-K stages run when their source partition changed: segment when ingest
+merged new rows into a documents partition, and classify when that rewrote a
+windows month file. Segment recomputes the partition whole, as the 8-K stages
+do. Classify costs an LLM call per filing with admitted windows, and a month
+file changes whenever any of its days does, so it records a done set: each
+judged filing's key is its accession plus a digest of its window spans
+(`filing_done_key`). A filing whose key is in the done set keeps its rows; a
+new or re-windowed filing is judged. A filing held by a provider outage or
+stale spans stays out of the done set, so the next run judges it again. The
+key does not cover the stage-1 model, its threshold or the stage-2 prompt;
+after changing any of those, run with `--force`. Classify renews the writer
+lease as each stage-2 call returns, since one month's calls can outlast the
+lease (#293).
 
 The OpenAI provider (`SIXK_TRIAGE_PROVIDER=openai`) exists because OpenRouter
 reserves an estimated maximum cost per in-flight request, so it is the first to

@@ -31,7 +31,7 @@ idi:memory = 4096
 idi:ecr_image_retention_count = 5
 idi:cron = cron(0 7 * * ? *)
 idi:schedule_enabled = false
-idi:poll_schedule_enabled = true
+idi:poll_schedule_enabled = false
 ```
 
 These are already committed in `pulumi/Pulumi.dev.yaml`; the bucket and DLQ names
@@ -184,7 +184,7 @@ cdt run daily
 
 It does not run `historical`.
 
-With the committed values, the daily schedule is off (`idi:schedule_enabled: false`) but the hourly poll is on (`idi:poll_schedule_enabled: true`). So after the first deploy, `cdt run poll` starts every hour. It is cheap while there is nothing to extract, and it drains the batch job a manual historical run leaves behind. Nothing else runs automatically until you enable the daily schedule and deploy again.
+With the committed values, the daily schedule is off (`idi:schedule_enabled: false`), and so is the hourly poll (`idi:poll_schedule_enabled: false`) while the dev root is rebuilt (see "When a stored format changes" in [docs/deployment.md](deployment.md)). With the poll on, `cdt run poll` starts every hour. It is cheap while there is nothing to extract, and it drains the batch job a manual historical run leaves behind. Nothing else runs automatically until you enable the daily schedule and deploy again.
 
 ## Run a Historical Backfill Manually
 
@@ -287,14 +287,18 @@ s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/sixk-snippets/...
 s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/mentions/...
 s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/mention-cluster-edges/...
 s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/debt-instruments/...
+s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/debt-instrument-redirects/...
 s3://idi-dev-ftm2j-shared-processor-storage/processors/cdt/runs/...
 
-Final snapshots are also written to:
+The publish writes, under the final database root:
 
+s3://idi-dev-ftm2j-shared-processor-storage/database/cdt/latest.json
+s3://idi-dev-ftm2j-shared-processor-storage/database/cdt/snapshots/snapshot=<run_id>/<table>.parquet
 s3://idi-dev-ftm2j-shared-processor-storage/database/cdt/items/latest.parquet
 s3://idi-dev-ftm2j-shared-processor-storage/database/cdt/debt-instruments/latest.parquet
 s3://idi-dev-ftm2j-shared-processor-storage/database/cdt/debt-instrument-mentions/latest.parquet
 s3://idi-dev-ftm2j-shared-processor-storage/database/cdt/mention-cluster-edges/latest.parquet
+s3://idi-dev-ftm2j-shared-processor-storage/database/cdt/debt-instrument-redirects/latest.parquet
 ```
 
 ## Enable the Daily Schedule

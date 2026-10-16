@@ -25,9 +25,9 @@ Two schema-wide contracts:
   mentions/
   mention-cluster-edges/
   debt-instruments/
+  debt-instrument-redirects/
   extractor-runs/
   extract-batches/
-  final-snapshots/
   runs/
   failures/
   locks/
@@ -39,103 +39,47 @@ Optional final snapshot layout:
 
 ```text
 <final-database-root>/
+  latest.json                                   # the generation pointer
+  snapshots/snapshot=<run_id>/<table>.parquet   # the current and prior generation
   items/latest.parquet
   debt-instruments/latest.parquet
   debt-instrument-mentions/latest.parquet
   mention-cluster-edges/latest.parquet
+  debt-instrument-redirects/latest.parquet
 ```
 
-`debt-instrument-mentions` is the `mentions` dataset. `items` is the union of `items` (8-K) and `sixk-snippets` (6-K), projected to the `items` columns plus a `form_type` column stamped `8-K` or `6-K` by the dataset each row came from. The `final-snapshots/latest.json` pointer under the artifact root names the current consistent four-table generation.
+Every published table has exactly the columns and Arrow types `src/cdt/publish_contract.json` lists, and every `*_json` column there is written in its documented shape (see [Publish contract](#publish-contract)); the publish logs a warning when a contract column is in no source partition (it publishes all null) or when sampled payloads break their shape. `debt-instrument-mentions` is the `mentions` dataset. `items` is the union of `items` (8-K) and `sixk-snippets` (6-K), cut to the rows some mention references, projected to the `items` columns plus a `form_type` column stamped `8-K` or `6-K` by the dataset each row came from. `latest.json` names the current consistent generation: `run_id`, `written_at`, `schema_version`, `contract_version`, `publish_format_version`, `tables` (each table's `rows` and snapshot `path`, relative to the final database root) and `source_digest` (what the publish gate compares; absent while a publish is mid-copy). A reader resolves every table from it; each `<table>/latest.parquet` is a copy refreshed after the pointer, atomic on its own but not consistent as a set mid-publish.
+
+### Publish contract
+
+`src/cdt/publish_contract.json` is owned by CDT and vendored by the website. It holds:
+
+- `contract_version`, stamped into `latest.json`; a change a reader must know about bumps it. The publish gate hashes the file's bytes, so any edit republishes.
+- `tables`: each published table's `primary_key` and `columns` (name and Arrow type, in order). The publish writes exactly these, so a column on disk that the contract does not name is never published.
+- `payloads.spans`: the keys every evidence span carries.
+- `payloads.columns`: for each `*_json` column, its `container` (`object`, or `array` of objects or of strings), the `keys` every object always carries, a `version`, and, under `nested`, the shape of an object-valued key when it is not null (`status_json.status_date`).
+
+`tests/test_publish_contract.py` checks that the contract names exactly the code's column lists with the declared types, and that a published fixture's tables and payloads have the contract's shapes.
 
 ## Partitioning Rules
 
-Date-partitioned datasets:
+| Datasets | Path | Rows in a file |
+|---|---|---|
+| `documents`, `documents-sixk` | `<dataset>/date=YYYY-MM-DD/shard=NNNN/part-0000.parquet` | one filing date's filings whose `crc32(accession_number) % 64` is `NNNN` |
+| `items`, `sixk-windows`, `classifications`, `sixk-snippets`, `mentions` | `<dataset>/month=YYYY-MM/part-0000.parquet` | every row whose filing `date` falls in the month, sorted by `(cik, date, accession_number)` |
+| `mention-cluster-edges`, `debt-instruments`, `debt-instrument-redirects` | `<dataset>/cik_shard=NNNN/part-0000.parquet` | the matcher's output for every CIK whose unpadded form hashes (`crc32 % 64`) to `NNNN` |
 
-- `documents`, `documents-sixk`
-- `items`, `sixk-windows`
-- `classifications`, `sixk-snippets`
-- `mentions`
+- `datasets.shard_label` is the single source of the shard contract (crc32, modulo, four-digit label); it never uses Python's per-process salted `hash`. `datasets.document_shard` is the `documents` shard of an accession; `datasets.shard_for_cik` hashes the unpadded CIK, so both spellings of one CIK land in one shard.
+- `datasets.target_month` names a row's month file. A stage writes a source's rows into the month of the source (`datasets.source_partition_month`).
+- A `documents` file holds 148 MB–1 GB of text per date, so splitting each date 64 ways keeps files near 8 MB and a late filing cheap to merge. The derived datasets hold a few rows per filing, so one file per month keeps them at a few MB rather than thousands of files of one row each. Measurements: `docs/decisions/storage-and-completion.md`.
 
-Canonical path shape:
+How a month file is written (`cdt.partition_stage.run_partition_stage`):
 
-```text
-<artifact-root>/<dataset>/date=YYYY-MM-DD/shard=NNNN/part-0000.parquet
-```
-
-CIK-sharded datasets:
-
-- `mention-cluster-edges`
-- `debt-instruments`
-
-Canonical path shape:
-
-```text
-<artifact-root>/<dataset>/cik_shard=NNNN/part-0000.parquet
-```
-
-Notes:
-
-- `documents` shards by `crc32(accession_number) % 64`, computed by `datasets.shard_label` — the single source of the shard contract (crc32, modulo, four-digit label). Changing it strands every existing partition, so it is defined nowhere else.
-- `items`, `classifications`, and `mentions` preserve their source document `date` and `shard`
-- CIK shards are `crc32 % 64` of the **unpadded** CIK, so the padded and unpadded spellings of one CIK always land in the same shard
-- `documents` currently use 64 date shards
-- downstream date-partitioned datasets currently preserve whichever document shards they read
-- CIK-sharded datasets currently use 64 shards
-- Shard assignment is stable across runs and processes: `datasets.shard_label` hashes with crc32, never Python's per-process salted `hash`.
-
-### What "Partition", "Shard", and "Batch" Mean
-
-- A `partition` is one physical parquet file at a canonical path such as `documents/date=2026-05-31/shard=0017/part-0000.parquet`.
-- A `shard` is the hash bucket inside a dataset's partitioning scheme. `documents` currently use 64 shards, rendered as `0000` through `0063`. Downstream date-partitioned datasets preserve source document shard values. CIK-sharded datasets also use 64 shards, rendered as `0000` through `0063`.
-- For `documents`, all rows for the same filing date are split across 64 shard files by `crc32(accession_number) % 64`.
-- For `items`, `classifications`, and `mentions`, rows keep the `date` and `shard` partition of their upstream source partition.
-- For CIK-sharded datasets, rows are split across 64 shard files by `crc32` of the unpadded CIK, regardless of filing date.
-- A `batch` is not a second storage layer. It is just the internal chunk size one pipeline invocation uses while draining all work in scope.
-
-### Date-Partitioned Stages
-
-`documents`, `items`, `classifications`, and `mentions` all use the same path shape:
-
-```text
-<artifact-root>/<dataset>/date=YYYY-MM-DD/shard=NNNN/part-0000.parquet
-```
-
-How rows land there:
-
-- `documents`: rows are grouped by filing `date`, then by `crc32(accession_number) % 64`.
-- `items`: each item row is written to the same `date` and `shard` partition as its parent document partition.
-- `classifications`: each classified row is written to the same `date` and `shard` partition as its source item partition.
-- `sixk-windows`: each window row is written to the same `date` and `shard` partition as its source `documents-sixk` partition.
-- `sixk-snippets`: each snippet row is written to the same `date` and `shard` partition as its source `sixk-windows` partition (and so its `documents-sixk` partition).
-- `mentions`: each extracted mention row is written to the same `date` and `shard` partition as its source classification or snippet partition.
-
-Practical implication:
-
-- one parquet file usually represents "one filing date, one shard bucket"
-- the number of rows in that file is variable and depends on how many filings hashed into that bucket
-- downstream stages preserve the partition shape rather than reshuffling by a new key
-- a source partition that produces zero downstream rows is marked completed without writing an output parquet. If an earlier run did write one, it is overwritten with an empty table instead, so the next stage sees that partition change and drops what it derived from the old rows
-
-### CIK-Sharded Stages
-
-`mention-cluster-edges` and `debt-instruments` use this path shape:
-
-```text
-<artifact-root>/<dataset>/cik_shard=NNNN/part-0000.parquet
-```
-
-How rows land there:
-
-- the matcher reads all `mentions`
-- each mention is assigned to `shard_for_cik(cik)`, which is `crc32` of the unpadded CIK modulo 64
-- all mentions for companies whose CIK hashes to the same shard are processed together
-- the matcher writes one `mention-cluster-edges` parquet and one `debt-instruments` parquet for that `cik_shard`
-
-Practical implication:
-
-- matching is company-scoped, not filing-date-scoped
-- rows from many filing dates can coexist in the same `cik_shard` parquet
-- this lets the matcher compare debt mentions across time for the same issuer
+- Completion stays keyed on **source** files. A stage buffers its outputs per target month and writes each month once: it reads the month file, replaces the rows that came from the reprocessed sources, and writes the month back.
+- The rows of a `documents` source are the month rows whose `date` and `document_shard(accession_number)` are the source's own; a month source owns the whole month file it maps to.
+- A source whose output is empty deletes its rows. A month file left with no rows is still written, so the next stage sees it change; a month that never had rows gets no file.
+- A source's completion entry is recorded only after its month is written. Buffered months are written whenever the run moves to another month and at every checkpoint.
+- Extract writes the mentions of a classification month file into the mentions file of the same month, replacing rows per item; both genres share it.
 
 ### Checkpoints and buffers
 
@@ -143,9 +87,13 @@ No stage has a batch size. Each one drains every pending partition in one
 invocation, and what an interruption can lose is bounded by time, not by a count
 of partitions:
 
-- `segment` and `classify` (both genres): completion is saved at most every
-  `cdt.completion.CHECKPOINT_INTERVAL_SECONDS` (300 s) and once at the end. The
-  writer lease is renewed per partition, throttled to the same interval.
+- `segment` and `classify` (both genres): buffered months are written and
+  completion saved at most every `cdt.completion.CHECKPOINT_INTERVAL_SECONDS`
+  (300 s) and once at the end. The writer lease is renewed before each month
+  write, throttled to the same interval. 6-K classify records a done set per
+  month, one key per filing judged (`classifier.sixk.filing_done_key`: the
+  accession and a digest of its window spans), so a month reprocessed after a
+  late filing judges only the filings whose windows are new or changed.
 - `extract` (live backend): commits what it has paid for at every partition end,
   and within a partition once `CHECKPOINT_INTERVAL_SECONDS` has passed since the
   last commit. A commit writes, in order:
@@ -158,12 +106,20 @@ of partitions:
   A resumed run pays only for rows with no verdict. The batch backend persists every row's state at each tick and sizes
   its work with `cdt run poll`'s `--max-rows-per-job`,
   `--max-requests-per-batch` and `--max-batch-bytes`.
-- `match`: processes every `cik_shard` group in turn, renewing the lease per
-  shard. It keeps no completion registry: each run re-matches every shard.
+- `match`: re-clusters only the CIKs whose mentions changed since the last run
+  (`runs/match/cik-digests/cik_shard=NNNN.json`, one digest per normalized CIK
+  over every mention column the matcher reads), and rewrites only the shards
+  they live in, renewing the lease per shard. A shard's digests are written
+  after its tables, so a run that stops part-way leaves those CIKs for the next
+  one. A full rebuild (`--force`, `--remint` or a stale schema) that stops
+  part-way leaves `runs/match/rebuild-pending.json`, and the next run repeats
+  it. The affected CIKs'
+  mentions are read with one filtered scan per batch of shards
+  (`MENTION_READ_BATCH_ROWS`).
 - `ingest`: `--flush-rows` (`cdt run`: `--ingest-flush-rows`, default 100) is a
   write buffer, not a checkpoint. Ingest flushes accumulated document rows after
-  that many, and each flush rewrites the `date/shard` partitions its rows land
-  in. A larger buffer means fewer rewrites and more memory.
+  that many, and each flush rewrites the `documents` `date/shard` partitions its
+  rows land in. A larger buffer means fewer rewrites and more memory.
 
 None of these settings controls parquet file size.
 
@@ -512,30 +468,31 @@ Columns:
 
 - `debt_instrument_mention_id`: Mention-level identifier from the `mentions` dataset.
 - `debt_instrument_id`: Canonical debt instrument entity the matcher assigned the mention to.
+- `cik`: The mention's normalized CIK, by which the matcher replaces one CIK's rows.
+- `item_id`: The mention's item, by which a re-extracted item finds the cluster it belonged to.
 - `edge_type`: Relationship type, currently `member`, `related`, or `ambiguous_candidate`.
 - `match_score`: Numeric matcher confidence score for the candidate relationship.
 - `candidate_rank`: Rank of this candidate among evaluated instrument candidates for the mention.
 - `match_via`: Short explanation of which feature family drove the match decision.
-- `evaluated_run_id`: Matcher run identifier that evaluated the relationship.
 
 ### `debt-instruments`
 
 Columns:
 
-- `debt_instrument_id`: Canonical entity identifier for one consolidated debt instrument history.
+- `debt_instrument_id`: Canonical entity identifier for one consolidated debt instrument history: `di::` and a digest. A cluster that shares mentions with one of its CIK's previous clusters keeps that cluster's id (the largest overlap wins). A cluster that shares only items with a previous one, as after a re-extraction, keeps its id only if some member states at least one of that instrument's name fingerprint, type, start date, maturity, rate or principal amount; more agreeing values win, then more shared items. A pairing that still ties gets a new id and no redirect. Any other cluster gets the digest of its CIK and its smallest member `mention_sort_key` (`cdt.matcher.identity`). `cdt match --remint` gives every cluster that content id.
 - `cik`: Issuer CIK shared by the instrument's directly matched mentions, zero-padded.
 - `company_name`: Issuer display name resolved from the instrument's directly matched mentions, falling back to the newest name any mention for the same CIK carries.
-- `seed_debt_instrument_mention_id`: First direct mention used as the representative seed for the instrument record.
-- `amendment_of_debt_instrument_id`: Parent instrument ID when this instrument is an amendment lineage child. Every lineage pointer on this table carries a relation the **extractor** asserted and cited, except where `amendment_inferred_by` says otherwise; the matcher resolves the `raw_id` to an instrument ID but never invents the relation. A pointer that records a matcher inference rather than an extracted fact needs a provenance column alongside it, documented here, and that column has to survive an incremental rematch — see the stage boundary in `docs/architecture.md`.
+- `seed_debt_instrument_mention_id`: The member mention that sorts first (`mention_sort_key`).
+- `amendment_of_debt_instrument_id`: Parent instrument ID when this instrument is an amendment lineage child. Every lineage pointer on this table carries a relation the **extractor** asserted and cited, except where `amendment_inferred_by` says otherwise; the matcher resolves the `raw_id` to an instrument ID but never invents the relation. A pointer that records a matcher inference rather than an extracted fact needs a provenance column alongside it, documented here — see the stage boundary in `docs/architecture.md`.
 - `retired_by_debt_instrument_ids`: JSON array of IDs of the instruments that retired this one, set on the retired instrument's own row (null when none).
 - `split_of_debt_instrument_id`: Parent instrument ID when this instrument is a split lineage child.
-- `amendment_inferred_by`: Which rule inferred `amendment_of_debt_instrument_id`, when the matcher filled it rather than the extractor: `ordinal_chain` (the amend-and-restate ordinal in the name) is the only value. Null means the pointer came from an extracted, cited relation — including the pointer from an amended instrument to the prior state the extractor minted for it — so an inferred pointer is never mistaken for an extracted one. Set by the lineage pass, which runs after every match — in `cdt match`, in the pipeline's match-and-finalize step, and in `Pipeline.run` (`cdt run daily|historical --extractor-backend live`) alike — and which clears and re-derives every inferred pointer on each run.
+- `amendment_inferred_by`: Which rule inferred `amendment_of_debt_instrument_id`, when the matcher filled it rather than the extractor: `ordinal_chain` (the amend-and-restate ordinal in the name) is the only value. Null means the pointer came from an extracted, cited relation — including the pointer from an amended instrument to the prior state the extractor minted for it — so an inferred pointer is never mistaken for an extracted one. Inferred within each CIK every time the matcher re-clusters it, from its current rows only.
 - `superseded_by_debt_instrument_id`: The amendment child that replaced this state, when exactly one exists. A row with this set is a superseded state, not a live obligation.
 - `lineage_family_id`: One ID per connected lineage component over amendment, split, and retirement pointers — every state of one obligation history shares it. Singleton instruments use their own ID.
 - `is_lineage_head`: True when no amendment child supersedes this row; the browse index should show heads and collapse the rest of the family beneath them.
 - `first_seen_filing_date` / `last_seen_filing_date`: Filing-date range of the instrument's direct mentions.
 - `mention_count` / `document_count`: Direct mentions, and distinct filings containing them.
-- `name`, `instrument_type`, `start_date`, `commitment_termination_date`: Matcher-selected canonical values — the newest non-null across direct mentions, falling back to the value already on the row when no mention carries one.
+- `name`, `instrument_type`, `start_date`, `commitment_termination_date`: Matcher-selected canonical values — the newest non-null across direct mentions.
 - `maturity_date`: Selected on a different rule from the fields above. The newest **stated** maturity wins; a derived one — read out of the instrument's own name, or computed from a tenor — publishes only when no mention in the cluster states any. The other canonical fields do not yet apply this preference.
 - `principal_amount`, `principal_currency`, `principal_amount_kind`: Canonical headline amount, taken together from the newest mention that carries one so the currency can never detach from its figure.
 - `outstanding_balance`, `outstanding_balance_currency`, `outstanding_balance_as_of`, `outstanding_balance_as_of_is_filing_date`: The newest balance observation, kept apart from principal so it never double-counts. When the filing dates the balance no other way, `as_of` falls back to the observing mention's filing date and `outstanding_balance_as_of_is_filing_date` is true, so a substituted date is never mistaken for a stated one.
@@ -545,14 +502,30 @@ Columns:
 - `parties_json`: JSON aggregation of party clusters from direct mentions, deduped by role plus normalized canonical name.
 - `lender_disclosure`: The instrument's worst-case answer across its direct mentions. `collective_present` wins outright — one filing showing a collective lender phrase means holders are hidden however many others name some — and `complete` beats `none_named`, so a filing that named every lender is not erased by one that named none.
 
-Primary key: `debt_instrument_id`
-
 **No lifecycle `status` is published here, by design.** The publisher derives
 it at publish time against an explicit `asOf` recorded alongside `generatedAt`
 (`dsi-rse/commercial-debt-tracker-website#15`). Every input it needs is already
 published: the lineage pointers, `start_date`, `maturity_date` and
 `commitment_termination_date`, and the member mentions' own `status`,
 `status_date` and `dates_json`. See Design notes for why.
+
+Primary key: `debt_instrument_id`
+
+### `debt-instrument-redirects`
+
+One row per instrument id no longer in use whose members another instrument
+took over, so a link to the old id can be sent to the right page.
+
+- `old_debt_instrument_id`: The id no longer published in `debt-instruments`.
+- `debt_instrument_id`: The live instrument that took most of its members. A redirect whose target later stops being used follows that target's redirect, so every target is live.
+- `cik`: The issuer's normalized CIK.
+
+An id that retired with no single successor (two instruments of one
+re-extracted item that content cannot tell apart) has no row. The publish
+shrink guard does not check this table: it shrinks whenever a retired id comes
+back into use.
+
+Primary key: `old_debt_instrument_id`
 
 ## Run Metadata
 
@@ -574,7 +547,8 @@ These stages overwrite a `latest` manifest, named by their completion-registry s
 <artifact-root>/runs/classify/run_id=latest.json       # 8-K classify
 <artifact-root>/runs/sixk-classify/run_id=latest.json  # 6-K classify (triage)
 <artifact-root>/runs/match/run_id=latest.json
-<artifact-root>/runs/infer-lineage/run_id=latest.json
+<artifact-root>/runs/match/cik-digests/cik_shard=NNNN.json   # {schema_version, ciks: {cik: digest}}
+<artifact-root>/runs/match/rebuild-pending.json            # {remint}; only while a full rebuild is unfinished
 ```
 
 The four segment and classify manifests share one shape (`cdt.partition_stage`):
@@ -585,20 +559,16 @@ spans no longer match their text) and `completion_registry`, plus stage-specific
 settings (`item_numbers`; `window_tokens`; `concurrency`, `stage2_model`,
 `stage2_provider`).
 
-`infer-lineage` is the amendment-lineage post-pass. It runs after every match
-and rewrites every `debt-instruments` partition the match manifest just listed,
-so it records its own manifest: the last manifest of that dataset then
-describes its final state. It carries the pass's counters (`links`,
-`reopened`, `heads_before`, `heads_after`) alongside the partitions it
-rewrote.
+The match manifest records `rebuild_all`, `remint`, `ciks_matched`,
+`ciks_removed`, `inferred_lineage_links` and the thresholds alongside the
+shards it rewrote.
 
-The match manifest and the `final-snapshots/latest.json` pointer carry
-`schema_version` (`MATCHER_SCHEMA_VERSION`, currently 7). It is bumped whenever a
+The match manifest and the `<final-database-root>/latest.json` pointer carry
+`schema_version` (`MATCHER_SCHEMA_VERSION`, currently 8). It is bumped whenever a
 `debt-instruments` or `mention-cluster-edges` column is added or removed.
-`match_pending_mentions` reads the recorded value back and **promotes a plain
-run to a full rematch when it is lower than the running version**; the manifest
-that rematch writes records the current version, so the next run is an
-ordinary incremental match again.
+`match_pending_mentions` reads the recorded value back and **re-clusters every
+CIK when it is lower than the running version**; the manifest that run writes
+records the current version, so the next run matches only changed CIKs again.
 
 ### Extractor manifests and audit logs
 
@@ -644,7 +614,7 @@ Every writing command also takes an advisory lock directly under the artifact ro
 locks/pipeline-writer.json           # single-writer lease: {holder, acquired_at, expires_at}
 ```
 
-When a job finishes, its mentions are written to the canonical `mentions` partitions and its
+When a job finishes, its mentions are written to the canonical `mentions` month files and its
 audit log to `extractor-runs/run_id=<run_id>/full.jsonl`, exactly like the synchronous
 backend. `state.jsonl.gz` and `batches.json` are working state, not canonical outputs.
 
@@ -679,7 +649,7 @@ and `batch` backends:
       "accession_number": "...",
       "cik": "...",
       "date": "2024-01-02",
-      "shard": "0001",
+      "month": "2024-01",
       "state": "ERROR",
       "stage": "ner",
       "run_id": "20260814T134326943342Z",
@@ -700,7 +670,7 @@ Each classify stage keeps a failure list of the filings it could not classify,
   "failure_count": 1,
   "failures": {
     "<accession_number>": {
-      "source_partition": "<artifact-root>/sixk-windows/date=2026-10-01/shard=0007/part-0000.parquet",
+      "source_partition": "<artifact-root>/sixk-windows/month=2026-10/part-0000.parquet",
       "error": "validation failed: [...]"
     }
   }
@@ -711,7 +681,7 @@ The filing's rows are written with `label` `failed`. When a run classifies that
 source partition again, its entries are replaced by that run's failures, so a
 filing that now succeeds leaves the list. `cdt classify --retry-failures`
 classifies only the listed filings again: it replaces their rows in the output
-partition, keeps every other row, and updates the list. It skips a source
+month file, keeps every other row, and updates the list. It skips a source
 partition that is pending, since the next plain run classifies it whole, and
 writes no completion entry. Only 6-K triage can fail today; the 8-K list stays
 empty.
@@ -772,14 +742,10 @@ published status a function of the run's **scope** rather than of the filings.
 Re-deriving one 542-instrument corpus against a reference date two years
 earlier moved 218 statuses and changed nothing else.
 
-**Why an older `schema_version` forces a rematch.** Mention ids are content
-hashes, so a schema change that alters the hashed payload changes every id,
-and clusters carried over from the older root are then keyed on ids the
-mentions dataset no longer contains. Minting prior-state rows adds mentions
-too, so carried-over clusters can hold slots the mints would take on a clean
-build, and a cluster can end up with two members naming two different
-amendment parents, which `derive_parent_links` refuses. Promoting rather than
-refusing keeps the scheduled run self-healing; a rematch is deterministic local
+**Why an older `schema_version` forces a rematch.** A schema change can change
+what the matcher writes for a CIK whose mentions did not change, so the
+digests alone would leave those CIKs stale. Promoting rather than refusing
+keeps the scheduled run self-healing; a rematch is deterministic local
 compute.
 
 **Observed evidence multiplicity.** Measured over a 669-mention window:

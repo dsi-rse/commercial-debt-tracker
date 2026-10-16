@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import io
-from collections.abc import Iterator, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 import pandas as pd
 import pyarrow as pa
+import pyarrow.compute
 import pyarrow.dataset
 import pyarrow.fs
 import pyarrow.parquet
@@ -39,15 +41,19 @@ def iter_partition_paths(
     *,
     partition_filter: dict[str, str] | None = None,
 ) -> Iterator[str]:
-    """Yield partition file paths under a dataset, optionally filtered by key/value."""
+    """Yield partition file paths under a dataset, optionally filtered by key/value.
+
+    A filter entry matches one whole ``key=value`` path segment, so
+    ``shard=0001`` does not match ``cik_shard=0001`` and ``month=2026-0`` does
+    not match ``month=2026-01``.
+    """
+    wanted = {f"{key}={value}" for key, value in (partition_filter or {}).items()}
     for path in list_artifacts(base, suffix=".parquet"):
-        if partition_filter is None:
+        if not wanted:
             yield path
             continue
-        normalized = normalize_artifact_path(path)
-        if all(
-            f"{key}={value}" in normalized for key, value in partition_filter.items()
-        ):
+        segments = set(normalize_artifact_path(path).split("/"))
+        if wanted <= segments:
             yield path
 
 
@@ -202,6 +208,21 @@ def read_table(
     return table.reindex(columns=requested)
 
 
+def read_arrow_table(path: ArtifactPath, columns: Sequence[str]) -> pa.Table:
+    """Read the ``columns`` a Parquet file has as an Arrow table; empty if absent.
+
+    Requested columns the file lacks are left out, not filled: the caller
+    knows their types and adds them.
+    """
+    normalized = normalize_artifact_path(path)
+    try:
+        parquet_file = _open_parquet_file(normalized)
+    except FileNotFoundError:
+        return pa.table({})
+    available = set(parquet_file.schema_arrow.names)
+    return parquet_file.read(columns=[name for name in columns if name in available])
+
+
 def count_table_rows(path: ArtifactPath) -> int | None:
     """Return a parquet table's row count from its footer alone; None if absent."""
     normalized = normalize_artifact_path(path)
@@ -223,17 +244,53 @@ def count_partition_rows(paths: Sequence[ArtifactPath]) -> int:
     return sum(count or 0 for count in counts)
 
 
+#: Keep only rows whose column value is in the given collection.
+RowFilter = Mapping[str, Collection[object]]
+
+
+def _filter_frame(table: pd.DataFrame, where: RowFilter | None) -> pd.DataFrame:
+    """Apply ``where`` to an in-memory frame; a filtered column it lacks keeps no row."""
+    if not where:
+        return table
+    mask = pd.Series(True, index=table.index)
+    for column, values in where.items():
+        if column not in table:
+            return table.iloc[0:0]
+        mask &= table[column].isin(list(values))
+    return table.loc[mask].reset_index(drop=True)
+
+
+def _arrow_filter(
+    where: RowFilter | None, schema: pa.Schema
+) -> pyarrow.compute.Expression | None | bool:
+    """Return ``where`` as an Arrow expression; False when a column is absent."""
+    if not where:
+        return None
+    expression: pyarrow.compute.Expression | None = None
+    for column, values in where.items():
+        if column not in schema.names:
+            return False
+        term = pyarrow.compute.field(column).isin(
+            pa.array(list(values), type=schema.field(column).type)
+        )
+        expression = term if expression is None else expression & term
+    return expression
+
+
 def _read_dataset_with_arrow(
-    paths: list[str], columns: Sequence[str] | None
+    paths: list[str],
+    columns: Sequence[str] | None,
+    where: RowFilter | None = None,
 ) -> tuple[pd.DataFrame | None, Exception | None]:
     """Read many partitions as one parallel Arrow dataset scan.
 
-    The schema is merged across every file by ``_unified_schema``. Returns
-    ``(table, None)`` on success, or ``(None, error)`` when the files cannot be
-    read as one table (an error in ``_ARROW_READ_ERRORS``: incompatible
-    per-partition types, or a partition deleted since the listing), so the
-    caller can report which. Requested ``columns`` absent from every file come
-    back all-null.
+    The schema is merged across every file by ``_unified_schema``. ``where``
+    is pushed into the scan, so row groups whose statistics rule it out are
+    skipped. Returns ``(table, None)`` on success, or ``(None, error)`` when
+    the files cannot be read as one table (an error in ``_ARROW_READ_ERRORS``:
+    incompatible per-partition types, or a partition deleted since the
+    listing), so the caller can report which. Requested ``columns`` absent
+    from every file come back all-null.
     """
     filesystem, _ = arrow_filesystem(paths[0])
     # One filesystem (and connection pool) for the whole scan; the other paths
@@ -247,12 +304,15 @@ def _read_dataset_with_arrow(
         unified = pyarrow.dataset.dataset(
             resolved, format="parquet", filesystem=filesystem, schema=schema
         )
+        row_filter = _arrow_filter(where, schema)
+        if row_filter is False:
+            return pd.DataFrame(columns=columns), None
         if columns is None:
-            return unified.to_table().to_pandas(), None
+            return unified.to_table(filter=row_filter).to_pandas(), None
         # Project only the columns this root actually has; a name absent
         # everywhere is reindexed in below, matching the pandas path.
         present = [name for name in columns if name in schema.names]
-        table = unified.to_table(columns=present).to_pandas()
+        table = unified.to_table(columns=present, filter=row_filter).to_pandas()
         return table.reindex(columns=list(columns)), None
     except _ARROW_READ_ERRORS as error:
         return None, error
@@ -263,15 +323,20 @@ def read_dataset(
     *,
     columns: Sequence[str] | None = None,
     partition_filter: dict[str, str] | None = None,
+    where: RowFilter | None = None,
 ) -> pd.DataFrame:
     """Read and concatenate all Parquet files under a dataset prefix.
 
-    ``partition_filter`` keeps only paths containing every ``key=value``. Reads
-    through ``read_partitions``: one parallel Arrow scan, falling back to
-    per-file reads when the partitions cannot be read as one table.
+    ``partition_filter`` keeps only paths containing every ``key=value``
+    segment; ``where`` keeps only rows whose column values are in the given
+    collections. Reads through ``read_partitions``: one parallel Arrow scan,
+    falling back to per-file reads when the partitions cannot be read as one
+    table.
     """
     paths = list(iter_partition_paths(base, partition_filter=partition_filter))
-    return read_partitions(paths, columns=columns, label=normalize_artifact_path(base))
+    return read_partitions(
+        paths, columns=columns, label=normalize_artifact_path(base), where=where
+    )
 
 
 def read_partitions(
@@ -279,18 +344,20 @@ def read_partitions(
     *,
     columns: Sequence[str] | None = None,
     label: str | None = None,
+    where: RowFilter | None = None,
 ) -> pd.DataFrame:
     """Read an explicit list of partitions as one table, Arrow scan first.
 
     Tries ``_read_dataset_with_arrow``; when the partitions cannot be read as
-    one table, logs the reason and concatenates per-file ``read_table`` reads.
-    ``label`` names the group in that log (default: the first path). No paths
-    returns an empty frame with ``columns``.
+    one table, logs the reason and concatenates per-file ``read_table`` reads,
+    filtered by ``where`` in memory. ``label`` names the group in that log
+    (default: the first path). No paths returns an empty frame with
+    ``columns``.
     """
     if not paths:
         return pd.DataFrame(columns=columns)
     resolved_paths = [normalize_artifact_path(path) for path in paths]
-    table, error = _read_dataset_with_arrow(resolved_paths, columns)
+    table, error = _read_dataset_with_arrow(resolved_paths, columns, where)
     if table is not None:
         return table
     LOGGER.info(
@@ -301,7 +368,9 @@ def read_partitions(
         type(error).__name__,
         error,
     )
-    frames = [read_table(path, columns) for path in resolved_paths]
+    frames = [
+        _filter_frame(read_table(path, columns), where) for path in resolved_paths
+    ]
     return pd.concat(frames, ignore_index=True)
 
 
@@ -331,6 +400,40 @@ def write_table(path: ArtifactPath, table: pd.DataFrame) -> str:
         if temp_path.exists():
             temp_path.unlink()
     return str(local_path)
+
+
+@contextmanager
+def parquet_table_writer(
+    path: ArtifactPath, schema: pa.Schema
+) -> Iterator[pyarrow.parquet.ParquetWriter]:
+    """Write one Parquet file a batch at a time; it appears only when complete.
+
+    Yields a ``ParquetWriter`` for ``schema``. The file is written to a local
+    temporary file, then renamed into place, or uploaded to S3 (multipart for
+    a large file). An exception leaves nothing at ``path``. Memory is bounded
+    by one batch; the file itself is on local disk until it is moved.
+    """
+    normalized = normalize_artifact_path(path)
+    on_s3 = is_s3_uri(normalized)
+    directory = None if on_s3 else Path(normalized).parent
+    if directory is not None:
+        directory.mkdir(parents=True, exist_ok=True)
+    # Not ending in .parquet, so a reader never picks up a partial file.
+    with NamedTemporaryFile(
+        dir=directory, suffix=".parquet.tmp", delete=False
+    ) as temp_file:
+        temp_path = Path(temp_file.name)
+    try:
+        with pyarrow.parquet.ParquetWriter(temp_path, schema) as writer:
+            yield writer
+        if on_s3:
+            bucket, key = parse_s3_uri(normalized)
+            s3_client().upload_file(str(temp_path), bucket, key)
+        else:
+            temp_path.replace(normalized)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
 
 def write_partition_table(

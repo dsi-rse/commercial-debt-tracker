@@ -374,35 +374,43 @@ def raw_id_for(index: int) -> str:
     return f"i-{index}"
 
 
+#: The mention columns a debt-instrument-mention id hashes. A ``*_json``
+#: column is hashed in normalized form (:func:`normalize_json_text`).
+MENTION_ID_COLUMNS = (
+    "amounts_json",
+    "commitment_termination_date",
+    "commitment_termination_date_json",
+    "dates_json",
+    "instrument_type",
+    "interest_rate_json",
+    "item_id",
+    "lender_disclosure",
+    "maturity_date",
+    "maturity_date_json",
+    "name",
+    "name_json",
+    "parties_json",
+    "principal_amount",
+    "start_date",
+    "start_date_json",
+    "status_json",
+)
+
+
 def debt_instrument_mention_id_for(
     item_id: str,
     mention_row: dict[str, object],
 ) -> str:
     """Return a stable persisted debt-instrument-mention ID."""
     payload = {
-        "amounts_json": normalize_json_text(mention_row.get("amounts_json")),
-        "dates_json": normalize_json_text(mention_row.get("dates_json")),
-        "commitment_termination_date": mention_row.get("commitment_termination_date"),
-        "commitment_termination_date_json": normalize_json_text(
-            mention_row.get("commitment_termination_date_json")
-        ),
-        "maturity_date": mention_row.get("maturity_date"),
-        "maturity_date_json": normalize_json_text(
-            mention_row.get("maturity_date_json")
-        ),
-        "instrument_type": mention_row.get("instrument_type"),
-        "interest_rate_json": normalize_json_text(
-            mention_row.get("interest_rate_json")
-        ),
-        "item_id": item_id,
-        "lender_disclosure": mention_row.get("lender_disclosure"),
-        "name_json": normalize_json_text(mention_row.get("name_json")),
-        "name": mention_row.get("name"),
-        "parties_json": normalize_json_text(mention_row.get("parties_json")),
-        "principal_amount": mention_row.get("principal_amount"),
-        "status_json": normalize_json_text(mention_row.get("status_json")),
-        "start_date": mention_row.get("start_date"),
-        "start_date_json": normalize_json_text(mention_row.get("start_date_json")),
+        column: (
+            item_id
+            if column == "item_id"
+            else normalize_json_text(mention_row.get(column))
+            if column.endswith("_json")
+            else mention_row.get(column)
+        )
+        for column in MENTION_ID_COLUMNS
     }
     digest = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")

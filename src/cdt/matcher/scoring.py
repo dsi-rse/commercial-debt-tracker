@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pandas as pd
-
 from cdt.matcher.compat import (
     NAME_CLASS_GATE,
     end_dates_are_compatible,
@@ -12,14 +10,8 @@ from cdt.matcher.compat import (
     name_rates_are_compatible,
 )
 from cdt.matcher.normalize import (
-    _json_text,
-    coerce_optional_text,
-    lender_signature,
     lender_similarity_score,
     mention_sort_key,
-    normalize_amount,
-    normalize_date,
-    normalize_name_fingerprint,
 )
 from cdt.matcher.schema import (
     DEFAULT_LENDER_SUPPORT_THRESHOLD,
@@ -29,117 +21,15 @@ from cdt.matcher.schema import (
 )
 
 
-def build_cluster_profiles(
-    *,
-    mention_index: dict[str, PreparedMention],
-    existing_edges: pd.DataFrame,
-    existing_instruments: pd.DataFrame,
-) -> dict[str, ClusterProfile]:
-    """Construct incremental cluster profiles from existing member edges."""
-    member_rows = [
-        row
-        for row in existing_edges.to_dict("records")
-        if str(row.get("edge_type")) == "member"
-    ]
-    members_by_instrument: dict[str, list[str]] = {}
-    for row in member_rows:
-        members_by_instrument.setdefault(str(row["debt_instrument_id"]), []).append(
-            str(row["debt_instrument_mention_id"])
-        )
-    instrument_rows = {
-        str(row["debt_instrument_id"]): row
-        for row in existing_instruments.to_dict("records")
-    }
-    profiles: dict[str, ClusterProfile] = {}
-    for debt_instrument_id, instrument_row in instrument_rows.items():
-        member_ids = sorted(members_by_instrument.get(debt_instrument_id, []))
-        seed_mention_id = str(
-            instrument_row.get(
-                "seed_debt_instrument_mention_id",
-                member_ids[0] if member_ids else debt_instrument_id,
-            )
-        )
-        profile = ClusterProfile(
-            debt_instrument_id=debt_instrument_id,
-            cik=coerce_optional_text(instrument_row.get("cik")) or "",
-            seed_mention_id=seed_mention_id,
-            member_ids=list(member_ids),
-            normalized_amounts=set(),
-            normalized_start_dates=set(),
-            normalized_end_dates=set(),
-            normalized_name_fingerprints=set(),
-            lender_signatures=set(),
-        )
-        normalized_amount = normalize_amount(
-            coerce_optional_text(instrument_row.get("principal_amount"))
-        )
-        if normalized_amount:
-            profile.normalized_amounts.add(normalized_amount)
-        normalized_start_date = normalize_date(
-            coerce_optional_text(instrument_row.get("start_date"))
-        )
-        if normalized_start_date:
-            profile.normalized_start_dates.add(normalized_start_date)
-        normalized_end_date = normalize_date(
-            coerce_optional_text(instrument_row.get("maturity_date"))
-        )
-        if normalized_end_date:
-            profile.normalized_end_dates.add(normalized_end_date)
-        normalized_name = normalize_name_fingerprint(
-            coerce_optional_text(instrument_row.get("name"))
-        )
-        if normalized_name:
-            profile.normalized_name_fingerprints.add(normalized_name)
-        lenders = lender_signature(_json_text(instrument_row, "parties_json") or "[]")
-        if lenders:
-            profile.lender_signatures.add(lenders)
-        for member_id in member_ids:
-            mention = mention_index.get(member_id)
-            if mention is not None:
-                profile.add_member(mention)
-        profiles[debt_instrument_id] = profile
-
-    for debt_instrument_id, member_ids in members_by_instrument.items():
-        if debt_instrument_id in profiles:
-            continue
-        ordered_member_ids = sorted(
-            [member_id for member_id in member_ids if member_id in mention_index],
-            key=lambda mention_id: mention_sort_key(mention_index[mention_id]),
-        )
-        if not ordered_member_ids:
-            continue
-        seed_mention_id = str(
-            instrument_rows.get(debt_instrument_id, {}).get(
-                "seed_debt_instrument_mention_id", ordered_member_ids[0]
-            )
-        )
-        seed_mention = mention_index[ordered_member_ids[0]]
-        profile = ClusterProfile(
-            debt_instrument_id=debt_instrument_id,
-            cik=seed_mention.cik or "",
-            seed_mention_id=seed_mention_id,
-            member_ids=[],
-            normalized_amounts=set(),
-            normalized_start_dates=set(),
-            normalized_end_dates=set(),
-            normalized_name_fingerprints=set(),
-            lender_signatures=set(),
-        )
-        for member_id in ordered_member_ids:
-            profile.add_member(mention_index[member_id])
-        profiles[debt_instrument_id] = profile
-    return profiles
-
-
 def build_empty_profile(
     debt_instrument_id: str,
     mention: PreparedMention,
 ) -> ClusterProfile:
-    """Create an empty profile for a newly created singleton cluster."""
+    """Create an empty profile for a cluster ``mention`` seeds."""
     return ClusterProfile(
         debt_instrument_id=debt_instrument_id,
         cik=mention.cik or "",
-        seed_mention_id=debt_instrument_id,
+        seed_sort_key=mention_sort_key(mention),
         member_ids=[],
         normalized_amounts=set(),
         normalized_start_dates=set(),
@@ -196,7 +86,8 @@ def score_candidates_for_mention(
 ) -> list[CandidateScore]:
     """Return scored candidate clusters for one mention, best first.
 
-    Sorted by descending score, then id. Empty when the mention has no CIK, or
+    Sorted by descending score, then by the cluster's seed sort key, so the
+    order never depends on a cluster's id. Empty when the mention has no CIK, or
     has neither both match keys nor an identifying name and its name class
     exceeds ``NAME_CLASS_GATE``. ``lender_signature`` overrides the mention's
     own for scoring only (see ``borrowed_lender_signature``).
@@ -292,6 +183,7 @@ def score_candidates_for_mention(
                             ),
                             cluster_size=len(profile.member_ids),
                             cluster_retired=profile.retired,
+                            seed_sort_key=profile.seed_sort_key,
                         )
                     )
             continue
@@ -326,11 +218,12 @@ def score_candidates_for_mention(
                 debt_instrument_id=profile.debt_instrument_id,
                 match_score=match_score,
                 support_family=support_family,
+                seed_sort_key=profile.seed_sort_key,
             )
         )
     return sorted(
         candidates,
-        key=lambda candidate: (-candidate.match_score, candidate.debt_instrument_id),
+        key=lambda candidate: (-candidate.match_score, candidate.seed_sort_key),
     )
 
 
@@ -341,13 +234,14 @@ def resolve_candidates(
     strong_match_threshold: float,
     loose_match_threshold: float,
     ambiguity_margin: float,
-    evaluated_run_id: str,
 ) -> tuple[str, list[dict[str, object]]]:
     """Return the mention's chosen cluster id and its edge rows.
 
     One member edge, plus related or ambiguous-candidate edges. A tie that is
     not name-only seeds a new cluster keyed on the mention's own id, as does a
-    mention with no candidate at the strong threshold.
+    mention with no candidate at the strong threshold. Cluster ids here are
+    provisional; :func:`cdt.matcher.identity.assign_instrument_ids` replaces
+    them.
     """
     qualifying_members = [
         candidate
@@ -368,13 +262,13 @@ def resolve_candidates(
         if name_only_tie:
             # A name-only tie joins one of the tied clusters rather than seeding
             # another: the exact name first, then a live cluster over a retired
-            # one, then the largest.
+            # one, then the largest, then the earliest seeded.
             tied.sort(
                 key=lambda candidate: (
                     not candidate.exact_name,
                     candidate.cluster_retired,
                     -candidate.cluster_size,
-                    candidate.debt_instrument_id,
+                    candidate.seed_sort_key,
                 )
             )
             top_candidate = tied[0]
@@ -388,7 +282,6 @@ def resolve_candidates(
                     match_via=render_match_via(
                         "member", top_candidate.support_family, top_candidate.basis
                     ),
-                    evaluated_run_id=evaluated_run_id,
                 )
             ]
             for rank, candidate in enumerate(tied[1:], start=2):
@@ -402,7 +295,6 @@ def resolve_candidates(
                         match_via=render_match_via(
                             "ambiguous", candidate.support_family, candidate.basis
                         ),
-                        evaluated_run_id=evaluated_run_id,
                     )
                 )
             return top_candidate.debt_instrument_id, edge_rows
@@ -417,7 +309,6 @@ def resolve_candidates(
                     match_via=render_match_via(
                         "member", top_candidate.support_family, top_candidate.basis
                     ),
-                    evaluated_run_id=evaluated_run_id,
                 )
             ]
             for rank, candidate in enumerate(candidates[1:], start=2):
@@ -433,7 +324,6 @@ def resolve_candidates(
                         match_via=render_match_via(
                             "related", candidate.support_family, candidate.basis
                         ),
-                        evaluated_run_id=evaluated_run_id,
                     )
                 )
             return top_candidate.debt_instrument_id, edge_rows
@@ -447,7 +337,6 @@ def resolve_candidates(
                 match_score=1.0,
                 candidate_rank=1,
                 match_via="member:seed",
-                evaluated_run_id=evaluated_run_id,
             )
         ]
         for rank, candidate in enumerate(qualifying_members, start=1):
@@ -461,7 +350,6 @@ def resolve_candidates(
                     match_via=render_match_via(
                         "ambiguous", candidate.support_family, candidate.basis
                     ),
-                    evaluated_run_id=evaluated_run_id,
                 )
             )
         return new_cluster_id, edge_rows
@@ -480,7 +368,6 @@ def resolve_candidates(
             match_score=1.0,
             candidate_rank=1,
             match_via="member:seed",
-            evaluated_run_id=evaluated_run_id,
         )
     ]
     for rank, candidate in enumerate(related_candidates, start=1):
@@ -494,7 +381,6 @@ def resolve_candidates(
                 match_via=render_match_via(
                     "related", candidate.support_family, candidate.basis
                 ),
-                evaluated_run_id=evaluated_run_id,
             )
         )
     return new_cluster_id, edge_rows
@@ -508,7 +394,6 @@ def build_edge_row(
     match_score: float,
     candidate_rank: int,
     match_via: str,
-    evaluated_run_id: str,
 ) -> dict[str, object]:
     """Return one persisted edge row."""
     return {
@@ -518,7 +403,6 @@ def build_edge_row(
         "match_score": match_score,
         "candidate_rank": candidate_rank,
         "match_via": match_via,
-        "evaluated_run_id": evaluated_run_id,
     }
 
 

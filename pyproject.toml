@@ -47,6 +47,9 @@ pulumi = [
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+cdt = ["publish_contract.json"]
+
 [tool.ruff.lint]
 extend-select = [
   # by default, ruff enables all F and a subset of E rules

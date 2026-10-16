@@ -13,7 +13,7 @@ import pyarrow.dataset
 import pyarrow.parquet
 import pytest
 from botocore.exceptions import ClientError, ReadTimeoutError
-from support import build_mention_row
+from support import build_mention_row, match_tables
 
 from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
 from cdt.datasets import (
@@ -26,7 +26,6 @@ from cdt.matcher.schema import (
     DEBT_INSTRUMENT_COLUMNS,
     MENTION_CLUSTER_EDGE_COLUMNS,
 )
-from cdt.matcher.stage import match_tables
 from cdt.segmenter.core import ITEM_COLUMNS
 from cdt.storage import objects as storage_objects
 from cdt.storage.columns import (
@@ -217,7 +216,7 @@ def test_iter_date_shard_partitions_raises_on_non_canonical_data(
     table = pd.DataFrame({"item_id": ["a"], "text": ["x"]})
     write_partition_table(
         str(root / "items"),
-        partition={"date": "2026-01-02", "shard": "0007"},
+        partition={"month": "2026-01"},
         table=table,
     )
     (root / "items" / "items.parquet").write_bytes(b"")
@@ -369,10 +368,8 @@ def test_a_reindexed_all_null_text_column_keeps_the_text_type(tmp_path: Path) ->
         synthesized_by="prior_state",
         synthesized_from_mention_id="m-1",
     )
-    for shard, frame in (("0001", model_only), ("0002", synthesized)):
-        write_partition_table(
-            root, partition={"date": "2026-01-02", "shard": shard}, table=frame
-        )
+    for month, frame in (("2026-01", model_only), ("2026-02", synthesized)):
+        write_partition_table(root, partition={"month": month}, table=frame)
 
     schemas = [
         pyarrow.parquet.read_schema(path) for path in sorted(root.rglob("*.parquet"))
@@ -410,7 +407,7 @@ def test_a_rewrite_may_mix_read_back_decimals_with_fresh_text(tmp_path: Path) ->
     )
     write_partition_table(
         tmp_path / "mentions",
-        partition={"date": "2024-06-01", "shard": "0001"},
+        partition={"month": "2024-06"},
         table=frame,
     )
     published = read_dataset(tmp_path / "mentions").set_index(

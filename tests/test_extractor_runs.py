@@ -71,7 +71,7 @@ def test_the_batch_finalize_publishes_through_the_mint_seam(tmp_path: Path) -> N
     from cdt.extractor.outputs import finalize_extract_outputs
 
     finalize_extract_outputs(
-        [(_row_state_with_a_prior_term(), "2024-06-01", "0001")],
+        [(_row_state_with_a_prior_term(), "2024-06")],
         claimed={},
         run_id="20240601T000000000000Z",
         model="test-model",
@@ -143,7 +143,7 @@ def test_the_batch_finalize_purges_an_item_re_extracted_to_zero_mentions(
         amount="$100 million",
     )
     finalize_extract_outputs(
-        [(row_state([mention]), "2024-06-01", "0001")],
+        [(row_state([mention]), "2024-06")],
         **common,  # type: ignore[arg-type]
     )
     assert read_dataset(mentions_root(tmp_path))["item_id"].astype(str).to_list() == [
@@ -152,7 +152,7 @@ def test_the_batch_finalize_purges_an_item_re_extracted_to_zero_mentions(
 
     # The same still-relevant item, re-extracted to nothing.
     finalize_extract_outputs(
-        [(row_state([]), "2024-06-01", "0001")],
+        [(row_state([]), "2024-06")],
         **common,  # type: ignore[arg-type]
     )
 
@@ -222,7 +222,7 @@ def test_the_batch_finalize_purges_an_item_that_stopped_being_relevant(
         amount="$100 million",
     )
     finalize_extract_outputs(
-        [(row_state([mention]), "2024-06-01", "0001")],
+        [(row_state([mention]), "2024-06")],
         claimed={},
         **common,  # type: ignore[arg-type]
     )
@@ -234,7 +234,7 @@ def test_the_batch_finalize_purges_an_item_that_stopped_being_relevant(
     # extracted is no longer relevant, so the source no longer offers it.
     classification_path = write_partition_table(
         classifications_root(tmp_path),
-        partition={"date": "2024-06-01", "shard": "0001"},
+        partition={"month": "2024-06"},
         table=pd.DataFrame(
             [{"item_id": "item-1", "relevance": False}],
             columns=CLASSIFIED_ITEM_COLUMNS,
@@ -331,7 +331,7 @@ def test_the_batch_run_manifest_records_its_fields(tmp_path: Path) -> None:
 
     run_id = "20240601T000000000000Z"
     finalize_extract_outputs(
-        [(_row_state_with_a_prior_term(), "2024-06-01", "0001")],
+        [(_row_state_with_a_prior_term(), "2024-06")],
         claimed={},
         run_id=run_id,
         model="test-model",
@@ -553,7 +553,7 @@ def test_every_partition_end_commits_even_inside_one_interval(
     from cdt.extractor import live as live_module
 
     _seed_classifications(tmp_path, ["a-8-01"], date="2024-01-02")
-    _seed_classifications(tmp_path, ["b-8-01"], date="2024-01-03")
+    _seed_classifications(tmp_path, ["b-8-01"], date="2024-02-03")
     calls = _fake_success_workflow(monkeypatch)
     # The clock never moves, so no interval ever elapses.
     monkeypatch.setattr(live_module, "monotonic", lambda: 0.0)

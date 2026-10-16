@@ -38,13 +38,13 @@ def test_pending_source_partitions_raises_on_flat_files(
     table = pd.DataFrame({"item_id": ["a"], "text": ["x"]})
     write_partition_table(
         str(root / "items"),
-        partition={"date": "2026-01-02", "shard": "0007"},
+        partition={"month": "2026-01"},
         table=table,
     )
     pending, _ = pending_source_partitions("classify", "items", artifact_root=str(root))
 
     assert len(pending) == 1
-    assert pending[0][0].endswith("date=2026-01-02/shard=0007/part-0000.parquet")
+    assert pending[0][0].endswith("month=2026-01/part-0000.parquet")
 
     (root / "items" / "items.parquet").write_bytes(b"")
 

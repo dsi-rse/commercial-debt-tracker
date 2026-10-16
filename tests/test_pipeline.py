@@ -8,14 +8,14 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
-from support import FakeModel
+from support import FakeModel, name_by_seed
 
 from cdt.classifier import eightk as classifier_eightk
 from cdt.datasets import GENRE_6K, GENRE_8K
 from cdt.extractor.state import ExtractionRowState
 from cdt.ingest.core import IngestRunResult
 from cdt.matcher import debt_instruments_root, mention_cluster_edges_root
-from cdt.matcher.schema import MENTION_CLUSTER_EDGE_COLUMNS
+from cdt.matcher.stage import MatchResult
 from cdt.pipeline import (
     ALL_TIME_START_DATE,
     DEFAULT_GENRES,
@@ -139,14 +139,15 @@ def test_run_pipeline_uses_stage_backed_functions(
         calls.append(("extract", None))
         return pd.DataFrame([{"debt_instrument_mention_id": "mention-1"}])
 
-    def fake_match_pending_mentions(**kwargs: object) -> dict[str, pd.DataFrame]:
+    def fake_match_pending_mentions(**kwargs: object) -> MatchResult:
         calls.append(("match", None))
-        return {
-            "debt_instrument_mentions": pd.DataFrame(
+        return MatchResult(
+            edges=pd.DataFrame(
                 [{"debt_instrument_mention_id": "mention-1", "edge_type": "member"}]
             ),
-            "debt_instrument": pd.DataFrame([{"debt_instrument_id": "instrument-1"}]),
-        }
+            instruments=pd.DataFrame([{"debt_instrument_id": "instrument-1"}]),
+            ciks_matched=1,
+        )
 
     monkeypatch.setattr(
         "cdt.ingest.genres.acquire_eightk_documents", fake_run_ingest_pipeline
@@ -260,15 +261,7 @@ def test_genres_narrow_the_run_to_one_chain(
     )
     monkeypatch.setattr(
         "cdt.pipeline.match_pending_mentions",
-        lambda **kwargs: (
-            calls.append("match"),
-            {
-                "debt_instrument_mentions": pd.DataFrame(
-                    columns=MENTION_CLUSTER_EDGE_COLUMNS
-                ),
-                "debt_instrument": pd.DataFrame(),
-            },
-        )[1],
+        lambda **kwargs: (calls.append("match"), MatchResult())[1],
     )
 
     result = run_pipeline(
@@ -518,30 +511,51 @@ This is the extracted event text.
     assert result.extracted_rows == 1
     assert result.matched_rows == 1
     assert written_matches["edge_type"].to_list() == ["member"]
-    assert written_instruments["debt_instrument_id"].to_list() == ["m-1"]
+    assert name_by_seed(written_instruments)["debt_instrument_id"].to_list() == ["m-1"]
     assert final_items["item_id"].to_list() == ["000114036126006577-8-01"]
     assert final_items["company_name"].to_list() == ["Example Inc."]
     assert final_mentions["debt_instrument_mention_id"].to_list() == ["m-1"]
     assert final_mentions["company_name"].to_list() == ["Example Inc."]
     assert final_edges["debt_instrument_mention_id"].to_list() == ["m-1"]
-    assert final_instruments["debt_instrument_id"].to_list() == ["m-1"]
+    assert name_by_seed(final_instruments)["debt_instrument_id"].to_list() == ["m-1"]
     assert final_instruments["company_name"].to_list() == ["Example Inc."]
 
 
-def _seed_final_tables(artifact_root: Path, *, rows: int = 2) -> None:
-    """Write minimal rows into every dataset finalize publishes."""
-    from cdt.publish import FINAL_OUTPUT_TABLES
+def _seed_final_tables(
+    artifact_root: Path, *, rows: int = 2, extra_item_ids: tuple[str, ...] = ()
+) -> None:
+    """Write ``rows`` minimal rows into every dataset finalize publishes.
+
+    Each row sets its table's first primary-key column; the mentions
+    reference the items (and ``extra_item_ids``), so every item publishes.
+    """
+    from cdt.publish import FINAL_OUTPUT_TABLES, publish_contract
 
     for table_name, dataset_root_fns in FINAL_OUTPUT_TABLES.items():
+        key = publish_contract()["tables"][table_name]["primary_key"][0]
+        table = pd.DataFrame([{key: f"{table_name}-{index}"} for index in range(rows)])
+        if table_name == "debt-instrument-mentions":
+            item_ids = [f"items-{index}" for index in range(rows)]
+            table["item_id"] = item_ids
+            table = pd.concat(
+                [
+                    table,
+                    pd.DataFrame(
+                        {
+                            key: [f"extra-{item_id}" for item_id in extra_item_ids],
+                            "item_id": list(extra_item_ids),
+                        }
+                    ),
+                ],
+                ignore_index=True,
+            )
         # The first dataset only. `items` unions a second one, and these tests
         # are about the pointer, the guard and pruning — seeding both would
         # double the row counts they assert on. The union has its own test.
         write_partition_table(
             dataset_root_fns[0](str(artifact_root)),
-            partition={"date": "2024-01-02", "shard": "0001"},
-            table=pd.DataFrame(
-                [{"id": f"{table_name}-{index}"} for index in range(rows)]
-            ),
+            partition={"month": "2024-01"},
+            table=table,
         )
 
 
@@ -578,51 +592,6 @@ def _mention_frame(*names: str) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS)
 
 
-def test_match_and_finalize_runs_the_lineage_pass_after_every_match(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The pass is part of the pipeline, renews the lease, and skips an empty corpus.
-
-    Behind `cdt match --infer-lineage` it never ran in production, which is why
-    537 of 542 instruments published as lineage heads (#170). It reads three
-    whole datasets and rewrites every shard, so it must renew the writer lease
-    like the phases around it (#89).
-    """
-    from cdt import pipeline as pipeline_module
-    from cdt import publish as publish_module
-
-    calls: list[dict[str, object]] = []
-    renewals: list[int] = []
-
-    def fake_pass(artifact_root: object, **kwargs: object) -> dict[str, int]:
-        calls.append({"artifact_root": str(artifact_root), **kwargs})
-        return {"links": 0, "reopened": 0, "heads_before": 0, "heads_after": 0}
-
-    monkeypatch.setattr(publish_module, "apply_lineage_inference_pass", fake_pass)
-
-    empty_root = tmp_path / "empty"
-    pipeline_module.run_match_and_finalize(
-        artifact_root=empty_root, renew=lambda: renewals.append(1)
-    )
-    assert calls == []
-
-    root = tmp_path / "artifacts"
-    write_partition_table(
-        root / "mentions",
-        partition={"date": "2022-01-02", "shard": "0001"},
-        table=_mention_frame(
-            "Credit Agreement", "Second Amended and Restated Credit Agreement"
-        ),
-    )
-    pipeline_module.run_match_and_finalize(
-        artifact_root=root, renew=lambda: renewals.append(1)
-    )
-    assert len(calls) == 1
-    assert calls[0]["artifact_root"] == str(root)
-    assert callable(calls[0]["renew"])
-    assert renewals  # the lease was renewed around the pass
-
-
 def test_published_items_union_both_genres_so_every_mention_can_join(
     tmp_path: Path,
 ) -> None:
@@ -640,10 +609,10 @@ def test_published_items_union_both_genres_so_every_mention_can_join(
 
     artifact_root = tmp_path / "artifacts"
     final_root = tmp_path / "final"
-    _seed_final_tables(artifact_root)
+    _seed_final_tables(artifact_root, extra_item_ids=("000165495426008172-6K-0-0-512",))
     write_partition_table(
         sixk_snippets_root(str(artifact_root)),
-        partition={"date": "2024-01-02", "shard": "0001"},
+        partition={"month": "2024-01"},
         table=pd.DataFrame(
             [
                 {
@@ -704,22 +673,22 @@ def test_final_snapshots_publish_atomically_with_pointer(tmp_path: Path) -> None
         artifact_root=str(artifact_root), final_database_root=str(final_root)
     )
 
-    pointer = read_json_artifact(str(artifact_root / "final-snapshots" / "latest.json"))
+    pointer = read_json_artifact(str(final_root / "latest.json"))
     assert isinstance(pointer, dict)
     assert set(pointer["tables"]) == set(written)
     for table_name, path in written.items():
         assert f"snapshot={pointer['run_id']}" in path
+        assert path.startswith(str(final_root / "snapshots"))
         assert len(read_table(path)) == 2
         assert pointer["tables"][table_name]["rows"] == 2
-        # The parquet-only contract surface under the final database root.
         assert (final_root / table_name / "latest.parquet").exists()
     assert pointer["schema_version"]
-    # The database prefix stays parquet-only: pointer and snapshots live
-    # under the artifact root instead.
+    assert pointer["contract_version"] == 1
+    # The pointer is the one non-parquet object, beside the tables it names.
     non_parquet = [
         p for p in final_root.rglob("*") if p.is_file() and p.suffix != ".parquet"
     ]
-    assert non_parquet == []
+    assert non_parquet == [final_root / "latest.json"]
 
 
 def test_final_snapshot_guard_blocks_shrinkage_unless_forced(tmp_path: Path) -> None:
@@ -741,7 +710,7 @@ def test_final_snapshot_guard_blocks_shrinkage_unless_forced(tmp_path: Path) -> 
     # The refused publish must not have moved the pointer.
     from cdt.storage.objects import read_json_artifact
 
-    pointer = read_json_artifact(str(artifact_root / "final-snapshots" / "latest.json"))
+    pointer = read_json_artifact(str(final_root / "latest.json"))
     assert pointer["tables"]["items"]["rows"] == 2
 
     forced = write_final_output_tables(
@@ -766,8 +735,7 @@ def test_old_final_snapshots_are_pruned(tmp_path: Path) -> None:
         )
 
     snapshot_dirs = {
-        path.parent.name
-        for path in (artifact_root / "final-snapshots").glob("*/*.parquet")
+        path.parent.name for path in (final_root / "snapshots").glob("*/*.parquet")
     }
     assert len(snapshot_dirs) == 2
 
@@ -875,73 +843,20 @@ def _stage_stubs(
     )
     monkeypatch.setattr(
         "cdt.pipeline.match_pending_mentions",
-        lambda **_: {
-            "debt_instrument_mentions": pd.DataFrame(
+        lambda **_: MatchResult(
+            edges=pd.DataFrame(
                 [{"debt_instrument_mention_id": "mention-1", "edge_type": "member"}]
             ),
-            "debt_instrument": instruments,
-        },
-    )
-
-
-@pytest.mark.parametrize(
-    ("instruments", "expected_calls"),
-    [
-        (pd.DataFrame([{"debt_instrument_id": "instrument-1"}]), 1),
-        (pd.DataFrame(columns=["debt_instrument_id"]), 0),
-    ],
-    ids=["matched-something", "matched-nothing"],
-)
-def test_run_pipeline_runs_the_lineage_pass_between_match_and_publish(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    instruments: pd.DataFrame,
-    expected_calls: int,
-) -> None:
-    """A live run infers lineage before publishing, as the batch backend does.
-
-    The guard matches `run_match_and_finalize`'s: nothing matched means three
-    empty datasets read to write none.
-    """
-    from cdt import publish as publish_module
-
-    cik_file = tmp_path / "ciks.txt"
-    cik_file.write_text("320193\n", encoding="utf-8")
-    calls: list[dict[str, object]] = []
-    _stage_stubs(monkeypatch, tmp_path, instruments=instruments)
-    monkeypatch.setattr(
-        publish_module,
-        "apply_lineage_inference_pass",
-        lambda artifact_root, **kwargs: (
-            calls.append({"artifact_root": str(artifact_root), **kwargs}),
-            {"links": 0, "reopened": 0, "heads_before": 0, "heads_after": 0},
-        )[1],
-    )
-
-    renewals: list[int] = []
-    run_pipeline(
-        PipelineConfig(
-            mode="historical",
-            cik_file=str(cik_file),
-            start_date=date(2024, 1, 1),
-            end_date=date(2024, 1, 31),
-            artifact_root=str(tmp_path / "artifacts"),
+            instruments=instruments,
         ),
-        renew=lambda: renewals.append(1),
     )
 
-    assert len(calls) == expected_calls
-    if expected_calls:
-        assert calls[0]["artifact_root"] == str(tmp_path / "artifacts")
-        assert callable(calls[0]["renew"])
-        assert renewals
 
-
-def _publish_all_four(final_root: Path) -> None:
+def _publish_every_table(final_root: Path) -> None:
     """Stand in for a complete published generation under the database root.
 
     Written directly rather than by running a real publish: the gate inspects
-    exactly these four objects, and seeding the *artifact* datasets with
+    exactly these objects, and seeding the *artifact* datasets with
     placeholder rows would hand the matcher mention rows it cannot parse.
     """
     from cdt.publish import FINAL_OUTPUT_TABLES
@@ -955,7 +870,7 @@ def _publish_all_four(final_root: Path) -> None:
 
 
 def _record_published_generation(artifact_root: Path, final_root: Path) -> None:
-    """Stand in for a complete publish: four live objects and a pointer.
+    """Stand in for a complete publish: every live table and a pointer.
 
     The gate compares a digest of the source partitions against the one the
     pointer recorded when the live generation was written, so "nothing has
@@ -969,9 +884,9 @@ def _record_published_generation(artifact_root: Path, final_root: Path) -> None:
     )
     from cdt.storage.objects import write_json_artifact
 
-    _publish_all_four(final_root)
+    _publish_every_table(final_root)
     write_json_artifact(
-        final_pointer_path(str(artifact_root)),
+        final_pointer_path(str(final_root)),
         {
             "run_id": "seeded-generation",
             PUBLISH_SOURCE_DIGEST_KEY: publish_source_digest(str(artifact_root)),
@@ -1027,14 +942,11 @@ def test_the_gate_fires_on_a_corpus_that_already_has_instruments(
     from cdt import pipeline as pipeline_module
     from cdt import publish as publish_module
 
-    monkeypatch.setattr(
-        publish_module, "apply_lineage_inference_pass", lambda *a, **k: {}
-    )
     artifact_root = tmp_path / "artifacts"
     final_root = tmp_path / "final"
     write_partition_table(
         artifact_root / "mentions",
-        partition={"date": "2022-01-02", "shard": "0001"},
+        partition={"month": "2022-01"},
         table=_mention_frame("Credit Agreement"),
     )
     # Match once so the corpus genuinely holds instruments, then record the
@@ -1066,7 +978,7 @@ def test_new_items_publish_even_though_match_produced_no_instruments(
 ) -> None:
     """``items`` is published too, and itemize writes it before match runs (#110).
 
-    ``FINAL_OUTPUT_TABLES`` publishes four tables, and ``items`` comes from the
+    ``FINAL_OUTPUT_TABLES`` publishes five tables, and ``items`` comes from the
     itemizer (and, on dev, the 6-K triage) — stages upstream of match. A gate
     that asked only about instruments could not see them, so a run that
     itemized new rows and matched nothing left the published ``items`` table
@@ -1080,7 +992,7 @@ def test_new_items_publish_even_though_match_produced_no_instruments(
     _record_published_generation(artifact_root, final_root)
     write_partition_table(
         artifact_root / "items",
-        partition={"date": "2022-01-02", "shard": "0001"},
+        partition={"month": "2022-01"},
         table=pd.DataFrame([{"item_id": "item-1"}]),
     )
 
@@ -1121,7 +1033,7 @@ def test_a_real_publish_records_the_digest_the_next_run_gates_on(
     final_root = tmp_path / "final"
     write_partition_table(
         artifact_root / "items",
-        partition={"date": "2022-01-02", "shard": "0001"},
+        partition={"month": "2022-01"},
         table=pd.DataFrame([{"item_id": "item-1"}]),
     )
 
@@ -1129,7 +1041,7 @@ def test_a_real_publish_records_the_digest_the_next_run_gates_on(
         artifact_root=str(artifact_root), final_database_root=str(final_root)
     )
 
-    pointer = read_json_artifact(final_pointer_path(str(artifact_root)))
+    pointer = read_json_artifact(final_pointer_path(str(final_root)))
     assert pointer[PUBLISH_SOURCE_DIGEST_KEY]
     assert publish_would_republish_nothing(
         artifact_root=str(artifact_root), final_database_root=str(final_root)
@@ -1137,7 +1049,7 @@ def test_a_real_publish_records_the_digest_the_next_run_gates_on(
 
     write_partition_table(
         artifact_root / "items",
-        partition={"date": "2022-01-03", "shard": "0001"},
+        partition={"month": "2022-01"},
         table=pd.DataFrame([{"item_id": "item-2"}]),
     )
 
@@ -1158,9 +1070,9 @@ def test_a_pointer_with_no_recorded_digest_publishes(tmp_path: Path) -> None:
 
     artifact_root = tmp_path / "artifacts"
     final_root = tmp_path / "final"
-    _publish_all_four(final_root)
+    _publish_every_table(final_root)
     write_json_artifact(
-        final_pointer_path(str(artifact_root)),
+        final_pointer_path(str(final_root)),
         {"run_id": "pre-gate", "tables": {}},
     )
 
@@ -1241,7 +1153,7 @@ def test_an_unpublished_database_root_publishes_despite_unchanged_sources(
 
 
 def test_a_partially_published_database_root_publishes(tmp_path: Path) -> None:
-    """Three of four latest.parquet objects is not a complete generation (#110).
+    """All but one latest.parquet object is not a complete generation (#110).
 
     The digest matches here, so the missing fourth object is the only reason
     left to publish — which is what this pins.
@@ -1264,7 +1176,7 @@ def test_a_partially_published_database_root_publishes(tmp_path: Path) -> None:
             pd.DataFrame([{"id": "x"}]),
         )
     write_json_artifact(
-        final_pointer_path(str(artifact_root)),
+        final_pointer_path(str(final_root)),
         {
             "run_id": "seeded-generation",
             PUBLISH_SOURCE_DIGEST_KEY: publish_source_digest(str(artifact_root)),
@@ -1327,28 +1239,6 @@ def test_the_publish_gate_leaves_the_live_tables_untouched(tmp_path: Path) -> No
     assert [path.read_bytes() for path in paths] == before
 
 
-def test_normalize_snapshot_text_is_not_the_publish_cost(tmp_path: Path) -> None:
-    """Recorded, not optimized: it is 1.2% of read+normalize (#110).
-
-    ``normalize_snapshot_text`` maps a Python lambda over every object column of
-    every row, which looks like it should dominate. Measured on
-    data/genwindow-eval-apr's 5,794-row x 16-column ``items`` dataset it is
-    0.113s against an 8.9s read — 1.2% — so the 25 minutes is I/O, not this, and
-    it was deliberately left alone. This test pins only that it still nulls
-    placeholders, which is the behaviour the dashboard depends on.
-    """
-    del tmp_path
-    from cdt.publish import normalize_snapshot_text
-
-    normalized = normalize_snapshot_text(
-        pd.DataFrame([{"a": "nan", "b": "real", "c": True}])
-    )
-
-    assert normalized["a"].to_list() == [None]
-    assert normalized["b"].to_list() == ["real"]
-    assert normalized["c"].to_list() == [True]
-
-
 @pytest.mark.parametrize(
     ("change_a_source", "force_publish", "expected_publishes"),
     [(True, False, 1), (False, False, 0), (False, True, 1)],
@@ -1375,16 +1265,13 @@ def test_run_pipeline_skips_the_publish_when_nothing_changed(
         tmp_path,
         instruments=pd.DataFrame([{"debt_instrument_id": "instrument-1"}]),
     )
-    monkeypatch.setattr(
-        publish_module, "apply_lineage_inference_pass", lambda *a, **k: {}
-    )
     artifact_root = tmp_path / "artifacts"
     final_root = tmp_path / "final"
     _record_published_generation(artifact_root, final_root)
     if change_a_source:
         write_partition_table(
             artifact_root / "items",
-            partition={"date": "2022-01-02", "shard": "0001"},
+            partition={"month": "2022-01"},
             table=pd.DataFrame([{"item_id": "item-1"}]),
         )
 
@@ -1457,15 +1344,7 @@ def _isolation_stubs(
     )
     monkeypatch.setattr(
         "cdt.pipeline.match_pending_mentions",
-        lambda **kwargs: (
-            calls.append("match"),
-            {
-                "debt_instrument_mentions": pd.DataFrame(
-                    columns=MENTION_CLUSTER_EDGE_COLUMNS
-                ),
-                "debt_instrument": pd.DataFrame(),
-            },
-        )[1],
+        lambda **kwargs: (calls.append("match"), MatchResult())[1],
     )
 
 
@@ -1592,34 +1471,22 @@ def test_a_run_with_a_failed_genre_does_not_report_success(
     assert "with failed genres: 6-K" in caplog.text
 
 
-def test_match_and_finalize_logs_its_lineage_and_finalize_stages(
+def test_match_and_finalize_logs_its_match_and_finalize_stages(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The batch path (daily, poll) logs the same stage lines a live run does."""
+    """The batch path (daily, poll) logs the same finalize lines a live run does."""
     from cdt.pipeline import run_match_and_finalize
 
     monkeypatch.setattr(
-        "cdt.pipeline.match_pending_mentions",
-        lambda **kwargs: {
-            "debt_instrument": pd.DataFrame([{"debt_instrument_id": "i-1"}]),
-            "debt_instrument_mentions": pd.DataFrame(
-                columns=MENTION_CLUSTER_EDGE_COLUMNS
-            ),
-        },
-    )
-    monkeypatch.setattr(
-        "cdt.publish.apply_lineage_inference_pass",
-        lambda *args, **kwargs: {"links": 0, "reopened": 0},
+        "cdt.pipeline.match_pending_mentions", lambda **kwargs: MatchResult()
     )
 
     with caplog.at_level("INFO"):
         run_match_and_finalize(artifact_root=str(tmp_path))
 
     messages = [record.getMessage() for record in caplog.records]
-    assert "Starting stage: infer-lineage" in messages
-    assert "Completed stage: infer-lineage | links=0 reopened=0" in messages
     assert any(m.startswith("Starting stage: finalize") for m in messages)
     assert any(m.startswith("Completed stage: finalize | tables=0") for m in messages)
 
@@ -1704,8 +1571,8 @@ def test_a_live_run_publishes_with_force_publish_not_force(
     _isolation_stubs(monkeypatch, tmp_path, calls)
     published: list[dict[str, object]] = []
     monkeypatch.setattr(
-        "cdt.pipeline.finalize_after_match",
-        lambda instruments, **kwargs: published.append(kwargs),
+        "cdt.pipeline.publish_final_tables",
+        lambda **kwargs: published.append(kwargs),
     )
     config = _both_genres_config(tmp_path)
 

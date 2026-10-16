@@ -126,8 +126,7 @@ def extract_pending_items(
     aborted: str | None = None
     total_partitions = len(pending_partitions)
     for partition_index, pending in enumerate(pending_partitions, start=1):
-        partition = {"date": pending.date, "shard": pending.shard}
-        partition_label = f"date={pending.date} shard={pending.shard}"
+        partition_label = pending.classification_path
         partition_start = perf_counter()
         visited_classification_paths.add(pending.classification_path)
         batch_items = read_table(
@@ -174,11 +173,7 @@ def extract_pending_items(
                 # the retry pays only for what never got a verdict.
                 aborted = str(exc)
                 break
-            mention_rows.extend(
-                outcomes.add(
-                    row_state, partition_date=pending.date, shard=pending.shard
-                )
-            )
+            mention_rows.extend(outcomes.add(row_state, month=pending.month))
             terminal_ids.add(row_state.item_id)
             replaced_item_ids.add(row_state.item_id)
             if row_state.state != "SUCCESS":
@@ -190,7 +185,7 @@ def extract_pending_items(
                     keep_lease()
                 write_mentions_partition(
                     resolved_root,
-                    partition=partition,
+                    month=pending.month,
                     new_mentions=pd.DataFrame(
                         mention_rows, columns=DEBT_INSTRUMENT_MENTION_COLUMNS
                     ),
@@ -222,7 +217,7 @@ def extract_pending_items(
             keep_lease()
         written = write_mentions_partition(
             resolved_root,
-            partition=partition,
+            month=pending.month,
             new_mentions=mentions,
             replaced_item_ids=replaced_item_ids,
             retired_item_ids=retired_item_ids,

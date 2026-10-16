@@ -22,8 +22,8 @@ CDT is intentionally file-native. Canonical state lives under one artifact root 
 
 This avoids a mutable database dependency and keeps reruns deterministic:
 
-- date-partitioned stages write `documents`, `items`, `classifications`, and `mentions` (and their 6-K counterparts `documents-sixk`, `sixk-windows`, `sixk-snippets`)
-- CIK-sharded matcher outputs write `mention-cluster-edges` and `debt-instruments`
+- ingest writes `documents` and `documents-sixk` by filing date; the derived stages write one file per month to `items`, `classifications` and `mentions` (and the 6-K counterparts `sixk-windows`, `sixk-snippets`)
+- CIK-sharded matcher outputs write `mention-cluster-edges`, `debt-instruments` and `debt-instrument-redirects`
 - stage manifests and extractor audit logs are written alongside those datasets
 
 See [docs/schema.md](docs/schema.md) for the concrete layout, including the optional `latest.parquet` final snapshots.
@@ -37,14 +37,14 @@ The deployed service is a single ECS Fargate task running `cdt run`, with:
 - a daily EventBridge Scheduler trigger that runs `cdt run daily`
 - an hourly EventBridge Scheduler trigger that runs `cdt run poll`
 - per-stack switches for both triggers (`idi:schedule_enabled`,
-  `idi:poll_schedule_enabled`); as committed, the daily schedule is disabled in
-  both stacks and the poll is enabled in `dev` only
+  `idi:poll_schedule_enabled`); as committed, both are disabled in both stacks
+  (the `dev` poll is off while its root is rebuilt)
 - manual historical backfills via `scripts/run-historical.sh` (admin-run ECS task command overrides; see [docs/deployment.md](docs/deployment.md))
 
 The deployed `daily` run does ingest → segment → classify for each genre (8-K and
 6-K), and refreshes match/final snapshots, but hands the expensive LLM extract stage to OpenAI's Batch API. The hourly
 `poll` run advances that asynchronous batch job one step at a time and re-runs match +
-finalize when it completes. See [docs/architecture.md](docs/architecture.md) for the
+publish when it completes. See [docs/architecture.md](docs/architecture.md) for the
 extract state machine.
 
 The GitHub Actions deployment path is the shared processor pipeline
@@ -75,7 +75,7 @@ cdt segment    8-K item sections and 6-K window spans                 (cdt.segme
 cdt classify   8-K item relevance and 6-K triage; `classify train`    (cdt.classifier)
 cdt extract    a batch tick (default) or `--backend live`; `extract job`  (cdt.extractor)
 cdt match      instruments and lineage                                (cdt.matcher)
-cdt publish    the four latest.parquet tables                         (cdt.publish)
+cdt publish    the published tables, cut to publish_contract.json     (cdt.publish)
 cdt run daily | historical | poll                                     (cdt.run)
 ```
 
@@ -120,7 +120,7 @@ For local development with a shared `DATA_DIR`:
 
 - CDT writes canonical working artifacts to `DATA_DIR`
 - CDT writes dashboard-facing final snapshots to `DATA_DIR/database/cdt`
-- the website repo reads those four `latest.parquet` files and builds its local `generated/*.json` snapshot from them
+- the website repo reads the `latest.parquet` files there and builds its local `generated/*.json` snapshot from them; the `latest.json` pointer beside them names one consistent generation for a reader that needs it, and `src/cdt/publish_contract.json` lists every column and payload shape a reader can rely on
 
 The dashboard-facing files are:
 
@@ -128,6 +128,8 @@ The dashboard-facing files are:
 - `debt-instruments/latest.parquet`
 - `debt-instrument-mentions/latest.parquet`
 - `mention-cluster-edges/latest.parquet`
+- `debt-instrument-redirects/latest.parquet`
+- `latest.json`, the pointer to the current consistent generation under `snapshots/`
 
 This mirrors the cloud contract: in deployment, CDT writes the same final snapshots to S3, and the dashboard publisher turns them into `generated/*` JSON for R2.
 

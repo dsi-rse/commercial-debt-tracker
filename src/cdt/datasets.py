@@ -1,6 +1,9 @@
 """Dataset paths, partition naming, shard assignment and filing genres.
 
-Prefixes are named ``*_root`` and single objects ``*_path``.
+Prefixes are named ``*_root`` and single objects ``*_path``. Two partition
+layouts exist: ``documents`` datasets are ``date=YYYY-MM-DD/shard=NNNN``, and
+every dataset derived from them is ``month=YYYY-MM``
+(:func:`target_month`). The matcher's outputs are ``cik_shard=NNNN``.
 """
 
 from __future__ import annotations
@@ -33,6 +36,9 @@ SIXK_WINDOW_DATASET_NAME = "sixk-windows"
 MATCH_SHARDS = 64
 PARTITION_PATTERN = re.compile(
     r"(?P<dataset>[a-z\-]+)/date=(?P<date>\d{4}-\d{2}-\d{2})/shard=(?P<shard>\d{4})/part-0000\.parquet$"
+)
+MONTH_PARTITION_PATTERN = re.compile(
+    r"(?P<dataset>[a-z\-]+)/month=(?P<month>\d{4}-\d{2})/part-0000\.parquet$"
 )
 
 
@@ -161,6 +167,32 @@ def date_shard_partition_path(
     )
 
 
+def target_month(partition_date: str) -> str:
+    """Return the ``month=`` partition a row dated ``partition_date`` belongs in."""
+    return str(partition_date)[: len("YYYY-MM")]
+
+
+def month_partition_path(
+    dataset_name: str,
+    *,
+    month: str,
+    artifact_root: ArtifactPath | None = None,
+) -> str:
+    """Return one canonical month partition file path."""
+    return join_artifact_path(
+        dataset_root(dataset_name, artifact_root=artifact_root),
+        f"month={month}",
+        "part-0000.parquet",
+    )
+
+
+def source_partition_month(partition: dict[str, str]) -> str:
+    """Return the target month of a parsed source partition of either layout."""
+    if "month" in partition:
+        return partition["month"]
+    return target_month(partition["date"])
+
+
 def cik_shard_partition_path(
     dataset_name: str,
     *,
@@ -176,21 +208,41 @@ def cik_shard_partition_path(
 
 
 def match_date_shard_partition(path: ArtifactPath) -> dict[str, str] | None:
-    """Match a canonical date/shard partition path, or None when non-canonical.
-
-    The single matcher behind both the strict parser and the dataset scan, so
-    the two can never drift on what counts as a canonical layout.
-    """
+    """Match a canonical date/shard partition path, or None when non-canonical."""
     match = PARTITION_PATTERN.search(normalize_artifact_path(path))
     return match.groupdict() if match else None
 
 
-def parse_date_shard_partition(path: ArtifactPath) -> dict[str, str]:
-    """Parse a canonical date/shard partition path."""
-    partition = match_date_shard_partition(path)
+def match_source_partition(path: ArtifactPath) -> dict[str, str] | None:
+    """Match a canonical partition path of either layout, or None.
+
+    Returns ``{"date", "shard"}`` for a date/shard partition and
+    ``{"month"}`` for a month partition, each with ``dataset``.
+    """
+    normalized = normalize_artifact_path(path)
+    for pattern in (PARTITION_PATTERN, MONTH_PARTITION_PATTERN):
+        match = pattern.search(normalized)
+        if match:
+            return match.groupdict()
+    return None
+
+
+def is_bare_partition_path(path: str) -> bool:
+    """Return whether ``path`` is exactly ``<dataset>/<partition>/part-0000.parquet``.
+
+    True for either layout, with nothing before the dataset name.
+    """
+    return bool(
+        PARTITION_PATTERN.fullmatch(path) or MONTH_PARTITION_PATTERN.fullmatch(path)
+    )
+
+
+def parse_source_partition(path: ArtifactPath) -> dict[str, str]:
+    """Parse a canonical partition path of either layout; raise ValueError if neither."""
+    partition = match_source_partition(path)
     if partition is None:
         normalized = normalize_artifact_path(path)
-        raise ValueError(f"Unrecognized date/shard partition path: {normalized}")
+        raise ValueError(f"Unrecognized partition path: {normalized}")
     return partition
 
 
@@ -229,6 +281,14 @@ def iter_date_shard_partitions(
             continue
         filtered.append(path)
     return filtered
+
+
+DOCUMENT_PARTITION_SHARDS = 64
+
+
+def document_shard(accession_number: str) -> str:
+    """Return the ``documents`` shard an accession is stored in."""
+    return shard_label(str(accession_number), DOCUMENT_PARTITION_SHARDS)
 
 
 def shard_label(value: str, shard_count: int) -> str:

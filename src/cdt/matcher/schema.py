@@ -13,17 +13,20 @@ DEFAULT_AMBIGUITY_MARGIN = 0.05
 DEFAULT_LENDER_SUPPORT_THRESHOLD = 0.5
 # Bump when published columns or hashed mention payloads change; a root matched
 # at an older version is fully rematched (`_stale_schema_forces_rematch`).
-MATCHER_SCHEMA_VERSION = 7
+MATCHER_SCHEMA_VERSION = 8
 
 
 MENTION_CLUSTER_EDGE_COLUMNS = [
     "debt_instrument_mention_id",
     "debt_instrument_id",
+    # The mention's normalized CIK and item, so a CIK's edges can be replaced
+    # and a re-extracted item still finds the cluster it belonged to.
+    "cik",
+    "item_id",
     "edge_type",
     "match_score",
     "candidate_rank",
     "match_via",
-    "evaluated_run_id",
 ]
 DEBT_INSTRUMENT_COLUMNS = [
     "debt_instrument_id",
@@ -73,8 +76,16 @@ DEBT_INSTRUMENT_COLUMNS = [
     # to know.
     "synthesized_only",
 ]
+#: An instrument id no longer in use, and the live id that took most of its
+#: members.
+DEBT_INSTRUMENT_REDIRECT_COLUMNS = [
+    "old_debt_instrument_id",
+    "debt_instrument_id",
+    "cik",
+]
 MENTION_CLUSTER_EDGE_DATASET_NAME = "mention-cluster-edges"
 DEBT_INSTRUMENT_DATASET_NAME = "debt-instruments"
+DEBT_INSTRUMENT_REDIRECT_DATASET_NAME = "debt-instrument-redirects"
 
 
 def mention_cluster_edges_root(
@@ -97,9 +108,19 @@ def debt_instruments_root(
     )
 
 
+def debt_instrument_redirects_root(
+    artifact_root: str | Path | None = None,
+) -> str:
+    """Return the canonical debt-instrument-redirects dataset root."""
+    return dataset_root(
+        DEBT_INSTRUMENT_REDIRECT_DATASET_NAME,
+        artifact_root=artifact_root,
+    )
+
+
 @dataclass(frozen=True)
 class PreparedMention:
-    """Normalized mention record used during incremental cluster assignment."""
+    """Normalized mention record used during cluster assignment."""
 
     debt_instrument_mention_id: str
     item_id: str
@@ -139,11 +160,13 @@ class PreparedMention:
 
 @dataclass
 class ClusterProfile:
-    """Cached cluster state used while matching mentions incrementally."""
+    """One cluster's state while a CIK's mentions are clustered."""
 
     debt_instrument_id: str
     cik: str
-    seed_mention_id: str
+    #: The seed's ``mention_sort_key``: the cluster's smallest member key,
+    #: which breaks scoring ties so a cluster's id never decides one.
+    seed_sort_key: tuple[object, ...]
     member_ids: list[str]
     normalized_amounts: set[str]
     normalized_start_dates: set[str]
@@ -190,6 +213,7 @@ class CandidateScore:
     exact_name: bool = False
     cluster_size: int = 0
     cluster_retired: bool = False
+    seed_sort_key: tuple[object, ...] = ()
 
 
 # Extracted terminal events. A cluster with a member carrying one is retired,

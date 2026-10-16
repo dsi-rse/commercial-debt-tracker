@@ -101,7 +101,7 @@ def test_the_matcher_never_reads_filing_text(monkeypatch: object) -> None:
     signature = inspect.signature(infer_amendment_parents)
     for parameter in ("item_texts", "member_groups", "mention_index"):
         assert parameter not in signature.parameters, parameter
-    for name in ("match_tables", "match_pending_mentions"):
+    for name in ("match_cik", "match_pending_mentions"):
         parameters = inspect.signature(getattr(stage, name)).parameters
         assert "item_texts" not in parameters, name
         assert "infer_lineage" not in parameters, name
@@ -246,14 +246,9 @@ def test_instruments_of_different_issuers_are_never_linked() -> None:
     assert result == {}
 
 
-def test_match_tables_itself_never_infers_a_pointer() -> None:
-    """Inference is the post-pass's job; the per-shard matcher publishes none.
-
-    `match_tables` sees only the clusters its batch touched, so a rule there
-    could never see both states of one facility. The pass runs after every
-    match (`run_match_and_finalize`, `cdt match`), not behind a flag.
-    """
-    from cdt.matcher.stage import match_tables
+def test_match_infers_the_ordinal_link_within_each_cik() -> None:
+    """Inference runs inside match, over every cluster of the CIK at once."""
+    from support import match_tables, name_by_seed
 
     mentions = pd.DataFrame(
         [
@@ -267,9 +262,12 @@ def test_match_tables_itself_never_infers_a_pointer() -> None:
         ]
     )
     tables = match_tables(mentions)
-    instruments = tables["debt_instrument"]
-    assert instruments["amendment_of_debt_instrument_id"].isna().all()
-    assert instruments["amendment_inferred_by"].isna().all()
+    instruments = name_by_seed(tables["debt_instrument"]).set_index(
+        "debt_instrument_id"
+    )
+    assert instruments.loc["m2", "amendment_of_debt_instrument_id"] == "m1"
+    assert instruments.loc["m2", "amendment_inferred_by"] == "ordinal_chain"
+    assert pd.isna(instruments.loc["m1", "amendment_inferred_by"])
 
 
 def borrower(name: str) -> str:

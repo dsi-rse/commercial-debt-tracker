@@ -19,14 +19,22 @@ from cdt.publish import (
 from cdt.storage.objects import read_json_artifact
 from cdt.storage.tables import read_table, write_partition_table
 
-_PARTITION = {"date": "2022-01-02", "shard": "0001"}
+_PARTITION = {"month": "2022-01"}
 
 
 def _items(artifact_root: Path, item_id: str = "item-1") -> None:
+    """Write one item and one mention that references it, so the item publishes."""
     write_partition_table(
         artifact_root / "items",
         partition=_PARTITION,
         table=pd.DataFrame([{"item_id": item_id}]),
+    )
+    write_partition_table(
+        artifact_root / "mentions",
+        partition=_PARTITION,
+        table=pd.DataFrame(
+            [{"debt_instrument_mention_id": f"m-{item_id}", "item_id": item_id}]
+        ),
     )
 
 
@@ -57,11 +65,11 @@ def test_a_publish_interrupted_after_the_pointer_publishes_again(
 ) -> None:
     """A crash refreshing ``latest.parquet`` must not read as published (#222).
 
-    The pointer flips before the four database objects are rewritten. If it
+    The pointer flips before the database tables are refreshed. If it
     already carried the new digest, a crash in that loop left a matching digest
     beside the *previous* generation's tables, and every later run skipped until
     some source happened to move. The digest is recorded only once all four are
-    written, so the interrupted publish leaves none and the next run publishes.
+    refreshed, so the interrupted publish leaves none and the next run publishes.
     """
     artifact_root = tmp_path / "artifacts"
     final_root = tmp_path / "final"
@@ -72,22 +80,20 @@ def test_a_publish_interrupted_after_the_pointer_publishes_again(
     assert _skips(artifact_root, final_root)
 
     _items(artifact_root, "item-2")
-    real_write_table = publish_module.write_table
+    real_copy = publish_module.copy_artifact
 
-    def dies_on_the_database_root(path: object, table: pd.DataFrame) -> str:
-        if str(path).startswith(str(final_root)):
-            msg = "simulated crash refreshing the database root"
-            raise RuntimeError(msg)
-        return real_write_table(path, table)
+    def dies_refreshing_a_table(source: object, target: object) -> str:
+        msg = "simulated crash refreshing the database root"
+        raise RuntimeError(msg)
 
-    monkeypatch.setattr(publish_module, "write_table", dies_on_the_database_root)
+    monkeypatch.setattr(publish_module, "copy_artifact", dies_refreshing_a_table)
     with pytest.raises(RuntimeError, match="simulated crash"):
         write_final_output_tables(
             artifact_root=str(artifact_root), final_database_root=str(final_root)
         )
-    monkeypatch.setattr(publish_module, "write_table", real_write_table)
+    monkeypatch.setattr(publish_module, "copy_artifact", real_copy)
 
-    pointer = read_json_artifact(final_pointer_path(str(artifact_root)))
+    pointer = read_json_artifact(final_pointer_path(str(final_root)))
     assert not pointer.get(PUBLISH_SOURCE_DIGEST_KEY)
     assert not _skips(artifact_root, final_root)
 
@@ -119,7 +125,7 @@ def test_a_source_written_while_the_publish_reads_is_not_recorded_as_published(
             writes.append("late")
             write_partition_table(
                 artifact_root / "items",
-                partition={"date": "2022-01-03", "shard": "0001"},
+                partition={"month": "2022-01"},
                 table=pd.DataFrame([{"item_id": "item-late"}]),
             )
         return real_read_dataset(*args, **kwargs)
@@ -189,7 +195,7 @@ def test_every_source_root_moves_the_digest(tmp_path: Path) -> None:
         before = publish_source_digest(str(artifact_root))
         write_partition_table(
             root,
-            partition={"date": "2022-01-02", "shard": f"{index:04d}"},
+            partition={"month": f"2022-{index + 1:02d}"},
             table=pd.DataFrame([{"id": f"row-{index}"}]),
         )
         assert publish_source_digest(str(artifact_root)) != before, root

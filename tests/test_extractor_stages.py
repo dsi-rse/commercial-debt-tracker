@@ -3441,8 +3441,7 @@ def test_a_salvaged_row_registers_the_salvage_note_not_the_last_stage() -> None:
 
     record = failure_record(
         row_state,
-        partition_date="2026-09-04",
-        shard="0025",
+        month="2026-09",
         run_id="run-1",
         backend="batch",
     )

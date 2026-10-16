@@ -14,9 +14,11 @@ config:
   idi:ecr_image_retention_count: "5"
   idi:cron: cron(0 7 * * ? *)
   idi:schedule_enabled: "false"
-  # The poller alone drives batch extraction; enabled so manual historical runs
-  # drain without hand-fired ticks while the daily schedule stays off.
-  idi:poll_schedule_enabled: "true"
+  # The poller alone drives batch extraction, so manual historical runs drain
+  # without hand-fired ticks while the daily schedule stays off. Off while the
+  # dev root is rebuilt for the step 4 formats (docs/deployment.md, "When a
+  # stored format changes"); set "true" again to drain the rebuild.
+  idi:poll_schedule_enabled: "false"
   # Where every alarm notifies. Alerts stay off until the deploy role gains the
   # sns/cloudwatch/events statements from dsi-rse/idi-ftm2j-shared#79 — flipping
   # alerts_enabled before that redeploy fails with AccessDenied on CreateTopic.

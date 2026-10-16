@@ -8,10 +8,11 @@ from operator import itemgetter
 from typing import Self
 
 from cdt.datasets import (
-    PARTITION_PATTERN,
     dataset_root,
-    match_date_shard_partition,
+    is_bare_partition_path,
+    match_source_partition,
     resolve_artifact_root,
+    source_partition_month,
 )
 from cdt.shared import get_logger
 from cdt.storage.objects import (
@@ -57,10 +58,10 @@ _UNDATED_REGISTRY_SHARD = "unknown"
 
 def _registry_shard_label(key: str) -> str:
     """Return the registry shard one entry's key belongs in."""
-    partition = match_date_shard_partition(key)
+    partition = match_source_partition(key)
     if partition is None:
         return _UNDATED_REGISTRY_SHARD
-    return partition["date"][:_REGISTRY_SHARD_DATE_CHARS]
+    return source_partition_month(partition)[:_REGISTRY_SHARD_DATE_CHARS]
 
 
 def completion_registry_shard_path(
@@ -81,9 +82,10 @@ class CompletedPartition:
     """One source partition's completion record.
 
     ``fingerprint`` is the source object's version at processing time (S3 ETag;
-    size+mtime locally); None when unknown. ``item_ids`` (extract only) are the
-    content-terminal rows (SUCCESS or FAILED-on-validation), which
-    re-processing the partition skips.
+    size+mtime locally); None when unknown. ``item_ids`` is the stage's done
+    set, the rows re-processing the partition skips: for extract the
+    content-terminal item ids (SUCCESS or FAILED-on-validation), for 6-K
+    triage one key per filing judged (:func:`cdt.classifier.sixk.filing_done_key`).
     """
 
     fingerprint: str | None = None
@@ -200,12 +202,12 @@ def _strip_registry_root(key: str, strip_prefix: str) -> str:
     if not key.startswith(strip_prefix):
         return key
     relative = key[len(strip_prefix) :]
-    return relative if PARTITION_PATTERN.fullmatch(relative) else key
+    return relative if is_bare_partition_path(relative) else key
 
 
 def _prepend_registry_root(stored: str, join_prefix: str) -> str:
     """Reattach a precomputed root prefix to one persisted registry key."""
-    if not PARTITION_PATTERN.fullmatch(stored):
+    if not is_bare_partition_path(stored):
         return stored
     return join_prefix + stored
 
@@ -388,11 +390,12 @@ def pending_source_partitions(
     """Select source partitions a whole-partition stage still has to process.
 
     Returns ``([(source_path, fingerprint), ...], registry)`` in path order. A
-    partition is pending when ``force`` is set, it has no completion entry, or
-    its source fingerprint changed (ingest merges late rows into partition
-    files in place). With ``force`` the registry starts empty. The caller
-    persists the returned registry via ``save_completion_registry``. Raises
-    ValueError on a non-canonical parquet file.
+    partition is pending when ``force`` is set, it has no completion entry, its
+    entry is marked incomplete, or its source fingerprint changed (a late
+    filing rewrites a source file in place). With ``force`` the registry starts
+    empty. The caller persists the returned registry via
+    ``save_completion_registry``. Sources may be of either partition layout;
+    raises ValueError on a non-canonical parquet file.
     """
     resolved_root = resolve_artifact_root(artifact_root)
     registry = (
@@ -408,7 +411,7 @@ def pending_source_partitions(
         dataset_root(source_dataset, artifact_root=resolved_root),
         suffix=".parquet",
     ).items():
-        if match_date_shard_partition(path) is not None:
+        if match_source_partition(path) is not None:
             fingerprints[path] = version
             continue
         msg = (
@@ -420,6 +423,11 @@ def pending_source_partitions(
     for source_path in sorted(fingerprints):
         fingerprint = fingerprints[source_path]
         entry = registry.get(source_path)
-        if force or entry is None or entry.fingerprint != fingerprint:
+        if (
+            force
+            or entry is None
+            or not entry.complete
+            or entry.fingerprint != fingerprint
+        ):
             pending.append((source_path, fingerprint))
     return pending, registry

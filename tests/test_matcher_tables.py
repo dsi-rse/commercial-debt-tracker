@@ -6,11 +6,10 @@ import json
 from pathlib import Path
 
 import pandas as pd
-from support import build_mention_row
+from support import build_mention_row, match_tables, name_by_seed
 
 from cdt.datasets import (
     run_manifest_path,
-    shard_for_cik,
 )
 from cdt.matcher import (
     debt_instruments_root,
@@ -18,16 +17,14 @@ from cdt.matcher import (
     mention_cluster_edges_root,
 )
 from cdt.matcher.instruments import company_names_by_cik
-from cdt.matcher.lineage_inference import apply_lineage_inference_pass
 from cdt.matcher.normalize import coerce_optional_text, lender_signature
 from cdt.matcher.schema import (
     DEBT_INSTRUMENT_COLUMNS,
     MATCHER_SCHEMA_VERSION,
     MENTION_CLUSTER_EDGE_COLUMNS,
 )
-from cdt.matcher.stage import _stale_schema_forces_rematch, match_tables
+from cdt.matcher.stage import _stale_schema_forces_rematch
 from cdt.storage.objects import (
-    artifact_exists,
     read_json_artifact,
     write_json_artifact,
 )
@@ -101,7 +98,7 @@ def test_match_pending_mentions_carries_lender_disclosure(tmp_path: Path) -> Non
     )
     write_partition_table(
         tmp_path / "mentions",
-        partition={"date": "2024-01-02", "shard": "0001"},
+        partition={"month": "2024-01"},
         table=mention_rows,
     )
 
@@ -147,19 +144,17 @@ def test_match_reads_a_partition_written_before_a_json_column_existed(
     legacy = pd.DataFrame([{k: v for k, v in row.items() if k not in absent}])
     write_partition_table(
         tmp_path / "mentions",
-        partition={"date": "2024-01-02", "shard": "0001"},
+        partition={"month": "2024-01"},
         table=legacy,
     )
     # Pin the premise: if a future writer starts backfilling these columns this
     # test would still pass while testing nothing.
-    stored = read_table(
-        tmp_path / "mentions" / "date=2024-01-02" / "shard=0001" / "part-0000.parquet"
-    )
+    stored = read_table(tmp_path / "mentions" / "month=2024-01" / "part-0000.parquet")
     assert not set(absent) & set(stored.columns)
 
-    tables = match_pending_mentions(artifact_root=tmp_path)
+    result = match_pending_mentions(artifact_root=tmp_path)
 
-    assert tables["debt_instrument"]["debt_instrument_id"].to_list() == ["m-1"]
+    assert name_by_seed(result.instruments)["debt_instrument_id"].to_list() == ["m-1"]
     # The literal text `nan` must not have reached a published payload.
     instruments = read_dataset(debt_instruments_root(tmp_path))
     assert instruments["parties_json"].to_list() == ["[]"]
@@ -218,17 +213,19 @@ def test_match_pending_mentions_writes_match_datasets(tmp_path: Path) -> None:
     )
     write_partition_table(
         tmp_path / "mentions",
-        partition={"date": "2024-01-02", "shard": "0001"},
+        partition={"month": "2024-01"},
         table=mention_rows,
     )
 
-    tables = match_pending_mentions(artifact_root=tmp_path)
+    result = match_pending_mentions(artifact_root=tmp_path)
 
     written_matches = read_dataset(mention_cluster_edges_root(tmp_path))
     written_instruments = read_dataset(debt_instruments_root(tmp_path))
-    assert len(tables["debt_instrument_mentions"]) == 1
+    assert len(result.edges) == 1
     assert written_matches["edge_type"].to_list() == ["member"]
-    assert written_instruments["debt_instrument_id"].to_list() == ["m-1"]
+    assert written_matches["cik"].to_list() == ["0000320193"]
+    assert name_by_seed(written_instruments)["debt_instrument_id"].to_list() == ["m-1"]
+    assert written_instruments["debt_instrument_id"].str.startswith("di::").all()
 
 
 def test_company_names_by_cik_takes_the_newest_known_name() -> None:
@@ -308,7 +305,9 @@ def test_match_tables_backfills_company_name_from_cik() -> None:
 
     tables = match_tables(mention_rows)
 
-    instruments = tables["debt_instrument"].set_index("debt_instrument_id")
+    instruments = name_by_seed(tables["debt_instrument"]).set_index(
+        "debt_instrument_id"
+    )
     assert len(instruments) == 2
     assert instruments.loc["m-1", "company_name"] == "Versigent PLC"
     assert instruments.loc["m-2", "company_name"] == "Versigent PLC"
@@ -324,9 +323,9 @@ def test_coerce_optional_text_treats_nan_like_text_as_missing() -> None:
     assert coerce_optional_text("Nantucket Bank") == "Nantucket Bank"
 
 
-def _ordinal_chain_root(tmp_path: Path, **mention_overrides: object) -> Path:
-    """Write two mentions the pass links by ordinal, and match them."""
-    rows = pd.DataFrame(
+def _ordinal_chain_rows(**mention_overrides: object) -> pd.DataFrame:
+    """Two mentions the ordinal rule links: a credit agreement and its second A&R."""
+    return pd.DataFrame(
         [
             build_mention_row(
                 mention_id="m-1",
@@ -352,71 +351,79 @@ def _ordinal_chain_root(tmp_path: Path, **mention_overrides: object) -> Path:
             ),
         ]
     )
-    write_partition_table(
-        tmp_path / "mentions",
-        partition={"date": "2024-01-02", "shard": "0001"},
-        table=rows,
-    )
-    match_pending_mentions(artifact_root=tmp_path)
-    return tmp_path
+
+
+def _write_mentions(root: Path, rows: pd.DataFrame, month: str = "2024-01") -> None:
+    write_partition_table(root / "mentions", partition={"month": month}, table=rows)
 
 
 def _published_instruments(root: Path) -> dict[str, dict[str, object]]:
+    """Return the written instruments keyed by seed mention id."""
     return {
         str(row["debt_instrument_id"]): row
-        for row in read_dataset(debt_instruments_root(root)).to_dict("records")
+        for row in name_by_seed(read_dataset(debt_instruments_root(root))).to_dict(
+            "records"
+        )
     }
 
 
-def test_lineage_pass_reopens_a_pointer_the_rules_would_now_refuse(
+def test_match_infers_lineage_and_rederives_the_rollup(tmp_path: Path) -> None:
+    """Lineage is inferred inside match, for each CIK it rebuilds.
+
+    The pointer, its provenance and the rollup it implies all come from the
+    current mentions, so a forced rematch gives the same answer as the first.
+    """
+    _write_mentions(tmp_path, _ordinal_chain_rows())
+
+    match_pending_mentions(artifact_root=tmp_path)
+
+    published = _published_instruments(tmp_path)
+    child, parent = published["m-2"], published["m-1"]
+    assert child["amendment_of_debt_instrument_id"] == "m-1"
+    assert child["amendment_inferred_by"] == "ordinal_chain"
+    assert child["is_lineage_head"]
+    assert parent["is_lineage_head"] is False
+    assert parent["superseded_by_debt_instrument_id"] == "m-2"
+    assert child["lineage_family_id"] == parent["lineage_family_id"]
+    manifest = read_json_artifact(
+        run_manifest_path("match", "latest", artifact_root=tmp_path)
+    )
+    assert manifest["inferred_lineage_links"] == 1
+
+    match_pending_mentions(artifact_root=tmp_path, force=True)
+
+    assert _published_instruments(tmp_path) == published
+
+
+def test_an_inferred_link_goes_when_the_mentions_stop_supporting_it(
     tmp_path: Path,
 ) -> None:
-    """A link an earlier run inferred does not outlive the evidence against it.
-
-    `infer_amendment_parents` only considers rows whose pointer is null and the
-    matcher carries an existing pointer forward, so the EQT/EQM cross-borrower
-    link #197's guard was written to remove survived on every already-matched
-    root and was republished by the next plain match (#204). Here the first
-    pass links the chain; the published rows then acquire disagreeing
-    borrowers, as a tightened rule or a later filing would give them, and a
-    plain second pass must take the link back.
-    """
-    root = _ordinal_chain_root(tmp_path)
-    first = apply_lineage_inference_pass(root)
-    assert first["links"] == 1
-    assert (
-        _published_instruments(root)["m-2"]["amendment_inferred_by"] == "ordinal_chain"
+    """Nothing is carried forward: a link the current mentions refuse is not published."""
+    _write_mentions(tmp_path, _ordinal_chain_rows())
+    match_pending_mentions(artifact_root=tmp_path)
+    assert _published_instruments(tmp_path)["m-2"]["amendment_inferred_by"] == (
+        "ordinal_chain"
     )
 
-    from cdt.datasets import shard_for_cik
+    rows = _ordinal_chain_rows()
+    rows["parties_json"] = [
+        json.dumps([{"role": "borrower", "canonical_name": "EQT Corporation"}]),
+        json.dumps(
+            [{"role": "borrower", "canonical_name": "EQM Midstream Partners, LP"}]
+        ),
+    ]
+    rows["debt_instrument_mention_id"] = ["m-1-re", "m-2-re"]
+    _write_mentions(tmp_path, rows)
+    match_pending_mentions(artifact_root=tmp_path)
 
-    published = read_dataset(debt_instruments_root(root))
-    borrowers = {
-        "m-1": [{"role": "borrower", "canonical_name": "EQT Corporation"}],
-        "m-2": [{"role": "borrower", "canonical_name": "EQM Midstream Partners, LP"}],
-    }
-    published["parties_json"] = published["debt_instrument_id"].map(
-        lambda value: json.dumps(borrowers[str(value)])
-    )
-    write_partition_table(
-        debt_instruments_root(root),
-        partition={"cik_shard": shard_for_cik("320193")},
-        table=published,
-    )
-
-    second = apply_lineage_inference_pass(root)
-    after = _published_instruments(root)
-    assert second["reopened"] == 1
-    assert second["links"] == 0
-    assert after["m-2"]["amendment_of_debt_instrument_id"] is None
-    assert after["m-2"]["amendment_inferred_by"] is None
-    # and the rollup follows the pointer back out
-    assert after["m-1"]["is_lineage_head"] is True
-    assert after["m-1"]["superseded_by_debt_instrument_id"] is None
+    after = _published_instruments(tmp_path)
+    assert after["m-2-re"]["amendment_of_debt_instrument_id"] is None
+    assert after["m-2-re"]["amendment_inferred_by"] is None
+    assert after["m-1-re"]["is_lineage_head"] is True
 
 
-def test_lineage_pass_never_reopens_an_extracted_pointer(tmp_path: Path) -> None:
-    """An extracted relation is a cited fact; only inferred pointers re-derive."""
+def test_an_extracted_pointer_is_not_marked_inferred(tmp_path: Path) -> None:
+    """An extracted relation is a cited fact; only rule-made links carry a rule name."""
     rows = pd.DataFrame(
         [
             build_mention_row(
@@ -442,143 +449,13 @@ def test_lineage_pass_never_reopens_an_extracted_pointer(tmp_path: Path) -> None
             ),
         ]
     )
-    write_partition_table(
-        tmp_path / "mentions",
-        partition={"date": "2024-01-02", "shard": "0001"},
-        table=rows,
-    )
+    _write_mentions(tmp_path, rows)
+
     match_pending_mentions(artifact_root=tmp_path)
-    before = _published_instruments(tmp_path)
-    assert before["m-new"]["amendment_of_debt_instrument_id"] == "m-old"
-    assert before["m-new"]["amendment_inferred_by"] is None
 
-    stats = apply_lineage_inference_pass(tmp_path)
-    after = _published_instruments(tmp_path)
-    assert stats["reopened"] == 0
-    assert after["m-new"]["amendment_of_debt_instrument_id"] == "m-old"
-    assert after["m-new"]["amendment_inferred_by"] is None
-
-
-def test_lineage_pass_keeps_a_null_cik_row_in_one_shard(tmp_path: Path) -> None:
-    """The rewrite must shard a null cik the way the matcher did, not twice.
-
-    `match_pending_mentions` maps `cik.fillna("")`; the pass mapped `str(cik)`,
-    so a null cik went to `shard_for_cik("nan")` while its original copy stayed
-    under `shard_for_cik("")` — a permanently duplicated instrument (#204).
-    """
-    from cdt.datasets import shard_for_cik
-
-    root = _ordinal_chain_root(tmp_path)
-    published = read_dataset(debt_instruments_root(root))
-    orphan = published.iloc[[0]].copy()
-    orphan["debt_instrument_id"] = "orphan"
-    orphan["cik"] = None
-    write_partition_table(
-        debt_instruments_root(root),
-        partition={"cik_shard": shard_for_cik("")},
-        table=orphan,
-    )
-
-    apply_lineage_inference_pass(root)
-
-    after = read_dataset(debt_instruments_root(root))
-    assert (after["debt_instrument_id"] == "orphan").sum() == 1
-    orphan_files = [
-        path
-        for path in (tmp_path / "debt-instruments").rglob("*.parquet")
-        if "orphan" in set(pd.read_parquet(path)["debt_instrument_id"])
-    ]
-    assert [path.parent.name for path in orphan_files] == [
-        f"cik_shard={shard_for_cik('')}"
-    ]
-
-
-def test_lineage_pass_renews_the_writer_lease(tmp_path: Path) -> None:
-    """A full-corpus read and rewrite must keep renewing, or it outlives its lease."""
-    root = _ordinal_chain_root(tmp_path)
-    renewals: list[int] = []
-
-    apply_lineage_inference_pass(root, renew=lambda: renewals.append(1))
-
-    # once after the reads, once per shard written
-    assert len(renewals) >= 2
-
-
-def test_lineage_inference_pass_writes_pointers_and_rederives_the_rollup(
-    tmp_path: Path,
-) -> None:
-    """The post-pass is the only production entry point, so cover it end to end.
-
-    Before this existed, gutting the pointer write, deleting the rollup
-    re-derive, or never writing partitions at all each left the suite green
-    (#184).
-    """
-    rows = pd.DataFrame(
-        [
-            build_mention_row(
-                mention_id="m-1",
-                item_id="item-1",
-                accession_number="0001",
-                cik="320193",
-                date="2020-01-02",
-                name="Credit Agreement",
-                start_date="2020-01-01",
-                amount="$100 million",
-            ),
-            build_mention_row(
-                mention_id="m-2",
-                item_id="item-2",
-                accession_number="0002",
-                cik="320193",
-                date="2024-01-02",
-                name="Second Amended and Restated Credit Agreement",
-                start_date="2024-01-01",
-                amount="$250 million",
-            ),
-        ]
-    )
-    write_partition_table(
-        tmp_path / "mentions",
-        partition={"date": "2024-01-02", "shard": "0001"},
-        table=rows,
-    )
-    match_pending_mentions(artifact_root=tmp_path)
-    stats = apply_lineage_inference_pass(str(tmp_path))
-
-    published = {
-        str(row["debt_instrument_id"]): row
-        for row in read_dataset(debt_instruments_root(tmp_path)).to_dict("records")
-    }
-    assert stats == {"links": 1, "reopened": 0, "heads_before": 2, "heads_after": 1}
-    child = published["m-2"]
-    parent = published["m-1"]
-    assert child["amendment_of_debt_instrument_id"] == "m-1"
-    assert child["amendment_inferred_by"] == "ordinal_chain"
-    assert child["is_lineage_head"]
-    # the rollup must be re-derived from the new pointer, not left stale
-    assert parent["is_lineage_head"] is False
-    assert parent["superseded_by_debt_instrument_id"] == "m-2"
-    assert child["lineage_family_id"] == parent["lineage_family_id"]
-
-    # An ordinary rematch keeps the pointer, so it must keep the provenance too:
-    # a guess that reads as an extracted relation is worse than no guess (#184).
-    match_pending_mentions(artifact_root=tmp_path)
-    after = {
-        str(row["debt_instrument_id"]): row
-        for row in read_dataset(debt_instruments_root(tmp_path)).to_dict("records")
-    }
-    assert after["m-2"]["amendment_of_debt_instrument_id"] == "m-1"
-    assert after["m-2"]["amendment_inferred_by"] == "ordinal_chain"
-    assert after["m-1"]["is_lineage_head"] is False
-
-    # --force drops both together: no pointer, no stale provenance.
-    match_pending_mentions(artifact_root=tmp_path, force=True)
-    forced = {
-        str(row["debt_instrument_id"]): row
-        for row in read_dataset(debt_instruments_root(tmp_path)).to_dict("records")
-    }
-    assert forced["m-2"]["amendment_of_debt_instrument_id"] is None
-    assert pd.isna(forced["m-2"]["amendment_inferred_by"])
+    published = _published_instruments(tmp_path)
+    assert published["m-new"]["amendment_of_debt_instrument_id"] == "m-old"
+    assert published["m-new"]["amendment_inferred_by"] is None
 
 
 def test_match_pending_mentions_drains_all_shards(tmp_path: Path) -> None:
@@ -611,28 +488,28 @@ def test_match_pending_mentions_drains_all_shards(tmp_path: Path) -> None:
     )
     write_partition_table(
         tmp_path / "mentions",
-        partition={"date": "2024-01-02", "shard": "0001"},
+        partition={"month": "2024-01"},
         table=mention_rows.iloc[[0]],
     )
     write_partition_table(
         tmp_path / "mentions",
-        partition={"date": "2024-01-03", "shard": "0002"},
+        partition={"month": "2024-02"},
         table=mention_rows.iloc[[1]],
     )
 
-    tables = match_pending_mentions(artifact_root=tmp_path)
+    result = match_pending_mentions(artifact_root=tmp_path)
 
     written_matches = read_dataset(mention_cluster_edges_root(tmp_path))
     written_instruments = read_dataset(debt_instruments_root(tmp_path))
-    assert len(tables["debt_instrument_mentions"]) == 2
+    assert len(result.edges) == 2
+    assert result.ciks_matched == 2
     assert sorted(written_matches["debt_instrument_mention_id"].to_list()) == [
         "m-1",
         "m-2",
     ]
-    assert sorted(written_instruments["debt_instrument_id"].to_list()) == [
-        "m-1",
-        "m-2",
-    ]
+    assert sorted(
+        name_by_seed(written_instruments)["debt_instrument_id"].to_list()
+    ) == ["m-1", "m-2"]
 
 
 def test_match_pending_mentions_force_rebuilds_existing_memberships(
@@ -665,12 +542,12 @@ def test_match_pending_mentions_force_rebuilds_existing_memberships(
     )
     write_partition_table(
         tmp_path / "mentions",
-        partition={"date": "2024-01-01", "shard": "0001"},
+        partition={"month": "2024-01"},
         table=mention_rows.iloc[[0]],
     )
     write_partition_table(
         tmp_path / "mentions",
-        partition={"date": "2024-01-02", "shard": "0001"},
+        partition={"month": "2024-02"},
         table=mention_rows.iloc[[1]],
     )
 
@@ -679,11 +556,10 @@ def test_match_pending_mentions_force_rebuilds_existing_memberships(
         strong_match_threshold=0.75,
         loose_match_threshold=0.75,
     )
+    first_edges = name_by_seed(first.edges, first.instruments)
     assert {
         row["debt_instrument_mention_id"]: row["debt_instrument_id"]
-        for row in first["debt_instrument_mentions"]
-        .query("edge_type == 'member'")
-        .to_dict("records")
+        for row in first_edges.query("edge_type == 'member'").to_dict("records")
     } == {"m-1": "m-1", "m-2": "m-1"}
 
     second = match_pending_mentions(
@@ -693,83 +569,27 @@ def test_match_pending_mentions_force_rebuilds_existing_memberships(
         loose_match_threshold=0.75,
     )
 
-    written_matches = read_dataset(mention_cluster_edges_root(tmp_path)).sort_values(
-        ["debt_instrument_mention_id", "edge_type", "debt_instrument_id"]
-    )
-    written_instruments = read_dataset(debt_instruments_root(tmp_path)).sort_values(
-        "debt_instrument_id"
-    )
+    written_instruments = read_dataset(debt_instruments_root(tmp_path))
+    written_matches = name_by_seed(
+        read_dataset(mention_cluster_edges_root(tmp_path)), written_instruments
+    ).sort_values(["debt_instrument_mention_id", "edge_type", "debt_instrument_id"])
+    second_edges = name_by_seed(second.edges, second.instruments)
     assert {
         row["debt_instrument_mention_id"]: row["debt_instrument_id"]
-        for row in second["debt_instrument_mentions"]
-        .query("edge_type == 'member'")
-        .to_dict("records")
+        for row in second_edges.query("edge_type == 'member'").to_dict("records")
     } == {"m-1": "m-1", "m-2": "m-2"}
     assert written_matches["edge_type"].to_list() == ["member", "member", "related"]
     assert written_matches["debt_instrument_id"].to_list() == ["m-1", "m-2", "m-1"]
-    assert written_instruments["debt_instrument_id"].to_list() == ["m-1", "m-2"]
+    assert sorted(
+        name_by_seed(written_instruments)["debt_instrument_id"].to_list()
+    ) == ["m-1", "m-2"]
 
 
-def test_match_tables_supports_incremental_batches_against_existing_clusters() -> None:
-    """Delta batches should match against existing clusters without full history."""
-    existing_mentions = pd.DataFrame(
-        [
-            build_mention_row(
-                mention_id="m-1",
-                item_id="item-1",
-                accession_number="0001",
-                cik="320193",
-                date="2024-01-01",
-                name="Alpha Loan",
-                start_date="2024-01-01",
-                amount="$100 million",
-                parties_json='[{"mentions": [{"text": "Acme Bank"}]}]',
-            )
-        ]
-    )
-    existing_tables = match_tables(existing_mentions)
+def test_an_obligation_retired_across_two_filings_keeps_both_retirers() -> None:
+    """Retirers named by different filings of one obligation are all published (#180).
 
-    new_mentions = pd.DataFrame(
-        [
-            build_mention_row(
-                mention_id="m-2",
-                item_id="item-2",
-                accession_number="0002",
-                cik="320193",
-                date="2024-01-02",
-                name="Alpha Loan",
-                start_date="2024-01-01",
-                amount="$100 million",
-                parties_json='[{"mentions": [{"text": "Acme Bank"}]}]',
-            )
-        ]
-    )
-    tables = match_tables(
-        new_mentions,
-        existing_edges=existing_tables["debt_instrument_mentions"],
-        existing_instruments=existing_tables["debt_instrument"],
-        strong_match_threshold=0.90,
-        loose_match_threshold=0.75,
-    )
-
-    member_edges = tables["debt_instrument_mentions"].query("edge_type == 'member'")
-    assert {
-        row["debt_instrument_mention_id"]: row["debt_instrument_id"]
-        for row in member_edges.to_dict("records")
-    } == {"m-1": "m-1", "m-2": "m-1"}
-    assert tables["debt_instrument"]["debt_instrument_id"].to_list() == ["m-1"]
-    assert tables["debt_instrument"]["name"].to_list() == ["Alpha Loan"]
-    assert tables["debt_instrument"]["company_name"].to_list() == ["Example Inc."]
-
-
-def test_match_tables_carries_forward_previously_published_retirers() -> None:
-    """A delta batch adds to the published retirers instead of replacing them (#180).
-
-    The retired obligation's column is read back out of the existing
-    `debt_instrument` row and merged with whatever the new batch found, so an
-    obligation retired in two tranches across two filings ends up with both.
-    Dropping that read-back loses every retirer published before the delta,
-    and nothing else in the suite exercises the parse of the persisted column.
+    The CIK is matched from all of its mentions at once, so the retirer the
+    second filing names is added to the one the first filing named.
     """
     first_batch = pd.DataFrame(
         [
@@ -798,11 +618,11 @@ def test_match_tables_carries_forward_previously_published_retirers() -> None:
             ),
         ]
     )
-    existing_tables = match_tables(first_batch)
+    first_instruments = name_by_seed(match_tables(first_batch)["debt_instrument"])
     assert (
-        existing_tables["debt_instrument"]
-        .set_index("debt_instrument_id")
-        .loc["m-old", "retired_by_debt_instrument_ids"]
+        first_instruments.set_index("debt_instrument_id").loc[
+            "m-old", "retired_by_debt_instrument_ids"
+        ]
         == '["m-2034"]'
     )
 
@@ -836,16 +656,14 @@ def test_match_tables_carries_forward_previously_published_retirers() -> None:
     )
 
     tables = match_tables(
-        second_batch,
-        existing_edges=existing_tables["debt_instrument_mentions"],
-        existing_instruments=existing_tables["debt_instrument"],
+        pd.concat([first_batch, second_batch], ignore_index=True),
         strong_match_threshold=0.90,
         loose_match_threshold=0.75,
     )
 
     instruments = {
         row["debt_instrument_id"]: row
-        for row in tables["debt_instrument"].to_dict("records")
+        for row in name_by_seed(tables["debt_instrument"]).to_dict("records")
     }
     assert instruments["m-old"]["retired_by_debt_instrument_ids"] == (
         '["m-2034", "m-2036"]'
@@ -924,7 +742,9 @@ def test_match_tables_retired_by_keeps_separate_clusters_and_ends_the_instrument
         loose_match_threshold=0.75,
     )
 
-    member_edges = tables["debt_instrument_mentions"].query("edge_type == 'member'")
+    member_edges = name_by_seed(
+        tables["debt_instrument_mentions"], tables["debt_instrument"]
+    ).query("edge_type == 'member'")
     assert {
         row["debt_instrument_mention_id"]: row["debt_instrument_id"]
         for row in member_edges.to_dict("records")
@@ -932,7 +752,7 @@ def test_match_tables_retired_by_keeps_separate_clusters_and_ends_the_instrument
 
     instruments = {
         row["debt_instrument_id"]: row
-        for row in tables["debt_instrument"].to_dict("records")
+        for row in name_by_seed(tables["debt_instrument"]).to_dict("records")
     }
     assert instruments["m-2"]["retired_by_debt_instrument_ids"] == '["m-1"]'
     # No cross-row propagation: the retirement filing's mention sits in the
@@ -1006,7 +826,7 @@ def test_match_tables_publishes_two_kinds_of_lineage_for_one_instrument() -> Non
 
     instruments = {
         row["debt_instrument_id"]: row
-        for row in tables["debt_instrument"].to_dict("records")
+        for row in name_by_seed(tables["debt_instrument"]).to_dict("records")
     }
     row = instruments["m-incremental"]
     assert row["split_of_debt_instrument_id"] == "m-tranche"
@@ -1071,7 +891,7 @@ def test_match_tables_keeps_every_joint_retirer() -> None:
 
     instruments = {
         row["debt_instrument_id"]: row
-        for row in tables["debt_instrument"].to_dict("records")
+        for row in name_by_seed(tables["debt_instrument"]).to_dict("records")
     }
     assert instruments["m-old"]["retired_by_debt_instrument_ids"] == (
         '["m-2034", "m-2036"]'
@@ -1147,7 +967,9 @@ def test_match_tables_drops_only_the_ambiguous_relation_kind() -> None:
 
     tables = match_tables(mentions)
 
-    member_edges = tables["debt_instrument_mentions"].query("edge_type == 'member'")
+    member_edges = name_by_seed(
+        tables["debt_instrument_mentions"], tables["debt_instrument"]
+    ).query("edge_type == 'member'")
     assignment = {
         row["debt_instrument_mention_id"]: row["debt_instrument_id"]
         for row in member_edges.to_dict("records")
@@ -1156,7 +978,8 @@ def test_match_tables_drops_only_the_ambiguous_relation_kind() -> None:
     # parents with them.
     assert assignment["m-1"] == assignment["m-2"]
     row = {
-        r["debt_instrument_id"]: r for r in tables["debt_instrument"].to_dict("records")
+        r["debt_instrument_id"]: r
+        for r in name_by_seed(tables["debt_instrument"]).to_dict("records")
     }[assignment["m-1"]]
     assert row["amendment_of_debt_instrument_id"] is None
     assert row["retired_by_debt_instrument_ids"] == '["m-notes"]'
@@ -1197,7 +1020,9 @@ def test_match_tables_keeps_same_day_siblings_apart() -> None:
 
     tables = match_tables(mentions)
 
-    member_edges = tables["debt_instrument_mentions"].query("edge_type == 'member'")
+    member_edges = name_by_seed(
+        tables["debt_instrument_mentions"], tables["debt_instrument"]
+    ).query("edge_type == 'member'")
     assignment = {
         row["debt_instrument_mention_id"]: row["debt_instrument_id"]
         for row in member_edges.to_dict("records")
@@ -1205,7 +1030,7 @@ def test_match_tables_keeps_same_day_siblings_apart() -> None:
     assert assignment["m-initial"] != assignment["m-additional"]
     amounts = {
         row["debt_instrument_id"]: row["principal_amount"]
-        for row in tables["debt_instrument"].to_dict("records")
+        for row in name_by_seed(tables["debt_instrument"]).to_dict("records")
     }
     assert amounts[assignment["m-initial"]] == "1250000"
     assert amounts[assignment["m-additional"]] == "1100000"
@@ -1246,7 +1071,9 @@ def test_match_tables_still_attaches_an_add_on_to_its_series() -> None:
 
     tables = match_tables(mentions)
 
-    member_edges = tables["debt_instrument_mentions"].query("edge_type == 'member'")
+    member_edges = name_by_seed(
+        tables["debt_instrument_mentions"], tables["debt_instrument"]
+    ).query("edge_type == 'member'")
     assignment = {
         row["debt_instrument_mention_id"]: row["debt_instrument_id"]
         for row in member_edges.to_dict("records")
@@ -1261,12 +1088,12 @@ def test_match_tables_still_attaches_an_add_on_to_its_series() -> None:
 
 def test_match_pending_mentions_renews_lease_per_shard(tmp_path: Path) -> None:
     """The matcher extends the writer lease before rewriting each shard (#89)."""
-    for index, (cik, date_value, shard) in enumerate(
-        [("320193", "2024-01-02", "0001"), ("789019", "2024-01-03", "0002")], start=1
+    for index, (cik, date_value) in enumerate(
+        [("320193", "2024-01-02"), ("789019", "2024-02-03")], start=1
     ):
         write_partition_table(
             tmp_path / "mentions",
-            partition={"date": date_value, "shard": shard},
+            partition={"month": date_value[:7]},
             table=pd.DataFrame(
                 [
                     build_mention_row(
@@ -1492,7 +1319,6 @@ def test_resolve_candidates_attaches_on_name_only_tie_instead_of_seeding() -> No
         strong_match_threshold=0.9,
         loose_match_threshold=0.75,
         ambiguity_margin=0.05,
-        evaluated_run_id="run-1",
     )
     assert cluster_id == "inst-series"
     by_type = {edge["edge_type"]: edge for edge in edges}
@@ -1567,7 +1393,7 @@ def test_published_instrument_columns_are_pinned() -> None:
 
 def test_matcher_schema_version_is_pinned() -> None:
     """The version is how a downstream reader learns a rebuild is required."""
-    assert MATCHER_SCHEMA_VERSION == 7
+    assert MATCHER_SCHEMA_VERSION == 8
 
 
 def test_match_tables_publishes_exactly_the_declared_columns() -> None:
@@ -1627,7 +1453,6 @@ def test_instrument_rollup_publishes_balance_and_rate_columns() -> None:
         {"inst-1": ["m-old"]},
         {"m-old": older},
         {},
-        existing_instruments=pd.DataFrame(),
         company_names={},
     )
     row = rows[0]
@@ -1646,12 +1471,11 @@ def test_instrument_rollup_publishes_balance_and_rate_columns() -> None:
 
 
 def test_outstanding_balance_as_of_flag_tells_stated_from_substituted() -> None:
-    """A stated as-of reads false; a substituted one carried forward stays true.
+    """A stated as-of reads false; a substituted filing date reads true.
 
     The flag is what lets a consumer trust `outstanding_balance_as_of` (#203):
     without it a filing date the matcher filled in looked exactly like a date
-    the filing stated. It has to survive an incremental rematch too, or the
-    first run to see no new balance would silently drop it.
+    the filing stated.
     """
     from cdt.matcher.instruments import build_debt_instrument_rows
     from cdt.matcher.normalize import prepare_mention
@@ -1684,49 +1508,19 @@ def test_outstanding_balance_as_of_flag_tells_stated_from_substituted() -> None:
         {"inst-1": ["m-stated"]},
         {"m-stated": balance_mention("m-stated", "2025-12-31")},
         {},
-        existing_instruments=pd.DataFrame(),
         company_names={},
     )[0]
     assert stated["outstanding_balance_as_of"] == "2025-12-31"
     assert stated["outstanding_balance_as_of_is_filing_date"] is False
 
-    # No member carries a balance, so every balance field comes off the row
-    # written last time — including the flag, as a bool, not the text "True".
-    no_balance = prepare_mention(
-        build_mention_row(
-            mention_id="m-later",
-            item_id="item-later",
-            accession_number="0002",
-            cik="0000320193",
-            date="2026-03-01",
-            name="Revolving Credit Facility",
-            start_date="2024-01-01",
-            amount="300000000",
-        )
-    )
-    existing = pd.DataFrame(
-        [
-            dict.fromkeys(DEBT_INSTRUMENT_COLUMNS)
-            | {
-                "debt_instrument_id": "inst-1",
-                "seed_debt_instrument_mention_id": "m-stated",
-                "cik": "0000320193",
-                "outstanding_balance": "270500000",
-                "outstanding_balance_as_of": "2026-01-01",
-                "outstanding_balance_as_of_is_filing_date": True,
-                "outstanding_balance_source_mention_id": "m-stated",
-            }
-        ]
-    )
-    carried = build_debt_instrument_rows(
-        {"inst-1": ["m-later"]},
-        {"m-later": no_balance},
+    substituted = build_debt_instrument_rows(
+        {"inst-1": ["m-undated"]},
+        {"m-undated": balance_mention("m-undated", None)},
         {},
-        existing_instruments=existing,
         company_names={},
     )[0]
-    assert carried["outstanding_balance_as_of"] == "2026-01-01"
-    assert carried["outstanding_balance_as_of_is_filing_date"] is True
+    assert substituted["outstanding_balance_as_of"] == "2026-01-01"
+    assert substituted["outstanding_balance_as_of_is_filing_date"] is True
 
 
 def _rollup_row(row_id: str, **overrides: object) -> dict[str, object]:
@@ -1834,21 +1628,12 @@ def test_first_and_last_seen_span_distinct_filing_dates() -> None:
 def test_a_root_matched_under_an_older_schema_forces_a_full_rematch(
     tmp_path: Path,
 ) -> None:
-    """An incremental match over an older root publishes wrong rows, so promote it.
+    """A root matched under an older schema re-clusters every CIK on a plain run.
 
-    `MATCHER_SCHEMA_VERSION` was written into the match manifest and read by
-    nothing. Mention ids are content hashes, so a schema change that alters the
-    hashed payload changes every id, and the surviving clusters are then keyed
-    on ids the mentions dataset no longer holds.
-
-    It also degraded #203 in a way that looked like success. Minting an amended
-    instrument's prior state adds mentions, so on a root at an older version
-    the pre-existing clusters keep the slots the mints would take on a clean
-    build, and a cluster can end up holding two members that name two different
-    amendment parents — which `derive_parent_links` then correctly refuses.
-    Measured on `data/lineage-verify` (recorded at 4, code at 7): backfill plus
-    one plain match gave 19 amendment pointers and 539 heads against a forced
-    match's 22 and 536, and further plain matches never recovered it.
+    Rows written under an older `MATCHER_SCHEMA_VERSION` may be keyed or shaped
+    differently, and only CIKs whose mentions changed would otherwise be
+    re-matched, so the rest would keep the old rows. A root at the current
+    version, or with no manifest, is not forced.
     """
     rows = pd.DataFrame(
         [
@@ -1876,18 +1661,17 @@ def test_a_root_matched_under_an_older_schema_forces_a_full_rematch(
     )
     write_partition_table(
         tmp_path / "mentions",
-        partition={"date": "2024-01-02", "shard": "0001"},
+        partition={"month": "2024-01"},
         table=rows,
     )
     match_pending_mentions(artifact_root=tmp_path)
-    apply_lineage_inference_pass(str(tmp_path))
 
     manifest_path = run_manifest_path("match", "latest", artifact_root=str(tmp_path))
     assert read_json_artifact(manifest_path)["schema_version"] == (
         MATCHER_SCHEMA_VERSION
     )
-    # A root at the current version is left alone: forcing every run would turn
-    # an incremental match into a full-corpus rewrite on every tick.
+    # A root at the current version is left alone: forcing every run would
+    # rewrite every shard on every tick.
     assert _stale_schema_forces_rematch(str(tmp_path)) is False
     # A fresh root has no manifest and must not be forced either.
     assert _stale_schema_forces_rematch(str(tmp_path / "unwritten")) is False
@@ -1897,136 +1681,79 @@ def test_a_root_matched_under_an_older_schema_forces_a_full_rematch(
     write_json_artifact(manifest_path, stale)
     assert _stale_schema_forces_rematch(str(tmp_path)) is True
 
-    # The plain call now behaves as `--force` does: the guessed pointer and its
-    # provenance are dropped together rather than surviving into a corpus whose
-    # identity has moved underneath them.
-    match_pending_mentions(artifact_root=tmp_path)
-    published = {
-        str(row["debt_instrument_id"]): row
-        for row in read_dataset(debt_instruments_root(tmp_path)).to_dict("records")
-    }
-    assert published["m-2"]["amendment_of_debt_instrument_id"] is None
-    assert pd.isna(published["m-2"]["amendment_inferred_by"])
+    # The plain call now behaves as `--force` does: every CIK is re-clustered,
+    # though its mentions did not change.
+    result = match_pending_mentions(artifact_root=tmp_path)
+    assert result.ciks_matched == 1
+    assert read_json_artifact(manifest_path)["rebuild_all"] is True
     # and the manifest now records the current version, so the next plain run
-    # is an ordinary incremental match again
+    # matches only changed CIKs again
     assert read_json_artifact(manifest_path)["schema_version"] == (
         MATCHER_SCHEMA_VERSION
     )
     assert _stale_schema_forces_rematch(str(tmp_path)) is False
 
 
-def test_lineage_pass_does_not_infer_against_a_column_it_then_overwrites(
-    tmp_path: Path,
-) -> None:
-    """Two passes over one unchanged corpus must agree (#211).
+def test_a_re_extracted_item_leaves_no_ghost_instrument(tmp_path: Path) -> None:
+    """Re-extraction mints new mention ids; the old instrument goes with them (#225).
 
-    `infer_amendment_parents` reads `first_seen_filing_date` as both the
-    predecessor-ordering guard and the chain sort key, and the rollup rewrites
-    that column from the member edges *after* the inference. So when the
-    recomputed value differed from what was on disk, pass N+1 inferred against
-    a different corpus than pass N.
-
-    A row whose member edges point at mentions that no longer exist is the
-    reachable case, and it arises on its own: mention ids are content hashes,
-    so re-extracting an item mints a new id, the old member edge is never
-    deleted, and the old instrument survives with `mention_count` 0. Its stored
-    `first_seen_filing_date` is then a date no surviving mention supports.
+    The CIK is rebuilt from the mentions that exist, so no instrument is left
+    with zero members, and the cluster keeps its id through the shared item.
     """
-    root = _ordinal_chain_root(tmp_path)
-    apply_lineage_inference_pass(root)
+    _write_mentions(tmp_path, _ordinal_chain_rows())
+    match_pending_mentions(artifact_root=tmp_path)
+    before = read_dataset(debt_instruments_root(tmp_path))
 
-    # Strand a third instrument on a member edge whose mention is gone, while
-    # leaving a stored observation date the surviving members cannot support.
-    instruments = read_dataset(debt_instruments_root(root))
-    stranded = dict(instruments.iloc[0])
-    stranded.update(
-        {
-            "debt_instrument_id": "m-stranded",
-            "seed_debt_instrument_mention_id": "m-gone",
-            "name": "Amended and Restated Credit Agreement",
-            "amendment_of_debt_instrument_id": None,
-            "amendment_inferred_by": None,
-            "superseded_by_debt_instrument_id": None,
-            # Later than the successor's, so the predecessor-ordering guard
-            # refuses the link while this value is believed. The rollup nulls
-            # it, because no surviving mention supports it.
-            "first_seen_filing_date": "2099-01-01",
-            "last_seen_filing_date": "2099-01-01",
-            "mention_count": 1,
-        }
-    )
-    write_partition_table(
-        debt_instruments_root(root),
-        partition={"cik_shard": shard_for_cik("320193")},
-        table=pd.DataFrame(
-            [*instruments.to_dict("records"), stranded],
-            columns=DEBT_INSTRUMENT_COLUMNS,
-        ),
-    )
-    edges = read_dataset(mention_cluster_edges_root(root))
-    stranded_edge = dict(edges.iloc[0])
-    stranded_edge.update(
-        {
-            "debt_instrument_id": "m-stranded",
-            "debt_instrument_mention_id": "m-gone",
-            "edge_type": "member",
-        }
-    )
-    write_partition_table(
-        mention_cluster_edges_root(root),
-        partition={"cik_shard": shard_for_cik("320193")},
-        table=pd.DataFrame(
-            [*edges.to_dict("records"), stranded_edge],
-            columns=MENTION_CLUSTER_EDGE_COLUMNS,
-        ),
-    )
+    rows = _ordinal_chain_rows()
+    rows.loc[rows["item_id"] == "item-2", "debt_instrument_mention_id"] = "m-2-re"
+    _write_mentions(tmp_path, rows)
+    match_pending_mentions(artifact_root=tmp_path)
 
-    first = apply_lineage_inference_pass(root)
-    after_first = _published_instruments(root)
-    second = apply_lineage_inference_pass(root)
-    after_second = _published_instruments(root)
+    after = read_dataset(debt_instruments_root(tmp_path))
+    edges = read_dataset(mention_cluster_edges_root(tmp_path))
+    assert len(after) == 2
+    assert (after["mention_count"] > 0).all()
+    assert "m-2" not in set(edges["debt_instrument_mention_id"])
+    assert set(after["debt_instrument_id"]) == set(before["debt_instrument_id"])
 
-    pointers_first = {
-        instrument_id: row["amendment_of_debt_instrument_id"]
-        for instrument_id, row in after_first.items()
+
+def test_a_ciks_last_mention_going_deletes_its_rows(tmp_path: Path) -> None:
+    """A CIK with no mentions left has its instruments and edges removed."""
+    other = build_mention_row(
+        mention_id="m-other",
+        item_id="item-9",
+        accession_number="0009",
+        cik="789019",
+        date="2024-01-05",
+        name="Term Loan",
+        start_date="2024-01-01",
+        amount="$10 million",
+    )
+    _write_mentions(tmp_path, pd.concat([_ordinal_chain_rows(), pd.DataFrame([other])]))
+    match_pending_mentions(artifact_root=tmp_path)
+
+    _write_mentions(tmp_path, pd.DataFrame([other]))
+    result = match_pending_mentions(artifact_root=tmp_path)
+
+    assert result.ciks_removed == 1
+    assert result.ciks_matched == 0
+    assert read_dataset(debt_instruments_root(tmp_path))["cik"].to_list() == [
+        "0000789019"
+    ]
+    assert set(read_dataset(mention_cluster_edges_root(tmp_path))["cik"]) == {
+        "0000789019"
     }
-    pointers_second = {
-        instrument_id: row["amendment_of_debt_instrument_id"]
-        for instrument_id, row in after_second.items()
-    }
-    assert first["links"] == second["links"]
-    assert pointers_first == pointers_second
-    # Not vacuous: the rank-1 stranded row is the parent the chain lands on,
-    # and it is reachable only once its unsupported date has been recomputed.
-    assert pointers_first["m-2"] == "m-stranded"
-    assert after_first["m-stranded"]["first_seen_filing_date"] is None
-    assert after_first["m-stranded"]["mention_count"] == 0
 
 
-def test_the_lineage_pass_records_a_run_manifest(tmp_path: Path) -> None:
-    """The pass rewrites every published shard, so it must say so (#211).
+def test_an_unchanged_root_matches_nothing_and_rewrites_nothing(tmp_path: Path) -> None:
+    """With no CIK's mentions changed, a plain match touches no shard."""
+    _write_mentions(tmp_path, _ordinal_chain_rows())
+    match_pending_mentions(artifact_root=tmp_path)
+    shard_file = next((tmp_path / "debt-instruments").rglob("*.parquet"))
+    written = shard_file.stat().st_mtime_ns
 
-    Every writing stage in this repo records a run manifest, and
-    `docs/architecture.md` names stage manifests as a design property. The match
-    manifest lists its own `partitions_written`, and then this pass rewrites
-    every one of them — so without a manifest of its own, the last record of the
-    `debt-instruments` dataset described a state something else had changed
-    afterwards. Tolerable while the pass was opt-in behind `--infer-lineage`;
-    #203 made it the unconditional default.
-    """
-    root = _ordinal_chain_root(tmp_path)
-    stats = apply_lineage_inference_pass(root)
+    result = match_pending_mentions(artifact_root=tmp_path)
 
-    manifest = read_json_artifact(
-        run_manifest_path("infer-lineage", "latest", artifact_root=str(root))
-    )
-    assert isinstance(manifest, dict)
-    assert manifest["stage"] == "infer-lineage"
-    assert manifest["schema_version"] == MATCHER_SCHEMA_VERSION
-    assert manifest["links"] == stats["links"]
-    assert manifest["heads_after"] == stats["heads_after"]
-    # the partitions it names are the ones it actually rewrote
-    assert manifest["partitions_written"]
-    for path in manifest["partitions_written"]:
-        assert artifact_exists(path)
-        assert "debt-instruments" in path
+    assert result.ciks_matched == 0
+    assert result.partitions_written == []
+    assert shard_file.stat().st_mtime_ns == written

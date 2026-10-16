@@ -29,6 +29,7 @@ it.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -78,6 +79,7 @@ ACTIVE_JOB_FILENAME = "active.json"
 BATCH_ENDPOINT = "/v1/chat/completions"
 BATCH_COMPLETION_WINDOW = "24h"
 MAX_CUSTOM_ID_LENGTH = 64
+_MONTH = re.compile(r"\d{4}-\d{2}")
 # Stay comfortably under OpenAI's 50k-requests-per-batch limit.
 DEFAULT_MAX_REQUESTS_PER_BATCH = 40_000
 # OpenAI also caps batch input files by size (200 MB); chunk at half that so
@@ -324,8 +326,9 @@ class RowEntry:
     """
 
     row_state: ExtractionRowState
-    date: str
-    shard: str
+    #: The month of the classification file the row was claimed from, which
+    #: is also its mentions month file.
+    month: str
     pending: dict[str, object] | None = None
     resubmissions: int = 0
     infrastructure_rounds: int = 0
@@ -567,7 +570,7 @@ def _serialize_state_jsonl(rows: dict[str, RowEntry]) -> str:
     lines = [
         json.dumps(
             {
-                "source": {"date": entry.date, "shard": entry.shard},
+                "source": {"month": entry.month},
                 "pending": entry.pending,
                 "resubmissions": entry.resubmissions,
                 "infrastructure_rounds": entry.infrastructure_rounds,
@@ -588,11 +591,12 @@ def _load_state_jsonl(text: str) -> dict[str, RowEntry]:
             continue
         payload = json.loads(line)
         row_state = ExtractionRowState.from_state_dict(payload["row"])
-        source = payload["source"]
+        month = str(payload["source"]["month"])
+        if not _MONTH.fullmatch(month):
+            raise ValueError(f"Extract job state names an invalid month: {month!r}")
         rows[row_state.item_id] = RowEntry(
             row_state=row_state,
-            date=source["date"],
-            shard=source["shard"],
+            month=month,
             pending=cast(dict[str, object] | None, payload.get("pending")),
             resubmissions=int(cast(int, payload.get("resubmissions", 0))),
             infrastructure_rounds=int(
@@ -734,7 +738,7 @@ def _create_job(
         return None
     job_id = _new_job_id()
     rows: dict[str, RowEntry] = {}
-    for item_row, partition_date, shard in entries:
+    for item_row, month in entries:
         row_state = ExtractionRowState(
             item_row=cast(dict[str, object], item_row),
             stage_name="ner",
@@ -747,7 +751,7 @@ def _create_job(
                 f"item_id {item_id!r} exceeds the {MAX_CUSTOM_ID_LENGTH}-char "
                 "OpenAI custom_id limit."
             )
-        rows[item_id] = RowEntry(row_state=row_state, date=partition_date, shard=shard)
+        rows[item_id] = RowEntry(row_state=row_state, month=month)
     job = JobState(
         job_id=job_id,
         model=model,
@@ -1440,7 +1444,7 @@ def _finalize_job(root: str, job: JobState) -> None:
     from the artifact root like any other stage.
     """
     row_entries = [
-        (entry.row_state, entry.date, entry.shard)
+        (entry.row_state, entry.month)
         for entry in job.rows.values()
         if not entry.deferred
     ]

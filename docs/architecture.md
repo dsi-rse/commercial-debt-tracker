@@ -23,18 +23,19 @@ those issuers happened to file is not something the caller should have to know.
 4. `extract`
    Extracts structured debt-instrument mentions from relevant rows of **both** classification sources and writes a full per-run audit log. Two backends exist: a synchronous `live` backend (OpenRouter chat completions) and the deployed `batch` backend (OpenAI Batch API). See "Extractor Design" below.
 5. `match`
-   Consolidates mention rows into debt instruments and writes instrument-level outputs partitioned by CIK shard, then runs the lineage pass. A 6-K mention consolidates against an 8-K mention for the same issuer for free: the matcher shards by CIK and never reads the genre.
+   Re-clusters, from scratch, every CIK whose set of mentions changed since the last run, assigns instrument ids (carried forward by member overlap, minted from content when new), infers amendment lineage within each CIK, and writes instrument-level outputs partitioned by CIK shard. A 6-K mention consolidates against an 8-K mention for the same issuer for free: the matcher works per CIK and never reads the genre.
 6. `publish`
-   Writes the four final snapshot tables below, when a final database root is configured.
+   Writes the five final snapshot tables below, cut to `src/cdt/publish_contract.json`, when a final database root is configured.
 
 The command line is `cdt`, with one command per stage above (`cdt ingest`, `cdt segment`, `cdt classify`, `cdt extract`, `cdt match`, `cdt publish`) and `cdt run daily|historical|poll` for whole runs, which is what ECS executes. `--genres` (default every genre, env `GENRES`) narrows `ingest`, `segment`, `classify` and `run daily|historical` to one genre; `--genres 8-K` is the 8-K-only pipeline. Every genre is searched for the same CIK list.
 
-After matching, the pipeline can optionally materialize four final snapshot tables for downstream consumers:
+After matching, the pipeline can optionally materialize five final snapshot tables for downstream consumers, each with exactly the columns and types `src/cdt/publish_contract.json` lists, behind one `latest.json` generation pointer:
 
-- `items/latest.parquet` — both genres: 8-K item sections and 6-K snippets, in the 8-K segmenter's column shape. Every mention joins to its source row here by `item_id`, and consumers read the item text, the filing's SEC URL and its accession number off it — so a genre missing from this table publishes mentions that join to nothing. A 6-K row's `item` is its snippet id (`{accession}:{document}:{window}`) where an 8-K row's is a dotted item number; the snippet's own span and stage-2 verdict stay in `sixk-snippets`. A `form_type` column (`8-K` or `6-K`) is stamped on each row as the table is published, because nothing in the segmenter's sixteen columns records which kind of filing a row came out of and the `item` column is not a reliable substitute.
+- `items/latest.parquet` — the items some mention references, from both genres: 8-K item sections and 6-K snippets, in the 8-K segmenter's column shape. Every mention joins to its source row here by `item_id`, and consumers read the item text, the filing's SEC URL and its accession number off it — so a genre missing from this table publishes mentions that join to nothing. A 6-K row's `item` is its snippet id (`{accession}:{document}:{window}`) where an 8-K row's is a dotted item number; the snippet's own span and stage-2 verdict stay in `sixk-snippets`. A `form_type` column (`8-K` or `6-K`) is stamped on each row as the table is published, because nothing in the segmenter's sixteen columns records which kind of filing a row came out of and the `item` column is not a reliable substitute.
 - `debt-instruments/latest.parquet`
 - `debt-instrument-mentions/latest.parquet`
 - `mention-cluster-edges/latest.parquet`
+- `debt-instrument-redirects/latest.parquet` — instrument ids no longer in use, and the live id that took their members
 
 Those files are written only when a final database root is configured.
 
@@ -45,6 +46,7 @@ CDT stores canonical state as Parquet, JSON, and JSONL artifacts under one root 
 That choice is visible throughout the code:
 
 - stage completion is recorded per source partition in a completion registry, keyed by the source file's fingerprint, so a partition that grows is processed again
+- `documents` are split by filing date and accession shard; every dataset derived from them is one file per month, in which a reprocessed source replaces only the rows it produced (see [schema.md](schema.md#partitioning-rules))
 - partitions are rewritten deterministically
 - stage manifests are sidecar metadata, not the source of truth
 - the same pipeline can target either local paths or `s3://` URIs
@@ -256,12 +258,12 @@ Practical consequences when extending the matcher:
 
 - Reading the `classifications` dataset, or any other raw document text, from matcher code is out of bounds. Consume the extractor's facts instead.
 - If a needed fact is not in the extractor's output, the fix belongs in the extractor — add the property there, bound to an object and cited with spans — not in a matcher heuristic that reconstructs it from text.
-- A new published column that records a matcher inference, rather than an extractor fact, needs a provenance column that survives an incremental rematch, and it needs saying so in `docs/schema.md`.
+- A new published column that records a matcher inference, rather than an extractor fact, needs a provenance column alongside it, and it needs saying so in `docs/schema.md`.
 
 `ordinal_chain` in `cdt.matcher.lineage_inference` illustrates the right side of the line: it reasons over the `name` column, the filing dates, and the borrower the extractor bound to each row in `parties_json` — all extractor facts, all cited. The other side is an instrument's prior state, the terms it had before an amendment: that is a new object with its own terms, so the extractor mints it from the filing's `prior` marks rather than the matcher inferring it. The rule of thumb: **IE owns facts; the matcher decides identity and may build views over extractor facts, but it neither creates objects nor asserts facts.**
 
 ## Dashboard Handoff
 
-After matching succeeds, CDT can write the four final parquet snapshots listed under [End-to-End Flow](#end-to-end-flow).
+After matching succeeds, CDT can write the five final parquet snapshots listed under [End-to-End Flow](#end-to-end-flow), with the contract the website vendors.
 
 The processor does not publish Cloudflare R2 JSON directly. The website publisher — `dsi-rse/commercial-debt-tracker-website` — reads these final parquet snapshots and writes `generated/*` JSON to R2. Anything that needs a notion of *now*, such as an instrument's lifecycle status, is derived there against an explicit `asOf` (website#15). A synthesized prior state reaches the publisher as an ordinary instrument row with `is_lineage_head` false and `superseded_by_debt_instrument_id` set, and `synthesized_only` true when no filing describes it on its own; the publisher collapses it beneath its head like any other superseded state.
