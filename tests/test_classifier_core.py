@@ -89,7 +89,9 @@ def _run(tmp_path: Path, classifier: FakeClassifier) -> None:
         source_dataset=SOURCE,
         output_dataset=OUTPUT,
         output_columns=COLUMNS,
-        process=lambda path, partition, _done: classifier(path, partition, None),
+        process=lambda path, partition, _done, _renew: classifier(
+            path, partition, None
+        ),
         artifact_root=str(tmp_path),
         force=True,
     )

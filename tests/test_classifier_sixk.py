@@ -827,6 +827,35 @@ def test_a_stage_two_outage_leaves_the_partition_pending(
     assert [entry.complete for entry in registry.values()] == [True]
 
 
+def test_a_rewindowed_filing_is_judged_again_and_an_outage_keeps_its_rows(
+    tmp_path: Path,
+) -> None:
+    """The done key covers the filing's spans; a 503 on the re-judge keeps the old rows."""
+    row = _document_row(
+        tmp_path, submission=_submission(("6-K", f"<p>{DEBT_PROSE}</p>"))
+    )
+    _write_documents(tmp_path, [row])
+    segment_and_classify_pending(
+        artifact_root=str(tmp_path), client=FakeChatClient(keep_all=True)
+    )
+    before = read_dataset(sixk_snippets_root(str(tmp_path)))
+    assert not before.empty
+    row["text"] = _submission(("6-K", f"<p>Revised. {DEBT_PROSE}</p>"))
+    _write_documents(tmp_path, [row])
+    outage = FakeChatClient(error=_ProviderError(503))
+
+    segment_and_classify_pending(artifact_root=str(tmp_path), client=outage)
+
+    # Same accession, new spans: not carried over, so stage 2 is called.
+    assert outage.calls
+    after = read_dataset(sixk_snippets_root(str(tmp_path)))
+    pd.testing.assert_frame_equal(
+        after.reset_index(drop=True), before.reset_index(drop=True)
+    )
+    registry = load_completion_registry("sixk-classify", artifact_root=str(tmp_path))
+    assert [entry.complete for entry in registry.values()] == [False]
+
+
 def test_exhausted_stage_two_validation_completes_the_partition_as_failed(
     tmp_path: Path,
 ) -> None:
@@ -880,6 +909,28 @@ def _two_filings(tmp_path: Path) -> None:
             for accession_number in ("000000000026000001", "000000000026000002")
         ],
     )
+
+
+def test_triage_renews_the_lease_as_stage_two_calls_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One month of stage-2 calls can outlast the lease, so each call renews it (#293)."""
+    from cdt import partition_stage
+
+    _two_filings(tmp_path)
+    segment_pending_sixk_documents(artifact_root=str(tmp_path))
+    renewals: list[int] = []
+    client = FakeChatClient(keep_all=True)
+    monkeypatch.setattr(partition_stage, "throttled", lambda renew, **_: renew)
+
+    triage_pending_windows(
+        artifact_root=str(tmp_path),
+        client=client,
+        renew=lambda: renewals.append(len(client.calls)),
+    )
+
+    # A renewal after each of the two calls, then one before the month write.
+    assert renewals == [1, 2, 2]
 
 
 def test_retry_triages_only_the_failed_filing_and_clears_its_entry(
@@ -1167,9 +1218,9 @@ def test_classify_holds_a_partition_whose_spans_no_longer_match_their_text(
 
     assert client.calls == []
     assert list_artifacts(sixk_snippets_root(str(tmp_path)), suffix=".parquet") == []
-    # Recorded with no fingerprint, so it matches nothing and stays pending.
+    # Recorded incomplete, so it stays pending.
     registry = load_completion_registry("sixk-classify", artifact_root=str(tmp_path))
-    assert [entry.fingerprint for entry in registry.values()] == [None]
+    assert [entry.complete for entry in registry.values()] == [False]
 
 
 def test_a_filing_gated_out_on_resegment_cascades_to_its_mentions(
@@ -1246,10 +1297,10 @@ def test_a_forced_classify_that_holds_a_partition_leaves_it_pending(
         )
 
 
-def test_a_partition_with_one_stale_filing_pays_for_no_stage_two_call(
+def test_a_stale_filing_holds_only_itself_and_keeps_the_months_done_set(
     tmp_path: Path,
 ) -> None:
-    """The whole partition is held, so its good filing's call would be wasted."""
+    """The month's good filing is judged and recorded; after a re-segment only the stale one is (#292)."""
     good = _document_row(
         tmp_path, submission=_submission(("6-K", f"<p>{DEBT_PROSE}</p>"))
     )
@@ -1267,8 +1318,20 @@ def test_a_partition_with_one_stale_filing_pays_for_no_stage_two_call(
     with pytest.raises(StaleSegmentationError, match="cdt segment --genres 6-K"):
         triage_pending_windows(artifact_root=str(tmp_path), client=client)
 
-    assert client.calls == []
-    assert list_artifacts(sixk_snippets_root(str(tmp_path)), suffix=".parquet") == []
+    assert len(client.calls) == 1
+    snippets = read_dataset(sixk_snippets_root(str(tmp_path)))
+    assert set(snippets["accession_number"]) == {good["accession_number"]}
+
+    segment_pending_sixk_documents(artifact_root=str(tmp_path))
+    resegmented = FakeChatClient(keep_all=True)
+    triage_pending_windows(artifact_root=str(tmp_path), client=resegmented)
+
+    assert len(resegmented.calls) == 1
+    snippets = read_dataset(sixk_snippets_root(str(tmp_path)))
+    assert set(snippets["accession_number"]) == {
+        good["accession_number"],
+        stale["accession_number"],
+    }
 
 
 def test_a_retry_skips_a_partition_that_changed_since_it_was_triaged(

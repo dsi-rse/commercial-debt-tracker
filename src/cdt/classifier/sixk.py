@@ -281,6 +281,7 @@ def triage_windows(
     s3_client: object | None = None,
     concurrency: int = DEFAULT_CONCURRENCY,
     max_attempts: int | None = None,
+    renew: Callable[[], None] | None = None,
 ) -> TriageOutput:
     """Score, expand and prune in-memory 6-K window spans.
 
@@ -288,7 +289,10 @@ def triage_windows(
     documents rows they were cut from, which supply each filing's text and
     metadata. ``artifacts`` is a pre-loaded ``(model, threshold)`` pair; when
     ``None`` the model is loaded from ``model_dir``. ``client`` defaults to
-    :func:`default_triage_client`, built only if a stage-2 call is needed.
+    :func:`default_triage_client`, built only if a stage-2 call is needed. A
+    filing whose spans no longer match its text is reported in
+    ``stale_accessions`` and not judged; the others are. ``renew`` is called
+    after each stage-2 call returns.
     """
     if windows.empty:
         return TriageOutput(rows=_empty_snippets())
@@ -327,8 +331,6 @@ def triage_windows(
             ",".join(stale),
             RESEGMENT_ADVICE,
         )
-        # The partition is held whole, so stage 2 would be paid for nothing.
-        return TriageOutput(rows=_empty_snippets(), stale_accessions=tuple(stale))
     windowed = sum(len(plan.candidates) for plan in plans)
 
     admitted_by_filing = [
@@ -362,6 +364,7 @@ def triage_windows(
         client=client,
         concurrency=concurrency,
         max_attempts=max_attempts,
+        renew=renew,
     )
     rows = [
         row
@@ -493,11 +496,13 @@ def _judge_filings(
     client: SupportsChatCompletion | None,
     concurrency: int,
     max_attempts: int | None,
+    renew: Callable[[], None] | None = None,
 ) -> list[FilingVerdict | None]:
     """Run stage 2 concurrently for every filing with snippets to send.
 
-    At most ``concurrency`` calls are in flight. Returns one verdict per plan,
-    ``None`` for a filing with nothing sent.
+    At most ``concurrency`` calls are in flight; ``renew`` is called as each
+    returns. Returns one verdict per plan, ``None`` for a filing with nothing
+    sent.
     """
     # Built here so a batch that makes no call needs no API key.
     resolved_client = client or default_triage_client()
@@ -510,12 +515,15 @@ def _judge_filings(
         if not sent:
             return None
         async with semaphore:
-            return await triage_filing(
+            verdict = await triage_filing(
                 resolved_client,
                 str(plan.document["accession_number"]),
                 [item.snippet for item in sent],
                 **kwargs,  # type: ignore[arg-type]
             )
+        if renew is not None:
+            renew()
+        return verdict
 
     async def judge_all() -> list[FilingVerdict | None]:
         return list(
@@ -763,8 +771,15 @@ class _WindowPartitionTriage:
         partition: dict[str, str],
         accessions: frozenset[str] | None = None,
         done_keys: frozenset[str] = frozenset(),
+        renew: Callable[[], None] | None = None,
     ) -> PartitionOutput:
-        """Triage the month's filings, or only ``accessions``, skipping done ones."""
+        """Triage the month's filings, or only ``accessions``, skipping done ones.
+
+        A filing that could not be judged this run, because its spans are
+        stale or its stage-2 call failed on the provider, keeps its earlier
+        rows and stays out of the done set, and the month is held; every
+        other filing's rows and done key are written.
+        """
         if self.artifacts is None:
             self.artifacts = load_stage1_model(self.model_dir)
             LOGGER.info("Stage-1 threshold %.3f", self.artifacts[1])
@@ -788,16 +803,16 @@ class _WindowPartitionTriage:
             s3_client=self.s3_client,
             concurrency=self.concurrency,
             max_attempts=self.max_attempts,
+            renew=renew,
         )
         source_rows = windows["accession_number"].nunique()
         if output.stale_accessions:
             self.stale_partitions.append(source_path)
-            return PartitionOutput(
-                rows=_empty_snippets(), source_rows=source_rows, complete=False
-            )
-        held = set(output.infrastructure_failed_accessions)
-        if held:
+        if output.infrastructure_failed_accessions:
             self.infrastructure_held.append(source_path)
+        held = set(output.stale_accessions) | set(
+            output.infrastructure_failed_accessions
+        )
         judged = output.rows.loc[
             ~output.rows["accession_number"].astype(str).isin(held)
         ]
@@ -865,11 +880,13 @@ def triage_pending_windows(
     A windows month is pending when its fingerprint changed since it was last
     classified, or always with ``force``. Its filings already judged with the
     same windows keep their rows; the rest cost one LLM call per filing with
-    admitted windows (``force`` judges every filing). A month holding a filing
-    whose spans no longer match its text is left pending and unwritten. A
-    filing whose stage-2 call failed on the provider or transport keeps its
-    earlier rows and leaves the month pending, so the next run judges it again
-    rather than sending its snippets to extraction untriaged. A filing stage 2
+    admitted windows (``force`` judges every filing). A filing whose spans no
+    longer match its text, or whose stage-2 call failed on the provider or
+    transport, keeps its earlier rows and leaves the month pending, so the
+    next run judges it again rather than sending its snippets to extraction
+    untriaged; the month's other filings are written and recorded as done.
+    ``renew`` is also called as stage-2 calls return, so one long month keeps
+    the lease. A filing stage 2
     could not judge for any other reason (its answers failed validation every
     attempt, or the request was rejected) is written as failed and listed in
     ``failures/sixk-classify/failures.json`` for :func:`retry_failed_triage`.
@@ -894,8 +911,8 @@ def triage_pending_windows(
         source_dataset=SIXK_WINDOW_DATASET_NAME,
         output_dataset=SIXK_SNIPPET_DATASET_NAME,
         output_columns=SIXK_SNIPPET_COLUMNS,
-        process=lambda source_path, partition, done: triage(
-            source_path, partition, None, done
+        process=lambda source_path, partition, done, renew: triage(
+            source_path, partition, None, done, renew
         ),
         artifact_root=resolved_root,
         force=force,

@@ -424,10 +424,6 @@
         {
           "name": "match_via",
           "type": "string"
-        },
-        {
-          "name": "evaluated_run_id",
-          "type": "string"
         }
       ]
     },
@@ -539,7 +535,18 @@
           "keys": [
             "status",
             "status_date"
-          ]
+          ],
+          "nested": {
+            "status_date": {
+              "container": "object",
+              "version": 1,
+              "keys": [
+                "normalized_date",
+                "derived_from",
+                "spans"
+              ]
+            }
+          }
         },
         "interest_rate_json": {
           "container": "object",

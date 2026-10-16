@@ -34,7 +34,10 @@ def _write_source(tmp_path: Path, rows: list[tuple[str, str, str]]) -> None:
 
 
 def _one_item_per_document(
-    source_path: str, partition: dict[str, str], done: frozenset[str]
+    source_path: str,
+    partition: dict[str, str],
+    done: frozenset[str],
+    renew: object = None,
 ) -> PartitionOutput:
     del partition, done
     documents = pd.read_parquet(source_path)
@@ -91,7 +94,10 @@ def test_a_late_filing_rewrites_only_its_own_sources_rows(tmp_path: Path) -> Non
     calls: list[str] = []
 
     def counting(
-        source_path: str, partition: dict[str, str], done: frozenset[str]
+        source_path: str,
+        partition: dict[str, str],
+        done: frozenset[str],
+        renew: object = None,
     ) -> PartitionOutput:
         calls.append(source_path)
         return _one_item_per_document(source_path, partition, done)
@@ -123,7 +129,10 @@ def test_an_emptied_source_deletes_its_rows_and_keeps_the_month_file(
     _run(tmp_path)
 
     def nothing(
-        source_path: str, partition: dict[str, str], done: frozenset[str]
+        source_path: str,
+        partition: dict[str, str],
+        done: frozenset[str],
+        renew: object = None,
     ) -> PartitionOutput:
         del partition, done
         return PartitionOutput(
@@ -169,7 +178,10 @@ def test_a_held_output_with_a_done_set_writes_and_stays_pending(
     seen_done: list[frozenset[str]] = []
 
     def partial(
-        source_path: str, partition: dict[str, str], done: frozenset[str]
+        source_path: str,
+        partition: dict[str, str],
+        done: frozenset[str],
+        renew: object = None,
     ) -> PartitionOutput:
         seen_done.append(done)
         output = _one_item_per_document(source_path, partition, done)
@@ -187,6 +199,45 @@ def test_a_held_output_with_a_done_set_writes_and_stays_pending(
     assert _items(tmp_path)["accession_number"].to_list() == ["acc-a"]
     entries = load_completion_registry(STAGE, artifact_root=str(tmp_path))
     assert [entry.complete for entry in entries.values()] == [True]
+
+
+def test_a_held_output_that_writes_nothing_keeps_the_earlier_done_set(
+    tmp_path: Path,
+) -> None:
+    """Holding a source with nothing to write does not throw its done set away (#292)."""
+    _write_source(tmp_path, [("acc-a", "100", "2024-01-02")])
+    seen_done: list[frozenset[str]] = []
+    outputs = [
+        PartitionOutput(
+            rows=pd.DataFrame(columns=COLUMNS),
+            source_rows=1,
+            done_keys=frozenset({"acc-a"}),
+        ),
+        PartitionOutput(
+            rows=pd.DataFrame(columns=COLUMNS), source_rows=1, complete=False
+        ),
+        PartitionOutput(rows=pd.DataFrame(columns=COLUMNS), source_rows=1),
+    ]
+
+    def scripted(
+        source_path: str, partition: dict[str, str], done: frozenset[str], renew: object
+    ) -> PartitionOutput:
+        seen_done.append(done)
+        return outputs[len(seen_done) - 1]
+
+    for _ in outputs:
+        run_partition_stage(
+            STAGE,
+            source_dataset=SOURCE,
+            output_dataset=OUTPUT,
+            output_columns=COLUMNS,
+            process=scripted,
+            artifact_root=str(tmp_path),
+        )
+        # A changed source is pending again.
+        _write_source(tmp_path, [("acc-a", str(len(seen_done)), "2024-01-02")])
+
+    assert seen_done == [frozenset(), frozenset({"acc-a"}), frozenset({"acc-a"})]
 
 
 def test_a_partition_filter_matches_whole_path_segments(tmp_path: Path) -> None:

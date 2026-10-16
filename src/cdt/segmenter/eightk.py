@@ -772,10 +772,13 @@ def segment_pending_eightk_documents(
     shared_client = s3_client
 
     def process(
-        source_path: str, partition: dict[str, str], done: frozenset[str]
+        source_path: str,
+        partition: dict[str, str],
+        done: frozenset[str],
+        renew: Callable[[], None],
     ) -> PartitionOutput:
         nonlocal shared_client
-        del partition, done
+        del partition, done, renew
         documents = read_table(source_path, DOCUMENT_COLUMNS).reindex(
             columns=DOCUMENT_COLUMNS
         )

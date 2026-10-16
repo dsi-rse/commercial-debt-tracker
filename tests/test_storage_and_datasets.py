@@ -13,7 +13,7 @@ import pyarrow.dataset
 import pyarrow.parquet
 import pytest
 from botocore.exceptions import ClientError, ReadTimeoutError
-from support import build_mention_row
+from support import build_mention_row, match_tables
 
 from cdt.classifier.core import CLASSIFIED_ITEM_COLUMNS
 from cdt.datasets import (
@@ -26,7 +26,6 @@ from cdt.matcher.schema import (
     DEBT_INSTRUMENT_COLUMNS,
     MENTION_CLUSTER_EDGE_COLUMNS,
 )
-from cdt.matcher.stage import match_tables
 from cdt.segmenter.core import ITEM_COLUMNS
 from cdt.storage import objects as storage_objects
 from cdt.storage.columns import (

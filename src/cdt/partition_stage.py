@@ -56,9 +56,9 @@ class PartitionOutput:
     ``done_keys`` is the stage's done set for the source
     (:attr:`cdt.completion.CompletedPartition.item_ids`): rows the next
     processing of this source may carry over instead of recomputing. A held
-    output (``complete`` False) with no ``done_keys`` writes nothing; one with
-    ``done_keys`` writes its rows and records the keys, so the retry redoes
-    only the rest. ``failures`` maps the accession number of each filing the
+    output (``complete`` False) with no ``done_keys`` writes nothing and keeps
+    the done set recorded before; one with ``done_keys`` writes its rows and
+    records the keys, so the retry redoes only the rest. ``failures`` maps the accession number of each filing the
     stage could not process to why; the stage still writes rows for it,
     marked failed.
     """
@@ -75,17 +75,22 @@ class PartitionOutput:
         return self.complete or self.done_keys is not None
 
 
-#: Process one source partition: ``(source_path, partition, done_keys)``.
+#: Process one source partition: ``(source_path, partition, done_keys, renew)``.
 #: ``partition`` is the parsed source path (``{date, shard}`` or ``{month}``);
 #: ``done_keys`` the done set its completion entry recorded (empty when forced
-#: or never processed).
-ProcessPartition = Callable[[str, dict[str, str], frozenset[str]], PartitionOutput]
+#: or never processed); ``renew`` keeps the writer lease, throttled, and is
+#: for a processor whose one partition can outlast the lease to call as it
+#: works (a no-op when the run holds no lease).
+ProcessPartition = Callable[
+    [str, dict[str, str], frozenset[str], Callable[[], None]], PartitionOutput
+]
 
 
 def sort_partition_rows(table: pd.DataFrame) -> pd.DataFrame:
     """Sort rows by ``(cik, date, accession_number)``, stably, for a month file.
 
-    Sorted files let a reader filtering on ``cik`` skip row groups.
+    The same rows always write the same file, whatever order sources were
+    processed in.
     """
     keys = [column for column in ("cik", "date", "accession_number") if column in table]
     table = table.reset_index(drop=True)
@@ -178,14 +183,16 @@ def run_partition_stage(
     (:func:`sort_partition_rows`). A source whose output is empty deletes its
     rows; a month file left empty is still written, so the next stage sees its
     rows go, and no file is created for a month that never had rows. A held
-    output with no ``done_keys`` writes nothing and stays pending. A completed
+    output with no ``done_keys`` writes nothing and stays pending, keeping its
+    earlier done set. A completed
     output's ``failures`` replace its entries in the stage's failure list.
 
     Completion entries are recorded only after their month is written, and
     saved at most every :data:`cdt.completion.CHECKPOINT_INTERVAL_SECONDS` and
     once at the end, so an interruption loses at most that much finished work
-    and never records work that was not written. ``renew`` is called before
-    each month write, throttled (:func:`cdt.lease.throttled`). A run manifest
+    and never records work that was not written. ``renew`` is called,
+    throttled (:func:`cdt.lease.throttled`), before each month write and
+    whenever ``process`` calls the hook it is given. A run manifest
     is written at ``runs/<stage_name>/run_id=latest.json``.
     """
     resolved_root = resolve_artifact_root(artifact_root)
@@ -201,6 +208,11 @@ def run_partition_stage(
     failures: dict[str, dict[str, object]] | None = None
     failures_changed = False
     keep_lease = throttled(renew) if renew is not None else None
+
+    def renew_while_working() -> None:
+        if keep_lease is not None:
+            keep_lease()
+
     result = PartitionStageResult(rows=pd.DataFrame(columns=output_columns))
     frames: list[pd.DataFrame] = []
 
@@ -270,7 +282,7 @@ def run_partition_stage(
         previous = registry.get(source_path)
         done = previous.item_ids if previous is not None and not force else frozenset()
         started = perf_counter()
-        output = process(source_path, partition, done)
+        output = process(source_path, partition, done, renew_while_working)
         result.source_rows += output.source_rows
         if output.writes:
             buffered_sources.append((partition, output.rows))
@@ -295,7 +307,7 @@ def run_partition_stage(
                 complete=output.complete,
             )
             if output.writes
-            else CompletedPartition(fingerprint=None)
+            else CompletedPartition(fingerprint=None, item_ids=done, complete=False)
         )
         LOGGER.info(
             "%s partition complete: source=%s month=%s progress=%s/%s "

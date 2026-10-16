@@ -6,8 +6,6 @@ import json
 import re
 from difflib import SequenceMatcher
 
-import pandas as pd
-
 from cdt.extractor.schema import (
     LENDER_DISCLOSURE_NONE_NAMED,
     LENDER_DISCLOSURE_PRECEDENCE,
@@ -232,28 +230,6 @@ def aggregate_lender_disclosure(values: list[str | None]) -> str:
     if not known:
         return LENDER_DISCLOSURE_NONE_NAMED
     return max(known, key=lambda value: LENDER_DISCLOSURE_PRECEDENCE[value])
-
-
-def coerce_optional_bool(value: object) -> bool | None:
-    """Return one nullable flag read back from a published row.
-
-    A declared `bool` column round-trips as Python or numpy bools with nulls
-    read as None or NaN.
-    Text spellings are accepted so a hand-built frame reads the same way.
-    """
-    if value is None or isinstance(value, bool):
-        return value
-    try:
-        if pd.isna(value):
-            return None
-    except (TypeError, ValueError):
-        pass
-    text = str(value).strip().lower()
-    if text in {"true", "1"}:
-        return True
-    if text in {"false", "0"}:
-        return False
-    return None
 
 
 def normalize_amount(value: str | None) -> str | None:

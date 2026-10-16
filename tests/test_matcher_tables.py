@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 import pandas as pd
-from support import build_mention_row, name_by_seed
+from support import build_mention_row, match_tables, name_by_seed
 
 from cdt.datasets import (
     run_manifest_path,
@@ -23,7 +23,7 @@ from cdt.matcher.schema import (
     MATCHER_SCHEMA_VERSION,
     MENTION_CLUSTER_EDGE_COLUMNS,
 )
-from cdt.matcher.stage import _stale_schema_forces_rematch, match_tables
+from cdt.matcher.stage import _stale_schema_forces_rematch
 from cdt.storage.objects import (
     read_json_artifact,
     write_json_artifact,
@@ -1319,7 +1319,6 @@ def test_resolve_candidates_attaches_on_name_only_tie_instead_of_seeding() -> No
         strong_match_threshold=0.9,
         loose_match_threshold=0.75,
         ambiguity_margin=0.05,
-        evaluated_run_id="run-1",
     )
     assert cluster_id == "inst-series"
     by_type = {edge["edge_type"]: edge for edge in edges}
@@ -1629,21 +1628,12 @@ def test_first_and_last_seen_span_distinct_filing_dates() -> None:
 def test_a_root_matched_under_an_older_schema_forces_a_full_rematch(
     tmp_path: Path,
 ) -> None:
-    """An incremental match over an older root publishes wrong rows, so promote it.
+    """A root matched under an older schema re-clusters every CIK on a plain run.
 
-    `MATCHER_SCHEMA_VERSION` was written into the match manifest and read by
-    nothing. Mention ids are content hashes, so a schema change that alters the
-    hashed payload changes every id, and the surviving clusters are then keyed
-    on ids the mentions dataset no longer holds.
-
-    It also degraded #203 in a way that looked like success. Minting an amended
-    instrument's prior state adds mentions, so on a root at an older version
-    the pre-existing clusters keep the slots the mints would take on a clean
-    build, and a cluster can end up holding two members that name two different
-    amendment parents — which `derive_parent_links` then correctly refuses.
-    Measured on `data/lineage-verify` (recorded at 4, code at 7): backfill plus
-    one plain match gave 19 amendment pointers and 539 heads against a forced
-    match's 22 and 536, and further plain matches never recovered it.
+    Rows written under an older `MATCHER_SCHEMA_VERSION` may be keyed or shaped
+    differently, and only CIKs whose mentions changed would otherwise be
+    re-matched, so the rest would keep the old rows. A root at the current
+    version, or with no manifest, is not forced.
     """
     rows = pd.DataFrame(
         [
@@ -1680,8 +1670,8 @@ def test_a_root_matched_under_an_older_schema_forces_a_full_rematch(
     assert read_json_artifact(manifest_path)["schema_version"] == (
         MATCHER_SCHEMA_VERSION
     )
-    # A root at the current version is left alone: forcing every run would turn
-    # an incremental match into a full-corpus rewrite on every tick.
+    # A root at the current version is left alone: forcing every run would
+    # rewrite every shard on every tick.
     assert _stale_schema_forces_rematch(str(tmp_path)) is False
     # A fresh root has no manifest and must not be forced either.
     assert _stale_schema_forces_rematch(str(tmp_path / "unwritten")) is False
@@ -1697,7 +1687,7 @@ def test_a_root_matched_under_an_older_schema_forces_a_full_rematch(
     assert result.ciks_matched == 1
     assert read_json_artifact(manifest_path)["rebuild_all"] is True
     # and the manifest now records the current version, so the next plain run
-    # is an ordinary incremental match again
+    # matches only changed CIKs again
     assert read_json_artifact(manifest_path)["schema_version"] == (
         MATCHER_SCHEMA_VERSION
     )

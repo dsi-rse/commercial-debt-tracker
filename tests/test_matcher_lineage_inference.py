@@ -101,7 +101,7 @@ def test_the_matcher_never_reads_filing_text(monkeypatch: object) -> None:
     signature = inspect.signature(infer_amendment_parents)
     for parameter in ("item_texts", "member_groups", "mention_index"):
         assert parameter not in signature.parameters, parameter
-    for name in ("match_tables", "match_pending_mentions"):
+    for name in ("match_cik", "match_pending_mentions"):
         parameters = inspect.signature(getattr(stage, name)).parameters
         assert "item_texts" not in parameters, name
         assert "infer_lineage" not in parameters, name
@@ -248,9 +248,7 @@ def test_instruments_of_different_issuers_are_never_linked() -> None:
 
 def test_match_infers_the_ordinal_link_within_each_cik() -> None:
     """Inference runs inside match, over every cluster of the CIK at once."""
-    from support import name_by_seed
-
-    from cdt.matcher.stage import match_tables
+    from support import match_tables, name_by_seed
 
     mentions = pd.DataFrame(
         [

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import pandas as pd
@@ -21,10 +22,14 @@ from cdt.matcher.schema import (
 )
 from cdt.publish import (
     FINAL_OUTPUT_TABLES,
+    PublishGuardError,
+    _guard_against_shrinkage,
     contract_schema,
     final_pointer_path,
+    payload_problem,
     publish_contract,
     publish_final_tables,
+    publish_source_digest,
     published_table_path,
 )
 from cdt.segmenter.core import ITEM_COLUMNS, items_root
@@ -214,26 +219,6 @@ def test_the_pointer_records_the_contract_version(tmp_path: Path) -> None:
     assert set(pointer["tables"]) == set(FINAL_OUTPUT_TABLES)
 
 
-def _check_payload(
-    value: object, shape: dict[str, object], span_keys: set[str]
-) -> None:
-    container = shape["container"]
-    if container == "object":
-        assert isinstance(value, dict)
-        elements: list[object] = [value]
-    else:
-        assert isinstance(value, list)
-        elements = value
-    for element in elements:
-        if "items" in shape:
-            assert isinstance(element, str)
-            continue
-        assert isinstance(element, dict)
-        assert set(shape["keys"]) <= set(element), (shape["keys"], sorted(element))
-        for span in element.get("spans") or []:
-            assert span_keys <= set(span)
-
-
 @pytest.mark.parametrize("table_name", ["debt-instrument-mentions", "debt-instruments"])
 def test_published_payloads_have_the_contract_shapes(
     tmp_path: Path, table_name: str
@@ -248,9 +233,106 @@ def test_published_payloads_have_the_contract_shapes(
     checked = 0
     for column, shape in payloads["columns"][table_name].items():
         for text in table[column].dropna():
-            _check_payload(json.loads(text), shape, span_keys)
+            assert payload_problem(json.loads(text), shape, span_keys) is None, column
             checked += 1
 
     assert checked
     parties = json.loads(table["parties_json"].iloc[0])
     assert {party["role"] for party in parties} == {"borrower", "lender"}
+
+
+def test_the_pointer_resolves_every_table_relative_to_the_final_root(
+    tmp_path: Path,
+) -> None:
+    """A copied or mirrored final root still resolves its generation."""
+    _, final_root = _golden_root(tmp_path)
+    moved = tmp_path / "moved"
+    shutil.copytree(final_root, moved)
+
+    pointer = read_json_artifact(final_pointer_path(moved))
+
+    for table_name, entry in pointer["tables"].items():
+        assert not Path(entry["path"]).is_absolute()
+        assert len(read_table(moved / entry["path"])) == entry["rows"], table_name
+
+
+def test_a_payload_that_breaks_its_shape_is_named() -> None:
+    """Missing keys, a wrong container and a broken nested object are each reported."""
+    shapes = publish_contract()["payloads"]
+    span_keys = set(shapes["spans"]["keys"])
+    status = shapes["columns"]["debt-instrument-mentions"]["status_json"]
+    parties = shapes["columns"]["debt-instrument-mentions"]["parties_json"]
+
+    assert payload_problem({"status": "active"}, status, span_keys) == (
+        "missing keys ['status_date']"
+    )
+    assert (
+        payload_problem({"status": "active", "status_date": None}, status, span_keys)
+        is None
+    )
+    assert (
+        payload_problem(
+            {"status": "active", "status_date": {"spans": []}}, status, span_keys
+        )
+        == "status_date: missing keys ['derived_from', 'normalized_date']"
+    )
+    assert payload_problem({"role": "lender"}, parties, span_keys) == "not an array"
+
+
+def test_publish_warns_about_absent_columns_and_broken_payloads(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A column no source has publishes null, and a bad payload publishes, but neither silently (#295)."""
+    artifact_root = tmp_path / "artifacts"
+    mention = amended_row(**_production_payloads())
+    mention["parties_json"] = json.dumps([{"canonical_name": "Example Inc."}])
+    columns = [
+        column for column in DEBT_INSTRUMENT_MENTION_COLUMNS if column != "status_date"
+    ]
+    write_partition_table(
+        mentions_root(artifact_root),
+        partition={"month": "2024-06"},
+        table=pd.DataFrame([mention], columns=columns),
+    )
+
+    with caplog.at_level("WARNING"):
+        publish_final_tables(
+            artifact_root=str(artifact_root),
+            final_database_root=str(tmp_path / "final"),
+        )
+
+    assert "debt-instrument-mentions with contract column(s) no source" in caplog.text
+    assert "status_date" in caplog.text
+    assert "debt-instrument-mentions.parties_json has payloads" in caplog.text
+    assert "missing keys ['kind', 'role', 'spans'] x1" in caplog.text
+
+
+def test_the_redirects_table_may_shrink_without_refusing_the_publish() -> None:
+    """Redirects shrink when retired ids come back; every other table is guarded (#296)."""
+    _guard_against_shrinkage(
+        {"debt-instrument-redirects": 0, "debt-instruments": 10},
+        {"debt-instrument-redirects": 2, "debt-instruments": 10},
+        force_publish=False,
+    )
+
+    with pytest.raises(PublishGuardError):
+        _guard_against_shrinkage(
+            {"debt-instruments": 4}, {"debt-instruments": 10}, force_publish=False
+        )
+
+
+def test_an_edit_to_the_contract_moves_the_publish_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gate hashes the contract's bytes, so an edit without a version bump republishes."""
+    from cdt import publish
+
+    before = publish_source_digest(tmp_path)
+    edited = tmp_path / "publish_contract.json"
+    edited.write_text(publish.PUBLISH_CONTRACT_PATH.read_text() + "\n")
+    monkeypatch.setattr(publish, "PUBLISH_CONTRACT_PATH", edited)
+    publish.publish_contract_digest.cache_clear()
+    try:
+        assert publish_source_digest(tmp_path) != before
+    finally:
+        publish.publish_contract_digest.cache_clear()

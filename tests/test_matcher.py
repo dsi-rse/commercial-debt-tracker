@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 import pandas as pd
+from support import match_tables
 
 from cdt.extractor.schema import DEBT_INSTRUMENT_MENTION_COLUMNS
 from cdt.matcher.compat import (
@@ -25,7 +26,6 @@ from cdt.matcher.normalize import (
 )
 from cdt.matcher.schema import PreparedMention
 from cdt.matcher.scoring import build_empty_profile, score_candidates_for_mention
-from cdt.matcher.stage import match_tables
 
 
 def mention_row(**overrides: object) -> dict[str, object]:
@@ -1080,7 +1080,6 @@ def test_name_only_tie_prefers_a_live_cluster_over_a_retired_one() -> None:
         strong_match_threshold=0.90,
         loose_match_threshold=0.75,
         ambiguity_margin=0.05,
-        evaluated_run_id="run-1",
     )
     assert chosen == "inst-live"
 
@@ -1114,7 +1113,6 @@ def test_name_only_tie_prefers_the_largest_cluster_then_the_earliest_seed() -> N
         "strong_match_threshold": 0.90,
         "loose_match_threshold": 0.75,
         "ambiguity_margin": 0.05,
-        "evaluated_run_id": "run-1",
     }
     bigger, _ = resolve_candidates(
         mention,

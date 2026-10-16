@@ -27,7 +27,6 @@ MENTION_CLUSTER_EDGE_COLUMNS = [
     "match_score",
     "candidate_rank",
     "match_via",
-    "evaluated_run_id",
 ]
 DEBT_INSTRUMENT_COLUMNS = [
     "debt_instrument_id",
@@ -165,7 +164,6 @@ class ClusterProfile:
 
     debt_instrument_id: str
     cik: str
-    seed_mention_id: str
     #: The seed's ``mention_sort_key``: the cluster's smallest member key,
     #: which breaks scoring ties so a cluster's id never decides one.
     seed_sort_key: tuple[object, ...]

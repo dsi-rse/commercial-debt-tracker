@@ -123,7 +123,7 @@ def classify_pending_items(
         source_dataset=ITEM_DATASET_NAME,
         output_dataset=CLASSIFICATION_DATASET_NAME,
         output_columns=CLASSIFIED_ITEM_COLUMNS,
-        process=lambda source_path, partition, _done: classify_partition(
+        process=lambda source_path, partition, _done, _renew: classify_partition(
             source_path, partition, None
         ),
         artifact_root=artifact_root,

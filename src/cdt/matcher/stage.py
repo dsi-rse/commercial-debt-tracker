@@ -1,8 +1,8 @@
 """The matcher stage: re-cluster every CIK whose mentions changed, and write its rows.
 
 Matching is a pure function of one CIK's mentions. A run finds the CIKs whose
-set of mention ids differs from what the last run matched (a digest per CIK,
-stored per ``cik_shard``), clusters each from scratch, assigns ids
+mentions differ from what the last run matched (a digest per CIK over every
+column the matcher reads, stored per ``cik_shard``), clusters each from scratch, assigns ids
 (:mod:`cdt.matcher.identity`), infers lineage, and rewrites only the shards
 those CIKs live in.
 """
@@ -10,8 +10,9 @@ those CIKs live in.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
@@ -30,6 +31,7 @@ from cdt.extractor.outputs import MENTIONS_DATASET_NAME
 from cdt.extractor.schema import (
     DEBT_INSTRUMENT_MENTION_COLUMNS as EXTRACTED_MENTION_COLUMNS,
 )
+from cdt.extractor.schema import MENTION_ID_COLUMNS
 from cdt.matcher.compat import name_class_sizes
 from cdt.matcher.identity import (
     PreviousClusters,
@@ -74,6 +76,7 @@ from cdt.matcher.scoring import (
 )
 from cdt.storage.objects import (
     artifact_exists,
+    delete_artifact,
     join_artifact_path,
     list_artifacts,
     read_json_artifact,
@@ -137,6 +140,13 @@ def cik_digests_root(artifact_root: str | Path | None = None) -> str:
     )
 
 
+def rebuild_pending_path(artifact_root: str | Path | None = None) -> str:
+    """Return the marker a full rebuild writes before it starts and deletes after."""
+    return join_artifact_path(
+        resolve_artifact_root(artifact_root), "runs", "match", "rebuild-pending.json"
+    )
+
+
 def cik_digests_path(cik_shard: str, artifact_root: str | Path | None = None) -> str:
     """Return the digest file of one ``cik_shard``."""
     return join_artifact_path(
@@ -144,9 +154,23 @@ def cik_digests_path(cik_shard: str, artifact_root: str | Path | None = None) ->
     )
 
 
-def mention_set_digest(mention_ids: list[str]) -> str:
-    """Return the digest of one CIK's set of mention ids."""
-    payload = "\n".join(sorted(set(mention_ids)))
+#: The mention columns a CIK's digest covers: the mention id, which hashes
+#: :data:`MENTION_ID_COLUMNS`, and every other column the matcher reads.
+DIGEST_COLUMNS = [
+    column for column in EXTRACTED_MENTION_COLUMNS if column not in MENTION_ID_COLUMNS
+]
+
+
+def mention_row_key(row: Sequence[object]) -> str:
+    """Return one mention's :data:`DIGEST_COLUMNS` values as one string."""
+    return json.dumps(
+        [None if value is None or pd.isna(value) else str(value) for value in row]
+    )
+
+
+def mention_set_digest(row_keys: list[str]) -> str:
+    """Return the digest of one CIK's mentions, from their :func:`mention_row_key`."""
+    payload = "\n".join(sorted(set(row_keys)))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -188,29 +212,29 @@ class CikMentions:
 
 
 def _current_cik_mentions(resolved_root: str) -> CikMentions:
-    """Return each normalized CIK's mention-set digest, stored spellings and count.
+    """Return each normalized CIK's mention digest, stored spellings and count.
 
-    Reads two columns of every mentions month file. Mentions with no CIK are
-    never matched, so they are left out.
+    Reads the :data:`DIGEST_COLUMNS` of every mentions month file, so a change
+    to any column the matcher reads changes the CIK's digest. Mentions with no
+    CIK are never matched, so they are left out.
     """
     table = read_dataset(
         dataset_root(MENTIONS_DATASET_NAME, artifact_root=resolved_root),
-        columns=["cik", "debt_instrument_mention_id"],
+        columns=DIGEST_COLUMNS,
     )
-    ids: dict[str, list[str]] = {}
+    keys: dict[str, list[str]] = {}
     spellings: dict[str, set[str]] = {}
-    for raw_cik, mention_id in zip(
-        table["cik"], table["debt_instrument_mention_id"], strict=True
-    ):
+    for row in table.itertuples(index=False, name=None):
+        raw_cik = row[DIGEST_COLUMNS.index("cik")]
         if raw_cik is None or pd.isna(raw_cik) or not str(raw_cik).strip():
             continue
         cik = normalize_cik(raw_cik)
-        ids.setdefault(cik, []).append(str(mention_id))
+        keys.setdefault(cik, []).append(mention_row_key(row))
         spellings.setdefault(cik, set()).add(str(raw_cik))
     return CikMentions(
-        digests={cik: mention_set_digest(values) for cik, values in ids.items()},
+        digests={cik: mention_set_digest(values) for cik, values in keys.items()},
         spellings=spellings,
-        counts={cik: len(values) for cik, values in ids.items()},
+        counts={cik: len(values) for cik, values in keys.items()},
     )
 
 
@@ -292,7 +316,7 @@ def match_pending_mentions(
 ) -> MatchResult:
     """Re-cluster every CIK whose mentions changed and rewrite its shards.
 
-    A CIK is matched when its mention-set digest is new, changed or gone since
+    A CIK is matched when its mention digest is new, changed or gone since
     the last run stored it; ``force`` (or a root matched at an older
     ``MATCHER_SCHEMA_VERSION``) matches every CIK and rewrites every shard.
     ``remint`` does the same and also replaces every instrument id with its
@@ -300,7 +324,10 @@ def match_pending_mentions(
     affected CIK is clustered from all of its current mentions only, so the
     result never depends on the order mentions arrived in. Shards holding no
     affected CIK are not touched. A shard's digests are written after its
-    tables, so a run that stops part-way is finished by the next one.
+    tables, so an incremental run that stops part-way is finished by the next
+    one; a full rebuild writes :func:`rebuild_pending_path` first and deletes it
+    last, so the next run repeats a rebuild that stopped (with ``remint`` if
+    the stopped one had it).
     ``renew`` is called before each shard is rewritten and must raise if the
     writer lease has been lost.
     """
@@ -310,7 +337,15 @@ def match_pending_mentions(
         ambiguity_margin=ambiguity_margin,
     )
     resolved_root = resolve_artifact_root(artifact_root)
+    marker_path = rebuild_pending_path(resolved_root)
+    if artifact_exists(marker_path):
+        pending = read_json_artifact(marker_path)
+        LOGGER.warning("A full rebuild did not finish; repeating it: %s", pending)
+        remint = remint or bool(pending.get("remint"))
+        force = True
     rebuild_all = force or remint or _stale_schema_forces_rematch(resolved_root)
+    if rebuild_all:
+        write_json_artifact(marker_path, {"remint": remint})
     current_mentions = _current_cik_mentions(resolved_root)
     current = current_mentions.digests
     stored = _stored_cik_digests(resolved_root)
@@ -379,6 +414,7 @@ def match_pending_mentions(
                 resolved_root,
             )
             edges_by_cik = dict(tuple(edges.groupby("cik")))
+            instruments_by_cik = dict(tuple(instruments.groupby("cik")))
             redirects_by_cik = dict(tuple(redirects.groupby("cik")))
             new_edges: list[pd.DataFrame] = []
             new_instruments: list[pd.DataFrame] = []
@@ -388,6 +424,7 @@ def match_pending_mentions(
                     cik_mentions,
                     cik=str(cik),
                     previous_edges=edges_by_cik.get(cik),
+                    previous_instruments=instruments_by_cik.get(cik),
                     previous_redirects=redirects_by_cik.get(cik),
                     thresholds=thresholds,
                     remint=remint,
@@ -403,11 +440,14 @@ def match_pending_mentions(
                 renew()
             replaced = set(mentions["cik"]) | shard_ciks
             for root, kept, frames, columns in (
+                # Retired ids are worked out from the stored edges, so the
+                # edges are written last: a run that stops before them
+                # retires the same ids again.
                 (
-                    mention_cluster_edges_root(resolved_root),
-                    edges,
-                    new_edges,
-                    MENTION_CLUSTER_EDGE_COLUMNS,
+                    debt_instrument_redirects_root(resolved_root),
+                    redirects,
+                    new_redirects,
+                    DEBT_INSTRUMENT_REDIRECT_COLUMNS,
                 ),
                 (
                     debt_instruments_root(resolved_root),
@@ -416,10 +456,10 @@ def match_pending_mentions(
                     DEBT_INSTRUMENT_COLUMNS,
                 ),
                 (
-                    debt_instrument_redirects_root(resolved_root),
-                    redirects,
-                    new_redirects,
-                    DEBT_INSTRUMENT_REDIRECT_COLUMNS,
+                    mention_cluster_edges_root(resolved_root),
+                    edges,
+                    new_edges,
+                    MENTION_CLUSTER_EDGE_COLUMNS,
                 ),
             ):
                 survivors = (
@@ -493,6 +533,8 @@ def match_pending_mentions(
             "schema_version": MATCHER_SCHEMA_VERSION,
         },
     )
+    if rebuild_all:
+        delete_artifact(marker_path)
     LOGGER.info(
         "Matcher complete: ciks_matched=%s ciks_removed=%s shards=%s "
         "debt_instruments=%s lineage_links=%s",
@@ -539,7 +581,6 @@ def cluster_mentions(
             strong_match_threshold=thresholds.strong,
             loose_match_threshold=thresholds.loose,
             ambiguity_margin=thresholds.ambiguity_margin,
-            evaluated_run_id="latest",
         )
         edge_rows.extend(chosen_edge_rows)
         member_map[mention_id] = chosen_cluster_id
@@ -556,6 +597,7 @@ def match_cik(
     *,
     cik: str,
     previous_edges: pd.DataFrame | None = None,
+    previous_instruments: pd.DataFrame | None = None,
     previous_redirects: pd.DataFrame | None = None,
     thresholds: MatchThresholds | None = None,
     remint: bool = False,
@@ -563,9 +605,9 @@ def match_cik(
     """Match one CIK's mentions from scratch: clusters, ids, rows and lineage.
 
     ``mentions`` are every current mention of ``cik`` (a normalized CIK).
-    ``previous_edges`` and ``previous_redirects`` are what the last match
-    wrote for it: they decide which ids carry over and which redirect, never
-    which mentions cluster together.
+    ``previous_edges``, ``previous_instruments`` and ``previous_redirects`` are
+    what the last match wrote for it: they decide which ids carry over and
+    which redirect, never which mentions cluster together.
     """
     resolved_thresholds = thresholds or MatchThresholds()
     rows = mentions.to_dict("records")
@@ -581,11 +623,7 @@ def match_cik(
         build_member_groups(provisional_map),
         cik=cik,
         mention_index=mention_index,
-        previous=PreviousClusters.from_edges(
-            previous_edges
-            if previous_edges is not None
-            else pd.DataFrame(columns=MENTION_CLUSTER_EDGE_COLUMNS)
-        ),
+        previous=PreviousClusters.from_tables(previous_edges, previous_instruments),
         remint=remint,
     )
     member_map = {
@@ -637,50 +675,3 @@ def match_cik(
         ),
         inferred_links=inferred_links,
     )
-
-
-def match_tables(
-    debt_instrument_mentions: pd.DataFrame,
-    *,
-    strong_match_threshold: float = DEFAULT_MEMBERSHIP_THRESHOLD,
-    loose_match_threshold: float = DEFAULT_RELATED_THRESHOLD,
-    ambiguity_margin: float = DEFAULT_AMBIGUITY_MARGIN,
-) -> dict[str, pd.DataFrame]:
-    """Match in-memory mentions of any CIKs from scratch, with nothing carried over.
-
-    Returns ``{"debt_instrument_mentions": edges, "debt_instrument":
-    instruments}``. Mentions with no CIK are skipped.
-
-    Raises:
-        ValueError: ``strong_match_threshold < loose_match_threshold`` or
-            ``ambiguity_margin`` is negative.
-    """
-    thresholds = MatchThresholds(
-        strong=strong_match_threshold,
-        loose=loose_match_threshold,
-        ambiguity_margin=ambiguity_margin,
-    )
-    with_cik = debt_instrument_mentions.loc[
-        debt_instrument_mentions["cik"].notna()
-        & debt_instrument_mentions["cik"].astype(str).str.strip().ne("")
-    ]
-    normalized = with_cik.assign(cik=with_cik["cik"].map(normalize_cik))
-    matches = [
-        match_cik(cik_mentions, cik=str(cik), thresholds=thresholds)
-        for cik, cik_mentions in normalized.groupby("cik", sort=True)
-    ]
-
-    def combine(frames: list[pd.DataFrame], columns: list[str]) -> pd.DataFrame:
-        populated = [frame for frame in frames if not frame.empty]
-        if not populated:
-            return pd.DataFrame(columns=columns)
-        return pd.concat(populated, ignore_index=True).reindex(columns=columns)
-
-    return {
-        "debt_instrument_mentions": combine(
-            [match.edges for match in matches], MENTION_CLUSTER_EDGE_COLUMNS
-        ),
-        "debt_instrument": combine(
-            [match.instruments for match in matches], DEBT_INSTRUMENT_COLUMNS
-        ),
-    }

@@ -10,10 +10,19 @@ import pytest
 
 from cdt.classifier.core import classifications_root
 from cdt.completion import load_completion_registry
+from cdt.datasets import normalize_cik
 from cdt.extractor.normalize.amounts import normalized_amount_from_text
 from cdt.extractor.schema import DEBT_INSTRUMENT_MENTION_COLUMNS
 from cdt.extractor.state import ExtractionRowState
 from cdt.ingest.core import DOCUMENT_COLUMNS
+from cdt.matcher.schema import (
+    DEBT_INSTRUMENT_COLUMNS,
+    DEFAULT_AMBIGUITY_MARGIN,
+    DEFAULT_MEMBERSHIP_THRESHOLD,
+    DEFAULT_RELATED_THRESHOLD,
+    MENTION_CLUSTER_EDGE_COLUMNS,
+)
+from cdt.matcher.stage import MatchThresholds, match_cik
 from cdt.storage.tables import write_partition_table
 
 _INSTRUMENT_ID_COLUMNS = (
@@ -418,4 +427,54 @@ def completed_partitions(stage_name: str, artifact_root: Path | str) -> set[str]
             stage_name, artifact_root=artifact_root
         ).items()
         if entry.complete
+    }
+
+
+def match_tables(
+    debt_instrument_mentions: pd.DataFrame,
+    *,
+    strong_match_threshold: float = DEFAULT_MEMBERSHIP_THRESHOLD,
+    loose_match_threshold: float = DEFAULT_RELATED_THRESHOLD,
+    ambiguity_margin: float = DEFAULT_AMBIGUITY_MARGIN,
+) -> dict[str, pd.DataFrame]:
+    """Match in-memory mentions of any CIKs from scratch, with nothing carried over.
+
+    Each CIK goes through :func:`cdt.matcher.stage.match_cik`, as a match
+    run would, without the storage around it.
+
+    Returns ``{"debt_instrument_mentions": edges, "debt_instrument":
+    instruments}``. Mentions with no CIK are skipped.
+
+    Raises:
+        ValueError: ``strong_match_threshold < loose_match_threshold`` or
+            ``ambiguity_margin`` is negative.
+    """
+    thresholds = MatchThresholds(
+        strong=strong_match_threshold,
+        loose=loose_match_threshold,
+        ambiguity_margin=ambiguity_margin,
+    )
+    with_cik = debt_instrument_mentions.loc[
+        debt_instrument_mentions["cik"].notna()
+        & debt_instrument_mentions["cik"].astype(str).str.strip().ne("")
+    ]
+    normalized = with_cik.assign(cik=with_cik["cik"].map(normalize_cik))
+    matches = [
+        match_cik(cik_mentions, cik=str(cik), thresholds=thresholds)
+        for cik, cik_mentions in normalized.groupby("cik", sort=True)
+    ]
+
+    def combine(frames: list[pd.DataFrame], columns: list[str]) -> pd.DataFrame:
+        populated = [frame for frame in frames if not frame.empty]
+        if not populated:
+            return pd.DataFrame(columns=columns)
+        return pd.concat(populated, ignore_index=True).reindex(columns=columns)
+
+    return {
+        "debt_instrument_mentions": combine(
+            [match.edges for match in matches], MENTION_CLUSTER_EDGE_COLUMNS
+        ),
+        "debt_instrument": combine(
+            [match.instruments for match in matches], DEBT_INSTRUMENT_COLUMNS
+        ),
     }

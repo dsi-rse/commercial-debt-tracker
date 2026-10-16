@@ -29,7 +29,6 @@ def build_empty_profile(
     return ClusterProfile(
         debt_instrument_id=debt_instrument_id,
         cik=mention.cik or "",
-        seed_mention_id=mention.debt_instrument_mention_id,
         seed_sort_key=mention_sort_key(mention),
         member_ids=[],
         normalized_amounts=set(),
@@ -235,7 +234,6 @@ def resolve_candidates(
     strong_match_threshold: float,
     loose_match_threshold: float,
     ambiguity_margin: float,
-    evaluated_run_id: str,
 ) -> tuple[str, list[dict[str, object]]]:
     """Return the mention's chosen cluster id and its edge rows.
 
@@ -284,7 +282,6 @@ def resolve_candidates(
                     match_via=render_match_via(
                         "member", top_candidate.support_family, top_candidate.basis
                     ),
-                    evaluated_run_id=evaluated_run_id,
                 )
             ]
             for rank, candidate in enumerate(tied[1:], start=2):
@@ -298,7 +295,6 @@ def resolve_candidates(
                         match_via=render_match_via(
                             "ambiguous", candidate.support_family, candidate.basis
                         ),
-                        evaluated_run_id=evaluated_run_id,
                     )
                 )
             return top_candidate.debt_instrument_id, edge_rows
@@ -313,7 +309,6 @@ def resolve_candidates(
                     match_via=render_match_via(
                         "member", top_candidate.support_family, top_candidate.basis
                     ),
-                    evaluated_run_id=evaluated_run_id,
                 )
             ]
             for rank, candidate in enumerate(candidates[1:], start=2):
@@ -329,7 +324,6 @@ def resolve_candidates(
                         match_via=render_match_via(
                             "related", candidate.support_family, candidate.basis
                         ),
-                        evaluated_run_id=evaluated_run_id,
                     )
                 )
             return top_candidate.debt_instrument_id, edge_rows
@@ -343,7 +337,6 @@ def resolve_candidates(
                 match_score=1.0,
                 candidate_rank=1,
                 match_via="member:seed",
-                evaluated_run_id=evaluated_run_id,
             )
         ]
         for rank, candidate in enumerate(qualifying_members, start=1):
@@ -357,7 +350,6 @@ def resolve_candidates(
                     match_via=render_match_via(
                         "ambiguous", candidate.support_family, candidate.basis
                     ),
-                    evaluated_run_id=evaluated_run_id,
                 )
             )
         return new_cluster_id, edge_rows
@@ -376,7 +368,6 @@ def resolve_candidates(
             match_score=1.0,
             candidate_rank=1,
             match_via="member:seed",
-            evaluated_run_id=evaluated_run_id,
         )
     ]
     for rank, candidate in enumerate(related_candidates, start=1):
@@ -390,7 +381,6 @@ def resolve_candidates(
                 match_via=render_match_via(
                     "related", candidate.support_family, candidate.basis
                 ),
-                evaluated_run_id=evaluated_run_id,
             )
         )
     return new_cluster_id, edge_rows
@@ -404,7 +394,6 @@ def build_edge_row(
     match_score: float,
     candidate_rank: int,
     match_via: str,
-    evaluated_run_id: str,
 ) -> dict[str, object]:
     """Return one persisted edge row."""
     return {
@@ -414,7 +403,6 @@ def build_edge_row(
         "match_score": match_score,
         "candidate_rank": candidate_rank,
         "match_via": match_via,
-        "evaluated_run_id": evaluated_run_id,
     }
 
 

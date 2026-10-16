@@ -11,6 +11,7 @@ time, so memory does not grow with the corpus.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Callable
@@ -84,6 +85,13 @@ REFERENCED_ITEMS_KEY = "item_id"
 # A table shrinking below this fraction of its published row count blocks the
 # publish unless ``force_publish``.
 FINAL_SNAPSHOT_GUARD_RATIO = 0.5
+#: Tables the shrink guard does not check: redirects shrink legitimately (a
+#: retired id comes back into use) and are small enough to swing by half.
+SHRINK_GUARD_EXEMPT_TABLES = frozenset({"debt-instrument-redirects"})
+
+#: Non-null payloads checked against the contract per column and partition: a
+#: change in the writer's shapes affects every row, so a sample finds it.
+PAYLOAD_CHECK_SAMPLE = 200
 
 
 #: Pointer key holding the source digest a generation was built from. Absent
@@ -109,6 +117,55 @@ _NAMED_TYPES: dict[str, pa.DataType] = {
 def publish_contract() -> dict[str, object]:
     """Return the publish contract, parsed from ``publish_contract.json``."""
     return json.loads(PUBLISH_CONTRACT_PATH.read_text(encoding="utf-8"))
+
+
+@cache
+def publish_contract_digest() -> str:
+    """Return the sha256 of ``publish_contract.json``'s bytes."""
+    return hashlib.sha256(PUBLISH_CONTRACT_PATH.read_bytes()).hexdigest()
+
+
+def payload_problem(
+    value: object, shape: dict[str, object], span_keys: set[str]
+) -> str | None:
+    """Return how one parsed payload breaks its contract shape, or None.
+
+    ``shape`` is one entry of the contract's ``payloads.columns``: a
+    ``container`` (``object`` or ``array``) whose elements carry the listed
+    ``keys`` (or are ``items`` strings), whose ``spans`` carry
+    ``span_keys``, and whose ``nested`` objects, when not null, have their
+    own shape.
+    """
+    if shape["container"] == "object":
+        if not isinstance(value, dict):
+            return "not an object"
+        elements: list[object] = [value]
+    else:
+        if not isinstance(value, list):
+            return "not an array"
+        elements = value
+    for element in elements:
+        if "items" in shape:
+            if not isinstance(element, str):
+                return "an element is not a string"
+            continue
+        if not isinstance(element, dict):
+            return "an element is not an object"
+        missing = set(shape["keys"]) - set(element)  # type: ignore[arg-type]
+        if missing:
+            return f"missing keys {sorted(missing)}"
+        for span in element.get("spans") or []:
+            if not isinstance(span, dict) or not span_keys <= set(span):
+                return "a span is missing keys"
+        nested_shapes: dict[str, dict[str, object]] = shape.get("nested", {})  # type: ignore[assignment]
+        for name, nested_shape in nested_shapes.items():
+            nested = element.get(name)
+            if nested is None:
+                continue
+            problem = payload_problem(nested, nested_shape, span_keys)
+            if problem is not None:
+                return f"{name}: {problem}"
+    return None
 
 
 def contract_type(name: str) -> pa.DataType:
@@ -138,8 +195,8 @@ def publish_source_digest(
 
     Covers the content versions (not mtimes) of every ``.parquet`` under the
     source roots, plus the table layout, ``MATCHER_SCHEMA_VERSION``,
-    ``PUBLISH_FORMAT_VERSION`` and the contract version. One LIST per root on
-    S3.
+    ``PUBLISH_FORMAT_VERSION`` and the contract file's bytes. One LIST per
+    root on S3.
     """
     layout = {
         table_name: [dataset_root_fn.__name__ for dataset_root_fn in entry]
@@ -151,7 +208,7 @@ def publish_source_digest(
         context={
             "publish_format_version": PUBLISH_FORMAT_VERSION,
             "matcher_schema_version": MATCHER_SCHEMA_VERSION,
-            "contract_version": publish_contract()["contract_version"],
+            "contract_sha256": publish_contract_digest(),
             "layout": layout,
         },
     )
@@ -302,7 +359,8 @@ def write_final_output_tables(
 
     Streams every table to ``snapshots/snapshot=<run_id>/`` under the final
     database root, then replaces ``latest.json`` (run id, schema, contract and
-    format versions, per-table paths and row counts), copies each table to
+    format versions, per-table row counts and paths relative to the final
+    database root, so a copied root still resolves), copies each table to
     ``<table>/latest.parquet``, and last records ``source_digest`` in the
     pointer. Prunes all generations but the current and prior one. No-op when
     ``final_database_root`` is None.
@@ -377,7 +435,7 @@ def write_final_output_tables(
         "publish_format_version": PUBLISH_FORMAT_VERSION,
         "tables": {
             table_name: {
-                "path": written_paths[table_name],
+                "path": f"snapshots/snapshot={run_id}/{table_name}.parquet",
                 "rows": row_counts[table_name],
             }
             for table_name in FINAL_OUTPUT_TABLES
@@ -467,10 +525,22 @@ def _stream_published_table(
     (:func:`null_placeholder_text`), and is conformed to the contract. Memory
     the partition used is handed back to the system before the next one, so
     the peak does not grow with the number of partitions.
+
+    Logs a warning when rows were written but some contract column was in no
+    source partition (it publishes all null), and when sampled payloads
+    (:data:`PAYLOAD_CHECK_SAMPLE` per column and partition) break their
+    contract shape (:func:`payload_problem`).
     """
     schema = contract_schema(table_name)
     form_types = FINAL_OUTPUT_TABLE_FORM_TYPES.get(table_name)
     referenced = pa.array(sorted(referenced_items), pa.string())
+    payloads = publish_contract()["payloads"]
+    payload_shapes: dict[str, dict[str, object]] = payloads["columns"].get(  # type: ignore[index]
+        table_name, {}
+    )
+    span_keys = set(payloads["spans"]["keys"])  # type: ignore[index]
+    present: set[str] = set()
+    problems: dict[str, dict[str, int]] = {}
     rows = 0
     with parquet_table_writer(output_path, schema) as writer:
         for index, dataset_root_fn in enumerate(dataset_root_fns):
@@ -491,13 +561,58 @@ def _stream_published_table(
                         pa.array([form_types[index]] * table.num_rows, pa.string()),
                     )
                 if table.num_rows:
+                    present.update(table.column_names)
+                    _count_payload_problems(table, payload_shapes, span_keys, problems)
                     writer.write_table(
                         conform_to_contract(null_placeholder_text(table), schema)
                     )
                     rows += table.num_rows
                 del table
                 pa.default_memory_pool().release_unused()
+    absent = [name for name in schema.names if name not in present]
+    if rows and absent:
+        LOGGER.warning(
+            "Published %s with contract column(s) no source partition has, so "
+            "they are all null: %s",
+            table_name,
+            ", ".join(absent),
+        )
+    for column, counts in sorted(problems.items()):
+        LOGGER.warning(
+            "Published %s.%s has payloads that break the contract shape "
+            "(sampled): %s",
+            table_name,
+            column,
+            "; ".join(
+                f"{problem} x{count}" for problem, count in sorted(counts.items())
+            ),
+        )
     return rows
+
+
+def _count_payload_problems(
+    table: pa.Table,
+    shapes: dict[str, dict[str, object]],
+    span_keys: set[str],
+    problems: dict[str, dict[str, int]],
+) -> None:
+    """Add the contract-shape problems of a sample of ``table``'s payloads to ``problems``."""
+    for column, shape in shapes.items():
+        if column not in table.column_names:
+            continue
+        values = table.column(column).drop_null()
+        for text in values.slice(0, PAYLOAD_CHECK_SAMPLE).to_pylist():
+            if isinstance(text, str) and text.strip().lower() in MISSING_TEXT_VALUES | {
+                ""
+            }:
+                continue
+            try:
+                problem = payload_problem(json.loads(text), shape, span_keys)
+            except (TypeError, json.JSONDecodeError):
+                problem = "not JSON"
+            if problem is not None:
+                counts = problems.setdefault(column, {})
+                counts[problem] = counts.get(problem, 0) + 1
 
 
 def _guard_against_shrinkage(
@@ -508,11 +623,15 @@ def _guard_against_shrinkage(
 ) -> None:
     """Refuse to publish a table shrinking below the guard ratio, unless ``force_publish``.
 
+    Tables in SHRINK_GUARD_EXEMPT_TABLES are not checked.
+
     Raises:
         PublishGuardError: If any table regressed and ``force_publish`` is False.
     """
     regressions: list[str] = []
     for table_name, rows in row_counts.items():
+        if table_name in SHRINK_GUARD_EXEMPT_TABLES:
+            continue
         prior_rows = previous_counts.get(table_name, 0)
         if prior_rows <= 0:
             continue

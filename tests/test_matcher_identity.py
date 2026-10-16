@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+from dataclasses import replace
 from pathlib import Path
 
 import pandas as pd
@@ -113,13 +114,26 @@ def _corpus() -> pd.DataFrame:
         "$750 million",
     )
     add(12, "789019", "2024-02-10", "6% Notes due 2034", "2024-04-10", "$750 million")
+    # Apart in a full match, but 14 and 15 merge when they arrive before 13:
+    # 13 is the competing candidate that makes 15's match ambiguous.
+    add(13, "1018724", "2024-02-15", "Credit Agreement", "2024-01-01", "$100 million")
+    add(
+        14,
+        "1018724",
+        "2024-03-15",
+        "Amended and Restated Credit Agreement",
+        "",
+        "$150 million",
+    )
+    add(15, "1018724", "2024-04-15", "Credit Agreement", "2024-01-01", "$150 million")
     return pd.DataFrame(rows)
 
 
 def _write(root: Path, mentions: pd.DataFrame) -> None:
-    """Replace the root's mentions with ``mentions``, one file per month."""
+    """Replace the root's mentions with ``mentions``, one shuffled file per month."""
     shutil.rmtree(root / "mentions", ignore_errors=True)
-    for month, rows in mentions.groupby(mentions["date"].str[:7]):
+    shuffled = mentions.sample(frac=1, random_state=len(mentions))
+    for month, rows in shuffled.groupby(shuffled["date"].str[:7]):
         write_partition_table(root / "mentions", partition={"month": month}, table=rows)
 
 
@@ -288,7 +302,9 @@ def test_ids_carry_by_mention_overlap_then_by_item_overlap() -> None:
             "di::kept": frozenset({"item-1"}),
             "di::reextracted": frozenset({"item-2"}),
         },
+        content={"di::reextracted": {"instrument_type": "term_loan"}},
     )
+    index["m-2-re"] = replace(index["m-2-re"], instrument_type="term_loan")
 
     final, redirects = assign_instrument_ids(
         {"p-1": ["m-1"], "p-2": ["m-2-re"], "p-3": ["m-3"]},
@@ -302,6 +318,108 @@ def test_ids_carry_by_mention_overlap_then_by_item_overlap() -> None:
     assert final["p-3"] == mint_instrument_id(
         "0000320193", ("2024-03-01", "acc-item-3", "item-3", 1, "m-3")
     )
+    assert redirects == {}
+
+
+def test_an_item_overlap_with_no_shared_content_carries_nothing() -> None:
+    """Sharing an item is not enough: the cluster must state some of the old content."""
+    index = {"m-2-re": _prepared("m-2-re", "item-2")}
+    previous = PreviousClusters(
+        mention_ids={"di::old": frozenset({"m-2"})},
+        item_ids={"di::old": frozenset({"item-2"})},
+        content={"di::old": {"instrument_type": "revolver"}},
+    )
+
+    final, redirects = assign_instrument_ids(
+        {"p": ["m-2-re"]},
+        cik="0000320193",
+        mention_index=index,
+        previous=previous,
+    )
+
+    assert final["p"] != "di::old"
+    assert redirects == {}
+
+
+def _two_instrument_item(
+    revolver_id: str = "m-revolver", term_loan_id: str = "m-term-loan"
+) -> list[dict[str, object]]:
+    """One 8-K item describing a revolver and a term loan B on the same day."""
+    common = {
+        "item_id": "item-1",
+        "accession_number": "0001",
+        "cik": "320193",
+        "date": "2024-01-10",
+        "start_date": "2024-01-10",
+    }
+    return [
+        build_mention_row(
+            mention_id=revolver_id,
+            name="Revolving Credit Facility",
+            amount="$500 million",
+            instrument_type="revolver",
+            maturity_date="2029-01-10",
+            **common,
+        ),
+        build_mention_row(
+            mention_id=term_loan_id,
+            name="Term Loan B",
+            amount="$750 million",
+            instrument_type="term_loan",
+            maturity_date="2031-01-10",
+            **common,
+        ),
+    ]
+
+
+def _ids_by_name(root: Path) -> dict[str, str]:
+    instruments = _instruments(root)
+    return dict(
+        zip(instruments["name"], instruments["debt_instrument_id"], strict=True)
+    )
+
+
+@pytest.mark.parametrize(
+    "new_ids", [("m-a-revolver", "m-z-term-loan"), ("m-z-revolver", "m-a-term-loan")]
+)
+def test_re_extracting_an_item_keeps_each_instruments_id(
+    tmp_path: Path, new_ids: tuple[str, str]
+) -> None:
+    """Two instruments of one item keep their own ids when its mention ids change (#289)."""
+    _write(tmp_path, pd.DataFrame(_two_instrument_item()))
+    match_pending_mentions(artifact_root=tmp_path)
+    before = _ids_by_name(tmp_path)
+
+    _write(tmp_path, pd.DataFrame(_two_instrument_item(*new_ids)))
+    match_pending_mentions(artifact_root=tmp_path)
+
+    assert _ids_by_name(tmp_path) == before
+    assert read_dataset(debt_instrument_redirects_root(tmp_path)).empty
+
+
+def test_indistinguishable_instruments_of_one_item_get_new_ids() -> None:
+    """When content cannot tell two re-extracted instruments apart, neither carries."""
+    index = {
+        "m-a": _prepared("m-a", "item-1"),
+        "m-b": _prepared("m-b", "item-1"),
+    }
+    previous = PreviousClusters(
+        mention_ids={"di::x": frozenset({"m-x"}), "di::y": frozenset({"m-y"})},
+        item_ids={"di::x": frozenset({"item-1"}), "di::y": frozenset({"item-1"})},
+        content={
+            "di::x": {"start_date": "2024-01-01"},
+            "di::y": {"start_date": "2024-01-01"},
+        },
+    )
+
+    final, redirects = assign_instrument_ids(
+        {"p-a": ["m-a"], "p-b": ["m-b"]},
+        cik="0000320193",
+        mention_index=index,
+        previous=previous,
+    )
+
+    assert not set(final.values()) & {"di::x", "di::y"}
     assert redirects == {}
 
 
@@ -337,11 +455,11 @@ def test_stored_redirects_follow_a_retired_target_and_drop_a_revived_id() -> Non
     assert resolved == {"di::a": "di::e", "di::b": "di::e"}
 
 
-def test_one_large_ciks_name_classes_are_counted_in_one_pass() -> None:
-    """Thousands of mentions with a few names cost a few comparisons each (#269)."""
-    from time import perf_counter
-
-    from cdt.matcher.compat import name_class_sizes
+def test_one_large_ciks_name_classes_are_counted_in_one_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Thousands of mentions with a few names compare each name pair once (#269)."""
+    from cdt.matcher import compat
 
     names = [f"{rate}% Senior Notes due {2030 + rate}" for rate in range(40)]
     index = {
@@ -359,9 +477,189 @@ def test_one_large_ciks_name_classes_are_counted_in_one_pass() -> None:
         )
         for i in range(4000)
     }
+    compared: list[tuple[str | None, str | None]] = []
+    compatible = compat.name_fingerprints_are_compatible
 
-    started = perf_counter()
-    sizes = name_class_sizes(index)
+    def counting(left: str | None, right: str | None) -> bool:
+        compared.append((left, right))
+        return compatible(left, right)
 
-    assert perf_counter() - started < 2.0
+    monkeypatch.setattr(compat, "name_fingerprints_are_compatible", counting)
+
+    sizes = compat.name_class_sizes(index)
+
+    assert len(compared) <= len(names) ** 2
     assert sizes["m-0"] == 100
+
+
+def _loan(mention_id: str, cik: str, name: str, **overrides: object) -> dict:
+    return build_mention_row(
+        mention_id=mention_id,
+        item_id=f"item-{mention_id}",
+        accession_number=f"acc-{mention_id}",
+        cik=cik,
+        date="2024-01-01",
+        name=name,
+        start_date="2024-01-01",
+        amount="$100 million",
+        **overrides,
+    )
+
+
+def _alpha_and_beta() -> pd.DataFrame:
+    """Two loans that cluster apart at the default thresholds and together at 0.75."""
+    return pd.DataFrame(
+        [_loan("m-a", "320193", "Alpha Loan"), _loan("m-b", "320193", "Beta Facility")]
+    )
+
+
+def test_a_change_to_a_column_the_id_does_not_hash_re_matches_the_cik(
+    tmp_path: Path,
+) -> None:
+    """The CIK digest covers every column the matcher reads, not just the ids (#290)."""
+    mentions = pd.DataFrame([_loan("m-a", "320193", "Alpha Loan")])
+    _write(tmp_path, mentions)
+    match_pending_mentions(artifact_root=tmp_path)
+
+    _write(tmp_path, mentions.assign(company_name="Renamed Inc."))
+    result = match_pending_mentions(artifact_root=tmp_path)
+
+    assert result.ciks_matched == 1
+    assert _instruments(tmp_path)["company_name"].to_list() == ["Renamed Inc."]
+    assert match_pending_mentions(artifact_root=tmp_path).ciks_matched == 0
+
+
+def test_a_rematch_keeps_the_rows_of_other_ciks_in_the_same_shard(
+    tmp_path: Path,
+) -> None:
+    """320193 and 100032 share ``cik_shard=0044``; re-matching one leaves the other."""
+    other = _loan("m-other", "100032", "Gamma Notes")
+    _write(tmp_path, pd.DataFrame([_loan("m-a", "320193", "Alpha Loan"), other]))
+    match_pending_mentions(artifact_root=tmp_path)
+    before = _instruments(tmp_path).set_index("cik").loc["0000100032"]
+
+    _write(
+        tmp_path,
+        pd.DataFrame([_loan("m-a2", "320193", "Alpha Loan Two"), other]),
+    )
+    result = match_pending_mentions(artifact_root=tmp_path)
+
+    assert result.ciks_matched == 1
+    after = _instruments(tmp_path).set_index("cik")
+    pd.testing.assert_series_equal(after.loc["0000100032"], before)
+    assert set(after.index) == {"0000320193", "0000100032"}
+
+
+def _merge_alpha_into_beta(root: Path) -> tuple[dict[str, str], str]:
+    """Match Alpha and Beta apart, then force a match that merges them."""
+    _write(root, _alpha_and_beta())
+    match_pending_mentions(artifact_root=root)
+    before = _instruments(root).set_index("seed_debt_instrument_mention_id")
+    return before["debt_instrument_id"].to_dict(), str(root)
+
+
+def test_a_merge_publishes_a_redirect_from_the_retired_id(tmp_path: Path) -> None:
+    """The retired id redirects to the survivor, kept by later re-matches and published."""
+    from cdt.publish import publish_final_tables, published_table_path
+    from cdt.storage.tables import read_table
+
+    ids, _ = _merge_alpha_into_beta(tmp_path)
+    match_pending_mentions(
+        artifact_root=tmp_path,
+        force=True,
+        strong_match_threshold=0.75,
+        loose_match_threshold=0.75,
+    )
+    [survivor] = _instruments(tmp_path)["debt_instrument_id"]
+    [retired] = set(ids.values()) - {survivor}
+    _write(
+        tmp_path,
+        pd.concat(
+            [_alpha_and_beta(), pd.DataFrame([_loan("m-c", "320193", "Zeta Notes")])]
+        ),
+    )
+    assert (
+        match_pending_mentions(
+            artifact_root=tmp_path,
+            strong_match_threshold=0.75,
+            loose_match_threshold=0.75,
+        ).ciks_matched
+        == 1
+    )
+
+    publish_final_tables(
+        artifact_root=str(tmp_path), final_database_root=str(tmp_path / "final")
+    )
+
+    published = read_table(
+        published_table_path(tmp_path / "final", "debt-instrument-redirects")
+    )
+    pairs = published[["old_debt_instrument_id", "debt_instrument_id"]]
+    assert pairs.to_numpy().tolist() == [[retired, survivor]]
+
+
+def test_redirects_survive_a_crash_before_the_edges_are_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run that stops after the redirects but before the edges retires them again (#291)."""
+    from cdt.matcher import stage
+
+    ids, _ = _merge_alpha_into_beta(tmp_path)
+    write = stage.write_partition_table
+
+    def crash_on_edges(root: object, **kwargs: object) -> object:
+        if "mention-cluster-edges" in str(root):
+            raise RuntimeError("simulated crash")
+        return write(root, **kwargs)
+
+    merge = {"strong_match_threshold": 0.75, "loose_match_threshold": 0.75}
+    monkeypatch.setattr(stage, "write_partition_table", crash_on_edges)
+    with pytest.raises(RuntimeError):
+        match_pending_mentions(artifact_root=tmp_path, force=True, **merge)
+    monkeypatch.undo()
+
+    match_pending_mentions(artifact_root=tmp_path, **merge)
+
+    [survivor] = _instruments(tmp_path)["debt_instrument_id"]
+    redirects = read_dataset(debt_instrument_redirects_root(tmp_path))
+    assert dict(
+        zip(
+            redirects["old_debt_instrument_id"],
+            redirects["debt_instrument_id"],
+            strict=True,
+        )
+    ) == {old: survivor for old in set(ids.values()) - {survivor}}
+
+
+def test_an_interrupted_remint_is_finished_by_the_next_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `--remint` that stops part-way is repeated, remint included, by a plain run (#294)."""
+    from cdt.matcher import stage
+
+    corpus = _corpus()
+    reference = tmp_path / "reference"
+    _write(reference, corpus)
+    match_pending_mentions(artifact_root=reference, remint=True)
+    root = tmp_path / "root"
+    _arrive_in(root, _orders()["backfill, newer half first"])
+    write = stage.write_partition_table
+    shards_written: list[str] = []
+
+    def crash_on_second_shard(root: object, **kwargs: object) -> object:
+        shard = kwargs["partition"]["cik_shard"]
+        if shard not in shards_written:
+            shards_written.append(shard)
+        if len(shards_written) > 1:
+            raise RuntimeError("simulated crash")
+        return write(root, **kwargs)
+
+    monkeypatch.setattr(stage, "write_partition_table", crash_on_second_shard)
+    with pytest.raises(RuntimeError):
+        match_pending_mentions(artifact_root=root, remint=True)
+    monkeypatch.undo()
+
+    match_pending_mentions(artifact_root=root)
+
+    pd.testing.assert_frame_equal(_instruments(root), _instruments(reference))
+    assert not (root / "runs" / "match" / "rebuild-pending.json").exists()
