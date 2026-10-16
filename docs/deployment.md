@@ -213,17 +213,18 @@ Normal daily processing is:
    batch extract job when classified work is pending and advances it one step per tick
    (extraction can span multiple hours/days per its 24h batch windows)
 4. when an extract job completes, that poll tick writes new `mentions` partitions and
-   re-runs match + finalize
+   re-runs match + publish
 5. outputs land under the configured artifact root in S3, and if `FINAL_DATABASE_ROOT` is
-   set, finalize publishes the five contract tables (`src/cdt/publish_contract.json`)
+   set, the publish writes the five contract tables (`src/cdt/publish_contract.json`)
    under it. Each is streamed to an immutable
    `<final database root>/snapshots/snapshot=<run_id>/<table>.parquet`, then a single
    `<final database root>/latest.json` pointer (run id, schema and contract versions,
-   per-table row counts and paths) is replaced as the atomic step — resolve the pointer
+   per-table row counts and paths relative to the final database root) is replaced as the atomic step — resolve the pointer
    to read a consistent generation across all tables. Each table is then copied to
    `<table>/latest.parquet`; each copy is atomic but the set is not consistent
-   mid-publish. A publish that would shrink a table below half its prior row count (or
-   empty it) is refused unless forced. Only the current and prior generations are
+   mid-publish. A publish that would shrink a table other than
+   `debt-instrument-redirects` below half its prior row count (or empty it) is
+   refused unless forced. Only the current and prior generations are
    retained.
 6. the website publisher ([dsi-rse/commercial-debt-tracker-website](https://github.com/dsi-rse/commercial-debt-tracker-website)) reads the final
    database root's parquet and publishes `generated/*` JSON to R2; if it needs
@@ -341,9 +342,32 @@ new filings only. Stored rows keep the old output until they are forced:
   heartbeat alarm) until `cdt segment --genres 6-K --force`.
 - **Amount parser.** Amounts are parsed at extraction and stored in
   `mentions`; only `cdt run poll --force` re-reads them.
+- **6-K triage.** A filing already judged with the same window spans keeps its
+  verdicts; the done set does not key on the stage-1 model, its threshold or
+  the stage-2 prompt. After changing any of them, run
+  `cdt classify --genres 6-K --force`.
 - **Matcher.** A change to clustering without a `MATCHER_SCHEMA_VERSION` bump
   reaches existing instruments on `cdt match --force`, which re-clusters every
-  CIK and keeps instrument ids that still share members.
+  CIK and keeps instrument ids that still share members. A forced or reminting
+  match that stops part-way is repeated by the next run.
+
+### When a stored format changes
+
+Nothing migrates stored state during the beta. A change the code cannot read
+in place (a dataset layout, the publish contract's tables) is deployed by
+rebuilding:
+
+1. Pause the poll (`idi:poll_schedule_enabled: "false"`, deploy) so no tick
+   reads old-format state.
+2. Delete everything under the artifact root (`processors/cdt/`) except
+   `documents/`, `documents-sixk/` and `raw-documents/sixk/`, and delete the
+   final database root (`database/cdt/`). The final database root matters too:
+   the publish compares each table with its old `latest.parquet`, and a
+   rebuild from empty (or an `items` table now cut to referenced rows) shrinks
+   past the guard, so every tick would refuse to publish and exit non-zero.
+   Instead of deleting it, the first publish can run with `--force-publish`.
+3. Rebuild with `cdt run daily --force` (or a historical backfill), then
+   re-enable the poll.
 
 ## Prod Launch Checklist
 

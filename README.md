@@ -22,8 +22,8 @@ CDT is intentionally file-native. Canonical state lives under one artifact root 
 
 This avoids a mutable database dependency and keeps reruns deterministic:
 
-- date-partitioned stages write `documents`, `items`, `classifications`, and `mentions` (and their 6-K counterparts `documents-sixk`, `sixk-windows`, `sixk-snippets`)
-- CIK-sharded matcher outputs write `mention-cluster-edges` and `debt-instruments`
+- ingest writes `documents` and `documents-sixk` by filing date; the derived stages write one file per month to `items`, `classifications` and `mentions` (and the 6-K counterparts `sixk-windows`, `sixk-snippets`)
+- CIK-sharded matcher outputs write `mention-cluster-edges`, `debt-instruments` and `debt-instrument-redirects`
 - stage manifests and extractor audit logs are written alongside those datasets
 
 See [docs/schema.md](docs/schema.md) for the concrete layout, including the optional `latest.parquet` final snapshots.
@@ -44,7 +44,7 @@ The deployed service is a single ECS Fargate task running `cdt run`, with:
 The deployed `daily` run does ingest → segment → classify for each genre (8-K and
 6-K), and refreshes match/final snapshots, but hands the expensive LLM extract stage to OpenAI's Batch API. The hourly
 `poll` run advances that asynchronous batch job one step at a time and re-runs match +
-finalize when it completes. See [docs/architecture.md](docs/architecture.md) for the
+publish when it completes. See [docs/architecture.md](docs/architecture.md) for the
 extract state machine.
 
 The GitHub Actions deployment path is the shared processor pipeline
@@ -120,7 +120,7 @@ For local development with a shared `DATA_DIR`:
 
 - CDT writes canonical working artifacts to `DATA_DIR`
 - CDT writes dashboard-facing final snapshots to `DATA_DIR/database/cdt`
-- the website repo reads the `latest.json` pointer there (or the `latest.parquet` files) and builds its local `generated/*.json` snapshot from them; `src/cdt/publish_contract.json` lists every column and payload shape it can rely on
+- the website repo reads the `latest.parquet` files there and builds its local `generated/*.json` snapshot from them; the `latest.json` pointer beside them names one consistent generation for a reader that needs it, and `src/cdt/publish_contract.json` lists every column and payload shape a reader can rely on
 
 The dashboard-facing files are:
 

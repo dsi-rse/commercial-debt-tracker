@@ -48,16 +48,16 @@ Optional final snapshot layout:
   debt-instrument-redirects/latest.parquet
 ```
 
-Every published table has exactly the columns and Arrow types `src/cdt/publish_contract.json` lists, and every `*_json` column there has its documented shape (see [Publish contract](#publish-contract)). `debt-instrument-mentions` is the `mentions` dataset. `items` is the union of `items` (8-K) and `sixk-snippets` (6-K), cut to the rows some mention references, projected to the `items` columns plus a `form_type` column stamped `8-K` or `6-K` by the dataset each row came from. `latest.json` names the current consistent generation: run id, `schema_version`, `contract_version`, `publish_format_version`, and each table's snapshot path and row count. A reader resolves every table from it; each `<table>/latest.parquet` is a copy refreshed after the pointer, atomic on its own but not consistent as a set mid-publish.
+Every published table has exactly the columns and Arrow types `src/cdt/publish_contract.json` lists, and every `*_json` column there is written in its documented shape (see [Publish contract](#publish-contract)); the publish logs a warning when a contract column is in no source partition (it publishes all null) or when sampled payloads break their shape. `debt-instrument-mentions` is the `mentions` dataset. `items` is the union of `items` (8-K) and `sixk-snippets` (6-K), cut to the rows some mention references, projected to the `items` columns plus a `form_type` column stamped `8-K` or `6-K` by the dataset each row came from. `latest.json` names the current consistent generation: run id, `schema_version`, `contract_version`, `publish_format_version`, and each table's row count and snapshot path, relative to the final database root. A reader resolves every table from it; each `<table>/latest.parquet` is a copy refreshed after the pointer, atomic on its own but not consistent as a set mid-publish.
 
 ### Publish contract
 
 `src/cdt/publish_contract.json` is owned by CDT and vendored by the website. It holds:
 
-- `contract_version`, stamped into `latest.json`; changing the contract bumps it and `publish.PUBLISH_FORMAT_VERSION`.
+- `contract_version`, stamped into `latest.json`; a change a reader must know about bumps it. The publish gate hashes the file's bytes, so any edit republishes.
 - `tables`: each published table's `primary_key` and `columns` (name and Arrow type, in order). The publish writes exactly these, so a column on disk that the contract does not name is never published.
 - `payloads.spans`: the keys every evidence span carries.
-- `payloads.columns`: for each `*_json` column, its `container` (`object`, or `array` of objects or of strings), the `keys` every object always carries, and a `version`.
+- `payloads.columns`: for each `*_json` column, its `container` (`object`, or `array` of objects or of strings), the `keys` every object always carries, a `version`, and, under `nested`, the shape of an object-valued key when it is not null (`status_json.status_date`).
 
 `tests/test_publish_contract.py` checks that the contract names exactly the code's column lists with the declared types, and that a published fixture's tables and payloads have the contract's shapes.
 
@@ -471,7 +471,6 @@ Columns:
 - `match_score`: Numeric matcher confidence score for the candidate relationship.
 - `candidate_rank`: Rank of this candidate among evaluated instrument candidates for the mention.
 - `match_via`: Short explanation of which feature family drove the match decision.
-- `evaluated_run_id`: Matcher run identifier that evaluated the relationship.
 
 ### `debt-instruments`
 
@@ -500,6 +499,13 @@ Columns:
 - `parties_json`: JSON aggregation of party clusters from direct mentions, deduped by role plus normalized canonical name.
 - `lender_disclosure`: The instrument's worst-case answer across its direct mentions. `collective_present` wins outright — one filing showing a collective lender phrase means holders are hidden however many others name some — and `complete` beats `none_named`, so a filing that named every lender is not erased by one that named none.
 
+**No lifecycle `status` is published here, by design.** The publisher derives
+it at publish time against an explicit `asOf` recorded alongside `generatedAt`
+(`dsi-rse/commercial-debt-tracker-website#15`). Every input it needs is already
+published: the lineage pointers, `start_date`, `maturity_date` and
+`commitment_termination_date`, and the member mentions' own `status`,
+`status_date` and `dates_json`. See Design notes for why.
+
 Primary key: `debt_instrument_id`
 
 ### `debt-instrument-redirects`
@@ -511,14 +517,12 @@ took over, so a link to the old id can be sent to the right page.
 - `debt_instrument_id`: The live instrument that took most of its members. A redirect whose target later stops being used follows that target's redirect, so every target is live.
 - `cik`: The issuer's normalized CIK.
 
-Primary key: `old_debt_instrument_id`
+An id that retired with no single successor (two instruments of one
+re-extracted item that content cannot tell apart) has no row. The publish
+shrink guard does not check this table: it shrinks whenever a retired id comes
+back into use.
 
-**No lifecycle `status` is published here, by design.** The publisher derives
-it at publish time against an explicit `asOf` recorded alongside `generatedAt`
-(`dsi-rse/commercial-debt-tracker-website#15`). Every input it needs is already
-published: the lineage pointers, `start_date`, `maturity_date` and
-`commitment_termination_date`, and the member mentions' own `status`,
-`status_date` and `dates_json`. See Design notes for why.
+Primary key: `old_debt_instrument_id`
 
 ## Run Metadata
 

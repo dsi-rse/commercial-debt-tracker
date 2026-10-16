@@ -43,9 +43,9 @@ There are two version functions because they answer different questions.
 identical bytes counts as a change. That is the right trade for the question
 "does this partition need reprocessing?", because a false positive costs only
 one redundant partition. It is the wrong trade for "may we skip re-reading the
-whole corpus?". The matcher rewrites every shard on every run, usually with
-byte-identical content, so an mtime-based check would differ every time and
-the skip would never fire. A guard that silently always says "changed" is the
+whole corpus?". A forced match or a month rewritten with the same rows
+changes the mtime but not the bytes, so an mtime-based check would say
+"changed" after every such run and the skip would rarely fire. A guard that silently always says "changed" is the
 failure `artifact_content_versions` was written to replace. Locally it hashes
 the bytes, which is cheaper than the parquet decode the skip can avoid. On S3
 it costs nothing extra, because the ETag of a single-part `put_object` (which

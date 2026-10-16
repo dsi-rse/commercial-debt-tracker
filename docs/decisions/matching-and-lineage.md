@@ -58,12 +58,6 @@ repeated round amounts. Without the gate, a single amount collision merges
 dozens of distinct bonds. Above two mentions that share one compatible name,
 the name counts as generic for that issuer, and the relaxed key rule turns off.
 
-## `name_class_sizes`
-
-Synthesized prior states carry their successor's name verbatim, so they are not
-other instruments bearing that name. Counting them pushed the class past the
-gate and split a mention out of the cluster it had always joined (#203).
-
 ## `name_fingerprints_are_compatible`, `NAME_MIN_SHARED_TOKENS`, `NAME_CLASS_TOKEN`
 
 Requiring equal names is too strict for the filing sequence. An announcement
@@ -139,19 +133,11 @@ live obligation.
 
 ## `apply_observation_columns`
 
-The rollup and the lineage rules share `first_seen_filing_date`: the lineage
-rules read it as both the ordering guard and the chain sort key, and the rollup
-rewrites it from the member edges. If the rollup ran only after inference, a
-pass could infer against a value that it then overwrote. Pass N+1 would then
-see a different corpus than pass N: on a row whose members are gone, pass 1
-yields one link and nulls the column, and pass 2 adds a link that pass 1
-refused. Rows like that arise naturally. Re-extracting an item mints a new
-content-hash mention id, the old member edge is never deleted, and the old
-instrument survives with `mention_count` 0. So the observation columns are
-recomputed both before and after inference (#211). Since the matcher builds
-rows only from current mentions, no row has members that are gone, but the
-order still matters: inference must read dates of the rows it is about to
-publish.
+The lineage rules read `first_seen_filing_date` as both the ordering guard and
+the chain sort key, so the observation columns are set from each row's members
+before inference runs (#211): inference must read the dates of the rows it is
+about to publish. Rows are built only from a CIK's current mentions, so every
+row has members.
 
 ## `derive_parent_links`
 
@@ -231,9 +217,26 @@ Every matching rule works within one CIK: candidates must share the CIK, name
 classes are counted per CIK, and the lender signatures, extracted pointers and
 lineage rules are all per CIK. So the CIK is the unit, and the 64 `cik_shard`
 files are only an I/O grouping. A run re-clusters, from all of their current
-mentions, exactly the CIKs whose set of mention ids changed (a digest per
-normalized CIK in `runs/match/cik-digests/`), then runs lineage for those same
-CIKs. It never extends clusters an earlier run built.
+mentions, exactly the CIKs whose mentions changed (a digest per normalized CIK
+in `runs/match/cik-digests/`), then runs lineage for those same CIKs. It never
+extends clusters an earlier run built.
+
+The digest covers each mention's id and every other column the matcher reads
+that the id does not hash (`DIGEST_COLUMNS`: the mention-id columns are
+`MENTION_ID_COLUMNS`). A digest of ids alone missed a change to
+`amendment_of`, `retired_by_json`, `company_name` and the like, so the CIK was
+never re-matched and its published rows went stale until a `--force` (#290).
+All of those columns are short, so the scan stays cheap.
+
+A shard's tables are written redirects first, then instruments, then edges,
+then the shard's digests. Retired ids are worked out from the stored edges, so
+a run that stops before the edges are written retires the same ids again;
+writing the edges first lost that run's redirects for good (#291). A full
+rebuild (`--force`, `--remint` or a stale schema) writes
+`runs/match/rebuild-pending.json` before it starts and deletes it after the
+manifest. Shards it finished already have current digests, so without the
+marker the next ordinary run would skip the rest and publish a mix of content
+and carried ids (#294).
 
 The matcher used to extend existing clusters, scoring only mentions with no
 member edge yet and then running a separate lineage pass over the whole
@@ -258,8 +261,8 @@ With the per-CIK design, on `genwindow-run-branch` (669 mentions, 193 CIKs) a
 full match, two halves forward and the newer half first all give the same 542
 clusters; the backfill order gives 16 of 669 mentions a different carried id,
 and after `--remint` every order gives identical ids. A full rematch takes
-3.4 s. A daily run whose mentions did not change reads two columns of the
-mentions dataset and writes nothing.
+3.4 s. A daily run whose mentions did not change reads the digest columns of
+the mentions dataset and writes nothing.
 
 **Ties never depend on ids.** Scoring ties are broken by the cluster's seed
 sort key (its smallest member `mention_sort_key`), not by its id, so how ids
@@ -278,21 +281,38 @@ earliest member and changes every URL); a separate persisted id map (another
 store to keep consistent); and the chosen one, a content id when a cluster is
 first seen, carried forward by member overlap.
 
-- Overlap is counted on mention ids first and on item ids second; 8-K item ids
-  survive re-extraction, so a re-extracted item keeps its cluster's id. 6-K
-  item ids name the snippet span, so a re-windowed 6-K filing loses both and
-  gets a new id, which the redirect records.
+- Overlap is counted on mention ids first. 8-K item ids survive
+  re-extraction while mention ids do not, so a cluster that shares no
+  mentions with a previous instrument can still pair with it through shared
+  items. An item often holds several instruments, and every old instrument of
+  a re-extracted item then shares that item with every new cluster from it;
+  pairing on items alone swapped a revolver's and a term loan's ids in one
+  item with no redirect (on `genwindow-run-branch`, renaming every mention id
+  moved 246 of 542 instruments to another's id, #289). So an item-only pair
+  also needs content agreement: how many of the previous instrument's name
+  fingerprint, type, start date, maturity and rate some member states (at
+  least one), ranked before shared items. A pairing still tied at its level
+  (two clusters for one old id, or two old ids for one cluster) is ambiguous:
+  neither side carries, and the old id gets no redirect, because a new id is
+  safe and a wrong one silently opens a different instrument. 6-K item ids
+  name the snippet span, so a re-windowed 6-K filing shares neither and gets a
+  new id.
 - Pairs are taken greedily, largest overlap first, each previous id used at
   most once, so when two clusters merge the larger keeps its id.
-- An id no longer used gets a redirect to the cluster that took most of its
-  members; redirects follow a retired target, so every target is live.
+- An id no longer used gets a redirect to its best admissible pair's cluster;
+  redirects follow a retired target, so every target is live.
 - Carried ids depend on history: two roots built in different orders get the
   same clusters but can label them differently. `cdt match --remint` replaces
   every id with its content id, once, before the first public publish.
 - The `di::` prefix keeps instrument ids distinct from mention ids (`dim::`).
 
-## `name_class_sizes`: one comparison per pair of distinct names
+## `name_class_sizes`
 
+Synthesized prior states carry their successor's name verbatim, so they are not
+other instruments bearing that name. Counting them pushed the class past the
+gate and split a mention out of the cluster it had always joined (#203).
+
+**One comparison per pair of distinct names.**
 Counting compatible names pairwise over an issuer's mentions was O(n²), and
 one 4,048-mention CIK took 31 s to match (#269). The count now compares each
 distinct fingerprint once against the issuer's distinct fingerprints. That
