@@ -45,7 +45,11 @@ CONTENT_FIELDS = (
     "start_date",
     "maturity_date",
     "interest_rate_pct",
+    "principal_amount",
 )
+
+#: Content fields compared as numbers, so ``690000000`` equals ``690000000.00``.
+_DECIMAL_FIELDS = frozenset({"interest_rate_pct", "principal_amount"})
 
 
 @dataclass(frozen=True)
@@ -107,7 +111,7 @@ def _row_content(row: dict[str, object]) -> dict[str, str]:
 
 def _comparable(name: str, value: str | None) -> str | None:
     """Return a content value in the form both sides compare in."""
-    if value is None or name != "interest_rate_pct":
+    if value is None or name not in _DECIMAL_FIELDS:
         return value
     try:
         return format(Decimal(value).normalize(), "f")

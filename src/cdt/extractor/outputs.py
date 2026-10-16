@@ -495,7 +495,9 @@ def finalize_extract_outputs(
     fingerprint and prior terminal item_ids (from
     ``collect_pending_extract_items``), so completion is recorded per row
     outcome rather than per visit. Mentions are grouped by month and each
-    month file is written once, merged per item.
+    month file is written once, merged per item. A row whose item no claimed
+    classification file of its month still lists as relevant (the month was
+    rewritten while the job ran) is retired instead of written.
     """
     resolved_root = resolve_artifact_root(artifact_root)
     outcomes = RowOutcomes(run_id=run_id, backend="batch")
@@ -528,6 +530,22 @@ def finalize_extract_outputs(
             str(item) for item in cast(list[object], claim.get("prior_item_ids") or [])
         }
         retired_by_month.setdefault(month, set()).update(prior_ids - relevant_ids)
+    # A row whose item left its month while the job was in flight (the month
+    # was re-segmented or reclassified) is retired, not written: no later
+    # claim lists it as done, so nothing would prune its mentions.
+    relevant_by_month: dict[str, set[str]] = {}
+    for classification_path, relevant_ids in relevant_by_path.items():
+        month = source_partition_month(parse_source_partition(classification_path))
+        relevant_by_month.setdefault(month, set()).update(relevant_ids)
+    for month, relevant_ids in relevant_by_month.items():
+        vanished = terminal_by_month.get(month, set()) - relevant_ids
+        if vanished:
+            retired_by_month.setdefault(month, set()).update(vanished)
+            mentions_by_month[month] = [
+                row
+                for row in mentions_by_month[month]
+                if str(row["item_id"]) not in vanished
+            ]
     # A month whose rows were all done already contributes no mention rows,
     # but may still have ids to prune.
     for month, retired_ids in retired_by_month.items():

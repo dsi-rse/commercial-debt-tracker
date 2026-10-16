@@ -397,6 +397,45 @@ def test_re_extracting_an_item_keeps_each_instruments_id(
     assert read_dataset(debt_instrument_redirects_root(tmp_path)).empty
 
 
+def _two_tranche_item(
+    first_id: str = "m-large", second_id: str = "m-small"
+) -> list[dict[str, object]]:
+    """One 8-K item describing two same-named note tranches of different sizes."""
+    common = {
+        "item_id": "item-1",
+        "accession_number": "0001",
+        "cik": "320193",
+        "date": "2024-01-10",
+        "start_date": "2024-01-10",
+        "name": "Convertible Senior Notes",
+        "instrument_type": "notes",
+    }
+    return [
+        build_mention_row(mention_id=first_id, amount="$1.6 billion", **common),
+        build_mention_row(mention_id=second_id, amount="$690 million", **common),
+    ]
+
+
+@pytest.mark.parametrize(
+    "new_ids", [("m-a-large", "m-z-small"), ("m-z-large", "m-a-small")]
+)
+def test_re_extracted_tranches_that_differ_only_by_amount_keep_their_ids(
+    tmp_path: Path, new_ids: tuple[str, str]
+) -> None:
+    """Principal amount tells same-named tranches of one item apart (#302)."""
+    _write(tmp_path, pd.DataFrame(_two_tranche_item()))
+    match_pending_mentions(artifact_root=tmp_path)
+    before = _instruments(tmp_path).set_index("principal_amount")["debt_instrument_id"]
+    assert len(before) == 2
+
+    _write(tmp_path, pd.DataFrame(_two_tranche_item(*new_ids)))
+    match_pending_mentions(artifact_root=tmp_path)
+
+    after = _instruments(tmp_path).set_index("principal_amount")["debt_instrument_id"]
+    assert after.to_dict() == before.to_dict()
+    assert read_dataset(debt_instrument_redirects_root(tmp_path)).empty
+
+
 def test_indistinguishable_instruments_of_one_item_get_new_ids() -> None:
     """When content cannot tell two re-extracted instruments apart, neither carries."""
     index = {
@@ -598,22 +637,27 @@ def test_a_merge_publishes_a_redirect_from_the_retired_id(tmp_path: Path) -> Non
     assert pairs.to_numpy().tolist() == [[retired, survivor]]
 
 
-def test_redirects_survive_a_crash_before_the_edges_are_written(
+def test_redirects_survive_a_crash_between_their_write_and_the_edges(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A run that stops after the redirects but before the edges retires them again (#291)."""
+    """A run that stops between the redirects and the edges keeps its redirects (#291).
+
+    The crash is on the instruments write, which comes after the redirects and
+    before the edges; with the edges written first, the rerun would see no
+    retired ids and the redirects would be lost.
+    """
     from cdt.matcher import stage
 
     ids, _ = _merge_alpha_into_beta(tmp_path)
     write = stage.write_partition_table
 
-    def crash_on_edges(root: object, **kwargs: object) -> object:
-        if "mention-cluster-edges" in str(root):
+    def crash_on_instruments(root: object, **kwargs: object) -> object:
+        if Path(str(root)).name == "debt-instruments":
             raise RuntimeError("simulated crash")
         return write(root, **kwargs)
 
     merge = {"strong_match_threshold": 0.75, "loose_match_threshold": 0.75}
-    monkeypatch.setattr(stage, "write_partition_table", crash_on_edges)
+    monkeypatch.setattr(stage, "write_partition_table", crash_on_instruments)
     with pytest.raises(RuntimeError):
         match_pending_mentions(artifact_root=tmp_path, force=True, **merge)
     monkeypatch.undo()

@@ -1335,6 +1335,16 @@ def test_unparseable_state_jsonl_self_heals(tmp_path: Path) -> None:
     assert _advance(tmp_path, client).status == "reset"
 
 
+def test_a_state_row_naming_an_invalid_month_is_corrupt_state() -> None:
+    """A stored month becomes a path, so anything but YYYY-MM is refused (#305)."""
+    line = _serialize_state_jsonl({"item-1": _awaiting_entry(NODEBT_TEXT)})
+    bad = line.replace('"month": "2024-01"', '"month": "../../tmp"')
+    assert bad != line
+
+    with pytest.raises(ValueError, match="invalid month"):
+        _load_state_jsonl(bad)
+
+
 def test_describe_active_job_reports_idle_active_and_corrupt(tmp_path: Path) -> None:
     """The read-only summary covers all three states without mutating anything."""
     assert describe_active_job(tmp_path).status == "idle"
@@ -1567,6 +1577,33 @@ def test_batch_job_pays_only_for_new_rows_after_partition_grows(
     assert second_job_rows == {"item-nodebt"}
     # The first job's mentions survived the second job's finalize.
     assert read_dataset(mentions_root(tmp_path))["name"].to_list() == ["Term Loan"]
+
+
+def test_an_item_gone_from_its_month_mid_job_publishes_no_mentions(
+    tmp_path: Path,
+) -> None:
+    """An item the daily run removed while the job was in flight is retired (#303).
+
+    Its mentions are dropped at finalize, not written for an item no
+    classification file lists any more, which nothing would ever prune.
+    """
+    seed_classification(tmp_path, [{"item_id": "item-multi", "text": MULTI_TEXT}])
+    client = FakeBatchClient(
+        {
+            "item-multi": {"ner": MULTI_NER, "instrument_ie": MULTI_IE},
+            "item-nodebt": {"ner": NODEBT_NER},
+        }
+    )
+    assert _advance(tmp_path, client).status == "submitted"
+
+    # The daily run re-segments the month: the claimed item's id is gone.
+    seed_classification(tmp_path, [{"item_id": "item-nodebt", "text": NODEBT_TEXT}])
+    _advance_until("completed", lambda: _advance(tmp_path, client))
+    assert read_dataset(mentions_root(tmp_path)).empty
+
+    _advance_until("completed", lambda: _advance(tmp_path, client))
+    assert read_dataset(mentions_root(tmp_path)).empty
+    assert _advance(tmp_path, client).status == "idle"
 
 
 def test_per_request_server_error_requeues_instead_of_terminating(

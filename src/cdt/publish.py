@@ -608,7 +608,7 @@ def _count_payload_problems(
                 continue
             try:
                 problem = payload_problem(json.loads(text), shape, span_keys)
-            except (TypeError, json.JSONDecodeError):
+            except (TypeError, ValueError, RecursionError):
                 problem = "not JSON"
             if problem is not None:
                 counts = problems.setdefault(column, {})

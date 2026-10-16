@@ -29,6 +29,7 @@ it.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -78,6 +79,7 @@ ACTIVE_JOB_FILENAME = "active.json"
 BATCH_ENDPOINT = "/v1/chat/completions"
 BATCH_COMPLETION_WINDOW = "24h"
 MAX_CUSTOM_ID_LENGTH = 64
+_MONTH = re.compile(r"\d{4}-\d{2}")
 # Stay comfortably under OpenAI's 50k-requests-per-batch limit.
 DEFAULT_MAX_REQUESTS_PER_BATCH = 40_000
 # OpenAI also caps batch input files by size (200 MB); chunk at half that so
@@ -589,10 +591,12 @@ def _load_state_jsonl(text: str) -> dict[str, RowEntry]:
             continue
         payload = json.loads(line)
         row_state = ExtractionRowState.from_state_dict(payload["row"])
-        source = payload["source"]
+        month = str(payload["source"]["month"])
+        if not _MONTH.fullmatch(month):
+            raise ValueError(f"Extract job state names an invalid month: {month!r}")
         rows[row_state.item_id] = RowEntry(
             row_state=row_state,
-            month=source["month"],
+            month=month,
             pending=cast(dict[str, object] | None, payload.get("pending")),
             resubmissions=int(cast(int, payload.get("resubmissions", 0))),
             infrastructure_rounds=int(

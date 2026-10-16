@@ -59,6 +59,7 @@ from cdt.datasets import (
     source_partition_month,
 )
 from cdt.ingest.core import DOCUMENT_COLUMNS
+from cdt.lease import throttled
 from cdt.partition_stage import PartitionOutput, run_partition_stage
 from cdt.segmenter.core import document_text_for_record, ensure_s3_client
 from cdt.segmenter.sixk import (
@@ -679,11 +680,11 @@ class _WindowPartitionTriage:
     set keeps its snippet rows from the ``sixk-snippets`` month file and makes
     no stage-2 call. The others are read from the 6-K documents partitions
     their date and accession place them in, and judged. The stage-1 model is
-    loaded on the first call. A month holding a filing whose spans no longer
-    match its text is held whole. When a stage-2 call fails on the provider or
-    transport, the month is written with that filing's earlier rows kept and
-    left pending, and its done set names only the filings judged, so the next
-    run judges only that filing again. Filings that failed for any other
+    loaded on the first call. A filing whose spans no longer match its text,
+    or whose stage-2 call failed on the provider or transport, keeps its
+    earlier rows and stays out of the done set; the month is written with
+    every other filing judged and left pending, so the next run judges only
+    the held filings again. Filings that failed for any other
     reason are not in the done set either. :meth:`report` logs and raises for
     what was held.
     """
@@ -955,12 +956,16 @@ def retry_failed_triage(
         concurrency=concurrency,
         max_attempts=max_attempts,
     )
+    # Stage-2 calls within one month renew too, as in a plain run.
+    keep_lease = throttled(renew) if renew is not None else None
     result = retry_failed_classifications(
         STAGE_NAME,
         source_dataset=SIXK_WINDOW_DATASET_NAME,
         output_dataset=SIXK_SNIPPET_DATASET_NAME,
         output_columns=SIXK_SNIPPET_COLUMNS,
-        classify_partition=triage,
+        classify_partition=lambda source_path, partition, accessions: triage(
+            source_path, partition, accessions, renew=keep_lease
+        ),
         artifact_root=resolved_root,
         renew=renew,
     )

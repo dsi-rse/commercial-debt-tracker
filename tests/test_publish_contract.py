@@ -307,6 +307,29 @@ def test_publish_warns_about_absent_columns_and_broken_payloads(
     assert "missing keys ['kind', 'role', 'spans'] x1" in caplog.text
 
 
+def test_a_payload_nested_past_the_parser_limit_is_reported_not_fatal(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A payload json cannot parse without recursing too deep still publishes (#305)."""
+    artifact_root = tmp_path / "artifacts"
+    mention = amended_row(**_production_payloads())
+    mention["parties_json"] = "[" * 100_000 + "]" * 100_000
+    write_partition_table(
+        mentions_root(artifact_root),
+        partition={"month": "2024-06"},
+        table=pd.DataFrame([mention], columns=DEBT_INSTRUMENT_MENTION_COLUMNS),
+    )
+
+    with caplog.at_level("WARNING"):
+        publish_final_tables(
+            artifact_root=str(artifact_root),
+            final_database_root=str(tmp_path / "final"),
+        )
+
+    assert "debt-instrument-mentions.parties_json has payloads" in caplog.text
+    assert "not JSON x1" in caplog.text
+
+
 def test_the_redirects_table_may_shrink_without_refusing_the_publish() -> None:
     """Redirects shrink when retired ids come back; every other table is guarded (#296)."""
     _guard_against_shrinkage(

@@ -982,6 +982,34 @@ def test_retry_triages_only_the_failed_filing_and_clears_its_entry(
     }
 
 
+def test_a_triage_retry_renews_the_lease_as_stage_two_calls_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The retry path renews per stage-2 call too, as a plain run does (#305)."""
+    from cdt.classifier import core, sixk
+
+    _two_filings(tmp_path)
+    segment_and_classify_pending(
+        artifact_root=str(tmp_path),
+        client=_FailsFirstFiling(keep_all=True),
+        concurrency=1,
+        max_attempts=1,
+    )
+    renewals: list[int] = []
+    client = FakeChatClient(keep_all=True)
+    for module in (core, sixk):
+        monkeypatch.setattr(module, "throttled", lambda renew, **_: renew)
+
+    retry_failed_triage(
+        artifact_root=str(tmp_path),
+        client=client,
+        renew=lambda: renewals.append(len(client.calls)),
+    )
+
+    # A renewal after the one stage-2 call, then one before the month write.
+    assert renewals == [1, 1]
+
+
 def test_a_retry_that_fails_again_keeps_the_entry_with_the_new_error(
     tmp_path: Path,
 ) -> None:
