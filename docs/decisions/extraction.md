@@ -305,6 +305,19 @@ The one seam between what the model returned for an item and what the pipeline w
 
 There are two reasons to write a mentions partition: new mentions to add, or stored ids to remove. The second matters when an item that is still relevant is re-extracted and this time yields *no* mentions: its previous rows must be withdrawn or the pipeline keeps publishing facts the newer pass retracted (#209). `retired_item_ids` cannot carry that case (it is `done_item_ids - relevant_item_ids`, and the item is still relevant), and `replaced_item_ids & pending.done_item_ids` is empty under `--force` by construction, because `pending_extract_partitions` sets `done_item_ids=frozenset()` for a forced partition. Both backends had each failed one of those ways, so the rule lives in one place and asks the stored partition directly. "Ids to remove" is not simply `replaced_item_ids`: on a first-ever extraction that yields nothing every claimed id is replaced and there is nothing to purge, and writing then would create an empty parquet file where the contract is to create none (`test_extract_pending_items_skips_empty_outputs_on_rerun`).
 
+### `finalize_extract_outputs`: items that left their month mid-job
+
+A batch job holds its claim for hours or days, and `cdt run daily` can rewrite
+the claimed classification month meanwhile: a re-segmented 8-K item or a
+re-windowed 6-K snippet gets a new id, and the old one is gone. Retiring only
+`prior_item_ids - relevant_ids` missed the ids the job itself extracted: their
+mentions were written, the completion entry left them out, so no later claim
+listed them and nothing pruned them, and publish emitted mentions with no
+`items` row (#303). Finalize now retires every terminal id that no claimed
+classification file of its month still lists as relevant, and writes none of
+its mentions. The live backend claims and writes under one writer lease, so
+nothing can rewrite the month in between.
+
 ### `sampling_params`, `handle_response`, `handle_provider_abort`
 
 The live backend (OpenRouter chat completions, `run_extraction_workflow`) and the batch backend (OpenAI Batch, `cdt.extractor.batch`) drive the same stage objects and share every decision that could make their output differ: sampling parameters (reasoning models reject `temperature != 1`, so both decide from `REASONING_MODEL_PREFIXES` against the native model id), scoring (`handle_response`), abort handling (`handle_provider_abort`), what publishes (`published_mention_rows`), and how a mentions partition is rewritten (`write_mentions_partition`), along with the per-row records, completion entries and run records (`RowOutcomes`, `completion_entry`, `write_run_records`). Each backend only classifies transport outcomes before handing a response to the shared path.

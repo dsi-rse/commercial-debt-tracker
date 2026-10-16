@@ -48,7 +48,7 @@ Optional final snapshot layout:
   debt-instrument-redirects/latest.parquet
 ```
 
-Every published table has exactly the columns and Arrow types `src/cdt/publish_contract.json` lists, and every `*_json` column there is written in its documented shape (see [Publish contract](#publish-contract)); the publish logs a warning when a contract column is in no source partition (it publishes all null) or when sampled payloads break their shape. `debt-instrument-mentions` is the `mentions` dataset. `items` is the union of `items` (8-K) and `sixk-snippets` (6-K), cut to the rows some mention references, projected to the `items` columns plus a `form_type` column stamped `8-K` or `6-K` by the dataset each row came from. `latest.json` names the current consistent generation: run id, `schema_version`, `contract_version`, `publish_format_version`, and each table's row count and snapshot path, relative to the final database root. A reader resolves every table from it; each `<table>/latest.parquet` is a copy refreshed after the pointer, atomic on its own but not consistent as a set mid-publish.
+Every published table has exactly the columns and Arrow types `src/cdt/publish_contract.json` lists, and every `*_json` column there is written in its documented shape (see [Publish contract](#publish-contract)); the publish logs a warning when a contract column is in no source partition (it publishes all null) or when sampled payloads break their shape. `debt-instrument-mentions` is the `mentions` dataset. `items` is the union of `items` (8-K) and `sixk-snippets` (6-K), cut to the rows some mention references, projected to the `items` columns plus a `form_type` column stamped `8-K` or `6-K` by the dataset each row came from. `latest.json` names the current consistent generation: `run_id`, `written_at`, `schema_version`, `contract_version`, `publish_format_version`, `tables` (each table's `rows` and snapshot `path`, relative to the final database root) and `source_digest` (what the publish gate compares; absent while a publish is mid-copy). A reader resolves every table from it; each `<table>/latest.parquet` is a copy refreshed after the pointer, atomic on its own but not consistent as a set mid-publish.
 
 ### Publish contract
 
@@ -106,11 +106,14 @@ of partitions:
   A resumed run pays only for rows with no verdict. The batch backend persists every row's state at each tick and sizes
   its work with `cdt run poll`'s `--max-rows-per-job`,
   `--max-requests-per-batch` and `--max-batch-bytes`.
-- `match`: re-clusters only the CIKs whose set of mention ids changed since the
-  last run (`runs/match/cik-digests/cik_shard=NNNN.json`, one digest per
-  normalized CIK), and rewrites only the shards they live in, renewing the
-  lease per shard. A shard's digests are written after its tables, so a run
-  that stops part-way leaves those CIKs for the next one. The affected CIKs'
+- `match`: re-clusters only the CIKs whose mentions changed since the last run
+  (`runs/match/cik-digests/cik_shard=NNNN.json`, one digest per normalized CIK
+  over every mention column the matcher reads), and rewrites only the shards
+  they live in, renewing the lease per shard. A shard's digests are written
+  after its tables, so a run that stops part-way leaves those CIKs for the next
+  one. A full rebuild (`--force`, `--remint` or a stale schema) that stops
+  part-way leaves `runs/match/rebuild-pending.json`, and the next run repeats
+  it. The affected CIKs'
   mentions are read with one filtered scan per batch of shards
   (`MENTION_READ_BATCH_ROWS`).
 - `ingest`: `--flush-rows` (`cdt run`: `--ingest-flush-rows`, default 100) is a
@@ -476,7 +479,7 @@ Columns:
 
 Columns:
 
-- `debt_instrument_id`: Canonical entity identifier for one consolidated debt instrument history: `di::` and a digest. A cluster that shares members with one of its CIK's previous clusters keeps that cluster's id (largest overlap of mention ids, then of item ids); a cluster with no previous overlap gets the digest of its CIK and its smallest member `mention_sort_key` (`cdt.matcher.identity`). `cdt match --remint` gives every cluster that content id.
+- `debt_instrument_id`: Canonical entity identifier for one consolidated debt instrument history: `di::` and a digest. A cluster that shares mentions with one of its CIK's previous clusters keeps that cluster's id (the largest overlap wins). A cluster that shares only items with a previous one, as after a re-extraction, keeps its id only if some member states at least one of that instrument's name fingerprint, type, start date, maturity, rate or principal amount; more agreeing values win, then more shared items. A pairing that still ties gets a new id and no redirect. Any other cluster gets the digest of its CIK and its smallest member `mention_sort_key` (`cdt.matcher.identity`). `cdt match --remint` gives every cluster that content id.
 - `cik`: Issuer CIK shared by the instrument's directly matched mentions, zero-padded.
 - `company_name`: Issuer display name resolved from the instrument's directly matched mentions, falling back to the newest name any mention for the same CIK carries.
 - `seed_debt_instrument_mention_id`: The member mention that sorts first (`mention_sort_key`).
@@ -545,6 +548,7 @@ These stages overwrite a `latest` manifest, named by their completion-registry s
 <artifact-root>/runs/sixk-classify/run_id=latest.json  # 6-K classify (triage)
 <artifact-root>/runs/match/run_id=latest.json
 <artifact-root>/runs/match/cik-digests/cik_shard=NNNN.json   # {schema_version, ciks: {cik: digest}}
+<artifact-root>/runs/match/rebuild-pending.json            # {remint}; only while a full rebuild is unfinished
 ```
 
 The four segment and classify manifests share one shape (`cdt.partition_stage`):

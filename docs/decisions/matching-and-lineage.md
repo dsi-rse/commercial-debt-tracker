@@ -120,7 +120,8 @@ A mention that ties several existing clusters on its name belongs to at most
 one of them. Seeding another cluster is never right, and it guarantees that
 every later mention of the series ties too. That cascade produced 263 ambiguous
 edges on the 2026-09 window. The tie-break order is: the exact name, then a
-live cluster over a retired one, then the largest cluster, then the id.
+live cluster over a retired one, then the largest cluster, then the earliest
+seeded (`seed_sort_key`).
 
 ## `TERMINAL_STATUS_EVENTS`, `apply_lifecycle_rollup`: no lifecycle status
 
@@ -259,9 +260,9 @@ different orders:
 
 With the per-CIK design, on `genwindow-run-branch` (669 mentions, 193 CIKs) a
 full match, two halves forward and the newer half first all give the same 542
-clusters; the backfill order gives 16 of 669 mentions a different carried id,
-and after `--remint` every order gives identical ids. A full rematch takes
-3.4 s. A daily run whose mentions did not change reads the digest columns of
+clusters. Split at the median month, the newer half first gives 40 of 669
+mentions a different carried id and reverse month order 138; after `--remint`
+every order gives identical ids. A full rematch takes 1.8 s. A daily run whose mentions did not change reads the digest columns of
 the mentions dataset and writes nothing.
 
 **Ties never depend on ids.** Scoring ties are broken by the cluster's seed
@@ -290,8 +291,12 @@ first seen, carried forward by member overlap.
   item with no redirect (on `genwindow-run-branch`, renaming every mention id
   moved 246 of 542 instruments to another's id, #289). So an item-only pair
   also needs content agreement: how many of the previous instrument's name
-  fingerprint, type, start date, maturity and rate some member states (at
-  least one), ranked before shared items. A pairing still tied at its level
+  fingerprint, type, start date, maturity, rate and principal amount some
+  member states (at least one), ranked before shared items. Without the
+  amount, same-named tranches such as $1.6B and $690M convertible notes in one
+  item tied and lost their ids (#302). With it, renaming every mention id
+  moves no id and keeps 534 of 542; the 8 that get new ids agree on every
+  compared field with another instrument of their item. A pairing still tied at its level
   (two clusters for one old id, or two old ids for one cluster) is ambiguous:
   neither side carries, and the old id gets no redirect, because a new id is
   safe and a wrong one silently opens a different instrument. 6-K item ids

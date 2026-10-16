@@ -218,8 +218,9 @@ Normal daily processing is:
    set, the publish writes the five contract tables (`src/cdt/publish_contract.json`)
    under it. Each is streamed to an immutable
    `<final database root>/snapshots/snapshot=<run_id>/<table>.parquet`, then a single
-   `<final database root>/latest.json` pointer (run id, schema and contract versions,
-   per-table row counts and paths relative to the final database root) is replaced as the atomic step — resolve the pointer
+   `<final database root>/latest.json` pointer (run id, write time, schema, contract and
+   publish-format versions, per-table row counts and paths relative to the final
+   database root, and the source digest) is replaced as the atomic step — resolve the pointer
    to read a consistent generation across all tables. Each table is then copied to
    `<table>/latest.parquet`; each copy is atomic but the set is not consistent
    mid-publish. A publish that would shrink a table other than
@@ -355,19 +356,50 @@ new filings only. Stored rows keep the old output until they are forced:
 
 Nothing migrates stored state during the beta. A change the code cannot read
 in place (a dataset layout, the publish contract's tables) is deployed by
-rebuilding:
+rebuilding. Merging to `dev` is the deploy, so the pause has to land first:
 
-1. Pause the poll (`idi:poll_schedule_enabled: "false"`, deploy) so no tick
-   reads old-format state.
-2. Delete everything under the artifact root (`processors/cdt/`) except
-   `documents/`, `documents-sixk/` and `raw-documents/sixk/`, and delete the
-   final database root (`database/cdt/`). The final database root matters too:
-   the publish compares each table with its old `latest.parquet`, and a
-   rebuild from empty (or an `items` table now cut to referenced rows) shrinks
-   past the guard, so every tick would refuse to publish and exit non-zero.
-   Instead of deleting it, the first publish can run with `--force-publish`.
-3. Rebuild with `cdt run daily --force` (or a historical backfill), then
-   re-enable the poll.
+1. **Before the merge**, set `idi:poll_schedule_enabled: "false"` in
+   `pulumi/Pulumi.dev.yaml`, in the format-changing PR itself or a commit
+   that lands before it, so the deploy itself turns the poll off. Turning
+   the schedule off by hand is not enough: the deploy re-applies the file. A
+   tick of the new code against an in-flight old-format extract job cannot
+   read the job's state and abandons it with its paid batches. Run
+   `cdt extract job show` (or read `extract-batches/active.json`) to see
+   whether a job is in flight; its results are lost either way, because the
+   wipe deletes them.
+2. **After the deploy**, with no task running, delete everything under the
+   artifact root (`processors/cdt/`) except `documents/`, `documents-sixk/`,
+   `raw-documents/sixk/` and `inputs/` (the CIK lists `idi:cik_scope` and the
+   backfill read), and delete the final database root (`database/cdt/`). The
+   final database root matters too: the publish compares each table with its
+   old `latest.parquet`, and a rebuild from empty (or an `items` table now
+   cut to referenced rows) shrinks past the guard, so every tick would refuse
+   to publish and exit non-zero. Instead of deleting it, the first publish
+   can run with `--force-publish`, but the artifact-root wipe is not
+   optional: a publish over both layouts streams the old rows too and only
+   warns where they break the contract.
+3. **Rebuild** with `./scripts/run-historical.sh` over the whole date range
+   (see Historical Backfills; `run historical` has a 72 h watchdog against
+   `daily`'s 12 h).
+4. **Drain extraction**: set `idi:poll_schedule_enabled: "true"` and deploy.
+   Each tick advances the extract job; a tick that completes one matches and
+   publishes.
+5. **Remint and publish** once no extract work is pending (a tick reports
+   `idle`), with one-off tasks built like the historical run in
+   [docs/deployment-dev.md](deployment-dev.md), changing only the command
+   override:
+
+   ```text
+   "command": ["match", "--remint"]
+   "command": ["publish"]
+   ```
+
+   `cdt match --remint` gives every instrument its content id, so ids no
+   longer depend on the order the backfill ran in. It does not publish, and a
+   poll tick publishes only when an extract job completes, so the `publish`
+   task is what makes the reminted ids visible. Each command takes the writer
+   lease and exits 1 if a poll tick holds it (ticks start at :30 past the
+   hour); run it again after the tick.
 
 ## Prod Launch Checklist
 

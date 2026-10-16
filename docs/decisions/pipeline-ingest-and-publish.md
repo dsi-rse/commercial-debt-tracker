@@ -462,12 +462,6 @@ Stage commands rewrite the same completion registries and datasets as the
 scheduled runs. Writers that are not serialized lose registry updates and
 strand partitions (#88).
 
-### `run_match` (lineage always)
-
-An amend-and-restate chain spans filings, so its links exist only after every
-shard has matched (#170, #204). Every inferred pointer is re-derived, never
-carried over.
-
 ## Ingest (`cdt.ingest`)
 
 ### `run_ingest_pipeline` (`candidate_source`)
