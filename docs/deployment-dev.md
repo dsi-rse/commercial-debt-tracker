@@ -30,7 +30,7 @@ idi:cpu = 1024
 idi:memory = 4096
 idi:ecr_image_retention_count = 5
 idi:cron = cron(0 7 * * ? *)
-idi:schedule_enabled = false
+idi:schedule_enabled = true
 idi:poll_schedule_enabled = true
 ```
 
@@ -41,7 +41,7 @@ neither appears above.
 Notes:
 
 - `cron(0 7 * * ? *)` runs at `2:00 AM CDT` on May 31, 2026. Because EventBridge Scheduler cron expressions are UTC-based here, that becomes `1:00 AM CST` in winter.
-- `idi:schedule_enabled = false` is deliberate for the first deploy. Create the infrastructure, run a manual task, inspect outputs, and only then enable the daily schedule.
+- On a fresh stack, start with `idi:schedule_enabled = false`: create the infrastructure, run a manual task, inspect outputs, and only then enable the daily schedule. Dev's committed value is `true` since the beta rebuild of 2026-10-16.
 
 ## Local Setup (direnv + make)
 
@@ -189,7 +189,7 @@ cdt run daily
 
 It does not run `historical`.
 
-With the committed values, the daily schedule is off (`idi:schedule_enabled: false`) and the hourly poll is on (`idi:poll_schedule_enabled: true`), so `cdt run poll` starts every hour. It is cheap while there is nothing to extract, and it drains the batch job a manual historical run leaves behind. Nothing else runs automatically until you enable the daily schedule and deploy again.
+With the committed values, both schedules are on: `cdt run daily` at 07:00 UTC (`idi:schedule_enabled: true`) and `cdt run poll` every hour at :30 (`idi:poll_schedule_enabled: true`). The poll is cheap while there is nothing to extract, and it drains the batch job the daily run or a manual historical run leaves behind.
 
 ## Run a Historical Backfill Manually
 
