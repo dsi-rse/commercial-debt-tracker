@@ -243,9 +243,9 @@ Local note: `cdt run` and `cdt publish` read `FINAL_DATABASE_ROOT`, or take
 
 The scheduler state is controlled by the Pulumi `idi:schedule_enabled` setting
 (`idi:poll_schedule_enabled` overrides it for the poll schedule alone). As
-committed, the daily schedule is disabled in both stacks and the hourly poll is
-enabled in `dev` only (`pulumi/Pulumi.<stack>.yaml`); check those before
-assuming a scheduled run happened.
+committed, both schedules are enabled in `dev` and disabled in `prod`
+(`pulumi/Pulumi.<stack>.yaml`); check those before assuming a scheduled run
+happened.
 
 ### Run-time limits and batch tuning
 

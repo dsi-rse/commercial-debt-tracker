@@ -17,11 +17,9 @@ config:
   idi:memory: "4096"
   idi:ecr_image_retention_count: "5"
   idi:cron: cron(0 7 * * ? *)
-  idi:schedule_enabled: "false"
-  # The poller alone drives batch extraction, so manual historical runs drain
-  # without hand-fired ticks while the daily schedule stays off. On, to drain
-  # the beta backfill of 2026-10-16 (docs/deployment.md, "When a stored format
-  # changes", step 4).
+  # On since the beta rebuild of 2026-10-16: the daily run maintains the
+  # cik_scope list (new filings only) and the hourly poll drains its extraction.
+  idi:schedule_enabled: "true"
   idi:poll_schedule_enabled: "true"
   # Where every alarm notifies. Alerts stay off until the deploy role gains the
   # sns/cloudwatch/events statements from dsi-rse/idi-ftm2j-shared#79 — flipping
