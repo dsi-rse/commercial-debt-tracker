@@ -4,8 +4,10 @@ The scraper stores a 6-K as one object per document (body, then exhibits),
 with no whole-submission object, so this source assembles the submission by
 concatenating the stored ``<DOCUMENT>`` blocks in sequence order and mirrors it
 (:mod:`cdt.ingest.mirror`). The result is EDGAR's complete submission minus the
-``<SEC-HEADER>`` preamble; see ``docs/sixk-two-stage-triage.md`` for how that
-was checked.
+``<SEC-HEADER>`` preamble and minus any attachment the scraper stored as raw
+bytes rather than as a ``<DOCUMENT>`` block (a courtesy PDF, an image), which
+no downstream stage reads; see ``docs/sixk-two-stage-triage.md`` for how the
+assembly was checked.
 """
 
 from __future__ import annotations
@@ -58,35 +60,55 @@ def submission_url(cik: str, accession_number: str) -> str:
     )
 
 
-#: The marker every stored document must begin with for assembly to be
-#: faithful; checked by :func:`assemble_submission`.
+#: The marker a stored document begins with when it is a dissemination-format
+#: block; :func:`assemble_submission` keeps exactly those documents.
 DOCUMENT_MARKER = "<DOCUMENT>"
 
 
 class MalformedSubmissionError(RuntimeError):
-    """A stored document is not a dissemination-format ``<DOCUMENT>`` block."""
+    """No stored document of a filing is a dissemination-format ``<DOCUMENT>`` block."""
+
+
+def is_dissemination_document(document: str) -> bool:
+    """Return whether a decoded stored object is a ``<DOCUMENT>`` block.
+
+    The scraper stores a filing's text documents in dissemination format and
+    its binary attachments (courtesy PDFs, images) as the raw file, so this is
+    the test for "text a downstream stage can read".
+    """
+    return document.lstrip().startswith(DOCUMENT_MARKER)
 
 
 def assemble_submission(filing: ScrapedFiling, documents: list[str]) -> str:
     """Return one complete submission from a filing's stored documents.
 
-    ``documents`` are the decoded objects in submission order, concatenated
-    verbatim with no separator.
+    ``documents`` are the decoded objects in submission order. The
+    ``<DOCUMENT>`` blocks among them are concatenated verbatim with no
+    separator; any other object is left out, because it is a binary attachment
+    no stage reads and wrapping it would change the prose the triage stage sees.
+    A snippet's ``document_index`` counts the kept blocks, which is also what
+    :func:`cdt.segmenter.sixk.prose_documents` splits the result back into.
 
     Raises:
-        MalformedSubmissionError: If a document does not begin with
-            :data:`DOCUMENT_MARKER`.
+        MalformedSubmissionError: If no document is a ``<DOCUMENT>`` block.
     """
-    for index, document in enumerate(documents):
-        if not document.lstrip().startswith(DOCUMENT_MARKER):
-            msg = (
-                f"Document {index} of {filing.accession_number} does not begin "
-                f"with {DOCUMENT_MARKER}; the scraper's copies are stored in "
-                "dissemination format and assembling one that is not would "
-                "change the prose the triage stage reads."
-            )
-            raise MalformedSubmissionError(msg)
-    return "".join(documents)
+    kept = [document for document in documents if is_dissemination_document(document)]
+    if not kept:
+        msg = (
+            f"None of the {len(documents)} stored documents of "
+            f"{filing.accession_number} begins with {DOCUMENT_MARKER}; there is "
+            "no dissemination-format text to assemble."
+        )
+        raise MalformedSubmissionError(msg)
+    if len(kept) < len(documents):
+        LOGGER.info(
+            "Left %d of %d stored documents out of %s: not <DOCUMENT> blocks "
+            "(binary attachments such as a courtesy PDF)",
+            len(documents) - len(kept),
+            len(documents),
+            filing.accession_number,
+        )
+    return "".join(kept)
 
 
 def documents_in_sequence(filing: ScrapedFiling) -> list[str]:

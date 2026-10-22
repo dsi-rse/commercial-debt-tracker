@@ -421,7 +421,11 @@ flattened prose document was byte-identical, which is what carries the triage
 stage's measured behaviour over from the corpus it was scored on.
 `DOCUMENT_MARKER` is checked rather than assumed because a source that stopped
 keeping the `<DOCUMENT>` wrapper would change the prose the window stage reads,
-with nothing downstream able to tell. The mirror is written as UTF-8 because
+with nothing downstream able to tell. A stored object without the wrapper is a
+binary attachment (the scraper stores a courtesy PDF or an image as the raw
+file; 846 of the 13,842 6-Ks of the 32 partner-listed foreign filers carry one),
+so it is left out of the assembly and the filing keeps its text documents; only
+a filing with no `<DOCUMENT>` block at all fails. The mirror is written as UTF-8 because
 that is what `decode_document_bytes` produced; any other encoding would change
 the text the extractor quotes as evidence.
 

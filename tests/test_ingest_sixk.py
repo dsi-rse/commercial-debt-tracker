@@ -376,19 +376,48 @@ def test_ciks_filter_which_filings_are_acquired(tmp_path: Path) -> None:
     assert table["accession_number"].to_list() == [HARMONY_STORED]
 
 
-def test_malformed_document_fails_the_filing_permanently(tmp_path: Path) -> None:
-    """A document that is not a <DOCUMENT> block is a recorded, permanent failure.
+def test_binary_attachment_is_left_out_and_the_filing_is_kept(tmp_path: Path) -> None:
+    """A stored object that is not a <DOCUMENT> block is dropped, not fatal.
 
-    Assembly is only faithful because the scraper stores documents in
-    dissemination format. Concatenating one that is not would hand the window
-    stage prose nothing downstream could tell was different, so the filing fails
-    instead.
+    The scraper stores a courtesy PDF or an image as the raw file. No stage
+    reads it, so the filing's text documents are assembled without it and the
+    prose split that gives a snippet its document_index sees only them.
     """
     objects = _objects()
-    _, body_key, _ = _harmony_keys()
-    objects[(BUCKET, body_key)] = gzip.compress(
-        b"<html><body><p>bare document, no wrapper</p></body></html>"
+    _, _, exhibit_key = _harmony_keys()
+    objects[(BUCKET, exhibit_key)] = gzip.compress(
+        b"%PDF-1.4\r%\xef\xbf\xbd\r\n1 0 obj"
     )
+    client = FakeS3Client(objects)
+
+    table, result = acquire_scraped_sixk_documents(
+        _config(tmp_path), s3_client=client, return_documents=True
+    )
+
+    assert sorted(table["accession_number"].to_list()) == sorted(
+        [HARMONY_STORED, VALE_STORED]
+    )
+    assert result.failures == 0
+    mirror = mirror_path(
+        str(tmp_path), filing_date="2026-09-08", accession_number=HARMONY_STORED
+    )
+    documents = prose_documents(gzip.decompress(Path(mirror).read_bytes()).decode())
+    assert [document.document_type for document in documents] == ["6-K"]
+    assert "The Company issued notes." in documents[0].text
+
+
+def test_filing_with_no_document_block_fails_permanently(tmp_path: Path) -> None:
+    """A filing none of whose stored objects is a <DOCUMENT> block is a recorded, permanent failure.
+
+    Assembly is only faithful because the scraper stores text documents in
+    dissemination format. With no such document there is nothing the window
+    stage could read, so the filing fails instead of mirroring an empty text.
+    """
+    objects = _objects()
+    _, body_key, exhibit_key = _harmony_keys()
+    bare = gzip.compress(b"<html><body><p>bare document, no wrapper</p></body></html>")
+    objects[(BUCKET, body_key)] = bare
+    objects[(BUCKET, exhibit_key)] = bare
     client = FakeS3Client(objects)
 
     table, result = acquire_scraped_sixk_documents(
@@ -442,8 +471,9 @@ def test_manifest_without_documents_fails_the_filing(tmp_path: Path) -> None:
 def test_registered_failures_are_skipped_until_forced(tmp_path: Path) -> None:
     """A recorded permanent failure stops the next run re-reading the filing."""
     objects = _objects()
-    _, body_key, _ = _harmony_keys()
+    _, body_key, exhibit_key = _harmony_keys()
     objects[(BUCKET, body_key)] = gzip.compress(b"no wrapper")
+    objects[(BUCKET, exhibit_key)] = gzip.compress(b"no wrapper either")
     first_client = FakeS3Client(objects)
     acquire_scraped_sixk_documents(_config(tmp_path), s3_client=first_client)
 
@@ -482,10 +512,22 @@ def test_empty_form_types_is_rejected(tmp_path: Path) -> None:
         )
 
 
-def test_assemble_submission_rejects_a_document_without_its_wrapper() -> None:
+def test_assemble_submission_keeps_only_document_blocks() -> None:
+    """A stored object without the wrapper is left out; the blocks are joined verbatim."""
+    assert (
+        assemble_submission(
+            _filing(), [HARMONY_BODY, "%PDF-1.4 binary", HARMONY_EXHIBIT]
+        )
+        == HARMONY_BODY + HARMONY_EXHIBIT
+    )
+
+
+def test_assemble_submission_rejects_a_filing_with_no_document_block() -> None:
     """The check is on the unit under test, not only on a run."""
-    with pytest.raises(MalformedSubmissionError, match="does not begin with"):
-        assemble_submission(_filing(), [HARMONY_BODY, "<html>bare</html>"])
+    with pytest.raises(
+        MalformedSubmissionError, match="None of the 2 stored documents"
+    ):
+        assemble_submission(_filing(), ["<html>bare</html>", "%PDF-1.4 binary"])
 
 
 def test_documents_with_unusable_sequence_sort_last() -> None:
