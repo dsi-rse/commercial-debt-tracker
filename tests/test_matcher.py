@@ -1551,6 +1551,45 @@ def test_an_extracted_fixed_rate_stands_in_for_a_coupon_less_name() -> None:
     assert score(floating, profile_from(series), name_class_size=1) != []
 
 
+def test_a_prior_state_is_not_held_to_its_inherited_rate() -> None:
+    """A synthesized prior state's rate is its successor's, so it is no coupon.
+
+    A note repriced from 10% to 12% mints a prior state carrying 12%. Holding
+    it to that rate refused it from the 10% cluster it belongs to, and the
+    amendment chain broke.
+    """
+    original = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="m-original",
+            item_id="item-a",
+            name="Promissory Note",
+            start_date="2022-01-15",
+            maturity_date="2025-01-15",
+            principal_amount="10000000",
+            interest_rate_pct="10.0000",
+            interest_rate_kind="fixed",
+        )
+    )
+    prior = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="m-prior",
+            item_id="item-b",
+            date="2024-06-01",
+            name="Promissory Note",
+            start_date="2022-01-15",
+            maturity_date="2025-01-15",
+            principal_amount="10000000",
+            interest_rate_pct="12.0000",
+            interest_rate_kind="fixed",
+            synthesized_by="prior_state",
+            synthesized_from_mention_id="m-amended",
+        )
+    )
+
+    assert prior.coupons == frozenset()
+    assert len(score(prior, profile_from(original))) == 1
+
+
 def test_name_fingerprints_fold_plurals_worded_coupons_and_leading_amounts() -> None:
     """Spellings of one name that the filings use interchangeably compare equal (#320)."""
     fp = normalize_name_fingerprint
@@ -1566,9 +1605,13 @@ def test_name_fingerprints_fold_plurals_worded_coupons_and_leading_amounts() -> 
         "$500,000,000 aggregate principal amount of 3.75% Notes due March 1, 2016",
     ):
         assert fp(prefixed) == fp("3.75% Notes due March 1, 2016"), prefixed
-    # a coupon or a maturity year leading the name is not an amount
+    assert fp("CAD $500 million revolving facility") == "revolving facility"
+    assert fp("R1 000 million revolving credit facility") == "revolving credit facility"
+    # a coupon, a year or a class designator leading the name is not an amount
     assert fp("4.625% Senior Notes due 2028") == "4 625% senior note due 2028"
     assert fp("2027 Notes") == "2027 note"
+    assert fp("US 2027 Notes") == "us 2027 note"
+    assert fp("A1 Notes due 2030") != fp("A2 Notes due 2030")
 
 
 def test_a_worded_coupon_is_a_coupon() -> None:

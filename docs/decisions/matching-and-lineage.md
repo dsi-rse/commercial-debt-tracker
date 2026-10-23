@@ -123,6 +123,10 @@ wins because, where both exist, they disagree on 58 of 4,099 notes, and in
 those the extracted rate is a step-up or current rate: the coupon plus one
 point.
 
+A synthesized prior state uses only its name's coupons. Its extracted rate is
+its successor's, inherited because no `prior` rate is extracted, so after a
+repricing it would refuse the prior state from the cluster it belongs to.
+
 On the 2026-10-23 beta, multi-mention note clusters that mix extracted rates
 fall from 64 to 11. All 11 remaining carry one coupon in every name; only the
 extracted rate holds the step-up.
@@ -141,7 +145,10 @@ Three further spellings of one name are folded (#320):
   `€1,000,000,000 2.125% Fixed Rate Notes`, `US$2 billion revolving credit
   facility`. There were 373 such names. An amount's tokens kept the name from
   being a subset of the same note's plain name. Only an amount with a currency
-  mark is dropped, so a leading coupon or year stays.
+  mark is dropped. A bare letter prefix needs a currency symbol (`A$`, `C$`,
+  `US$`), and a rand `R` with no symbol needs a magnitude word or grouped
+  digits (`R1 000 million`). A leading coupon, year or class designator
+  (`US 2027 Notes`, `A1 Notes`) therefore stays.
 - **Plural instrument nouns** are singularized (note, bond, debenture, loan,
   facility): `Series B Senior Note Due 2032` against `Series B Senior Notes due
   2032`.
