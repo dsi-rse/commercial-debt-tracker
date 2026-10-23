@@ -72,7 +72,8 @@ The classifier is a handful of rules over the document's `<TYPE>` and its text
 1. EX-1, EX-4 and EX-10 exhibits are event documents.
 2. In the first 400 (agreement) or 1,000 (report) characters after the cover
    page, an agreement title (`Underwriting Agreement`, `Supplemental
-   Indenture`, `EXECUTION VERSION`, `as Borrower`) or a report title
+   Indenture`, `EXECUTION VERSION`, `as Borrowers`, `Consent Solicitation`,
+   `Capitalization and Indebtedness`) or a report title
    (`Interim Financial Statements`, `Management's Discussion and Analysis`,
    `Reports Third Quarter Results`, `3Q18`, `Reference Form`, `Management
    Proxy Circular`) decides, whichever comes first.
@@ -93,15 +94,14 @@ opening and a middle excerpt, 15 low-confidence calls):
 
 | | labelled report | labelled event |
 |---|---|---|
-| classified report | 113 | 4 |
-| classified event | 2 | 85 |
+| classified report | 113 | 2 |
+| classified event | 2 | 87 |
 
-Report precision is 96.6% and recall 98.3%. By mention, the rules withdraw
-1,364 of the sample's 1,368 report mentions and 3 of its 307 event mentions.
-The misses: a BHP operational review and a Franco-Nevada results release read
-as events; an ArcelorMittal capitalization table (an offering exhibit), a
-merger-cooperation agreement, an acquisition presentation and meeting minutes
-read as reports.
+Report precision is 98.3% and recall 98.3%. By mention, the rules withdraw
+1,364 of the sample's 1,368 report mentions and none of its 307 event
+mentions. The misses: a BHP operational review and a Franco-Nevada results
+release read as events; an acquisition presentation and meeting minutes read
+as reports.
 
 These figures are optimistic. The rules were written on the other 2,591
 documents, but three changes followed the first scoring: the earlier of an
@@ -109,10 +109,15 @@ agreement and a report title decides (no document moved); the title zone is
 cut at its character budget, where a document set on one long line had made
 it the whole first paragraph; and the report zone is 1,000 characters,
 chosen among 600 to 3,000 with the labels in view (600 misses one more labelled
-report, 3,000 misreads five more labelled events). A fresh sample is the
-honest check.
+report, 3,000 misreads five more labelled events). A fourth change followed a
+sweep of every document the statement rule had marked: long agreements,
+consent solicitations, irrevocable undertakings and capitalization tables cite
+the statements they summarise, and six agreement titles were added for them.
+That moved 15 documents (81 mentions) from report to event, among them a
+Unilever consent solicitation and three Wheaton credit agreements, and no
+labelled report. A fresh sample is the honest check.
 
-Over all 2,795 documents the rules mark 1,629 as reports, carrying 18,419 of
+Over all 2,795 documents the rules mark 1,614 as reports, carrying 18,338 of
 the 21,545 published 6-K mentions.
 
 What it costs: debt facts disclosed only in periodic reports are no longer

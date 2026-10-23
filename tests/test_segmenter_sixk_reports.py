@@ -70,6 +70,29 @@ def test_an_agreement_title_ahead_of_a_report_title_makes_an_event() -> None:
     assert kind.rule == "agreement_title"
 
 
+@pytest.mark.parametrize(
+    "opening",
+    [
+        "WHEATON PRECIOUS METALS CORP. AND WHEATON PRECIOUS METALS INTERNATIONAL LTD. "
+        "as Borrowers - and - BANK OF MONTREAL as Administrative Agent",
+        "EXECUTION COPY\nCOOPERATION AGREEMENT",
+        "CONSENT SOLICITATIONS: NOTICE OF SEPARATE MEETINGS of the holders of the Notes",
+        "IRREVOCABLE UNDERTAKING",
+        "CAPITALIZATION AND INDEBTEDNESS as at 31 March 2021",
+    ],
+)
+def test_long_transaction_documents_citing_the_statements_are_events(
+    opening: str,
+) -> None:
+    """A credit agreement, consent solicitation or offering table names the statements it summarises."""
+    body = f"{COVER}{opening}\nannual audited financial statements\n{STATEMENTS * 20}"
+
+    kind = classify_sixk_document(body, "EX-99.1")
+
+    assert kind.kind == "event"
+    assert kind.rule == "agreement_title"
+
+
 def test_a_report_title_ahead_of_an_agreement_makes_a_report() -> None:
     """A report whose first paragraph mentions a credit agreement is still a report."""
     body = f"{COVER}Unaudited Interim Financial Statements\nThe credit agreement ..."

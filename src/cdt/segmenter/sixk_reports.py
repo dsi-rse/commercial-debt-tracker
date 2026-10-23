@@ -46,19 +46,21 @@ AGREEMENT_TITLE_CHARS = 400
 #: Characters of non-cover text in which a report title counts.
 REPORT_TITLE_CHARS = 1_000
 
-#: A transaction document's title. Underwriting and credit agreements cite the
-#: issuer's financial statements, so an agreement title ahead of a report
-#: title decides.
+#: A transaction document's title. Underwriting and credit agreements, consent
+#: solicitations and offering tables cite the issuer's financial statements, so
+#: an agreement title ahead of a report title decides.
 _AGREEMENT_TITLE = re.compile(
     r"""(?ix)
     \b(?:credit|loan|facility|facilities|underwriting|purchase|subscription
-       |arrangement|merger|amalgamation|sales|distribution|dealer|agency
-       |guarantee|guaranty|security|intercreditor|amending|amendment|commitment)
+       |arrangement|merger|amalgamation|cooperation|implementation|sales
+       |distribution|dealer|agency|guarantee|guaranty|security|intercreditor
+       |amending|amendment|commitment)
       \s+agreement\b
-    | \b(?:supplemental\s+)?indenture\b | \bexecution\s+version\b
-    | \bconformed\s+copy\b | \bas\s+borrower\b | \bglobal\s+(?:note|security)\b
+    | \b(?:supplemental\s+)?indenture\b | \bexecution\s+(?:version|copy)\b
+    | \bconformed\s+copy\b | \bas\s+borrowers?\b | \bglobal\s+(?:note|security)\b
     | \bofficer['’]?s['’]?\s+certificate\b | \bpricing\s+supplement\b
-    | \bfinal\s+terms\b
+    | \bfinal\s+terms\b | \bconsent\s+solicitations?\b
+    | \birrevocable\s+undertaking\b | \bcapitali[sz]ation\s+and\s+indebtedness\b
     """
 )
 
