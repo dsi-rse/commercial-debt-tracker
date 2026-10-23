@@ -154,8 +154,12 @@ def _vale_keys() -> tuple[str, str]:
 
 
 def _objects(
-    *, gzip_bodies: bool = True, exhibit_first_in_manifest: bool = False
+    *,
+    gzip_bodies: bool = True,
+    exhibit_first_in_manifest: bool = False,
+    attachment: tuple[str, bytes] | None = None,
 ) -> dict[tuple[str, str], bytes]:
+    """Return the fake bucket; ``attachment`` adds a raw (filename, bytes) object as seq 3."""
     manifest_key, body_key, exhibit_key = _harmony_keys()
     vale_manifest_key, vale_body_key = _vale_keys()
 
@@ -175,7 +179,22 @@ def _objects(
         if exhibit_first_in_manifest
         else [body_entry, exhibit_entry]
     )
+    attachment_objects: dict[tuple[str, str], bytes] = {}
+    if attachment is not None:
+        filename, raw = attachment
+        attachment_key = f"{manifest_key.rsplit('/', 1)[0]}/{filename}"
+        # A courtesy PDF is typed like the body it accompanies; only the
+        # filename differs.
+        documents.append(
+            _document_entry(
+                key=attachment_key, document_type="6-K", sequence="3", filename=filename
+            )
+        )
+        attachment_objects[(BUCKET, attachment_key)] = (
+            gzip.compress(raw) if gzip_bodies else raw
+        )
     return {
+        **attachment_objects,
         (BUCKET, manifest_key): _manifest(
             cik="0001023514",
             accession_number=HARMONY_ACCESSION,
@@ -377,16 +396,14 @@ def test_ciks_filter_which_filings_are_acquired(tmp_path: Path) -> None:
 
 
 def test_binary_attachment_is_left_out_and_the_filing_is_kept(tmp_path: Path) -> None:
-    """A stored object that is not a <DOCUMENT> block is dropped, not fatal.
+    """A raw object the manifest does not name as text is dropped, not fatal.
 
     The scraper stores a courtesy PDF or an image as the raw file. No stage
     reads it, so the filing's text documents are assembled without it and the
     prose split that gives a snippet its document_index sees only them.
     """
-    objects = _objects()
-    _, _, exhibit_key = _harmony_keys()
-    objects[(BUCKET, exhibit_key)] = gzip.compress(
-        b"%PDF-1.4\r%\xef\xbf\xbd\r\n1 0 obj"
+    objects = _objects(
+        attachment=("courtesy.pdf", b"%PDF-1.4\r%\xef\xbf\xbd\r\n1 0 obj")
     )
     client = FakeS3Client(objects)
 
@@ -401,23 +418,26 @@ def test_binary_attachment_is_left_out_and_the_filing_is_kept(tmp_path: Path) ->
     mirror = mirror_path(
         str(tmp_path), filing_date="2026-09-08", accession_number=HARMONY_STORED
     )
-    documents = prose_documents(gzip.decompress(Path(mirror).read_bytes()).decode())
-    assert [document.document_type for document in documents] == ["6-K"]
+    mirrored = gzip.decompress(Path(mirror).read_bytes()).decode()
+    assert "%PDF" not in mirrored
+    documents = prose_documents(mirrored)
+    assert [document.document_type for document in documents] == ["6-K", "EX-99.1"]
     assert "The Company issued notes." in documents[0].text
 
 
-def test_filing_with_no_document_block_fails_permanently(tmp_path: Path) -> None:
-    """A filing none of whose stored objects is a <DOCUMENT> block is a recorded, permanent failure.
+def test_unwrapped_text_document_fails_the_filing_permanently(tmp_path: Path) -> None:
+    """A document the manifest names as text but stored bare is a recorded, permanent failure.
 
     Assembly is only faithful because the scraper stores text documents in
-    dissemination format. With no such document there is nothing the window
-    stage could read, so the filing fails instead of mirroring an empty text.
+    dissemination format. One stored without the wrapper is a change in the
+    source that would alter the prose the window stage reads, with nothing
+    downstream able to tell, so the filing fails instead.
     """
     objects = _objects()
-    _, body_key, exhibit_key = _harmony_keys()
-    bare = gzip.compress(b"<html><body><p>bare document, no wrapper</p></body></html>")
-    objects[(BUCKET, body_key)] = bare
-    objects[(BUCKET, exhibit_key)] = bare
+    _, body_key, _ = _harmony_keys()
+    objects[(BUCKET, body_key)] = gzip.compress(
+        b"<html><body><p>bare document, no wrapper</p></body></html>"
+    )
     client = FakeS3Client(objects)
 
     table, result = acquire_scraped_sixk_documents(
@@ -471,9 +491,8 @@ def test_manifest_without_documents_fails_the_filing(tmp_path: Path) -> None:
 def test_registered_failures_are_skipped_until_forced(tmp_path: Path) -> None:
     """A recorded permanent failure stops the next run re-reading the filing."""
     objects = _objects()
-    _, body_key, exhibit_key = _harmony_keys()
+    _, body_key, _ = _harmony_keys()
     objects[(BUCKET, body_key)] = gzip.compress(b"no wrapper")
-    objects[(BUCKET, exhibit_key)] = gzip.compress(b"no wrapper either")
     first_client = FakeS3Client(objects)
     acquire_scraped_sixk_documents(_config(tmp_path), s3_client=first_client)
 
@@ -512,28 +531,66 @@ def test_empty_form_types_is_rejected(tmp_path: Path) -> None:
         )
 
 
+def _stored(filename: str, text: str, seq: str = "1") -> tuple[ScrapedDocument, str]:
+    """Return a manifest entry named ``filename`` paired with its decoded object."""
+    entry = ScrapedDocument(
+        seq=seq,
+        description="",
+        filename=filename,
+        type="6-K",
+        s3_key=f"s3://{BUCKET}/{filename}",
+        url="",
+    )
+    return entry, text
+
+
 def test_assemble_submission_keeps_only_document_blocks() -> None:
-    """A stored object without the wrapper is left out; the blocks are joined verbatim."""
+    """A raw attachment is left out; the blocks are joined verbatim."""
     assert (
         assemble_submission(
-            _filing(), [HARMONY_BODY, "%PDF-1.4 binary", HARMONY_EXHIBIT]
+            _filing(),
+            [
+                _stored("body.htm", HARMONY_BODY),
+                _stored("courtesy.pdf", "%PDF-1.4 binary", seq="2"),
+                _stored("exhibit.htm", HARMONY_EXHIBIT, seq="3"),
+            ],
         )
         == HARMONY_BODY + HARMONY_EXHIBIT
     )
 
 
+def test_assemble_submission_rejects_an_unwrapped_text_document() -> None:
+    """A bare object the manifest names as text fails the filing, not just the document."""
+    with pytest.raises(
+        MalformedSubmissionError, match="'body.htm' .* is named as text"
+    ):
+        assemble_submission(
+            _filing(),
+            [
+                _stored("body.htm", "<html>bare</html>"),
+                _stored("exhibit.htm", HARMONY_EXHIBIT, seq="2"),
+            ],
+        )
+
+
 def test_assemble_submission_rejects_a_filing_with_no_document_block() -> None:
-    """The check is on the unit under test, not only on a run."""
+    """Attachments alone are nothing to assemble."""
     with pytest.raises(
         MalformedSubmissionError, match="None of the 2 stored documents"
     ):
-        assemble_submission(_filing(), ["<html>bare</html>", "%PDF-1.4 binary"])
+        assemble_submission(
+            _filing(),
+            [
+                _stored("courtesy.pdf", "%PDF-1.4 binary"),
+                _stored("logo.jpg", "\xff\xd8\xff", seq="2"),
+            ],
+        )
 
 
 def test_documents_with_unusable_sequence_sort_last() -> None:
     """A document whose seq cannot be read keeps the filing, at the end."""
     filing = _filing()
-    assert documents_in_sequence(filing) == [
+    assert [document.s3_key for document in documents_in_sequence(filing)] == [
         f"s3://{BUCKET}/second.htm",
         f"s3://{BUCKET}/first.htm",
     ]

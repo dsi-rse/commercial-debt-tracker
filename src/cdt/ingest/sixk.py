@@ -4,10 +4,10 @@ The scraper stores a 6-K as one object per document (body, then exhibits),
 with no whole-submission object, so this source assembles the submission by
 concatenating the stored ``<DOCUMENT>`` blocks in sequence order and mirrors it
 (:mod:`cdt.ingest.mirror`). The result is EDGAR's complete submission minus the
-``<SEC-HEADER>`` preamble and minus any attachment the scraper stored as raw
-bytes rather than as a ``<DOCUMENT>`` block (a courtesy PDF, an image), which
-no downstream stage reads; see ``docs/sixk-two-stage-triage.md`` for how the
-assembly was checked.
+``<SEC-HEADER>`` preamble and minus any binary attachment the scraper stored
+as the raw file rather than as a ``<DOCUMENT>`` block (a courtesy PDF, an
+image), which no downstream stage reads; see ``docs/sixk-two-stage-triage.md``
+for how the assembly was checked.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from __future__ import annotations
 import gzip
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 from typing import Self
 
 import pandas as pd
@@ -28,6 +29,7 @@ from cdt.ingest.core import (
     IngestFailureType,
     IngestRunResult,
     S3Client,
+    ScrapedDocument,
     ScrapedFiling,
     decode_document_bytes,
     filing_from_manifest_key,
@@ -65,34 +67,65 @@ def submission_url(cik: str, accession_number: str) -> str:
 DOCUMENT_MARKER = "<DOCUMENT>"
 
 
+#: Filename suffixes of the documents the scraper stores as ``<DOCUMENT>``
+#: blocks. One of these stored bare is a change in how the source stores text,
+#: not an attachment; :func:`assemble_submission` fails the filing on it.
+TEXT_DOCUMENT_SUFFIXES = frozenset({".htm", ".html", ".txt"})
+
+
 class MalformedSubmissionError(RuntimeError):
-    """No stored document of a filing is a dissemination-format ``<DOCUMENT>`` block."""
+    """A text document is stored without its ``<DOCUMENT>`` wrapper, or no document has one."""
 
 
 def is_dissemination_document(document: str) -> bool:
-    """Return whether a decoded stored object is a ``<DOCUMENT>`` block.
-
-    The scraper stores a filing's text documents in dissemination format and
-    its binary attachments (courtesy PDFs, images) as the raw file, so this is
-    the test for "text a downstream stage can read".
-    """
+    """Return whether a decoded stored object is a ``<DOCUMENT>`` block."""
     return document.lstrip().startswith(DOCUMENT_MARKER)
 
 
-def assemble_submission(filing: ScrapedFiling, documents: list[str]) -> str:
+def names_text_document(document: ScrapedDocument) -> bool:
+    """Return whether the manifest names ``document`` as a text document.
+
+    By filename suffix (:data:`TEXT_DOCUMENT_SUFFIXES`), falling back to the S3
+    key when the manifest carries no filename. The manifest's ``type`` cannot
+    tell: a courtesy PDF and the body it accompanies are both typed ``6-K``.
+    """
+    name = document.filename or document.s3_key
+    return PurePosixPath(name).suffix.lower() in TEXT_DOCUMENT_SUFFIXES
+
+
+def assemble_submission(
+    filing: ScrapedFiling, documents: list[tuple[ScrapedDocument, str]]
+) -> str:
     """Return one complete submission from a filing's stored documents.
 
-    ``documents`` are the decoded objects in submission order. The
-    ``<DOCUMENT>`` blocks among them are concatenated verbatim with no
-    separator; any other object is left out, because it is a binary attachment
-    no stage reads and wrapping it would change the prose the triage stage sees.
-    A snippet's ``document_index`` counts the kept blocks, which is also what
-    :func:`cdt.segmenter.sixk.prose_documents` splits the result back into.
+    ``documents`` pairs each manifest entry with its decoded object, in
+    submission order. The ``<DOCUMENT>`` blocks are concatenated verbatim with
+    no separator. An object that is not a block and is not named as a text
+    document is a binary attachment (a courtesy PDF, an image) no stage reads,
+    so it is left out. The blocks :func:`cdt.segmenter.sixk.prose_documents`
+    keeps are what a snippet's ``document_index`` counts.
 
     Raises:
-        MalformedSubmissionError: If no document is a ``<DOCUMENT>`` block.
+        MalformedSubmissionError: If an object named as a text document is not
+            a ``<DOCUMENT>`` block, since assembling it would change the prose
+            the triage stage reads, or if no object is a block.
     """
-    kept = [document for document in documents if is_dissemination_document(document)]
+    kept: list[str] = []
+    left_out: list[str] = []
+    for entry, text in documents:
+        if is_dissemination_document(text):
+            kept.append(text)
+        elif names_text_document(entry):
+            msg = (
+                f"Document {entry.filename!r} (seq {entry.seq}) of "
+                f"{filing.accession_number} is named as text but does not begin "
+                f"with {DOCUMENT_MARKER}; the scraper stores text documents in "
+                "dissemination format and assembling one that is not would "
+                "change the prose the triage stage reads."
+            )
+            raise MalformedSubmissionError(msg)
+        else:
+            left_out.append(entry.filename or entry.s3_key)
     if not kept:
         msg = (
             f"None of the {len(documents)} stored documents of "
@@ -100,26 +133,26 @@ def assemble_submission(filing: ScrapedFiling, documents: list[str]) -> str:
             "no dissemination-format text to assemble."
         )
         raise MalformedSubmissionError(msg)
-    if len(kept) < len(documents):
+    if left_out:
         LOGGER.info(
-            "Left %d of %d stored documents out of %s: not <DOCUMENT> blocks "
-            "(binary attachments such as a courtesy PDF)",
-            len(documents) - len(kept),
-            len(documents),
+            "Left binary attachments out of the assembly: accession=%s "
+            "left_out=%s total=%d",
             filing.accession_number,
+            ",".join(left_out),
+            len(documents),
         )
     return "".join(kept)
 
 
-def documents_in_sequence(filing: ScrapedFiling) -> list[str]:
-    """Return the filing's document S3 URIs in submission order.
+def documents_in_sequence(filing: ScrapedFiling) -> list[ScrapedDocument]:
+    """Return the filing's manifest documents that have an S3 key, in submission order.
 
     Sorted by the manifest's ``seq``, the order a snippet's ``document_index``
     counts in. A document with no integer ``seq`` sorts last; one with no S3 key
     is omitted.
     """
     ordered = sorted(filing.documents, key=lambda document: _sequence(document.seq))
-    return [document.s3_key for document in ordered if document.s3_key]
+    return [document for document in ordered if document.s3_key]
 
 
 def _sequence(value: str) -> int:
@@ -202,24 +235,25 @@ class ScraperDocumentSource:
         self: Self, filing: ScrapedFiling, target: str, key: tuple[str, str]
     ) -> bool:
         """Assemble one submission into the mirror; False when it could not be."""
-        uris = documents_in_sequence(filing)
-        if not uris:
+        entries = documents_in_sequence(filing)
+        if not entries:
             LOGGER.warning(
                 "Manifest lists no documents: accession=%s", filing.accession_number
             )
             self.failures.record(key, IngestFailureType.DOCUMENT_NOT_FOUND)
             return False
-        documents = []
-        for uri in uris:
+        documents: list[tuple[ScrapedDocument, str]] = []
+        for entry in entries:
             try:
-                bucket, object_key = parse_s3_uri(uri)
-                documents.append(
-                    decode_document_bytes(
-                        get_object_bytes(self.s3_client, bucket, object_key)
-                    )
+                bucket, object_key = parse_s3_uri(entry.s3_key)
+                text = decode_document_bytes(
+                    get_object_bytes(self.s3_client, bucket, object_key)
                 )
+                documents.append((entry, text))
             except Exception:
-                LOGGER.exception("Failed to read scraped 6-K document: %s", uri)
+                LOGGER.exception(
+                    "Failed to read scraped 6-K document: %s", entry.s3_key
+                )
                 self.failures.record(key, IngestFailureType.DOCUMENT_DOWNLOAD_FAILED)
                 return False
         try:
