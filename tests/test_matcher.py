@@ -14,12 +14,12 @@ from cdt.matcher.compat import (
     name_class_sizes,
     name_fingerprints_are_compatible,
     name_rate_tokens,
-    name_rates_are_compatible,
 )
 from cdt.matcher.instruments import build_debt_instrument_rows, derive_parent_links
 from cdt.matcher.normalize import (
     borrowed_lender_signature,
     lender_signature,
+    mention_coupons,
     mention_sort_key,
     normalize_name_fingerprint,
     prepare_mention,
@@ -497,15 +497,29 @@ def test_year_resolution_end_date_still_matches_exact_maturity() -> None:
     assert len(score(closing, profile_from(seed))) == 1
 
 
-def test_name_rates_are_compatible_requires_rates_on_both_sides() -> None:
-    """Rate conflicts only apply when both fingerprints carry a rate."""
-    assert name_rates_are_compatible(None, None)
-    assert name_rates_are_compatible("term loan", "5.25% senior notes due 2028")
-    assert name_rates_are_compatible(
-        "5.25% senior notes due 2028", "5.25% senior notes due 2028"
+def test_mention_coupons_prefer_the_name_then_a_fixed_extracted_rate() -> None:
+    """The name's coupon wins; the extracted rate fills in when the name has none.
+
+    Where both exist, the extracted rate is sometimes a step-up rate, the
+    coupon plus one point, so it never overrides the name (#318).
+    """
+    fp = normalize_name_fingerprint("5.25% Senior Notes due 2028")
+    assert mention_coupons(
+        fp, interest_rate_pct="6.2500", interest_rate_kind="fixed"
+    ) == frozenset({"5.25"})
+    bare = normalize_name_fingerprint("Senior Notes due 2028")
+    assert mention_coupons(
+        bare, interest_rate_pct="5.2500", interest_rate_kind="fixed"
+    ) == frozenset({"5.25"})
+    assert mention_coupons(bare, interest_rate_pct="5.25", interest_rate_kind=None) == (
+        frozenset({"5.25"})
     )
-    assert not name_rates_are_compatible(
-        "5.25% senior notes due 2028", "6.75% senior notes due 2031"
+    assert (
+        mention_coupons(bare, interest_rate_pct="1.75", interest_rate_kind="floating")
+        == frozenset()
+    )
+    assert mention_coupons(bare, interest_rate_pct=None, interest_rate_kind=None) == (
+        frozenset()
     )
 
 
@@ -538,9 +552,9 @@ def test_name_rates_refuse_two_coupons_sharing_a_fractional_part() -> None:
         ("10.25% Notes", "5.25% Notes"),
         ("0.625% Notes", "4.625% Notes"),
     ):
-        assert not name_rates_are_compatible(fp(left), fp(right)), (left, right)
+        assert not name_rate_tokens(fp(left)) & name_rate_tokens(fp(right))
     # and equivalent spellings of one coupon still match
-    assert name_rates_are_compatible(fp("5.00% Notes"), fp("5% Notes"))
+    assert name_rate_tokens(fp("5.00% Notes")) == name_rate_tokens(fp("5% Notes"))
 
 
 def test_keyless_mention_matches_on_identifying_fingerprint() -> None:
@@ -780,10 +794,11 @@ def test_same_item_sibling_with_a_conflicting_amount_does_not_attach() -> None:
     assert score(additional, profile_from(initial)) == []
 
 
-def test_same_item_mentions_never_merge() -> None:
-    """Same-item pairs are distinct debts however identifying the name is (#161).
+def test_same_item_siblings_with_conflicting_keys_never_merge() -> None:
+    """A same-item sibling whose amount or start date conflicts is another debt (#161).
 
-    One item returns one object per instrument by extractor construction.
+    One item returns one object per instrument by extractor construction, so
+    an identifying name alone does not merge a same-item pair.
 
     Gray Media's $70M add-on tap merged into its $775M parent series and
     published the series at the add-on's size. Cross-filing merges still work:
@@ -1410,3 +1425,197 @@ def test_a_synthesized_row_borrows_its_successors_lenders_for_scoring() -> None:
     assert published_via(lenders) == "member:amount_start+lenders"
     # Nothing to borrow when the successor names no lender either.
     assert published_via("[]") == "member:amount_start+name"
+
+
+def test_a_same_item_repeat_of_one_object_joins_it() -> None:
+    """The extractor returning one instrument twice in an item is one instrument (#319).
+
+    Same identifying name, no conflicting amount or start date: a repeat, not
+    a sibling.
+    """
+    first = prepare_mention(mention_row(principal_amount="2000000000"))
+    repeat = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-2",
+            principal_amount="2000000000",
+            start_date=None,
+        )
+    )
+
+    candidates = score(repeat, profile_from(first))
+
+    assert len(candidates) == 1
+    assert candidates[0].basis == "name_fingerprint"
+
+
+def test_a_same_item_repeat_needs_an_identifying_name() -> None:
+    """One item can describe two term loans; a generic name stays one-object-per-instrument."""
+    first = prepare_mention(
+        mention_row(name="Term Loan", start_date=None, maturity_date=None)
+    )
+    second = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-2",
+            name="Term Loan",
+            start_date=None,
+            maturity_date=None,
+        )
+    )
+
+    assert score(second, profile_from(first)) == []
+
+
+def test_a_same_item_repeat_still_honours_a_relation_to_its_twin() -> None:
+    """An exchange's old notes, retired by new notes of the same name, stay apart."""
+    new = prepare_mention(mention_row(debt_instrument_mention_id="mention-new"))
+    retired_old = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-old",
+            retired_by_json='["mention-new"]',
+        )
+    )
+
+    assert score(retired_old, profile_from(new)) == []
+
+
+def test_a_coupon_less_member_does_not_open_a_cluster_to_a_second_coupon() -> None:
+    """Every coupon a cluster has seen counts against a new series (#318).
+
+    EQT: `Senior Notes due 2027` seeded a cluster that then took both the
+    3.900% and the 6.500% notes due 2027, because the old guard passed when any
+    one member name, the coupon-less seed, was rate-compatible.
+    """
+    seed = prepare_mention(
+        mention_row(
+            name="Senior Notes due 2027",
+            start_date=None,
+            maturity_date="2027-12-31",
+            principal_amount=None,
+        )
+    )
+    profiles = profile_from(seed)
+    profile = profiles["mention-1"]
+    profile.add_member(
+        prepare_mention(
+            mention_row(
+                debt_instrument_mention_id="mention-2",
+                item_id="item-2",
+                name="3.900% Senior Notes due 2027",
+                start_date=None,
+                maturity_date="2027-12-31",
+                principal_amount=None,
+            )
+        )
+    )
+    other_series = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-3",
+            item_id="item-3",
+            name="6.500% Senior Notes due 2027",
+            start_date=None,
+            maturity_date="2027-12-31",
+            principal_amount=None,
+        )
+    )
+
+    assert score(other_series, profiles) == []
+
+
+def test_an_extracted_fixed_rate_stands_in_for_a_coupon_less_name() -> None:
+    """A name with no coupon is held to the rate the extractor read for it (#318)."""
+    series = prepare_mention(mention_row(name="5.25% senior notes due 2028"))
+    coupon_less = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-2",
+            item_id="item-2",
+            name="senior notes due 2028",
+            interest_rate_pct="6.7500",
+            interest_rate_kind="fixed",
+            start_date=None,
+            principal_amount=None,
+        )
+    )
+    floating = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="mention-3",
+            item_id="item-3",
+            name="senior notes due 2028",
+            interest_rate_pct="6.7500",
+            interest_rate_kind="floating",
+            start_date=None,
+            principal_amount=None,
+        )
+    )
+
+    assert score(coupon_less, profile_from(series)) == []
+    assert score(floating, profile_from(series), name_class_size=1) != []
+
+
+def test_a_prior_state_is_not_held_to_its_inherited_rate() -> None:
+    """A synthesized prior state's rate is its successor's, so it is no coupon.
+
+    A note repriced from 10% to 12% mints a prior state carrying 12%. Holding
+    it to that rate refused it from the 10% cluster it belongs to, and the
+    amendment chain broke.
+    """
+    original = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="m-original",
+            item_id="item-a",
+            name="Promissory Note",
+            start_date="2022-01-15",
+            maturity_date="2025-01-15",
+            principal_amount="10000000",
+            interest_rate_pct="10.0000",
+            interest_rate_kind="fixed",
+        )
+    )
+    prior = prepare_mention(
+        mention_row(
+            debt_instrument_mention_id="m-prior",
+            item_id="item-b",
+            date="2024-06-01",
+            name="Promissory Note",
+            start_date="2022-01-15",
+            maturity_date="2025-01-15",
+            principal_amount="10000000",
+            interest_rate_pct="12.0000",
+            interest_rate_kind="fixed",
+            synthesized_by="prior_state",
+            synthesized_from_mention_id="m-amended",
+        )
+    )
+
+    assert prior.coupons == frozenset()
+    assert len(score(prior, profile_from(original))) == 1
+
+
+def test_name_fingerprints_fold_plurals_worded_coupons_and_leading_amounts() -> None:
+    """Spellings of one name that the filings use interchangeably compare equal (#320)."""
+    fp = normalize_name_fingerprint
+    assert fp("Series B Senior Note Due 2032") == fp("Series B Senior Notes due 2032")
+    assert fp("5.25 per cent. Notes due 2030") == fp("5.25% Notes due 2030")
+    assert fp("1.500 percent Bonds due July 2026") == fp("1.5% Bond due July 2026")
+    for prefixed in (
+        "$500 million 3.75% Notes due March 1, 2016",
+        "US$500,000,000 3.75% Notes due March 1, 2016",
+        "U.S. $500,000,000 3.75% Notes due March 1, 2016",
+        "EUR 500,000,000 3.75% Notes due March 1, 2016",
+        "€500,000,000 3.75% Notes due March 1, 2016",
+        "$500,000,000 aggregate principal amount of 3.75% Notes due March 1, 2016",
+    ):
+        assert fp(prefixed) == fp("3.75% Notes due March 1, 2016"), prefixed
+    assert fp("CAD $500 million revolving facility") == "revolving facility"
+    assert fp("R1 000 million revolving credit facility") == "revolving credit facility"
+    # a coupon, a year or a class designator leading the name is not an amount
+    assert fp("4.625% Senior Notes due 2028") == "4 625% senior note due 2028"
+    assert fp("2027 Notes") == "2027 note"
+    assert fp("US 2027 Notes") == "us 2027 note"
+    assert fp("A1 Notes due 2030") != fp("A2 Notes due 2030")
+
+
+def test_a_worded_coupon_is_a_coupon() -> None:
+    """`per cent` names carry a coupon the coupon guard can see (#320)."""
+    assert name_rate_tokens(
+        normalize_name_fingerprint("5.25 per cent. Notes due 2030")
+    ) == frozenset({"5.25"})

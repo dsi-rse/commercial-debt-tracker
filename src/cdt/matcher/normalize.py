@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 import re
+from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
+from functools import lru_cache
 
+from cdt.extractor.normalize.amounts import normalize_numeric_string
 from cdt.extractor.schema import (
     LENDER_DISCLOSURE_NONE_NAMED,
     LENDER_DISCLOSURE_PRECEDENCE,
@@ -129,6 +132,8 @@ def cluster_canonical_key(cluster: dict[str, object]) -> str:
 def prepare_mention(row: dict[str, object]) -> PreparedMention:
     """Normalize one mention row for matching."""
     parties_json = _json_text(row, "parties_json") or "[]"
+    fingerprint = normalize_name_fingerprint(coerce_optional_text(row.get("name")))
+    synthesized_by = coerce_optional_text(row.get("synthesized_by"))
     return PreparedMention(
         debt_instrument_mention_id=str(row["debt_instrument_mention_id"]),
         item_id=str(row["item_id"]),
@@ -165,11 +170,20 @@ def prepare_mention(row: dict[str, object]) -> PreparedMention:
             coerce_optional_text(row.get("start_date"))
         ),
         normalized_end_date=normalized_end_date_for_matching(row),
-        normalized_name_fingerprint=normalize_name_fingerprint(
-            coerce_optional_text(row.get("name"))
+        normalized_name_fingerprint=fingerprint,
+        # A synthesized prior state's rate is its successor's, inherited, so it
+        # says nothing about the coupon before the amendment.
+        coupons=mention_coupons(
+            fingerprint,
+            interest_rate_pct=(
+                None
+                if synthesized_by is not None
+                else coerce_optional_text(row.get("interest_rate_pct"))
+            ),
+            interest_rate_kind=coerce_optional_text(row.get("interest_rate_kind")),
         ),
         lender_signature=lender_signature(parties_json),
-        synthesized_by=coerce_optional_text(row.get("synthesized_by")),
+        synthesized_by=synthesized_by,
         synthesized_from_mention_id=coerce_optional_text(
             row.get("synthesized_from_mention_id")
         ),
@@ -285,18 +299,106 @@ def normalize_date(value: str | None) -> str | None:
     return re.sub(r"\s+", " ", text.lower()).strip()
 
 
+# A coupon written out in words: `5.25 per cent.`, `4 percent`, `3.5 pct`.
+_WORDED_PERCENT = re.compile(r"(\d)\s*(?:per\s*cent|percent|pct)\b\.?")
+# A currency amount leading a name: `$500 million`, `US$2 billion`,
+# `EUR 1,000,000,000`, `R1 000 million`,
+# `U.S. $1,400,000,000 aggregate principal amount of`. A bare letter prefix
+# needs a currency symbol, and a bare rand `R` a magnitude word or grouped
+# digits, so a class designator (`A1 Notes`) or a year (`US 2027 Notes`) is
+# not an amount.
+_MAGNITUDE = r"(?:million|billion|thousand|bn|mm|m)\b"
+_CURRENCY_CODE = r"(?:usd|eur|gbp|cad|aud|chf|jpy)"
+_LEADING_AMOUNT = re.compile(
+    rf"""(?x)
+    ^(?:
+        (?:(?:{_CURRENCY_CODE}|u\.?s\.?|a|c|r)\s?)?[$€£¥]\s?\d[\d,.]*(?:\s?{_MAGNITUDE})?
+      | {_CURRENCY_CODE}\s?\d[\d,.]*(?:\s?{_MAGNITUDE})?
+      | r\s?(?:\d{{1,3}}(?:[,\s]\d{{3}})+(?:\.\d+)?(?:\s?{_MAGNITUDE})?
+            | \d[\d.]*\s?{_MAGNITUDE})
+    )
+    \s+(?:(?:in\s+)?aggregate\s+principal\s+amount\s+)?(?:of\s+)?
+    """
+)
+# Instrument nouns folded to the singular, so `note` and `notes` compare equal.
+_SINGULAR = {
+    "notes": "note",
+    "bonds": "bond",
+    "debentures": "debenture",
+    "loans": "loan",
+    "facilities": "facility",
+}
+
+
 def normalize_name_fingerprint(value: str | None) -> str | None:
-    """Normalize debt-instrument names for comparison."""
+    """Normalize debt-instrument names for comparison.
+
+    Lowercases; writes a worded coupon as ``%``; drops a leading currency
+    amount; drops trailing zeros from a coupon; turns punctuation into token
+    breaks; and singularizes the instrument nouns.
+
+    >>> normalize_name_fingerprint("$500 million 5.25 per cent. Notes due 2030")
+    '5 25% note due 2030'
+    """
     if value is None:
         return None
     text = value.lower()
+    text = _WORDED_PERCENT.sub(r"\1%", text)
+    text = _LEADING_AMOUNT.sub("", text.strip())
     # `4.375 %` -> `4.375%` before the trailing-zero rules look for `%`.
     text = re.sub(r"(\d)\s+%", r"\1%", text)
     text = re.sub(r"(\d+)\.(\d*?[1-9])0+(?=%)", r"\1.\2", text)
     text = re.sub(r"(\d+)\.0+(?=%)", r"\1", text)
     text = re.sub(r"[^a-z0-9%]+", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
+    text = " ".join(_SINGULAR.get(token, token) for token in text.split())
     return text or None
+
+
+# `normalize_name_fingerprint` turns the decimal point into a token break, so a
+# coupon arrives here as `4 375%` rather than `4.375%`; the separator is
+# therefore optional. `(?<!\d)` keeps a maturity year out of the whole-number
+# part, so `notes due 2028 5%` yields the rate and not `2028 5%`.
+NAME_RATE_PATTERN = re.compile(r"(?<!\d)(\d{1,3})(?:[ .](\d{1,4}))?%")
+_FINGERPRINT_CACHE = 1 << 14
+
+
+@lru_cache(maxsize=_FINGERPRINT_CACHE)
+def name_rate_tokens(fingerprint: str | None) -> frozenset[str]:
+    """Return the coupon rates in one name fingerprint, as canonical numbers.
+
+    ``4 375%`` yields the normalized numeric string for 4.375; an empty
+    fingerprint yields the empty set.
+    """
+    if not fingerprint:
+        return frozenset()
+    rates: set[str] = set()
+    for whole, fraction in NAME_RATE_PATTERN.findall(fingerprint):
+        try:
+            rates.add(normalize_numeric_string(Decimal(f"{whole}.{fraction or 0}")))
+        except InvalidOperation:
+            continue
+    return frozenset(rates)
+
+
+def mention_coupons(
+    fingerprint: str | None,
+    *,
+    interest_rate_pct: str | None,
+    interest_rate_kind: str | None,
+) -> frozenset[str]:
+    """Return a mention's coupons, as canonical numbers.
+
+    The coupons in its name; when the name has none, the extracted rate unless
+    it is floating. The name wins because the extracted rate can be a step-up
+    or current rate rather than the coupon. Empty when neither is known.
+    """
+    rates = name_rate_tokens(fingerprint)
+    if rates or interest_rate_pct is None or interest_rate_kind == "floating":
+        return rates
+    try:
+        return frozenset({normalize_numeric_string(Decimal(interest_rate_pct))})
+    except InvalidOperation:
+        return frozenset()
 
 
 def lender_keys(value: object) -> list[str]:

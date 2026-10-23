@@ -7,7 +7,6 @@ from cdt.matcher.compat import (
     end_dates_are_compatible,
     name_fingerprint_is_identifying,
     name_fingerprints_are_compatible,
-    name_rates_are_compatible,
 )
 from cdt.matcher.normalize import (
     lender_similarity_score,
@@ -76,6 +75,36 @@ def relaxed_keys_support_membership(
     return not conflicts
 
 
+def _keys_agree(left: str | None, right: str | None) -> bool:
+    """Return whether two keys do not conflict: equal, or either one missing."""
+    return left is None or right is None or left == right
+
+
+def repeats_a_same_item_member(
+    mention: PreparedMention,
+    profile: ClusterProfile,
+) -> bool:
+    """Return whether a mention repeats one of the cluster's same-item members.
+
+    True when the mention is model-emitted, its name is identifying, and a
+    member from the same item has exactly that name and no conflicting amount
+    or start date: the extractor returned one instrument twice. A same-item
+    sibling with a conflicting key (an add-on tap) is not a repeat.
+    """
+    fingerprint = mention.normalized_name_fingerprint
+    if mention.synthesized_by is not None or not name_fingerprint_is_identifying(
+        fingerprint
+    ):
+        return False
+    return any(
+        _keys_agree(mention.normalized_amount, amount)
+        and _keys_agree(mention.normalized_start_date, start_date)
+        for amount, start_date in profile.item_name_keys.get(
+            (mention.item_id, fingerprint), ()
+        )
+    )
+
+
 def score_candidates_for_mention(
     mention: PreparedMention,
     profiles: dict[str, ClusterProfile],
@@ -114,9 +143,11 @@ def score_candidates_for_mention(
     for profile in profiles.values():
         if profile.cik != mention.cik:
             continue
-        if mention.item_id in profile.member_item_ids:
+        if mention.item_id in profile.member_item_ids and not (
+            repeats_a_same_item_member(mention, profile)
+        ):
             # One item returns one object per instrument, so a same-item pair
-            # is two instruments whatever their names and keys say.
+            # is two instruments unless the mention repeats a member.
             continue
         if mention.amendment_of and mention.amendment_of in profile.member_ids:
             continue
@@ -131,11 +162,12 @@ def score_candidates_for_mention(
             for candidate_end_date in profile.normalized_end_dates
         ):
             continue
-        if profile.normalized_name_fingerprints and not any(
-            name_rates_are_compatible(
-                mention.normalized_name_fingerprint, candidate_name
-            )
-            for candidate_name in profile.normalized_name_fingerprints
+        # Every coupon the cluster has seen counts, so a member whose name states
+        # none cannot open it to a second series.
+        if (
+            mention.coupons
+            and profile.coupons
+            and not (mention.coupons & profile.coupons)
         ):
             continue
         keys_match = (

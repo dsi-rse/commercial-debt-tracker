@@ -43,6 +43,18 @@ Two qualifying candidates within the ambiguity margin (0.05) count as a tie.
   series stated no start date; Longevity Health's same-day twin notes (#131);
   and Kestra's four tranches. Launch, pricing and closing merges across filings
   are different items and are unaffected.
+- **`repeats_a_same_item_member`.** The invariant does not always hold: the
+  extractor sometimes returns one instrument twice in an item (#319). A
+  same-item mention may therefore join a cluster when its name is identifying
+  and exactly equals a same-item member's, and neither its amount nor its start
+  date conflicts with that member's. Gray Media's tap and Longevity's twins
+  conflict on principal, and Kestra's tranches differ in name, so they still
+  stay apart. A generic name keeps the exclusion, since one item can describe
+  two term loans. The relation checks still apply. On the 2026-10-23 beta
+  (`database/cdt-beta` run 20261023T204636541016Z), 93 items hold an
+  identifying same-name pair with no conflicting key. 67 of those pairs are
+  exchanges or refinancings in which one object is `retired_by` its namesake,
+  and they stay apart. The rule joins 18.
 
 ## `relaxed_keys_support_membership`
 
@@ -94,10 +106,77 @@ pattern's separator is optional. The rate is returned as a canonical number,
 not as the matched text. Matching the raw token compared only the fractional
 digits: `4.375%` and `3.375%` both became `375%`.
 
+## `mention_coupons`, `ClusterProfile.coupons`: the coupon guard
+
+A cluster keeps every coupon its model-emitted members carry, and a mention
+whose coupons miss that set is refused. The guard used to pass when any one
+member *name* was rate-compatible with the mention. Because a coupon-less name
+is compatible with every coupon, one `Senior Notes due 2027` member opened the
+cluster to all series due that year (#318). EQT's cluster held the 3.900% and
+the 6.500% notes due 2027. Once filings named both series in one item, the
+same-item exclusion sent one of them to a second cluster, and the two series
+then alternated between the two clusters from filing to filing.
+
+A mention's coupons are those in its name. When the name has none, the
+extracted `interest_rate_pct` stands in, unless the rate is floating. The name
+wins because, where both exist, they disagree on 58 of 4,099 notes, and in
+those the extracted rate is a step-up or current rate: the coupon plus one
+point.
+
+A synthesized prior state uses only its name's coupons. Its extracted rate is
+its successor's, inherited because no `prior` rate is extracted, so after a
+repricing it would refuse the prior state from the cluster it belongs to.
+
+On the 2026-10-23 beta, multi-mention note clusters that mix extracted rates
+fall from 64 to 11. All 11 remaining carry one coupon in every name; only the
+extracted rate holds the step-up.
+
 ## `normalize_name_fingerprint`
 
 Filings write both `4.375%` and `4.375 %`. The punctuation pass would turn the
 space into a token break, so the gap is closed first.
+
+Three further spellings of one name are folded (#320):
+
+- **Worded coupons:** `5.25 per cent.` becomes `5.25%`. The 2026-10-23 beta has
+  229 such names, mostly from 6-K issuers. No coupon was read from any of them,
+  and only 5 had an extracted rate, so the coupon guard could not see them.
+- **Leading currency amounts** are dropped: `$500 million 3.75% Notes`,
+  `€1,000,000,000 2.125% Fixed Rate Notes`, `US$2 billion revolving credit
+  facility`. There were 373 such names. An amount's tokens kept the name from
+  being a subset of the same note's plain name. Only an amount with a currency
+  mark is dropped. A bare letter prefix needs a currency symbol (`A$`, `C$`,
+  `US$`), and a rand `R` with no symbol needs a magnitude word or grouped
+  digits (`R1 000 million`). A leading coupon, year or class designator
+  (`US 2027 Notes`, `A1 Notes`) therefore stays.
+- **Plural instrument nouns** are singularized (note, bond, debenture, loan,
+  facility): `Series B Senior Note Due 2032` against `Series B Senior Notes due
+  2032`.
+
+## The 2026-10-23 rematch: #318, #319, #320
+
+A forced rematch of the beta mentions (7,184 mentions, 82 CIKs), with each fix
+in turn switched off:
+
+| Measure | Before | All three | Without #319 | Without #320 |
+|---|---|---|---|---|
+| Instruments | 4,035 | 3,985 | 3,996 | 4,068 |
+| Note clusters mixing extracted rates | 64 | 11 | 11 | 11 |
+| (CIK, coupon, maturity year) note keys over 2+ instruments | 254 | 208 | 210 | 229 |
+| Excess note instruments on those keys | 329 | 248 | 253 | 303 |
+| Ambiguous-candidate edges | 684 | 590 | 598 | 613 |
+
+The coupon guard alone adds instruments, because it separates mixed series;
+the name folding and the repeat rule take them back out. A read of 14 of the
+123 new merges and 10 of the 71 splits found no wrong call. Each merge joined
+spellings of one series. Each split separated distinct coupons, such as
+Murphy's 4.875% and 7.500% notes due 2031, and Petrobras's 8.375%, 5.375% and
+3.750% notes due 2021. Facilities are unchanged: 92% of them still have a
+single mention.
+
+`MATCHER_SCHEMA_VERSION` is not bumped, because no published column or hashed
+payload changes. A root matched before this change keeps its clusters until
+`cdt match --force`.
 
 ## `normalized_end_date_for_matching`, `end_dates_are_compatible`
 

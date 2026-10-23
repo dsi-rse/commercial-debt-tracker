@@ -248,7 +248,7 @@ This is not stylistic. Two invariants depend on it:
 - **Every published value is citable.** Each evidence payload records `spans` whose offsets index the source item's `text` exactly. A value the matcher derives from text has no span and cannot acquire one, because no span was ever bound to that object — it would publish as fact with no route back to the sentence behind it.
 - **Facts are bound to objects; text is bound to documents.** The extractor resolves a fact to one object through `raw_id`. Item text carries no such scoping, so a rule that reads item text here attributes a document-level observation to whichever objects happen to be in scope. In a filing that names several instruments, that is all of them.
 
-The line is not "no heuristics in the matcher". The matcher does parse text-like attributes — `name_rates_are_compatible` pulls coupon rates out of name fingerprints — and that is fine, because of *how* the result is used:
+The line is not "no heuristics in the matcher". The matcher does parse text-like attributes — `mention_coupons` pulls coupon rates out of name fingerprints — and that is fine, because of *how* the result is used:
 
 > A matcher heuristic may **refuse** a match. It may not **assert** a fact or a relation about an object.
 
