@@ -15,23 +15,113 @@ this is the runtime implementation.
 2. **Gate on debt vocabulary.** Nine keyword lemmas, plurals allowed. Adding the
    plural suffix moved the pass rate from 10.9% to 13.4% — those were filings
    being missed on `debentures` versus `debenture`.
-3. **Window at 400 tokens.** Not the 2,000 the 8-K path uses. Only 1.2% of
+3. **Leave out periodic reports.** Financial statements, MD&A, annual and
+   interim reports, results releases and presentations and shareholder-meeting
+   materials are not windowed; only event documents are. See "Why periodic
+   reports are not windowed" below.
+4. **Window at 400 tokens.** Not the 2,000 the 8-K path uses. Only 1.2% of
    positive windows proved context-dependent at that size, and the smaller crop
    cut extraction tokens to 0.34x while still matching 146 of 154 known mentions.
-4. **Stage 1: TF-IDF linear SVM, threshold 0.332.** Tuned for recall, not
+5. **Stage 1: TF-IDF linear SVM, threshold 0.332.** Tuned for recall, not
    precision.
-5. **Expand each admitted window backwards.** 200 tokens of context at least,
+6. **Expand each admitted window backwards.** 200 tokens of context at least,
    400 at most, stopping early at a section header. A 400-token crop can keep
    an instrument's amounts and dates while cutting away the noun that names it.
-6. **Stage 2: LLM over a whole filing's expanded windows at once.**
+7. **Stage 2: LLM over a whole filing's expanded windows at once.**
 
-Steps 1-3 are the segment stage and steps 4-6 the classify stage (see "Segment
-and classify" below). Steps 1-2 are `cdt.segmenter.sixk.gated_body` and step 3
-`split_into_windows`; `prepare_filing` composes all three for one text, so the
-order is code rather than prose. It matters in both directions: the gate applies to the whole
-document, so applying it per window would change the 13.4% pass rate above,
-and stripping has to come first because a prologue's tag names are themselves
-made of debt vocabulary.
+Steps 1-4 are the segment stage and steps 5-7 the classify stage (see "Segment
+and classify" below). Steps 1-2 are `cdt.segmenter.sixk.gated_body`, step 3
+`cdt.segmenter.sixk_reports.classify_sixk_document` and step 4
+`split_into_windows`; `window_rows_for_submission` composes them for one
+submission, so the order is code rather than prose. It matters in both
+directions: the gate applies to the whole document, so applying it per window
+would change the 13.4% pass rate above, and stripping has to come first
+because a prologue's tag names are themselves made of debt vocabulary.
+`prepare_filing`, the research harness's entry point, composes steps 1, 2 and
+4 for one text with no document type, and so does not apply step 3.
+
+## Why periodic reports are not windowed
+
+The extractor's prompts describe event disclosures: an agreement entered into,
+notes priced, a facility amended. A 6-K carries those, as press releases and
+transaction exhibits, but it also carries the issuer's periodic reporting, and
+on the large foreign filers that reporting is most of the text. Its debt
+schedules extract as one "instrument" per table row and reporting period: a
+lender category, a balance in a unit the window cut away, no start date. The
+matcher cannot join those rows to each other or to the instrument they
+describe. The 8-K path draws the same line, since it never segments Item 2.02
+or reads a 10-K or 10-Q.
+
+Measured on the dev beta root (35 CIKs, 2016-01 to 2026-10; 2,262 filings
+passing the gate, 2,795 gated documents, 21,545 published 6-K mentions):
+
+| source of the mention | mentions | name has no digit | instrument has one mention |
+|---|---|---|---|
+| 6-K document under 30k characters | 3,238 | 31% | 39% |
+| 6-K document over 150k characters | 12,663 | 62% | 77% |
+| 8-K item (reference) | 3,890 | 27% | 49% |
+
+Where a principal published under 100,000 (a scale error), the document's
+unit statement (`in millions of`) was inside the window in 37% of 60 rebuilt
+cases and only above it in 62%, a median of about 25,000 tokens above; no
+expansion budget reaches that.
+
+The classifier is a handful of rules over the document's `<TYPE>` and its text
+(`cdt.segmenter.sixk_reports`); first match wins:
+
+1. EX-1, EX-4 and EX-10 exhibits are event documents.
+2. In the first 400 (agreement) or 1,000 (report) characters after the cover
+   page, an agreement title (`Underwriting Agreement`, `Supplemental
+   Indenture`, `EXECUTION VERSION`, `as Borrower`) or a report title
+   (`Interim Financial Statements`, `Management's Discussion and Analysis`,
+   `Reports Third Quarter Results`, `3Q18`, `Reference Form`, `Management
+   Proxy Circular`) decides, whichever comes first.
+3. A document of at least 30,000 characters naming three or more primary
+   statements (`balance sheet`, `statement of cash flows`, ...) is a report.
+4. Everything else is an event document.
+
+Ambiguity resolves to *event*, because a lost event document loses
+instruments while a kept report only keeps noise. Rules 1 and 2's agreement
+half exist because underwriting and credit agreements cite the issuer's
+financial statements; the title zone is short because press releases cite
+their annual report further down. Cover lines (the SEC header, check boxes,
+incorporation-by-reference paragraphs) are skipped before the zone is cut.
+
+Scored against 204 documents labelled blind (stratified by size, weighted to
+documents with mentions; one LLM annotator working from each document's
+opening and a middle excerpt, 15 low-confidence calls):
+
+| | labelled report | labelled event |
+|---|---|---|
+| classified report | 113 | 4 |
+| classified event | 2 | 85 |
+
+Report precision is 96.6% and recall 98.3%. By mention, the rules withdraw
+1,364 of the sample's 1,368 report mentions and 3 of its 307 event mentions.
+The misses: a BHP operational review and a Franco-Nevada results release read
+as events; an ArcelorMittal capitalization table (an offering exhibit), a
+merger-cooperation agreement, an acquisition presentation and meeting minutes
+read as reports.
+
+These figures are optimistic. The rules were written on the other 2,591
+documents, but three changes followed the first scoring: the earlier of an
+agreement and a report title decides (no document moved); the title zone is
+cut at its character budget, where a document set on one long line had made
+it the whole first paragraph; and the report zone is 1,000 characters,
+chosen among 600 to 3,000 with the labels in view (600 misses one more labelled
+report, 3,000 misreads five more labelled events). A fresh sample is the
+honest check.
+
+Over all 2,795 documents the rules mark 1,629 as reports, carrying 18,419 of
+the 21,545 published 6-K mentions.
+
+What it costs: debt facts disclosed only in periodic reports are no longer
+read — period-end balances, and events a report mentions that no press release
+announced (Vale's revolving credit facility extensions are one). Results
+releases are reports even when they mention a debt transaction in passing.
+Recovering balances from reports is a different extraction (table-aware,
+unit-aware, attaching observations to existing instruments), not a tuning of
+this one.
 
 ## Why stage 1 is deliberately imprecise
 
