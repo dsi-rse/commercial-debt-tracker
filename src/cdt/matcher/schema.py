@@ -156,6 +156,8 @@ class PreparedMention:
     # the model-emitted mention it was minted from. Never a match key itself.
     synthesized_by: str | None = None
     synthesized_from_mention_id: str | None = None
+    #: Canonical coupon rates (``mention_coupons``); empty when none is known.
+    coupons: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -175,6 +177,14 @@ class ClusterProfile:
     lender_signatures: set[str]
     relation_target_ids: set[str] = field(default_factory=set)
     member_item_ids: set[str] = field(default_factory=set)
+    #: Model-emitted members' ``(amount, start date)`` keyed by
+    #: ``(item id, name fingerprint)``, to tell a repeat of one object from a
+    #: same-item sibling.
+    item_name_keys: dict[tuple[str, str], set[tuple[str | None, str | None]]] = field(
+        default_factory=dict
+    )
+    #: Model-emitted members' coupons.
+    coupons: set[str] = field(default_factory=set)
     retired: bool = False
 
     def add_member(self: ClusterProfile, mention: PreparedMention) -> None:
@@ -192,9 +202,15 @@ class ClusterProfile:
         if mention.normalized_end_date:
             self.normalized_end_dates.add(mention.normalized_end_date)
         # A synthesized prior state carries its successor's name, which must not
-        # widen the cluster's name class for later mentions.
-        if mention.normalized_name_fingerprint and mention.synthesized_by is None:
-            self.normalized_name_fingerprints.add(mention.normalized_name_fingerprint)
+        # widen the cluster's name class or coupons for later mentions.
+        if mention.synthesized_by is None:
+            self.coupons.update(mention.coupons)
+            fingerprint = mention.normalized_name_fingerprint
+            if fingerprint:
+                self.normalized_name_fingerprints.add(fingerprint)
+                self.item_name_keys.setdefault(
+                    (mention.item_id, fingerprint), set()
+                ).add((mention.normalized_amount, mention.normalized_start_date))
         if mention.lender_signature:
             self.lender_signatures.add(mention.lender_signature)
         for target in (mention.amendment_of, *mention.retired_by, mention.split_of):

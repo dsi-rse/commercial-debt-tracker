@@ -1,15 +1,15 @@
-"""Rules that refuse a match: incompatible names, coupons and end dates."""
+"""Rules that refuse a match: incompatible names and end dates."""
 
 from __future__ import annotations
 
 import re
-from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 
-from cdt.extractor.normalize.amounts import normalize_numeric_string
 from cdt.matcher.normalize import (
     MONTH_TEXT_LENGTH,
+    NAME_RATE_PATTERN,
     YEAR_TEXT_LENGTH,
+    name_rate_tokens,
 )
 from cdt.matcher.schema import PreparedMention
 
@@ -35,31 +35,6 @@ def end_dates_are_compatible(left: str | None, right: str | None) -> bool:
         return True
     shorter, longer = sorted((left, right), key=len)
     return len(shorter) == MONTH_TEXT_LENGTH and longer[:MONTH_TEXT_LENGTH] == shorter
-
-
-# `normalize_name_fingerprint` turns the decimal point into a token break, so a
-# coupon arrives here as `4 375%` rather than `4.375%`; the separator is
-# therefore optional. `(?<!\d)` keeps a maturity year out of the whole-number
-# part, so `notes due 2028 5%` yields the rate and not `2028 5%`.
-NAME_RATE_PATTERN = re.compile(r"(?<!\d)(\d{1,3})(?:[ .](\d{1,4}))?%")
-
-
-@lru_cache(maxsize=_FINGERPRINT_CACHE)
-def name_rate_tokens(fingerprint: str | None) -> frozenset[str]:
-    """Return the coupon rates in one name fingerprint, as canonical numbers.
-
-    ``4 375%`` yields the normalized numeric string for 4.375; an empty
-    fingerprint yields the empty set.
-    """
-    if not fingerprint:
-        return frozenset()
-    rates: set[str] = set()
-    for whole, fraction in NAME_RATE_PATTERN.findall(fingerprint):
-        try:
-            rates.add(normalize_numeric_string(Decimal(f"{whole}.{fraction or 0}")))
-        except InvalidOperation:
-            continue
-    return frozenset(rates)
 
 
 NAME_STOPWORDS = frozenset({"the", "of", "and", "its", "new", "existing", "certain"})
@@ -171,13 +146,3 @@ def name_class_sizes(mention_index: dict[str, PreparedMention]) -> dict[str, int
             )
         sizes[mention_id] = class_sizes[fingerprint]
     return sizes
-
-
-@lru_cache(maxsize=_FINGERPRINT_PAIR_CACHE)
-def name_rates_are_compatible(left: str | None, right: str | None) -> bool:
-    """Return whether two name fingerprints can still describe one instrument."""
-    left_rates = name_rate_tokens(left)
-    right_rates = name_rate_tokens(right)
-    if left_rates and right_rates:
-        return bool(left_rates & right_rates)
-    return True
