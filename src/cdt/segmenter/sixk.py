@@ -2,8 +2,9 @@
 
 :func:`prepare_filing` strips the inline-XBRL prologue, gates the document on
 debt vocabulary, and cuts it into :data:`WINDOW_TOKENS`-token windows; the
-segment stage (:func:`segment_pending_sixk_documents`) persists those windows as
-spans in ``sixk-windows``. After stage 1, :func:`expand_admitted_windows`
+segment stage (:func:`segment_pending_sixk_documents`) also leaves out periodic
+reports (:mod:`cdt.segmenter.sixk_reports`) and persists the windows as spans in
+``sixk-windows``. After stage 1, :func:`expand_admitted_windows`
 prepends context to the admitted windows and merges adjacent ones. Window size, gate vocabulary and
 expansion limits were chosen against labelled data; see
 ``docs/sixk-two-stage-triage.md``.
@@ -28,6 +29,7 @@ from cdt.datasets import (
 from cdt.ingest.core import DOCUMENT_COLUMNS
 from cdt.partition_stage import PartitionOutput, run_partition_stage
 from cdt.segmenter.core import document_text_for_record, ensure_s3_client
+from cdt.segmenter.sixk_reports import classify_sixk_document
 from cdt.segmenter.text import DOCUMENT_RE, TYPE_RE, normalize_body_lines
 from cdt.storage.tables import read_table
 
@@ -1081,15 +1083,16 @@ SIXK_WINDOW_INTEGER_COLUMNS = [
 def window_rows_for_submission(
     document: dict[str, object], submission: str
 ) -> list[dict[str, object]]:
-    """Return one span row per window of a submission's gated prose documents.
+    """Return one span row per window of a submission's gated event documents.
 
     ``document`` is the filing's documents row; a document the keyword gate
-    rejects contributes no rows.
+    rejects, or that :func:`cdt.segmenter.sixk_reports.classify_sixk_document`
+    reads as a periodic report, contributes no rows.
     """
     rows: list[dict[str, object]] = []
     for document_index, prose in enumerate(prose_documents(submission)):
         body = gated_body(prose.text)
-        if body is None:
+        if body is None or classify_sixk_document(body, prose.document_type).is_report:
             continue
         digest = body_digest(body)
         for window in split_into_windows(body):

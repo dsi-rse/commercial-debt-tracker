@@ -227,7 +227,7 @@ The snippet's own span and triage detail (`sixk_window_start`, `sixk_window_end`
 
 ### `sixk-windows`
 
-The 6-K segment output: one row per window of each 6-K prose document that passes the debt-vocabulary gate, as a **span only**. The text is not stored; the classify stage rebuilds it from the filing's submission (see [sixk-two-stage-triage.md](sixk-two-stage-triage.md)). A filing the gate rejects writes no rows.
+The 6-K segment output: one row per window of each 6-K prose document that passes the debt-vocabulary gate and is an event document rather than a periodic report (`cdt.segmenter.sixk_reports.classify_sixk_document`), as a **span only**. The text is not stored; the classify stage rebuilds it from the filing's submission (see [sixk-two-stage-triage.md](sixk-two-stage-triage.md)). A filing the gate rejects, or whose gated documents are all periodic reports, writes no rows.
 
 Columns:
 

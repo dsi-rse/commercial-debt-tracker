@@ -44,6 +44,7 @@ from cdt.datasets import (
 )
 from cdt.ingest.core import DOCUMENT_COLUMNS
 from cdt.ingest.core import documents_root as ingest_documents_root
+from cdt.segmenter import sixk as sixk_segmenter
 from cdt.segmenter.sixk import (
     SIXK_WINDOW_COLUMNS,
     prepare_filing,
@@ -52,6 +53,7 @@ from cdt.segmenter.sixk import (
     strip_inline_xbrl_prologue,
     window_documents,
 )
+from cdt.segmenter.sixk_reports import SixkDocumentKind
 from cdt.storage.objects import list_artifacts, read_json_artifact
 from cdt.storage.tables import read_dataset, write_partition_table
 
@@ -1291,6 +1293,62 @@ def test_a_filing_gated_out_on_resegment_cascades_to_its_mentions(
         sixk_snippets_root(str(tmp_path)), columns=SIXK_SNIPPET_COLUMNS
     ).empty
     assert read_dataset(mentions_root(str(tmp_path))).empty
+
+
+REPORT_BODY = f"<p>Unaudited Interim Financial Statements</p><p>{DEBT_PROSE}</p>"
+
+
+def test_segment_windows_only_a_filing_s_event_documents(tmp_path: Path) -> None:
+    """A periodic report beside a press release leaves no windows; the release keeps its index."""
+    submission = _submission(("6-K", f"<p>{DEBT_PROSE}</p>"), ("EX-99.2", REPORT_BODY))
+    _write_documents(tmp_path, [_document_row(tmp_path, submission=submission)])
+
+    windows = segment_pending_sixk_documents(artifact_root=str(tmp_path))
+
+    assert set(windows["document_index"]) == {0}
+    assert set(windows["document_type"]) == {"6-K"}
+
+
+def test_a_forced_resegment_withdraws_a_report_s_mentions_and_keeps_the_rest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one-time cleanup: segment --force, classify and extract prune report mentions.
+
+    The press release's snippet keeps its span, so its id, and extraction does
+    not pay for it again; the report's snippet leaves its month, so extract
+    retires its mentions.
+    """
+    from support import _fake_success_workflow
+
+    from cdt.extractor import extract_pending_items, mentions_root
+
+    submission = _submission(("6-K", f"<p>{DEBT_PROSE}</p>"), ("EX-99.2", REPORT_BODY))
+    _write_documents(tmp_path, [_document_row(tmp_path, submission=submission)])
+    # Windowed as before the document-kind gate existed.
+    with monkeypatch.context() as before:
+        before.setattr(
+            sixk_segmenter,
+            "classify_sixk_document",
+            lambda body, document_type: SixkDocumentKind("event", "default"),
+        )
+        segment_and_classify_pending(
+            artifact_root=str(tmp_path), client=FakeChatClient(keep_all=True)
+        )
+    calls = _fake_success_workflow(monkeypatch)
+    extract_pending_items(artifact_root=str(tmp_path), client=None)
+    mentions = read_dataset(mentions_root(str(tmp_path)))
+    assert mentions["item_id"].str.split("-6K-").str[1].str[0].tolist() == ["0", "1"]
+    extracted = list(calls)
+
+    segment_pending_sixk_documents(artifact_root=str(tmp_path), force=True)
+    triage_pending_windows(
+        artifact_root=str(tmp_path), client=FakeChatClient(keep_all=True)
+    )
+    extract_pending_items(artifact_root=str(tmp_path), client=None)
+
+    remaining = read_dataset(mentions_root(str(tmp_path)))
+    assert remaining["item_id"].tolist() == [extracted[0]]
+    assert calls == extracted
 
 
 def test_a_forced_classify_that_holds_a_partition_leaves_it_pending(
