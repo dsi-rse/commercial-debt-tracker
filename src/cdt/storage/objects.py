@@ -6,7 +6,7 @@ import gzip
 import hashlib
 import json
 import shutil
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from time import sleep
@@ -98,6 +98,8 @@ _STREAMING_READ_ERRORS = (
 )
 _GET_OBJECT_ATTEMPTS = 5
 _GET_OBJECT_BACKOFF_SECONDS = 1.0
+# The read size of a streamed artifact; a line longer than this spans reads.
+_STREAM_CHUNK_BYTES = 8 * 1024 * 1024
 
 
 def _get_object_with_body(
@@ -127,6 +129,68 @@ def _get_object_with_body(
             sleep(_GET_OBJECT_BACKOFF_SECONDS * attempt)
     msg = "unreachable: loop returns or raises"
     raise AssertionError(msg)
+
+
+def _iter_object_chunks(s3_client: object, bucket: str, key: str) -> Iterator[bytes]:
+    """Yield an S3 object's body in chunks, resuming a failed stream where it stopped.
+
+    A retry asks for the bytes after the last chunk yielded (``Range``) of the
+    same object (``IfMatch`` on the first response's ETag), so nothing is
+    yielded twice; the last failure is re-raised after ``_GET_OBJECT_ATTEMPTS``.
+    """
+    offset = 0
+    etag: str | None = None
+    for attempt in range(1, _GET_OBJECT_ATTEMPTS + 1):
+        request: dict[str, str] = {"Bucket": bucket, "Key": key}
+        if etag is not None:
+            request.update({"Range": f"bytes={offset}-", "IfMatch": etag})
+        try:
+            response = s3_client.get_object(**request)
+            etag = cast(str, response["ETag"])
+            for chunk in response["Body"].iter_chunks(_STREAM_CHUNK_BYTES):
+                offset += len(chunk)
+                yield chunk
+            return
+        except _STREAMING_READ_ERRORS as error:
+            if attempt == _GET_OBJECT_ATTEMPTS:
+                raise
+            LOGGER.warning(
+                "S3 object stream failed at byte %s (attempt %s/%s) for "
+                "s3://%s/%s: %s",
+                offset,
+                attempt,
+                _GET_OBJECT_ATTEMPTS,
+                bucket,
+                key,
+                error,
+            )
+            sleep(_GET_OBJECT_BACKOFF_SECONDS * attempt)
+
+
+def iter_text_lines(path: ArtifactPath) -> Iterator[str]:
+    """Yield a UTF-8 text artifact's lines, without newlines, one read at a time.
+
+    Holds one read and one partial line in memory, never the whole artifact,
+    for logs too large to read with :func:`read_text_artifact`. Lines end at
+    a line feed only; a carriage return stays in the line.
+    """
+    normalized = normalize_artifact_path(path)
+    if is_s3_uri(normalized):
+        bucket, key = parse_s3_uri(normalized)
+        yield from _split_lines(_iter_object_chunks(s3_client(), bucket, key))
+        return
+    with Path(normalized).open("rb") as handle:
+        yield from _split_lines(iter(lambda: handle.read(_STREAM_CHUNK_BYTES), b""))
+
+
+def _split_lines(chunks: Iterable[bytes]) -> Iterator[str]:
+    pending = b""
+    for chunk in chunks:
+        *lines, pending = (pending + chunk).split(b"\n")
+        for line in lines:
+            yield line.decode("utf-8")
+    if pending:
+        yield pending.decode("utf-8")
 
 
 def get_object_bytes(s3_client: object, bucket: str, key: str) -> bytes:

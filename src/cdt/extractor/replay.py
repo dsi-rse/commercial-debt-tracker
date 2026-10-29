@@ -51,8 +51,8 @@ from cdt.lease import throttled
 from cdt.shared import get_logger
 from cdt.storage.columns import apply_declared_column_types
 from cdt.storage.objects import (
+    iter_text_lines,
     list_artifacts,
-    read_text_artifact,
     write_json_artifact,
     write_text_artifact,
 )
@@ -161,13 +161,13 @@ def _audit_files(resolved_root: str) -> list[tuple[str, list[str]]]:
 def latest_recorded_outcomes(resolved_root: str) -> dict[str, RecordedOutcome]:
     """Return each item's newest audit record, across every extract run.
 
-    Run ids are UTC timestamps, so the newest run's record wins. Files are read
-    one at a time and only the fields a replay needs are kept.
+    Run ids are UTC timestamps, so the newest run's record wins. Files are
+    streamed a line at a time, and only the fields a replay needs are kept.
     """
     outcomes: dict[str, RecordedOutcome] = {}
     for run_id, paths in _audit_files(resolved_root):
         for path in paths:
-            for line in read_text_artifact(path).splitlines():
+            for line in iter_text_lines(path):
                 if not line.strip():
                     continue
                 record = json.loads(line)
