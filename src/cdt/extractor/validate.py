@@ -312,7 +312,7 @@ def validate_amount_is_not_rate(
     evidence = value.get("evidence")
     if not isinstance(evidence, list):
         return []
-    # The same normalization `canonical_value` applies, so the validator and
+    # The same normalization `cluster_span_texts` applies, so the validator and
     # `standardized_amount_payload` judge one text; collapsing rather than
     # stripping whitespace keeps multi-word markers such as `basis point`.
     evidence_texts = [

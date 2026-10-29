@@ -164,17 +164,6 @@ def cluster_span_texts(
     return [value for value in values if value]
 
 
-def canonical_value(
-    tag_ids: object,
-    tag_details: dict[str, dict[str, object]],
-) -> str | None:
-    """Return the longest textual member of one coreference cluster."""
-    values = cluster_span_texts(tag_ids, tag_details)
-    if not values:
-        return None
-    return max(values, key=len)
-
-
 def cluster_payload(
     tag_ids: object,
     tag_details: dict[str, dict[str, object]],

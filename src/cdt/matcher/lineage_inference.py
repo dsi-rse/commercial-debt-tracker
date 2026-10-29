@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import re
 
+from cdt.extractor.normalize.parties import is_role_only_text
 from cdt.matcher.normalize import _json_list
 
 LOGGER = logging.getLogger(__name__)
@@ -64,31 +65,6 @@ BORROWER_SUFFIXES = frozenset(
         "na",
     }
 )
-# A borrower "named" only by its role or defined term, which reads as naming no
-# borrower. Keys are compared after `NAME_NOISE` and `BORROWER_SUFFIXES` are
-# stripped, so `the Borrowers` and `Co-Borrower` both land on `borrower(s)`.
-GENERIC_BORROWER_PHRASES = frozenset(
-    {
-        "borrower",
-        "borrowers",
-        "subsidiary borrower",
-        "subsidiary borrowers",
-        "parent borrower",
-        "other borrowers party thereto",
-        "issuer",
-        "issuers",
-        "obligor",
-        "obligors",
-        "buyer",
-        "buyers",
-        "buyer parent",
-        "parent",
-        "loan party",
-        "loan parties",
-        "credit party",
-        "credit parties",
-    }
-)
 
 
 def _borrower_key(name: object) -> tuple[str, ...]:
@@ -103,7 +79,8 @@ def _borrower_key(name: object) -> tuple[str, ...]:
 def _borrowers(row: dict[str, object]) -> set[tuple[str, ...]]:
     """Return the borrower keys the extractor bound to this instrument.
 
-    Placeholders in `GENERIC_BORROWER_PHRASES` are dropped. Absent, unparseable
+    A borrower named only by its role (`is_role_only_text`, after `NAME_NOISE`
+    and `BORROWER_SUFFIXES` are stripped) is dropped. Absent, unparseable
     or non-list `parties_json` returns the empty set, meaning no borrower named.
     """
     keys = {
@@ -111,9 +88,7 @@ def _borrowers(row: dict[str, object]) -> set[tuple[str, ...]]:
         for party in _json_list(row, "parties_json")
         if isinstance(party, dict) and party.get("role") == "borrower"
     }
-    return {
-        key for key in keys if key and " ".join(key) not in GENERIC_BORROWER_PHRASES
-    }
+    return {key for key in keys if key and not is_role_only_text(" ".join(key))}
 
 
 def _borrowers_disagree(child: dict[str, object], parent: dict[str, object]) -> bool:

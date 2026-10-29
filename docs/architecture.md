@@ -223,6 +223,15 @@ Two `cdt` commands cover the same ground manually:
   `pipeline-writer` lease first so it cannot race a running tick. Without `--yes` it only
   reports what a reset would abandon. The job directory is left in place for inspection.
 
+After a change to how responses become mentions (stage `postprocess`, the normalizers),
+`cdt extract replay` brings stored mentions up to date without paying for extraction. It
+reads each item's newest record in `extractor-runs/`, re-runs the kept stages on the
+recorded responses, and rewrites only the items whose rows changed, under the
+`pipeline-writer` lease. Then run `cdt match` and `cdt publish`. `--dry-run` reports the
+counts and writes nothing. Items the current validators reject, and items whose stored
+mentions are not the ones their record published, are left as they are and counted.
+Classification files the active batch job has claimed are skipped; its finalize writes them.
+
 ## Matcher Design
 
 Matcher outputs are partitioned by `cik_shard` instead of by filing date because the matching problem is company-scoped. Mentions for the same issuer need to be considered together across time.

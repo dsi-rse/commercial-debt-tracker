@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,7 +34,7 @@ from cdt.storage.columns import (
     coerce_dataset_text,
     decimal_column_values,
 )
-from cdt.storage.objects import get_object_bytes
+from cdt.storage.objects import get_object_bytes, iter_text_lines
 from cdt.storage.tables import (
     read_dataset,
     read_table,
@@ -145,6 +146,80 @@ def test_get_object_bytes_does_not_retry_client_errors(
         get_object_bytes(_MissingKeyClient(), "bucket", "key")
 
     assert calls == 1
+
+
+class _ResumableS3Client:
+    """Streams ``payload`` in 3-byte chunks; each stream dies after ``dies_after`` chunks."""
+
+    def __init__(self: _ResumableS3Client, payload: bytes, dies_after: int) -> None:
+        self.payload = payload
+        self.dies_after = dies_after
+        self.requests: list[dict[str, str]] = []
+
+    def get_object(self: _ResumableS3Client, **request: str) -> dict[str, object]:
+        self.requests.append(request)
+        start = int(request.get("Range", "bytes=0-")[len("bytes=") : -1])
+        body = self.payload[start:]
+        dies_after = self.dies_after
+
+        def iter_chunks(size: int) -> Iterator[bytes]:
+            del size
+            for index in range(0, len(body), 3):
+                if index // 3 == dies_after:
+                    raise ReadTimeoutError(endpoint_url="https://s3.test")
+                yield body[index : index + 3]
+
+        return {"ETag": '"etag-1"', "Body": SimpleNamespace(iter_chunks=iter_chunks)}
+
+
+def test_iter_text_lines_resumes_a_failed_stream_where_it_stopped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mid-stream timeout re-asks for the remaining bytes of the same object.
+
+    Restarting from byte 0 would yield the lines already read a second time.
+    """
+    monkeypatch.setattr(storage_objects, "sleep", lambda seconds: None)
+    client = _ResumableS3Client("first\nsécond\nthird".encode(), dies_after=2)
+    monkeypatch.setattr(storage_objects, "s3_client", lambda: client)
+
+    assert list(iter_text_lines("s3://bucket/run/full.jsonl")) == [
+        "first",
+        "sécond",
+        "third",
+    ]
+    assert client.requests[0] == {"Bucket": "bucket", "Key": "run/full.jsonl"}
+    assert client.requests[1] == {
+        "Bucket": "bucket",
+        "Key": "run/full.jsonl",
+        "Range": "bytes=6-",
+        "IfMatch": '"etag-1"',
+    }
+
+
+def test_iter_text_lines_gives_up_after_bounded_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stream that never gets past its first chunk surfaces the failure."""
+    monkeypatch.setattr(storage_objects, "sleep", lambda seconds: None)
+    client = _ResumableS3Client(b"never\nread\n", dies_after=0)
+    monkeypatch.setattr(storage_objects, "s3_client", lambda: client)
+
+    with pytest.raises(ReadTimeoutError):
+        list(iter_text_lines("s3://bucket/key"))
+
+    assert len(client.requests) == storage_objects._GET_OBJECT_ATTEMPTS
+
+
+def test_iter_text_lines_joins_lines_and_characters_split_across_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A line, or a multi-byte character, cut by a read boundary comes back whole."""
+    monkeypatch.setattr(storage_objects, "_STREAM_CHUNK_BYTES", 2)
+    path = tmp_path / "full.jsonl"
+    path.write_text('{"a": "é"}\n\nlast', encoding="utf-8")
+
+    assert list(iter_text_lines(path)) == ['{"a": "é"}', "", "last"]
 
 
 class _PrefixMatchingS3Client:

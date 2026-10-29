@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from support import _dates_tag_details, maturity_row_state, party_row_state
 
 from cdt.extractor.normalize.amounts import (
@@ -935,6 +936,80 @@ def test_parties_list_derives_lender_disclosure() -> None:
     # A trustee-only indenture names nobody who holds the debt. Under the
     # boolean this replaced, that read the same as a collective phrase.
     assert no_lender == "none_named"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "we",
+        "our",
+        "Company\u2019s",
+        "Notes Collateral Agent",
+        "Trustee and Collateral Agent",
+        "Required Holders",
+        "Dealer(s)",
+        "Co-Issuers",
+        "2034 Notes Issuer",
+        "the other lenders party thereto",
+        "Loan Parties",
+    ],
+)
+def test_role_only_text_names_no_one(text: str) -> None:
+    """Text made only of role words, modifiers and pronouns is role-only (#323)."""
+    from cdt.extractor.normalize.parties import is_role_only_text
+
+    assert is_role_only_text(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Citibank, N.A.",
+        "BHP Group Plc",
+        "The Bank of New York Mellon Trust Company, N.A.",
+        "Magellan Midstream Partners, L.P.",
+        "3M Company",
+        "2034",
+    ],
+)
+def test_a_real_name_is_not_role_only(text: str) -> None:
+    """A name keeps at least one word outside the role vocabulary."""
+    from cdt.extractor.normalize.parties import is_role_only_text
+
+    assert not is_role_only_text(text)
+
+
+def test_party_canonical_name_prefers_a_real_name_over_a_role() -> None:
+    """A longer role phrase loses to the party's name; a role-only cluster is collective (#323)."""
+    from cdt.extractor.normalize.parties import party_payloads_and_disclosure
+
+    tags = {
+        "tag-1": {"text": "Citibank, N.A.", "char_start": 0, "char_end": 14},
+        "tag-2": {
+            "text": "Securities Administrator",
+            "char_start": 20,
+            "char_end": 44,
+        },
+        "tag-3": {"text": "we", "char_start": 50, "char_end": 52},
+        "tag-4": {"text": "Required Holders", "char_start": 60, "char_end": 76},
+    }
+    parties, disclosure = party_payloads_and_disclosure(
+        {
+            "parties": [
+                {"tag_ids": ["tag-1", "tag-2"], "role": "other", "kind": "named"},
+                {"tag_ids": ["tag-3"], "role": "borrower", "kind": "named"},
+                {"tag_ids": ["tag-4"], "role": "lender", "kind": "named"},
+            ]
+        },
+        tags,
+    )
+    assert [(p["canonical_name"], p["role"], p["kind"]) for p in parties] == [
+        ("Citibank, N.A.", "other", "named"),
+        ("we", "borrower", "collective"),
+        ("Required Holders", "lender", "collective"),
+    ]
+    # A syndicate named only as `Required Holders` does not disclose its lenders.
+    assert disclosure == "collective_present"
 
 
 def test_entry_without_parties_names_no_lender() -> None:
