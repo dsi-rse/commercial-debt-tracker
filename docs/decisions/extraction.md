@@ -133,6 +133,12 @@ A three-valued disclosure replaces a boolean that was true for two different rea
 
 The model labels every cluster, and the labels persist rather than only steering what to drop (#150). The borrower's identity matters exactly when a subsidiary is the obligor under the parent filer's 8-K. The model gives a `kind` for every party and the code keeps it, but only lender kinds feed `lender_disclosure`.
 
+### `is_role_only_text`, `canonical_party_name`
+
+Longest-span selection published role words as party names: on the 2026-10-28 beta snapshot (7,184 mentions, 18,681 party clusters) 1,048 `named` clusters held only spans such as `Company`, `Trustee`, `we` or `Required Holders`, and 65 chose a role phrase over a real name in the same cluster (`Securities Administrator` over `Citibank, N.A.`, `Parent Companies` over `BHP Group Plc`). A lender cluster named `Required Holders` also made `lender_disclosure` `complete` (#323).
+
+Text is role-only when every letter word is in `ROLE_ONLY_WORDS`. Testing every word covers compounds (`Notes Collateral Agent`, `Trustee and Collateral Agent`) without listing them, and a real name keeps at least one word outside the vocabulary. Over the snapshot no cluster that changed kind held a real name, and every rename landed on one. A role-only cluster becomes `collective` rather than a new kind so the publish contract is unchanged; consumers already read `collective` as "not a name". The matcher's lender keys and lineage borrower check use the same test, so the three role lists no longer drift.
+
 ### `canonical_instrument_name`
 
 `ner.md` rule 11 has NER tag both the facility phrase and its agreement name, and says the descriptive phrase "must never be dropped in favour of the agreement name". Plain longest-span selection did exactly that on 9 of the 476 multi-span names in the 2026-09 window (`Second Amended and Restated Credit Agreement` over `term loan B facility`; the `Super-Priority Senior Secured Priming ...` title over `DIP Facility`). It is not only display: the published name feeds the matcher's `normalize_name_fingerprint`, and an amendment title is the generic, near-duplicate string that `NAME_CLASS_GATE` and the identifying-name guard have to defend against.

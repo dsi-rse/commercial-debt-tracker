@@ -9,6 +9,7 @@ from difflib import SequenceMatcher
 from functools import lru_cache
 
 from cdt.extractor.normalize.amounts import normalize_numeric_string
+from cdt.extractor.normalize.parties import is_role_only_text
 from cdt.extractor.schema import (
     LENDER_DISCLOSURE_NONE_NAMED,
     LENDER_DISCLOSURE_PRECEDENCE,
@@ -16,25 +17,6 @@ from cdt.extractor.schema import (
 )
 from cdt.matcher.schema import PreparedMention
 from cdt.storage.columns import coerce_dataset_text, json_column
-
-GENERIC_LENDER_TERMS = frozenset(
-    {
-        "lender",
-        "lenders",
-        "purchaser",
-        "purchasers",
-        "holder",
-        "holders",
-        "investor",
-        "investors",
-        "buyer",
-        "buyers",
-        "noteholder",
-        "noteholders",
-        "trustee",
-        "trustees",
-    }
-)
 
 
 def _json_text(row: dict[str, object], column: str) -> str | None:
@@ -111,8 +93,9 @@ def cluster_canonical_key(cluster: dict[str, object]) -> str:
     """Return the normalized canonical key for one cluster.
 
     A cluster can hold a defined-term alias alongside the party it names, as in
-    `Oaktree` and `Purchasers`. The specific name is the useful key, so generic
-    party words lose to it even when the alias is the longer string.
+    `Oaktree` and `Purchasers`. The specific name is the useful key, so
+    role-only text (`is_role_only_text`) loses to it even when the alias is the
+    longer string.
     """
     spans = cluster.get("spans", [])
     if not isinstance(spans, list):
@@ -125,7 +108,7 @@ def cluster_canonical_key(cluster: dict[str, object]) -> str:
     texts = [text for text in texts if text]
     if not texts:
         return ""
-    specific = [text for text in texts if text not in GENERIC_LENDER_TERMS]
+    specific = [text for text in texts if not is_role_only_text(text)]
     return max(specific or texts, key=len)
 
 
@@ -415,9 +398,7 @@ def lender_keys(value: object) -> list[str]:
 
 def lender_signature(value: object) -> str:
     """Return one normalized lender signature from extractor JSON payload."""
-    return " | ".join(
-        key for key in lender_keys(value) if key not in GENERIC_LENDER_TERMS
-    )
+    return " | ".join(key for key in lender_keys(value) if not is_role_only_text(key))
 
 
 def normalize_party_text(value: str) -> str:

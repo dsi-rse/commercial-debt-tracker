@@ -16,7 +16,6 @@ from cdt.extractor.schema import (
     PARTY_ROLES,
 )
 from cdt.extractor.tags import (
-    canonical_value,
     cluster_payload,
     cluster_span_texts,
     payload_tag_ids,
@@ -37,6 +36,104 @@ INSTRUMENT_NOUN_PATTERN = re.compile(
     r"financing|borrowing|borrowings|credit)\b",
     re.IGNORECASE,
 )
+# The words a filing uses to refer to a party by its role rather than its name.
+# Text made only of these (`Trustee`, `Notes Collateral Agent`, `we`, `the other
+# lenders party thereto`) names no one; a real name keeps at least one word
+# outside it (`Citibank`, `BHP`).
+ROLE_ONLY_WORDS = frozenset(
+    {
+        # roles
+        "administrator",
+        "affiliate",
+        "agent",
+        "bank",
+        "borrower",
+        "buyer",
+        "company",
+        "dealer",
+        "debtor",
+        "entity",
+        "guarantor",
+        "holder",
+        "investor",
+        "issuer",
+        "lender",
+        "noteholder",
+        "obligor",
+        "partnership",
+        "party",
+        "person",
+        "purchaser",
+        "representative",
+        "trustee",
+        "underwriter",
+        # modifiers
+        "administrative",
+        "co",
+        "collateral",
+        "credit",
+        "facility",
+        "increasing",
+        "initial",
+        "issuing",
+        "lead",
+        "loan",
+        "notes",
+        "original",
+        "other",
+        "parent",
+        "required",
+        "revolving",
+        "securities",
+        "specified",
+        "subsidiary",
+        "successor",
+        # pronouns and fillers
+        "and",
+        "as",
+        "its",
+        "of",
+        "our",
+        "the",
+        "thereto",
+        "us",
+        "we",
+    }
+)
+
+
+def is_role_only_text(text: str) -> bool:
+    """Return whether ``text`` refers to a party only by role, modifier or pronoun.
+
+    Curly quotes fold to plain ones, a possessive `'s` and a `(s)` plural marker
+    are dropped, and only the letter words are kept; the text is role-only when
+    every word, or its singular, is in `ROLE_ONLY_WORDS`. Text with no letter
+    words is not role-only.
+    """
+    folded = text.replace("\u2019", "'").replace("\u2018", "'").lower()
+    folded = re.sub(r"'s\b|\(s\)", "", folded)
+    words = re.findall(r"[a-z]+", folded)
+    return bool(words) and all(_is_role_word(word) for word in words)
+
+
+def _is_role_word(word: str) -> bool:
+    if word in ROLE_ONLY_WORDS:
+        return True
+    if word.endswith("ies"):
+        return f"{word[:-3]}y" in ROLE_ONLY_WORDS
+    return word.endswith("s") and word[:-1] in ROLE_ONLY_WORDS
+
+
+def canonical_party_name(values: list[str]) -> str | None:
+    """Return the longest span that names the party, else the longest span.
+
+    A role-only span (`Securities Administrator`) loses to a name
+    (`Citibank, N.A.`) however long it is; None for an empty cluster.
+    """
+    if not values:
+        return None
+    named = [value for value in values if not is_role_only_text(value)]
+    return max(named or values, key=len)
 
 
 def canonical_instrument_name(
@@ -72,8 +169,10 @@ def party_payloads_and_disclosure(
     """Return every party cluster with its role and kind, plus lender disclosure.
 
     Each cluster with at least one known span becomes ``canonical_name``
-    (longest span), ``role`` (the model's, or ``other`` when unknown), ``kind``
-    (the model's, or ``named`` when absent or unknown) and ``spans``. The
+    (`canonical_party_name`), ``role`` (the model's, or ``other`` when
+    unknown), ``kind`` and ``spans``. ``kind`` is ``collective`` when every
+    span is role-only (`is_role_only_text`), since such a cluster names no
+    one; otherwise it is the model's, or ``named`` when absent or unknown. The
     borrower is kept: its identity matters when a subsidiary is the obligor
     under the parent filer's 8-K. The disclosure is computed from the lender
     clusters' kinds (`lender_disclosure_for`).
@@ -86,13 +185,14 @@ def party_payloads_and_disclosure(
         payload = cluster_payload(cluster.get("tag_ids"), tag_details)
         if not payload["spans"]:
             continue
+        values = cluster_span_texts(payload_tag_ids(payload), tag_details)
         role = cluster.get("role")
         kind = cluster.get("kind")
+        if values and all(is_role_only_text(value) for value in values):
+            kind = COLLECTIVE_LENDER_KIND
         parties.append(
             {
-                "canonical_name": canonical_value(
-                    payload_tag_ids(payload), tag_details
-                ),
+                "canonical_name": canonical_party_name(values),
                 "role": role if role in PARTY_ROLES else "other",
                 "kind": kind if kind in PARTY_KINDS else DEFAULT_LENDER_CLUSTER_KIND,
                 "spans": payload["spans"],

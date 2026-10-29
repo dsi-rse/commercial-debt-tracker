@@ -442,7 +442,7 @@ active revolvers at once (#170).
   history, so any candidate set that does not single out one parent is
   refused.
 
-## `_borrowers_disagree`, `BORROWER_SUFFIXES`, `GENERIC_BORROWER_PHRASES`
+## `_borrowers_disagree`, `BORROWER_SUFFIXES`, role-only borrowers
 
 - **Why a borrower check.** The CIK check uses the filer's CIK, and that cannot
   separate two issuers' agreements named in one 8-K. EQT's own Third Amended
@@ -455,10 +455,11 @@ active revolvers at once (#170).
   their parent, so a prefix rule treats `EQT Corporation` and `EQT Midstream
   Partners, LP` as one party. `BORROWER_SUFFIXES` already makes `EQT` equal to
   `EQT Corporation` (#205).
-- **Placeholders are silence.** The extractor records a party as the longest
-  span it saw, so a filing that never uses the company's name records the
-  borrower as `Issuer`. Read as a name, that turned `HSBC Holdings plc` versus
-  `Issuer` into evidence of two different companies (#205).
+- **Placeholders are silence.** A filing that never uses the company's name
+  records the borrower as `Issuer`. Read as a name, that turned `HSBC Holdings
+  plc` versus `Issuer` into evidence of two different companies (#205). The
+  extractor's `is_role_only_text` decides what is a placeholder, the same
+  check that picks party `canonical_name` and lender keys (#323).
 - **Silence is not disagreement.** Refusing a link whenever a party is missing
   would drop ordinary links to the many mentions that never name a borrower.
 - **One JSON guard.** `_borrowers` reads `parties_json` through

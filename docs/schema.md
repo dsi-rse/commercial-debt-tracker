@@ -283,7 +283,7 @@ Columns:
 - `amendment_of`: `debt_instrument_mention_id` of the mention this row amends, when the extractor found that relation.
 - `split_of`: `debt_instrument_mention_id` of the mention this row splits from, when the extractor found that relation.
 - `retired_by_json`: JSON array of `debt_instrument_mention_id`s of the mentions that retired this row's obligation. The pointer sits on the retired instrument's mention; proceeds-financed redemption counts.
-- `parties_json`: JSON array of every party cluster with `canonical_name` (longest span), `role` (`lender`, `borrower`, `agent`, `trustee`, `underwriter`, `guarantor`, `other`), `kind` (`named` or `collective`), and evidence `spans`. The extractor returns one `parties` list with a role per cluster; nothing the model labels is discarded.
+- `parties_json`: JSON array of every party cluster with `canonical_name` (the longest span that names the party rather than its role, else the longest span), `role` (`lender`, `borrower`, `agent`, `trustee`, `underwriter`, `guarantor`, `other`), `kind` (`named` or `collective`; a cluster whose every span is a role word or pronoun, such as `Trustee` or `we`, is `collective`), and evidence `spans`. The extractor returns one `parties` list with a role per cluster; nothing the model labels is discarded.
 - `name_json`: Evidence payload (`spans`) for `name`.
 - `start_date_json`, `maturity_date_json`, `commitment_termination_date_json`: Evidence payloads with `normalized_date` and `derived_from`.
 - `amounts_json`: JSON array of kind-typed money facts: `{kind, normalized_amount, currency, as_of_date, spans, derived_from, prior}` with `kind` one of `commitment`, `principal`, `outstanding_balance`, `draw`, `repayment`, `proceeds`. `as_of_date` is normally present only on balances. `prior` is true for a figure the filing states as it stood before an amendment (`from $25,000,000 to $50,000,000`); prior facts never supply `principal_amount`.
@@ -361,7 +361,7 @@ everywhere:
 | `expected` | date payloads, `dates_json` | True for a date the filing states as planned rather than occurred — an expected closing, a noticed redemption. |
 | `as_of_date` | `amounts_json` | Normally present only on balances. |
 | `currency` | `amounts_json` | ISO 4217. |
-| `role`, `kind`, `canonical_name` | `parties_json` | Role in the instrument, `named` or `collective`, and the longest span's text as the cluster's key. |
+| `role`, `kind`, `canonical_name` | `parties_json` | Role in the instrument, `named` or `collective`, and the cluster's name (longest non-role span) as its key. |
 | `status`, `status_date`, `derived_from_kind` | `status_json` | `status_date` is itself a full evidence payload, nested one level deeper. `derived_from_kind` names the `dates_json` event kind that decided the status. |
 
 ##### Worked examples
