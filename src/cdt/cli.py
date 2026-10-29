@@ -2,7 +2,7 @@
 
 Stage commands, each named after the module it runs::
 
-    cdt ingest | segment | classify [train] | extract [job show|reset] | match | publish
+    cdt ingest | segment | classify [train] | extract [job show|reset | replay] | match | publish
 
 Whole runs, as deployed (see :mod:`cdt.run`)::
 
@@ -47,6 +47,7 @@ from cdt.extractor import (
     extract_pending_items,
     extracted_tables_path,
     mentions_root,
+    replay_extracted_mentions,
     reset_active_job,
 )
 from cdt.ingest.core import (
@@ -551,6 +552,18 @@ def _add_extract(commands: argparse._SubParsersAction) -> None:
         help="clear the marker; without it, only report what would be abandoned",
     )
     reset.set_defaults(func=run_extract_job_reset)
+    replay = nested.add_parser(
+        "replay",
+        parents=[_common_options(suppress=True)],
+        help="re-derive stored mentions from the recorded model responses with "
+        "the current code; calls no model",
+    )
+    replay.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what would change without writing",
+    )
+    replay.set_defaults(func=run_extract_replay)
 
 
 def _add_match(commands: argparse._SubParsersAction) -> None:
@@ -1014,6 +1027,42 @@ def run_extract_job_reset(args: argparse.Namespace) -> int:
     # The lease a poll tick holds, so a running tick cannot rewrite the marker
     # underneath the reset.
     return _with_writer_lease(args, "the extract job reset", body)
+
+
+def run_extract_replay(args: argparse.Namespace) -> int:
+    """Run ``cdt extract replay``: re-derive mentions from the audit log."""
+
+    def body(artifact_root: str, lease: Lease) -> int:
+        result = replay_extracted_mentions(
+            artifact_root=artifact_root,
+            dry_run=args.dry_run,
+            renew=renewer(lease),
+        )
+        print(
+            f"Replayed {result.items_replayed} item(s); {result.items_changed} "
+            f"changed ({result.mention_rows_before} -> "
+            f"{result.mention_rows_after} mention rows)."
+        )
+        if result.items_rejected:
+            print(
+                f"{len(result.items_rejected)} item(s) the current validators "
+                "reject were left as they are."
+            )
+        if result.items_out_of_step:
+            print(
+                f"{len(result.items_out_of_step)} item(s) whose stored mentions "
+                "differ from their newest audit record were left as they are."
+            )
+        if result.dry_run:
+            print("Dry run: nothing was written.")
+        elif result.partitions_written:
+            print(
+                f"Rewrote {len(result.partitions_written)} month file(s) under "
+                f"{mentions_root(artifact_root)}; run `cdt match`."
+            )
+        return 0
+
+    return _with_writer_lease(args, "the extract replay", body)
 
 
 def run_match(args: argparse.Namespace) -> int:

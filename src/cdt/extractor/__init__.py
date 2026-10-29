@@ -10,6 +10,7 @@ from cdt.extractor.batch import (
 )
 from cdt.extractor.live import extract_pending_items
 from cdt.extractor.outputs import extracted_tables_path, mentions_root
+from cdt.extractor.replay import ReplayResult, replay_extracted_mentions
 from cdt.extractor.state import DEFAULT_MAX_ATTEMPTS
 
 __all__ = [
@@ -17,10 +18,12 @@ __all__ = [
     "ActiveJobSummary",
     "ExtractTickResult",
     "OpenAIBatchClient",
+    "ReplayResult",
     "advance_extract_job",
     "describe_active_job",
     "extract_pending_items",
     "extracted_tables_path",
     "mentions_root",
+    "replay_extracted_mentions",
     "reset_active_job",
 ]
