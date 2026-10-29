@@ -51,6 +51,22 @@ def test_lender_signature_uses_stored_lender_clusters() -> None:
     assert lender_signature(payload) == "acme bank"
 
 
+def test_lender_signature_drops_lenders_named_only_by_their_role() -> None:
+    """A lender cluster of role words alone adds nothing to the signature (#323).
+
+    `the Lenders party thereto` or `Administrative Agent` reads the same in
+    unrelated syndicates, so keeping it would score them as sharing lenders.
+    """
+    role_only = [
+        {"role": "lender", "spans": [{"text": "the Lenders party thereto"}]},
+        {"role": "lender", "spans": [{"text": "Administrative Agent"}]},
+    ]
+    named = {"role": "lender", "spans": [{"text": "Citibank, N.A."}]}
+
+    assert lender_signature(json.dumps(role_only)) == ""
+    assert lender_signature(json.dumps([*role_only, named])) == "citibank"
+
+
 def test_party_dedupe_trusts_the_extractors_canonical_name() -> None:
     """Two clusters the extractor named alike are one party, whatever they span.
 
