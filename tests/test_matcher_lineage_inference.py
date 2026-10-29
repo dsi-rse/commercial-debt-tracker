@@ -362,16 +362,26 @@ def ordinal_pair(
 
 @pytest.mark.parametrize(
     "placeholder",
-    ["Issuer", "the Borrowers", "Buyer Parent", "other Borrowers party thereto"],
+    [
+        "Issuer",
+        "the Borrowers",
+        "Buyer Parent",
+        "other Borrowers party thereto",
+        "we",
+        "Partnership",
+        "Subsidiaries",
+    ],
 )
 def test_a_placeholder_borrower_is_silence_not_a_different_company(
     placeholder: str,
 ) -> None:
     """A borrower recorded only by its role or defined term constrains nothing.
 
-    The extractor keeps the longest span, so a filing that never names the
-    company records `Issuer`; read as a name, `HSBC Holdings plc` against
-    `Issuer` refused the link on 17 rows of one corpus (#205).
+    A filing that never names the company records the borrower as `Issuer`,
+    `we` or `the Partnership`; read as a name, `HSBC Holdings plc` against
+    `Issuer` refused the link on 17 rows of one corpus (#205). `Partnership`,
+    `we` and `Subsidiaries` are the commonest borrower placeholders on the
+    2026-10-28 beta snapshot (#323).
     """
     rows = ordinal_pair(borrower("HSBC Holdings plc"), borrower(placeholder))
     result = infer_amendment_parents(rows)
